@@ -25,7 +25,6 @@ use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result, bail};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_manifest::Workspace;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Disk;
@@ -35,6 +34,7 @@ use blaze_resolve::resolver::{
     PackageTargets, ResolveBehavior, ResolvedFeatures, members_with_features,
 };
 use blaze_resolve::{Cfg, InternedString, PackageId, PackageIdSpec, Platform, Summary};
+use std::alloc::Global;
 
 use blaze_ids::bits::BitSet as Bits;
 pub use blaze_resolve::DepKind;
@@ -136,7 +136,9 @@ impl Kinds {
         let mut requested = Vec::with_capacity(self.targets.len().max(1));
         match self.targets.is_empty() {
             true => requested.push(CompileKind::Host),
-            false => requested.extend(self.targets.iter().map(|it| CompileKind::Target(InternedString::new(&it.triple)))),
+            false => requested.extend(
+                self.targets.iter().map(|it| CompileKind::Target(InternedString::new(&it.triple))),
+            ),
         }
         requested
     }
@@ -153,10 +155,12 @@ impl Kinds {
     pub(crate) fn kind(&self, kind: CompileKind) -> Kind {
         match kind {
             CompileKind::Host => Kind::HOST,
-            CompileKind::Target(triple) => match self.targets.iter().position(|it| it.triple == *triple) {
-                Some(i) => Kind(u16::try_from(i + 1).expect("fewer than 2^16 `--target`s")),
-                None => panic!("`{triple}` is not a platform asked"),
-            },
+            CompileKind::Target(triple) => {
+                match self.targets.iter().position(|it| it.triple == *triple) {
+                    Some(i) => Kind(u16::try_from(i + 1).expect("fewer than 2^16 `--target`s")),
+                    None => panic!("`{triple}` is not a platform asked"),
+                }
+            }
         }
     }
 
@@ -216,7 +220,8 @@ static ASCII_SYMBOLS: Symbols = Symbols { down: "|", tee: "|", ell: "`", right: 
 const RESET: &str = "\x1b[0m";
 
 /// The color of a line to a dependency of each tag: cargo's `style::DEP_*`.
-const EDGE_COLORS: [&str; TAGS] = ["\x1b[2m", "\x1b[1m\x1b[34m", "\x1b[1m\x1b[36m", "\x1b[1m\x1b[35m"];
+const EDGE_COLORS: [&str; TAGS] =
+    ["\x1b[2m", "\x1b[1m\x1b[34m", "\x1b[1m\x1b[36m", "\x1b[1m\x1b[35m"];
 
 /// About a line of output per package, for the output's first size.
 const LINE: usize = 48;
@@ -312,7 +317,8 @@ fn feature_resolves<'a>(input: &Input<'a>) -> Result<Vec<FeatureMembers<'a>>> {
         let mut narrowed = input.cli_features.clone();
         let enabled = members.iter().filter(|(member, _)| spec.matches(member.package_id()));
         // alloc: as `narrowed`.
-        narrowed.features = std::rc::Rc::new(enabled.flat_map(|(_, it)| it.features.iter().cloned()).collect());
+        narrowed.features =
+            std::rc::Rc::new(enabled.flat_map(|(_, it)| it.features.iter().cloned()).collect());
         // alloc: clone: the one spec this resolve is for.
         let specs = vec![spec.clone()];
         let members = members_with_features(&input.members, &specs, &narrowed)?;
@@ -341,21 +347,27 @@ pub(crate) fn print_resolved(
     let targets = Targets { packages: input.packages, kinds };
     // Each tree resolved as it is printed, as cargo does: a later resolve's error comes after
     // an earlier tree's warnings.
-    let trees = feature_resolves(input)?
-        .into_iter()
-        .map(|(specs, members)| resolve_tree(input, opts, &targets, &requested_kinds, specs, &members));
+    let trees = feature_resolves(input)?.into_iter().map(|(specs, members)| {
+        resolve_tree(input, opts, &targets, &requested_kinds, specs, &members)
+    });
     print_trees(input, opts, kinds, trees, out, warn)
 }
 
 /// The features of each tree of `input`: one per feature resolve, so one per package under
 /// `resolver.feature-unification = "package"`.
 #[cfg(test)]
-pub(crate) fn resolve_trees<'a>(input: &Input<'a>, opts: &Options, kinds: &Kinds) -> Result<Vec<Resolved<'a>>> {
+pub(crate) fn resolve_trees<'a>(
+    input: &Input<'a>,
+    opts: &Options,
+    kinds: &Kinds,
+) -> Result<Vec<Resolved<'a>>> {
     let requested_kinds = kinds.requested();
     let targets = Targets { packages: input.packages, kinds };
     feature_resolves(input)?
         .into_iter()
-        .map(|(specs, members)| resolve_tree(input, opts, &targets, &requested_kinds, specs, &members))
+        .map(|(specs, members)| {
+            resolve_tree(input, opts, &targets, &requested_kinds, specs, &members)
+        })
         .collect()
 }
 
@@ -377,7 +389,13 @@ fn resolve_tree<'a>(
         false => ForceAllTargets::No,
     };
     let feature_opts = FeatureOpts::new(input.behavior, has_dev, force_all);
-    let features = FeatureResolver::resolve(targets, input.resolve, feature_members, requested_kinds, feature_opts)?;
+    let features = FeatureResolver::resolve(
+        targets,
+        input.resolve,
+        feature_members,
+        requested_kinds,
+        feature_opts,
+    )?;
     let members = members_with_features(&input.members, &specs, input.cli_features)?;
     Ok(Resolved { specs, features, members })
 }
@@ -406,14 +424,22 @@ pub(crate) fn print_trees<'a>(
     let mut pattern = None;
     for tree in trees {
         let Resolved { specs, features, members: feature_members } = tree?;
-        let mut graph =
-            graph::build(input.resolve, &features, feature_members, kinds, &requested_kinds, &packages, opts);
+        let mut graph = graph::build(
+            input.resolve,
+            &features,
+            feature_members,
+            kinds,
+            &requested_kinds,
+            &packages,
+            opts,
+        );
 
         let root_ids = match opts.invert.is_empty() {
             true => specs_to_ids(&packages, &specs)?,
             false => {
                 // alloc: the specs of `--invert`, once per tree.
-                let specs: Vec<PackageIdSpec> = opts.invert.iter().map(|p| PackageIdSpec::parse(p)).collect::<Result<_>>()?;
+                let specs: Vec<PackageIdSpec> =
+                    opts.invert.iter().map(|p| PackageIdSpec::parse(p)).collect::<Result<_>>()?;
                 specs_to_ids(&packages, &specs)?
             }
         };
@@ -596,7 +622,12 @@ impl Printer<'_, '_> {
                         out.push_str("   ");
                     }
                     let c = if last_continues { symbols.tee } else { symbols.ell };
-                    paint(out, color, EDGE_COLORS[last_tag as usize], &[c, symbols.right, symbols.right]);
+                    paint(
+                        out,
+                        color,
+                        EDGE_COLORS[last_tag as usize],
+                        &[c, symbols.right, symbols.right],
+                    );
                     out.push(' ');
                 }
             }
@@ -658,7 +689,8 @@ impl Printer<'_, '_> {
         let (members, pruned) = (self.members, self.pruned);
         let keep = |dep: &Edge| match graph.node(dep.node()) {
             Node::Package { pkg, .. } => {
-                !(filter_non_workspace_member && !members.contains(pkg.index())) && !pruned.contains(pkg.index())
+                !(filter_non_workspace_member && !members.contains(pkg.index()))
+                    && !pruned.contains(pkg.index())
             }
             Node::Feature { .. } => true,
         };

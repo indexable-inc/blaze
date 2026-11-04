@@ -97,7 +97,13 @@ pub fn splat(ty: Ty, value: i128) -> String {
 
 /// The value of `ty` that is all zero bits.
 pub fn zero(ty: Ty) -> &'static str {
-    if ty.is_vector() { "zeroinitializer" } else if ty.is_float() { "0.0" } else { "0" }
+    if ty.is_vector() {
+        "zeroinitializer"
+    } else if ty.is_float() {
+        "0.0"
+    } else {
+        "0"
+    }
 }
 
 /// One stencil being written: its text, a counter of values, and the intrinsics it calls.
@@ -241,7 +247,9 @@ impl B<'_> {
     pub fn add_lo12(&mut self, kind: HoleKind, v: &str) -> String {
         assert_eq!(self.isa, Isa::Aarch64, "an `add #:lo12:` on {:?}", self.isa);
         let sym = kind.symbol();
-        self.val(&format!("call i64 asm \"add ${{0:x}}, ${{1:x}}, #:lo12:{sym}\", \"=r,r\"(i64 {v})"))
+        self.val(&format!(
+            "call i64 asm \"add ${{0:x}}, ${{1:x}}, #:lo12:{sym}\", \"=r,r\"(i64 {v})"
+        ))
     }
 
     /// `<op> <from> v to <to>`, or `v` when the types are LLVM's same type.
@@ -273,7 +281,8 @@ impl B<'_> {
             Some(Acc::Float) if ty.is_vector() => self.cast("bitcast", ty, v, Ty::I64x2),
             Some(Acc::Float) => {
                 let lanes = if ty == Ty::F32 { Ty::F32x4 } else { Ty::F64x2 };
-                let w = self.val(&format!("insertelement {} poison, {} {v}, i64 0", ir(lanes), ir(ty)));
+                let w =
+                    self.val(&format!("insertelement {} poison, {} {v}, i64 0", ir(lanes), ir(ty)));
                 self.cast("bitcast", lanes, &w, Ty::I64x2)
             }
             None => unreachable!("{} has no accumulator", ty.name()),
@@ -421,7 +430,13 @@ pub fn name(index: u32) -> String {
 }
 
 /// The function of stencil `index` (`shape`), appended to `out`.
-fn stencil(out: &mut String, decls: &mut BTreeMap<String, String>, isa: Isa, index: u32, shape: Shape) {
+fn stencil(
+    out: &mut String,
+    decls: &mut BTreeMap<String, String>,
+    isa: Isa,
+    index: u32,
+    shape: Shape,
+) {
     let attrs = if isa == Isa::X86_64 && shape.op == Op::AtomicCas && shape.ty == Ty::I128 {
         "#1"
     } else {
@@ -498,14 +513,29 @@ pub fn module(isa: Isa, stencils: &[(u32, Shape)]) -> String {
     let mut out = String::with_capacity(stencils.len() * 1024 + 4096);
     let mut decls = BTreeMap::new();
     if isa == Isa::X86_64 {
-        for kind in [HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2, HoleKind::Result0, HoleKind::Result1] {
-            let _ = writeln!(out, "@{} = external hidden global i8, !absolute_symbol !0", kind.symbol());
+        for kind in [
+            HoleKind::Slot0,
+            HoleKind::Slot1,
+            HoleKind::Slot2,
+            HoleKind::Result0,
+            HoleKind::Result1,
+        ] {
+            let _ = writeln!(
+                out,
+                "@{} = external hidden global i8, !absolute_symbol !0",
+                kind.symbol()
+            );
         }
         for kind in [HoleKind::Imm0, HoleKind::Imm1, HoleKind::Imm2, HoleKind::Offset] {
-            let _ = writeln!(out, "@{} = external hidden global i8, !absolute_symbol !1", kind.symbol());
+            let _ = writeln!(
+                out,
+                "@{} = external hidden global i8, !absolute_symbol !1",
+                kind.symbol()
+            );
         }
     }
-    let _ = writeln!(out, "@{} = external hidden global [16 x i8], align 16", HoleKind::Const.symbol());
+    let _ =
+        writeln!(out, "@{} = external hidden global [16 x i8], align 16", HoleKind::Const.symbol());
     let _ = writeln!(
         out,
         "declare hidden preserve_nonecc void @{}(ptr, i64, <2 x i64>)\n",

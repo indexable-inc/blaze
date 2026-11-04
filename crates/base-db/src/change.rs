@@ -3,11 +3,11 @@
 
 use std::fmt;
 
-use blaze_hash::HashSet;
-use std::alloc::Global;
-use blaze_query::db::{Durability, Setter as _};
-use triomphe::Arc;
 use crate::FileId;
+use blaze_hash::HashSet;
+use blaze_query::db::{Durability, Setter as _};
+use std::alloc::Global;
+use triomphe::Arc;
 
 use crate::{
     CrateGraphBuilder, CratesIdMap, Db, LibraryRoots, LocalRoots, SourceRoot, SourceRootId,

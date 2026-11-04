@@ -2,10 +2,10 @@
 //! are parsed only when a body is lowered.
 
 use base_db::{Crate, all_crates};
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use span::Edition;
 use syntax::FlatTree;
-use hir_expand::fixture;
 
 use crate::{
     AssocItemId, DefWithBodyId, ModuleDefId,
@@ -178,5 +178,8 @@ fn lowering_one_fn_parses_only_its_own_body() {
 
 /// The text of each lazy node of `tree` that was parsed.
 fn parsed(tree: &FlatTree) -> Vec<&str> {
-    tree.lazies().filter(|&at| tree.is_parsed(at)).map(|at| &tree.source()[tree.range(at)]).collect()
+    tree.lazies()
+        .filter(|&at| tree.is_parsed(at))
+        .map(|at| &tree.source()[tree.range(at)])
+        .collect()
 }

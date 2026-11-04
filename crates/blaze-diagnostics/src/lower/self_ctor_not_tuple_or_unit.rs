@@ -19,14 +19,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::SelfCtorNotTupleOrUnit<'_>) -> Vec
     let ptr = InFile::new(d.expr.file_id, d.expr.value.syntax_node_ptr());
     let at = cx.span_of(ptr);
     // clone: a handle, on the error path
-    let mut diag =
-        Diag::error(None, "the `Self` constructor can only be used with tuple or unit structs", at.clone());
+    let mut diag = Diag::error(
+        None,
+        "the `Self` constructor can only be used with tuple or unit structs",
+        at.clone(),
+    );
     match d.self_ty.as_adt() {
         Some(Adt::Enum(_)) => {
             diag.help("did you mean to use one of the enum's variants?");
         }
         Some(Adt::Struct(_) | Adt::Union(_)) => {
-            diag.suggestion(at, "use curly brackets", "Self { /* fields */ }", Applicability::HasPlaceholders);
+            diag.suggestion(
+                at,
+                "use curly brackets",
+                "Self { /* fields */ }",
+                Applicability::HasPlaceholders,
+            );
         }
         None => {}
     }

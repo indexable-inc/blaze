@@ -41,7 +41,13 @@ impl LatePass for MapUnitFn {
     const LINTS: LintSet = lint_set(["map_unit_fn"]);
     const HOOKS: Hooks = Hooks::STMT;
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        block: ExprId,
+        index: usize,
+        out: &mut Vec<Found>,
+    ) {
         if let Some(found) = map_unit_fn(b, block, index) {
             out.push(found);
         }
@@ -51,9 +57,13 @@ impl LatePass for MapUnitFn {
 fn map_unit_fn(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<Found> {
     let Expr::Block { statements, .. } = b.store().expr(block) else { return None };
     let Statement::Expr { expr, has_semi: true } = statements.get(index)? else { return None };
-    let Expr::MethodCall { receiver, method_name, args: &[arg], .. } = b.store().expr(expr) else { return None };
+    let Expr::MethodCall { receiver, method_name, args: &[arg], .. } = b.store().expr(expr) else {
+        return None;
+    };
     if method_name.as_str() != "map"
-        || !method_fn(b, expr).and_then(|it| fn_item(b.db(), it)).is_some_and(|it| it.as_str() == "IteratorMap")
+        || !method_fn(b, expr)
+            .and_then(|it| fn_item(b.db(), it))
+            .is_some_and(|it| it.as_str() == "IteratorMap")
     {
         return None;
     }
@@ -80,7 +90,9 @@ fn map_unit_fn(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<Fo
     }
     let function_label = match arg_ty.kind() {
         TyKind::Closure(closure, _) => closure_span(b, closure.0.loc(b.db())),
-        TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), _) => fn_span(b, function),
+        TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), _) => {
+            fn_span(b, function)
+        }
         _ => None,
     };
 
@@ -88,10 +100,17 @@ fn map_unit_fn(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<Fo
     let call = ast::MethodCallExpr::cast(node.value)?;
     let name = call.name_ref()?;
     let name_span = b.cx.span(node.with_value(name.syntax().text_range()));
-    let span = b.cx.span(node.with_value(TextRange::new(name.syntax().text_range().start(), node.value.text_range().end())));
+    let span = b.cx.span(node.with_value(TextRange::new(
+        name.syntax().text_range().start(),
+        node.value.text_range().end(),
+    )));
     let arg_span = util::span(b, arg)?;
     // clone: a node handle or span, once the lint fires
-    let mut diag = Diag::lint("map_unit_fn", "`Iterator::map` call that discard the iterator's values", span.clone());
+    let mut diag = Diag::lint(
+        "map_unit_fn",
+        "`Iterator::map` call that discard the iterator's values",
+        span.clone(),
+    );
     diag.note("`Iterator::map`, like many of the methods on `Iterator`, gets executed lazily, meaning that its effects won't be visible until it is iterated");
     diag.span_label(
         // clone: a node handle or span, once the lint fires
@@ -100,13 +119,21 @@ fn map_unit_fn(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<Fo
     );
     diag.span_label(arg_span, "called `Iterator::map` with callable that returns `()`");
     diag.span_label(span, "after this call to map, the resulting iterator is `impl Iterator<Item = ()>`, which means the only information carried by the iterator is the number of items");
-    diag.suggestion_verbose(name_span, "you might have meant to use `Iterator::for_each`", "for_each", Applicability::MaybeIncorrect);
+    diag.suggestion_verbose(
+        name_span,
+        "you might have meant to use `Iterator::for_each`",
+        "for_each",
+        Applicability::MaybeIncorrect,
+    );
     if let Some(written) = util::syntax(b, receiver).and_then(|it| ast::Expr::cast(it.value))
         && let Some(receiver_ty) = b.cx.vsema.type_of_expr(written)
     {
         let printed = b.cx.ty(&receiver_ty.original);
         // alloc: the lint's diagnostic
-        diag.fact_opt(b.cx.method_fact(&receiver_ty.original, "map"), format!("what `map` is on `{printed}`"));
+        diag.fact_opt(
+            b.cx.method_fact(&receiver_ty.original, "map"),
+            format!("what `map` is on `{printed}`"),
+        );
     }
     Some(b.lint(diag, Phase::Late, stmt.map(ast::ptr)))
 }
@@ -150,7 +177,9 @@ fn closure_span(b: &BodyCx<'_, '_, '_>, closure: InternedClosure<'_>) -> Option<
     let start = node
         .value
         .children_with_tokens()
-        .find(|it| !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))?
+        .find(|it| {
+            !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
+        })?
         .text_range()
         .start();
     let end = match written.ret_type() {

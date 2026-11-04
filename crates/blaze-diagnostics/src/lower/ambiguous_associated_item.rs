@@ -33,14 +33,18 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::AmbiguousAssociatedItem<'db>
     let ident = d.item.name(db).display(db, cx.edition).to_string();
 
     // clone: the lint's span, for a lint hir found
-    let mut diag = Diag::lint("ambiguous_associated_items", "ambiguous associated item", span.clone());
+    let mut diag =
+        Diag::lint("ambiguous_associated_items", "ambiguous associated item", span.clone());
     if let Some(variant) = variant_span(cx, d.variant) {
         // alloc: the lint's text, for a lint hir found
         diag.span_note(variant, format!("`{ident}` could refer to the variant defined here"));
     }
     if let Some(item) = assoc_type_span(cx, d.item) {
         // alloc: the lint's text, for a lint hir found
-        diag.span_note(item, format!("`{ident}` could also refer to the associated type defined here"));
+        diag.span_note(
+            item,
+            format!("`{ident}` could also refer to the associated type defined here"),
+        );
     }
     diag.suggestion(
         span,
@@ -54,7 +58,10 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::AmbiguousAssociatedItem<'db>
     // alloc: the lint's text, for a lint hir found
     let adt_name = adt.name(db).display(db, cx.edition).to_string();
     // alloc: the lint's text, for a lint hir found
-    diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("the variants of `{adt_name}`"));
+    diag.fact(
+        Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+        format!("the variants of `{adt_name}`"),
+    );
     diag.fact(
         Fact::Signature(cx.key(ItemId::Trait(d.bound.into()))),
         // alloc: the lint's text, for a lint hir found
@@ -75,13 +82,21 @@ fn variant_span(cx: &Cx<'_, '_>, variant: Variant) -> Option<crate::model::Span>
         Variant::Struct(it) => {
             let source = cx.vsema.source(it)?;
             source.map(|it| {
-                named(it.syntax(), it.name().map(|it| it.syntax()), it.generic_param_list().map(|it| it.syntax()))
+                named(
+                    it.syntax(),
+                    it.name().map(|it| it.syntax()),
+                    it.generic_param_list().map(|it| it.syntax()),
+                )
             })
         }
         Variant::Union(it) => {
             let source = cx.vsema.source(it)?;
             source.map(|it| {
-                named(it.syntax(), it.name().map(|it| it.syntax()), it.generic_param_list().map(|it| it.syntax()))
+                named(
+                    it.syntax(),
+                    it.name().map(|it| it.syntax()),
+                    it.generic_param_list().map(|it| it.syntax()),
+                )
             })
         }
     };
@@ -97,13 +112,21 @@ pub(crate) fn assoc_type_span(cx: &Cx<'_, '_>, item: hir::TypeAlias) -> Option<c
             let start = item_range_view(it.syntax()).start();
             TextRange::new(start, bound.syntax().text_range().end().max(start))
         }
-        None => named(it.syntax(), it.name().map(|it| it.syntax()), it.generic_param_list().map(|it| it.syntax())),
+        None => named(
+            it.syntax(),
+            it.name().map(|it| it.syntax()),
+            it.generic_param_list().map(|it| it.syntax()),
+        ),
     });
     Some(cx.span(at))
 }
 
 /// rustc's `named_span`: from the item's start, past its attributes, to its name or generics.
-fn named(item: ast::Node<'_>, name: Option<ast::Node<'_>>, generics: Option<ast::Node<'_>>) -> TextRange {
+fn named(
+    item: ast::Node<'_>,
+    name: Option<ast::Node<'_>>,
+    generics: Option<ast::Node<'_>>,
+) -> TextRange {
     let range = item_range_view(item);
     let end = generics.or(name).map_or(range.end(), |it| it.text_range().end());
     TextRange::new(range.start(), end.max(range.start()))

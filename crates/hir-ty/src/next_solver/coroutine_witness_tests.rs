@@ -10,11 +10,11 @@ use hir_def::{
     DefWithBodyId, FunctionId, ModuleDefId, TraitId, expr_store::Body, nameres::crate_def_map,
     signatures::FunctionSignature,
 };
+use hir_expand::fixture;
 use rustc_type_ir::{
     BoundVar, DebruijnIndex, INNERMOST, Mutability, TypingMode,
     inherent::{SliceLike as _, Ty as _},
 };
-use hir_expand::fixture;
 
 use super::interner::bind_witness_regions;
 use crate::{
@@ -181,7 +181,10 @@ fn each_free_region_of_a_witness_is_a_bound_region_of_its_own() {
             [shared(bound(INNERMOST, 0), types.u8), shared(r, types.u16)],
             types.unit,
         );
-        Ty::new_fn_ptr(interner, Binder::bind_with_vars(sig, BoundVarKinds::new_from_slice(&[anon])))
+        Ty::new_fn_ptr(
+            interner,
+            Binder::bind_with_vars(sig, BoundVarKinds::new_from_slice(&[anon])),
+        )
     };
 
     let witnesses = [

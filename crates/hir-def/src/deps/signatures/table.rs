@@ -18,8 +18,8 @@
 
 use base_db::{Crate, Db};
 use blaze_format::{Aligned, FormatError, Persist, open_as};
-use hir_expand::MacroCallId;
 use blaze_query::db::{AsId, FromId};
+use hir_expand::MacroCallId;
 use syntax::ast;
 
 use crate::{

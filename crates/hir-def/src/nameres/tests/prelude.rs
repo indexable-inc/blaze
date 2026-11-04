@@ -13,10 +13,15 @@ use crate::nameres::{
 };
 
 /// The prelude diagnostics of `def_map`, by the crate each names.
-fn prelude_errors(db: &base_db::Db, def_map: &crate::nameres::DefMap) -> Vec<(String, PreludeError)> {
+fn prelude_errors(
+    db: &base_db::Db,
+    def_map: &crate::nameres::DefMap,
+) -> Vec<(String, PreludeError)> {
     (def_map.diagnostics(db).iter())
         .filter_map(|it| match &it.kind {
-            DefDiagnosticKind::Prelude { krate, error } => Some((krate.as_str().to_owned(), *error)),
+            DefDiagnosticKind::Prelude { krate, error } => {
+                Some((krate.as_str().to_owned(), *error))
+            }
             _ => None,
         })
         .collect()
@@ -60,7 +65,10 @@ fn a_crate_with_no_std_is_e0463() {
 
 #[test]
 fn a_no_std_crate_with_no_core_is_e0463() {
-    assert_eq!(alone("#![no_std]\npub struct S;"), [("core".to_owned(), PreludeError::CrateNotFound)]);
+    assert_eq!(
+        alone("#![no_std]\npub struct S;"),
+        [("core".to_owned(), PreludeError::CrateNotFound)]
+    );
 }
 
 #[test]
@@ -73,7 +81,8 @@ fn a_no_core_crate_needs_no_prelude_crate() {
 /// they get, and `#![no_core]` without it.
 #[test]
 fn a_fixture_without_std_is_no_std() {
-    let fixtures = [("//- minicore: option\n//- /main.rs\npub struct S;", true), ("pub struct S;", false)];
+    let fixtures =
+        [("//- minicore: option\n//- /main.rs\npub struct S;", true), ("pub struct S;", false)];
     for (text, prelude) in fixtures {
         let db = fixture::db(text).into_db();
         let def_map = crate_def_map(&db, db.fetch_test_crate());

@@ -398,9 +398,7 @@ impl ReadingsCache {
     fn find(&self, id: TermId, hash: u64, text: &[char]) -> Option<usize> {
         let texts = &self.texts;
         self.table
-            .find(hash, |held| {
-                held.id == id && texts[held.start..held.end] == *text
-            })
+            .find(hash, |held| held.id == id && texts[held.start..held.end] == *text)
             .map(|held| held.scans)
     }
 
@@ -414,13 +412,7 @@ impl ReadingsCache {
         self.texts.extend_from_slice(text);
         self.table.insert_unique(
             hash,
-            Remembered {
-                hash,
-                id,
-                start,
-                end: self.texts.len(),
-                scans: at,
-            },
+            Remembered { hash, id, start, end: self.texts.len(), scans: at },
             |held| held.hash,
         );
         self.len += 1;
@@ -579,11 +571,8 @@ impl GrammarSpec {
                 options.max_depth, root.name, root.min_depth
             )));
         }
-        let classes = analysis
-            .rules
-            .iter()
-            .map(|rule| AltClasses::of(&rule.alternatives))
-            .collect();
+        let classes =
+            analysis.rules.iter().map(|rule| AltClasses::of(&rule.alternatives)).collect();
         let group_classes = group_classes(&analysis);
         let internal = |e: crate::control::InternalError| GrammarError::new(format!("{e}"));
         let max_size = usize::try_from(options.max_size).unwrap_or(usize::MAX);
@@ -591,23 +580,13 @@ impl GrammarSpec {
         let terminal_names = grammar.terminals.iter().map(|t| t.name.clone()).collect();
         let ignore = grammar.ignore.clone();
         let constraint = Arc::new(
-            GrammarConstraint::new(
-                grammar,
-                start,
-                max_size,
-                options.max_depth,
-                alphabet.as_ref(),
-            )
-            .map_err(internal)?,
+            GrammarConstraint::new(grammar, start, max_size, options.max_depth, alphabet.as_ref())
+                .map_err(internal)?,
         );
         let kind = Arc::new(StringChoice {
             intervals: Arc::clone(constraint.intervals()),
             min_size: 0,
-            max_size: if placeholders.is_empty() {
-                max_size
-            } else {
-                usize::MAX
-            },
+            max_size: if placeholders.is_empty() { max_size } else { usize::MAX },
             constraint: Some(Constraint::Grammar(Arc::clone(&constraint))),
         });
         let spec = GrammarSpec {
@@ -772,8 +751,7 @@ impl GrammarSpec {
             }
             let lexed = match known.get(k) {
                 Some(&(start, len, scans)) if start == pos => {
-                    self.lexer
-                        .extend(&findings[scans].basic, text, pos, len, true)
+                    self.lexer.extend(&findings[scans].basic, text, pos, len, true)
                 }
                 _ => None,
             }
@@ -864,13 +842,7 @@ impl GrammarSpec {
     /// at a position (see [`Starters`]) is not matched there at all.
     fn scans(&self, text: &[char], tokens: &[Token], findings: &[TokenScans]) -> bool {
         let mut scratch = self.scratch.lock();
-        let ScansScratch {
-            bounds,
-            significant,
-            reachable,
-            tried,
-            ..
-        } = &mut *scratch;
+        let ScansScratch { bounds, significant, reachable, tried, .. } = &mut *scratch;
         bounds.clear();
         let mut pos = 0;
         for token in tokens {
@@ -879,12 +851,7 @@ impl GrammarSpec {
         }
         significant.clear();
         significant.extend((0..tokens.len()).filter(|&i| tokens[i].needed));
-        let kept = |k: usize| {
-            significant[k..]
-                .iter()
-                .find(|&&i| !tokens[i].droppable)
-                .copied()
-        };
+        let kept = |k: usize| significant[k..].iter().find(|&&i| !tokens[i].droppable).copied();
         let within = |got: usize, k: usize| kept(k).is_none_or(|i| got < bounds[i].1);
         reachable.clear();
         reachable.resize(text.len() + 1, false);
@@ -1022,19 +989,11 @@ impl GrammarSpec {
     /// differs is [`Fit::Wrong`]. A token the lexer cannot read at all
     /// makes the whole check moot.
     fn basic_fit(&self, text: &[char], tokens: &[Token], findings: &[TokenScans]) -> Fit {
-        if tokens
-            .iter()
-            .any(|t| *t.reading(findings) == Reading::Opaque)
-        {
+        if tokens.iter().any(|t| *t.reading(findings) == Reading::Opaque) {
             return Fit::Exact;
         }
         let mut scratch = self.scratch.lock();
-        let ScansScratch {
-            observed,
-            known,
-            regions,
-            ..
-        } = &mut *scratch;
+        let ScansScratch { observed, known, regions, .. } = &mut *scratch;
         known.clear();
         let mut start = 0;
         for token in tokens {
@@ -1056,9 +1015,7 @@ impl GrammarSpec {
             pos = end;
         }
         let overlapping = |start: usize, end: usize| {
-            regions
-                .iter()
-                .filter(move |&&(s, e, _)| start < e && s < end)
+            regions.iter().filter(move |&&(s, e, _)| start < e && s < end)
         };
         let mut fit = Fit::Exact;
         let mut i = 0;
@@ -1104,11 +1061,7 @@ impl GrammarSpec {
             if group.len() != expected.len() {
                 return Fit::Wrong;
             }
-            if !group
-                .iter()
-                .zip(expected)
-                .all(|(&(g, _, _), &x)| self.same_type(x, g))
-            {
+            if !group.iter().zip(expected).all(|(&(g, _, _), &x)| self.same_type(x, g)) {
                 if start == s && last_end == e {
                     fit = Fit::Retyped;
                 } else {
@@ -1143,11 +1096,7 @@ enum Placement {
     /// Nothing is left in the string; the ignorable drawn first was of
     /// this terminal, and read back as itself on its own or not, or was
     /// too long for the string.
-    Rejected {
-        id: TermId,
-        lexable: bool,
-        oversize: bool,
-    },
+    Rejected { id: TermId, lexable: bool, oversize: bool },
 }
 
 /// How the lexer reads one token's text on its own.
@@ -1261,10 +1210,7 @@ impl Token {
     /// Whether the basic lexer reads the token back as itself on its own
     /// (or, for an ignorable, as nothing but ignorable tokens).
     fn lexable(&self, findings: &[TokenScans]) -> bool {
-        matches!(
-            self.reading(findings),
-            Reading::Itself | Reading::Ignorables
-        )
+        matches!(self.reading(findings), Reading::Itself | Reading::Ignorables)
     }
 
     /// Whether the token's own pattern takes all of its text.
@@ -1371,15 +1317,8 @@ impl<'s> Generation<'s> {
         candidates.clear();
         chain_candidates.clear();
         chains.clear();
-        let buffers = Buffers {
-            text,
-            tokens,
-            budgets,
-            candidates,
-            chain_candidates,
-            chains,
-            readings,
-        };
+        let buffers =
+            Buffers { text, tokens, budgets, candidates, chain_candidates, chains, readings };
         let unkept = buffers.offer(&mut spec.buffers.lock());
         drop(unkept);
     }
@@ -1397,14 +1336,7 @@ impl<'s> Generation<'s> {
     /// on, with `scans` where what the lexers find in it is (see
     /// [`Token::scans`]).
     fn token(&self, id: TermId, start: usize, scans: usize) -> Token {
-        Token {
-            id,
-            start,
-            end: self.text.len(),
-            droppable: false,
-            needed: true,
-            scans,
-        }
+        Token { id, start, end: self.text.len(), droppable: false, needed: true, scans }
     }
 
     /// Whether the string is within the size cap, its placeholder
@@ -1424,10 +1356,7 @@ impl<'s> Generation<'s> {
 
     /// The token before the last `pending`, if any.
     fn before(&self, pending: usize) -> Option<&Token> {
-        self.tokens
-            .len()
-            .checked_sub(pending + 1)
-            .map(|i| &self.tokens[i])
+        self.tokens.len().checked_sub(pending + 1).map(|i| &self.tokens[i])
     }
 }
 
@@ -1493,9 +1422,8 @@ fn typical_size(re: &CompiledRegex, min: u64) -> u64 {
 /// about `1 + r * ignore_cost` times the budget its tokens were given.
 fn ignore_cost(ignore: &[TermId], term_typical: &[u64]) -> f64 {
     let mean = |ids: &mut dyn Iterator<Item = TermId>| {
-        let (sum, count) = ids.fold((0u64, 0u64), |(sum, count), id| {
-            (sum + term_typical[id], count + 1)
-        });
+        let (sum, count) =
+            ids.fold((0u64, 0u64), |(sum, count), id| (sum + term_typical[id], count + 1));
         (count > 0).then(|| sum as f64 / count as f64)
     };
     let Some(inserted) = mean(&mut ignore.iter().copied()) else {
@@ -1521,9 +1449,7 @@ fn token_budget(target: u64, min: u64, rate: f64, ignore_cost: f64) -> u64 {
 /// rule, a tree of nullable rules) ends soon enough whatever the caps.
 fn work_limit(max_size: u64, max_depth: u32) -> usize {
     let per_size = max_size.saturating_mul(u64::from(max_depth));
-    usize::try_from(per_size)
-        .unwrap_or(usize::MAX)
-        .max(GENERATION_BUDGET)
+    usize::try_from(per_size).unwrap_or(usize::MAX).max(GENERATION_BUDGET)
 }
 
 /// How many alternatives of a rule [`Generation::choose_alt`] can hold in
@@ -1552,11 +1478,7 @@ fn feasible_classes(alts: &[Alt], budget: u64, depth: u32, max_depth: u32) -> (u
         let i = rest.trailing_zeros();
         rest &= rest - 1;
         let alt = &alts[i as usize];
-        let closes = if any_closing {
-            !alt.growing()
-        } else {
-            alt.typical_size == typical
-        };
+        let closes = if any_closing { !alt.growing() } else { alt.typical_size == typical };
         if !closes {
             growing |= 1 << i;
             cheapest_growing = cheapest_growing.min(alt.typical_size);
@@ -1748,11 +1670,7 @@ impl Generation<'_> {
             return self.cheapest_in_depth(alts, depth);
         }
         let closing = |alt: &Alt| {
-            if any_closing {
-                !alt.growing()
-            } else {
-                alt.typical_size == typical
-            }
+            if any_closing { !alt.growing() } else { alt.typical_size == typical }
         };
         let in_class = |alt: &Alt, grow: bool| feasible(alt) && closing(alt) != grow;
         let growing = alts.iter().filter(|alt| in_class(alt, true));
@@ -1766,9 +1684,7 @@ impl Generation<'_> {
         let size = alts.iter().filter(|alt| in_class(alt, grow)).count();
         let index = d.draw_integer_uniform(0, size as u64 - 1)?;
         Ok(hegel_internal_unwrap!(
-            alts.iter()
-                .filter(|alt| in_class(alt, grow))
-                .nth(index as usize),
+            alts.iter().filter(|alt| in_class(alt, grow)).nth(index as usize),
             "choose_alt: drew an index past the class"
         ))
     }
@@ -1836,8 +1752,7 @@ impl Generation<'_> {
         base: usize,
     ) -> Result<(), Step> {
         let flexible = |item: &Node| item.max_size != Some(item.min_size);
-        self.budgets
-            .extend(alt.items.iter().map(|item| item.typical_size));
+        self.budgets.extend(alt.items.iter().map(|item| item.typical_size));
         let spare = budget.saturating_sub(alt.typical_size);
         let parts = alt.items.iter().filter(|item| flexible(item)).count();
         if parts > 0 && spare > 0 {
@@ -2016,9 +1931,7 @@ impl Generation<'_> {
         match &self.spec.terminals[id] {
             TerminalGen::Placeholder(_) => {
                 self.draw_text(d, id)?;
-                let scans = self
-                    .readings
-                    .read_token(self.spec, id, &self.text[start..], None);
+                let scans = self.readings.read_token(self.spec, id, &self.text[start..], None);
                 Ok(self.token(id, start, scans))
             }
             TerminalGen::Pattern(_) => {
@@ -2047,8 +1960,7 @@ impl Generation<'_> {
                     };
                     self.text.truncate(start + end);
                     let scans = scans.filter(|_| end == len).unwrap_or_else(|| {
-                        self.readings
-                            .read_token(self.spec, id, &self.text[start..], None)
+                        self.readings.read_token(self.spec, id, &self.text[start..], None)
                     });
                     let token = self.token(id, start, scans);
                     if token.lexable(&self.readings.findings) || attempt > LEX_RETRIES {
@@ -2152,12 +2064,8 @@ impl Generation<'_> {
         let prev = self.before(pending).map(|prev| prev.id);
         while *draws > 0 {
             let hopeful = |this: &Self, id: TermId| prev.is_none_or(|prev| this.hopeful(prev, id));
-            let candidates = || {
-                self.chain_candidates[base..]
-                    .iter()
-                    .copied()
-                    .filter(|&id| hopeful(self, id))
-            };
+            let candidates =
+                || self.chain_candidates[base..].iter().copied().filter(|&id| hopeful(self, id));
             let count = candidates().count();
             if count == 0 {
                 break;
@@ -2205,11 +2113,7 @@ impl Generation<'_> {
             self.chains.entry(pair).or_default().0 += 1;
         }
         let placement = match drawn {
-            Drawn::Oversize => Placement::Rejected {
-                id,
-                lexable: false,
-                oversize: true,
-            },
+            Drawn::Oversize => Placement::Rejected { id, lexable: false, oversize: true },
             Drawn::Fits(fit) if fit > Fit::Wrong => {
                 self.unsettled |= fit < Fit::Settled;
                 Placement::Placed(fit)
@@ -2277,10 +2181,7 @@ impl Generation<'_> {
         depth: u32,
     ) -> Result<Drawn, Step> {
         let at = self.tokens.len() - pending;
-        let start = self
-            .tokens
-            .get(at)
-            .map_or(self.text.len(), |next| next.start);
+        let start = self.tokens.get(at).map_or(self.text.len(), |next| next.start);
         let drawn = self.text.len();
         self.draw_text(d, id)?;
         let len = self.text.len() - drawn;
@@ -2290,31 +2191,18 @@ impl Generation<'_> {
         }
         self.text[start..].rotate_left(drawn - start);
         let swallowed = depth > 0 && pending > 0 && self.swallowed(at, len);
-        let scans = self
-            .readings
-            .read_token(self.spec, id, &self.text[start..start + len], None);
+        let scans = self.readings.read_token(self.spec, id, &self.text[start..start + len], None);
         for later in &mut self.tokens[at..] {
             later.start += len;
             later.end += len;
         }
-        let token = Token {
-            id,
-            start,
-            end: start + len,
-            droppable: false,
-            needed: false,
-            scans,
-        };
+        let token = Token { id, start, end: start + len, droppable: false, needed: false, scans };
         self.tokens.insert(at, token);
         if swallowed {
             return Ok(Drawn::Swallowed);
         }
         let (text, tokens) = self.window(from, 0);
-        Ok(Drawn::Fits(self.spec.fit(
-            text,
-            tokens,
-            &self.readings.findings,
-        )))
+        Ok(Drawn::Fits(self.spec.fit(text, tokens, &self.readings.findings)))
     }
 
     /// Whether the token before index `at`, matched on over the `len`
@@ -2327,10 +2215,7 @@ impl Generation<'_> {
         }
         let through = next.start + len + next.len();
         let own = &self.readings.findings[prev.scans].own;
-        let got = self
-            .spec
-            .lexer
-            .extend(own, &self.text[..through], prev.start, prev.len(), false);
+        let got = self.spec.lexer.extend(own, &self.text[..through], prev.start, prev.len(), false);
         matches!(got, Some(Lexed::Token(_, end)) if end >= through)
     }
 
@@ -2378,11 +2263,7 @@ impl Generation<'_> {
             self.spec.is_placeholder(self.tokens[from].id)
                 || self.spec.is_placeholder(self.tokens[at].id)
         });
-        let forced = if pair < Fit::Exact || beside_placeholder {
-            Some(true)
-        } else {
-            None
-        };
+        let forced = if pair < Fit::Exact || beside_placeholder { Some(true) } else { None };
         if d.weighted_against(self.ignore_rate, self.ignore_threshold, forced)?
             && self.insert_ignore(d, pending)?
         {
@@ -2398,11 +2279,7 @@ impl Generation<'_> {
     fn run<D: Draws>(&mut self, d: &mut D, budget: u64) -> Result<(), Step> {
         self.rule(d, self.spec.start, budget, 0)?;
         self.maybe_ignore(d, 0)?;
-        if !self.unsettled
-            || self
-                .spec
-                .scans(&self.text, &self.tokens, &self.readings.findings)
-        {
+        if !self.unsettled || self.spec.scans(&self.text, &self.tokens, &self.readings.findings) {
             Ok(())
         } else {
             Err(Step::Misread)
@@ -2424,9 +2301,7 @@ pub fn generate_grammar(
     max_size: Option<u64>,
 ) -> Result<String, EngineError> {
     spec.ensure_simplest()?;
-    let max_size = max_size.map_or(spec.max_size, |cap| {
-        cap.clamp(spec.min_size(), spec.max_size)
-    });
+    let max_size = max_size.map_or(spec.max_size, |cap| cap.clamp(spec.min_size(), spec.max_size));
     spanned(ntc, LABEL_GRAMMAR, |ntc| {
         let text =
             ntc.draw_string_from(Arc::clone(&spec.kind), |d| draw_grammar(d, spec, max_size))?;

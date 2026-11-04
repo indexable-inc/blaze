@@ -24,9 +24,9 @@
 //! `compiler/rustc_span/src/source_map.rs` (`span_extend_to_line`) (MIT or Apache-2.0).
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir::InFile;
 use smallvec::SmallVec;
+use std::alloc::Global;
 use stdx::edit_distance::find_best_match_for_name;
 use syntax::{
     NodeOrToken, SyntaxKind, T, TextRange,
@@ -88,7 +88,11 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
     remaining.swap_remove("libc");
     remaining.swap_remove("test");
 
-    let local = if features.enabled("staged_api") { collect(owners, Some((cx, &mut found))) } else { Library::default() };
+    let local = if features.enabled("staged_api") {
+        collect(owners, Some((cx, &mut found)))
+    } else {
+        Library::default()
+    };
     // clone: once per check; empty unless the crate is staged
     let mut implications = local.implications.clone();
     if !remaining.is_empty() || !implications.is_empty() {
@@ -135,7 +139,8 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
                 names[start..].sort_unstable();
             }
             // alloc: on the error path, as above
-            let removed: Vec<&Removed> = libraries.iter().flat_map(|(_, library)| &library.removed).collect();
+            let removed: Vec<&Removed> =
+                libraries.iter().flat_map(|(_, library)| &library.removed).collect();
             for (feature, at) in std::mem::take(&mut remaining.entries) {
                 let span = cx.span(at);
                 let mut diag = match removed.iter().find(|it| it.feature == feature) {
@@ -146,7 +151,10 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
                         let mut diag = Diag::error(Some("E0557"), message, span.clone());
                         diag.span_label(span, "feature has been removed");
                         // alloc: the error's note
-                        diag.note(format!("removed in {}; see <{}> for more information", removed.since, removed.link));
+                        diag.note(format!(
+                            "removed in {}; see <{}> for more information",
+                            removed.since, removed.link
+                        ));
                         // clone: the error's note
                         diag.note(removed.reason.clone());
                         diag
@@ -171,7 +179,10 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
                 crate_fact(cx, &mut diag);
                 for (krate, _) in &libraries {
                     let root = krate.root_module(cx.db);
-                    diag.fact(blaze_items::Fact::Signature(cx.module_key(root)), "the library features of a dependency");
+                    diag.fact(
+                        blaze_items::Fact::Signature(cx.module_key(root)),
+                        "the library features of a dependency",
+                    );
                 }
                 found.push(Found::new(diag, Phase::Items));
             }
@@ -200,7 +211,9 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
 enum Stability {
     /// Stable since the version, as rustc prints it.
     Accepted(String),
-    Unstable { old_name: Option<String> },
+    Unstable {
+        old_name: Option<String>,
+    },
 }
 
 /// A crate's library features: rustc's `LibFeatures`, `stability_implications` and its
@@ -287,7 +300,9 @@ impl<'a, 'c, 'db> Libraries<'a, 'c, 'db> {
 
     /// Those of the `at`th crate, read by [`Libraries::get`].
     fn loaded(&self, at: usize) -> &Library {
-        self.loaded[at].as_ref().expect("a crate's library features are read before they are looked at")
+        self.loaded[at]
+            .as_ref()
+            .expect("a crate's library features are read before they are looked at")
     }
 
     fn load_all(&mut self) {
@@ -318,10 +333,9 @@ impl<'a, 'c, 'db> Libraries<'a, 'c, 'db> {
 /// Whether `library` has a stable feature the crate enables: what `check_features` says of one
 /// reads every crate's implications.
 fn needs_all(library: &Library, remaining: &Remaining) -> bool {
-    library
-        .features
-        .iter()
-        .any(|(name, (stability, _))| matches!(stability, Stability::Accepted(_)) && remaining.get(name).is_some())
+    library.features.iter().any(|(name, (stability, _))| {
+        matches!(stability, Stability::Accepted(_)) && remaining.get(name).is_some()
+    })
 }
 
 /// rustc's `check_features`, over one crate's features after another.
@@ -342,14 +356,17 @@ struct Check<'a, 'c, 'db> {
 impl Check<'_, '_, '_> {
     fn features(&mut self, library: &Library) {
         // alloc: once per staged crate read, only for a crate that enables a library feature.
-        let mut sorted: Vec<(&String, &Stability)> = library.features.iter().map(|(k, (s, _))| (k, s)).collect();
+        let mut sorted: Vec<(&String, &Stability)> =
+            library.features.iter().map(|(k, (s, _))| (k, s)).collect();
         sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (feature, stability) in sorted {
             if self.stable_lint
                 && let Stability::Accepted(since) = stability
                 && let Some(at) = self.remaining.get(feature)
             {
-                let all = self.all.expect("every crate's implications are read before a stable feature is looked at");
+                let all = self.all.expect(
+                    "every crate's implications are read before a stable feature is looked at",
+                );
                 let mut diag = match all.get(feature) {
                     Some(implies) => partially_stable(self.cx, at, feature, implies, since),
                     None => stable(self.cx, at, feature, since),
@@ -379,12 +396,20 @@ impl Check<'_, '_, '_> {
 fn stable(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str, since: &str) -> Diag {
     let since = if since == VERSION_PLACEHOLDER { CFG_RELEASE } else { since };
     // alloc: the lint's message
-    let message = format!("the feature `{feature}` has been stable since {since} and no longer requires an attribute to enable");
+    let message = format!(
+        "the feature `{feature}` has been stable since {since} and no longer requires an attribute to enable"
+    );
     Diag::lint("stable_features", message, cx.span(at))
 }
 
 /// `unnecessary_partially_stable_feature_lint`.
-fn partially_stable(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str, implies: &str, since: &str) -> Diag {
+fn partially_stable(
+    cx: &Cx<'_, '_>,
+    at: InFile<TextRange>,
+    feature: &str,
+    implies: &str,
+    since: &str,
+) -> Diag {
     let span = cx.span(at);
     // alloc: the lint's message
     let message = format!(
@@ -412,7 +437,11 @@ fn partially_stable(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str, impli
 /// `duplicate_feature_lint`.
 fn duplicate(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str) -> Diag {
     // alloc: the lint's message
-    Diag::lint("duplicate_features", format!("the feature `{feature}` has already been enabled"), cx.span(at))
+    Diag::lint(
+        "duplicate_features",
+        format!("the feature `{feature}` has already been enabled"),
+        cx.span(at),
+    )
 }
 
 /// `span_extend_to_line`: `span` grown to the start and the end of the lines it is on.
@@ -430,7 +459,11 @@ fn line_of(cx: &Cx<'_, '_>, span: &Span) -> Span {
 /// `Symbol::find_similar`: the name that is the feature in lower case, else the nearest one.
 fn similar<'a>(names: &[&'a str], feature: &str) -> Option<&'a str> {
     let lowercase = feature.to_lowercase();
-    names.iter().copied().find(|it| *it == lowercase).or_else(|| find_best_match_for_name(names, feature, None).copied())
+    names
+        .iter()
+        .copied()
+        .find(|it| *it == lowercase)
+        .or_else(|| find_best_match_for_name(names, feature, None).copied())
 }
 
 /// The crates rustc loads besides the crate (`tcx.crates(())`): its dependencies and theirs, each
@@ -441,7 +474,8 @@ fn crates(cx: &Cx<'_, '_>) -> Vec<hir::Crate> {
     // alloc: setup, once per check that enables a library feature
     let mut order = Vec::new();
     // alloc: as above
-    let mut stack: Vec<hir::Crate> = cx.krate.dependencies(cx.db).into_iter().rev().map(|it| it.krate).collect();
+    let mut stack: Vec<hir::Crate> =
+        cx.krate.dependencies(cx.db).into_iter().rev().map(|it| it.krate).collect();
     while let Some(krate) = stack.pop() {
         if !seen.insert(krate) {
             continue;
@@ -495,7 +529,10 @@ enum Level {
     /// `StabilityLevel::Stable`; no version when `since` is missing or no version
     /// (`StableSince::Err`).
     Stable(Option<String>),
-    Unstable { implied_by: Option<String>, old_name: Option<String> },
+    Unstable {
+        implied_by: Option<String>,
+        old_name: Option<String>,
+    },
 }
 
 /// Whether rustc's `hir_crate_items(()).definitions()` has what `target` names: what
@@ -637,10 +674,13 @@ fn parse(attr: &Attr<'_>, meta: ast::Meta<'_>, name: &str, group: Group) -> Opti
         }
         let feature = feature.filter(|it| is_ident(it))?;
         // alloc: the library's table, once per staged crate read
-        let since = since.and_then(|it| if it == VERSION_PLACEHOLDER { Some(CFG_RELEASE.to_owned()) } else { version(&it) });
+        let since = since.and_then(|it| {
+            if it == VERSION_PLACEHOLDER { Some(CFG_RELEASE.to_owned()) } else { version(&it) }
+        });
         return Some(Declared { group, feature, level: Level::Stable(since), at });
     }
-    let (mut feature, mut reason, mut issue, mut implied_by, mut old_name) = (None, None, None, None, None);
+    let (mut feature, mut reason, mut issue, mut implied_by, mut old_name) =
+        (None, None, None, None, None);
     for (key, value) in items {
         let slot = match key.as_str() {
             "feature" => &mut feature,
@@ -761,6 +801,9 @@ mod tests {
     #[test]
     fn similar_prefers_the_lower_case_name() {
         assert_eq!(similar(&["abc_def", "Abc_Def"], "Abc_Def"), Some("abc_def"));
-        assert_eq!(similar(&["const_fn_trait_bound"], "const_fn_trait_bonud"), Some("const_fn_trait_bound"));
+        assert_eq!(
+            similar(&["const_fn_trait_bound"], "const_fn_trait_bonud"),
+            Some("const_fn_trait_bound")
+        );
     }
 }

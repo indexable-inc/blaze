@@ -215,10 +215,7 @@ impl DefaultGenerator for PathBuf {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            binary()
-                .map(std::ffi::OsString::from_vec)
-                .map(PathBuf::from)
-                .boxed()
+            binary().map(std::ffi::OsString::from_vec).map(PathBuf::from).boxed()
         }
         #[cfg(windows)]
         {

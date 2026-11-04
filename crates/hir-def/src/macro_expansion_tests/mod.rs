@@ -20,11 +20,13 @@ use std::{any::TypeId, iter, ops::Range, sync};
 
 use base_db::Db;
 use expect_test::Expect;
+use hir_expand::fixture;
 use hir_expand::{
     AstId, ExpansionInfo, HirFileId, InFile, MacroCallId, MacroCallKind, MacroKind,
     builtin::quote::quote,
     proc_macro::{
-        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+        Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+        ProcMacroKind,
     },
     span_map::SpanMap,
 };
@@ -43,7 +45,6 @@ use syntax::{
     view::{self as ast, AstNode},
 };
 use syntax_bridge::token_tree_to_syntax_node;
-use hir_expand::fixture;
 use tt::{TextRange, TextSize};
 
 use crate::{
@@ -52,7 +53,6 @@ use crate::{
     nameres::{DefMap, ModuleSourceView, crate_def_map},
     src::HasSource,
     test_db::TestDBExt,
-    tt::TopSubtree,
 };
 
 #[track_caller]
@@ -466,14 +466,17 @@ impl ProcMacroExpander for IdentityWhenValidProcMacroExpander {
         &self,
         _: &Db,
         ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let (parse, _) = syntax_bridge::token_tree_to_syntax_node(
             subtree.view(),
             syntax_bridge::TopEntryPoint::MacroItems,
             &mut |_| span::Edition::CURRENT,
         );
         if parse.errors().is_empty() {
-            Ok(subtree.copy())
+            Ok(Expanded::untraced(
+                subtree.copy(),
+                "a test's proc macro, which traces nothing of what it read",
+            ))
         } else {
             panic!("got invalid macro input: {:?}", parse.errors());
         }

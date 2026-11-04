@@ -192,7 +192,8 @@ struct Back {
 /// Writes a back map of `ids` (`None` for an id without syntax) and its `runs`, as
 /// `BackColumns::write` does.
 fn back(build: &mut Build, ids: &[Option<(SyntaxKind, u32, u32)>], runs: &[[u64; 2]]) -> Back {
-    let kinds: Vec<u16> = ids.iter().map(|it| it.map_or(NO_SOURCE, |(kind, ..)| u16::from(kind))).collect();
+    let kinds: Vec<u16> =
+        ids.iter().map(|it| it.map_or(NO_SOURCE, |(kind, ..)| u16::from(kind))).collect();
     let starts: Vec<u32> = ids.iter().map(|it| it.map_or(0, |(_, start, _)| start)).collect();
     let ends: Vec<u32> = ids.iter().map(|it| it.map_or(0, |(.., end)| end)).collect();
     Back {
@@ -234,7 +235,8 @@ pub fn source_map(build: &mut Build) -> SourceMapCols {
     // The words go after the expression maps' first columns, as the writer places them.
     let placed = w.place(build);
     let types_map_back = back(build, &[Some((SyntaxKind::NEVER_TYPE, 16, 17))], &[run(FILE, 1, 0)]);
-    let lifetime_map_back = back(build, &[Some((SyntaxKind::LIFETIME, 18, 20))], &[run(FILE, 1, 0)]);
+    let lifetime_map_back =
+        back(build, &[Some((SyntaxKind::LIFETIME, 18, 20))], &[run(FILE, 1, 0)]);
     let binding_pats = build.column::<u32>(&[0], true);
     // Each table's keys in increasing order of (file kind, file, start, end, kind).
     let expr_map = build.column(
@@ -282,7 +284,9 @@ pub fn source_map(build: &mut Build) -> SourceMapCols {
 /// The `SourceMapRoot` fields of `cols`.
 pub fn source_map_root(root: &mut Root, cols: &SourceMapCols) {
     for back in &cols.backs {
-        [back.kinds, back.starts, back.ends, back.runs].into_iter().for_each(|column| root.slice(column));
+        [back.kinds, back.starts, back.ends, back.runs]
+            .into_iter()
+            .for_each(|column| root.slice(column));
     }
     cols.columns.iter().for_each(|&column| root.slice(column));
     root.words(&cols.placed);

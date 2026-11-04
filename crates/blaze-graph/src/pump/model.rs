@@ -58,7 +58,15 @@ enum Got {
 /// Task `me` asks for `key` and, given the run, ends it on `value`. A waiter waits for its end
 /// and asks again after a cancel; with `give_way`, it leaves at once instead, as one whose wait
 /// the scheduler refused.
-fn ask(runs: &Runs<u32>, flights: &Flights, once: &Once, key: Key, me: u64, value: u32, give_way: bool) -> Got {
+fn ask(
+    runs: &Runs<u32>,
+    flights: &Flights,
+    once: &Once,
+    key: Key,
+    me: u64,
+    value: u32,
+    give_way: bool,
+) -> Got {
     loop {
         let waiter = Waiter::new();
         match runs.ask(key, me, None, &waiter, &mut |_, _| flights.claim()) {
@@ -95,7 +103,11 @@ fn hold(runs: &Runs<u32>, key: Key, me: u64) -> Claim<'_> {
 #[test]
 fn model_a_waiter_gets_the_runs_value_or_runs_the_key_itself() {
     model(|| {
-        let (runs, flights, once) = (Arc::new(Runs::<u32>::new(1)), Arc::new(Flights::default()), Arc::new(Once::default()));
+        let (runs, flights, once) = (
+            Arc::new(Runs::<u32>::new(1)),
+            Arc::new(Flights::default()),
+            Arc::new(Once::default()),
+        );
         let other = {
             let (runs, flights, once) = (runs.clone(), flights.clone(), once.clone());
             thread::spawn(move || ask(&runs, &flights, &once, key(1), 2, 20, false))
@@ -103,7 +115,8 @@ fn model_a_waiter_gets_the_runs_value_or_runs_the_key_itself() {
         let mine = ask(&runs, &flights, &once, key(1), 1, 10, false);
         let theirs = other.join().unwrap();
         match (mine, theirs) {
-            (Got::Ran(10), Got::Waited(10) | Got::Ran(20)) | (Got::Waited(20) | Got::Ran(10), Got::Ran(20)) => {}
+            (Got::Ran(10), Got::Waited(10) | Got::Ran(20))
+            | (Got::Waited(20) | Got::Ran(10), Got::Ran(20)) => {}
             _ => panic!("a waiter was written another run's value"),
         }
         assert_eq!(runs.running(), 0);
@@ -116,14 +129,21 @@ fn model_a_waiter_gets_the_runs_value_or_runs_the_key_itself() {
 #[test]
 fn model_a_cancelled_run_sends_its_waiter_to_ask_again() {
     model(|| {
-        let (runs, flights, once) = (Arc::new(Runs::<u32>::new(1)), Arc::new(Flights::default()), Arc::new(Once::default()));
+        let (runs, flights, once) = (
+            Arc::new(Runs::<u32>::new(1)),
+            Arc::new(Flights::default()),
+            Arc::new(Once::default()),
+        );
         let held = hold(&runs, key(1), 1);
         let other = {
             let (runs, flights, once) = (runs.clone(), flights.clone(), once.clone());
             thread::spawn(move || ask(&runs, &flights, &once, key(1), 2, 20, false))
         };
         assert_eq!(runs.end(&held, None).is_some(), flights.next.load(Ordering::SeqCst) == 1);
-        assert!(matches!(other.join().unwrap(), Got::Ran(20)), "the waiter was written a value of a cancelled run");
+        assert!(
+            matches!(other.join().unwrap(), Got::Ran(20)),
+            "the waiter was written a value of a cancelled run"
+        );
         assert_eq!(runs.running(), 0);
     });
 }
@@ -133,7 +153,11 @@ fn model_a_cancelled_run_sends_its_waiter_to_ask_again() {
 #[test]
 fn model_a_waiter_that_gives_way_leaves_while_the_run_ends() {
     model(|| {
-        let (runs, flights, once) = (Arc::new(Runs::<u32>::new(1)), Arc::new(Flights::default()), Arc::new(Once::default()));
+        let (runs, flights, once) = (
+            Arc::new(Runs::<u32>::new(1)),
+            Arc::new(Flights::default()),
+            Arc::new(Once::default()),
+        );
         let held = hold(&runs, key(1), 1);
         let other = {
             let (runs, flights, once) = (runs.clone(), flights.clone(), once.clone());
@@ -151,7 +175,11 @@ fn model_a_waiter_that_gives_way_leaves_while_the_run_ends() {
 #[test]
 fn model_a_grow_moves_a_run_and_its_waiter() {
     model(|| {
-        let (runs, flights, once) = (Arc::new(Runs::<u32>::new(1)), Arc::new(Flights::default()), Arc::new(Once::default()));
+        let (runs, flights, once) = (
+            Arc::new(Runs::<u32>::new(1)),
+            Arc::new(Flights::default()),
+            Arc::new(Once::default()),
+        );
         let held = hold(&runs, key(1), 1);
         let waiter = {
             let (runs, flights, once) = (runs.clone(), flights.clone(), once.clone());

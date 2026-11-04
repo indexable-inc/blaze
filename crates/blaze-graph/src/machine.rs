@@ -63,13 +63,19 @@ pub struct Spec {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] // clone: a memo's copy, allocating only for `Failed`
 pub enum Outcome {
     Built,
-    Cached { remote: bool },
-    Failed { why: String },
+    Cached {
+        remote: bool,
+    },
+    Failed {
+        why: String,
+    },
     /// Failed, but what the nodes that wait for it read of it is sound: under keep-going they
     /// run as after [`Outcome::Built`] (a check that failed only in its bodies or lints, whose
     /// dependents read only its items), while it stays failed and so does its request. Without
     /// keep-going it stops the request as any failure does.
-    FailedOpen { why: String },
+    FailedOpen {
+        why: String,
+    },
 }
 
 impl Outcome {

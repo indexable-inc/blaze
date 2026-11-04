@@ -8,8 +8,7 @@ use rustc_type_ir::solve::{AccessedOpaques, Certainty, NoSolution, QueryResult, 
 use crate::canonical::response_no_constraints_raw;
 use crate::delegate::SolverDelegate;
 use crate::solve::{
-    EvalCtxt, FIXPOINT_STEP_LIMIT, SolverScratch, has_no_inference_or_external_constraints,
-    inspect,
+    EvalCtxt, FIXPOINT_STEP_LIMIT, SolverScratch, has_no_inference_or_external_constraints, inspect,
 };
 
 /// This type is never constructed. We only use it to implement `search_graph::Delegate`

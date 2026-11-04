@@ -40,7 +40,9 @@ pub(super) fn is(meta: &ast::Meta<'_>, name: &str) -> bool {
 /// item's span).
 pub(super) fn stability_range(node: Node<'_>, cfg: &CfgOptions) -> Option<TextRange> {
     each(node, cfg, |meta, written| {
-        if !(is(&meta, "stable") || is(&meta, "unstable")) || !matches!(meta, ast::Meta::TokenTreeMeta(_)) {
+        if !(is(&meta, "stable") || is(&meta, "unstable"))
+            || !matches!(meta, ast::Meta::TokenTreeMeta(_))
+        {
             return ControlFlow::Continue(());
         }
         ControlFlow::Break(match meta.syntax().parent() {

@@ -70,33 +70,74 @@ pub enum BinaryEnd {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Event {
     /// A unit's compile began: its id (dense, the daemon's) and how it is named.
-    UnitBegan { id: u32, label: String },
+    UnitBegan {
+        id: u32,
+        label: String,
+    },
     /// A unit's compile ended.
-    UnitEnded { id: u32 },
+    UnitEnded {
+        id: u32,
+    },
     /// A unit said an error: it failed, and so does every test executable after it.
-    UnitFailed { id: u32 },
+    UnitFailed {
+        id: u32,
+    },
     /// The build is over.
-    BuildEnded { ok: bool },
+    BuildEnded {
+        ok: bool,
+    },
     /// A test executable or doc test never built: its unit, the unit whose failure held it
     /// back (itself when its own compile failed), and why that one failed. The summary lists it.
-    Unbuilt { unit: String, behind: String, why: String },
+    Unbuilt {
+        unit: String,
+        behind: String,
+        why: String,
+    },
     /// A test executable is known and waits for its turn. `binary` is the driver's dense index;
     /// `order` sorts it among the others as cargo orders them; `rerun` is what reruns it.
-    BinaryQueued { binary: u32, label: String, order: String, rerun: String },
-    BinaryStarted { binary: u32 },
+    BinaryQueued {
+        binary: u32,
+        label: String,
+        order: String,
+        rerun: String,
+    },
+    BinaryStarted {
+        binary: u32,
+    },
     /// libtest's count of the tests the executable runs (its suite's `test_count`).
-    SuiteTotal { binary: u32, tests: u32 },
-    TestStarted { binary: u32, name: String },
+    SuiteTotal {
+        binary: u32,
+        tests: u32,
+    },
+    TestStarted {
+        binary: u32,
+        name: String,
+    },
     /// libtest warned that the test has run a long time (its `timeout` event).
-    TestSlow { binary: u32, name: String },
+    TestSlow {
+        binary: u32,
+        name: String,
+    },
     /// A test ended: libtest's time for it when it gave one, and its captured output (shown
     /// when it failed).
-    TestEnded { binary: u32, name: String, verdict: Verdict, took: Option<Duration>, output: String },
+    TestEnded {
+        binary: u32,
+        name: String,
+        verdict: Verdict,
+        took: Option<Duration>,
+        output: String,
+    },
     /// The executable ended; `output` is what it said outside any test (stderr, stray stdout),
     /// shown when it failed with no test that did.
-    BinaryEnded { binary: u32, end: BinaryEnd, output: String },
+    BinaryEnded {
+        binary: u32,
+        end: BinaryEnd,
+        output: String,
+    },
     /// The command stops starting tests: why.
-    Stopping { why: String },
+    Stopping {
+        why: String,
+    },
     /// Lines to print above the region as they are: the compiler's diagnostics and cargo's
     /// status lines, with their ANSI colors.
     Said(String),
@@ -229,7 +270,7 @@ impl TestView {
             failures: Vec::new(),                     // alloc: one a failure
             stopping: None,
             unbuilt: Vec::new(), // alloc: none until a test unit did not build
-            above: Vec::new(), // alloc: drained at every draw
+            above: Vec::new(),   // alloc: drained at every draw
         }
     }
 
@@ -305,12 +346,15 @@ impl TestView {
                 self.running.push(Running { binary, name, since: now, slow: false });
             }
             Event::TestSlow { binary, name } => {
-                if let Some(it) = self.running.iter_mut().find(|it| it.binary == binary && it.name == name) {
+                if let Some(it) =
+                    self.running.iter_mut().find(|it| it.binary == binary && it.name == name)
+                {
                     it.slow = true;
                 }
             }
             Event::TestEnded { binary, name, verdict, took, output } => {
-                let started = self.running.iter().position(|it| it.binary == binary && it.name == name);
+                let started =
+                    self.running.iter().position(|it| it.binary == binary && it.name == name);
                 let since = started.map(|at| self.running.remove(at).since);
                 let took = took.or_else(|| since.map(|it| now.saturating_sub(it)));
                 match verdict {
@@ -344,7 +388,9 @@ impl TestView {
                     BinaryEnd::Failed { status } if failed_tests == 0 => {
                         self.above.push(Above::Crashed { binary, status, output });
                     }
-                    BinaryEnd::NeverRan { why } => self.above.push(Above::Crashed { binary, status: why, output }),
+                    BinaryEnd::NeverRan { why } => {
+                        self.above.push(Above::Crashed { binary, status: why, output })
+                    }
                     BinaryEnd::Passed | BinaryEnd::Stopped | BinaryEnd::Failed { .. } => {}
                 }
             }
@@ -362,7 +408,11 @@ impl TestView {
             (std::cmp::Reverse(it.took), order.to_owned(), it.name.clone()) // alloc: a key, compared a few times a test
         };
         let new = key(&timed, &self.binaries);
-        let at = self.slowest.iter().position(|it| key(it, &self.binaries) > new).unwrap_or(self.slowest.len());
+        let at = self
+            .slowest
+            .iter()
+            .position(|it| key(it, &self.binaries) > new)
+            .unwrap_or(self.slowest.len());
         if at < SLOWEST {
             self.slowest.insert(at, timed);
             self.slowest.truncate(SLOWEST);
@@ -401,7 +451,10 @@ impl TestView {
     fn total(&self) -> (u32, bool) {
         let known = self.binaries.iter().filter_map(|it| it.total).sum::<u32>();
         let more = self.build == Build::Running
-            || self.binaries.iter().any(|it| it.total.is_none() && matches!(it.state, State::Queued | State::Running));
+            || self
+                .binaries
+                .iter()
+                .any(|it| it.total.is_none() && matches!(it.state, State::Queued | State::Running));
         (known.max(self.done()), more)
     }
 
@@ -445,7 +498,10 @@ impl TestView {
         }
         if running.len() > shown && room > 0 {
             let more = running.len() - shown;
-            rows.push(Line::from(vec![Span::styled(format!("   … {more} more running"), self.dim())])); // alloc: a row
+            rows.push(Line::from(vec![Span::styled(
+                format!("   … {more} more running"),
+                self.dim(),
+            )])); // alloc: a row
         }
         for (y, row) in (area.y..area.bottom()).zip(&rows) {
             buf.set_line(area.x, y, row, area.width);
@@ -468,7 +524,11 @@ impl TestView {
             Span::raw("  "),
             Span::styled(phase, self.dim()),
         ];
-        right_aligned(left, vec![Span::styled(elapsed, Style::new().add_modifier(Modifier::BOLD))], width)
+        right_aligned(
+            left,
+            vec![Span::styled(elapsed, Style::new().add_modifier(Modifier::BOLD))],
+            width,
+        )
     }
 
     fn gauge(&self, width: usize) -> Line<'static> {
@@ -479,7 +539,10 @@ impl TestView {
         ];
         if self.failed > 0 {
             counts.push(Span::raw("  "));
-            counts.push(Span::styled(format!("✘ {}", self.failed), self.style(Color::Red).add_modifier(Modifier::BOLD))); // alloc: a row
+            counts.push(Span::styled(
+                format!("✘ {}", self.failed),
+                self.style(Color::Red).add_modifier(Modifier::BOLD),
+            )); // alloc: a row
         }
         if self.ignored > 0 {
             counts.push(Span::raw("  "));
@@ -537,11 +600,17 @@ impl TestView {
                     n => format!(" {n} units failed"),      // alloc: a row
                 };
                 line.push(Span::styled(failed, self.style(Color::Red)));
-                line.push(Span::styled(format!(" · {} built  {}", self.units_ended, duration(at)), self.dim())); // alloc: a row
+                line.push(Span::styled(
+                    format!(" · {} built  {}", self.units_ended, duration(at)),
+                    self.dim(),
+                )); // alloc: a row
             }
             Build::Running => {
                 line.extend(self.bar(10, self.units_ended, self.units_began.max(1), Color::Blue));
-                line.push(Span::styled(format!(" {}/{}  ", self.units_ended, self.units_began), self.dim())); // alloc: a row
+                line.push(Span::styled(
+                    format!(" {}/{}  ", self.units_ended, self.units_began),
+                    self.dim(),
+                )); // alloc: a row
                 let mut units: Vec<&Unit> = self.compiling.iter().collect(); // alloc: one a draw
                 units.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.label.cmp(&b.label)));
                 let mut used: usize = line.iter().map(Span::width).sum();
@@ -568,7 +637,8 @@ impl TestView {
 
     /// A bar of `cells` cells filled `done` of `of`, by eighths.
     fn bar(&self, cells: usize, done: u32, of: u32, color: Color) -> Vec<Span<'static>> {
-        let eighths = ((f64::from(done.min(of)) / f64::from(of.max(1))) * (cells * 8) as f64) as usize;
+        let eighths =
+            ((f64::from(done.min(of)) / f64::from(of.max(1))) * (cells * 8) as f64) as usize;
         let (full, part) = (eighths / 8, eighths % 8);
         let mut filled = "█".repeat(full); // alloc: a row
         if full < cells && part > 0 {
@@ -589,7 +659,12 @@ impl TestView {
             line.push(Span::styled(fit(why, width.saturating_sub(10)), self.style(Color::Red))); // alloc: a row
             return Line::from(line);
         }
-        let (passed, failed, running, queued) = (count(State::Passed), count(State::Failed), count(State::Running), count(State::Queued));
+        let (passed, failed, running, queued) = (
+            count(State::Passed),
+            count(State::Failed),
+            count(State::Running),
+            count(State::Queued),
+        );
         line.push(Span::styled(format!("✔ {passed}"), self.style(Color::Green))); // alloc: a row
         if failed > 0 {
             line.push(Span::styled(format!("  ✘ {failed}"), self.style(Color::Red))); // alloc: a row
@@ -598,7 +673,8 @@ impl TestView {
         if queued > 0 {
             line.push(Span::styled(format!("  ⋯ {queued}"), self.dim())); // alloc: a row
         }
-        let mut names: Vec<&Binary> = self.binaries.iter().filter(|it| it.state == State::Running).collect(); // alloc: one a draw
+        let mut names: Vec<&Binary> =
+            self.binaries.iter().filter(|it| it.state == State::Running).collect(); // alloc: one a draw
         names.sort_by(|a, b| a.since.cmp(&b.since).then_with(|| a.order.cmp(&b.order)));
         let mut used: usize = line.iter().map(Span::width).sum::<usize>() + 3;
         line.push(Span::raw("   "));
@@ -670,11 +746,17 @@ impl TestView {
                     let title = vec![
                         Span::styled(" ✘ FAIL ", self.badge(Color::Red)),
                         Span::raw(" "),
-                        Span::styled(self.label(binary).to_owned(), Style::new().add_modifier(Modifier::BOLD)), // alloc: a title
+                        Span::styled(
+                            self.label(binary).to_owned(),
+                            Style::new().add_modifier(Modifier::BOLD),
+                        ), // alloc: a title
                         Span::raw(" "),
                     ];
                     let status = fit(&status, width / 2);
-                    let footer = self.binaries.get(binary as usize).map_or_else(String::new, |it| format!("rerun: blaze test {}", it.rerun)); // alloc: a footer
+                    let footer = self
+                        .binaries
+                        .get(binary as usize)
+                        .map_or_else(String::new, |it| format!("rerun: blaze test {}", it.rerun)); // alloc: a footer
                     self.boxed(&mut lines, title, &status, &footer, &output, width);
                 }
             }
@@ -691,7 +773,15 @@ impl TestView {
 
     /// A box: `title` and `right` on its top edge, `footer` on its bottom, and `output` inside:
     /// the panic's place and message first, then the last [`OUTPUT_LINES`] of the rest.
-    fn boxed(&self, lines: &mut Vec<Line<'static>>, title: Vec<Span<'static>>, right: &str, footer: &str, output: &str, width: usize) {
+    fn boxed(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        title: Vec<Span<'static>>,
+        right: &str,
+        footer: &str,
+        output: &str,
+        width: usize,
+    ) {
         let edge = self.style(Color::Red);
         if width < 16 {
             lines.extend(wrap(title, width));
@@ -713,9 +803,17 @@ impl TestView {
         let mut body: Vec<Vec<Span<'static>>> = Vec::new(); // alloc: one a box
         let (panic, rest) = split_panic(output);
         if let Some((place, message)) = panic {
-            body.push(vec![Span::styled("▸ ", self.style(Color::Red)), Span::styled(place, self.style(Color::Cyan).add_modifier(Modifier::BOLD))]);
+            body.push(vec![
+                Span::styled("▸ ", self.style(Color::Red)),
+                Span::styled(place, self.style(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ]);
             for line in message.lines() {
-                body.push(ansi(line, self.paint).into_iter().map(|it| Span::styled(it.content, it.style.add_modifier(Modifier::BOLD))).collect());
+                body.push(
+                    ansi(line, self.paint)
+                        .into_iter()
+                        .map(|it| Span::styled(it.content, it.style.add_modifier(Modifier::BOLD)))
+                        .collect(),
+                );
             }
         }
         let rest: Vec<&str> = rest.lines().collect(); // alloc: one a box
@@ -723,7 +821,7 @@ impl TestView {
         if !rest.is_empty() {
             let skipped = rest.len().saturating_sub(OUTPUT_LINES);
             let said = match skipped {
-                0 => String::from("output"),                                  // alloc: a line
+                0 => String::from("output"), // alloc: a line
                 n => format!("output, last {OUTPUT_LINES} of {} lines", n + OUTPUT_LINES), // alloc: a line
             };
             if !body.is_empty() {
@@ -766,15 +864,24 @@ impl TestView {
         lines.push(Line::from(Span::styled("─".repeat(width.min(80)), self.dim()))); // alloc: once a run
         let mut counts = vec![
             Span::raw(" "),
-            Span::styled(format!("✔ {} passed", self.passed), self.style(Color::Green).add_modifier(Modifier::BOLD)), // alloc: once a run
+            Span::styled(
+                format!("✔ {} passed", self.passed),
+                self.style(Color::Green).add_modifier(Modifier::BOLD),
+            ), // alloc: once a run
         ];
         if self.failed > 0 {
             counts.push(Span::raw("   "));
-            counts.push(Span::styled(format!("✘ {} failed", self.failed), self.style(Color::Red).add_modifier(Modifier::BOLD))); // alloc: once a run
+            counts.push(Span::styled(
+                format!("✘ {} failed", self.failed),
+                self.style(Color::Red).add_modifier(Modifier::BOLD),
+            )); // alloc: once a run
         }
         if self.ignored > 0 {
             counts.push(Span::raw("   "));
-            counts.push(Span::styled(format!("⊘ {} ignored", self.ignored), self.style(Color::Yellow))); // alloc: once a run
+            counts.push(Span::styled(
+                format!("⊘ {} ignored", self.ignored),
+                self.style(Color::Yellow),
+            )); // alloc: once a run
         }
         let binaries = self.binaries.len();
         let noun = if binaries == 1 { "binary" } else { "binaries" };
@@ -782,7 +889,14 @@ impl TestView {
             Build::Ended { at, .. } => format!(" (build {})", duration(at)), // alloc: once a run
             Build::Running => String::new(),                                 // alloc: none
         };
-        counts.push(Span::styled(format!("   {} tests in {binaries} {noun} · {}{build}", self.done(), duration(self.now)), self.dim())); // alloc: once a run
+        counts.push(Span::styled(
+            format!(
+                "   {} tests in {binaries} {noun} · {}{build}",
+                self.done(),
+                duration(self.now)
+            ),
+            self.dim(),
+        )); // alloc: once a run
         lines.extend(wrap(counts, width));
         if !self.slowest.is_empty() && self.done() > 1 {
             lines.push(Line::default());
@@ -803,8 +917,14 @@ impl TestView {
             }
         }
         let mut failures: Vec<&Failure> = self.failures.iter().collect(); // alloc: once a run
-        failures.sort_by(|a, b| self.order(a.binary).cmp(self.order(b.binary)).then_with(|| a.name.cmp(&b.name)));
-        let crashed = self.binaries.iter().enumerate().filter(|(_, it)| it.state == State::Failed && it.failed == 0);
+        failures.sort_by(|a, b| {
+            self.order(a.binary).cmp(self.order(b.binary)).then_with(|| a.name.cmp(&b.name))
+        });
+        let crashed = self
+            .binaries
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.state == State::Failed && it.failed == 0);
         let mut crashed: Vec<(usize, &Binary)> = crashed.collect(); // alloc: once a run
         crashed.sort_by(|a, b| a.1.order.cmp(&b.1.order));
         if !failures.is_empty() || !crashed.is_empty() {
@@ -823,7 +943,10 @@ impl TestView {
                 lines.extend(wrap(line, width));
             }
             if failures.len() > FAILURES {
-                let more = vec![Span::styled(format!("          … and {} more", failures.len() - FAILURES), self.dim())]; // alloc: once a run
+                let more = vec![Span::styled(
+                    format!("          … and {} more", failures.len() - FAILURES),
+                    self.dim(),
+                )]; // alloc: once a run
                 lines.extend(wrap(more, width));
             }
             for (_, it) in &crashed {
@@ -836,13 +959,20 @@ impl TestView {
                 lines.extend(wrap(line, width));
             }
             // Each executable with a failure, once, with what reruns it.
-            let mut reruns: Vec<&Binary> = self.binaries.iter().filter(|it| it.state == State::Failed || it.failed > 0).collect(); // alloc: once a run
+            let mut reruns: Vec<&Binary> = self
+                .binaries
+                .iter()
+                .filter(|it| it.state == State::Failed || it.failed > 0)
+                .collect(); // alloc: once a run
             reruns.sort_by(|a, b| a.order.cmp(&b.order));
             reruns.dedup_by(|a, b| a.rerun == b.rerun);
             for (at, it) in reruns.iter().enumerate() {
                 let head = if at == 0 { " rerun   " } else { "         " };
                 lines.extend(wrap(
-                    vec![Span::styled(head, self.dim()), Span::styled(format!("blaze test {}", it.rerun), self.style(Color::Cyan))], // alloc: once a failure
+                    vec![
+                        Span::styled(head, self.dim()),
+                        Span::styled(format!("blaze test {}", it.rerun), self.style(Color::Cyan)),
+                    ], // alloc: once a failure
                     width,
                 ));
             }
@@ -853,7 +983,7 @@ impl TestView {
             for (at, (unit, behind, why)) in self.unbuilt.iter().enumerate() {
                 let head = if at == 0 { " unbuilt " } else { "         " };
                 let held = match behind == unit {
-                    true => format!("  {why}"),              // alloc: once an unbuilt test
+                    true => format!("  {why}"), // alloc: once an unbuilt test
                     false => format!("  behind {behind} ({why})"), // alloc: once an unbuilt test
                 };
                 let line = vec![
@@ -868,14 +998,24 @@ impl TestView {
         lines.push(Line::default());
         let (word, color, said) = match (self.failing(), self.stopping.as_deref()) {
             (false, _) => (" PASS ", Color::Green, String::from("every test passed")), // alloc: once a run
-            (true, Some(why)) => (" FAIL ", Color::Red, format!("stopped: {why}")),     // alloc: once a run
+            (true, Some(why)) => (" FAIL ", Color::Red, format!("stopped: {why}")), // alloc: once a run
             (true, None) => (" FAIL ", Color::Red, String::from("some tests failed")), // alloc: once a run
         };
         let said = match self.build {
-            Build::Ended { ok: false, .. } if self.failed == 0 => String::from("the build failed; the tests it built ran"), // alloc: once a run
+            Build::Ended { ok: false, .. } if self.failed == 0 => {
+                String::from("the build failed; the tests it built ran")
+            } // alloc: once a run
             Build::Ended { .. } | Build::Running => said,
         };
-        lines.extend(wrap(vec![Span::raw(" "), Span::styled(word, self.badge(color)), Span::raw(" "), Span::raw(said)], width));
+        lines.extend(wrap(
+            vec![
+                Span::raw(" "),
+                Span::styled(word, self.badge(color)),
+                Span::raw(" "),
+                Span::raw(said),
+            ],
+            width,
+        ));
         lines
     }
 
@@ -885,7 +1025,11 @@ impl TestView {
 }
 
 /// `left` then `right` at the end of a line `width` wide; `left` cut where they meet.
-fn right_aligned(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+fn right_aligned(
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+    width: usize,
+) -> Line<'static> {
     let right_width: usize = right.iter().map(Span::width).sum();
     let left = clip(left, width.saturating_sub(right_width + 1));
     let gap = width.saturating_sub(left.width() + right_width);
@@ -904,8 +1048,8 @@ fn clip(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
 pub fn duration(it: Duration) -> String {
     let secs = it.as_secs_f64();
     match it.as_secs() {
-        0..10 => format!("{secs:.2}s"),   // alloc: a row's text
-        10..60 => format!("{secs:.1}s"),  // alloc: a row's text
+        0..10 => format!("{secs:.2}s"),            // alloc: a row's text
+        10..60 => format!("{secs:.1}s"),           // alloc: a row's text
         n => format!("{}m{:02}s", n / 60, n % 60), // alloc: a row's text
     }
 }
@@ -950,7 +1094,10 @@ fn split_panic(output: &str) -> (Option<(String, String)>, String) {
     let mut offset = 0;
     for line in rest.split_inclusive('\n') {
         let bare = line.trim_end();
-        if bare.is_empty() || bare.starts_with("note: run with `RUST_BACKTRACE") || bare.starts_with("stack backtrace:") {
+        if bare.is_empty()
+            || bare.starts_with("note: run with `RUST_BACKTRACE")
+            || bare.starts_with("stack backtrace:")
+        {
             end = offset;
             break;
         }
@@ -1066,7 +1213,16 @@ fn sgr(mut style: Style, params: &str, paint: Paint) -> Style {
         (Paint::Color, false) => style.fg(color),
         (Paint::Color, true) => style.bg(color),
     };
-    const BASIC: [Color; 8] = [Color::Black, Color::Red, Color::Green, Color::Yellow, Color::Blue, Color::Magenta, Color::Cyan, Color::Gray];
+    const BASIC: [Color; 8] = [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+    ];
     const BRIGHT: [Color; 8] = [
         Color::DarkGray,
         Color::LightRed,

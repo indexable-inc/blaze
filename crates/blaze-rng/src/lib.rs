@@ -174,7 +174,9 @@ mod tests {
 
     #[test]
     fn one_seed_one_stream() {
-        let draws = |seed| (0..8).scan(SplitMix64::new(seed), |rng, _| Some(rng.next_u64())).collect::<Vec<_>>();
+        let draws = |seed| {
+            (0..8).scan(SplitMix64::new(seed), |rng, _| Some(rng.next_u64())).collect::<Vec<_>>()
+        };
         assert_eq!(draws(7), draws(7));
         assert_ne!(draws(7), draws(8));
     }

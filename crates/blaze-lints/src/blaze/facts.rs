@@ -6,12 +6,15 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::AsAssocItem as _;
-use hir_def::{FunctionId, ModuleDefId, ModuleId, expr_store::Body, hir::ExprId, nameres::crate_def_map, per_ns::PerNs};
+use hir_def::{
+    FunctionId, ModuleDefId, ModuleId, expr_store::Body, hir::ExprId, nameres::crate_def_map,
+    per_ns::PerNs,
+};
 use hir_expand::name::Name;
 use hir_ty_mir::mir::MirSpan;
 use intern::Symbol;
+use std::alloc::Global;
 use syntax::{NodeOrToken, TextRange};
 
 use super::{Finding, Lint};
@@ -20,7 +23,12 @@ use crate::check::Cx;
 /// Whether `krate`'s name is `name`: how a lint knows `hir_ty`, `anyhow` or `hashbrown` when
 /// the crate linted names them only through other crates.
 pub(crate) fn crate_is(db: &Db, krate: hir::Crate, name: &str) -> bool {
-    krate.base().extra_data(db).display_name.as_ref().is_some_and(|it| it.crate_name().symbol().as_str() == name)
+    krate
+        .base()
+        .extra_data(db)
+        .display_name
+        .as_ref()
+        .is_some_and(|it| it.crate_name().symbol().as_str() == name)
 }
 
 /// Whether `adt` is the item `name` of the crate `krate`.
@@ -91,7 +99,10 @@ pub(super) fn report(cx: &mut Cx<'_, '_>, found: Vec<Finding>) {
 }
 
 /// Reports one finding as [`report`] does, giving back its diagnostic for what else it says.
-pub(super) fn report_one<'c>(cx: &'c mut Cx<'_, '_>, finding: Finding) -> &'c mut crate::diag::Diag {
+pub(super) fn report_one<'c>(
+    cx: &'c mut Cx<'_, '_>,
+    finding: Finding,
+) -> &'c mut crate::diag::Diag {
     let root = cx.root();
     let at = match root.text_range().contains_range(finding.range) {
         true => match root.covering_element(finding.range) {
@@ -111,7 +122,13 @@ pub(super) fn report_one<'c>(cx: &'c mut Cx<'_, '_>, finding: Finding) -> &'c mu
 }
 
 /// Adds a finding of `lint` at `range` to `found`, once per lint and range.
-pub(super) fn push(found: &mut Vec<Finding>, lint: Lint, range: TextRange, message: String, note: Option<String>) {
+pub(super) fn push(
+    found: &mut Vec<Finding>,
+    lint: Lint,
+    range: TextRange,
+    message: String,
+    note: Option<String>,
+) {
     if !found.iter().any(|it| it.lint == lint && it.range == range) {
         found.push(Finding { lint, range, message, note });
     }
@@ -163,22 +180,34 @@ pub(crate) fn impl_adt(db: &Db, f: FunctionId) -> Option<hir::Adt> {
 pub(crate) fn mir_range(analysis: &hir::BodyAnalysis<'_>, span: MirSpan) -> Option<TextRange> {
     match span {
         MirSpan::ExprId(it) | MirSpan::ExprEnd(it) => analysis.expr_range(it),
-        MirSpan::PatId(_) | MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown | MirSpan::Inlined(_) => {
-            None
-        }
+        MirSpan::PatId(_)
+        | MirSpan::BindingId(_)
+        | MirSpan::SelfParam
+        | MirSpan::Unknown
+        | MirSpan::Inlined(_) => None,
     }
 }
 
 /// The type at the public `path` of the crate named `name`, `krate` itself or one of its
 /// dependencies, through its modules' scopes and re-exports: how a lint finds `blaze_graph`'s
 /// wait API wherever it is defined inside the crate.
-pub(crate) fn dep_type(db: &Db, krate: base_db::Crate, name: &str, path: &[&str]) -> Option<ModuleDefId> {
+pub(crate) fn dep_type(
+    db: &Db,
+    krate: base_db::Crate,
+    name: &str,
+    path: &[&str],
+) -> Option<ModuleDefId> {
     let (module, last) = dep_module(db, krate, name, path)?;
     scope_get(db, module, last).take_types()
 }
 
 /// The function at the public `path` of the crate named `name`, as [`dep_type`] finds a type.
-pub(crate) fn dep_fn(db: &Db, krate: base_db::Crate, name: &str, path: &[&str]) -> Option<FunctionId> {
+pub(crate) fn dep_fn(
+    db: &Db,
+    krate: base_db::Crate,
+    name: &str,
+    path: &[&str],
+) -> Option<FunctionId> {
     let (module, last) = dep_module(db, krate, name, path)?;
     match scope_get(db, module, last).take_values()? {
         ModuleDefId::FunctionId(it) => Some(it),
@@ -187,7 +216,12 @@ pub(crate) fn dep_fn(db: &Db, krate: base_db::Crate, name: &str, path: &[&str]) 
 }
 
 /// The module of all but the last segment of `path` in the crate named `name`, and the last.
-fn dep_module<'p>(db: &Db, krate: base_db::Crate, name: &str, path: &[&'p str]) -> Option<(ModuleId, &'p str)> {
+fn dep_module<'p>(
+    db: &Db,
+    krate: base_db::Crate,
+    name: &str,
+    path: &[&'p str],
+) -> Option<(ModuleId, &'p str)> {
     let is = |it: base_db::Crate| crate_is(db, hir::Crate::from(it), name);
     let home = match is(krate) {
         true => krate,

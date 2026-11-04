@@ -144,15 +144,25 @@ fn nameres_found(finding: &Finding) -> NameresFound {
             format!("{changed} {what} changed, the facts allow {min} to {max}: {}", keys.join(", "))
         }
         // alloc: as above.
-        Finding::Unrecorded { what, kind } => format!("neither trace has {what} (kind {:#06x})", kind.0),
+        Finding::Unrecorded { what, kind } => {
+            format!("neither trace has {what} (kind {:#06x})", kind.0)
+        }
         Finding::Kept { query, read, saw, now } => {
             // alloc: as above.
-            format!("{} was kept though it read {} at {saw:?}, which is now {now:?}", name(query), name(read))
+            format!(
+                "{} was kept though it read {} at {saw:?}, which is now {now:?}",
+                name(query),
+                name(read)
+            )
         }
         // alloc: as above.
-        Finding::Unexplained { query } => format!("{} reran though nothing it read changed", name(query)),
+        Finding::Unexplained { query } => {
+            format!("{} reran though nothing it read changed", name(query))
+        }
         // alloc: as above.
-        Finding::Needless { query } => format!("{} reran, read and made what it did before", name(query)),
+        Finding::Needless { query } => {
+            format!("{} reran, read and made what it did before", name(query))
+        }
         Finding::Stale(stale) => {
             let f = found(stale);
             // alloc: as above.
@@ -172,15 +182,25 @@ fn dbsp_found(finding: &dbsp::Finding) -> NameresFound {
             format!("{reran} {what} reran, the edit touched {most}: {}", keys.join(", "))
         }
         // alloc: as above.
-        dbsp::Finding::Unrecorded { what, kind } => format!("neither trace has {what} (kind {:#06x})", kind.0),
+        dbsp::Finding::Unrecorded { what, kind } => {
+            format!("neither trace has {what} (kind {:#06x})", kind.0)
+        }
         dbsp::Finding::Coarse { query, read } => {
             // alloc: as above.
-            format!("{} read {}, a whole crate's table, so it reruns with every impl of it", name(query), name(read))
+            format!(
+                "{} read {}, a whole crate's table, so it reruns with every impl of it",
+                name(query),
+                name(read)
+            )
         }
         // alloc: as above.
-        dbsp::Finding::Unexplained { query } => format!("{} reran though nothing it read changed", name(query)),
+        dbsp::Finding::Unexplained { query } => {
+            format!("{} reran though nothing it read changed", name(query))
+        }
         // alloc: as above.
-        dbsp::Finding::Needless { query } => format!("{} reran, read and made what it did before", name(query)),
+        dbsp::Finding::Needless { query } => {
+            format!("{} reran, read and made what it did before", name(query))
+        }
     };
     NameresFound { side: finding.side(), detail }
 }
@@ -229,7 +249,9 @@ fn found(stale: &Stale) -> Found {
             format!("read the same as from scratch; {incremental:?} against {scratch:?}"),
         ),
         // alloc: as above.
-        Stale::Absent { .. } => ("absent", "the build from scratch has it, the incremental build not".to_owned()),
+        Stale::Absent { .. } => {
+            ("absent", "the build from scratch has it, the incremental build not".to_owned())
+        }
         Stale::Downstream { incremental, scratch, .. } => {
             // alloc: as above.
             ("downstream", format!("read stale results; {incremental:?} against {scratch:?}"))
@@ -296,15 +318,23 @@ fn compare(input: &Input) -> Result<Output, String> {
         (Some(case), Some(before)) => Some(Nameres {
             slot: case.slot,
             claim: case.claim,
-            findings: nameres::check(case, &before.to_trace(), &incremental.to_trace(), &scratch.to_trace())
-                .iter()
-                .map(nameres_found)
-                // alloc: the CLI's output, once a run with a fixture slot.
-                .collect(),
+            findings: nameres::check(
+                case,
+                &before.to_trace(),
+                &incremental.to_trace(),
+                &scratch.to_trace(),
+            )
+            .iter()
+            .map(nameres_found)
+            // alloc: the CLI's output, once a run with a fixture slot.
+            .collect(),
         }),
         (Some(case), None) => {
             // alloc: error path; the CLI exits 2.
-            return Err(format!("the `{}` case needs `before`, the trace of the build before the edit", case.slot));
+            return Err(format!(
+                "the `{}` case needs `before`, the trace of the build before the edit",
+                case.slot
+            ));
         }
         (None, _) => None,
     };
@@ -321,7 +351,11 @@ fn compare_files(files: &Files) -> ExitCode {
             if at.is_some() { ExitCode::from(1) } else { ExitCode::SUCCESS }
         }
         Err(e) => {
-            eprintln!("blaze-v2-proof: {} against {}: {e}", files.first.display(), files.second.display());
+            eprintln!(
+                "blaze-v2-proof: {} against {}: {e}",
+                files.first.display(),
+                files.second.display()
+            );
             ExitCode::from(2)
         }
     }
@@ -368,7 +402,10 @@ fn main() -> ExitCode {
             return match check_dbsp(&input) {
                 Ok(output) => {
                     let over = output.findings.iter().any(|f| f.side != Side::Unmeasured);
-                    println!("{}", serde_json::to_string_pretty(&output).expect("the output is JSON"));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&output).expect("the output is JSON")
+                    );
                     if over { ExitCode::from(1) } else { ExitCode::SUCCESS }
                 }
                 Err(e) => {
@@ -386,7 +423,10 @@ fn main() -> ExitCode {
     };
     match compare(&input) {
         Ok(output) => {
-            let wrong = output.nameres.as_ref().is_some_and(|n| n.findings.iter().any(|f| f.side != Side::Unmeasured));
+            let wrong = output
+                .nameres
+                .as_ref()
+                .is_some_and(|n| n.findings.iter().any(|f| f.side != Side::Unmeasured));
             let stale = !output.stale.is_empty() || wrong;
             println!("{}", serde_json::to_string_pretty(&output).expect("the output is JSON"));
             if stale { ExitCode::from(1) } else { ExitCode::SUCCESS }

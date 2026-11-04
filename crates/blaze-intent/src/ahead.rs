@@ -7,10 +7,10 @@
 //! every test when there are none.
 
 use blaze_hash::ByHash;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::CodeHash;
 use memchr::memmem::Finder;
+use std::alloc::Global;
 
 /// A test as its binary's last build and run left it.
 pub struct Test<'a> {
@@ -69,7 +69,8 @@ pub fn plan(binaries: &[Binary<'_>], filters: &[String]) -> Plan {
         }
     }
     plan.hot = hottest_first(count);
-    plan.unmatched = filters.iter().zip(&matched).filter(|(_, hit)| !**hit).map(|(it, _)| it.clone()).collect();
+    plan.unmatched =
+        filters.iter().zip(&matched).filter(|(_, hit)| !**hit).map(|(it, _)| it.clone()).collect();
     plan
 }
 
@@ -130,7 +131,8 @@ mod tests {
             }
             count.insert(CodeHash(ContentId(bytes)), n % 5);
         }
-        let mut reference: Vec<(u32, CodeHash)> = count.iter().map(|(hash, n)| (*n, *hash)).collect();
+        let mut reference: Vec<(u32, CodeHash)> =
+            count.iter().map(|(hash, n)| (*n, *hash)).collect();
         reference.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         let reference: Vec<CodeHash> = reference.into_iter().map(|(_, hash)| hash).collect();
         assert_eq!(hottest_first(count), reference);
@@ -143,7 +145,11 @@ mod tests {
         for filter in filters {
             let finder = Finder::new(filter.as_bytes());
             for name in names {
-                assert_eq!(finder.find(name.as_bytes()).is_some(), name.contains(filter), "{name:?} {filter:?}");
+                assert_eq!(
+                    finder.find(name.as_bytes()).is_some(),
+                    name.contains(filter),
+                    "{name:?} {filter:?}"
+                );
             }
         }
     }
@@ -155,6 +161,9 @@ mod tests {
         let second = [Test { name: "u", reached: &[a, b] }];
         let binaries = [Binary { unit: 0, tests: &first }, Binary { unit: 1, tests: &second }];
         let plan = plan(&binaries, &[]);
-        assert_eq!((plan.units, plan.hot, plan.unmatched), (vec![0, 1], vec![a, b], Vec::<String>::new()));
+        assert_eq!(
+            (plan.units, plan.hot, plan.unmatched),
+            (vec![0, 1], vec![a, b], Vec::<String>::new())
+        );
     }
 }

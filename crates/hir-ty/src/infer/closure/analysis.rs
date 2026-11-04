@@ -33,7 +33,6 @@
 use std::{cmp, iter, mem};
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_def::{
     expr_store::ExpressionStore,
@@ -53,6 +52,7 @@ use rustc_type_ir::{
 };
 use rustc_type_ir::{Interner as _, TypeVisitableExt as _};
 use span::Edition;
+use std::alloc::Global;
 use tracing::{debug, instrument};
 
 use crate::{
@@ -273,7 +273,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         assert!(self.deferred_call_resolutions.is_empty());
     }
 
-    fn analyze_closures_in_expr(&mut self, expr: ExprId, upvars: &'db HashMap<ExprId, Upvars, Global>) {
+    fn analyze_closures_in_expr(
+        &mut self,
+        expr: ExprId,
+        upvars: &'db HashMap<ExprId, Upvars, Global>,
+    ) {
         self.store.walk_child_exprs(expr, |expr| self.analyze_closures_in_expr(expr, upvars));
 
         match self.store.expr(expr) {
@@ -1362,10 +1366,8 @@ impl<'db, 'f> euv::Delegate<'db, 'f> for InferBorrowKind<'f> {
         let PlaceWithOrigin { origins, place } = place_with_id;
         let place = ctx.normalize_capture_place(span, place);
 
-        self.capture_information.push((
-            place,
-            CaptureInfoBuf { sources: origins, capture_kind: UpvarCapture::ByUse },
-        ));
+        self.capture_information
+            .push((place, CaptureInfoBuf { sources: origins, capture_kind: UpvarCapture::ByUse }));
     }
 
     #[instrument(skip(self), level = "debug")]

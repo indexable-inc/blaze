@@ -260,8 +260,13 @@ fn split(it: u32) -> (usize, usize) {
 /// each shard's keys keep the batch's order), each shard's keys interned by one task. Appends
 /// `wrap` of the joined (shard, index) of each key to `out`. Below [`PARALLEL`] keys nothing is
 /// allocated but `out`'s growth; above, two buffers of a pair per key.
-fn batch<K, S, T>(shards: &mut [S], keys: &[K], hash: impl Fn(K) -> u64 + Sync, wrap: impl Fn(u32) -> T, out: &mut Vec<T>)
-where
+fn batch<K, S, T>(
+    shards: &mut [S],
+    keys: &[K],
+    hash: impl Fn(K) -> u64 + Sync,
+    wrap: impl Fn(u32) -> T,
+    out: &mut Vec<T>,
+) where
     K: Copy + Sync,
     S: Shard<K>,
     T: Copy,
@@ -288,11 +293,14 @@ where
         parts.push(part);
         rest = tail;
     }
-    par::for_each(par::enumerate(par::zip(shards, parts.as_mut_slice())), |(shard, (it, items))| {
-        for item in items.iter_mut() {
-            item.1 = u64::from(join(shard, it.get_or_insert(item.1, keys[item.0 as usize])));
-        }
-    });
+    par::for_each(
+        par::enumerate(par::zip(shards, parts.as_mut_slice())),
+        |(shard, (it, items))| {
+            for item in items.iter_mut() {
+                item.1 = u64::from(join(shard, it.get_or_insert(item.1, keys[item.0 as usize])));
+            }
+        },
+    );
     drop(parts);
     let base = out.len();
     out.resize(base + keys.len(), wrap(0));
@@ -313,7 +321,11 @@ impl Symbols {
     /// Reserves the tables' regions, committing nothing until a key goes in: once per image,
     /// three allocations (the lists of shards).
     pub fn new() -> Result<Symbols, MemError> {
-        Ok(Symbols { keys: shards(KeyShard::new)?, names: shards(NameShard::new)?, ids: shards(IdShard::new)? })
+        Ok(Symbols {
+            keys: shards(KeyShard::new)?,
+            names: shards(NameShard::new)?,
+            ids: shards(IdShard::new)?,
+        })
     }
 
     /// The bytes its shards' regions have committed ([`crate::Image::held`]).
@@ -415,7 +427,8 @@ impl Symbols {
     /// names gathered, each interned, the keys made of them, and the result.
     pub fn intern_wide(&mut self, keys: &[Wide<'_>]) -> Vec<Sym> {
         let mut ids: Vec<&ContentId> = Vec::with_capacity(keys.len());
-        let mut names: Vec<&str> = Vec::with_capacity(keys.iter().filter(|it| matches!(it, Wide::Name(_))).count());
+        let mut names: Vec<&str> =
+            Vec::with_capacity(keys.iter().filter(|it| matches!(it, Wide::Name(_))).count());
         for key in keys {
             match *key {
                 Wide::Key(_) => {}
@@ -503,8 +516,12 @@ impl Symbols {
 
     pub fn cmp_keys(&self, a: SymKey, b: SymKey) -> Ordering {
         use SymKey::*;
-        let id = |x: IdNo, y: IdNo| if x == y { Ordering::Equal } else { self.content(x).cmp(self.content(y)) };
-        let name = |x: NameId, y: NameId| if x == y { Ordering::Equal } else { self.str(x).cmp(self.str(y)) };
+        let id = |x: IdNo, y: IdNo| {
+            if x == y { Ordering::Equal } else { self.content(x).cmp(self.content(y)) }
+        };
+        let name = |x: NameId, y: NameId| {
+            if x == y { Ordering::Equal } else { self.str(x).cmp(self.str(y)) }
+        };
         let obj = |x: Obj, y: Obj| id(x.native, y.native).then(x.member.cmp(&y.member));
         match (a, b) {
             (Body(x), Body(y))
@@ -515,14 +532,19 @@ impl Symbols {
             | (WinInfo(x), WinInfo(y))
             | (CoveragePcs(x), CoveragePcs(y))
             | (LazyEntry(x), LazyEntry(y)) => id(x, y),
-            (Static(x, i), Static(y, j)) | (Tlv(x, i), Tlv(y, j)) | (StaticList(x, i), StaticList(y, j)) => {
-                id(x, y).then_with(|| id(i, j))
+            (Static(x, i), Static(y, j))
+            | (Tlv(x, i), Tlv(y, j))
+            | (StaticList(x, i), StaticList(y, j)) => id(x, y).then_with(|| id(i, j)),
+            (Name(x), Name(y))
+            | (FileName(x), FileName(y))
+            | (IatEnd(x), IatEnd(y))
+            | (Common(x), Common(y)) => name(x, y),
+            (Local(x, i), Local(y, j)) | (Section(x, i), Section(y, j)) => {
+                obj(x, y).then(i.cmp(&j))
             }
-            (Name(x), Name(y)) | (FileName(x), FileName(y)) | (IatEnd(x), IatEnd(y)) | (Common(x), Common(y)) => {
-                name(x, y)
+            (Position(x, i), Position(y, j)) | (Coverage(x, i), Coverage(y, j)) => {
+                id(x, y).then(i.cmp(&j))
             }
-            (Local(x, i), Local(y, j)) | (Section(x, i), Section(y, j)) => obj(x, y).then(i.cmp(&j)),
-            (Position(x, i), Position(y, j)) | (Coverage(x, i), Coverage(y, j)) => id(x, y).then(i.cmp(&j)),
             (Frame(x, s, i), Frame(y, t, j)) => obj(x, y).then(s.cmp(&t)).then(i.cmp(&j)),
             (Got(k, x), Got(l, y)) => k.cmp(&l).then_with(|| self.cmp(x, y)),
             (Plt(x), Plt(y)) => self.cmp(x, y),
@@ -539,15 +561,29 @@ impl Symbols {
         // alloc: error messages: the one string the message is written into
         let mut out = String::new();
         let _ = match self.key(sym) {
-            SymKey::Body(key) | SymKey::Slot(key) => write!(out, "the function {:?}", self.instance(key)),
-            SymKey::Static(item, instance) => write!(out, "the static {:?} ({:?})", self.item(item), self.content(instance)),
+            SymKey::Body(key) | SymKey::Slot(key) => {
+                write!(out, "the function {:?}", self.instance(key))
+            }
+            SymKey::Static(item, instance) => {
+                write!(out, "the static {:?} ({:?})", self.item(item), self.content(instance))
+            }
             SymKey::Name(name) => write!(out, "`{}`", self.str(name)),
             SymKey::Data(id) => write!(out, "the data {:?}", self.content(id)),
             SymKey::Coverage(key, array) => {
-                write!(out, "SanitizerCoverage array {array} of the function {:?}", self.instance(key))
+                write!(
+                    out,
+                    "SanitizerCoverage array {array} of the function {:?}",
+                    self.instance(key)
+                )
             }
-            SymKey::CoveragePcs(key) => write!(out, "the SanitizerCoverage PC table of the function {:?}", self.instance(key)),
-            SymKey::LazyEntry(key) => write!(out, "the lazy entry of the function {:?}", self.instance(key)),
+            SymKey::CoveragePcs(key) => write!(
+                out,
+                "the SanitizerCoverage PC table of the function {:?}",
+                self.instance(key)
+            ),
+            SymKey::LazyEntry(key) => {
+                write!(out, "the lazy entry of the function {:?}", self.instance(key))
+            }
             key => self.write_debug(key, &mut out),
         };
         out
@@ -562,14 +598,20 @@ impl Symbols {
     }
 
     fn write_debug(&self, key: SymKey, out: &mut String) -> std::fmt::Result {
-        let obj = |out: &mut String, o: Obj| write!(out, "Obj {{ native: {:?}, member: {} }}", self.content(o.native), o.member);
+        let obj = |out: &mut String, o: Obj| {
+            write!(out, "Obj {{ native: {:?}, member: {} }}", self.content(o.native), o.member)
+        };
         match key {
             SymKey::Body(it) => write!(out, "Body({:?})", self.instance(it)),
             SymKey::Slot(it) => write!(out, "Slot({:?})", self.instance(it)),
             SymKey::Data(it) => write!(out, "Data({:?})", self.content(it)),
-            SymKey::Static(a, b) => write!(out, "Static({:?}, {:?})", self.item(a), self.content(b)),
+            SymKey::Static(a, b) => {
+                write!(out, "Static({:?}, {:?})", self.item(a), self.content(b))
+            }
             SymKey::Tlv(a, b) => write!(out, "Tlv({:?}, {:?})", self.item(a), self.content(b)),
-            SymKey::StaticList(a, b) => write!(out, "StaticList({:?}, {:?})", self.item(a), self.content(b)),
+            SymKey::StaticList(a, b) => {
+                write!(out, "StaticList({:?}, {:?})", self.item(a), self.content(b))
+            }
             SymKey::Name(it) => write!(out, "Name({:?})", self.str(it)),
             SymKey::Local(o, at) => {
                 out.push_str("Local(");
@@ -581,7 +623,9 @@ impl Symbols {
                 obj(out, o)?;
                 write!(out, ", {at})")
             }
-            SymKey::Position(anchor, index) => write!(out, "Position({:?})", self.span(anchor, index)),
+            SymKey::Position(anchor, index) => {
+                write!(out, "Position({:?})", self.span(anchor, index))
+            }
             SymKey::FileName(it) => write!(out, "FileName({:?})", self.str(it)),
             SymKey::Cie(it) => write!(out, "Cie({:?})", self.content(it)),
             SymKey::Fde(it) => write!(out, "Fde({:?})", self.instance(it)),
@@ -609,7 +653,9 @@ impl Symbols {
             SymKey::Cells => write!(out, "Cells"),
             SymKey::Stubs => write!(out, "Stubs"),
             SymKey::Descriptor => write!(out, "Descriptor"),
-            SymKey::Coverage(it, array) => write!(out, "Coverage({:?}, {array})", self.instance(it)),
+            SymKey::Coverage(it, array) => {
+                write!(out, "Coverage({:?}, {array})", self.instance(it))
+            }
             SymKey::CoveragePcs(it) => write!(out, "CoveragePcs({:?})", self.instance(it)),
             SymKey::StartHook => write!(out, "StartHook"),
             SymKey::Counters => write!(out, "Counters"),
@@ -751,10 +797,13 @@ mod tests {
         let mut serial = Symbols::default();
         let b: Vec<Sym> = wide.chunks(PARALLEL / 4).flat_map(|it| serial.intern_wide(it)).collect();
         let mut one = Symbols::default();
-        let c: Vec<Sym> = ids.iter().map(|it| {
-            let id = one.id(it);
-            one.intern(SymKey::Data(id))
-        }).collect();
+        let c: Vec<Sym> = ids
+            .iter()
+            .map(|it| {
+                let id = one.id(it);
+                one.intern(SymKey::Data(id))
+            })
+            .collect();
         assert_eq!(a, b);
         assert_eq!(a, c);
     }
@@ -764,8 +813,14 @@ mod tests {
         let mut symbols = Symbols::default();
         let (f, item, data) = (InstanceKey(content(1)), ItemKey(content(2)), content(3));
         let span = SpanRef { anchor: content(4), index: 9 };
-        let wide =
-            [Wide::Body(&f), Wide::Slot(&f), Wide::Static(&item, &data), Wide::Name("memcpy"), Wide::Position(&span), Wide::Key(SymKey::Cells)];
+        let wide = [
+            Wide::Body(&f),
+            Wide::Slot(&f),
+            Wide::Static(&item, &data),
+            Wide::Name("memcpy"),
+            Wide::Position(&span),
+            Wide::Key(SymKey::Cells),
+        ];
         let syms = symbols.intern_wide(&wide);
         assert_eq!(syms[0], symbols.body(&f));
         assert_eq!(Some(syms[1]), symbols.find_slot(&f));

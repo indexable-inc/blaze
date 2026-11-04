@@ -53,7 +53,11 @@ impl TermGrid {
     /// Whether `(x, y)` is on the grid, `slack` points around it counted in.
     #[must_use]
     pub fn holds(&self, x: f32, y: f32, slack: f32) -> bool {
-        self.w > 0.0 && x >= self.x - slack && y >= self.y - slack && x <= self.x + self.w + slack && y <= self.y + self.h + slack
+        self.w > 0.0
+            && x >= self.x - slack
+            && y >= self.y - slack
+            && x <= self.x + self.w + slack
+            && y <= self.y + self.h + slack
     }
 }
 
@@ -82,7 +86,16 @@ impl TermInput {
     #[must_use]
     pub fn pack(i: &Input) -> Self {
         let m = &i.modes;
-        let bits = [m.app_cursor, m.app_keypad, m.bracketed_paste, m.focus_events, m.alt_scroll, m.alt_screen, m.sync_output, m.cursor_visible];
+        let bits = [
+            m.app_cursor,
+            m.app_keypad,
+            m.bracketed_paste,
+            m.focus_events,
+            m.alt_scroll,
+            m.alt_screen,
+            m.sync_output,
+            m.cursor_visible,
+        ];
         let flags = bits.iter().enumerate().fold(0u8, |f, (k, &b)| f | (u8::from(b) << k));
         let mouse = match m.mouse {
             MouseTracking::None => 0,
@@ -98,7 +111,15 @@ impl TermInput {
             MouseFormat::Urxvt => 3,
             MouseFormat::SgrPixels => 4,
         };
-        Self { flags, mouse, format, kitty: m.kitty_flags, cols: i.size.0, rows: i.size.1, history: i.history }
+        Self {
+            flags,
+            mouse,
+            format,
+            kitty: m.kitty_flags,
+            cols: i.size.0,
+            rows: i.size.1,
+            history: i.history,
+        }
     }
 
     /// The [`Input`] with `cursor`.
@@ -130,7 +151,12 @@ impl TermInput {
             },
             kitty_flags: self.kitty,
         };
-        Input { modes, cursor: (cursor.row, cursor.col), size: (self.cols, self.rows), history: self.history }
+        Input {
+            modes,
+            cursor: (cursor.row, cursor.col),
+            size: (self.cols, self.rows),
+            history: self.history,
+        }
     }
 }
 
@@ -213,7 +239,10 @@ pub fn register(world: &World) {
     // The scene puts these tags on hn.Pane and hn.Terminal.
     world.component::<PaneNode>().writable();
     world.component::<PaneFocus>();
-    world.component::<Back>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
+    world
+        .component::<Back>()
+        .add_trait::<flecs::Exclusive>()
+        .on_delete_target(flecs::Cleanup::Remove);
     world.component::<TermNode>().writable();
     world.component::<TermFocus>();
     world.component::<TermGrid>();

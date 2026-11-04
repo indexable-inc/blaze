@@ -21,8 +21,8 @@ use blaze_ids::radix;
 use smallvec::SmallVec;
 
 use crate::model::{
-    Apply, Binding, Data, Name, Names, NativeFixup, Object, Section, SectionKind, Symbol, SymbolDef,
-    SymbolKind,
+    Apply, Binding, Data, Name, Names, NativeFixup, Object, Section, SectionKind, Symbol,
+    SymbolDef, SymbolKind,
 };
 use crate::unwind::DW_EH_PE_OMIT;
 
@@ -63,17 +63,23 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
         // alloc: error path
-        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: a Mach-O object in a {arch:?} link")),
+        Arch::Wasm32 | Arch::Wasm64 => {
+            return Err(format!("{name}: a Mach-O object in a {arch:?} link"));
+        }
     };
     let found = header.cputype(LE);
     if found != cpu {
         // alloc: error path
-        return Err(format!("{name}: a Mach-O object for CPU type {found:#x}, not {arch:?} ({cpu:#x})"));
+        return Err(format!(
+            "{name}: a Mach-O object for CPU type {found:#x}, not {arch:?} ({cpu:#x})"
+        ));
     }
     let filetype = header.filetype(LE);
     if filetype != macho::MH_OBJECT {
         // alloc: error path
-        return Err(format!("{name}: Mach-O file type {filetype}, not a relocatable object (MH_OBJECT)"));
+        return Err(format!(
+            "{name}: Mach-O file type {filetype}, not a relocatable object (MH_OBJECT)"
+        ));
     }
     let subsections = header.flags(LE).contains(macho::MH_SUBSECTIONS_VIA_SYMBOLS);
 
@@ -94,7 +100,8 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
                     command.segment_64().map_err(|e| format!("{name}: {e}"))?
                 {
                     // alloc: error path
-                    headers.push(segment.sections(LE, sections).map_err(|e| format!("{name}: {e}"))?);
+                    headers
+                        .push(segment.sections(LE, sections).map_err(|e| format!("{name}: {e}"))?);
                 }
             }
             // alloc: error path
@@ -117,7 +124,10 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
             | macho::LC_ATOM_INFO => {}
             other => {
                 // alloc: error path
-                return Err(format!("{name}: load command {:#x}, which blaze-link does not read", other.0));
+                return Err(format!(
+                    "{name}: load command {:#x}, which blaze-link does not read",
+                    other.0
+                ));
             }
         }
     }
@@ -129,7 +139,8 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
     let (nlists, raw): (&[Nlist], Vec<&[u8]>) = match symtab {
         Some(symtab) => {
             // alloc: error path
-            let table = symtab.symbols::<Header, _>(LE, data).map_err(|e| format!("{name}: {e}"))?;
+            let table =
+                symtab.symbols::<Header, _>(LE, data).map_err(|e| format!("{name}: {e}"))?;
             let strings = table.strings();
             let nlists = table.iter().as_slice();
             let mut raw = Vec::with_capacity(nlists.len());
@@ -183,7 +194,8 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
             return Err(format!("{name}: {full}: alignment 2^{align}"));
         }
         // alloc: error path
-        let relocations = header.relocations(LE, data).map_err(|e| format!("{name}: {full}: {e}"))?;
+        let relocations =
+            header.relocations(LE, data).map_err(|e| format!("{name}: {full}: {e}"))?;
         let splits = subsections
             && matches!(what, SectionKind::Alloc(..))
             && !matches!(
@@ -251,10 +263,12 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
     // ld64's `dontDeadStripIfReferencesLive`: every loaded atom of an `S_ATTR_LIVE_SUPPORT`
     // section. `__eh_frame` has the attribute too; its records are kept by function instead.
     let supports = |input: &Input<'_>| {
-        input.flags & macho::S_ATTR_LIVE_SUPPORT.0 != 0 && matches!(input.what, SectionKind::Alloc(..))
+        input.flags & macho::S_ATTR_LIVE_SUPPORT.0 != 0
+            && matches!(input.what, SectionKind::Alloc(..))
     };
-    let mut live_support =
-        Vec::with_capacity(inputs.iter().filter(|&it| supports(it)).map(|it| it.atoms as usize).sum());
+    let mut live_support = Vec::with_capacity(
+        inputs.iter().filter(|&it| supports(it)).map(|it| it.atoms as usize).sum(),
+    );
     let mut relocations = 0;
     for input in &mut inputs {
         let first = input.first as usize;
@@ -343,7 +357,15 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
     let mut column = Vec::with_capacity(fixups.len());
     column.extend(fixups.iter().map(|it| it.1));
     drop(fixups);
-    Ok(Object { sections, symbols, fixups: column, names, libraries, live_support, ..Object::default() })
+    Ok(Object {
+        sections,
+        symbols,
+        fixups: column,
+        names,
+        libraries,
+        live_support,
+        ..Object::default()
+    })
 }
 
 fn text<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a str, String> {
@@ -407,7 +429,9 @@ pub(crate) fn autolink(option: &str) -> Result<Autolink<'_>, String> {
     match (first, rest) {
         ("-framework", Some(name)) if named(name) => return Ok(Autolink::Framework(name)),
         ("-weak_framework", Some(name)) if named(name) => return Err(weak("-weak_framework")),
-        (word, None) if word.starts_with("-weak-l") && word.len() > "-weak-l".len() => return Err(weak("-weak-l")),
+        (word, None) if word.starts_with("-weak-l") && word.len() > "-weak-l".len() => {
+            return Err(weak("-weak-l"));
+        }
         (word, None) => {
             if let Some(name) = word.strip_prefix("-l").filter(|it| !it.is_empty()) {
                 return Ok(Autolink::Library(name));
@@ -428,12 +452,18 @@ pub(crate) fn autolink(option: &str) -> Result<Autolink<'_>, String> {
 /// checked with [`autolink`]. Only the header and the load commands are read. A universal file
 /// is read for `arch`'s slice. A member that is not a Mach-O object of `arch` asks for nothing:
 /// the engine refuses it if it is ever taken.
-pub(crate) fn asked_libraries(name: &str, bytes: &[u8], arch: Arch) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn asked_libraries(
+    name: &str,
+    bytes: &[u8],
+    arch: Arch,
+) -> Result<Vec<(String, String)>, String> {
     let cpu = match arch {
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
         // alloc: error path
-        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: Mach-O linker options in a {arch:?} link")),
+        Arch::Wasm32 | Arch::Wasm64 => {
+            return Err(format!("{name}: Mach-O linker options in a {arch:?} link"));
+        }
     };
     let bytes = slice(name, bytes, cpu)?;
     // alloc: once per file searched for its linker options (setup, kept per process)
@@ -480,8 +510,11 @@ pub(crate) fn asked_libraries(name: &str, bytes: &[u8], arch: Arch) -> Result<Ve
 
 /// Whether `data` begins as a thin little-endian 64-bit Mach-O object (`MH_OBJECT`) for `cpu`.
 fn is_object(data: &[u8], cpu: macho::CpuType) -> bool {
-    let word = |at: usize| data.get(at..at + 4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
-    word(0) == Some(macho::MH_MAGIC_64) && word(4) == Some(cpu.0) && word(12) == Some(macho::MH_OBJECT.0)
+    let word =
+        |at: usize| data.get(at..at + 4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
+    word(0) == Some(macho::MH_MAGIC_64)
+        && word(4) == Some(cpu.0)
+        && word(12) == Some(macho::MH_OBJECT.0)
 }
 
 /// The `LC_LINKER_OPTION`s of the Mach-O object `data` ([`is_object`]), each checked with
@@ -505,7 +538,11 @@ fn options_of(name: &str, data: &[u8]) -> Result<SmallVec<[String; 2]>, String> 
 }
 
 /// `cpu`'s slice of a universal file, or the file.
-pub(super) fn slice<'a>(name: &str, bytes: &'a [u8], cpu: macho::CpuType) -> Result<&'a [u8], String> {
+pub(super) fn slice<'a>(
+    name: &str,
+    bytes: &'a [u8],
+    cpu: macho::CpuType,
+) -> Result<&'a [u8], String> {
     use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
     let magic = bytes.get(..4).map(|it| u32::from_be_bytes([it[0], it[1], it[2], it[3]]));
     // alloc: error path
@@ -526,7 +563,9 @@ pub(super) fn slice<'a>(name: &str, bytes: &'a [u8], cpu: macho::CpuType) -> Res
         _ => return Ok(bytes),
     };
     // alloc: error path
-    let (offset, size) = found.ok_or_else(|| format!("{name} is a universal file without a slice for CPU type {cpu:#x}"))?;
+    let (offset, size) = found.ok_or_else(|| {
+        format!("{name} is a universal file without a slice for CPU type {cpu:#x}")
+    })?;
     usize::try_from(offset)
         .ok()
         .zip(usize::try_from(offset.saturating_add(size)).ok())
@@ -555,12 +594,21 @@ fn position(
         .checked_sub(1)
         .and_then(|it| inputs.get(it))
         // alloc: error path
-        .ok_or_else(|| format!("{name}: symbol {} is in section {n_sect}, which the object doesn't have", shown()))?;
+        .ok_or_else(|| {
+            format!(
+                "{name}: symbol {} is in section {n_sect}, which the object doesn't have",
+                shown()
+            )
+        })?;
     let value = nlist.n_value(LE);
     match value.checked_sub(input.addr) {
         Some(offset) if offset <= input.size => Ok((n_sect - 1, offset)),
         // alloc: error path
-        _ => Err(format!("{name}: symbol {} at {value:#x} is outside {}", shown(), names.at(input.full))),
+        _ => Err(format!(
+            "{name}: symbol {} at {value:#x} is outside {}",
+            shown(),
+            names.at(input.full)
+        )),
     }
 }
 
@@ -666,9 +714,12 @@ impl Reader<'_> {
                     let (s, offset) = position(name, &self.inputs, &self.names, nlist, raw)?;
                     let (section, start, end) = self.atom(s, offset);
                     let input = &self.inputs[s];
-                    let bounds = &self.bounds[input.bounds.start as usize..input.bounds.end as usize];
-                    let next =
-                        bounds.get(bounds.partition_point(|&it| it <= offset)).copied().unwrap_or(end);
+                    let bounds =
+                        &self.bounds[input.bounds.start as usize..input.bounds.end as usize];
+                    let next = bounds
+                        .get(bounds.partition_point(|&it| it <= offset))
+                        .copied()
+                        .unwrap_or(end);
                     let def = SymbolDef::Section {
                         section,
                         value: offset - start,
@@ -679,7 +730,9 @@ impl Reader<'_> {
                         | macho::S_THREAD_LOCAL_ZEROFILL
                         | macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => SymbolKind::Tls,
                         _ if input.flags
-                            & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS).0
+                            & (macho::S_ATTR_PURE_INSTRUCTIONS
+                                | macho::S_ATTR_SOME_INSTRUCTIONS)
+                                .0
                             != 0 =>
                         {
                             SymbolKind::Function
@@ -696,7 +749,10 @@ impl Reader<'_> {
                 macho::N_UNDF => (SymbolDef::Undefined, SymbolKind::Other),
                 macho::N_INDR => {
                     // alloc: error path
-                    return Err(format!("{name}: symbol {} is an indirect symbol (N_INDR)", shown()));
+                    return Err(format!(
+                        "{name}: symbol {} is an indirect symbol (N_INDR)",
+                        shown()
+                    ));
                 }
                 other => {
                     // alloc: error path
@@ -705,7 +761,9 @@ impl Reader<'_> {
             };
             let weak = match def {
                 SymbolDef::Undefined => n_desc.contains(macho::N_WEAK_REF),
-                SymbolDef::Section { .. } | SymbolDef::Absolute(_) => n_desc.contains(macho::N_WEAK_DEF),
+                SymbolDef::Section { .. } | SymbolDef::Absolute(_) => {
+                    n_desc.contains(macho::N_WEAK_DEF)
+                }
                 SymbolDef::Common { .. } | SymbolDef::Fallback { .. } => false,
             };
             let binding = if !external {
@@ -718,7 +776,8 @@ impl Reader<'_> {
             self.map[index] = self.symbols.len() as u32;
             self.symbols.push(Symbol {
                 // alloc: error path
-                name: super::push_core_name(&mut self.names, raw).map_err(|e| format!("{name}: {e}"))?,
+                name: super::push_core_name(&mut self.names, raw)
+                    .map_err(|e| format!("{name}: {e}"))?,
                 def,
                 binding,
                 kind,
@@ -754,7 +813,9 @@ impl Reader<'_> {
             }
             Arch::Wasm32 | Arch::Wasm64 if relocations.is_empty() => {}
             // alloc: error path
-            arch @ (Arch::Wasm32 | Arch::Wasm64) => return Err(format!("{}: a Mach-O object in a {arch:?} link", self.name)),
+            arch @ (Arch::Wasm32 | Arch::Wasm64) => {
+                return Err(format!("{}: a Mach-O object in a {arch:?} link", self.name));
+            }
         }
         Ok(())
     }
@@ -780,7 +841,9 @@ impl Reader<'_> {
                 };
                 if !matches!(
                     next.r_type,
-                    macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_PAGEOFF12 | macho::ARM64_RELOC_BRANCH26
+                    macho::ARM64_RELOC_PAGE21
+                        | macho::ARM64_RELOC_PAGEOFF12
+                        | macho::ARM64_RELOC_BRANCH26
                 ) {
                     // alloc: error path
                     return Err(format!(
@@ -974,11 +1037,17 @@ impl Reader<'_> {
         }
         if !r.r_extern {
             // alloc: error path
-            return Err(format!("{}: a SUBTRACTOR of a section rather than a symbol", self.place_of(s, at)));
+            return Err(format!(
+                "{}: a SUBTRACTOR of a section rather than a symbol",
+                self.place_of(s, at)
+            ));
         }
         let Some(next) = relocations.get(1).map(|it| it.info(LE)) else {
             // alloc: error path
-            return Err(format!("{}: a SUBTRACTOR with no UNSIGNED after it", self.place_of(s, at)));
+            return Err(format!(
+                "{}: a SUBTRACTOR with no UNSIGNED after it",
+                self.place_of(s, at)
+            ));
         };
         if next.r_type != unsigned
             || next.r_address != r.r_address
@@ -1050,7 +1119,8 @@ impl Reader<'_> {
             ));
         }
         let shift = at.wrapping_sub(from) as i64;
-        let (symbol, addend) = self.extern_target(next.r_symbolnum, implicit.wrapping_add(shift), true)?;
+        let (symbol, addend) =
+            self.extern_target(next.r_symbolnum, implicit.wrapping_add(shift), true)?;
         let apply = if length == 3 { Apply::Rel64 } else { Apply::Rel32 };
         self.place(s, Fix { at, width: 1 << length, apply, symbol, addend, minus: None })
     }
@@ -1058,14 +1128,21 @@ impl Reader<'_> {
     /// The target of an extern relocation to nlist entry `index` plus `offset`. With `anchor`,
     /// a symbol local to the object (not `N_EXT`, or an `L` label) is replaced by the atom at
     /// the address the relocation names, as ld64 does: `ltmp0 + 0x40` is in a later atom.
-    fn extern_target(&mut self, index: u32, offset: i64, anchor: bool) -> Result<(u32, i64), String> {
+    fn extern_target(
+        &mut self,
+        index: u32,
+        offset: i64,
+        anchor: bool,
+    ) -> Result<(u32, i64), String> {
         let name = self.name;
         let nlists = self.nlists;
         let (Some(nlist), Some(symbol)) =
             (nlists.get(index as usize), self.map.get(index as usize).copied())
         else {
             // alloc: error path
-            return Err(format!("{name}: a relocation names symbol {index}, which the object doesn't have"));
+            return Err(format!(
+                "{name}: a relocation names symbol {index}, which the object doesn't have"
+            ));
         };
         if symbol == NONE {
             // alloc: error path
@@ -1089,12 +1166,18 @@ impl Reader<'_> {
             .checked_sub(1)
             .filter(|&it| it < self.inputs.len())
             // alloc: error path
-            .ok_or_else(|| format!("{name}: a relocation names section {ordinal}, which the object doesn't have"))?;
+            .ok_or_else(|| {
+                format!(
+                    "{name}: a relocation names section {ordinal}, which the object doesn't have"
+                )
+            })?;
         let input = &self.inputs[s];
         let offset = match addr.checked_sub(input.addr) {
             Some(offset) if offset <= input.size => offset,
             // alloc: error path
-            _ => return Err(format!("{name}: a relocation to {addr:#x}, outside {}", self.full(s))),
+            _ => {
+                return Err(format!("{name}: a relocation to {addr:#x}, outside {}", self.full(s)));
+            }
         };
         let (section, start, _) = self.atom(s, offset);
         Ok((self.section_symbol(section), (offset - start) as i64))
@@ -1132,7 +1215,9 @@ impl Reader<'_> {
             .ok()
             .and_then(|at| bytes.get(at..at.checked_add(width)?))
             // alloc: error path
-            .ok_or_else(|| format!("{}: a relocation past the end of the section", self.place_of(s, at)))?;
+            .ok_or_else(|| {
+                format!("{}: a relocation past the end of the section", self.place_of(s, at))
+            })?;
         let mut word = [0u8; 8];
         word[..width].copy_from_slice(field);
         let value = u64::from_le_bytes(word);
@@ -1155,13 +1240,16 @@ impl Reader<'_> {
                 fix.width
             ));
         }
-        self.fixups.push((section, NativeFixup {
-            at: fix.at - start,
-            apply: fix.apply,
-            symbol: fix.symbol,
-            addend: fix.addend,
-            minus: fix.minus,
-        }));
+        self.fixups.push((
+            section,
+            NativeFixup {
+                at: fix.at - start,
+                apply: fix.apply,
+                symbol: fix.symbol,
+                addend: fix.addend,
+                minus: fix.minus,
+            },
+        ));
         Ok(())
     }
 
@@ -1201,16 +1289,17 @@ impl Reader<'_> {
                 return Err(self.frame_error(s, at, "a 64-bit call frame entry"));
             }
             let start = at + 4;
-            let end = start
-                .checked_add(length as usize)
-                .filter(|&it| it <= bytes.len())
-                .ok_or_else(|| self.frame_error(s, at, "a call frame entry longer than the section"))?;
+            let end =
+                start.checked_add(length as usize).filter(|&it| it <= bytes.len()).ok_or_else(
+                    || self.frame_error(s, at, "a call frame entry longer than the section"),
+                )?;
             let mut c = cursor::Reader::starting_at(&bytes[..end], start)
                 .map_err(|it| self.frame_error(s, start, it.as_str()))?;
             let id = c.u32().map_err(|it| self.frame_error(s, start, it.as_str()))?;
             if id == 0 {
                 personalities.clear();
-                let cie = Cie::parse(&mut c, &mut personalities).map_err(|it| self.frame_error(s, start, &it))?;
+                let cie = Cie::parse(&mut c, &mut personalities)
+                    .map_err(|it| self.frame_error(s, start, &it))?;
                 cies.push((at, cie));
                 for &(field, encoding) in &personalities {
                     self.eh_pointer(s, field, encoding, &covered, &mut by_addr)?;
@@ -1221,10 +1310,13 @@ impl Reader<'_> {
                     .checked_sub(id as usize)
                     .and_then(|it| cies.binary_search_by_key(&it, |(cie, _)| *cie).ok())
                     .map(|found| cies[found].1)
-                    .ok_or_else(|| self.frame_error(s, start, "an FDE whose CIE isn't before it"))?;
+                    .ok_or_else(|| {
+                        self.frame_error(s, start, "an FDE whose CIE isn't before it")
+                    })?;
                 let pc_begin = c.at();
                 skip_pointer(&mut c, cie.fde).map_err(|it| self.frame_error(s, c.at(), &it))?;
-                skip_pointer(&mut c, cie.fde & 0x0f).map_err(|it| self.frame_error(s, c.at(), &it))?;
+                skip_pointer(&mut c, cie.fde & 0x0f)
+                    .map_err(|it| self.frame_error(s, c.at(), &it))?;
                 let mut lsda = None;
                 if cie.z {
                     c.skip_leb().map_err(|it| self.frame_error(s, c.at(), it.as_str()))?;
@@ -1266,7 +1358,8 @@ impl Reader<'_> {
         match encoding & 0x70 {
             0x10 => {
                 let value = self.read(s, at as u64, length, true)?;
-                let target = (self.inputs[s].addr.wrapping_add(at as u64)).wrapping_add_signed(value);
+                let target =
+                    (self.inputs[s].addr.wrapping_add(at as u64)).wrapping_add_signed(value);
                 if by_addr.is_none() {
                     *by_addr = Some(self.by_addr()?);
                 }
@@ -1278,12 +1371,17 @@ impl Reader<'_> {
                 })?;
                 let (symbol, addend) = self.at_address(ordinal, target)?;
                 let apply = if length == 3 { Apply::Rel64 } else { Apply::Rel32 };
-                let fix = Fix { at: at as u64, width: 1 << length, apply, symbol, addend, minus: None };
+                let fix =
+                    Fix { at: at as u64, width: 1 << length, apply, symbol, addend, minus: None };
                 self.place(s, fix)
             }
             0x00 => {
                 if self.read(s, at as u64, length, false)? != 0 {
-                    return Err(self.frame_error(s, at, "an absolute pointer without a relocation"));
+                    return Err(self.frame_error(
+                        s,
+                        at,
+                        "an absolute pointer without a relocation",
+                    ));
                 }
                 Ok(())
             }
@@ -1299,7 +1397,9 @@ impl Reader<'_> {
         let inputs = &self.inputs;
         let mut out = Vec::with_capacity(inputs.len());
         out.extend((0..inputs.len() as u32).filter(|&it| inputs[it as usize].size != 0));
-        radix::sort_copy_by_key(&mut out, |&it| radix::pack_64(inputs[it as usize].addr, u64::from(it)));
+        radix::sort_copy_by_key(&mut out, |&it| {
+            radix::pack_64(inputs[it as usize].addr, u64::from(it))
+        });
         for pair in out.windows(2) {
             let (a, b) = (&inputs[pair[0] as usize], &inputs[pair[1] as usize]);
             if a.addr.saturating_add(a.size) > b.addr {
@@ -1313,7 +1413,8 @@ impl Reader<'_> {
 
     /// The 1-based ordinal of the section holding `addr`, of those [`Reader::by_addr`] gives.
     fn ordinal_of(&self, by_addr: &[u32], addr: u64) -> Option<u32> {
-        let i = by_addr.partition_point(|&it| self.inputs[it as usize].addr <= addr).checked_sub(1)?;
+        let i =
+            by_addr.partition_point(|&it| self.inputs[it as usize].addr <= addr).checked_sub(1)?;
         let s = by_addr[i] as usize;
         let input = &self.inputs[s];
         (addr - input.addr < input.size).then_some(s as u32 + 1)
@@ -1334,7 +1435,10 @@ struct Cie {
 impl Cie {
     /// Reads a CIE after its id, noting where its personality pointer is, and its encoding, in
     /// `personalities`.
-    fn parse(c: &mut cursor::Reader<'_>, personalities: &mut SmallVec<[(usize, u8); 2]>) -> Result<Cie, String> {
+    fn parse(
+        c: &mut cursor::Reader<'_>,
+        personalities: &mut SmallVec<[(usize, u8); 2]>,
+    ) -> Result<Cie, String> {
         let version = c.u8()?;
         if version != 1 && version != 3 {
             // alloc: error path
@@ -1447,7 +1551,9 @@ pub(crate) mod tests {
     use object::macho;
 
     use super::{Autolink, asked_libraries, autolink, read};
-    use crate::model::{Apply, Binding, Data, NativeFixup, Object, SectionKind, Symbol, SymbolDef, SymbolKind};
+    use crate::model::{
+        Apply, Binding, Data, NativeFixup, Object, SectionKind, Symbol, SymbolDef, SymbolKind,
+    };
 
     const TEXT: u32 = macho::S_ATTR_PURE_INSTRUCTIONS.0 | macho::S_ATTR_SOME_INSTRUCTIONS.0;
     const EH_FRAME: u32 = macho::S_COALESCED.to_flags().0
@@ -1492,7 +1598,14 @@ pub(crate) mod tests {
         out.extend_from_slice(&field);
     }
 
-    fn rel(address: u32, symbolnum: u32, pcrel: bool, length: u32, external: bool, kind: u8) -> [u32; 2] {
+    fn rel(
+        address: u32,
+        symbolnum: u32,
+        pcrel: bool,
+        length: u32,
+        external: bool,
+        kind: u8,
+    ) -> [u32; 2] {
         [
             address,
             (symbolnum & 0x00ff_ffff)
@@ -1509,7 +1622,13 @@ pub(crate) mod tests {
 
     impl Obj {
         fn new(cpu: u32) -> Obj {
-            Obj { cpu, subsections: true, sections: Vec::new(), symbols: Vec::new(), options: Vec::new() }
+            Obj {
+                cpu,
+                subsections: true,
+                sections: Vec::new(),
+                symbols: Vec::new(),
+                options: Vec::new(),
+            }
         }
 
         /// Adds a section; returns its 1-based ordinal.
@@ -1553,7 +1672,14 @@ pub(crate) mod tests {
         }
 
         /// Adds an nlist entry; returns its index.
-        fn symbol(&mut self, name: &'static str, n_type: u8, n_sect: u8, n_desc: u16, n_value: u64) -> u32 {
+        fn symbol(
+            &mut self,
+            name: &'static str,
+            n_type: u8,
+            n_sect: u8,
+            n_desc: u16,
+            n_value: u64,
+        ) -> u32 {
             self.symbols.push(Sym { name, n_type, n_sect, n_desc, n_value });
             self.symbols.len() as u32 - 1
         }
@@ -1785,15 +1911,18 @@ pub(crate) mod tests {
         obj.relocate(text, rel(24, t, true, 2, true, macho::ARM64_RELOC_BRANCH26.0));
         let object = obj.read(Arch::Aarch64).unwrap();
         let (t, _) = find(&object, "_t");
-        assert_eq!(fixups(&object, 0), [
-            fixup(0, Apply::A64Page21, t, 16),
-            fixup(4, Apply::A64Lo12 { shift: 0 }, t, 0),
-            fixup(8, Apply::A64Lo12 { shift: 3 }, t, 0),
-            fixup(12, Apply::A64Lo12 { shift: 2 }, t, 0),
-            fixup(16, Apply::A64Lo12 { shift: 4 }, t, 0),
-            fixup(20, Apply::A64Call26, t, -8),
-            fixup(24, Apply::A64Jump26, t, 0),
-        ]);
+        assert_eq!(
+            fixups(&object, 0),
+            [
+                fixup(0, Apply::A64Page21, t, 16),
+                fixup(4, Apply::A64Lo12 { shift: 0 }, t, 0),
+                fixup(8, Apply::A64Lo12 { shift: 3 }, t, 0),
+                fixup(12, Apply::A64Lo12 { shift: 2 }, t, 0),
+                fixup(16, Apply::A64Lo12 { shift: 4 }, t, 0),
+                fixup(20, Apply::A64Call26, t, -8),
+                fixup(24, Apply::A64Jump26, t, 0),
+            ]
+        );
     }
 
     #[test]
@@ -1809,19 +1938,32 @@ pub(crate) mod tests {
         obj.relocate(text, rel(12, g, false, 2, true, macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12.0));
         let object = obj.read(Arch::Aarch64).unwrap();
         let (g, _) = find(&object, "_g");
-        assert_eq!(fixups(&object, 0), [
-            fixup(0, Apply::A64GotPage21, g, 0),
-            fixup(4, Apply::A64GotLo12, g, 0),
-            fixup(8, Apply::TlvPage21, g, 0),
-            fixup(12, Apply::TlvLo12, g, 0),
-        ]);
+        assert_eq!(
+            fixups(&object, 0),
+            [
+                fixup(0, Apply::A64GotPage21, g, 0),
+                fixup(4, Apply::A64GotLo12, g, 0),
+                fixup(8, Apply::TlvPage21, g, 0),
+                fixup(12, Apply::TlvLo12, g, 0),
+            ]
+        );
     }
 
     #[test]
     fn subtractor_and_unsigned_are_one_delta64() {
         for (cpu, arch, subtractor, unsigned) in [
-            (macho::CPU_TYPE_ARM64.0, Arch::Aarch64, macho::ARM64_RELOC_SUBTRACTOR.0, macho::ARM64_RELOC_UNSIGNED.0),
-            (macho::CPU_TYPE_X86_64.0, Arch::X86_64, macho::X86_64_RELOC_SUBTRACTOR.0, macho::X86_64_RELOC_UNSIGNED.0),
+            (
+                macho::CPU_TYPE_ARM64.0,
+                Arch::Aarch64,
+                macho::ARM64_RELOC_SUBTRACTOR.0,
+                macho::ARM64_RELOC_UNSIGNED.0,
+            ),
+            (
+                macho::CPU_TYPE_X86_64.0,
+                Arch::X86_64,
+                macho::X86_64_RELOC_SUBTRACTOR.0,
+                macho::X86_64_RELOC_UNSIGNED.0,
+            ),
         ] {
             let mut obj = Obj::new(cpu);
             let mut bytes = 5u64.to_le_bytes().to_vec();
@@ -1838,10 +1980,25 @@ pub(crate) mod tests {
             let object = obj.read(arch).unwrap();
             let (y, _) = find(&object, "_y");
             let (z, _) = find(&object, "_z");
-            assert_eq!(fixups(&object, 0), [
-                NativeFixup { at: 0, apply: Apply::Delta64, symbol: z, addend: 5, minus: Some(y) },
-                NativeFixup { at: 8, apply: Apply::Delta32, symbol: y, addend: -3, minus: Some(z) },
-            ]);
+            assert_eq!(
+                fixups(&object, 0),
+                [
+                    NativeFixup {
+                        at: 0,
+                        apply: Apply::Delta64,
+                        symbol: z,
+                        addend: 5,
+                        minus: Some(y)
+                    },
+                    NativeFixup {
+                        at: 8,
+                        apply: Apply::Delta32,
+                        symbol: y,
+                        addend: -3,
+                        minus: Some(z)
+                    },
+                ]
+            );
 
             let mut bad = Obj::new(cpu);
             let data = bad.section("__DATA", "__data", 0, vec![0; 8], 3, 0);
@@ -1857,7 +2014,14 @@ pub(crate) mod tests {
     fn local_symbol_plus_addend_targets_the_atom_it_lands_in() {
         // `adrp x0, ltmp0@PAGE + 0x14`: the addend lands in `_b`'s atom, which is what is kept.
         let mut obj = Obj::new(macho::CPU_TYPE_ARM64.0);
-        let text = obj.section("__TEXT", "__text", 0, words(&[0x9000_0000, NOP, NOP, NOP, NOP, NOP]), 2, TEXT);
+        let text = obj.section(
+            "__TEXT",
+            "__text",
+            0,
+            words(&[0x9000_0000, NOP, NOP, NOP, NOP, NOP]),
+            2,
+            TEXT,
+        );
         obj.symbol("ltmp0", SECT, text, 0, 0);
         obj.symbol("_a", SECT | EXT, text, 0, 0);
         obj.symbol("_b", SECT | EXT, text, 0, 16);
@@ -1882,7 +2046,10 @@ pub(crate) mod tests {
         obj.symbol("_f", SECT | EXT, text, 0, 0);
         obj.symbol("_g", SECT | EXT, text, 0, 16);
         obj.relocate(text, rel(3, u32::from(data), true, 2, false, macho::X86_64_RELOC_SIGNED.0));
-        obj.relocate(data, rel(0, u32::from(text), false, 3, false, macho::X86_64_RELOC_UNSIGNED.0));
+        obj.relocate(
+            data,
+            rel(0, u32::from(text), false, 3, false, macho::X86_64_RELOC_UNSIGNED.0),
+        );
         let object = obj.read(Arch::X86_64).unwrap();
         assert_eq!(object.sections.len(), 3);
 
@@ -1890,7 +2057,10 @@ pub(crate) mod tests {
         assert_eq!((pointer.at, pointer.apply, pointer.addend), (0, Apply::Abs64, 4));
         let target = &object.symbols[pointer.symbol as usize];
         assert_eq!(target.def, SymbolDef::Section { section: 1, value: 0, size: 16 });
-        assert_eq!((target.kind, target.binding, object.name(target.name)), (SymbolKind::Section, Binding::Local, ""));
+        assert_eq!(
+            (target.kind, target.binding, object.name(target.name)),
+            (SymbolKind::Section, Binding::Local, "")
+        );
 
         let [lea] = fixups(&object, 0)[..] else { panic!("{:?}", fixups(&object, 0)) };
         assert_eq!((lea.at, lea.apply, lea.addend), (3, Apply::Rel32, -4));
@@ -1914,19 +2084,36 @@ pub(crate) mod tests {
         obj.relocate(text, rel(25, x, true, 2, true, macho::X86_64_RELOC_TLV.0));
         let object = obj.read(Arch::X86_64).unwrap();
         let (x, _) = find(&object, "_x");
-        assert_eq!(fixups(&object, 0), [
-            fixup(2, Apply::Rel32, x, 0),
-            fixup(11, Apply::X86Branch32, x, -4),
-            fixup(18, Apply::X86GotPcRel32, x, -4),
-            fixup(25, Apply::TlvRel32, x, -4),
-        ]);
+        assert_eq!(
+            fixups(&object, 0),
+            [
+                fixup(2, Apply::Rel32, x, 0),
+                fixup(11, Apply::X86Branch32, x, -4),
+                fixup(18, Apply::X86GotPcRel32, x, -4),
+                fixup(25, Apply::TlvRel32, x, -4),
+            ]
+        );
     }
 
     #[test]
     fn thread_local_descriptors() {
         let mut obj = Obj::new(macho::CPU_TYPE_ARM64.0);
-        let vars = obj.section("__DATA", "__thread_vars", 0, vec![0; 24], 3, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0);
-        let tdata = obj.section("__DATA", "__thread_data", 24, vec![7; 8], 3, macho::S_THREAD_LOCAL_REGULAR.to_flags().0);
+        let vars = obj.section(
+            "__DATA",
+            "__thread_vars",
+            0,
+            vec![0; 24],
+            3,
+            macho::S_THREAD_LOCAL_VARIABLES.to_flags().0,
+        );
+        let tdata = obj.section(
+            "__DATA",
+            "__thread_data",
+            24,
+            vec![7; 8],
+            3,
+            macho::S_THREAD_LOCAL_REGULAR.to_flags().0,
+        );
         obj.symbol("_v", SECT | EXT, vars, 0, 0);
         let init = obj.symbol("_v$tlv$init", SECT, tdata, 0, 24);
         let bootstrap = obj.symbol("__tlv_bootstrap", EXT, 0, 0, 0);
@@ -1939,7 +2126,10 @@ pub(crate) mod tests {
         assert_eq!(fixups.len(), 2);
         assert_eq!(fixups[0], fixup(0, Apply::Abs64, bootstrap, 0));
         assert_eq!((fixups[1].at, fixups[1].apply, fixups[1].addend), (16, Apply::DtpOff64, 0));
-        assert_eq!(object.symbols[fixups[1].symbol as usize].def, SymbolDef::Section { section: 1, value: 0, size: 8 });
+        assert_eq!(
+            object.symbols[fixups[1].symbol as usize].def,
+            SymbolDef::Section { section: 1, value: 0, size: 8 }
+        );
     }
 
     #[test]
@@ -1974,7 +2164,8 @@ pub(crate) mod tests {
     fn no_dead_strip_retains_every_atom() {
         let mut obj = Obj::new(macho::CPU_TYPE_ARM64.0);
         let text = obj.section("__TEXT", "__text", 0, words(&[NOP; 2]), 2, TEXT);
-        let kept = obj.section("__DATA", "__kept", 8, vec![0; 16], 3, macho::S_ATTR_NO_DEAD_STRIP.0);
+        let kept =
+            obj.section("__DATA", "__kept", 8, vec![0; 16], 3, macho::S_ATTR_NO_DEAD_STRIP.0);
         obj.symbol("_f", SECT | EXT, text, 0, 0);
         obj.symbol("_k0", SECT | EXT, kept, 0, 8);
         obj.symbol("_k1", SECT | EXT, kept, 0, 16);
@@ -1987,12 +2178,17 @@ pub(crate) mod tests {
     fn live_support_lists_every_atom_and_retains_none() {
         let mut obj = Obj::new(macho::CPU_TYPE_ARM64.0);
         let text = obj.section("__TEXT", "__text", 0, words(&[NOP; 2]), 2, TEXT);
-        let pcs = obj.section("__DATA", "__sancov_pcs", 8, vec![0; 32], 3, macho::S_ATTR_LIVE_SUPPORT.0);
+        let pcs =
+            obj.section("__DATA", "__sancov_pcs", 8, vec![0; 32], 3, macho::S_ATTR_LIVE_SUPPORT.0);
         obj.symbol("_f", SECT | EXT, text, 0, 0);
         obj.symbol("_p0", SECT | EXT, pcs, 0, 8);
         obj.symbol("_p1", SECT | EXT, pcs, 0, 24);
         let object = obj.read(Arch::Aarch64).unwrap();
-        assert_eq!(object.live_support, [1, 2], "both atoms of the live support section, not the text");
+        assert_eq!(
+            object.live_support,
+            [1, 2],
+            "both atoms of the live support section, not the text"
+        );
         assert!(object.sections.iter().all(|it| !it.retain));
         assert!(object.ties.is_empty());
     }
@@ -2004,7 +2200,11 @@ pub(crate) mod tests {
         let s = obj.symbol("_s", EXT, 0, 0, 0);
         obj.relocate(data, rel(0, s, false, 3, true, macho::ARM64_RELOC_AUTHENTICATED_POINTER.0));
         let error = obj.read(Arch::Aarch64).unwrap_err();
-        assert!(error.contains("ARM64_RELOC_AUTHENTICATED_POINTER") && error.contains("__DATA,__data at 0x0"), "{error}");
+        assert!(
+            error.contains("ARM64_RELOC_AUTHENTICATED_POINTER")
+                && error.contains("__DATA,__data at 0x0"),
+            "{error}"
+        );
 
         let mut obj = Obj::new(macho::CPU_TYPE_ARM64.0);
         let data = obj.section("__DATA", "__data", 0, vec![0; 8], 3, 0);
@@ -2062,7 +2262,11 @@ pub(crate) mod tests {
 
     /// An object for `cpu` defining each of `defines` (`_`-prefixed Mach-O names) as a `ret`,
     /// with `options` as its `LC_LINKER_OPTION`s.
-    pub(crate) fn linking(cpu: macho::CpuType, defines: &[&'static str], options: &[&[&'static str]]) -> Vec<u8> {
+    pub(crate) fn linking(
+        cpu: macho::CpuType,
+        defines: &[&'static str],
+        options: &[&[&'static str]],
+    ) -> Vec<u8> {
         let mut obj = Obj::new(cpu.0);
         let ret = match cpu {
             macho::CPU_TYPE_ARM64 => words(&[0xd65f_03c0]),
@@ -2083,11 +2287,27 @@ pub(crate) mod tests {
         assert_eq!(autolink("-framework Security"), Ok(Autolink::Framework("Security")));
         for weak in ["-weak_framework Security", "-weak-lz"] {
             let error = autolink(weak).unwrap_err();
-            assert!(error.contains(weak) && error.contains("weakly") && error.contains("no weak library"), "{error}");
+            assert!(
+                error.contains(weak)
+                    && error.contains("weakly")
+                    && error.contains("no weak library"),
+                "{error}"
+            );
         }
-        for other in ["-l", "-framework", "-needed_framework Security", "-lz extra", "-framework A B", "-force_load x.a", "-Wl,-x"] {
+        for other in [
+            "-l",
+            "-framework",
+            "-needed_framework Security",
+            "-lz extra",
+            "-framework A B",
+            "-force_load x.a",
+            "-Wl,-x",
+        ] {
             let error = autolink(other).unwrap_err();
-            assert!(error.contains(&format!("`{other}`")) && error.contains("none of them"), "{other}: {error}");
+            assert!(
+                error.contains(&format!("`{other}`")) && error.contains("none of them"),
+                "{other}: {error}"
+            );
         }
     }
 
@@ -2095,7 +2315,15 @@ pub(crate) mod tests {
     fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = b"!<arch>\n".to_vec();
         for (name, bytes) in members {
-            let header = format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", format!("{name}/"), 0, 0, 0, 644, bytes.len());
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("{name}/"),
+                0,
+                0,
+                0,
+                644,
+                bytes.len()
+            );
             out.extend_from_slice(header.as_bytes());
             out.extend_from_slice(bytes);
             if out.len() % 2 != 0 {
@@ -2114,21 +2342,32 @@ pub(crate) mod tests {
             [(String::new(), "-lz".to_owned()), (String::new(), "-framework Security".to_owned())],
             "an object's own, each once"
         );
-        assert!(asked_libraries("f.o", &object, Arch::X86_64).unwrap().is_empty(), "an object of another CPU asks nothing");
+        assert!(
+            asked_libraries("f.o", &object, Arch::X86_64).unwrap().is_empty(),
+            "an object of another CPU asks nothing"
+        );
 
         let a = linking(arm, &["_a"], &[&["-framework", "Security"]]);
         let b = linking(arm, &["_b"], &[&["-lc++"], &["-framework", "Security"]]);
         let x86 = linking(macho::CPU_TYPE_X86_64, &["_c"], &[&["-lnope"]]);
-        let archive = ar(&[("a.o", &a), ("b.o", &b), ("x86.o", &x86), ("notes.txt", b"not an object")]);
+        let archive =
+            ar(&[("a.o", &a), ("b.o", &b), ("x86.o", &x86), ("notes.txt", b"not an object")]);
         assert_eq!(
             asked_libraries("libsec.a", &archive, Arch::Aarch64).unwrap(),
-            [("a.o".to_owned(), "-framework Security".to_owned()), ("b.o".to_owned(), "-lc++".to_owned())],
+            [
+                ("a.o".to_owned(), "-framework Security".to_owned()),
+                ("b.o".to_owned(), "-lc++".to_owned())
+            ],
             "every member's, each library once (the first member asking), other members asking nothing"
         );
 
         let bad = linking(arm, &["_d"], &[&["-needed_framework", "Security"]]);
-        let error = asked_libraries("libbad.a", &ar(&[("a.o", &a), ("d.o", &bad)]), Arch::Aarch64).unwrap_err();
-        assert!(error.contains("libbad.a(d.o)") && error.contains("-needed_framework Security"), "{error}");
+        let error = asked_libraries("libbad.a", &ar(&[("a.o", &a), ("d.o", &bad)]), Arch::Aarch64)
+            .unwrap_err();
+        assert!(
+            error.contains("libbad.a(d.o)") && error.contains("-needed_framework Security"),
+            "{error}"
+        );
         let weak = linking(arm, &["_w"], &[&["-weak-lz"]]);
         let error = asked_libraries("w.o", &weak, Arch::Aarch64).unwrap_err();
         assert!(error.starts_with("w.o: ") && error.contains("-weak-lz"), "{error}");
@@ -2145,7 +2384,10 @@ pub(crate) mod tests {
         }
         fat.resize(0x4000, 0);
         fat.extend_from_slice(&arm);
-        assert_eq!(asked_libraries("fat.o", &fat, Arch::Aarch64).unwrap(), [(String::new(), "-lz".to_owned())]);
+        assert_eq!(
+            asked_libraries("fat.o", &fat, Arch::Aarch64).unwrap(),
+            [(String::new(), "-lz".to_owned())]
+        );
         let error = asked_libraries("fat.o", &fat, Arch::X86_64).unwrap_err();
         assert!(error.contains("without a slice"), "{error}");
     }
@@ -2172,7 +2414,9 @@ pub(crate) mod tests {
         let object = obj.read(Arch::X86_64).unwrap();
         let eh = &object.sections[2];
         assert_eq!(eh.what, SectionKind::EhFrame);
-        let [pc_begin] = object.section_fixups(eh)[..] else { panic!("{:?}", object.section_fixups(eh)) };
+        let [pc_begin] = object.section_fixups(eh)[..] else {
+            panic!("{:?}", object.section_fixups(eh))
+        };
         assert_eq!((pc_begin.at, pc_begin.apply, pc_begin.addend), (28, Apply::Rel64, 0));
         let target = &object.symbols[pc_begin.symbol as usize];
         assert_eq!(target.def, SymbolDef::Section { section: 1, value: 0, size: 16 });
@@ -2212,11 +2456,14 @@ pub(crate) mod tests {
         let got: Vec<(u64, Apply, i64, SymbolDef)> = (object.section_fixups(eh).iter())
             .map(|it| (it.at, it.apply, it.addend, object.symbols[it.symbol as usize].def))
             .collect();
-        assert_eq!(got, [
-            (28, Apply::Rel64, 0, SymbolDef::Section { section: 1, value: 0, size: 16 }),
-            (76, Apply::Rel64, 0, SymbolDef::Section { section: 2, value: 0, size: 16 }),
-            (104, Apply::Rel64, 0, SymbolDef::Section { section: 0, value: 0, size: 16 }),
-        ]);
+        assert_eq!(
+            got,
+            [
+                (28, Apply::Rel64, 0, SymbolDef::Section { section: 1, value: 0, size: 16 }),
+                (76, Apply::Rel64, 0, SymbolDef::Section { section: 2, value: 0, size: 16 }),
+                (104, Apply::Rel64, 0, SymbolDef::Section { section: 0, value: 0, size: 16 }),
+            ]
+        );
     }
 
     /// What clang writes for an FDE's `pc_begin` on both CPUs: a SUBTRACTOR of `ltmp1` (the
@@ -2226,8 +2473,18 @@ pub(crate) mod tests {
     #[test]
     fn eh_frame_subtractor_of_its_own_section_is_pc_relative() {
         for (cpu, arch, subtractor, unsigned) in [
-            (macho::CPU_TYPE_ARM64.0, Arch::Aarch64, macho::ARM64_RELOC_SUBTRACTOR.0, macho::ARM64_RELOC_UNSIGNED.0),
-            (macho::CPU_TYPE_X86_64.0, Arch::X86_64, macho::X86_64_RELOC_SUBTRACTOR.0, macho::X86_64_RELOC_UNSIGNED.0),
+            (
+                macho::CPU_TYPE_ARM64.0,
+                Arch::Aarch64,
+                macho::ARM64_RELOC_SUBTRACTOR.0,
+                macho::ARM64_RELOC_UNSIGNED.0,
+            ),
+            (
+                macho::CPU_TYPE_X86_64.0,
+                Arch::X86_64,
+                macho::X86_64_RELOC_SUBTRACTOR.0,
+                macho::X86_64_RELOC_UNSIGNED.0,
+            ),
         ] {
             let mut obj = Obj::new(cpu);
             let text = obj.section("__TEXT", "__text", 0, vec![0; 32], 4, TEXT);
@@ -2257,10 +2514,18 @@ pub(crate) mod tests {
             let (g, _) = find(&object, "_g");
             let eh = &object.sections[2];
             assert_eq!(eh.what, SectionKind::EhFrame);
-            let [direct, local] = object.section_fixups(eh) else { panic!("{:?}", object.section_fixups(eh)) };
+            let [direct, local] = object.section_fixups(eh) else {
+                panic!("{:?}", object.section_fixups(eh))
+            };
             assert_eq!(*direct, fixup(28, Apply::Rel64, g, 0));
-            assert_eq!((local.at, local.apply, local.addend, local.minus), (56, Apply::Rel64, 0, None));
-            assert_eq!(object.symbols[local.symbol as usize].def, SymbolDef::Section { section: 1, value: 0, size: 16 });
+            assert_eq!(
+                (local.at, local.apply, local.addend, local.minus),
+                (56, Apply::Rel64, 0, None)
+            );
+            assert_eq!(
+                object.symbols[local.symbol as usize].def,
+                SymbolDef::Section { section: 1, value: 0, size: 16 }
+            );
 
             // A section's UNSIGNED after it is refused by name, not guessed at.
             let mut bad = Obj::new(cpu);
@@ -2279,7 +2544,11 @@ pub(crate) mod tests {
             bad.relocate(frame, rel(28, ltmp1, false, 3, true, subtractor));
             bad.relocate(frame, rel(28, 1, false, 3, false, unsigned));
             let error = bad.read(arch).unwrap_err();
-            assert!(error.contains("__TEXT,__eh_frame at 0x1c") && error.contains("UNSIGNED of section 1"), "{error}");
+            assert!(
+                error.contains("__TEXT,__eh_frame at 0x1c")
+                    && error.contains("UNSIGNED of section 1"),
+                "{error}"
+            );
         }
     }
 
@@ -2298,7 +2567,8 @@ pub(crate) mod tests {
         obj.symbol("_d", SECT | EXT, data, 0, text_len);
         for i in 0..n {
             let undefined = obj.symbol(leak(format!("_u{i}")), EXT, 0, 0, 0);
-            let unsigned = rel(8 * i as u32, undefined, false, 3, true, macho::X86_64_RELOC_UNSIGNED.0);
+            let unsigned =
+                rel(8 * i as u32, undefined, false, 3, true, macho::X86_64_RELOC_UNSIGNED.0);
             obj.relocate(data, unsigned);
         }
         let frame = text_len + data_len;
@@ -2327,7 +2597,10 @@ pub(crate) mod tests {
         let eh = object.section_fixups(&object.sections[101]);
         assert_eq!(eh.len(), 100);
         for (i, fixup) in eh.iter().enumerate() {
-            assert_eq!((fixup.at, fixup.apply, fixup.addend), (20 + 28 * i as u64 + 8, Apply::Rel64, 0));
+            assert_eq!(
+                (fixup.at, fixup.apply, fixup.addend),
+                (20 + 28 * i as u64 + 8, Apply::Rel64, 0)
+            );
             let def = object.symbols[fixup.symbol as usize].def;
             assert_eq!(def, SymbolDef::Section { section: i as u32, value: 0, size: 16 });
         }
@@ -2352,7 +2625,9 @@ pub(crate) mod tests {
     /// each atom's bytes copied out of its section.
     fn model(obj: &Obj) -> (Vec<Atom>, Vec<Seen>) {
         let n = obj.sections.len();
-        let splits = |s: usize| obj.subsections && obj.sections[s].flags != macho::S_CSTRING_LITERALS.to_flags().0;
+        let splits = |s: usize| {
+            obj.subsections && obj.sections[s].flags != macho::S_CSTRING_LITERALS.to_flags().0
+        };
         let mut starts: Vec<Vec<u64>> = vec![vec![0]; n];
         let mut bounds: Vec<Vec<u64>> = vec![Vec::new(); n];
         for sym in &obj.symbols {
@@ -2405,7 +2680,11 @@ pub(crate) mod tests {
                     value: offset - starts[s][j],
                     size: next.min(end) - offset,
                 };
-                let kind = if obj.sections[s].flags & TEXT != 0 { SymbolKind::Function } else { SymbolKind::Data };
+                let kind = if obj.sections[s].flags & TEXT != 0 {
+                    SymbolKind::Function
+                } else {
+                    SymbolKind::Data
+                };
                 (def, kind)
             } else {
                 (SymbolDef::Undefined, SymbolKind::Other)
@@ -2430,30 +2709,36 @@ pub(crate) mod tests {
                     u64::from_le_bytes(word)
                 };
                 let symbolnum = word1 & 0x00ff_ffff;
-                let (apply, symbol, addend) = if (word1 >> 28) as u8 == macho::ARM64_RELOC_BRANCH26.0 {
-                    let call = field(4) & 0x8000_0000 != 0;
-                    (if call { Apply::A64Call26 } else { Apply::A64Jump26 }, symbolnum, 0)
-                } else if word1 >> 27 & 1 != 0 {
-                    (Apply::Abs64, symbolnum, field(8) as i64)
-                } else {
-                    let t = symbolnum as usize - 1;
-                    let offset = field(8) - obj.sections[t].addr;
-                    let j = atom(t, offset);
-                    let at_atom = first[t] + j;
-                    let symbol = *section_symbols[at_atom].get_or_insert_with(|| {
-                        symbols.push((
-                            String::new(),
-                            SymbolDef::Section { section: at_atom as u32, value: 0, size: atoms[at_atom].2.len() },
-                            Binding::Local,
-                            SymbolKind::Section,
-                            false,
-                        ));
-                        symbols.len() as u32 - 1
-                    });
-                    (Apply::Abs64, symbol, (offset - starts[t][j]) as i64)
-                };
+                let (apply, symbol, addend) =
+                    if (word1 >> 28) as u8 == macho::ARM64_RELOC_BRANCH26.0 {
+                        let call = field(4) & 0x8000_0000 != 0;
+                        (if call { Apply::A64Call26 } else { Apply::A64Jump26 }, symbolnum, 0)
+                    } else if word1 >> 27 & 1 != 0 {
+                        (Apply::Abs64, symbolnum, field(8) as i64)
+                    } else {
+                        let t = symbolnum as usize - 1;
+                        let offset = field(8) - obj.sections[t].addr;
+                        let j = atom(t, offset);
+                        let at_atom = first[t] + j;
+                        let symbol = *section_symbols[at_atom].get_or_insert_with(|| {
+                            symbols.push((
+                                String::new(),
+                                SymbolDef::Section {
+                                    section: at_atom as u32,
+                                    value: 0,
+                                    size: atoms[at_atom].2.len(),
+                                },
+                                Binding::Local,
+                                SymbolKind::Section,
+                                false,
+                            ));
+                            symbols.len() as u32 - 1
+                        });
+                        (Apply::Abs64, symbol, (offset - starts[t][j]) as i64)
+                    };
                 let j = atom(s, at);
-                let fixup = NativeFixup { at: at - starts[s][j], apply, symbol, addend, minus: None };
+                let fixup =
+                    NativeFixup { at: at - starts[s][j], apply, symbol, addend, minus: None };
                 atoms[first[s] + j].3.push(fixup);
             }
         }
@@ -2467,7 +2752,8 @@ pub(crate) mod tests {
     /// alternate entries at random places; `BRANCH26` and extern and non-extern `UNSIGNED`
     /// relocations in a shuffled table.
     fn seeded(seed: u64) -> Obj {
-        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15 ^ (seed + 1).wrapping_mul(0x2545_f491_4f6c_dd1d));
+        let mut rng =
+            SplitMix64::new(0x9e37_79b9_7f4a_7c15 ^ (seed + 1).wrapping_mul(0x2545_f491_4f6c_dd1d));
         const KINDS: [(&str, &str, u32); 4] = [
             ("__TEXT", "__text", TEXT),
             ("__DATA", "__data", 0),
@@ -2519,15 +2805,36 @@ pub(crate) mod tests {
                 }
                 let target = undefined[rng.below(undefined.len() as u64) as usize];
                 if kind == 0 {
-                    relocations.push(rel(at as u32, target, true, 2, true, macho::ARM64_RELOC_BRANCH26.0));
+                    relocations.push(rel(
+                        at as u32,
+                        target,
+                        true,
+                        2,
+                        true,
+                        macho::ARM64_RELOC_BRANCH26.0,
+                    ));
                 } else if rng.below(2) == 0 {
-                    relocations.push(rel(at as u32, target, false, 3, true, macho::ARM64_RELOC_UNSIGNED.0));
+                    relocations.push(rel(
+                        at as u32,
+                        target,
+                        false,
+                        3,
+                        true,
+                        macho::ARM64_RELOC_UNSIGNED.0,
+                    ));
                 } else {
                     let t = rng.below(layout.len() as u64) as usize;
                     let (_, t_addr, t_size, _) = layout[t];
                     let pointer = t_addr + rng.below(t_size + 1);
                     data[at as usize..at as usize + 8].copy_from_slice(&pointer.to_le_bytes());
-                    relocations.push(rel(at as u32, t as u32 + 1, false, 3, false, macho::ARM64_RELOC_UNSIGNED.0));
+                    relocations.push(rel(
+                        at as u32,
+                        t as u32 + 1,
+                        false,
+                        3,
+                        false,
+                        macho::ARM64_RELOC_UNSIGNED.0,
+                    ));
                 }
             }
             for i in (1..relocations.len()).rev() {
@@ -2547,10 +2854,13 @@ pub(crate) mod tests {
         for seed in 0..256 {
             let obj = seeded(seed);
             let input = obj.bytes();
-            let object = read("test.o", &input, Arch::Aarch64).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            let object = read("test.o", &input, Arch::Aarch64)
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
             let (atoms, symbols) = model(&obj);
             assert_eq!(object.sections.len(), atoms.len(), "seed {seed}");
-            for (i, (got, (name, align, data, fixups))) in object.sections.iter().zip(&atoms).enumerate() {
+            for (i, (got, (name, align, data, fixups))) in
+                object.sections.iter().zip(&atoms).enumerate()
+            {
                 assert_eq!(
                     (
                         object.name(got.name),
@@ -2566,8 +2876,9 @@ pub(crate) mod tests {
             }
             assert_eq!(seen(&object), symbols, "seed {seed}");
             // The arena holds each Mach-O section's name once and each symbol's, nothing else.
-            let named = (obj.sections.iter()).map(|it| it.segment.len() + 1 + it.name.len()).sum::<usize>()
-                + symbols.iter().map(|it| it.0.len()).sum::<usize>();
+            let named =
+                (obj.sections.iter()).map(|it| it.segment.len() + 1 + it.name.len()).sum::<usize>()
+                    + symbols.iter().map(|it| it.0.len()).sum::<usize>();
             assert_eq!(object.names.bytes(), named, "seed {seed}");
             // Every fixup is in exactly one atom's run, in atom order.
             let mut next = 0;
@@ -2587,13 +2898,15 @@ pub(crate) mod tests {
             let obj = seeded(seed);
             let bytes = obj.bytes();
             let (atoms, _) = model(&obj);
-            let aligned = read("test.o", &bytes, Arch::Aarch64).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            let aligned = read("test.o", &bytes, Arch::Aarch64)
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
             // From unaligned slices too, read in place: the ranges are of the slice given.
             for shift in [0, 1, 3, 7] {
                 let mut shifted = vec![0u8; shift];
                 shifted.extend_from_slice(&bytes);
                 let input = &shifted[shift..];
-                let object = read("test.o", input, Arch::Aarch64).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+                let object = read("test.o", input, Arch::Aarch64)
+                    .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
                 assert_eq!(object.sections.len(), atoms.len(), "seed {seed}");
                 for (i, (got, atom)) in object.sections.iter().zip(&atoms).enumerate() {
                     match (&got.data, &atom.2) {
@@ -2602,13 +2915,22 @@ pub(crate) mod tests {
                                 .ok()
                                 .zip(usize::try_from(range.end).ok())
                                 .and_then(|(start, end)| input.get(start..end));
-                            assert_eq!(held, Some(&copy[..]), "seed {seed}, shift {shift}, atom {i}");
-                            assert_eq!(got.data, aligned.sections[i].data, "seed {seed}, shift {shift}, atom {i}");
+                            assert_eq!(
+                                held,
+                                Some(&copy[..]),
+                                "seed {seed}, shift {shift}, atom {i}"
+                            );
+                            assert_eq!(
+                                got.data, aligned.sections[i].data,
+                                "seed {seed}, shift {shift}, atom {i}"
+                            );
                         }
                         (Data::Zero(got), Data::Zero(want)) => {
                             assert_eq!(got, want, "seed {seed}, shift {shift}, atom {i}");
                         }
-                        (got, want) => panic!("seed {seed}, shift {shift}, atom {i}: {got:?}, the old copy {want:?}"),
+                        (got, want) => panic!(
+                            "seed {seed}, shift {shift}, atom {i}: {got:?}, the old copy {want:?}"
+                        ),
                     }
                 }
             }

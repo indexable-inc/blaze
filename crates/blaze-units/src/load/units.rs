@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::targets::TargetKind;
@@ -20,6 +19,7 @@ use blaze_resolve::resolver::{
 use blaze_resolve::{Cfg, InternedString, PackageId, Platform};
 use cargo_util_schemas::core::PartialVersion;
 use cargo_util_schemas::manifest::{ProfileName, RustVersion, TomlProfile, TomlProfiles};
+use std::alloc::Global;
 
 use super::files::Snap;
 use super::manifest::WorkspaceRead;
@@ -75,7 +75,11 @@ pub(crate) fn units(
     let Platforms { host, host_flags, target, target_flags, macro_wasm } = &platforms;
     let requested = match &spec.foreign {
         Some(ask) => ask.profile.root.clone(),
-        None => match requested_profile(spec.intent.default_profile(), spec.release, spec.profile.as_deref()) {
+        None => match requested_profile(
+            spec.intent.default_profile(),
+            spec.release,
+            spec.profile.as_deref(),
+        ) {
             Ok(it) => it,
             Err(error) => return Ok(fail(error)),
         },
@@ -87,7 +91,13 @@ pub(crate) fn units(
         },
         None => ws.profiles().cloned(),
     };
-    let mut profiles = match Profiles::new(manifest_profiles.as_ref(), ws.unstable_features(), config, &requested, &host.triple) {
+    let mut profiles = match Profiles::new(
+        manifest_profiles.as_ref(),
+        ws.unstable_features(),
+        config,
+        &requested,
+        &host.triple,
+    ) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
@@ -105,9 +115,15 @@ pub(crate) fn units(
     warnings.extend(read.warnings.iter().cloned());
     warnings.extend(resolved.warnings.iter().cloned());
     {
-        let pkgs: Vec<&blaze_manifest::manifest::PackageId> =
-            resolved.resolve.iter().filter_map(|id| resolved.manifests.get(&id)).map(|(_, m)| &m.package_id).collect();
-        if let Err(error) = profiles.validate_packages(manifest_profiles.as_ref(), &pkgs, &mut warnings) {
+        let pkgs: Vec<&blaze_manifest::manifest::PackageId> = resolved
+            .resolve
+            .iter()
+            .filter_map(|id| resolved.manifests.get(&id))
+            .map(|(_, m)| &m.package_id)
+            .collect();
+        if let Err(error) =
+            profiles.validate_packages(manifest_profiles.as_ref(), &pkgs, &mut warnings)
+        {
             return Ok(fail(error));
         }
     }
@@ -122,27 +138,39 @@ pub(crate) fn units(
         None => vec![CompileKind::Host],
     };
     let opts = FeatureOpts::new(resolved.behavior, resolved.has_dev_units, ForceAllTargets::No);
-    let members: Vec<_> = resolved.feature_members.iter().map(|(summary, features)| (summary, features.clone())).collect();
-    let features = match FeatureResolver::resolve(&targets, &resolved.resolve, &members, &kinds, opts) {
-        Ok(it) => it,
-        Err(error) => return Ok(fail(error)),
-    };
+    let members: Vec<_> = resolved
+        .feature_members
+        .iter()
+        .map(|(summary, features)| (summary, features.clone()))
+        .collect();
+    let features =
+        match FeatureResolver::resolve(&targets, &resolved.resolve, &members, &kinds, opts) {
+            Ok(it) => it,
+            Err(error) => return Ok(fail(error)),
+        };
     let all_ids: Vec<PackageId> = resolved.resolve.iter().collect();
     // A foreign workspace's roots are the packages it names (cargo's `generate_std_roots`),
     // which need not be the packages it resolves for.
     let root_specs: Vec<blaze_resolve::PackageIdSpec> = match &spec.foreign {
-        Some(ask) => match ask.roots.iter().map(|name| blaze_resolve::PackageIdSpec::parse(name)).collect() {
-            Ok(it) => it,
-            Err(error) => return Ok(fail(error)),
-        },
+        Some(ask) => {
+            match ask.roots.iter().map(|name| blaze_resolve::PackageIdSpec::parse(name)).collect() {
+                Ok(it) => it,
+                Err(error) => return Ok(fail(error)),
+            }
+        }
         None => resolved.specs.clone(),
     };
-    let roots = match root_specs.iter().map(|spec| spec.query(&all_ids)).collect::<anyhow::Result<Vec<_>>>() {
+    let roots = match root_specs
+        .iter()
+        .map(|spec| spec.query(&all_ids))
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
     let members: HashSet<PackageId, Global> = resolved.member_ids.iter().copied().collect();
-    let mut by_id: HashMap<PackageId, Package<'_>, Global> = HashMap::with_capacity_in(all_ids.len(), Global);
+    let mut by_id: HashMap<PackageId, Package<'_>, Global> =
+        HashMap::with_capacity_in(all_ids.len(), Global);
     let mut packages_by_spec: BySpec<'_> = HashMap::with_capacity_in(all_ids.len(), Global);
     for id in &all_ids {
         let Some((_, manifest)) = resolved.manifests.get(id) else { continue };
@@ -160,7 +188,10 @@ pub(crate) fn units(
     let mut test_sandbox: HashMap<PackageId, TestSandbox, Global> = HashMap::new_in(Global);
     for (spec, (id, package)) in &packages_by_spec {
         let own = match package.is_member {
-            true => match super::sandbox::package(package.manifest.custom_metadata.as_ref(), resolved.manifests[id].0) {
+            true => match super::sandbox::package(
+                package.manifest.custom_metadata.as_ref(),
+                resolved.manifests[id].0,
+            ) {
                 Ok(it) => it,
                 Err(error) => return Ok(Staged::Failed(error)),
             },
@@ -222,10 +253,14 @@ pub(crate) fn units(
             Ok(it) => it,
             Err(error) => return Ok(Staged::Failed(error)),
         };
-        for unit in graph.units.iter_mut().filter(|it| !it.macro_wasm && it.profile.panic == "unwind") {
+        for unit in
+            graph.units.iter_mut().filter(|it| !it.macro_wasm && it.profile.panic == "unwind")
+        {
             let aborts = match (&unit.platform, &target) {
                 (None, _) => host_aborts,
-                (Some(triple), Some(target)) if *triple == target.triple => target_aborts == Some(true),
+                (Some(triple), Some(target)) if *triple == target.triple => {
+                    target_aborts == Some(true)
+                }
                 (Some(triple), _) => {
                     return Ok(fail(anyhow::anyhow!(
                         "the unit graph has a unit of `{}` ({}) for {triple}, which the build is not for",
@@ -277,7 +312,11 @@ pub(crate) fn units(
                 });
                 match found {
                     Some(at) => named.push((name.clone(), at)),
-                    None => return Ok(fail(anyhow::anyhow!("package `{name}` has no library unit among the roots"))),
+                    None => {
+                        return Ok(fail(anyhow::anyhow!(
+                            "package `{name}` has no library unit among the roots"
+                        )));
+                    }
                 }
             }
             named
@@ -298,7 +337,9 @@ pub(crate) fn units(
             // another for its macros, of one triple), in `BuiltFor`'s order.
             let mut platforms_used: Vec<BuiltFor<'_>> = [
                 Some(BuiltFor { platform: None, macro_wasm: false }),
-                target.as_ref().map(|it| BuiltFor { platform: Some(it.triple.as_str()), macro_wasm: false }),
+                target
+                    .as_ref()
+                    .map(|it| BuiltFor { platform: Some(it.triple.as_str()), macro_wasm: false }),
                 macro_platform.map(|triple| BuiltFor { platform: Some(triple), macro_wasm: true }),
             ]
             .into_iter()
@@ -306,7 +347,9 @@ pub(crate) fn units(
             .filter(|it| graph.units.iter().any(|unit| unit.built_for() == *it))
             .collect(); // alloc: at most three, once per load
             platforms_used.sort();
-            if let Some(unit) = graph.units.iter().find(|unit| !platforms_used.contains(&unit.built_for())) {
+            if let Some(unit) =
+                graph.units.iter().find(|unit| !platforms_used.contains(&unit.built_for()))
+            {
                 return Ok(fail(anyhow::anyhow!(
                     "the unit graph has a unit of `{}` ({}) built for {}, which is none of the build's \
                      platforms: the host, its target {:?} and its wasm macros' {macro_platform:?}",
@@ -332,7 +375,16 @@ pub(crate) fn units(
                     Some(_) => target_flags.clone(),
                     None => host_flags.clone(),
                 };
-                let key = match std_key(spec, &graph, &packages_by_spec, &base, &profiles, triple, rustflags, built_for) {
+                let key = match std_key(
+                    spec,
+                    &graph,
+                    &packages_by_spec,
+                    &base,
+                    &profiles,
+                    triple,
+                    rustflags,
+                    built_for,
+                ) {
                     Ok(it) => it,
                     Err(error) => return Ok(Staged::Failed(error)),
                 };
@@ -344,10 +396,11 @@ pub(crate) fn units(
                     attach_std(&mut graph, roots, built_for, &links_runtime);
                     continue;
                 }
-                let std = match ctx.files().with_cx(|cx| cx.get::<StdUnits>(&key).map(|it| it.get()))? {
-                    StdPlanned::Ready(std) => std,
-                    StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
-                };
+                let std =
+                    match ctx.files().with_cx(|cx| cx.get::<StdUnits>(&key).map(|it| it.get()))? {
+                        StdPlanned::Ready(std) => std,
+                        StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
+                    };
                 // Named by its key alone, never by the workspace: every workspace on the daemon
                 // asking for the same std names the same outputs, and builds it once.
                 if !Path::new(&spec.std).is_absolute() {
@@ -357,7 +410,15 @@ pub(crate) fn units(
                     )));
                 }
                 let out = format!("{}/{:x}", spec.std, id);
-                let roots = merge_std(&mut graph, &mut std_plans, &mut std_packages, std, built_for, &out, &links_runtime);
+                let roots = merge_std(
+                    &mut graph,
+                    &mut std_plans,
+                    &mut std_packages,
+                    std,
+                    built_for,
+                    &out,
+                    &links_runtime,
+                );
                 if let Err(error) = runs_as_keyed(&graph, &roots, &key, id, built_for) {
                     return Ok(Staged::Failed(error));
                 }
@@ -411,14 +472,23 @@ pub(crate) fn units(
     for (here, std) in planned.plans.into_iter().zip(std_plans) {
         match here.or(std) {
             Some(plan) => plans.push(plan),
-            None => return Ok(Staged::Failed(LoadError { what: "a unit has no plan".to_owned(), at: at.clone() })),
+            None => {
+                return Ok(Staged::Failed(LoadError {
+                    what: "a unit has no plan".to_owned(),
+                    at: at.clone(),
+                }));
+            }
         }
     }
     if let Some(ask) = &spec.foreign {
         let ours = |at: &Path| at.display().to_string();
         let prefixes = [
             ours(&Path::new(FOREIGN_TARGET).join(&ask.triple).join(&dir_name)),
-            ours(&Path::new(FOREIGN_TARGET).join(super::plan::macro_dir(&ask.triple)).join(&dir_name)),
+            ours(
+                &Path::new(FOREIGN_TARGET)
+                    .join(super::plan::macro_dir(&ask.triple))
+                    .join(&dir_name),
+            ),
             ours(&Path::new(FOREIGN_TARGET).join(&dir_name)),
         ];
         for plan in &mut plans {
@@ -436,7 +506,12 @@ pub(crate) fn units(
         let tests = test_sandbox.remove(id).unwrap_or_default();
         let manifest_path = resolved.manifests[id].0;
         let metadata = package.manifest.custom_metadata.as_ref();
-        match super::sandbox::const_macros(metadata, manifest_path, ws.root_manifest(), const_macros_on) {
+        match super::sandbox::const_macros(
+            metadata,
+            manifest_path,
+            ws.root_manifest(),
+            const_macros_on,
+        ) {
             Ok(const_macros) => packages.push(package_plan(
                 *id,
                 package.manifest,
@@ -475,7 +550,13 @@ pub(crate) fn units(
                     })
                 })
                 .collect();
-            match super::native::needed(ctx.files(), ws.custom_metadata(), ws.root_manifest(), &host.triple, &runs) {
+            match super::native::needed(
+                ctx.files(),
+                ws.custom_metadata(),
+                ws.root_manifest(),
+                &host.triple,
+                &runs,
+            ) {
                 Ok(it) => it,
                 Err(error) => return Ok(Staged::Failed(error)),
             }
@@ -517,7 +598,9 @@ fn jobs(config: &blaze_manifest::Config<Snap>, asked: Option<u32>) -> anyhow::Re
             Ok(0) => anyhow::bail!("jobs may not be 0"),
             Ok(n) if n > 0 => Some(n as u32),
             Ok(_) => None,
-            Err(_) => anyhow::bail!("could not parse `{it}`. Number of parallel jobs should be `default` or a number."),
+            Err(_) => anyhow::bail!(
+                "could not parse `{it}`. Number of parallel jobs should be `default` or a number."
+            ),
         },
     })
 }
@@ -568,7 +651,9 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
     let error = |what: String| LoadError { what, at: None };
     if let Some(ask) = &spec.foreign {
         let parse = |cfg: &[String]| -> Result<Vec<Cfg>, LoadError> {
-            cfg.iter().map(|it| it.parse::<Cfg>().map_err(|e| error(format!("the cfg `{it}`: {e}")))).collect()
+            cfg.iter()
+                .map(|it| it.parse::<Cfg>().map_err(|e| error(format!("the cfg `{it}`: {e}"))))
+                .collect()
         };
         return Ok(Platforms {
             host: Platformed { triple: ask.host.clone(), cfg: parse(&ask.host_cfg)? },
@@ -592,16 +677,19 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
                 [one] => Some(one.clone()),
                 _ => {
                     return Err(error(
-                        "blaze builds for one target at a time, and `build.target` names several".to_owned(),
+                        "blaze builds for one target at a time, and `build.target` names several"
+                            .to_owned(),
                     ));
                 }
             }
         }
     };
     let platform = |triple: &str| -> Result<(Platformed, Vec<String>), LoadError> {
-        let rustflags = super::plan::platform_rustflags(config, triple, &spec.host, target.as_deref())?;
+        let rustflags =
+            super::plan::platform_rustflags(config, triple, &spec.host, target.as_deref())?;
         let args = CfgArgs::from_flags(&rustflags).map_err(error)?;
-        let cfg = platform::target_cfgs(triple, &CfgArgs { proc_macro: true, ..args }).map_err(error)?;
+        let cfg =
+            platform::target_cfgs(triple, &CfgArgs { proc_macro: true, ..args }).map_err(error)?;
         Ok((Platformed { triple: triple.to_owned(), cfg }, rustflags))
     };
     let (host, host_flags) = platform(&spec.host)?;
@@ -614,8 +702,11 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
     // `schema::Unit::macro_wasm`, never by their triple.
     let macro_wasm = match spec.macro_wasm {
         true => {
-            let cfg = platform::target_cfgs(super::MACRO_WASM, &CfgArgs { proc_macro: true, ..CfgArgs::default() })
-                .map_err(error)?;
+            let cfg = platform::target_cfgs(
+                super::MACRO_WASM,
+                &CfgArgs { proc_macro: true, ..CfgArgs::default() },
+            )
+            .map_err(error)?;
             Some(Platformed { triple: super::MACRO_WASM.to_owned(), cfg })
         }
         false => None,
@@ -653,7 +744,10 @@ fn run_filter(spec: &Spec, resolved: &Resolved<'_>) -> anyhow::Result<Filter> {
     if !spec.run || !matches!(spec.filter, Filter::Default { .. }) {
         return Ok(spec.filter.clone());
     }
-    let selected = resolved.member_ids.iter().filter(|id| resolved.specs.iter().any(|spec| spec.matches(**id)));
+    let selected = resolved
+        .member_ids
+        .iter()
+        .filter(|id| resolved.specs.iter().any(|spec| spec.matches(**id)));
     let default_runs: Vec<&str> = selected
         .filter_map(|id| resolved.manifests.get(id))
         .filter_map(|(_, manifest)| manifest.default_run.as_deref())
@@ -683,8 +777,14 @@ fn run_one(graph: &schema::UnitGraph, filter: &Filter) -> anyhow::Result<()> {
     match runnable.as_slice() {
         [] if !specific => anyhow::bail!("a bin target must be available for `cargo run`"),
         [] => Ok(()),
-        [one] if one.target.kind.iter().any(|it| it == "example") && !one.target.crate_types.iter().any(|it| it == "bin") => {
-            anyhow::bail!("example target `{}` is a library and cannot be executed", one.target.name)
+        [one]
+            if one.target.kind.iter().any(|it| it == "example")
+                && !one.target.crate_types.iter().any(|it| it == "bin") =>
+        {
+            anyhow::bail!(
+                "example target `{}` is a library and cannot be executed",
+                one.target.name
+            )
         }
         [_] => Ok(()),
         _ if !specific => {
@@ -695,7 +795,9 @@ fn run_one(graph: &schema::UnitGraph, filter: &Filter) -> anyhow::Result<()> {
                 names.join(", ")
             )
         }
-        _ => anyhow::bail!("`cargo run` can run at most one executable, but multiple were specified"),
+        _ => {
+            anyhow::bail!("`cargo run` can run at most one executable, but multiple were specified")
+        }
     }
 }
 
@@ -704,22 +806,38 @@ type BySpec<'a> = HashMap<String, (PackageId, Package<'a>), Global>;
 
 /// The first unit that depends on an artifact dependency (`-Z bindeps`, #601), which blaze
 /// does not build: refused, naming both. Units that depend on none build.
-fn artifact_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, resolved: &Resolved<'_>) -> Option<LoadError> {
+fn artifact_refusal(
+    graph: &schema::UnitGraph,
+    packages: &BySpec<'_>,
+    resolved: &Resolved<'_>,
+) -> Option<LoadError> {
     for unit in &graph.units {
         let Some((id, package)) = packages.get(unit.pkg_id.as_str()) else { continue };
         if !package.manifest.dependencies.iter().any(|dep| dep.artifact.is_some()) {
             continue;
         }
         let script = unit.target.is_custom_build() && unit.mode != Mode::RunCustomBuild;
-        let dev = matches!(unit.mode, Mode::Test) || unit.target.kind.iter().any(|it| matches!(it.as_str(), "test" | "bench" | "example"));
+        let dev = matches!(unit.mode, Mode::Test)
+            || unit
+                .target
+                .kind
+                .iter()
+                .any(|it| matches!(it.as_str(), "test" | "bench" | "example"));
         let used = |kind: blaze_manifest::dependency::DepKind| match kind {
             blaze_manifest::dependency::DepKind::Build => script,
             blaze_manifest::dependency::DepKind::Development => dev && !script,
-            blaze_manifest::dependency::DepKind::Normal => !script && unit.mode != Mode::RunCustomBuild,
+            blaze_manifest::dependency::DepKind::Normal => {
+                !script && unit.mode != Mode::RunCustomBuild
+            }
         };
         for dep in &package.manifest.dependencies {
             let Some(artifact) = &dep.artifact else { continue };
-            if !used(dep.kind) || !resolved.resolve.deps(*id).any(|(it, _)| it.name().as_str() == dep.name.as_str()) {
+            if !used(dep.kind)
+                || !resolved
+                    .resolve
+                    .deps(*id)
+                    .any(|(it, _)| it.name().as_str() == dep.name.as_str())
+            {
                 continue;
             }
             return Some(LoadError {
@@ -739,7 +857,11 @@ fn artifact_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, resolved: 
 
 /// cargo's check in `create_bcx` that rustc meets the `rust-version` of each unit's package,
 /// a nightly counting as its release: a line for each unit that it doesn't, by package.
-fn rust_version_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, rustc: &str) -> anyhow::Result<()> {
+fn rust_version_refusal(
+    graph: &schema::UnitGraph,
+    packages: &BySpec<'_>,
+    rustc: &str,
+) -> anyhow::Result<()> {
     let release = rustc.split(' ').next().unwrap_or(rustc);
     let rustc_version: PartialVersion = semver::Version::parse(release)
         .with_context(|| format!("blaze's rustc version `{rustc}` is not a version"))?
@@ -762,8 +884,11 @@ fn rust_version_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, rustc:
     }
     use std::fmt::Write as _;
     let plural = if incompatible.len() == 1 { "" } else { "s" };
-    let mut message = format!("rustc {rustc_version} is not supported by the following package{plural}:\n");
-    incompatible.sort_by(|a, b| (a.0.name().as_str(), a.0.version()).cmp(&(b.0.name().as_str(), b.0.version())));
+    let mut message =
+        format!("rustc {rustc_version} is not supported by the following package{plural}:\n");
+    incompatible.sort_by(|a, b| {
+        (a.0.name().as_str(), a.0.version()).cmp(&(b.0.name().as_str(), b.0.version()))
+    });
     for (id, msrv) in incompatible {
         _ = writeln!(message, "  {}@{} requires rustc {msrv}", id.name(), id.version());
     }
@@ -790,7 +915,8 @@ fn unit_name(unit: &Unit) -> String {
 /// The base profile (no package's overrides) in the unit graph's form: what [`StdKey`] takes
 /// of the user's profile.
 fn schema_profile(profiles: &Profiles) -> anyhow::Result<schema::Profile> {
-    serde_json::from_value(serde_json::to_value(profiles.base_profile())?).context("a profile in cargo's form")
+    serde_json::from_value(serde_json::to_value(profiles.base_profile())?)
+        .context("a profile in cargo's form")
 }
 
 fn debuginfo_text(debuginfo: &schema::DebugInfo) -> String {
@@ -802,7 +928,8 @@ fn debuginfo_text(debuginfo: &schema::DebugInfo) -> String {
 
 /// Whether rustc builds for `triple` with `panic = "abort"` when given no `-C panic`.
 fn target_aborts(triple: &str) -> Result<bool, LoadError> {
-    let facts = crate::stdlib::target::target_facts(triple).map_err(|what| LoadError { what, at: None })?;
+    let facts =
+        crate::stdlib::target::target_facts(triple).map_err(|what| LoadError { what, at: None })?;
     Ok(facts.panic == "abort")
 }
 
@@ -821,7 +948,10 @@ fn std_key(
 ) -> Result<StdKey, LoadError> {
     let for_macros = built_for.macro_wasm;
     let library = spec.library.clone().ok_or_else(|| LoadError {
-        what: format!("the standard library is mounted nowhere: no mount is at `{}`", spec.library_at),
+        what: format!(
+            "the standard library is mounted nowhere: no mount is at `{}`",
+            spec.library_at
+        ),
         at: None,
     })?;
     let mut crates = match &spec.build_std {
@@ -833,10 +963,12 @@ fn std_key(
     // `--all-targets` of `check --fix`, whose crate's root has the harness and its `extern crate
     // test` appended all the same), or a library's doctests, whose runner is a libtest harness
     // blaze writes (docs/v2/plan/doctests.md).
-    let harnessed = !for_macros && graph.units.iter().any(|unit| {
-        let rustc_test = unit.mode == Mode::Test || (unit.mode == Mode::Check && unit.checked_as_test);
-        (rustc_test && harness_of(unit, packages)) || unit.mode == Mode::Doctest
-    });
+    let harnessed = !for_macros
+        && graph.units.iter().any(|unit| {
+            let rustc_test =
+                unit.mode == Mode::Test || (unit.mode == Mode::Check && unit.checked_as_test);
+            (rustc_test && harness_of(unit, packages)) || unit.mode == Mode::Doctest
+        });
     if crates.iter().any(|it| it == "std") && harnessed && !crates.iter().any(|it| it == "test") {
         crates.push("test".to_owned());
     }
@@ -850,7 +982,8 @@ fn std_key(
         && !matches!(base.name.as_str(), "release" | "bench")
         && matches!(base.opt_level.as_str(), "0" | "1")
         && graph.units.iter().any(|unit| unit.built_for() == built_for && dev_executable(unit));
-    if crates.iter().any(|it| it == "std") && dev_run && !crates.iter().any(|it| it == DEV_RUNTIME) {
+    if crates.iter().any(|it| it == "std") && dev_run && !crates.iter().any(|it| it == DEV_RUNTIME)
+    {
         crates.push(DEV_RUNTIME.to_owned());
     }
     crates.sort();
@@ -912,7 +1045,8 @@ fn runs_as_keyed(
     id: blaze_ids::ContentId,
     built_for: BuiltFor<'_>,
 ) -> Result<(), LoadError> {
-    let at = |runs_here: bool| if runs_here { "on the machine that builds it" } else { "elsewhere" };
+    let at =
+        |runs_here: bool| if runs_here { "on the machine that builds it" } else { "elsewhere" };
     match roots.iter().find(|(_, index)| graph.units[*index].runs_here() != key.runs_here) {
         None => Ok(()),
         Some((name, index)) => Err(LoadError {
@@ -994,7 +1128,8 @@ fn merge_std(
         plans.push(Some(plan));
     }
     // alloc: std's few roots, once per platform's std.
-    let roots: Vec<(String, usize)> = std.roots.into_iter().map(|(name, index)| (name, index + offset)).collect();
+    let roots: Vec<(String, usize)> =
+        std.roots.into_iter().map(|(name, index)| (name, index + offset)).collect();
     attach_std(graph, &roots, built_for, links_runtime);
     packages.extend(std.packages);
     roots
@@ -1005,7 +1140,12 @@ fn merge_std(
 /// dev runtime ([`DEV_RUNTIME`]), when a root, only for a dev executable ([`dev_executable`])
 /// that does not link it itself (`links_runtime`, by unit, [`links_dev_runtime`]): two would
 /// be two start hooks, and two runtimes whose program asks one that the hook never attached.
-fn attach_std(graph: &mut schema::UnitGraph, roots: &[(String, usize)], built_for: BuiltFor<'_>, links_runtime: &[bool]) {
+fn attach_std(
+    graph: &mut schema::UnitGraph,
+    roots: &[(String, usize)],
+    built_for: BuiltFor<'_>,
+    links_runtime: &[bool],
+) {
     for (at, unit) in graph.units.iter_mut().enumerate() {
         if unit.is_std || unit.built_for() != built_for || unit.mode == Mode::RunCustomBuild {
             continue;
@@ -1035,7 +1175,10 @@ fn dev_executable(unit: &Unit) -> bool {
     !unit.is_std
         && match unit.mode {
             Mode::Test => true,
-            Mode::Build => !unit.target.is_custom_build() && unit.target.crate_types.iter().any(|it| it == "bin"),
+            Mode::Build => {
+                !unit.target.is_custom_build()
+                    && unit.target.crate_types.iter().any(|it| it == "bin")
+            }
             _ => false,
         }
 }
@@ -1054,10 +1197,15 @@ fn links_dev_runtime(graph: &schema::UnitGraph, packages: &BySpec<'_>) -> Vec<bo
     }
     let is_runtime = |name: &str| {
         name.len() == DEV_RUNTIME.len()
-            && name.bytes().zip(DEV_RUNTIME.bytes()).all(|(it, want)| it == want || (it == b'-' && want == b'_'))
+            && name
+                .bytes()
+                .zip(DEV_RUNTIME.bytes())
+                .all(|(it, want)| it == want || (it == b'-' && want == b'_'))
     };
     let linked = |unit: &Unit| {
-        unit.mode != Mode::RunCustomBuild && !unit.target.is_custom_build() && !unit.target.is_proc_macro()
+        unit.mode != Mode::RunCustomBuild
+            && !unit.target.is_custom_build()
+            && !unit.target.is_proc_macro()
     };
     let units = &graph.units;
     // alloc: one mark a unit, once per load
@@ -1083,7 +1231,9 @@ fn links_dev_runtime(graph: &schema::UnitGraph, packages: &BySpec<'_>) -> Vec<bo
                 continue;
             }
             let own = !unit.is_std
-                && packages.get(unit.pkg_id.as_str()).is_some_and(|(id, _)| is_runtime(id.name().as_str()));
+                && packages
+                    .get(unit.pkg_id.as_str())
+                    .is_some_and(|(id, _)| is_runtime(id.name().as_str()));
             let reached = own
                 || unit
                     .dependencies
@@ -1109,9 +1259,9 @@ fn foreign_units(graph: &mut schema::UnitGraph, packages: &BySpec<'_>, ask: &For
         // cargo feature in library/Cargo.toml: the build's own, on every unit as it asked.
         unit.profile.codegen_backend.clone_from(&ask.profile.codegen_backend);
         let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
-        let aborts = packages
-            .get(unit.pkg_id.as_str())
-            .is_some_and(|(id, _)| ask.panic_abort.iter().any(|it| it.as_str() == id.name().as_str()));
+        let aborts = packages.get(unit.pkg_id.as_str()).is_some_and(|(id, _)| {
+            ask.panic_abort.iter().any(|it| it.as_str() == id.name().as_str())
+        });
         if aborts && !script {
             unit.profile.panic = "abort".to_owned();
         }
@@ -1128,7 +1278,10 @@ fn foreign_units(graph: &mut schema::UnitGraph, packages: &BySpec<'_>, ask: &For
 }
 
 /// The workspace's own profiles, the root `ask.profile.root` given the build's settings.
-fn foreign_profiles(profiles: Option<&TomlProfiles>, ask: &ForeignAsk) -> anyhow::Result<TomlProfiles> {
+fn foreign_profiles(
+    profiles: Option<&TomlProfiles>,
+    ask: &ForeignAsk,
+) -> anyhow::Result<TomlProfiles> {
     let mut profiles = profiles.cloned().unwrap_or_else(|| TomlProfiles(BTreeMap::new()));
     let quoted = |it: &str| match it.parse::<u32>() {
         Ok(number) => number.to_string(),
@@ -1142,7 +1295,8 @@ fn foreign_profiles(profiles: Option<&TomlProfiles>, ask: &ForeignAsk) -> anyhow
         quoted(&ask.profile.debuginfo),
         ask.profile.panic,
     );
-    let settings: TomlProfile = toml::from_str(&text).with_context(|| format!("the standard library's profile: {text}"))?;
+    let settings: TomlProfile =
+        toml::from_str(&text).with_context(|| format!("the standard library's profile: {text}"))?;
     let name = ProfileName::new(ask.profile.root.clone())?;
     profiles.0.entry(name).or_default().merge(&settings);
     Ok(profiles)
@@ -1161,7 +1315,8 @@ fn package_plan(
 ) -> PackagePlan {
     let named = format!("{} v{}", id.name(), id.version());
     let full = id.to_string();
-    let source = full.strip_prefix(&named).map(str::trim).filter(|it| !it.is_empty()).map(str::to_owned);
+    let source =
+        full.strip_prefix(&named).map(str::trim).filter(|it| !it.is_empty()).map(str::to_owned);
     PackagePlan {
         id: id.to_spec().to_string(),
         name: manifest.package_id.name.to_string(),
@@ -1170,7 +1325,9 @@ fn package_plan(
         source,
         is_member,
         default_run: manifest.default_run.clone(),
-        checksum: checksum.filter(|_| id.source_id().is_crates_io()).and_then(blaze_format::hex::decode::<32>),
+        checksum: checksum
+            .filter(|_| id.source_id().is_crates_io())
+            .and_then(blaze_format::hex::decode::<32>),
         tests,
         const_macros,
     }

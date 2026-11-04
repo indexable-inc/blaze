@@ -295,7 +295,8 @@ fn get_array_len<'db>(at: &mut Reader<'_>) -> R<Const<'db>> {
     }
     let scalar = ScalarInt::try_from_uint(data, Size::from_bytes(size))
         .ok_or("an array length wider than its size")?;
-    let value = ValueConst::new(default_types().types.usize, ValTree::new(ValTreeKind::Leaf(scalar)));
+    let value =
+        ValueConst::new(default_types().types.usize, ValTree::new(ValTreeKind::Leaf(scalar)));
     Ok(Const::new_without_interner(ConstKind::Value(value)))
 }
 

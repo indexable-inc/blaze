@@ -24,8 +24,11 @@ fn symbol(name: &str) -> String {
 fn conf(counts: &[(&str, u64)]) -> Conf {
     let symbols: Vec<String> = counts.iter().map(|(name, _)| symbol(name)).collect();
     let counters: Vec<[u64; 1]> = counts.iter().map(|&(_, count)| [count]).collect();
-    let records: Vec<(&str, u64, &[u64])> =
-        symbols.iter().zip(&counters).map(|(name, counts)| (name.as_str(), 1, counts.as_slice())).collect();
+    let records: Vec<(&str, u64, &[u64])> = symbols
+        .iter()
+        .zip(&counters)
+        .map(|(name, counts)| (name.as_str(), 1, counts.as_slice()))
+        .collect();
     let bytes = indexed::written(indexed::IR_PROF, &records);
     let settings = Settings {
         path: PathBuf::from("/profiles/app.profdata"),
@@ -33,7 +36,8 @@ fn conf(counts: &[(&str, u64)]) -> Conf {
         hot_ppb: HOT_DEFAULT_PPB,
         cold_ppb: COLD_DEFAULT_PPB,
     };
-    let loaded = Loaded { settings, profile: Arc::new(profile::read(&bytes).expect("the profile reads")) };
+    let loaded =
+        Loaded { settings, profile: Arc::new(profile::read(&bytes).expect("the profile reads")) };
     Conf { profile: Some(loaded), ..Conf::default() }
 }
 
@@ -59,7 +63,11 @@ pub fn idle(s: &String) {
     assert!(out.contains("src/lib.rs:3:"), "the clone in `busy`, not in `idle`:\n{out}");
     assert!(out.contains("implied by `blaze::profile_hot`: this function is hot per profile `app.profdata`, 99% of its counts"), "{out}");
     // Allowed, `profile_hot` raises nothing.
-    let out = lint_with(&main, "-A clippy::all --allow=blaze::profile_hot", conf(&[("busy", 991), ("idle", 9)]));
+    let out = lint_with(
+        &main,
+        "-A clippy::all --allow=blaze::profile_hot",
+        conf(&[("busy", 991), ("idle", 9)]),
+    );
     assert!(!out.contains("clone"), "{out}");
 }
 
@@ -73,7 +81,11 @@ pub fn idle() {}
 pub fn busy() {}
 "#,
     );
-    let out = lint_with(&main, "-A clippy::all --warn=blaze::stale_hot_marker", conf(&[("busy", 100), ("idle", 0)]));
+    let out = lint_with(
+        &main,
+        "-A clippy::all --warn=blaze::stale_hot_marker",
+        conf(&[("busy", 100), ("idle", 0)]),
+    );
     assert_eq!(out.matches("warning: `fn").count(), 1, "{out}");
     assert!(
         out.contains("`fn idle` is marked hot (`#[deny(blaze::hot)]`), and profile `app.profdata` counts none of its code"),
@@ -91,9 +103,18 @@ pub fn busy() {}
 pub fn rare() {}
 "#,
     );
-    let out = lint_with(&main, "-A clippy::all --warn=blaze::hot_marked_cold", conf(&[("busy", 5_000), ("rare", 1)]));
+    let out = lint_with(
+        &main,
+        "-A clippy::all --warn=blaze::hot_marked_cold",
+        conf(&[("busy", 5_000), ("rare", 1)]),
+    );
     assert_eq!(out.matches("warning: `fn").count(), 1, "{out}");
-    assert!(out.contains("`fn busy` is `#[cold]`, and profile `app.profdata` counts 100% of its counts"), "{out}");
+    assert!(
+        out.contains(
+            "`fn busy` is `#[cold]`, and profile `app.profdata` counts 100% of its counts"
+        ),
+        "{out}"
+    );
 }
 
 #[test]
@@ -126,7 +147,10 @@ fn a_configured_profile_that_does_not_read_is_an_error_naming_it() {
     assert!(error.contains("is not an indexed profile"), "{error}");
     for (text, says) in [
         ("profile = 3\n", "expected a path for `profile`"),
-        ("profile = \"a\"\nprofile-hot-percent = \"hot\"\n", "expected a percent for `profile-hot-percent`"),
+        (
+            "profile = \"a\"\nprofile-hot-percent = \"hot\"\n",
+            "expected a percent for `profile-hot-percent`",
+        ),
         ("profile = \"a\"\nprofile-cold-percent = 120\n", "from 0 to 100"),
     ] {
         std::fs::write(&path, text).unwrap();

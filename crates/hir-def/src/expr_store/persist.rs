@@ -29,6 +29,8 @@ use std::{
 use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Str, Writer, open_as, schema_of,
 };
+use blaze_hash::HashMap;
+use blaze_query::db::{AsId, FromId};
 use hir_expand::{
     MacroCallId, MacroCallStyles, MacroDefId, MacroDefKind,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
@@ -39,11 +41,9 @@ use hir_expand::{
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use rustc_abi::ExternAbi;
-use blaze_hash::HashMap;
-use std::alloc::Global;
-use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
+use std::alloc::Global;
 
 use crate::{
     AdtId, BlockId, ConstId, EnumId, EnumVariantId, FunctionId, GenericDefId, ImplId,
@@ -52,9 +52,10 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     deps::ImageBuf,
     expr_store::{
-        Body, ComptimeForm, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId, MissingBodyItemKind,
-        NO_OWNER, SpecClauseKind, VerifyRefusal, kinds_of,
+        Body, ComptimeForm, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId,
+        MissingBodyItemKind, NO_OWNER, SpecClauseKind, VerifyRefusal,
         body::Param,
+        kinds_of,
         path::{BindingRow, GenericArg, GenericArgsRow, Names, PathColumns, PathTag, UseArgs},
     },
     hir::{
@@ -71,8 +72,8 @@ use crate::{
     },
     lang_item::LangItemTarget,
     type_ref::{
-        self, ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId,
-        RefType, TraitBoundModifier, TypeBound, TypeColumns, TypeRefId, UseArgRef,
+        self, ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, RefType,
+        TraitBoundModifier, TypeBound, TypeColumns, TypeRefId, UseArgRef,
     },
 };
 
@@ -297,7 +298,9 @@ fn ascending<T>(
     buffer: &[u8],
     what: &'static str,
 ) -> Result<(), FormatError> {
-    column.windows(2).try_for_each(|pair| ensure(key(&pair[0]) < key(&pair[1]), &pair[1], buffer, what))
+    column
+        .windows(2)
+        .try_for_each(|pair| ensure(key(&pair[0]) < key(&pair[1]), &pair[1], buffer, what))
 }
 
 fn check_nodes(
@@ -330,7 +333,10 @@ fn hygiene_bits(hygiene: HygieneId) -> u32 {
 }
 
 fn hygiene_of(bits: u32) -> HygieneId {
-    HygieneId(syntax_context(bits).expect("a syntax context of u32::MAX, refused when the buffer was read"))
+    HygieneId(
+        syntax_context(bits)
+            .expect("a syntax context of u32::MAX, refused when the buffer was read"),
+    )
 }
 
 fn packed_bits(id: ExprOrPatIdPacked) -> u32 {
@@ -802,7 +808,8 @@ fn decoded<R, T>(
     (records.iter())
         .map(|record| {
             let value = of(record)?;
-            check(&value).map_err(|what| FormatError::Invalid { at: at_of(record, buffer), what })?;
+            check(&value)
+                .map_err(|what| FormatError::Invalid { at: at_of(record, buffer), what })?;
             Ok(value)
         })
         // alloc: the decode's one copy of the column.
@@ -962,11 +969,9 @@ impl StoreColumns {
             bindings_end: raw(root.bindings_end),
         });
         let type_hygiene_pairs = type_hygiene.as_deref().unwrap_or(&[]);
-        let type_hygiene_column =
-            push_mapped(out, pairs, type_hygiene_pairs, |&(ty, hygiene)| IdPair {
-                a: raw(ty),
-                b: hygiene_bits(hygiene),
-            });
+        let type_hygiene_column = push_mapped(out, pairs, type_hygiene_pairs, |&(ty, hygiene)| {
+            IdPair { a: raw(ty), b: hygiene_bits(hygiene) }
+        });
         let flags = (if expr_only.is_some() { HAS_EXPRS } else { 0 })
             | (if type_hygiene.is_some() { HAS_TYPE_HYGIENE } else { 0 });
         StoreColumns {
@@ -1147,7 +1152,12 @@ impl<'a> ExpressionStoreRef<'a> {
     fn check(&self) -> Result<(), FormatError> {
         let (root, buffer) = (self.root, self.buffer);
         let flags = root.flags;
-        ensure(flags & !(HAS_EXPRS | HAS_TYPE_HYGIENE) == 0, root, buffer, "store flags out of range")?;
+        ensure(
+            flags & !(HAS_EXPRS | HAS_TYPE_HYGIENE) == 0,
+            root,
+            buffer,
+            "store flags out of range",
+        )?;
         let words = root.words.words.len;
         let datas = self.expr_data.len() == self.expr_kind.len()
             && self.pat_data.len() == self.pat_kind.len()
@@ -1155,7 +1165,12 @@ impl<'a> ExpressionStoreRef<'a> {
             && self.ty_data.len() == self.ty_kind.len()
             && self.path_data.len() == self.path_kind.len();
         ensure(datas, root, buffer, "a data column that is not one word for each node")?;
-        check_kinds(self.expr_kind, ExprKind::ALL.len(), buffer, "an expression kind out of range")?;
+        check_kinds(
+            self.expr_kind,
+            ExprKind::ALL.len(),
+            buffer,
+            "an expression kind out of range",
+        )?;
         check_kinds(self.pat_kind, PatKind::ALL.len(), buffer, "a pattern kind out of range")?;
         check_kinds(
             self.stmt_kind,
@@ -1213,7 +1228,12 @@ impl<'a> ExpressionStoreRef<'a> {
             "binding owners that are not one for each binding",
         )?;
         for owner in owners {
-            ensure(*owner == NO_OWNER || *owner < exprs, owner, buffer, "a binding owner past the expressions")?;
+            ensure(
+                *owner == NO_OWNER || *owner < exprs,
+                owner,
+                buffer,
+                "a binding owner past the expressions",
+            )?;
         }
         for block in self.block_scopes {
             blaze_query::db::Id::decode(*block, at_of(block, buffer), "a block scope's id")?;
@@ -1269,7 +1289,12 @@ impl<'a> ExpressionStoreRef<'a> {
         }
         ascending(self.type_hygiene, |it| it.a, buffer, "type hygiene out of order")?;
         for pair in self.type_hygiene {
-            ensure(pair.a < self.ty_kind.len() as u32, pair, buffer, "the hygiene of a type past its arena")?;
+            ensure(
+                pair.a < self.ty_kind.len() as u32,
+                pair,
+                buffer,
+                "the hygiene of a type past its arena",
+            )?;
             ensure(pair.b != u32::MAX, pair, buffer, "a syntax context of u32::MAX")?;
         }
         Ok(())
@@ -1385,7 +1410,8 @@ impl<'a> ExpressionStoreRef<'a> {
         let buffer = self.buffer;
         let as_is = AsIs { image, root: self.root, buffer };
         let words = Read::new(&self.root.words, buffer);
-        let lifetimes = arena(self.lifetimes, &words, buffer, LifetimeRefKind::from_u32, get_lifetime)?;
+        let lifetimes =
+            arena(self.lifetimes, &words, buffer, LifetimeRefKind::from_u32, get_lifetime)?;
         let bindings = arena(self.bindings, &words, buffer, only_kind, get_binding)?;
         let labels = arena(self.labels, &words, buffer, only_kind, get_label)?;
         let side = SideTables::get(&mut words.from(self.root.side))?;
@@ -1438,13 +1464,20 @@ impl<'a> ExpressionStoreRef<'a> {
         (ids.side_tables(&side))
             .map_err(|what| FormatError::Invalid { at: at_of(&self.root.words, buffer), what })?;
         if !self.has_exprs() {
-            ensure(side.is_empty(), self.root, buffer, "side tables in a store without expressions")?;
+            ensure(
+                side.is_empty(),
+                self.root,
+                buffer,
+                "side tables in a store without expressions",
+            )?;
         }
 
         let arms: Vec<MatchArm> = decoded(
             self.arms,
             buffer,
-            |rec| Ok(MatchArm { pat: idx(rec.pat), guard: opt_idx(rec.guard), expr: idx(rec.expr) }),
+            |rec| {
+                Ok(MatchArm { pat: idx(rec.pat), guard: opt_idx(rec.guard), expr: idx(rec.expr) })
+            },
             |arm| {
                 ids.pat(arm.pat)?;
                 ids.expr_opt(arm.guard)?;
@@ -1743,7 +1776,8 @@ impl Persist for Body {
         ensure(self_params.len() <= 1, root, buffer, "more than one `self` parameter")?;
         let self_param = self_params.first();
         if let Some(param) = self_param {
-            let fits = param.a < store.bindings.len() as u32 && param.b < store.bindings.len() as u32;
+            let fits =
+                param.a < store.bindings.len() as u32 && param.b < store.bindings.len() as u32;
             ensure(fits, param, buffer, "a `self` parameter past the bindings")?;
         }
         Ok(BodyRef { store, params, self_param })
@@ -2036,8 +2070,11 @@ impl Code for ConstRef {
 
 impl Code for GenericArgsRow {
     fn put(&self, w: &mut Words) {
-        let GenericArgsRow { args: [args_at, args_len], bindings: [bindings_at, bindings_len], flags } =
-            *self;
+        let GenericArgsRow {
+            args: [args_at, args_len],
+            bindings: [bindings_at, bindings_len],
+            flags,
+        } = *self;
         w.u32(args_at);
         w.u32(args_len);
         w.u32(bindings_at);
@@ -2439,7 +2476,8 @@ impl Code for MacroCallStyles {
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         let bits: u8 = r.get()?;
-        MacroCallStyles::from_bits(bits).ok_or_else(|| r.invalid("macro call styles of unknown bits"))
+        MacroCallStyles::from_bits(bits)
+            .ok_or_else(|| r.invalid("macro call styles of unknown bits"))
     }
 }
 
@@ -2609,8 +2647,8 @@ pub(crate) fn assert_store_round_trip(
 mod tests {
     use blaze_format::Aligned;
     use blaze_hash::HashSet;
-    use std::alloc::Global;
     use hir_expand::fixture;
+    use std::alloc::Global;
 
     use super::*;
     use crate::{
@@ -2740,7 +2778,9 @@ mod tests {
     }
 
     /// The functions of the fixture's crate root, each body lowered and round-tripped.
-    pub(super) fn bodies(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, Vec<DefWithBodyId>) {
+    pub(super) fn bodies(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    ) -> (TestDB, Vec<DefWithBodyId>) {
         let db = fixture::db(ra_fixture).into_db();
         let krate = db.fetch_test_crate();
         let def_map = crate_def_map(&db, krate);
@@ -3022,7 +3062,10 @@ fn main() { m!(B); }
                         let bindings = segment.args_and_bindings.map(|it| it.bindings);
                         for binding in bindings.iter().flat_map(|it| it.iter()) {
                             // alloc: a test's list
-                            keys.push((binding.name.as_str().to_owned(), binding.name.key().is_some()));
+                            keys.push((
+                                binding.name.as_str().to_owned(),
+                                binding.name.key().is_some(),
+                            ));
                         }
                     }
                 }
@@ -3073,7 +3116,10 @@ fn f() -> u32 {
         assert_eq!(read.statement_kind(0), Some(StatementKind::Let));
         let mut bad = bytes.clone();
         bad[offset_in(read.stmt_kind, &buffer)] = StatementKind::ALL.len() as u8;
-        assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "a statement kind out of range");
+        assert!(
+            ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(),
+            "a statement kind out of range"
+        );
 
         let data = offset_in(read.stmt_data, &buffer);
         let past = with_word(&bytes, data, read.extra.len() as u32);
@@ -3083,7 +3129,8 @@ fn f() -> u32 {
         let head = read.stmt_data[0] as usize;
         let flags = read.extra[head] & ((1 << columns::LET_BITS) - 1);
         let head_at = offset_in(read.extra, &buffer) + head * size_of::<u32>();
-        let past = with_word(&bytes, head_at, (read.pats_len() as u32) << columns::LET_BITS | flags);
+        let past =
+            with_word(&bytes, head_at, (read.pats_len() as u32) << columns::LET_BITS | flags);
         let past = ExpressionStore::read(&past).expect("only `extra` changed");
         assert!(past.decode().is_err(), "a pattern id past its arena in a statement");
 
@@ -3158,7 +3205,10 @@ fn f() -> u32 {
         let kind = offset_in(read.ty_kind, &buffer) + raw(tuple) as usize;
         let mut bad = bytes.clone();
         bad[kind] = TypeRefKind::ALL.len() as u8;
-        assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "a type kind out of range");
+        assert!(
+            ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(),
+            "a type kind out of range"
+        );
 
         let range_at = offset_in(read.ty_extra, &buffer) + range * size_of::<u32>();
         let lists = read.ty_lists.len() as u32;
@@ -3190,11 +3240,17 @@ fn f() -> u32 {
 
         let mut bad = bytes.clone();
         bad[offset_in(read.path_kind, &buffer)] = PathTag::ALL.len() as u8;
-        assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "a path kind out of range");
+        assert!(
+            ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(),
+            "a path kind out of range"
+        );
 
         let data_len = at_of(&read.root.path_data, &buffer) as usize + offset_of!(Slice<u32>, len);
         let short = with_word(&bytes, data_len, paths - 1);
-        assert!(ExpressionStore::read(&short).is_err(), "a path data column of fewer words than paths");
+        assert!(
+            ExpressionStore::read(&short).is_err(),
+            "a path data column of fewer words than paths"
+        );
 
         let slot = (read.path_slots.iter().position(|&word| word != 0))
             .expect("`Option<u32>`'s segment has arguments");
@@ -3301,7 +3357,11 @@ fn f() -> u32 {
         let mut out = room();
         let root = blaze_alloc_count::assert_at_most(0, "a warm encode", || body.write(&mut out));
         assert_eq!(out.finish(root), reference, "the same bytes on reused scratch");
-        assert_eq!(ENCODE.with(|it| it.borrow().capacity()), held, "a buffer grew on a warm encode");
+        assert_eq!(
+            ENCODE.with(|it| it.borrow().capacity()),
+            held,
+            "a buffer grew on a warm encode"
+        );
     }
 
     /// The contexts of an `offset_of!`'s field names (`OffsetOf::hygiene`) read back as
@@ -3334,7 +3394,9 @@ fn main() { let _ = m!(x); }
                 .collect();
             let indices = body
                 .exprs()
-                .filter(|(id, expr)| matches!(expr, Expr::Field { .. }) && !body.member_hygiene(*id).is_root())
+                .filter(|(id, expr)| {
+                    matches!(expr, Expr::Field { .. }) && !body.member_hygiene(*id).is_root()
+                })
                 .count();
             (offsets, indices)
         };

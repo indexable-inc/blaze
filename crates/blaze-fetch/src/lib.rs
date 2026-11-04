@@ -56,7 +56,9 @@ pub use crate::{
     decisions::{Failure, Policy},
     digest::{Algo, Blake3, Digest, DigestRefused, Hashed, Hashing},
     error::{FetchError, Producer, redact, scrub},
-    fetcher::{DEFAULT_MOST_BYTES, Fetcher, Git, Net, Source, StoreOf, Verified, is_commit, verify},
+    fetcher::{
+        DEFAULT_MOST_BYTES, Fetcher, Git, Net, Source, StoreOf, Verified, is_commit, verify,
+    },
     flight::Flights,
     graph::{StepError, Transform, Tree, TreeFile},
     request::Asked,

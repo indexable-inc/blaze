@@ -11,29 +11,34 @@ use std::time::{Duration, Instant};
 
 use std::sync::{Mutex, PoisonError};
 use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     ACL, ACL_REVISION, AddAccessAllowedAce, AddMandatoryAce, CopySid, CreateWellKnownSid, EqualSid,
-    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SECURITY_MAX_SID_SIZE, SetSecurityDescriptorDacl, SetSecurityDescriptorSacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    WELL_KNOWN_SID_TYPE, WinBuiltinAnyPackageSid, WinLowLabelSid,
+    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorDacl,
+    SetSecurityDescriptorSacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
+    WinBuiltinAnyPackageSid, WinLowLabelSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
-    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
+    CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PeekNamedPipe,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
+    WaitNamedPipeW,
 };
-use windows_sys::Win32::System::SystemServices::{SECURITY_DESCRIPTOR_REVISION, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP};
+use windows_sys::Win32::System::SystemServices::{
+    SECURITY_DESCRIPTOR_REVISION, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-    WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
 };
 use windows_sys::core::BOOL;
 
@@ -104,9 +109,10 @@ impl Stream {
             let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             let at = bytes.as_ptr();
             // SAFETY: as in `read`, for a write of `bytes`.
-            let done = self.transfer("WriteFile on the channel's pipe", |pipe, overlapped| unsafe {
-                WriteFile(pipe, at, len, std::ptr::null_mut(), overlapped)
-            })?;
+            let done =
+                self.transfer("WriteFile on the channel's pipe", |pipe, overlapped| unsafe {
+                    WriteFile(pipe, at, len, std::ptr::null_mut(), overlapped)
+                })?;
             match done {
                 None | Some(0) => return Err(Error::new("the other end of the channel hung up")),
                 Some(wrote) => bytes = &bytes[(wrote as usize).min(bytes.len())..],
@@ -119,9 +125,14 @@ impl Stream {
     /// when the other end hung up. A transfer still running when the timeout passes is
     /// cancelled, and waited for, before this returns: the system never touches the buffer or
     /// the `OVERLAPPED` after.
-    fn transfer(&mut self, what: &str, start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> BOOL) -> Result<Option<u32>, Error> {
+    fn transfer(
+        &mut self,
+        what: &str,
+        start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> BOOL,
+    ) -> Result<Option<u32>, Error> {
         let pipe = self.pipe.as_raw_handle();
-        let mut overlapped = OVERLAPPED { hEvent: self.event.as_raw_handle(), ..Default::default() };
+        let mut overlapped =
+            OVERLAPPED { hEvent: self.event.as_raw_handle(), ..Default::default() };
         if start(pipe, &mut overlapped) == 0 {
             let error = std::io::Error::last_os_error();
             if hung_up(&error) {
@@ -159,7 +170,14 @@ impl Stream {
         let mut available = 0u32;
         // SAFETY: peeks no bytes, writes only `available`; the pipe is open while `self` is.
         let ok = unsafe {
-            PeekNamedPipe(self.pipe.as_raw_handle(), std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut available, std::ptr::null_mut())
+            PeekNamedPipe(
+                self.pipe.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
         };
         ok == 0 && hung_up(&std::io::Error::last_os_error())
     }
@@ -167,7 +185,9 @@ impl Stream {
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
         self.timeout = match timeout {
             None => INFINITE,
-            Some(timeout) => u32::try_from(timeout.as_millis()).unwrap_or(INFINITE).min(INFINITE - 1),
+            Some(timeout) => {
+                u32::try_from(timeout.as_millis()).unwrap_or(INFINITE).min(INFINITE - 1)
+            }
         };
         Ok(())
     }
@@ -189,12 +209,14 @@ impl Listener {
         let _ = dir;
         let mut token = [0u8; 16];
         super::random(&mut token)?;
-        let address = format!("{PIPES}{PREFIX}{}-{}", std::process::id(), crate::handshake::hex(&token));
+        let address =
+            format!("{PIPES}{PREFIX}{}-{}", std::process::id(), crate::handshake::hex(&token));
         let name = wide(&address);
         let user = Sid::current_user()?;
         let security = Security::new(&user)?;
         let first = instance(&name, &security, true)?;
-        let listener = Listener { name, security, next: Mutex::new(Some(first)), event: event()?, user };
+        let listener =
+            Listener { name, security, next: Mutex::new(Some(first)), event: event()?, user };
         Ok((listener, address))
     }
 
@@ -212,10 +234,15 @@ impl Listener {
         }
         let mut pid = 0;
         // SAFETY: a query of the pipe this listener owns; writes only `pid`.
-        check(unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) }, "GetNamedPipeClientProcessId")?;
+        check(
+            unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) },
+            "GetNamedPipeClientProcessId",
+        )?;
         let peer = Sid::of_process(pid)?;
         if !peer.equal(&self.user) {
-            return Err(Error::new(format!("process {pid} of another user connected to blaze-inproc's pipe: refused")));
+            return Err(Error::new(format!(
+                "process {pid} of another user connected to blaze-inproc's pipe: refused"
+            )));
         }
         Ok((Stream::new(pipe)?, pid))
     }
@@ -268,7 +295,10 @@ fn wait_for_client(pipe: &OwnedHandle, event: &OwnedHandle) -> Result<(), Error>
     let mut done = 0;
     // SAFETY: waits until the connect `overlapped` names is over; then the system no longer
     // touches it.
-    check(unsafe { GetOverlappedResult(pipe.as_raw_handle(), &overlapped, &mut done, 1) }, "ConnectNamedPipe")
+    check(
+        unsafe { GetOverlappedResult(pipe.as_raw_handle(), &overlapped, &mut done, 1) },
+        "ConnectNamedPipe",
+    )
 }
 
 /// The start hook's end, of the pipe `address` ([`Listener::bind`]).
@@ -322,7 +352,9 @@ impl Sid {
         let mut size = SECURITY_MAX_SID_SIZE;
         // SAFETY: writes at most `size` bytes into the buffer, which has that many.
         check(
-            unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), sid.0.as_mut_ptr().cast(), &mut size) },
+            unsafe {
+                CreateWellKnownSid(kind, std::ptr::null_mut(), sid.0.as_mut_ptr().cast(), &mut size)
+            },
             "CreateWellKnownSid",
         )?;
         Ok(sid)
@@ -411,11 +443,23 @@ impl Security {
         // copying the SIDs it is given, which are valid (made above).
         unsafe {
             check(InitializeAcl(dacl_at, dacl_len, ACL_REVISION), "InitializeAcl")?;
-            check(AddAccessAllowedAce(dacl_at, ACL_REVISION, FILE_ALL_ACCESS, user.ptr()), "AddAccessAllowedAce")?;
-            check(AddAccessAllowedAce(dacl_at, ACL_REVISION, CONNECT, packages.ptr()), "AddAccessAllowedAce")?;
+            check(
+                AddAccessAllowedAce(dacl_at, ACL_REVISION, FILE_ALL_ACCESS, user.ptr()),
+                "AddAccessAllowedAce",
+            )?;
+            check(
+                AddAccessAllowedAce(dacl_at, ACL_REVISION, CONNECT, packages.ptr()),
+                "AddAccessAllowedAce",
+            )?;
             check(InitializeAcl(sacl_at, sacl_len, ACL_REVISION), "InitializeAcl")?;
             check(
-                AddMandatoryAce(sacl_at, ACL_REVISION, 0, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, low.ptr()),
+                AddMandatoryAce(
+                    sacl_at,
+                    ACL_REVISION,
+                    0,
+                    SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
+                    low.ptr(),
+                ),
                 "AddMandatoryAce",
             )?;
         }
@@ -424,7 +468,10 @@ impl Security {
         // SAFETY: sets up the absolute descriptor in its box, pointing at the ACLs above, which
         // move with it into `Security` (their heap buffers stay put) and outlive every use.
         unsafe {
-            check(InitializeSecurityDescriptor(at, SECURITY_DESCRIPTOR_REVISION), "InitializeSecurityDescriptor")?;
+            check(
+                InitializeSecurityDescriptor(at, SECURITY_DESCRIPTOR_REVISION),
+                "InitializeSecurityDescriptor",
+            )?;
             check(SetSecurityDescriptorDacl(at, 1, dacl_at, 0), "SetSecurityDescriptorDacl")?;
             check(SetSecurityDescriptorSacl(at, 1, sacl_at, 0), "SetSecurityDescriptorSacl")?;
         }

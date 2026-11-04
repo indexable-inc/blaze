@@ -41,11 +41,7 @@ impl UllbcPass for Transform {
                 block.statements.push(Statement::new(
                     block.terminator.span,
                     StatementKind::Assert {
-                        assert: Assert {
-                            cond: discr,
-                            expected,
-                            check_kind: None,
-                        },
+                        assert: Assert { cond: discr, expected, check_kind: None },
                         on_failure: abort.clone(),
                     },
                 ));

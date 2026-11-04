@@ -17,7 +17,7 @@ use hir_def::{
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -59,7 +59,8 @@ impl LatePass for InvalidFromUtf8 {
             init.or_init();
         }
         let Some(error) = invalid_bytes(init.b(), init.expr) else { return };
-        let (Some(at), Some(call), Some(literal)) = (b.expr_node(expr), util::span(b, expr), util::span(init.b(), init.expr))
+        let (Some(at), Some(call), Some(literal)) =
+            (b.expr_node(expr), util::span(b, expr), util::span(init.b(), init.expr))
         else {
             return;
         };
@@ -85,7 +86,10 @@ impl LatePass for InvalidFromUtf8 {
             ),
         };
         // alloc: the lint's diagnostic
-        diag.span_label(literal, format!("the literal was valid UTF-8 up to the {} bytes", error.valid_up_to()));
+        diag.span_label(
+            literal,
+            format!("the literal was valid UTF-8 up to the {} bytes", error.valid_up_to()),
+        );
         for def in init.read.iter().rev() {
             let (item, def) = *def;
             let name = b.cx.def_path(def.into());
@@ -94,7 +98,10 @@ impl LatePass for InvalidFromUtf8 {
         }
         let called = b.cx.def_path(ModuleDefId::FunctionId(def).into());
         // alloc: the lint's diagnostic
-        diag.fact(Fact::Signature(b.cx.key(ItemId::Function(def))), format!("the signature of `{called}`"));
+        diag.fact(
+            Fact::Signature(b.cx.key(ItemId::Function(def))),
+            format!("the signature of `{called}`"),
+        );
         out.push(b.lint(diag, Phase::Late, at));
     }
 }

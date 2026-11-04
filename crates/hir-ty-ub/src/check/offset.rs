@@ -13,12 +13,21 @@ use crate::{
 /// (`compiler/rustc_const_eval/messages.ftl`, `const_eval_offset_from_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OffsetFromError {
-    DifferentAllocations { unsigned: bool },
-    OutOfBounds { unsigned: bool },
-    TooFarAhead { unsigned: bool },
+    DifferentAllocations {
+        unsigned: bool,
+    },
+    OutOfBounds {
+        unsigned: bool,
+    },
+    TooFarAhead {
+        unsigned: bool,
+    },
     TooFarBefore,
     /// `ptr_offset_from_unsigned` with the first address below the second.
-    Negative { a: u64, b: u64 },
+    Negative {
+        a: u64,
+        b: u64,
+    },
 }
 
 fn name(unsigned: bool) -> &'static str {
@@ -39,7 +48,11 @@ impl fmt::Display for OffsetFromError {
                 name(unsigned)
             ),
             OffsetFromError::TooFarAhead { unsigned } => {
-                write!(f, "`{}` called when first pointer is too far ahead of second", name(unsigned))
+                write!(
+                    f,
+                    "`{}` called when first pointer is too far ahead of second",
+                    name(unsigned)
+                )
             }
             OffsetFromError::TooFarBefore => {
                 f.write_str("`ptr_offset_from` called when first pointer is too far before second")

@@ -76,7 +76,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             unresolved_ty.len() + unresolved_int.len() + unresolved_float.len(),
             self.frame,
         );
-        unresolved_variables.extend(unresolved_ty.into_iter().map(|vid| Ty::new_var(interner, vid)));
+        unresolved_variables
+            .extend(unresolved_ty.into_iter().map(|vid| Ty::new_var(interner, vid)));
         unresolved_variables
             .extend(unresolved_int.into_iter().map(|vid| Ty::new_int_var(interner, vid)));
         unresolved_variables

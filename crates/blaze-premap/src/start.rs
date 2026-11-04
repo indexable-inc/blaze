@@ -52,15 +52,22 @@ pub struct Start<'a> {
 /// are `workspace` (blaze-link's `premap::layout`), sorted by name, each once.
 pub fn plan<'a>(image: &View<'a>, workspace: &[(String, Def)]) -> Result<Start<'a>, PremapError> {
     if !workspace.is_sorted_by(|a, b| a.0 < b.0) {
-        return Err(PremapError::of(format_args!("the workspace link's names are not sorted, each once")));
+        return Err(PremapError::of(format_args!(
+            "the workspace link's names are not sorted, each once"
+        )));
     }
     let binds = image.binds().count();
     let mut writes = Vec::with_capacity(binds);
     let mut lookups = Vec::with_capacity(binds);
     for bind in image.binds() {
-        let theirs = workspace.binary_search_by(|it| it.0.as_str().cmp(bind.name)).ok().map(|at| workspace[at].1);
+        let theirs = workspace
+            .binary_search_by(|it| it.0.as_str().cmp(bind.name))
+            .ok()
+            .map(|at| workspace[at].1);
         let def = match (theirs, bind.own) {
-            (Some(a), Some(b)) if a.strength == Strength::Strong && b.strength == Strength::Strong => {
+            (Some(a), Some(b))
+                if a.strength == Strength::Strong && b.strength == Strength::Strong =>
+            {
                 return Err(PremapError::of(format_args!(
                     "`{}` is defined in the workspace and in a dependency, both strongly",
                     bind.name
@@ -76,10 +83,18 @@ pub fn plan<'a>(image: &View<'a>, workspace: &[(String, Def)]) -> Result<Start<'
         };
         match (def, bind.kind) {
             (Some(def), BindKind::Addr) if def.kind != Kind::ThreadLocal => {
-                writes.push(Write { place: bind.place, value: def.value.wrapping_add_signed(bind.addend), address: true });
+                writes.push(Write {
+                    place: bind.place,
+                    value: def.value.wrapping_add_signed(bind.addend),
+                    address: true,
+                });
             }
             (Some(def), BindKind::TpOff) if def.kind == Kind::ThreadLocal => {
-                writes.push(Write { place: bind.place, value: def.value.wrapping_add_signed(bind.addend), address: false });
+                writes.push(Write {
+                    place: bind.place,
+                    value: def.value.wrapping_add_signed(bind.addend),
+                    address: false,
+                });
             }
             (Some(_), _) => {
                 return Err(PremapError::of(format_args!(
@@ -97,7 +112,12 @@ pub fn plan<'a>(image: &View<'a>, workspace: &[(String, Def)]) -> Result<Start<'
                 )));
             }
             (None, BindKind::Addr) => {
-                lookups.push(Lookup { place: bind.place, name: bind.name, addend: bind.addend, weak: bind.weak });
+                lookups.push(Lookup {
+                    place: bind.place,
+                    name: bind.name,
+                    addend: bind.addend,
+                    weak: bind.weak,
+                });
             }
         }
     }

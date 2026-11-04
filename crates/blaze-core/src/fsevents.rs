@@ -146,7 +146,11 @@ unsafe extern "C" {
 // SAFETY: these signatures match dispatch/queue.h and dispatch/object.h.
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const c_char, attributes: *const c_void) -> DispatchQueue;
-    fn dispatch_sync_f(queue: DispatchQueue, context: *mut c_void, work: extern "C" fn(*mut c_void));
+    fn dispatch_sync_f(
+        queue: DispatchQueue,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
     fn dispatch_release(object: *mut c_void);
 }
 
@@ -323,10 +327,9 @@ fn is_under(name: &str, dir: &str) -> bool {
 /// fails, naming the device.
 fn store_of(path: &Path) -> io::Result<[u8; 16]> {
     use std::os::unix::fs::MetadataExt as _;
-    let meta = path
-        .ancestors()
-        .find_map(|it| std::fs::metadata(it).ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "none of its directories is there"))?;
+    let meta = path.ancestors().find_map(|it| std::fs::metadata(it).ok()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "none of its directories is there")
+    })?;
     // `st_dev` is an `int32_t` that `dev()` widened; narrowing gives it back.
     let device = meta.dev() as libc::dev_t;
     // SAFETY: no pointers; the result is a CFUUID retained for the caller, or null.
@@ -491,8 +494,9 @@ impl<S: Tell> Watch<S> {
         let mut c_path = Vec::with_capacity(256);
         c_string(&cookies, &mut c_path)?;
         // SAFETY: a NUL-terminated path; the string is released in `Drop`.
-        let cookie_string =
-            unsafe { CFStringCreateWithFileSystemRepresentation(std::ptr::null(), c_path.as_ptr().cast()) };
+        let cookie_string = unsafe {
+            CFStringCreateWithFileSystemRepresentation(std::ptr::null(), c_path.as_ptr().cast())
+        };
         if cookie_string.is_null() {
             _ = std::fs::remove_dir_all(&cookies);
             return Err(io::Error::other("CoreFoundation made no string of the cookies' path"));
@@ -532,7 +536,13 @@ impl<S: Tell> Watch<S> {
             #[cfg(test)]
             payload: AtomicU64::new(0),
         };
-        Ok(Watch { shared: Owned::new(shared), queue, cookie_string, stream: std::ptr::null_mut(), c_path })
+        Ok(Watch {
+            shared: Owned::new(shared),
+            queue,
+            cookie_string,
+            stream: std::ptr::null_mut(),
+            c_path,
+        })
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -604,7 +614,8 @@ impl<S: Tell> Watch<S> {
         assert!(!self.is_running(), "a watch runs one stream at a time");
         // SAFETY: no stream runs, asserted above.
         let Shared { root: real_root, real_dir, .. } = unsafe { self.shared.get_mut() };
-        let resolved = c_string(root, &mut self.c_path).and_then(|()| realpath(&self.c_path, real_root));
+        let resolved =
+            c_string(root, &mut self.c_path).and_then(|()| realpath(&self.c_path, real_root));
         resolved.map_err(|error| {
             // alloc: an error path.
             io::Error::new(error.kind(), format!("watching under {}: {error}", root.display()))
@@ -619,7 +630,14 @@ impl<S: Tell> Watch<S> {
 
     /// The stream of `shared.real_dir` and the cookies from `since`, `before` run once it is
     /// made, just before it starts.
-    fn open(&mut self, dir: FileName, tag: Tag, since: u64, mode: Mode, before: impl FnOnce()) -> io::Result<()> {
+    fn open(
+        &mut self,
+        dir: FileName,
+        tag: Tag,
+        since: u64,
+        mode: Mode,
+        before: impl FnOnce(),
+    ) -> io::Result<()> {
         let failed = |shared: &Shared<S>, why: &str| {
             // alloc: an error path.
             io::Error::other(format!("watching {}: {why}", shared.real_dir.display()))
@@ -635,7 +653,10 @@ impl<S: Tell> Watch<S> {
         c_string(&self.shared.get().real_dir, &mut self.c_path)?;
         // SAFETY: a NUL-terminated path; the string is released below.
         let dir_string = unsafe {
-            CFStringCreateWithFileSystemRepresentation(std::ptr::null(), self.c_path.as_ptr().cast())
+            CFStringCreateWithFileSystemRepresentation(
+                std::ptr::null(),
+                self.c_path.as_ptr().cast(),
+            )
         };
         if dir_string.is_null() {
             return Err(failed(self.shared.get(), "CoreFoundation made no string of the path"));
@@ -894,7 +915,8 @@ fn changed<S: Tell>(shared: &Shared<S>, flags: &[u32], paths: &[*const c_char], 
 
 /// `name` lost for `why`, once.
 fn lose(heard: &mut Heard, name: Span, why: Lost) {
-    let seen = heard.lost.iter().any(|&(it, was, _)| was == why && heard.str(it) == heard.str(name));
+    let seen =
+        heard.lost.iter().any(|&(it, was, _)| was == why && heard.str(it) == heard.str(name));
     if !seen {
         let order = heard.lost.len() as u32;
         heard.lost.push((name, why, order));
@@ -1023,7 +1045,10 @@ fn tell_flushes<S: Tell>(shared: &Shared<S>, heard: &mut Heard) {
 /// back from a cursor: it writes its store on its own schedule, and nothing says when an event
 /// is in it.
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, reason = "fseventsd's store has no event that says what it holds")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "fseventsd's store has no event that says what it holds"
+)]
 pub(crate) fn fseventsd_keeps(long: Duration) {
     std::thread::sleep(long);
 }

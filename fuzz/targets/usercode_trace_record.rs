@@ -23,7 +23,10 @@ const TARGET: Target = Target {
     name: "usercode_trace_record",
     check,
     seeds,
-    dictionary: &[b"\t", b"\n", b"R\t", b"L\t", b"D\t", b"E\t", b"T\t", b"W\t", b"N\t", b"X\t", b"*", b"clock"],
+    dictionary: &[
+        b"\t", b"\n", b"R\t", b"L\t", b"D\t", b"E\t", b"T\t", b"W\t", b"N\t", b"X\t", b"*",
+        b"clock",
+    ],
     max_len: 1 << 16,
     budget: Duration::from_secs(120),
 };
@@ -31,7 +34,10 @@ const TARGET: Target = Target {
 /// Whether `line` (without its line break) is a record's line.
 fn is_line(line: &str) -> bool {
     let bytes = line.as_bytes();
-    bytes.len() >= 2 && b"RLDETWNX".contains(&bytes[0]) && bytes[1] == b'\t' && line[2..].contains('\t')
+    bytes.len() >= 2
+        && b"RLDETWNX".contains(&bytes[0])
+        && bytes[1] == b'\t'
+        && line[2..].contains('\t')
 }
 
 /// What `trace::parse` must say of `text`.
@@ -73,7 +79,11 @@ fn boundary(text: &str, mut at: usize) -> usize {
 fn check(data: &[u8]) {
     let text = String::from_utf8_lossy(data);
     let (most, got) = blaze_fuzz::largest_allocation(|| trace::parse(&text));
-    assert!(most <= blaze_fuzz::allowed(text.len()), "reading {} bytes asked for {most} at once", text.len());
+    assert!(
+        most <= blaze_fuzz::allowed(text.len()),
+        "reading {} bytes asked for {most} at once",
+        text.len()
+    );
 
     let expected = model(&text);
     let said = got.as_ref().map(|(lines, used)| (lines.len(), *used)).map_err(Clone::clone);

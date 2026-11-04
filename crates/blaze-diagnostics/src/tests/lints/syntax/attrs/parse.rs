@@ -19,7 +19,10 @@ fn ui(name: &str, source: &str, files: &[(&str, &str)]) -> String {
         fixture.push_str(&format!("//- /{path}\n{text}"));
     }
     let options = compiletest(Mode::Other, &Options::default());
-    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
+    normalized(
+        &checked_with(&fixture, "$DIR/", &options)
+            .stderr_with(Style { ui_testing: true, ..Style::default() }),
+    )
 }
 
 /// The messages of `lints` that `source`, of edition 2021, gets, with their lint names.
@@ -28,7 +31,9 @@ fn messages(source: &str, lints: &[&str]) -> Vec<String> {
     checked_with(&fixture, "", &Options::default())
         .messages()
         .into_iter()
-        .filter(|it| lints.iter().any(|lint| it.strip_prefix(lint).is_some_and(|rest| rest.starts_with(':'))))
+        .filter(|it| {
+            lints.iter().any(|lint| it.strip_prefix(lint).is_some_and(|rest| rest.starts_with(':')))
+        })
         .collect()
 }
 
@@ -150,7 +155,10 @@ LL | #![deny(unused_attributes)]
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui("crate-root-path-in-different-file.rs", source, &[("auxiliary/submod.rs", aux)]), expected);
+    assert_eq!(
+        ui("crate-root-path-in-different-file.rs", source, &[("auxiliary/submod.rs", aux)]),
+        expected
+    );
 }
 
 /// `tests/ui/attributes/invalid-crate-type.rs`.
@@ -992,9 +1000,12 @@ error: aborting due to 4 previous errors; 30 warnings emitted
 
 For more information about this error, try `rustc --explain E0658`.
 "##;
-    let fixture = format!("{CORE_UNREACHABLE}//- /attr-on-mac-call.rs crate:other:main edition:2015 deps:core\n{source}");
+    let fixture = format!(
+        "{CORE_UNREACHABLE}//- /attr-on-mac-call.rs crate:other:main edition:2015 deps:core\n{source}"
+    );
     let options = compiletest(Mode::Other, &Options::default());
-    let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = checked_with(&fixture, "$DIR/", &options)
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     assert_eq!(normalized(&stderr), expected);
 }
 
@@ -1086,7 +1097,10 @@ fn b() -> u8 { 0 }
 mod m {}
 fn main() {}
 "#;
-    assert_eq!(messages(source, &["unused_attributes"]), ["unused_attributes: unused attribute"; 2]);
+    assert_eq!(
+        messages(source, &["unused_attributes"]),
+        ["unused_attributes: unused attribute"; 2]
+    );
 }
 
 #[test]
@@ -1113,7 +1127,10 @@ fn empty_lists_are_unused() {
 mod m {}
 fn main() {}
 "#;
-    assert_eq!(messages(source, &["unused_attributes"]), ["unused_attributes: unused attribute"; 2]);
+    assert_eq!(
+        messages(source, &["unused_attributes"]),
+        ["unused_attributes: unused attribute"; 2]
+    );
 }
 
 #[test]

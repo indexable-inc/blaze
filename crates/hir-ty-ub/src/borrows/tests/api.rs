@@ -52,13 +52,15 @@ fn retag_accesses() {
 
     // `-Zmiri-tree-borrows-implicit-writes`: a protected `&mut` is `Unique` from the start and
     // its retag a write; outside function entry nothing changes.
-    let write = NewPermission::new(PtrKind::Mut, RetagMode::FnEntry, true, true, &[]).with_implicit_writes(true);
+    let write = NewPermission::new(PtrKind::Mut, RetagMode::FnEntry, true, true, &[])
+        .with_implicit_writes(true);
     assert!(write.writes());
     s.call();
     s.retag_with(x, &write, 8).unwrap();
     assert_eq!(s.b.retag_accesses(), &[(Span::new(0, 8), AccessKind::Write)]);
     s.ret().unwrap();
-    let default = NewPermission::new(PtrKind::Mut, RetagMode::Default, true, true, &[]).with_implicit_writes(true);
+    let default = NewPermission::new(PtrKind::Mut, RetagMode::Default, true, true, &[])
+        .with_implicit_writes(true);
     assert!(!default.writes());
     s.retag_with(x, &default, 8).unwrap();
     assert_eq!(s.b.retag_accesses(), &[read(0, 8)]);
@@ -76,7 +78,10 @@ fn write_through_shared_reference() {
     let e = expect_ub(s.write(r, 1), AliasErrorKind::ChildAccessForbidden, "write access through");
     assert_eq!(e.title(), "write access through <2> at alloc1[0x0] is forbidden");
     assert_eq!(e.details().len(), 1);
-    expect_detail(&e, "the accessed tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(&e, &["the accessed tag <TAG> was created here, in the initial state Frozen"]);
     assert_eq!(e.history()[0].site, Some(created));
     assert_eq!((e.alloc(), e.offset()), (x.alloc, 0));
@@ -100,9 +105,13 @@ fn foreign_write_disables_mut() {
     s.write(x.add(1), 1).unwrap();
     let disabled = s.last_site();
     s.read(m, 1).unwrap();
-    let e = expect_ub(s.read(m.add(1), 1), AliasErrorKind::ChildAccessForbidden, "read access through");
+    let e =
+        expect_ub(s.read(m.add(1), 1), AliasErrorKind::ChildAccessForbidden, "read access through");
     assert_eq!(e.title(), "read access through <2> at alloc1[0x1] is forbidden");
-    expect_detail(&e, "the accessed tag <TAG> has state Disabled which forbids this child read access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Disabled which forbids this child read access",
+    );
     expect_history(
         &e,
         &[
@@ -129,7 +138,8 @@ fn child_of_frozen_cannot_write() {
         e.details(),
         &[
             "the accessed tag <3> is a child of the conflicting tag <2>".to_owned(),
-            "the conflicting tag <2> has state Frozen which forbids this child write access".to_owned(),
+            "the conflicting tag <2> has state Frozen which forbids this child write access"
+                .to_owned(),
         ]
     );
     expect_history(
@@ -222,7 +232,8 @@ fn protected_shared_forbids_foreign_write() {
     let sibling = s.mutable(x, 1).unwrap();
     s.call();
     let a = s.arg_shared(x, 1).unwrap();
-    let e = expect_ub(s.write(sibling, 1), AliasErrorKind::ProtectedDisabled, "write access through");
+    let e =
+        expect_ub(s.write(sibling, 1), AliasErrorKind::ProtectedDisabled, "write access through");
     expect_detail(&e, "protected tags must never be Disabled");
     let _ = a;
 }
@@ -268,7 +279,8 @@ fn strong_protector_forbids_dealloc() {
     assert_eq!(
         e.details(),
         &[
-            "the allocation of the accessed tag <2> also contains the strongly protected tag <2>".to_owned(),
+            "the allocation of the accessed tag <2> also contains the strongly protected tag <2>"
+                .to_owned(),
             "the strongly protected tag <2> disallows deallocations".to_owned(),
         ]
     );
@@ -341,7 +353,10 @@ fn precise_interior_mutability() {
     s.write(r.add(2), 2).unwrap();
     let e = expect_ub(s.write(r, 2), AliasErrorKind::ChildAccessForbidden, "write access through");
     assert_eq!(e.offset(), 0);
-    expect_detail(&e, "the accessed tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Frozen which forbids this child write access",
+    );
 }
 
 /// A two-phase borrow survives the parent's reads until its first write.
@@ -361,7 +376,10 @@ fn free_through_shared_is_ub() {
     let x = s.alloc(1);
     let r = s.shared(x, 1).unwrap();
     let e = expect_ub(s.free(r, 1), AliasErrorKind::ChildAccessForbidden, "deallocation through");
-    expect_detail(&e, "the accessed tag <TAG> has state Frozen which forbids this deallocation (acting as a child write access)");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> has state Frozen which forbids this deallocation (acting as a child write access)",
+    );
 }
 
 /// After a free a zero-size retag of the dangling pointer still makes a tag.
@@ -379,9 +397,16 @@ fn zero_size_retag_of_dead_allocation() {
 fn wildcard_needs_an_exposed_tag() {
     let mut s = Sim::new();
     let x = s.alloc(1);
-    let e = expect_ub(s.write(x.wildcard(), 1), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
+    let e = expect_ub(
+        s.write(x.wildcard(), 1),
+        AliasErrorKind::NoExposedTag,
+        "write access through <wildcard>",
+    );
     assert_eq!(e.title(), "write access through <wildcard> at alloc1[0x0] is forbidden");
-    assert_eq!(e.details(), &["there are no exposed tags which may perform this access here".to_owned()]);
+    assert_eq!(
+        e.details(),
+        &["there are no exposed tags which may perform this access here".to_owned()]
+    );
     assert!(e.history().is_empty());
     s.expose(x);
     s.write(x.wildcard(), 1).unwrap();
@@ -396,7 +421,11 @@ fn wildcard_respects_exposed_permissions() {
     let r = s.shared(x, 1).unwrap();
     s.expose(r);
     s.read(x.wildcard(), 1).unwrap();
-    expect_ub(s.write(x.wildcard(), 1), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
+    expect_ub(
+        s.write(x.wildcard(), 1),
+        AliasErrorKind::NoExposedTag,
+        "write access through <wildcard>",
+    );
 }
 
 /// A reference made from a wildcard pointer roots a new subtree; an access through a tag
@@ -592,7 +621,9 @@ fn gc_never_changes_a_verdict() {
                     b: rng.next_u64(),
                 },
                 7 if held.len() > 1 => Op::Drop { which: 1 + rng.index(held.len() - 1) },
-                8 if frames < 2 => Op::Call { from: rng.index(held.len()), kind: rng.index(3) as u8 },
+                8 if frames < 2 => {
+                    Op::Call { from: rng.index(held.len()), kind: rng.index(3) as u8 }
+                }
                 9 if frames > 0 => Op::Ret,
                 _ => continue,
             };

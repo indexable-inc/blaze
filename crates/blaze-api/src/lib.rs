@@ -45,14 +45,14 @@ pub mod units;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
+pub use blaze_protocol::events::NodeKind;
+pub use blaze_report::{Blocks, Fact, Fix, Report, Severity, Span as ReportSpan, Text};
+pub use blaze_vfs::{Mode, Op};
 pub use borrowed::{
     BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
     SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
-pub use blaze_protocol::events::NodeKind;
-pub use blaze_report::{Blocks, Fact, Fix, Report, Severity, Span as ReportSpan, Text};
 pub use intent::{Edit, Edited, EditedItem, How, Target};
-pub use blaze_vfs::{Mode, Op};
 
 use blaze_core::Conn;
 use blaze_ids::{ContentId, Fingerprint};
@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 /// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
 /// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
 /// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
-/// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], [`Request::Sql`], their
+/// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], `Request::Sql`, their
 /// answers, and [`Status::history`]. 21: [`Edit::Replace`]. 22: [`Status::build`]. 23:
 /// [`Request::Hot`] and [`Response::Hot`]. 24: [`Request::Gc`] and [`Response::Collected`]. 25:
 /// [`Response::UnitBegan`] and [`Response::TestReady`], which let `blaze test` run a test
@@ -80,8 +80,12 @@ use serde::{Deserialize, Serialize};
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
 /// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
-/// [`Response::Report`], and [`Behind::id`].
-pub const SCHEMA: u32 = 36;
+/// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`]. 38:
+/// [`Request::Flush`] and [`Response::Flushed`] in place of `Request::Sql` (`blaze debug sql
+/// --live`) and `Response::Queried`: a reader of the profile history asks the daemon to flush,
+/// then reads the history itself; and [`Request::ClientRows`] and [`Worked::build_id`]: a client
+/// sends its own recorder's rows of a build to the daemon, which writes them to the history.
+pub const SCHEMA: u32 = 38;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -213,10 +217,20 @@ impl<T> std::fmt::Debug for Names<'_, T> {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Request {
     /// Applies ops to a head, rebased if it moved; answered with [`Response::Committed`].
-    Commit { ops: Vec<Op>, base: ContentId, head: String },
+    Commit {
+        ops: Vec<Op>,
+        base: ContentId,
+        head: String,
+    },
     /// Checks the view; answered with diagnostics.
-    Check { view: ViewRef, targets: Targets },
-    Build { view: ViewRef, targets: Targets },
+    Check {
+        view: ViewRef,
+        targets: Targets,
+    },
+    Build {
+        view: ViewRef,
+        targets: Targets,
+    },
     /// Runs the tests the view's change reached (all, with `all`), filtered by name, with
     /// libtest's selection `args`; in blaze's MIR evaluator, checked for undefined behavior,
     /// with `ub`.
@@ -228,23 +242,44 @@ pub enum Request {
         filter: Vec<String>,
         targets: Targets,
     },
-    Run { bin: Option<String>, args: Vec<String>, view: ViewRef, targets: Targets },
+    Run {
+        bin: Option<String>,
+        args: Vec<String>,
+        view: ViewRef,
+        targets: Targets,
+    },
     /// The files that differ between two views.
-    Diff { to: ViewRef, from: ViewRef },
+    Diff {
+        to: ViewRef,
+        from: ViewRef,
+    },
     /// Why a query reran in the last build of a view.
-    Why { view: ViewRef, query: QueryKey },
+    Why {
+        view: ViewRef,
+        query: QueryKey,
+    },
     /// What the daemon is doing: its requests, memory, views.
     Status,
     /// Cancels the request `id` of this connection.
-    Cancel { id: u64 },
+    Cancel {
+        id: u64,
+    },
     /// Resolves a view to its root and keeps it open until [`Request::Close`] or the
     /// connection ends; answered with [`Response::Opened`].
-    Open { view: ViewRef },
-    Close { root: ContentId },
+    Open {
+        view: ViewRef,
+    },
+    Close {
+        root: ContentId,
+    },
     /// What the change from `from` to `to` reaches (items, facts, functions compiled again,
     /// tests), building only each view's proc macros and build scripts' runs, which its front
     /// end applies before it reads as rustc compiles; answered with [`Response::Reached`].
-    Reach { to: ViewRef, from: ViewRef, targets: Targets },
+    Reach {
+        to: ViewRef,
+        from: ViewRef,
+        targets: Targets,
+    },
     /// Each candidate's ops applied to `base` as a what-if, checked (and tested, with `test`),
     /// all at once: each candidate's responses as [`Response::Of`], then [`Response::Ranked`].
     BestOf {
@@ -256,18 +291,29 @@ pub enum Request {
     },
     /// The production oracle: the view built again from nothing and compared; answered with
     /// [`Response::Verified`].
-    Verify { view: ViewRef, targets: Targets },
+    Verify {
+        view: ViewRef,
+        targets: Targets,
+    },
     /// The daemon's state made durable, before the VM snapshots itself; answered with
     /// [`Response::Snapshotted`] once it is.
     Snapshot,
     /// Every instance the view's last build compiled or found, with the hash its code was
     /// made from; answered with [`Response::CodegenInputs`].
-    CodegenInputs { view: ViewRef, targets: Targets },
+    CodegenInputs {
+        view: ViewRef,
+        targets: Targets,
+    },
     /// Every result the view's last build ran or kept, with its edges; answered with
     /// [`Response::Trace`].
-    Trace { view: ViewRef, targets: Targets },
+    Trace {
+        view: ViewRef,
+        targets: Targets,
+    },
     /// The size of each of the daemon's long-lived tables; answered with [`Response::Tables`].
-    Tables { view: ViewRef },
+    Tables {
+        view: ViewRef,
+    },
     /// `blaze stop`: the daemon's state made durable, then it exits; answered with
     /// `Done { ok: true }` before it does.
     Stop,
@@ -275,18 +321,33 @@ pub enum Request {
     /// [`Request::Commit`] commits: answered with [`Response::Edited`], then
     /// [`Response::Committed`] once durable. The view's proc macros and build scripts' runs,
     /// which its front end applies before it resolves a name as rustc would, are built first.
-    Edit { base: ContentId, head: String, edits: Vec<Edit> },
+    Edit {
+        base: ContentId,
+        head: String,
+        edits: Vec<Edit>,
+    },
     /// Declared intent: the tests `filter` selects in the view will be run soon. What they
     /// reach is built ahead at a priority below every request's, answered at once with
     /// [`Response::Announced`]. A request on the same root takes the work over; a newer intent
     /// of this connection, the connection's end, or `wait_ms` with no such request cancels it.
     /// The view's proc macros and build scripts' runs, which its front end applies before it
     /// lists a unit's tests, are built before the tests are chosen.
-    WillTest { view: ViewRef, filter: Vec<String>, targets: Targets, wait_ms: u64 },
+    WillTest {
+        view: ViewRef,
+        filter: Vec<String>,
+        targets: Targets,
+        wait_ms: u64,
+    },
     /// Declared intent: `ops` will be committed to `head`. The what-if is checked (tested,
     /// with `test`) ahead as [`Request::WillTest`] builds ahead; a commit to `head` that makes
     /// the same root takes the work over, and one that makes another root cancels it.
-    WillSave { ops: Vec<Op>, head: String, test: bool, targets: Targets, wait_ms: u64 },
+    WillSave {
+        ops: Vec<Op>,
+        head: String,
+        test: bool,
+        targets: Targets,
+        wait_ms: u64,
+    },
     /// What each subsystem's memory is doing, from blaze-mem's counters; answered with
     /// [`Response::Memory`].
     Memory,
@@ -294,50 +355,77 @@ pub enum Request {
     /// `targets` asks (its build scripts run and its proc macros loaded in the sandbox, every
     /// expansion of the program recorded) as one file for blaze's in-browser compiler
     /// (`blaze_wasm_pack::Pack`); answered with [`Response::Packed`].
-    Pack { view: ViewRef, program: String, targets: Targets },
+    Pack {
+        view: ViewRef,
+        program: String,
+        targets: Targets,
+    },
     /// `cargo doc`: the targets it documents checked as `targets` asks (`Targets::cargo`'s
     /// command `doc`), then the HTML documentation of those crates and, unless `no_deps`, of
     /// every library they depend on, written by blaze from the front end (`blaze-doc`), no
     /// rustdoc run. `private` is `--document-private-items`. Answered with
     /// [`Response::Documented`], then each file as a [`Response::DocPage`], which the client
     /// writes, then rustdoc's warnings as [`Response::Diagnostic`]s.
-    Doc { view: ViewRef, no_deps: bool, private: bool, targets: Targets },
+    Doc {
+        view: ViewRef,
+        no_deps: bool,
+        private: bool,
+        targets: Targets,
+    },
     /// `blaze explore`: the explorer's server started in the daemon if it is not yet (with
     /// `dev`, also accepting the page's development server), answered with
     /// [`Response::Explored`]. Answered by the daemon's loop, which holds the server.
-    Explore { dev: bool },
+    Explore {
+        dev: bool,
+    },
     /// `blaze debug profile`: a Chrome trace of the last `seconds` of every thread's flight
     /// recorder and the CPU samples; answered with [`Response::Profiled`].
-    Profile { seconds: u32 },
+    Profile {
+        seconds: u32,
+    },
     /// `blaze debug live`: a [`Response::Live`] every 250 ms until the connection ends. A
     /// subscriber whose connection has a frame not yet sent is skipped that tick; the next
     /// frame has every row since its last. Answered by the daemon's loop, which holds the feeds.
     Live,
-    /// `blaze debug sql --live`: `sql` over the history and the last `last_s` seconds of the
-    /// daemon's flight recorder, run by the daemon (the recorder is its); answered with
-    /// [`Response::Queried`].
-    Sql { sql: String, last_s: u32 },
+    /// A reader of the profile history (`blaze debug sql`, `blaze slow`, `blaze debug time`,
+    /// `blaze explain`) asks the daemon that writes it to flush what it has recorded, so the
+    /// history's manifest lists every row recorded before the ask; answered with
+    /// [`Response::Flushed`] once that flush has committed. Answered by the daemon's loop,
+    /// which hands it to the history's keeper.
+    Flush,
     /// `blaze debug hot`: the `top` keys (a span and what it is of) that took most time and
     /// each kind of wait's quantiles, from the daemon's live sketches (blaze-profile's `hot`),
     /// no history read; answered with [`Response::Hot`].
-    Hot { top: u32, since: HotSince },
+    Hot {
+        top: u32,
+        since: HotSince,
+    },
     /// `blaze cache gc` while the daemon holds the collector's areas: one run of the daemon's
     /// collector to its end (`dry_run` plans and removes nothing), answered with
     /// [`Response::Collected`] as it records. Answered by the daemon's loop, which holds the
     /// collector.
-    Gc { dry_run: bool },
+    Gc {
+        dry_run: bool,
+    },
     /// `blaze why [ITEM]`: what the last build that ended in this daemon's life computed again
     /// instead of reusing, grouped by step and reason, each group with its first items (every
     /// one with `all`); with `item`, that item's reasons and, after them, those of each item a
     /// reason names, in order (its chain). Of the last build of the workspace holding `cwd`
     /// (an absolute path), or with none the newest build's. Answered with
     /// [`Response::Rebuilt`] by the daemon's loop, which keeps each workspace's last reasons.
-    Rebuilt { all: bool, cwd: Option<String>, item: Option<String> },
+    Rebuilt {
+        all: bool,
+        cwd: Option<String>,
+        item: Option<String>,
+    },
     /// `blaze run` of a built program, before it execs it as process `pid`: what that process
     /// needs to run on the daemon's code memory when `program` (the path the build linked it
     /// at) is a dev executable the daemon holds (docs/v2/plan/lanes/fastcompile/inproc.md).
     /// Answered with [`Response::Launched`] by the daemon's loop, which holds the programs.
-    Launch { pid: u32, program: String },
+    Launch {
+        pid: u32,
+        program: String,
+    },
     /// `blaze fetch-url '<json>'`: the bytes of `url`, or the tree of the git repository `repo`
     /// at the full commit `rev`, whose digest is `digest` (`sha256:<hex>`, `sha512:<hex>` or
     /// `blake3:<hex>`; a git tree's over its canonical listing): from the daemon's store when it
@@ -353,6 +441,25 @@ pub enum Request {
         digest: String,
         most_bytes: Option<u64>,
         out: Option<String>,
+    },
+    /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
+    /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
+    /// stream of the profile schema's table (empty for none), every row's `build_id` the
+    /// build's, and when it started and had its answer, on the profile's clock
+    /// (`blaze_profile::clock::mono_ns`). The daemon's loop hands them to its profile history,
+    /// which writes them as the client's process and gives the build's row the two times
+    /// (`builds.client_started_ns`, `client_ended_ns`); answered with `Done { ok: true }` once
+    /// written. A daemon that keeps no history answers at once and keeps nothing.
+    ClientRows {
+        build: u64,
+        #[serde(with = "blaze_protocol::bytes")]
+        events: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
+        folded: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
+        spans: Vec<u8>,
+        ended_ns: i64,
+        started_ns: i64,
     },
 }
 
@@ -426,6 +533,10 @@ pub enum RebuildCause {
     /// Its key is the one it had when last computed, in build `since`, yet nothing is kept
     /// under it: that compute did not keep it.
     Lost { since: u64 },
+    /// Its key is the one it had when last computed, in build `since`, which did not end well
+    /// (it failed or was stopped), and nothing is kept under it: that compute likely failed or
+    /// was stopped before it kept anything.
+    Unfinished { since: u64 },
     /// Its key is the one it had when last computed, in build `since`, so what its value is
     /// filed under past the key differs, or that compute did not keep it: `what` is filed
     /// beyond the key, which blaze does not explain yet.
@@ -547,8 +658,10 @@ pub enum HotWaitKind {
     Scope,
 }
 
-/// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table one Arrow IPC
-/// stream of the schema's table of that name.
+/// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table the next bytes of
+/// the subscription's one long-lived Arrow IPC stream of the schema's table of that name
+/// (`live::Encoder`; empty when it has no rows), which a client reads with one `live::Decoder`
+/// a table across the frames, in order.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct LiveFrame {
     /// Spans not recorded since the daemon began.
@@ -575,13 +688,20 @@ pub struct Ub {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Response {
-    Committed { root: ContentId, rebased: bool },
+    Committed {
+        root: ContentId,
+        rebased: bool,
+    },
     /// A diagnostic, as rustc would give it, with its code.
     Diagnostic(Diagnostic),
     /// A build's output, placed. `profile` as cargo's `Finished` line names it:
     /// "`dev` profile [unoptimized + debuginfo]". `members` is the workspace's member count:
     /// cargo's `needs_spec_flag` puts `-p foo` in "to rerun pass" when there is more than one.
-    Built { members: u32, profile: String, artifacts: Vec<Artifact> },
+    Built {
+        members: u32,
+        profile: String,
+        artifacts: Vec<Artifact>,
+    },
     /// A unit began: cargo's `Compiling foo v0.1.0 (/path)` line.
     Unit(UnitStarted),
     /// A unit's compile ended, after every diagnostic of it: where cargo prints its
@@ -590,7 +710,10 @@ pub enum Response {
     /// cargo's `Updating crates.io index` / `Downloaded serde v1.0.219` as the daemon fetches
     /// what the load asked for: once for each source a job fetches, once for each index or
     /// git repository it updates.
-    Fetched { verb: FetchVerb, what: String },
+    Fetched {
+        verb: FetchVerb,
+        what: String,
+    },
     /// A build script ran: cargo's `build-script-executed` message.
     BuildScript(BuildScriptRan),
     /// What a build, test or run did, before its [`Response::Done`].
@@ -606,21 +729,34 @@ pub enum Response {
         #[serde(with = "blaze_protocol::bytes")]
         stdout: Vec<u8>,
     },
-    Diff { changes: Vec<Change> },
+    Diff {
+        changes: Vec<Change>,
+    },
     Why(Why),
     Status(Status),
     /// The request is over; `ok` false after an error or a failed build.
-    Done { ok: bool },
+    Done {
+        ok: bool,
+    },
     Error(ApiError),
-    Opened { root: ContentId },
+    Opened {
+        root: ContentId,
+    },
     Reached(Reach),
     /// A response of candidate `candidate` of a best-of-N.
-    Of { response: Box<Response>, candidate: u32 },
+    Of {
+        response: Box<Response>,
+        candidate: u32,
+    },
     /// Best first.
     Ranked(Vec<Ranked>),
-    Verified { mismatches: Vec<Mismatch> },
+    Verified {
+        mismatches: Vec<Mismatch>,
+    },
     /// Every head's root, as made durable.
-    Snapshotted { heads: Vec<(String, ContentId)> },
+    Snapshotted {
+        heads: Vec<(String, ContentId)>,
+    },
     /// Each instance's key (`blaze_codegen::InstanceKey`) with the code hash
     /// (`blaze_items::CodeHash`) it was made from, sorted by key.
     CodegenInputs(Vec<(ContentId, ContentId)>),
@@ -629,7 +765,9 @@ pub enum Response {
     /// What a [`Request::Edit`] changed, before its commit's [`Response::Committed`].
     Edited(Edited),
     /// The root a [`Request::WillTest`] or [`Request::WillSave`] builds ahead.
-    Announced { root: ContentId },
+    Announced {
+        root: ContentId,
+    },
     Memory(Memory),
     /// A [`Request::Pack`]'s pack: `blaze_wasm_pack::Pack` as JSON.
     Packed {
@@ -647,24 +785,27 @@ pub enum Response {
     Documented(Documented),
     /// The link of [`Request::Explore`]: `https://ix.dev/explore#127.0.0.1:<port>/<token>/<hash>`.
     /// Its fragment holds the session's token: printed to the terminal only, never logged.
-    Explored { link: String },
+    Explored {
+        link: String,
+    },
     /// [`Request::Profile`]'s Chrome trace (ui.perfetto.dev opens it).
     Profiled {
         #[serde(with = "blaze_protocol::bytes")]
         trace: Vec<u8>,
     },
     Live(LiveFrame),
-    /// [`Request::Sql`]'s answer: one Arrow IPC stream of its batches, and its rows.
-    Queried {
-        #[serde(with = "blaze_protocol::bytes")]
-        ipc: Vec<u8>,
-        rows: u64,
+    /// [`Request::Flush`]'s answer: the number of the flush that committed, which the
+    /// history's manifest says from then on (`Manifest::flushed`).
+    Flushed {
+        seq: u64,
     },
     /// [`Request::Hot`]'s answer.
     Hot(Hot),
     /// [`Request::Gc`]'s answer: the run's report as `blaze cache gc` prints it (its line, each
     /// volume, each object's fate).
-    Collected { report: String },
+    Collected {
+        report: String,
+    },
     /// A unit's compile began: one for every unit, where [`Response::Unit`] is one for its
     /// package. Sent only for a cargo `test` or `bench` build, with a
     /// [`Response::UnitEnded`] for every unit too (not only those with diagnostics), so the
@@ -679,19 +820,30 @@ pub enum Response {
     /// [`Request::Launch`]'s answer: `live` when the program runs on the daemon's code memory
     /// and takes the build's edits while it runs, with the variables `env` its process is
     /// started with; otherwise it runs its file as linked, and `env` is empty.
-    Launched { env: Vec<(String, String)>, live: bool },
+    Launched {
+        env: Vec<(String, String)>,
+        live: bool,
+    },
     /// After a [`Request::Stop`]'s [`Response::Done`], each step the daemon takes before it
     /// hangs up (making, writing and mapping its image), said as it begins: `blaze stop` waits
     /// for each step in turn and, when one outlasts its patience, names it.
-    Stopping { doing: String },
+    Stopping {
+        doing: String,
+    },
     /// [`Request::FetchUrl`]'s answer: the bytes' BLAKE3 (`blake3`, in hex), as the store
     /// keeps them, and, when the request named `out`, where they are written out, read-only
     /// and named by it: a file for a URL, a directory for a git tree.
-    Stored { path: Option<String>, blake3: String },
+    Stored {
+        path: Option<String>,
+        blake3: String,
+    },
     /// Something blaze itself says, of a unit (`unit`) or of the request: a build script that
     /// failed, a directive the sandbox refused. A diagnostic of code is a
     /// [`Response::Diagnostic`]; an error that ends the request is a [`Response::Error`].
-    Report { unit: Option<UnitOf>, report: Report },
+    Report {
+        unit: Option<UnitOf>,
+        report: Report,
+    },
 }
 
 /// What a [`Request::Doc`] documented.
@@ -936,6 +1088,10 @@ pub struct Worked {
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
     /// whether its check outcome and its bodies were served.
     pub served: Vec<ServedCrate>,
+    /// The build's id in the daemon's profile history (`builds.build_id`): what the client
+    /// tags the rows it sends with ([`Request::ClientRows`]). `None` for work no build row
+    /// stands for.
+    pub build_id: Option<u64>,
     /// Functions whose code was generated.
     pub compiled: u64,
     /// The measured run time of the request's nodes, summed by kind: each kind that ran at
@@ -1376,7 +1532,11 @@ pub struct Bug {
 impl std::fmt::Display for Bug {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Bug { kind, what, at, count, thread } = self;
-        write!(f, "a blaze bug: `{kind}` {what} at {at}, {count} time{}", if *count == 1 { "" } else { "s" })?;
+        write!(
+            f,
+            "a blaze bug: `{kind}` {what} at {at}, {count} time{}",
+            if *count == 1 { "" } else { "s" }
+        )?;
         match thread {
             Some(thread) => write!(f, ", first on thread `{thread}`"),
             None => Ok(()),
@@ -1560,9 +1720,14 @@ pub struct RequestRef {
 /// What the server hands the session.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Arrived {
-    Request { from: RequestRef, request: Request },
+    Request {
+        from: RequestRef,
+        request: Request,
+    },
     /// The connection ended: its requests are cancelled and its replies dropped.
-    Gone { conn: Conn },
+    Gone {
+        conn: Conn,
+    },
 }
 
 /// A response for the server to send.
@@ -1653,7 +1818,10 @@ mod tests {
             (blaze_protocol::cbor::to_vec(&TargetKind::CustomBuild).unwrap(), "custom-build"),
             (blaze_protocol::cbor::to_vec(&CrateType::ProcMacro).unwrap(), "proc-macro"),
             (blaze_protocol::cbor::to_vec(&ArtifactKind::Doctest).unwrap(), "doctest"),
-            (blaze_protocol::cbor::to_vec(&Applicability::MachineApplicable).unwrap(), "MachineApplicable"),
+            (
+                blaze_protocol::cbor::to_vec(&Applicability::MachineApplicable).unwrap(),
+                "MachineApplicable",
+            ),
             (blaze_protocol::cbor::to_vec(&TargetKind::Lib).unwrap(), TargetKind::Lib.name()),
         ];
         for (bytes, name) in names {
@@ -1680,10 +1848,10 @@ mod tests {
         let bytes = blaze_protocol::cbor::to_vec("staticlibs").unwrap();
         let refused = blaze_protocol::cbor::from_slice::<CrateType>(&bytes).unwrap_err();
         assert!(refused.to_string().contains("`staticlibs`"), "{refused}");
-        let item = blaze_protocol::cbor::to_vec(&Envelope::new(3, Response::Fetched {
-            verb: FetchVerb::Updating,
-            what: String::new(),
-        }))
+        let item = blaze_protocol::cbor::to_vec(&Envelope::new(
+            3,
+            Response::Fetched { verb: FetchVerb::Updating, what: String::new() },
+        ))
         .unwrap();
         let updating = [0x68, b'U', b'p', b'd', b'a', b't', b'i', b'n', b'g'];
         let at = item.windows(updating.len()).position(|it| it == updating).unwrap();

@@ -233,28 +233,16 @@ impl<'c> AstFormatter for FmtCtx<'c> {
     }
 
     fn no_generics<'a>(&'a self) -> Self::Reborrow<'a> {
-        FmtCtx {
-            generics: BindingStack::empty(),
-            ..self.reborrow()
-        }
+        FmtCtx { generics: BindingStack::empty(), ..self.reborrow() }
     }
     fn set_generics<'a>(&'a self, generics: &'a GenericParams) -> Self::Reborrow<'a> {
-        FmtCtx {
-            generics: BindingStack::new(Cow::Borrowed(generics)),
-            ..self.reborrow()
-        }
+        FmtCtx { generics: BindingStack::new(Cow::Borrowed(generics)), ..self.reborrow() }
     }
     fn set_current_type<'a>(&'a self, type_id: TypeDeclId) -> Self::Reborrow<'a> {
-        FmtCtx {
-            current_type: Some(type_id),
-            ..self.reborrow()
-        }
+        FmtCtx { current_type: Some(type_id), ..self.reborrow() }
     }
     fn set_locals<'a>(&'a self, locals: &'a Locals) -> Self::Reborrow<'a> {
-        FmtCtx {
-            local_names: Some(Cow::Owned(compute_local_names(locals))),
-            ..self.reborrow()
-        }
+        FmtCtx { local_names: Some(Cow::Owned(compute_local_names(locals))), ..self.reborrow() }
     }
     fn push_binder<'a>(&'a self, new_params: Cow<'a, GenericParams>) -> Self::Reborrow<'a> {
         let mut ret = self.reborrow();
@@ -266,16 +254,10 @@ impl<'c> AstFormatter for FmtCtx<'c> {
     }
 
     fn increase_indent<'a>(&'a self) -> Self::Reborrow<'a> {
-        FmtCtx {
-            indent_level: self.indent_level + 1,
-            ..self.reborrow()
-        }
+        FmtCtx { indent_level: self.indent_level + 1, ..self.reborrow() }
     }
     fn reset_indent<'a>(&'a self) -> Self::Reborrow<'a> {
-        FmtCtx {
-            indent_level: 0,
-            ..self.reborrow()
-        }
+        FmtCtx { indent_level: 0, ..self.reborrow() }
     }
     fn indent(&self) -> String {
         TAB_INCR.repeat(self.indent_level)
@@ -325,10 +307,7 @@ impl<'c> AstFormatter for FmtCtx<'c> {
         if self.generics.is_empty() {
             return write!(f, "{var_prefix}{var}");
         }
-        match self
-            .generics
-            .get_var_with_outermost_free::<_, GenericParams>(var)
-        {
+        match self.generics.get_var_with_outermost_free::<_, GenericParams>(var) {
             None => write!(f, "missing({var_prefix}{var})"),
             Some(v) => match fmt_var(v) {
                 Some(name) => write!(f, "{name}"),
@@ -336,11 +315,7 @@ impl<'c> AstFormatter for FmtCtx<'c> {
                     write!(f, "{var_prefix}")?;
                     let (dbid, varid) = self.generics.as_bound_var_with_outermost_free(var);
                     let depth = self.generics.depth().index - dbid.index;
-                    if depth == 0 {
-                        write!(f, "{varid}")
-                    } else {
-                        write!(f, "{varid}_{depth}")
-                    }
+                    if depth == 0 { write!(f, "{varid}") } else { write!(f, "{varid}_{depth}") }
                 }
             },
         }
@@ -356,9 +331,7 @@ impl<'a> FmtCtx<'a> {
         let Some(translated) = &self.translated else {
             return Err(None);
         };
-        translated
-            .get_item(id)
-            .ok_or_else(|| Some(translated.item_short_name(id)))
+        translated.get_item(id).ok_or_else(|| Some(translated.item_short_name(id)))
     }
 
     /// Print the whole definition.
@@ -367,9 +340,8 @@ impl<'a> FmtCtx<'a> {
         match self.get_item(id) {
             Ok(d) => d.to_string_with_ctx(self),
             Err(opt_name) => {
-                let opt_name = opt_name
-                    .map(|n| format!(" ({})", n.with_ctx(self)))
-                    .unwrap_or_default();
+                let opt_name =
+                    opt_name.map(|n| format!(" ({})", n.with_ctx(self))).unwrap_or_default();
                 format!("Missing decl: {id:?}{opt_name}")
             }
         }
@@ -392,19 +364,13 @@ impl<'a> FmtCtx<'a> {
 
 /// Compute a unique name for each local.
 pub fn compute_local_names(locals: &Locals) -> IndexVec<LocalId, String> {
-    let mut local_names = locals.locals.map_ref(|local| {
-        format!(
-            "{}_{}",
-            local.name.as_deref().unwrap_or_default(),
-            local.index
-        )
-    });
+    let mut local_names = locals
+        .locals
+        .map_ref(|local| format!("{}_{}", local.name.as_deref().unwrap_or_default(), local.index));
 
     let mut name_counts = HashMap::<String, usize>::new();
     for local in &locals.locals {
-        *name_counts
-            .entry(local_names[local.index].clone())
-            .or_default() += 1;
+        *name_counts.entry(local_names[local.index].clone()).or_default() += 1;
         if let Some(name) = &local.name {
             *name_counts.entry(name.clone()).or_default() += 1;
         }

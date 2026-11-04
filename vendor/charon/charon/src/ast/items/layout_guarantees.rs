@@ -5,8 +5,7 @@ use enum_as_inner::EnumAsInner;
 use serde_state::{DeserializeState, SerializeState};
 
 /// The predecessor of a field in a struct or enum variant.
-#[derive(Debug, Copy, Clone, PartialEq)]
-#[derive(SerializeState, DeserializeState)]
+#[derive(Debug, Copy, Clone, PartialEq, SerializeState, DeserializeState)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Predecessor"))]
 pub enum FieldPredecessor {
     Field(FieldId),
@@ -14,9 +13,9 @@ pub enum FieldPredecessor {
 }
 
 /// Guaranteed facts about a field offset.
-#[derive(Debug, Clone)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, EnumAsInner, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 pub enum OffsetGuarantee {
     /// Guaranteed to be exactly at the given offset.
     AtOffset(SizeExpr),
@@ -28,9 +27,21 @@ pub enum OffsetGuarantee {
 }
 
 /// Layout information given by the metadata of an unsized type.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variant_prefix("LayoutValue"))]
 pub enum MetadataValue {
     /// For a DST with `dyn Trait` metadata, this refers to the size found in the metadata.
@@ -42,14 +53,38 @@ pub enum MetadataValue {
 }
 
 /// An expression that represents a size in bytes.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde_state(state_implements = DedupSerializerState)]
 pub struct SizeExpr(pub HashConsed<WithCachedTypeInfo<SizeExprKind>>);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("SizeExpr"))]
 pub enum SizeExprKind {
     /// An arbitrary constant of type `usize`.
@@ -140,12 +175,7 @@ impl SizeExpr {
     }
 
     pub fn if_inhabited(ty: &Ty, then_size: SizeExpr, else_size: SizeExpr) -> SizeExpr {
-        SizeExprKind::IfInhabited {
-            ty: ty.clone(),
-            then_size,
-            else_size,
-        }
-        .into_expr()
+        SizeExprKind::IfInhabited { ty: ty.clone(), then_size, else_size }.into_expr()
     }
 
     /// Recursively evaluate the parts of this expression that are known in `krate`.
@@ -184,11 +214,7 @@ impl SizeExpr {
         }
 
         fn rewrap_at_least(kind: SizeExprKind, at_least: bool) -> SizeExprKind {
-            if at_least {
-                SizeExprKind::AtLeast(kind.into_expr())
-            } else {
-                kind
-            }
+            if at_least { SizeExprKind::AtLeast(kind.into_expr()) } else { kind }
         }
 
         fn as_usize_bound(value: &SizeExpr) -> Option<(u128, bool)> {
@@ -206,15 +232,15 @@ impl SizeExpr {
                 return false;
             }
             match value.kind() {
-                SizeExprKind::Constant(constant) => constant
-                    .as_usize_literal()
-                    .is_some_and(|value| value % align == 0),
-                SizeExprKind::Scale(_, multiplier) => multiplier
-                    .as_usize_literal()
-                    .is_some_and(|multiplier| multiplier % align == 0),
-                SizeExprKind::AlignTo { target_align, .. } => target_align
-                    .as_usize()
-                    .is_some_and(|target_align| target_align % align == 0),
+                SizeExprKind::Constant(constant) => {
+                    constant.as_usize_literal().is_some_and(|value| value % align == 0)
+                }
+                SizeExprKind::Scale(_, multiplier) => {
+                    multiplier.as_usize_literal().is_some_and(|multiplier| multiplier % align == 0)
+                }
+                SizeExprKind::AlignTo { target_align, .. } => {
+                    target_align.as_usize().is_some_and(|target_align| target_align % align == 0)
+                }
                 _ => false,
             }
         }
@@ -474,11 +500,7 @@ impl SizeExpr {
                             _ => return,
                         }
                     }
-                    SizeExprKind::IfInhabited {
-                        ty,
-                        then_size,
-                        else_size,
-                    } => {
+                    SizeExprKind::IfInhabited { ty, then_size, else_size } => {
                         if then_size == else_size {
                             then_size.kind().clone()
                         } else if let Some(krate) = self.krate
@@ -504,12 +526,7 @@ impl SizeExpr {
             }
         }
 
-        NormalizeSizeExpr {
-            krate,
-            for_target,
-            allow_precision_loss,
-        }
-        .visit(&mut self);
+        NormalizeSizeExpr { krate, for_target, allow_precision_loss }.visit(&mut self);
         self
     }
 
@@ -644,12 +661,10 @@ mod tests {
         );
 
         let scaled = SizeExprKind::Scale(dyn_size, ConstantExpr::mk_usize(8)).into_expr();
-        let aligned_scale = SizeExprKind::AlignTo {
-            base: scaled.clone(),
-            target_align: target_align.clone(),
-        }
-        .into_expr()
-        .normalize(Some(&krate), Some(&target), false);
+        let aligned_scale =
+            SizeExprKind::AlignTo { base: scaled.clone(), target_align: target_align.clone() }
+                .into_expr()
+                .normalize(Some(&krate), Some(&target), false);
         assert_eq!(aligned_scale, scaled);
 
         let inner_align_to = SizeExprKind::AlignTo {
@@ -675,9 +690,7 @@ mod tests {
         }
         .into_expr();
         assert_eq!(
-            insufficient_inner_align
-                .clone()
-                .normalize(Some(&krate), Some(&target), false),
+            insufficient_inner_align.clone().normalize(Some(&krate), Some(&target), false),
             insufficient_inner_align
         );
 
@@ -691,11 +704,7 @@ mod tests {
             with_scale,
             SizeExprKind::Plus(
                 scaled,
-                SizeExprKind::AlignTo {
-                    base: dyn_align,
-                    target_align,
-                }
-                .into_expr(),
+                SizeExprKind::AlignTo { base: dyn_align, target_align }.into_expr(),
             )
             .into_expr()
         );
@@ -714,9 +723,7 @@ mod tests {
         }
         .into_expr();
         assert_eq!(
-            unaligned_scale
-                .clone()
-                .normalize(Some(&krate), Some(&target), false),
+            unaligned_scale.clone().normalize(Some(&krate), Some(&target), false),
             unaligned_scale
         );
     }
@@ -741,15 +748,10 @@ mod tests {
         };
         assert_eq!(contenders.len(), 2);
         assert_eq!(contenders[1].as_usize(), Some(5));
-        assert!(matches!(
-            contenders[0].kind(),
-            SizeExprKind::FromMetadata(MetadataValue::DynSize)
-        ));
+        assert!(matches!(contenders[0].kind(), SizeExprKind::FromMetadata(MetadataValue::DynSize)));
 
         let empty =
-            SizeExprKind::Max(Vec::new())
-                .into_expr()
-                .normalize(Some(&krate), Some(&target), false);
+            SizeExprKind::Max(Vec::new()).into_expr().normalize(Some(&krate), Some(&target), false);
         assert_eq!(empty.as_usize(), Some(0));
     }
 
@@ -770,10 +772,7 @@ mod tests {
         .into_expr()
         .normalize(Some(&krate), Some(&target), false);
 
-        assert!(matches!(
-            max.kind(),
-            SizeExprKind::FromMetadata(MetadataValue::DynSize)
-        ));
+        assert!(matches!(max.kind(), SizeExprKind::FromMetadata(MetadataValue::DynSize)));
         assert_eq!(min.as_usize(), Some(0));
     }
 
@@ -806,17 +805,11 @@ mod tests {
             at_least(8)
         );
         assert_eq!(
-            normalize(SizeExprKind::Min(vec![
-                at_least(5),
-                SizeExpr::from_usize(3)
-            ])),
+            normalize(SizeExprKind::Min(vec![at_least(5), SizeExpr::from_usize(3)])),
             SizeExpr::from_usize(3)
         );
         assert_eq!(
-            normalize(SizeExprKind::Min(vec![
-                at_least(3),
-                SizeExpr::from_usize(5)
-            ])),
+            normalize(SizeExprKind::Min(vec![at_least(3), SizeExpr::from_usize(5)])),
             at_least(3)
         );
     }
@@ -879,9 +872,7 @@ mod tests {
             Ty::mk_usize(),
         ))
         .into_expr();
-        let pointer_size_a = pointer_size
-            .clone()
-            .normalize(Some(&krate), Some(&target_a), false);
+        let pointer_size_a = pointer_size.clone().normalize(Some(&krate), Some(&target_a), false);
         let pointer_size_b = pointer_size.normalize(Some(&krate), Some(&target_b), false);
 
         assert_eq!(size.as_usize(), Some(8));
@@ -905,14 +896,8 @@ mod tests {
         ))
         .into_expr();
 
-        assert_eq!(
-            size_of_usize.clone().normalize(None, None, false),
-            size_of_usize
-        );
-        assert_eq!(
-            align_of_u16.clone().normalize(None, None, false),
-            align_of_u16
-        );
+        assert_eq!(size_of_usize.clone().normalize(None, None, false), size_of_usize);
+        assert_eq!(align_of_u16.clone().normalize(None, None, false), align_of_u16);
 
         let target_independent = SizeExprKind::Plus(
             SizeExprKind::Constant(ConstantExpr::new(
@@ -932,18 +917,13 @@ mod tests {
         let (mut krate, target) = test_krate();
         let id = TypeDeclId::ZERO;
         let mut generics = GenericParams::empty();
-        generics
-            .types
-            .push_with(|id| TypeParam::new(id, "T".to_owned(), Variance::Invariant));
+        generics.types.push_with(|id| TypeParam::new(id, "T".to_owned(), Variance::Invariant));
         let generic_ty = generics.identity_args().types[TypeVarId::ZERO].clone();
         let mut layouts = SeqHashMap::new();
         layouts.insert(
             target.clone(),
             Layout {
-                size: Size {
-                    chosen: Some(SizeExpr::from_usize(99)),
-                    guarantee: None,
-                },
+                size: Size { chosen: Some(SizeExpr::from_usize(99)), guarantee: None },
                 align: Size::new(1),
                 discriminator: None,
                 inhabited: InhabitedPredicate::mk_true(),

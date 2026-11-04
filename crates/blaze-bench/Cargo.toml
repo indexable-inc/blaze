@@ -17,7 +17,9 @@ blaze-cas.workspace = true
 blaze-codegen.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-profile.workspace = true
 blaze-query.workspace = true
+tracing.workspace = true
 
 [[bench]]
 name = "store"
@@ -29,6 +31,10 @@ harness = false
 
 [[bench]]
 name = "dedupe"
+harness = false
+
+[[bench]]
+name = "record"
 harness = false
 
 [lints]

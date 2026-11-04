@@ -66,9 +66,13 @@ pub fn outside_reads(db: &Db, krate: Crate) -> Result<ContentId, Refused> {
 /// now: one that still has such an expansion is the refusal, and one whose call is gone or
 /// traces now is not refused. A gone call's traced reads stay among the reads, which can
 /// only make a value keyed by them miss.
-pub fn closure_expansion_reads(db: &Db, krate: Crate) -> Result<Vec<(Crate, Vec<(Box<[u8]>, ContentId)>)>, Refused> {
+pub fn closure_expansion_reads(
+    db: &Db,
+    krate: Crate,
+) -> Result<Vec<(Crate, Vec<(Box<[u8]>, ContentId)>)>, Refused> {
     // alloc: once per value keyed by a crate's closure, a crate of it each
-    let closure: blaze_hash::HashSet<Crate, std::alloc::Global> = krate.transitive_deps(db).iter().copied().collect();
+    let closure: blaze_hash::HashSet<Crate, std::alloc::Global> =
+        krate.transitive_deps(db).iter().copied().collect();
     // alloc: as above, a crate whose expansions read something each
     let mut reads: Vec<(Crate, Vec<(Box<[u8]>, ContentId)>)> = Vec::new();
     let mut asked: Option<Crate> = None;

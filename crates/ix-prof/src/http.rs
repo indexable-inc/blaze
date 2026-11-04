@@ -59,7 +59,8 @@ pub struct Bound {
 /// Binds `addr`, loopback only.
 pub fn bind(addr: &str) -> Result<Bound, String> {
     let listener = TcpListener::bind(addr).map_err(|why| format!("binding {addr}: {why}"))?;
-    let bound = listener.local_addr().map_err(|why| format!("the address bound for {addr}: {why}"))?;
+    let bound =
+        listener.local_addr().map_err(|why| format!("the address bound for {addr}: {why}"))?;
     if !bound.ip().is_loopback() {
         return Err(format!(
             "{addr} is not a loopback address: the profile would be readable from other hosts; use 127.0.0.1:<port>"
@@ -83,8 +84,8 @@ impl Bound {
     /// Serves on a thread, every request checked against a new random token.
     pub fn serve(self) -> Result<Server, String> {
         let token = crate::token::new().map_err(|why| format!("making its token: {why}"))?;
-        let (wake, woken) =
-            std::os::unix::net::UnixStream::pair().map_err(|why| format!("its stop socket: {why}"))?;
+        let (wake, woken) = std::os::unix::net::UnixStream::pair()
+            .map_err(|why| format!("its stop socket: {why}"))?;
         self.listener.set_nonblocking(true).map_err(|why| format!("the listener: {why}"))?;
         let want: Arc<str> = Arc::from(token.as_str());
         let listener = self.listener;
@@ -167,7 +168,10 @@ fn accept_loop(listener: &TcpListener, woken: &std::os::unix::net::UnixStream, t
                     break;
                 }
                 Err(why)
-                    if matches!(why.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => {}
+                    if matches!(
+                        why.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(why) => {
                     backoff_ms = Some(match backoff_ms {
                         None => {
@@ -194,7 +198,8 @@ fn admit(conn: TcpStream, gate: &Arc<Gate>, token: &Arc<str>) {
     // the deadline. The clone is the gate's handle to shut it down; without one (out of
     // descriptors) the connection is closed here.
     let Ok(handle_of) = conn.try_clone() else { return };
-    if conn.set_nonblocking(false).is_err() || conn.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
+    if conn.set_nonblocking(false).is_err() || conn.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
+    {
         return;
     }
     let (waiting, evicted) = gate.enter(handle_of);
@@ -228,7 +233,10 @@ impl Gate {
         let mut g = self.0.lock();
         let id = g.next;
         g.next += 1;
-        let evicted = (g.waiting.len() >= MAX_UNCHECKED).then(|| g.waiting.pop_front()).flatten().map(|it| it.1);
+        let evicted = (g.waiting.len() >= MAX_UNCHECKED)
+            .then(|| g.waiting.pop_front())
+            .flatten()
+            .map(|it| it.1);
         g.waiting.push_back((id, conn));
         drop(g);
         (Waiting { gate: Arc::clone(self), id, left: false }, evicted)
@@ -289,7 +297,9 @@ impl Request {
     }
 
     fn num<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>, String> {
-        self.get(key).map(|v| v.parse().map_err(|_| format!("query `{key}={v}` is not a number"))).transpose()
+        self.get(key)
+            .map(|v| v.parse().map_err(|_| format!("query `{key}={v}` is not a number")))
+            .transpose()
     }
 }
 
@@ -309,7 +319,10 @@ struct Before<'a> {
 impl Read for Before<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let late = || {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, format!("the request was not whole within {READ_TIMEOUT:?} of the connection"))
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("the request was not whole within {READ_TIMEOUT:?} of the connection"),
+            )
         };
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -331,7 +344,8 @@ fn parse_request(from: impl Read) -> Result<Request, String> {
     if !next(&mut reader, &mut line)? {
         return Err("an empty request".to_owned());
     }
-    let first = std::str::from_utf8(&line).map_err(|_| "the request line is not UTF-8".to_owned())?;
+    let first =
+        std::str::from_utf8(&line).map_err(|_| "the request line is not UTF-8".to_owned())?;
     let mut parts = first.split_whitespace();
     let method = parts.next().ok_or("an empty request")?.to_owned();
     let target = parts.next().ok_or("a request with no path")?;
@@ -368,7 +382,10 @@ fn parse_request(from: impl Read) -> Result<Request, String> {
 
 /// The next line into `line`, its `\n` included; false at the end. A line the cap or the end
 /// of the stream cuts short is an error.
-fn next<R: Read>(reader: &mut BufReader<std::io::Take<R>>, line: &mut Vec<u8>) -> Result<bool, String> {
+fn next<R: Read>(
+    reader: &mut BufReader<std::io::Take<R>>,
+    line: &mut Vec<u8>,
+) -> Result<bool, String> {
     line.clear();
     let n = reader.read_until(b'\n', line).map_err(|why| format!("reading the request: {why}"))?;
     if (n > 0 && line.last() != Some(&b'\n')) || (n == 0 && reader.get_ref().limit() == 0) {
@@ -432,8 +449,16 @@ fn allowed_origin(origin: Option<&str>) -> Option<&str> {
     (o == "https://ix.dev" || loopback).then_some(o)
 }
 
-fn head(conn: &mut TcpStream, req: &Request, status: &str, content_type: &str, len: Option<usize>) -> std::io::Result<()> {
-    let mut h = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nConnection: close\r\n");
+fn head(
+    conn: &mut TcpStream,
+    req: &Request,
+    status: &str,
+    content_type: &str,
+    len: Option<usize>,
+) -> std::io::Result<()> {
+    let mut h = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nConnection: close\r\n"
+    );
     if let Some(o) = allowed_origin(req.origin.as_deref()) {
         h.push_str(&format!("Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n"));
     }
@@ -445,21 +470,42 @@ fn head(conn: &mut TcpStream, req: &Request, status: &str, content_type: &str, l
     conn.write_all(h.as_bytes())
 }
 
-fn reply(conn: &mut TcpStream, req: &Request, status: &str, content_type: &str, body: &[u8]) -> std::io::Result<()> {
+fn reply(
+    conn: &mut TcpStream,
+    req: &Request,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     head(conn, req, status, content_type, Some(body.len()))?;
     conn.write_all(body)
 }
 
-fn handle(mut conn: TcpStream, deadline: Instant, mut waiting: Waiting, token: &str) -> std::io::Result<()> {
+fn handle(
+    mut conn: TcpStream,
+    deadline: Instant,
+    mut waiting: Waiting,
+    token: &str,
+) -> std::io::Result<()> {
     let req = match read_request(&conn, deadline) {
         Ok(it) => it,
         Err(why) => {
-            let r = Request { method: String::new(), path: String::new(), query: Vec::new(), origin: None, host: None, bearer: None };
+            let r = Request {
+                method: String::new(),
+                path: String::new(),
+                query: Vec::new(),
+                origin: None,
+                host: None,
+                bearer: None,
+            };
             return reply(&mut conn, &r, "400 Bad Request", "text/plain", why.as_bytes());
         }
     };
     if !loopback_host(req.host.as_deref()) {
-        let why = format!("Host {:?} is not a loopback name: refused (a page could reach this port by DNS rebinding)", req.host);
+        let why = format!(
+            "Host {:?} is not a loopback name: refused (a page could reach this port by DNS rebinding)",
+            req.host
+        );
         return reply(&mut conn, &req, "403 Forbidden", "text/plain", why.as_bytes());
     }
     if !token_matches(req.token(), token) {
@@ -481,7 +527,13 @@ fn handle(mut conn: TcpStream, deadline: Instant, mut waiting: Waiting, token: &
         return reply(&mut conn, &req, "405 Method Not Allowed", "text/plain", b"only GET");
     }
     let Some(session) = crate::session() else {
-        return reply(&mut conn, &req, "503 Service Unavailable", "text/plain", b"ix-prof has stopped");
+        return reply(
+            &mut conn,
+            &req,
+            "503 Service Unavailable",
+            "text/plain",
+            b"ix-prof has stopped",
+        );
     };
     let route = req.path.strip_prefix("/debug/pprof").unwrap_or("?");
     let result: Result<(&str, Vec<u8>), (&str, String)> = match route {
@@ -498,7 +550,9 @@ fn handle(mut conn: TcpStream, deadline: Instant, mut waiting: Waiting, token: &
     };
     match result {
         Ok((ty, body)) => reply(&mut conn, &req, "200 OK", ty, &body),
-        Err((status, why)) => reply(&mut conn, &req, status, "text/plain; charset=utf-8", why.as_bytes()),
+        Err((status, why)) => {
+            reply(&mut conn, &req, status, "text/plain; charset=utf-8", why.as_bytes())
+        }
     }
 }
 
@@ -519,14 +573,19 @@ fn bad(why: String) -> (&'static str, String) {
 }
 
 /// `?seconds=N` as the last N seconds, or everything retained.
-fn window_last(req: &Request) -> Result<Option<(Option<i64>, Option<i64>)>, (&'static str, String)> {
+fn window_last(
+    req: &Request,
+) -> Result<Option<(Option<i64>, Option<i64>)>, (&'static str, String)> {
     let secs: Option<u64> = req.num("seconds").map_err(bad)?;
     Ok(secs.map(|s| (Some(clock::now_ns() - (s as i64).saturating_mul(1_000_000_000)), None)))
 }
 
-fn snapshot(window: Option<(Option<i64>, Option<i64>)>) -> Result<crate::Profile, (&'static str, String)> {
+fn snapshot(
+    window: Option<(Option<i64>, Option<i64>)>,
+) -> Result<crate::Profile, (&'static str, String)> {
     let (since, until) = window.unwrap_or((None, None));
-    crate::snapshot(since, until).ok_or(("503 Service Unavailable", "ix-prof has stopped".to_owned()))
+    crate::snapshot(since, until)
+        .ok_or(("503 Service Unavailable", "ix-prof has stopped".to_owned()))
 }
 
 fn pprof_of(p: &crate::Profile, kind: Kind, default: Option<&str>) -> Answer {
@@ -537,7 +596,12 @@ fn pprof_of(p: &crate::Profile, kind: Kind, default: Option<&str>) -> Answer {
     Ok(("application/octet-stream", v.to_pprof()))
 }
 
-fn view(_req: &Request, kind: Kind, window: Option<(Option<i64>, Option<i64>)>, default: Option<&str>) -> Answer {
+fn view(
+    _req: &Request,
+    kind: Kind,
+    window: Option<(Option<i64>, Option<i64>)>,
+    default: Option<&str>,
+) -> Answer {
     pprof_of(&snapshot(window)?, kind, default)
 }
 
@@ -547,7 +611,10 @@ fn cpu(req: &Request) -> Answer {
         return Err(bad(format!("seconds={secs}: give 1 to 3600")));
     }
     let from = clock::now_ns();
-    #[allow(clippy::disallowed_methods, reason = "this connection's own thread waits out the profile's window, as Go's handler does")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "this connection's own thread waits out the profile's window, as Go's handler does"
+    )]
     std::thread::sleep(Duration::from_secs(secs));
     pprof_of(&snapshot(Some((Some(from), None)))?, Kind::Cpu, None)
 }
@@ -570,7 +637,8 @@ fn ixprof(req: &Request) -> Answer {
         "chrome" => Ok(("application/json", crate::chrome::to_chrome(&p).into_bytes())),
         "pprof" => {
             let kind = req.get("kind").unwrap_or("cpu");
-            let kind = Kind::parse(kind).ok_or_else(|| bad(format!("kind={kind}: give cpu, heap, spans or waits")))?;
+            let kind = Kind::parse(kind)
+                .ok_or_else(|| bad(format!("kind={kind}: give cpu, heap, spans or waits")))?;
             pprof_of(&p, kind, None)
         }
         other => Err(bad(format!("format={other}: give ixprof, pprof or chrome"))),
@@ -585,7 +653,12 @@ fn threads() -> String {
             out.push_str(&format!("thread {}\n", s.thread));
             last = Some(s.thread);
         }
-        out.push_str(&format!("  {}{} {:.3}ms", "  ".repeat(usize::from(s.depth)), s.name, s.dur_ns as f64 / 1e6));
+        out.push_str(&format!(
+            "  {}{} {:.3}ms",
+            "  ".repeat(usize::from(s.depth)),
+            s.name,
+            s.dur_ns as f64 / 1e6
+        ));
         if let Some(w) = &s.wait {
             out.push_str(&format!(" wait {w}"));
             if let Some(on) = &s.wait_on {
@@ -653,7 +726,10 @@ fn live(conn: &mut TcpStream, req: &Request, session: &crate::Session) -> std::i
             chunk(conn, &Log::end_frame("profiler stopped"))?;
             return conn.write_all(b"0\r\n\r\n");
         }
-        #[allow(clippy::disallowed_methods, reason = "this connection's own thread polls the log at the client's tick; a driver's timer")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "this connection's own thread polls the log at the client's tick; a driver's timer"
+        )]
         std::thread::sleep(Duration::from_millis(tick_ms));
     }
 }
@@ -677,7 +753,11 @@ mod tests {
     }
 
     fn scratch(what: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("ix-prof-{what}-{}-{}", std::process::id(), crate::nonce()))
+        std::env::temp_dir().join(format!(
+            "ix-prof-{what}-{}-{}",
+            std::process::id(),
+            crate::nonce()
+        ))
     }
 
     #[test]
@@ -703,12 +783,23 @@ mod tests {
     #[test]
     fn a_request_that_never_ends_is_refused_after_16_kib() {
         let line = parse_request(std::io::repeat(b'a')).err();
-        assert!(line.as_deref().is_some_and(|why| why.contains("over 16384 bytes")), "an endless request line: {line:?}");
-        let headers = parse_request(std::io::Read::chain(&b"GET /debug/pprof HTTP/1.1\r\n"[..], Headers)).err();
-        assert!(headers.as_deref().is_some_and(|why| why.contains("over 16384 bytes")), "endless headers: {headers:?}");
+        assert!(
+            line.as_deref().is_some_and(|why| why.contains("over 16384 bytes")),
+            "an endless request line: {line:?}"
+        );
+        let headers =
+            parse_request(std::io::Read::chain(&b"GET /debug/pprof HTTP/1.1\r\n"[..], Headers))
+                .err();
+        assert!(
+            headers.as_deref().is_some_and(|why| why.contains("over 16384 bytes")),
+            "endless headers: {headers:?}"
+        );
         let ok = parse_request(&b"GET /debug/pprof/heap?token=ab HTTP/1.1\r\nHost: 127.0.0.1:1\r\nAuthorization: Bearer cd\r\n\r\n"[..])
             .unwrap_or_else(|why| panic!("a whole request: {why}"));
-        assert_eq!((ok.path.as_str(), ok.get("token"), ok.token()), ("/debug/pprof/heap", Some("ab"), Some("cd")));
+        assert_eq!(
+            (ok.path.as_str(), ok.get("token"), ok.token()),
+            ("/debug/pprof/heap", Some("ab"), Some("cd"))
+        );
     }
 
     /// S2: when [`MAX_UNCHECKED`] connections wait for their token check, one more evicts the
@@ -720,22 +811,38 @@ mod tests {
         let dir = scratch("evict");
         let (guard, addr, token) = start_serving(&dir);
         // Each would hold its place until the deadline: they send nothing.
-        let idle: Vec<TcpStream> = (0..MAX_UNCHECKED).map(|_| TcpStream::connect(&addr).unwrap()).collect();
+        let idle: Vec<TcpStream> =
+            (0..MAX_UNCHECKED).map(|_| TcpStream::connect(&addr).unwrap()).collect();
         // Let the server take all of them in before the owner's comes.
         std::thread::sleep(Duration::from_millis(300));
         let mut owner = TcpStream::connect(&addr).unwrap();
         owner.set_read_timeout(Some(READ_TIMEOUT / 2)).unwrap();
-        write!(owner, "GET /debug/pprof/ HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n").unwrap();
+        write!(
+            owner,
+            "GET /debug/pprof/ HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\r\n"
+        )
+        .unwrap();
         let got = answer(owner);
-        assert!(got.starts_with("HTTP/1.1 200"), "connection {} with {MAX_UNCHECKED} waiting: {got:?}", MAX_UNCHECKED + 1);
+        assert!(
+            got.starts_with("HTTP/1.1 200"),
+            "connection {} with {MAX_UNCHECKED} waiting: {got:?}",
+            MAX_UNCHECKED + 1
+        );
         // The oldest was shut down at once, long before its deadline.
         let mut oldest = idle.into_iter().next().unwrap();
         oldest.set_read_timeout(Some(READ_TIMEOUT / 2)).unwrap();
         let t = Instant::now();
         let mut buf = [0u8; 64];
         let n = oldest.read(&mut buf);
-        assert!(n.as_ref().is_ok_and(|&n| n == 0 || buf[..n].starts_with(b"HTTP/1.1 400")), "the oldest: {n:?}");
-        assert!(t.elapsed() < READ_TIMEOUT / 2, "the oldest was not evicted: it lasted {:?} more", t.elapsed());
+        assert!(
+            n.as_ref().is_ok_and(|&n| n == 0 || buf[..n].starts_with(b"HTTP/1.1 400")),
+            "the oldest: {n:?}"
+        );
+        assert!(
+            t.elapsed() < READ_TIMEOUT / 2,
+            "the oldest was not evicted: it lasted {:?} more",
+            t.elapsed()
+        );
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -748,7 +855,10 @@ mod tests {
         let t = Instant::now();
         let got = answer(c);
         let took = t.elapsed();
-        assert!(got.starts_with("HTTP/1.1 400") && took < READ_TIMEOUT * 2, "{got:?} after {took:?}");
+        assert!(
+            got.starts_with("HTTP/1.1 400") && took < READ_TIMEOUT * 2,
+            "{got:?} after {took:?}"
+        );
     }
 
     /// S2, from the review's `review_a_trickling_client_holds_its_slot_past_the_read_timeout`,
@@ -775,14 +885,24 @@ mod tests {
                     let _ = c.read_to_end(&mut got);
                     break;
                 }
-                Err(why) if matches!(why.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(why)
+                    if matches!(
+                        why.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
                 Err(_) => break,
             }
         }
         let took = t.elapsed();
         let got = String::from_utf8_lossy(&got);
-        assert!(took < READ_TIMEOUT + Duration::from_secs(2), "a byte every 0.9 s held the connection {took:?}: {got:?}");
-        assert!(got.starts_with("HTTP/1.1 400") && got.contains("not whole within"), "after {took:?}: {got:?}");
+        assert!(
+            took < READ_TIMEOUT + Duration::from_secs(2),
+            "a byte every 0.9 s held the connection {took:?}: {got:?}"
+        );
+        assert!(
+            got.starts_with("HTTP/1.1 400") && got.contains("not whole within"),
+            "after {took:?}: {got:?}"
+        );
     }
 
     fn start_serving(dir: &std::path::Path) -> (crate::Guard, String, String) {
@@ -804,7 +924,8 @@ mod tests {
         let _g = crate::TEST_GLOBALS.lock();
         let dir = scratch("gate");
         let (guard, addr, token) = start_serving(&dir);
-        let mode = std::fs::metadata(dir.join(crate::endpoint::FILE)).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(dir.join(crate::endpoint::FILE)).unwrap().permissions().mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "http.endpoint mode");
         let get = |path: &str, auth: Option<&str>| -> String {
             let mut c = TcpStream::connect(&addr).unwrap();
@@ -815,8 +936,14 @@ mod tests {
         assert!(get("/debug/pprof/", None).starts_with("HTTP/1.1 403"), "no token");
         assert!(get("/debug/pprof/?token=00", None).starts_with("HTTP/1.1 403"), "short token");
         let wrong = "0".repeat(32);
-        assert!(get(&format!("/debug/pprof/?token={wrong}"), None).starts_with("HTTP/1.1 403"), "wrong token");
-        assert!(get("/debug/pprof/", Some(wrong.as_str())).starts_with("HTTP/1.1 403"), "wrong bearer token");
+        assert!(
+            get(&format!("/debug/pprof/?token={wrong}"), None).starts_with("HTTP/1.1 403"),
+            "wrong token"
+        );
+        assert!(
+            get("/debug/pprof/", Some(wrong.as_str())).starts_with("HTTP/1.1 403"),
+            "wrong bearer token"
+        );
         let ok = get(&format!("/debug/pprof/?token={token}"), None);
         assert!(ok.starts_with("HTTP/1.1 200"), "the token in the query: {ok}");
         let ok = get("/debug/pprof/", Some(token.as_str()));
@@ -834,11 +961,20 @@ mod tests {
         let _g = crate::TEST_GLOBALS.lock();
         let dir = scratch("retract");
         let (guard, addr, token) = start_serving(&dir);
-        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         assert_eq!(names, [crate::endpoint::FILE], "the directory while serving");
-        assert_eq!(std::fs::read_to_string(dir.join(crate::endpoint::FILE)).unwrap(), format!("{addr}\n{token}\n"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(crate::endpoint::FILE)).unwrap(),
+            format!("{addr}\n{token}\n")
+        );
         drop(guard);
-        assert!(!dir.join(crate::endpoint::FILE).exists(), "http.endpoint is still there after the stop");
+        assert!(
+            !dir.join(crate::endpoint::FILE).exists(),
+            "http.endpoint is still there after the stop"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -870,15 +1006,30 @@ mod tests {
         let open = start(&shared);
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750)).unwrap();
         let group = start(&shared);
-        let left: Vec<_> = std::fs::read_dir(&shared).unwrap().map(|it| it.unwrap().file_name()).collect();
+        let left: Vec<_> =
+            std::fs::read_dir(&shared).unwrap().map(|it| it.unwrap().file_name()).collect();
         let _ = std::fs::remove_dir_all(&root);
         let link_s = link.display().to_string();
         let shared_s = shared.display().to_string();
-        assert!(linked.as_ref().is_err_and(|why| why.contains(&link_s) && why.contains("symbolic link")), "a link: {linked:?}");
-        assert!(open.as_ref().is_err_and(|why| why.contains(&shared_s) && why.contains("mode 0777")), "mode 0777: {open:?}");
-        assert!(group.as_ref().is_err_and(|why| why.contains(&shared_s) && why.contains("mode 0750")), "mode 0750: {group:?}");
+        assert!(
+            linked
+                .as_ref()
+                .is_err_and(|why| why.contains(&link_s) && why.contains("symbolic link")),
+            "a link: {linked:?}"
+        );
+        assert!(
+            open.as_ref().is_err_and(|why| why.contains(&shared_s) && why.contains("mode 0777")),
+            "mode 0777: {open:?}"
+        );
+        assert!(
+            group.as_ref().is_err_and(|why| why.contains(&shared_s) && why.contains("mode 0750")),
+            "mode 0750: {group:?}"
+        );
         assert!(left.is_empty(), "written into the refused directory: {left:?}");
-        assert!(!crate::recording() && crate::session().is_none(), "a refused start leaves no session");
+        assert!(
+            !crate::recording() && crate::session().is_none(),
+            "a refused start leaves no session"
+        );
     }
 
     /// S1: at stop, a FIFO planted as `http.endpoint` (or a link to `/dev/zero`) is refused by

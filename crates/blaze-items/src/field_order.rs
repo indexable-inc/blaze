@@ -98,7 +98,10 @@ pub fn decode(db: &Db, bytes: &[u8]) -> Result<Decoded, DecodeError> {
     match lines.next() {
         Some((_, HEADER)) => {}
         other => {
-            return Err(refuse(1, format!("expected `{HEADER}`, found {:?}", other.map(|it| it.1))));
+            return Err(refuse(
+                1,
+                format!("expected `{HEADER}`, found {:?}", other.map(|it| it.1)),
+            ));
         }
     }
     let mut by_adt: HashMap<AdtId, AdtPlan, Global> = HashMap::new_in(Global);
@@ -171,7 +174,9 @@ pub fn decode(db: &Db, bytes: &[u8]) -> Result<Decoded, DecodeError> {
                 }
                 *slot = names;
             }
-            _ => return Err(refuse(line, format!("expected an `adt` or `v` line, found `{text}`"))),
+            _ => {
+                return Err(refuse(line, format!("expected an `adt` or `v` line, found `{text}`")));
+            }
         }
     }
     finish(current.take())?;

@@ -318,7 +318,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
     }
 
-    pub(crate) fn check_lhs_assignable(&mut self, lhs: ExprId, assign: ExprId, op: Option<ArithOp>) {
+    pub(crate) fn check_lhs_assignable(
+        &mut self,
+        lhs: ExprId,
+        assign: ExprId,
+        op: Option<ArithOp>,
+    ) {
         if self.is_syntactic_place_expr(lhs) {
             return;
         }
@@ -510,26 +515,18 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 closure_kind,
                 capture_by: _,
                 binder: _,
-            } => self
-                .infer_closure(
-                    body,
-                    args,
-                    ret_type,
-                    arg_types,
-                    closure_kind,
-                    tgt_expr,
-                    expected,
-                ),
+            } => self.infer_closure(
+                body,
+                args,
+                ret_type,
+                arg_types,
+                closure_kind,
+                tgt_expr,
+                expected,
+            ),
             Expr::Call { callee, args, .. } => self.infer_call(tgt_expr, callee, args, expected),
             Expr::MethodCall { receiver, args, method_name, generic_args } => self
-                .infer_method_call(
-                    tgt_expr,
-                    receiver,
-                    args,
-                    method_name,
-                    generic_args,
-                    expected,
-                ),
+                .infer_method_call(tgt_expr, receiver, args, method_name, generic_args, expected),
             Expr::Match { expr, arms } => {
                 let mut scrutinee_is_read = true;
                 let mut contains_ref_bindings = false;
@@ -553,7 +550,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     // rustc's `warn_arms_when_scrutinee_diverges`.
                     for index in 0..arms.len() {
                         let index = index as u32;
-                        self.warn_if_unreachable(UnreachableAt::Arm { match_expr: tgt_expr, index });
+                        self.warn_if_unreachable(UnreachableAt::Arm {
+                            match_expr: tgt_expr,
+                            index,
+                        });
                     }
                     let matchee_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
                     let mut all_arms_diverge = Diverges::WarnedAlways;
@@ -755,24 +755,22 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 // As rustc's `CastCheck::new`, a cast to an unsized type is reported here and is
                 // of the error type, so nothing that uses its value reports it again.
                 let resolved = self.table.resolve_vars_with_obligations(cast_ty);
-                if !resolved.has_infer_types() && !self.table.type_is_sized_modulo_regions(resolved) {
+                if !resolved.has_infer_types() && !self.table.type_is_sized_modulo_regions(resolved)
+                {
                     self.push_diagnostic(InferenceDiagnostic::CastToUnsized {
                         expr: tgt_expr,
                         cast_ty: resolved.store(),
                     });
                     self.err_ty()
                 } else {
-                    self.deferred_cast_checks.push(CastCheck::new(tgt_expr, expr, expr_ty, cast_ty));
+                    self.deferred_cast_checks
+                        .push(CastCheck::new(tgt_expr, expr, expr_ty, cast_ty));
                     cast_ty
                 }
             }
-            Expr::Ref { expr, rawness, mutability } => self.infer_ref_expr(
-                rawness,
-                lower_mutability(mutability),
-                expr,
-                expected,
-                tgt_expr,
-            ),
+            Expr::Ref { expr, rawness, mutability } => {
+                self.infer_ref_expr(rawness, lower_mutability(mutability), expr, expected, tgt_expr)
+            }
             Expr::UnaryOp { expr, op } => self.infer_unop_expr(op, expr, expected, tgt_expr),
             Expr::BinaryOp { lhs, rhs, op } => match op {
                 Some(BinaryOp::Assignment { op: Some(op) }) => {
@@ -1181,7 +1179,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // Find the relevant variant
         let (adt_ty, Some(variant)) = self.resolve_variant(expr.into(), path, false) else {
             if let Some(segment) = self.first_unresolved_segment(path, expr.into()) {
-                self.push_diagnostic(InferenceDiagnostic::UnresolvedPath { id: expr.into(), segment });
+                self.push_diagnostic(InferenceDiagnostic::UnresolvedPath {
+                    id: expr.into(),
+                    segment,
+                });
             }
             for field in fields {
                 self.infer_expr_no_expect(field.expr, ExprIsRead::Yes);
@@ -1253,8 +1254,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         );
         remaining_fields.extend(variant_fields.fields().iter().map(|(i, field)| (&field.name, i)));
 
-        let mut seen_fields =
-            hashbrown::HashMap::with_capacity_and_hasher_in(hir_fields.len(), FixedState, self.frame);
+        let mut seen_fields = hashbrown::HashMap::with_capacity_and_hasher_in(
+            hir_fields.len(),
+            FixedState,
+            self.frame,
+        );
 
         // Type-check each field, its name looked up hygienically among the variant's (rustc's
         // `check_expr_struct_fields`).
@@ -1489,7 +1493,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
     }
 
-    fn infer_expr_path(&mut self, path: Path<'_>, id: ExprOrPatIdPacked, scope_id: ExprId) -> Ty<'db> {
+    fn infer_expr_path(
+        &mut self,
+        path: Path<'_>,
+        id: ExprOrPatIdPacked,
+        scope_id: ExprId,
+    ) -> Ty<'db> {
         let g = self.resolver.update_to_inner_scope(self.db, self.store_owner, scope_id);
         let ty = match self.infer_path(path, id) {
             Some((_, ty)) => ty,
@@ -1542,8 +1551,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             }
         }
         let hygiene = self.store.expr_or_pat_path_hygiene(id.unpack());
-        let names_something = self.resolver.resolve_path_in_value_ns(self.db, path, hygiene).is_some()
-            || self.resolver.resolve_path_in_type_ns_hygienic(self.db, path, hygiene).is_some();
+        let names_something =
+            self.resolver.resolve_path_in_value_ns(self.db, path, hygiene).is_some()
+                || self.resolver.resolve_path_in_type_ns_hygienic(self.db, path, hygiene).is_some();
         (!names_something).then_some(last as u32)
     }
 
@@ -1772,7 +1782,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         continue;
                     }
                     // rustc's `check_stmt`: the statement, and the outer divergence hidden.
-                    this.warn_if_unreachable(UnreachableAt::Stmt { block: expr, index: index as u32 });
+                    this.warn_if_unreachable(UnreachableAt::Stmt {
+                        block: expr,
+                        index: index as u32,
+                    });
                     let old_diverges = mem::replace(&mut this.diverges, Diverges::Maybe);
                     match stmt {
                         Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
@@ -1805,7 +1818,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                                 );
                                 let else_ty = this.insert_type_vars_shallow(else_ty);
                                 this.write_expr_ty(expr, else_ty);
-                                _ = this.demand_eqtype(expr.into(), this.types.types.never, else_ty);
+                                _ = this.demand_eqtype(
+                                    expr.into(),
+                                    this.types.types.never,
+                                    else_ty,
+                                );
                                 this.diverges = previous_diverges;
                             }
                         }
@@ -1929,7 +1946,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     (_, Some(variant)) => (VariantId::EnumVariantId(variant), args),
                     (AdtId::EnumId(it), None) => {
                         let ctxt = offset.field_hygiene(index).syntax_context();
-                        let Some(it) = EnumVariants::variant_written(self.db, it, name, ctxt) else {
+                        let Some(it) = EnumVariants::variant_written(self.db, it, name, ctxt)
+                        else {
                             return;
                         };
                         variant = Some(it);
@@ -1941,15 +1959,19 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 _ => return,
             };
             let hygiene = offset.field_hygiene(index);
-            let Some(local_id) = of.fields(self.db).field_written(self.db, of, name, hygiene) else {
+            let Some(local_id) = of.fields(self.db).field_written(self.db, of, name, hygiene)
+            else {
                 return;
             };
             let visibility = VariantFields::field_visibilities(self.db, of)[local_id];
             let expn = hir_def::nameres::variant_expansion(self.db, of);
             let scope = self.resolver.privacy_scope(self.db, hygiene, expn);
-            if !visibility.is_visible_from(self.db, scope.unwrap_or_else(|| self.resolver.module())) {
+            if !visibility.is_visible_from(self.db, scope.unwrap_or_else(|| self.resolver.module()))
+            {
                 let field = FieldId { parent: of, local_id };
-                let at = Some(u32::try_from(index).expect("an `offset_of!` names fewer than 2^32 fields"));
+                let at = Some(
+                    u32::try_from(index).expect("an `offset_of!` names fewer than 2^32 fields"),
+                );
                 self.push_diagnostic(InferenceDiagnostic::PrivateField { expr, field, at });
             }
             ty = self.db.field_types(of)[local_id].ty().instantiate(interner, args).skip_norm_wip();
@@ -2470,7 +2492,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     // Otherwise, there's a mismatch, so clear out what we're expecting, and set
                     // our input types to err_args so we don't blow up the error messages
                     if !tuple_type.is_ty_error() {
-                        self.push_diagnostic(InferenceDiagnostic::FnTraitArgsNotTuple { call_expr });
+                        self.push_diagnostic(InferenceDiagnostic::FnTraitArgsNotTuple {
+                            call_expr,
+                        });
                     }
                     let mut formal = Vec::with_capacity_in(provided_args.len(), frame);
                     formal.resize(provided_args.len(), self.types.types.error);
@@ -2506,7 +2530,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // We introduce a helper function to demand that a given argument satisfy a given input
         // This is more complicated than just checking type equality, as arguments could be coerced
         // This version writes those types back so further type checking uses the narrowed types
-        let demand_compatible = |this: &mut InferenceContext<'db, 'f>, idx: usize, provided_arg: ExprId| {
+        let demand_compatible = |this: &mut InferenceContext<'db, 'f>,
+                                 idx: usize,
+                                 provided_arg: ExprId| {
             let formal_input_ty: Ty<'db> = formal_input_tys[idx];
             let expected_input_ty: Ty<'db> = expected_input_tys[idx];
 
@@ -2671,7 +2697,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             .iter()
             .zip(expected_input_tys)
             .map(|(&formal, &expected)| {
-                (self.table.resolve_vars_if_possible(formal), self.table.resolve_vars_if_possible(expected))
+                (
+                    self.table.resolve_vars_if_possible(formal),
+                    self.table.resolve_vars_if_possible(expected),
+                )
             })
             .collect(); // alloc: error path
 
@@ -2708,7 +2737,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             // alloc: error path
             formal_inputs: inputs_tys.iter().map(|&(formal, _)| self.ty_as_found(formal)).collect(),
             // alloc: error path
-            expected_inputs: inputs_tys.iter().map(|&(_, expected)| self.ty_as_found(expected)).collect(),
+            expected_inputs: inputs_tys
+                .iter()
+                .map(|&(_, expected)| self.ty_as_found(expected))
+                .collect(),
             // alloc: error path
             provided: provided.iter().map(|&ty| self.ty_as_found(ty)).collect(),
             compatible_ends: compatible_ends.into_boxed_slice(),
@@ -2733,7 +2765,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let cause = ObligationCause::dummy();
         let subtyping_error = infcx
             .probe(|_| infcx.sup_raw(&cause, self.table.param_env, formal, coerced_ty).is_err());
-        !subtyping_error && !coerced_ty.references_non_lt_error() && !arg_ty.references_non_lt_error()
+        !subtyping_error
+            && !coerced_ty.references_non_lt_error()
+            && !arg_ty.references_non_lt_error()
     }
 
     pub(super) fn with_breakable_ctx<T>(

@@ -17,7 +17,7 @@
 use std::{borrow::Cow, convert::Infallible, fmt, ops::ControlFlow};
 
 use ::tt::TextRange;
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_mem::{Tag, frame};
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
@@ -458,7 +458,10 @@ impl AttrId {
         krate: Crate,
         owner: view::AnyHasAttrs<'t>,
     ) -> Option<(view::Attr<'t>, view::Meta<'t>)> {
-        #[expect(clippy::disallowed_types, reason = "crate cfg options, set once per attribute lookup: not global")]
+        #[expect(
+            clippy::disallowed_types,
+            reason = "crate cfg options, set once per attribute lookup: not global"
+        )]
         let cfg_options = std::cell::OnceCell::new();
         let mut index = 0;
         let result = collect_item_tree_attrs_view(
@@ -493,7 +496,8 @@ impl AttrId {
             return derive_attr.syntax().text_range();
         };
         // Only the offsets in the file are read, so the spans are absolute: no map is made.
-        let spans = AbsoluteSpans(span::EditionedFileId::current_edition(span::FileId::from_raw(0)));
+        let spans =
+            AbsoluteSpans(span::EditionedFileId::current_edition(span::FileId::from_raw(0)));
         frame::task(Tag::Expand, |frame| {
             let tt = syntax_bridge::call_input_in(
                 tt.syntax(),
@@ -553,10 +557,14 @@ struct S;
         };
 
         let mut kept = Vec::new();
-        let _ = collect_item_tree_attrs_view::<Infallible>(item, || &cfg, |meta, _| {
-            kept.push(meta.syntax().text().to_string());
-            ControlFlow::Continue(())
-        });
+        let _ = collect_item_tree_attrs_view::<Infallible>(
+            item,
+            || &cfg,
+            |meta, _| {
+                kept.push(meta.syntax().text().to_string());
+                ControlFlow::Continue(())
+            },
+        );
         let mut expected = Vec::new();
         let _ = expand_cfg_attr_view::<Infallible>(
             view::attrs_including_inner(&item),
@@ -573,7 +581,10 @@ struct S;
             },
         );
         assert_eq!(kept, expected);
-        assert_eq!(kept, ["foo::doc", "derive(Y)", "serde", "no_mangle", "must_used", "r#mod_attr"]);
+        assert_eq!(
+            kept,
+            ["foo::doc", "derive(Y)", "serde", "no_mangle", "must_used", "r#mod_attr"]
+        );
 
         for attr in view::attrs_including_inner(&item) {
             let Some(path) = attr.meta().and_then(|it| it.path()) else { continue };
@@ -615,7 +626,9 @@ struct S;
             names.push(text[..text.len() - 1].to_owned());
             names.push(text[1..].to_owned());
         }
-        names.extend(["", "cfg", "derive", "must_used", "rustc_const_stable", "test"].map(String::from));
+        names.extend(
+            ["", "cfg", "derive", "must_used", "rustc_const_stable", "test"].map(String::from),
+        );
         for name in &names {
             assert_eq!(is_item_tree_filtered_attr(name), reference(name), "{name}");
         }
@@ -645,10 +658,14 @@ fn f() {}
         let cfg = CfgOptions::default();
         let viewed = parse.root().descendants().find_map(view::Fn::cast).unwrap();
         let mut expected = Vec::new();
-        expand_cfg_attr_view::<()>(viewed.attrs(), || &cfg, |meta, attr| {
-            expected.push((meta.syntax().text_range(), attr.syntax().text_range()));
-            ControlFlow::Continue(())
-        });
+        expand_cfg_attr_view::<()>(
+            viewed.attrs(),
+            || &cfg,
+            |meta, attr| {
+                expected.push((meta.syntax().text_range(), attr.syntax().text_range()));
+                ControlFlow::Continue(())
+            },
+        );
         let got: Vec<_> = cfg_attrs_view(viewed.attrs(), &cfg)
             .map(|(meta, attr)| (meta.syntax().text_range(), attr.syntax().text_range()))
             .collect();

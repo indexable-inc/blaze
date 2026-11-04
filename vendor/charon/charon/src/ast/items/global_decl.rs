@@ -5,8 +5,7 @@ use crate::ast::*;
 use enum_as_inner::EnumAsInner;
 
 /// A global variable definition (constant or static).
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 pub struct GlobalDecl {
     pub def_id: GlobalDeclId,
     /// The meta data associated with the declaration.
@@ -44,9 +43,18 @@ pub struct GlobalDecl {
     pub value: ConstantExpr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum GlobalKind {
     /// A static or thread-local static.
     Static {
@@ -70,8 +78,7 @@ pub enum GlobalKind {
 }
 
 /// Where a given global came from.
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Global"))]
 pub enum GlobalSource {
     /// A normal global.
@@ -121,11 +128,7 @@ impl GlobalDecl {
     /// Whether this global is unsafe to access, because it is a mutable or unsafe external static (safety.unsafe-static).
     pub fn is_unsafe_to_access(&self, _krate: &TranslatedCrate) -> bool {
         match self.global_kind {
-            GlobalKind::Static {
-                is_mut,
-                is_safe,
-                is_thread_local: _,
-            } => is_mut || !is_safe,
+            GlobalKind::Static { is_mut, is_safe, is_thread_local: _ } => is_mut || !is_safe,
             GlobalKind::NamedConst | GlobalKind::AnonConst | GlobalKind::VTable => false,
         }
     }

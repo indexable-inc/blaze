@@ -33,7 +33,9 @@ pub fn load(app: &App, strip: f32) -> Result<(), String> {
         let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
         let err = e.try_get::<&flecs::Script>(|s| {
             // SAFETY: `error` is null or a NUL-terminated string owned by the EcsScript component, alive for this call.
-            (!s.error.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(s.error) }.to_string_lossy().into_owned())
+            (!s.error.is_null()).then(|| {
+                unsafe { std::ffi::CStr::from_ptr(s.error) }.to_string_lossy().into_owned()
+            })
         });
         if let Some(Some(err)) = err {
             return Err(format!("gallery scene {name}: {err}"));
@@ -68,9 +70,15 @@ pub fn load(app: &App, strip: f32) -> Result<(), String> {
 /// The lazy example's rows: only those in view, and a line saying how many exist.
 fn lazy_rows(w: WorldRef<'_>) {
     let Some(rows) = at(w, "cards::lazy::scroll::rows") else { return };
-    let live = view::lazy_for_each(View::of(rows), "ui.Words", 10_000, |i| format!("r{i}"), |v, i, _| {
-        v.text(&format!("Row {i}  \u{b7}  session s{}", (i * 7) % 997));
-    });
+    let live = view::lazy_for_each(
+        View::of(rows),
+        "ui.Words",
+        10_000,
+        |i| format!("r{i}"),
+        |v, i, _| {
+            v.text(&format!("Row {i}  \u{b7}  session s{}", (i * 7) % 997));
+        },
+    );
     let r = rows.try_cloned::<&LazyRange>().unwrap_or_default();
     if let Some(status) = at(w, "cards::lazy::status") {
         View::of(status).text(&format!("{live} of 10 000 exist (rows {}..{})", r.first, r.last));
@@ -80,7 +88,9 @@ fn lazy_rows(w: WorldRef<'_>) {
 /// The inserted chips' words, once their parts exist (a chip made in a system is instantiated when the system ends).
 fn label_chips(w: WorldRef<'_>) {
     let Some(chips) = at(w, "cards::transition::chips") else { return };
-    for (name, words) in [("c_fade", "Opacity"), ("c_slide", "Slide"), ("c_scale", "Scale"), ("c_move", "Move")] {
+    for (name, words) in
+        [("c_fade", "Opacity"), ("c_slide", "Slide"), ("c_scale", "Scale"), ("c_move", "Move")]
+    {
         if let Some(words_view) = View::of(chips).part(name).and_then(|c| c.part("words")) {
             words_view.text(words);
         }
@@ -100,7 +110,12 @@ fn change(w: WorldRef<'_>) {
         if let Some(first) = chips.part("first") {
             view::leave(first);
         }
-        for (name, prefab) in [("c_fade", "ex.Chip"), ("c_slide", "ex.ChipSlide"), ("c_scale", "ex.ChipScale"), ("c_move", "ex.ChipMove")] {
+        for (name, prefab) in [
+            ("c_fade", "ex.Chip"),
+            ("c_slide", "ex.ChipSlide"),
+            ("c_scale", "ex.ChipScale"),
+            ("c_move", "ex.ChipMove"),
+        ] {
             chips.child(prefab).named(name);
         }
     }

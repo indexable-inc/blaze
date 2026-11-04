@@ -27,7 +27,7 @@ use syntax::{
 
 use crate::{
     cx::Cx,
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -81,7 +81,8 @@ impl LatePass for AsmLabels {
         let Some(templates) = templates(b, at) else { return };
         let arch = *self.arch.get_or_insert_with(|| asm_arch(b.cx));
         let raw = asm.options.contains(AsmOptions::RAW);
-        let binary = !asm.options.contains(AsmOptions::ATT_SYNTAX) && matches!(arch, Some(Arch::X86) | None);
+        let binary =
+            !asm.options.contains(AsmOptions::ATT_SYNTAX) && matches!(arch, Some(Arch::X86) | None);
         for template in &templates {
             for (label, kind) in labels(&template.value, raw, arch == Some(Arch::Hexagon)) {
                 if kind == Label::Binary && !binary {
@@ -89,7 +90,9 @@ impl LatePass for AsmLabels {
                 }
                 let found = template.snippet.and_then(|it| find_label_span(it, label));
                 let span = match found {
-                    Some((lo, hi)) => template.span.with_lo(template.span.lo + lo).with_hi(template.span.lo + hi),
+                    Some((lo, hi)) => {
+                        template.span.with_lo(template.span.lo + lo).with_hi(template.span.lo + hi)
+                    }
                     // clone: a span, for the lint's diagnostic
                     None => template.span.clone(),
                 };
@@ -114,7 +117,10 @@ struct Template<'db> {
 
 /// The template strings of the `asm!` written as `at`, those `cfg` removes left out; `None`
 /// when one is not a string, which rustc refuses before there is an `asm!` to lint.
-fn templates<'db>(b: &BodyCx<'_, '_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<SmallVec<[Template<'db>; 2]>> {
+fn templates<'db>(
+    b: &BodyCx<'_, '_, 'db>,
+    at: InFile<SyntaxNodePtr>,
+) -> Option<SmallVec<[Template<'db>; 2]>> {
     let cx = b.cx;
     let node = cx.syntax_view(at);
     let asm = ast::AsmExpr::cast(node.value)?;
@@ -219,12 +225,17 @@ fn invalid_asm_label(kind: Label, span: Span, missing_precise_span: bool) -> Dia
             diag
         }
         Label::Binary => {
-            let message = "avoid using labels containing only the digits `0` and `1` in inline assembly";
+            let message =
+                "avoid using labels containing only the digits `0` and `1` in inline assembly";
             // clone: a span, for the lint's diagnostic
             let mut diag = Diag::lint("binary_asm_labels", message, span.clone());
             diag.help("start numbering with `2` instead")
-                .note("an LLVM bug makes these labels ambiguous with a binary literal number on x86")
-                .note("see <https://github.com/llvm/llvm-project/issues/99547> for more information");
+                .note(
+                    "an LLVM bug makes these labels ambiguous with a binary literal number on x86",
+                )
+                .note(
+                    "see <https://github.com/llvm/llvm-project/issues/99547> for more information",
+                );
             if missing_precise_span {
                 diag.note(MACRO);
             }
@@ -281,7 +292,9 @@ fn labels(template: &str, raw: bool, hexagon: bool) -> Vec<(&str, Label)> {
                     kind = Label::FormatArg;
                 } else {
                     let continues = match kind {
-                        Label::Named | Label::FormatArg => c.is_ascii_alphanumeric() || matches!(c, '_' | '$'),
+                        Label::Named | Label::FormatArg => {
+                            c.is_ascii_alphanumeric() || matches!(c, '_' | '$')
+                        }
                         Label::Binary => matches!(c, '0' | '1'),
                     };
                     if !continues {
@@ -300,7 +313,9 @@ fn labels(template: &str, raw: bool, hexagon: bool) -> Vec<(&str, Label)> {
 #[cfg(test)]
 fn is_hexagon_register_span(possible_label: &str) -> bool {
     match possible_label.find(':') {
-        Some(colon) => is_hexagon_register_span_impl(&possible_label[..colon], &possible_label[colon + 1..]),
+        Some(colon) => {
+            is_hexagon_register_span_impl(&possible_label[..colon], &possible_label[colon + 1..])
+        }
         None => false,
     }
 }
@@ -364,8 +379,12 @@ mod tests {
     fn statements_split_at_newlines_and_semicolons_without_comments() {
         assert_eq!(named("\n ab: nop // ab: does foo\n // cd: nop\n"), [("ab", Label::Named)]);
         assert_eq!(named("nop; foo10: nop"), [("foo10", Label::Named)]);
-        assert_eq!(named("nop\n bar6: bar7: nop"), [("bar6", Label::Named), ("bar7", Label::Named)]);
-        let included = "lab1: nop\n// do more things\nlab2: nop // does bar\n// a: b\nlab3: nop; lab4: nop\n";
+        assert_eq!(
+            named("nop\n bar6: bar7: nop"),
+            [("bar6", Label::Named), ("bar7", Label::Named)]
+        );
+        let included =
+            "lab1: nop\n// do more things\nlab2: nop // does bar\n// a: b\nlab3: nop; lab4: nop\n";
         let found: Vec<&str> = named(included).into_iter().map(|(it, _)| it).collect();
         assert_eq!(found, ["lab1", "lab2", "lab3", "lab4"]);
     }
@@ -391,7 +410,9 @@ mod tests {
     /// rustc's `compiler/rustc_lint/src/tests.rs`, `test_hexagon_register_span_patterns`.
     #[test]
     fn hexagon_register_span_patterns() {
-        for it in ["r1:0", "r15:14", "V5:4", "V3:2", "V5:4.w", "V3:2.h", "r99:98", "V123:122.whatever"] {
+        for it in
+            ["r1:0", "r15:14", "V5:4", "V3:2", "V5:4.w", "V3:2.h", "r99:98", "V123:122.whatever"]
+        {
             assert!(is_hexagon_register_span(it), "{it}");
         }
         for it in ["label1", "foo:", ":0", "r:0", "r1:", "r1:a", "1:0", "r1", "r", "", "ra:0"] {
@@ -411,7 +432,10 @@ mod tests {
         ] {
             assert!(labels(template, false, true).is_empty(), "{template}");
         }
-        assert_eq!(labels("label1: r7:6 = combine(#2, #3)", false, true), [("label1", Label::Named)]);
+        assert_eq!(
+            labels("label1: r7:6 = combine(#2, #3)", false, true),
+            [("label1", Label::Named)]
+        );
         assert_eq!(named("r1:0 = memd(r29+#0)"), [("r1", Label::Named)]);
     }
 

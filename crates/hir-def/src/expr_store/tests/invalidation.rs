@@ -10,7 +10,10 @@ use crate::{
     AssocItemId, DefWithBodyId, GenericDefId, ModuleDefId,
     expr_store::{Body, scope::ExprScopes},
     hir::generics::GenericParams,
-    nameres::{assoc::{ImplItems, TraitItems}, crate_def_map},
+    nameres::{
+        assoc::{ImplItems, TraitItems},
+        crate_def_map,
+    },
     signatures::FunctionSignature,
     test_db::{TestDB, TestDBExt},
 };
@@ -178,7 +181,11 @@ fn an_edit_in_one_body_lowers_only_that_body() {
     for (&def, (at, bytes)) in bodies.iter().zip(&before) {
         let after = Body::of(&db, def);
         if def == edited {
-            assert_ne!(*bytes, blaze_format::to_bytes(after), "the edit changed nothing of `second`");
+            assert_ne!(
+                *bytes,
+                blaze_format::to_bytes(after),
+                "the edit changed nothing of `second`"
+            );
             continue;
         }
         assert_eq!(*bytes, blaze_format::to_bytes(after), "{def:?}");
@@ -345,7 +352,9 @@ pub trait Tr { fn m(&self); }
     db.set_file_text(file_id, &edited);
     assert_eq!(outline_before, outline(&db), "the outline's text, every body left out");
     let mut after = Vec::new();
-    let log = db.executed_in_read_order(|| after = assoc.iter().map(|it| it.assoc_visibility(&db)).collect());
+    let log = db.executed_in_read_order(|| {
+        after = assoc.iter().map(|it| it.assoc_visibility(&db)).collect()
+    });
     assert_eq!(before, after);
     assert_eq!(count(&log, "AssocItemId::assoc_visibility"), 0, "{log:#?}");
 }
@@ -368,7 +377,9 @@ mod inner {
 "#,
     );
     let db = fx.into_db();
-    let DefWithBodyId::FunctionId(helper) = function_named(&db, "helper") else { panic!("`helper` is a fn") };
+    let DefWithBodyId::FunctionId(helper) = function_named(&db, "helper") else {
+        panic!("`helper` is a fn")
+    };
     let id = crate::Lookup::lookup(&helper, &db).id;
     assert!(crate::signatures::outline_item(&db, id).is_some(), "`helper` is not in the outline");
 }

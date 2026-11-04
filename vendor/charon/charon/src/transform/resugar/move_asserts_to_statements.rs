@@ -26,13 +26,7 @@ impl UllbcPass for Transform {
 
         for block in b.body.iter_mut() {
             let TerminatorKind::Assert {
-                assert:
-                    Assert {
-                        check_kind: Some(_),
-                        ..
-                    },
-                target,
-                ..
+                assert: Assert { check_kind: Some(_), .. }, target, ..
             } = &block.terminator.kind
             else {
                 continue;
@@ -40,17 +34,11 @@ impl UllbcPass for Transform {
 
             let new_terminator = TerminatorKind::Goto { target: *target };
             let old_terminator = std::mem::replace(&mut block.terminator.kind, new_terminator);
-            let TerminatorKind::Assert {
-                assert, on_unwind, ..
-            } = old_terminator
-            else {
+            let TerminatorKind::Assert { assert, on_unwind, .. } = old_terminator else {
                 unreachable!();
             };
 
-            let on_failure = panics
-                .get(&on_unwind)
-                .cloned()
-                .unwrap_or(AbortKind::Panic(None));
+            let on_failure = panics.get(&on_unwind).cloned().unwrap_or(AbortKind::Panic(None));
 
             block.statements.push(Statement {
                 kind: StatementKind::Assert { assert, on_failure },

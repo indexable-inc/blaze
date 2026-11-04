@@ -17,9 +17,19 @@ pub static BOX_WRITE: &str = "alloc::boxed::Box::write";
 pub static BOX_WRITE_PATTERN: &str = "alloc::boxed::_::write"; // `_` matches an impl block
 
 /// See the comments for [Name]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Pe"))]
 pub enum PathElem {
     #[serde_state(stateless)]
@@ -39,9 +49,7 @@ pub enum PathElem {
 }
 
 /// Used for builtin items, rather than hardcoding these as strings.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[derive(EnumAsInner)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, EnumAsInner, Serialize, Deserialize)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Pe"))]
 pub enum BuiltinPathElem {
     /// The tuple of the given arity.
@@ -81,9 +89,19 @@ pub enum BuiltinPathElem {
 ///   impl<T> PartialEq for List<T> { ...}
 ///   ```
 /// We distinguish the two.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("ImplElem"))]
 pub enum ImplElem {
     Ty(Box<Binder<Ty>>),
@@ -126,8 +144,19 @@ pub enum ImplElem {
 /// name clashes anyway. Still, we might want to be more precise in the future.
 ///
 /// Also note that the first path element in the name is always the crate name.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde(transparent)]
 #[cfg_attr(feature = "charon_on_charon", charon::transparent)]
 pub struct Name {
@@ -246,10 +275,7 @@ impl Name {
     /// slices) or an item we generate for one, such as its drop glue. They belong to no crate, so
     /// their name starts either with the builtin itself or with the `impl` block we generated for them.
     pub fn is_builtin(&self) -> bool {
-        matches!(
-            self.name.first(),
-            Some(PathElem::Builtin(..) | PathElem::Impl(_))
-        )
+        matches!(self.name.first(), Some(PathElem::Builtin(..) | PathElem::Impl(_)))
     }
 
     /// Get the last identifier of the name, if any. This is useful for error messages and such.
@@ -303,10 +329,7 @@ impl BuiltinPathElem {
     /// If this builtin name is also how Rust refers to the item, in which case we don't
     /// need to put braces around the name, as it is part of the actual path of the item.
     pub fn is_rust_name(self) -> bool {
-        matches!(
-            self,
-            BuiltinPathElem::Str | BuiltinPathElem::Tuple(_) | BuiltinPathElem::DropGlue
-        )
+        matches!(self, BuiltinPathElem::Str | BuiltinPathElem::Tuple(_) | BuiltinPathElem::DropGlue)
     }
 
     /// The identifier we use to refer to this element.

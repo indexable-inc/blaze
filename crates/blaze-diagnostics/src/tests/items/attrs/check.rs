@@ -498,7 +498,14 @@ gen fn gen_foo() {}
 //~^ ERROR attribute cannot be applied to a `async`, `gen` or `async gen` function
 async gen fn async_gen_foo() {}
 "#;
-    assert_reports(&ui_core("invalid.rs", "2024", "future", source), &[error(4, &["`async`", "`gen`", "`async gen`"]), error(8, &["`async`", "`gen`", "`async gen`"]), error(12, &["`async`", "`gen`", "`async gen`"])]);
+    assert_reports(
+        &ui_core("invalid.rs", "2024", "future", source),
+        &[
+            error(4, &["`async`", "`gen`", "`async gen`"]),
+            error(8, &["`async`", "`gen`", "`async gen`"]),
+            error(12, &["`async`", "`gen`", "`async gen`"]),
+        ],
+    );
 }
 
 #[test]

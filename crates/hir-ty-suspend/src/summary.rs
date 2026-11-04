@@ -3,7 +3,6 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_query::db::FromId;
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_ty::{
@@ -12,6 +11,7 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::dispatch::{Body, LONGEST, body_of};
+use std::alloc::Global;
 
 use crate::dispatch::{Cx, Instance, Marked, Target, Unseen, sites};
 
@@ -84,7 +84,11 @@ pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) 
             }
         }
     }
-    let made = sites.slots.iter().flat_map(|it| &it.targets).chain(sites.reified.iter().flat_map(|it| &it.targets));
+    let made = sites
+        .slots
+        .iter()
+        .flat_map(|it| &it.targets)
+        .chain(sites.reified.iter().flat_map(|it| &it.targets));
     for target in made {
         if let Target::Walk(callee) = target {
             edge(callee, &mut callees);
@@ -127,9 +131,13 @@ fn step_name(db: &Db, step: &Step) -> String {
         Step::Walk(instance) => instance_name(db, instance.def),
         Step::Root(root) => fn_name(db, *root),
         // alloc: an error's path
-        Step::Marked(Marked::Method(method)) => format!("{} (`#[blaze::may_suspend]`, through `dyn`)", fn_name(db, *method)),
+        Step::Marked(Marked::Method(method)) => {
+            format!("{} (`#[blaze::may_suspend]`, through `dyn`)", fn_name(db, *method))
+        }
         // alloc: an error's path
-        Step::Marked(Marked::Field(_)) => "a function pointer from a `#[blaze::may_suspend]` field".to_owned(),
+        Step::Marked(Marked::Field(_)) => {
+            "a function pointer from a `#[blaze::may_suspend]` field".to_owned()
+        }
     }
 }
 
@@ -142,10 +150,15 @@ pub(crate) fn instance_name(db: &Db, def: Body) -> String {
     match def {
         Body::Fn(func) => fn_name(db, func),
         // alloc: an error's path
-        Body::Closure(id) => format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner)),
+        Body::Closure(id) => {
+            format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner))
+        }
         Body::Coroutine(id) | Body::CoroutineByMove(id) => {
             // alloc: an error's path
-            format!("an `async` block in {}", parent(InternedCoroutineId::from_id(id).loc(db).owner))
+            format!(
+                "an `async` block in {}",
+                parent(InternedCoroutineId::from_id(id).loc(db).owner)
+            )
         }
     }
 }
@@ -163,6 +176,8 @@ pub(crate) fn owner_of(db: &Db, def: Body) -> Option<DefWithBodyId> {
     match def {
         Body::Fn(func) => Some(func.into()),
         Body::Closure(id) => of(InternedClosureId::from_id(id).loc(db).owner),
-        Body::Coroutine(id) | Body::CoroutineByMove(id) => of(InternedCoroutineId::from_id(id).loc(db).owner),
+        Body::Coroutine(id) | Body::CoroutineByMove(id) => {
+            of(InternedCoroutineId::from_id(id).loc(db).owner)
+        }
     }
 }

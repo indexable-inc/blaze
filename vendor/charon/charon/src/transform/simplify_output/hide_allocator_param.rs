@@ -25,17 +25,10 @@ impl TransformPass for Transform {
         if !ctx.options.hide_allocator {
             return;
         }
-        let types = &[
-            "alloc::boxed::Box",
-            "alloc::vec::Vec",
-            "alloc::rc::Rc",
-            "alloc::sync::Arc",
-        ];
+        let types = &["alloc::boxed::Box", "alloc::vec::Vec", "alloc::rc::Rc", "alloc::sync::Arc"];
 
-        let types: Vec<NamePattern> = types
-            .iter()
-            .map(|s| NamePattern::parse(s).unwrap())
-            .collect_vec();
+        let types: Vec<NamePattern> =
+            types.iter().map(|s| NamePattern::parse(s).unwrap()).collect_vec();
         let types: HashSet<TypeDeclId> = ctx
             .translated
             .item_names
@@ -73,8 +66,6 @@ impl TransformPass for Transform {
             }
         }
 
-        let _ = ctx
-            .translated
-            .drive_mut(&mut RemoveLastParamVisitor { types });
+        let _ = ctx.translated.drive_mut(&mut RemoveLastParamVisitor { types });
     }
 }

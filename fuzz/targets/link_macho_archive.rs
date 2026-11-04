@@ -59,8 +59,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::MachO, arch, ARCHIVE, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::MachO, arch, ARCHIVE, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a {arch:?} read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -103,18 +104,36 @@ fn seeds() -> Vec<Vec<u8>> {
 
 fn named() -> Vec<(&'static str, Arch, Vec<u8>)> {
     let mut out = Vec::new();
-    for (arch, architecture) in [(Arch::X86_64, Architecture::X86_64), (Arch::Aarch64, Architecture::Aarch64)] {
+    for (arch, architecture) in
+        [(Arch::X86_64, Architecture::X86_64), (Arch::Aarch64, Architecture::Aarch64)]
+    {
         let members = vec![
             ("a_rather_long_member_name.o", member(architecture, &["one"])),
             ("b.o", member(architecture, &["two", "three"])),
         ];
         let (strings, entries) = index(&[("_one", 0), ("_two", 1), ("_three", 1)]);
-        out.push(("a BSD archive with a __.SYMDEF SORTED", arch, bsd(&members, &strings, &entries, false)));
-        out.push(("a BSD archive with a __.SYMDEF_64 SORTED", arch, bsd(&members, &strings, &entries, true)));
+        out.push((
+            "a BSD archive with a __.SYMDEF SORTED",
+            arch,
+            bsd(&members, &strings, &entries, false),
+        ));
+        out.push((
+            "a BSD archive with a __.SYMDEF_64 SORTED",
+            arch,
+            bsd(&members, &strings, &entries, true),
+        ));
         let short = [("a.o", members[0].1.clone()), ("b.o", members[1].1.clone())];
-        out.push(("a GNU archive with a / index", arch, gnu(&short, &[("_one", 0), ("_two", 1), ("_three", 1)])));
+        out.push((
+            "a GNU archive with a / index",
+            arch,
+            gnu(&short, &[("_one", 0), ("_two", 1), ("_three", 1)]),
+        ));
     }
-    out.push(("a BSD archive of an empty index and no member", Arch::X86_64, bsd(&[], &[], &[], false)));
+    out.push((
+        "a BSD archive of an empty index and no member",
+        Arch::X86_64,
+        bsd(&[], &[], &[], false),
+    ));
     out
 }
 
@@ -152,7 +171,9 @@ fn index(symbols: &[(&str, usize)]) -> (Vec<u8>, Vec<(usize, usize)>) {
 }
 
 fn header(out: &mut Vec<u8>, name: &str, size: usize) {
-    out.extend_from_slice(format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes());
+    out.extend_from_slice(
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes(),
+    );
 }
 
 /// A BSD member: a `#1/<len>` name padded with NULs to 8 bytes, as Apple's `ar` writes.
@@ -177,7 +198,12 @@ fn word(out: &mut Vec<u8>, wide: bool, value: usize) {
 
 /// `members` after a `__.SYMDEF SORTED` (`__.SYMDEF_64 SORTED` when `wide`) of `strings` and
 /// `entries` (string offset, member index).
-fn bsd(members: &[(&str, Vec<u8>)], strings: &[u8], entries: &[(usize, usize)], wide: bool) -> Vec<u8> {
+fn bsd(
+    members: &[(&str, Vec<u8>)],
+    strings: &[u8],
+    entries: &[(usize, usize)],
+    wide: bool,
+) -> Vec<u8> {
     let size = if wide { 8 } else { 4 };
     let mut strings = strings.to_vec();
     strings.resize(strings.len().next_multiple_of(size), 0);
@@ -289,7 +315,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, arch, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::MachO, arch, ARCHIVE, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::MachO, arch, ARCHIVE, &bytes),
+                "seed `{what}` is refused"
+            );
         }
         let read = |bytes: &[u8]| {
             blaze_link::fuzz_read(Format::MachO, blaze_codegen::Arch::X86_64, ARCHIVE, bytes)

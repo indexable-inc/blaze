@@ -117,8 +117,13 @@ pub(crate) fn prefetch<T>(at: *const T) {
 /// The query database's reservation of `bytes`, on huge pages if `huge`; stops naming what it
 /// was for when the kernel refuses (a database without its tables can do nothing).
 fn reserve(bytes: usize, huge: bool, what: &str) -> Region {
-    let region = if huge { Region::reserve_huge(bytes, Tag::Query) } else { Region::reserve(bytes, Tag::Query) };
-    region.unwrap_or_else(|error| panic!("the query database could not reserve its {what}: {error}"))
+    let region = if huge {
+        Region::reserve_huge(bytes, Tag::Query)
+    } else {
+        Region::reserve(bytes, Tag::Query)
+    };
+    region
+        .unwrap_or_else(|error| panic!("the query database could not reserve its {what}: {error}"))
 }
 
 /// Commits `region` through `len` bytes; stops naming what it was for when it cannot.
@@ -204,7 +209,10 @@ impl<T> Rows<T> {
     }
 
     fn row(&self, row: u32) -> *mut T {
-        debug_assert!((row as usize + 1) * Self::SIZE <= self.rows.committed(), "a row never written");
+        debug_assert!(
+            (row as usize + 1) * Self::SIZE <= self.rows.committed(),
+            "a row never written"
+        );
         self.rows.at(row as usize * Self::SIZE).as_ptr().cast()
     }
 
@@ -319,7 +327,9 @@ const GENERATION_ROWS: usize = ROWS_RESERVED / 32;
 
 impl Generations {
     pub(crate) fn new() -> Generations {
-        Generations { words: reserve(GENERATION_ROWS * size_of::<PlainWord>(), false, "generations") }
+        Generations {
+            words: reserve(GENERATION_ROWS * size_of::<PlainWord>(), false, "generations"),
+        }
     }
 
     /// The row's next generation: called once each time the row is claimed, by its claimer,
@@ -472,7 +482,8 @@ fn row_of(place: u64) -> Option<u32> {
 /// hashed again.
 fn tag(key: &QueryKey) -> u32 {
     let input = &key.input.0;
-    u32::from_le_bytes([input[8], input[9], input[10], input[11]]) ^ u32::from(key.kind.0).wrapping_mul(0x9e37_79b9)
+    u32::from_le_bytes([input[8], input[9], input[10], input[11]])
+        ^ u32::from(key.kind.0).wrapping_mul(0x9e37_79b9)
 }
 
 /// A shard's table is its places alone, 8 bytes each, at most half full with live entries and
@@ -734,7 +745,11 @@ impl<V: Send + Sync + 'static> Map<V> {
         let count = blaze_ids::shard_count();
         Map {
             shards: (0..count)
-                .map(|_| Shard { writer: ShortLock::default(), due: AtomicBool::new(false), table: Published::null() })
+                .map(|_| Shard {
+                    writer: ShortLock::default(),
+                    due: AtomicBool::new(false),
+                    table: Published::null(),
+                })
                 .collect(), // alloc: once a map
             ids: Ids::new(),
             rows,
@@ -744,7 +759,8 @@ impl<V: Send + Sync + 'static> Map<V> {
 
     fn shard(&self, key: &QueryKey) -> &Shard {
         let input = &key.input.0;
-        &self.shards[u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize & self.mask]
+        &self.shards
+            [u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize & self.mask]
     }
 
     fn table<'g>(shard: &'g Shard, _task: &'g Guard) -> Option<&'g [AtomicU64]> {
@@ -767,7 +783,11 @@ impl<V: Send + Sync + 'static> Map<V> {
     }
 
     /// Where `key` is: its place's index and word, and its entry.
-    fn find<'g>(&'g self, table: &'g [AtomicU64], key: &QueryKey) -> Option<(usize, u64, &'g Entry<V>)> {
+    fn find<'g>(
+        &'g self,
+        table: &'g [AtomicU64],
+        key: &QueryKey,
+    ) -> Option<(usize, u64, &'g Entry<V>)> {
         let tag = tag(key);
         let mask = table.len() - 1;
         let mut at = tag as usize & mask;
@@ -839,10 +859,17 @@ impl<V: Send + Sync + 'static> Map<V> {
 
     /// The shard's table, with a place for one more entry. A table it outgrew is reused when
     /// `horizon` (taken before the lock) passed its grace.
-    fn room<'s>(shard: &'s Shard, writer: &mut Writer, horizon: Option<Horizon>) -> &'s [AtomicU64] {
+    fn room<'s>(
+        shard: &'s Shard,
+        writer: &mut Writer,
+        horizon: Option<Horizon>,
+    ) -> &'s [AtomicU64] {
         let current = shard.table.load(Ordering::Acquire);
         if current.is_null() {
-            let table = writer.outgrown.take(FIRST_TABLE, horizon).unwrap_or_else(|| new_table(FIRST_TABLE));
+            let table = writer
+                .outgrown
+                .take(FIRST_TABLE, horizon)
+                .unwrap_or_else(|| new_table(FIRST_TABLE));
             shard.table.store(table, Ordering::Release);
             // SAFETY: just published; freed only once outgrown and past its grace, or by `&mut`.
             return unsafe { places(table) };
@@ -971,7 +998,12 @@ impl<V: Send + Sync + 'static> Map<V> {
     /// Replaces `key`'s value with what `change` makes of it (`None`: leave it), made without
     /// the lock and made again if another writer changed the entry meanwhile. A place names
     /// one row, which is not reused while this task lives, so an equal place is the same entry.
-    pub(crate) fn update(&self, task: &Guard, key: QueryKey, mut change: impl FnMut(Option<&V>) -> Option<V>) {
+    pub(crate) fn update(
+        &self,
+        task: &Guard,
+        key: QueryKey,
+        mut change: impl FnMut(Option<&V>) -> Option<V>,
+    ) {
         let shard = self.shard(&key);
         loop {
             let seen = self.get_entry(task, &key);
@@ -1000,8 +1032,15 @@ impl<V: Send + Sync + 'static> Map<V> {
     }
 
     /// [`Map::for_each`] of the entries of shard `shard` (none past the last).
-    pub(crate) fn for_each_in<'g>(&'g self, task: &'g Guard, shard: usize, mut f: impl FnMut(&'g QueryKey, &'g V)) {
-        let Some(table) = self.shards.get(shard).and_then(|shard| Self::table(shard, task)) else { return };
+    pub(crate) fn for_each_in<'g>(
+        &'g self,
+        task: &'g Guard,
+        shard: usize,
+        mut f: impl FnMut(&'g QueryKey, &'g V),
+    ) {
+        let Some(table) = self.shards.get(shard).and_then(|shard| Self::table(shard, task)) else {
+            return;
+        };
         for place in table.iter() {
             // SAFETY: loaded from a table of this map in the caller's task.
             if let Some(entry) = unsafe { self.entry_at(place.load(Ordering::Acquire)) } {
@@ -1053,7 +1092,9 @@ impl<V: Send + Sync + 'static> Map<V> {
             let mut state = start();
             blaze_mem::frame::task(Tag::Query, |frame| {
                 let (mut edits, mut gone) = (Vec::new_in(frame), Vec::new_in(frame));
-                while let Some(shard) = self.shards.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                while let Some(shard) =
+                    self.shards.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
                     self.edit_shard(
                         shard,
                         &task,
@@ -1072,7 +1113,11 @@ impl<V: Send + Sync + 'static> Map<V> {
     /// One shard of [`Map::edit_all_with`]: `edit` decides without the lock, then each edit
     /// still current is made under it. `edits` and `gone` are scratch, left empty.
     #[allow(clippy::too_many_arguments)]
-    fn edit_shard<S, A: std::alloc::Allocator + std::alloc::AllocatorNightly, B: std::alloc::Allocator + std::alloc::AllocatorNightly>(
+    fn edit_shard<
+        S,
+        A: std::alloc::Allocator + std::alloc::AllocatorNightly,
+        B: std::alloc::Allocator + std::alloc::AllocatorNightly,
+    >(
         &self,
         shard: &Shard,
         task: &Guard,
@@ -1285,7 +1330,11 @@ pub(crate) struct Column<T> {
 
 impl<T: Send + Sync + 'static> Column<T> {
     pub(crate) fn new() -> Column<T> {
-        Column { chunks: std::array::from_fn(|_| OnceLock::new()), next: AtomicU32::new(0), _owns: PhantomData }
+        Column {
+            chunks: std::array::from_fn(|_| OnceLock::new()),
+            next: AtomicU32::new(0),
+            _owns: PhantomData,
+        }
     }
 
     fn place(&self, index: u32) -> &AtomicPtr<T> {
@@ -1337,14 +1386,16 @@ impl<T: Send + Sync + 'static> Column<T> {
     }
 
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.chunks.iter_mut().filter_map(OnceLock::get_mut).flat_map(|chunk| chunk.iter_mut()).filter_map(
-            |place| {
+        self.chunks
+            .iter_mut()
+            .filter_map(OnceLock::get_mut)
+            .flat_map(|chunk| chunk.iter_mut())
+            .filter_map(|place| {
                 let value = *place.get_mut();
                 // SAFETY: published from `Box::into_raw` and owned by the column; `&mut`
                 // excludes readers.
                 (!value.is_null()).then(|| unsafe { &mut *value })
-            },
-        )
+            })
     }
 
     /// Every value, taken out, and the next index; for [`Column::restore`].
@@ -1400,7 +1451,12 @@ const _: () = assert!(align_of::<EdgeRecord>() == 8);
 
 impl EdgeRecord {
     pub(crate) fn new(read: QueryKey, saw: Fingerprint) -> EdgeRecord {
-        EdgeRecord { kind: read.kind.0.to_le_bytes(), pad: [0; 6], input: read.input.0, saw: saw.0.to_le_bytes() }
+        EdgeRecord {
+            kind: read.kind.0.to_le_bytes(),
+            pad: [0; 6],
+            input: read.input.0,
+            saw: saw.0.to_le_bytes(),
+        }
     }
 
     pub(crate) fn read(&self) -> QueryKey {
@@ -1440,7 +1496,12 @@ impl EdgeRecord {
         debug_assert!(bytes.as_ptr().addr() % align_of::<EdgeRecord>() == 0);
         // SAFETY: aligned by the caller's contract, in bounds (`len / 56` whole records), and
         // every bit pattern of a record's byte arrays is valid.
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<EdgeRecord>(), bytes.len() / EDGE_RECORD) }
+        unsafe {
+            std::slice::from_raw_parts(
+                bytes.as_ptr().cast::<EdgeRecord>(),
+                bytes.len() / EDGE_RECORD,
+            )
+        }
     }
 }
 

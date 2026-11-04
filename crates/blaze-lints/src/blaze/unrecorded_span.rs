@@ -1,10 +1,12 @@
-//! `unrecorded_span`: a `tracing` span or event at a level the flight recorder keeps whose
-//! target it drops ([`blaze_profile::keeps`]). The recorder is a blaze process's only
-//! subscriber, so such a span or event costs its call and is never seen: no profile, flight
-//! dump, `events` row or watchdog line has it. A target is its module's path unless the call
-//! names one, so what this finds is a call outside a `blaze*` crate (a rust-analyzer crate's)
-//! that names no target and, for a span, whose name is no query's (`*_query`). The fix names
-//! `target: "blaze"` (`target = "blaze"` in `#[instrument]`).
+//! `unrecorded_span`: a `tracing` span at a level the flight recorder keeps whose target it
+//! drops ([`blaze_profile::keeps`]), or an INFO event it drops
+//! ([`blaze_profile::logs::keeps_event`]: every WARN and ERROR event is kept, of any target).
+//! The recorder is a blaze process's only subscriber, so such a span or event costs its call
+//! and is never seen: no profile, flight dump, `events` row or watchdog line has it. A target
+//! is its module's path unless the call names one, so what this finds is a call outside a
+//! `blaze*` crate (a rust-analyzer crate's) that names no target and, for a span, whose name is
+//! no query's (`*_query`). The fix names `target: "blaze"` (`target = "blaze"` in
+//! `#[instrument]`).
 //!
 //! Read from the call as written: the span macros of the crate `tracing` (`info_span!`,
 //! `span!(Level::INFO, ..)`, ..), its event macros (`warn!`, `event!(Level::INFO, ..)`, ..) and
@@ -41,7 +43,9 @@ enum Made {
 }
 
 fn check_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, call: ast::MacroCall<'t>) {
-    let Some(called) = call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref()) else { return };
+    let Some(called) = call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref()) else {
+        return;
+    };
     let (made, level) = match called.text() {
         "error_span" => (Made::Span, Some("error")),
         "warn_span" => (Made::Span, Some("warn")),
@@ -58,7 +62,11 @@ fn check_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, call: ast::MacroCall
         _ => return,
     };
     let db = cx.db();
-    if cx.macro_crate(call).and_then(|it| it.display_name(db)).is_none_or(|it| it.crate_name().as_str() != "tracing") {
+    if cx
+        .macro_crate(call)
+        .and_then(|it| it.display_name(db))
+        .is_none_or(|it| it.crate_name().as_str() != "tracing")
+    {
         return;
     }
     let Some(display) = cx.krate().display_name(db) else { return };
@@ -78,7 +86,13 @@ fn check_call<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, call: ast::MacroCall
     };
     let Some(dropped) = dropped else { return };
     let open = tt.syntax().text_range().start();
-    report(cx, node, display.crate_name().as_str(), dropped, Fix::Open { at: open, key: "target: \"blaze\", " });
+    report(
+        cx,
+        node,
+        display.crate_name().as_str(),
+        dropped,
+        Fix::Open { at: open, key: "target: \"blaze\", " },
+    );
 }
 
 fn check_attr<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, attr: ast::Attr<'t>) {
@@ -103,7 +117,9 @@ fn check_attr<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, attr: ast::Attr<'t>)
                 Some(it) => target = Some(it),
                 None => literal = false,
             },
-            Some("level") => level = arg.last.is_some_and(|it| blaze_profile::keeps_level(unquoted(it.text()))),
+            Some("level") => {
+                level = arg.last.is_some_and(|it| blaze_profile::keeps_level(unquoted(it.text())))
+            }
             Some("name") => match arg.value() {
                 Some(it) => name = unquoted(it.text()),
                 None => literal = false,
@@ -114,7 +130,12 @@ fn check_attr<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, attr: ast::Attr<'t>)
             return;
         }
     }
-    if !level || blaze_profile::keeps(target.map_or(krate, |it: ast::Token<'t>| unquoted(it.text())), name) {
+    if !level
+        || blaze_profile::keeps(
+            target.map_or(krate, |it: ast::Token<'t>| unquoted(it.text())),
+            name,
+        )
+    {
         return;
     }
     let fix = match tt {
@@ -152,10 +173,15 @@ fn dropped_call<'t>(level: Option<&str>, args: &[Arg<'t>], krate: &str) -> Optio
             Some("target") => target = Some(arg.value()?),
             Some("parent") => {}
             _ => match kept_level {
-                None => kept_level = Some(arg.last.is_some_and(|it| blaze_profile::keeps_level(unquoted(it.text())))),
+                None => {
+                    kept_level = Some(
+                        arg.last.is_some_and(|it| blaze_profile::keeps_level(unquoted(it.text()))),
+                    )
+                }
                 Some(level) => {
                     let name = unquoted(arg.string()?.text());
-                    let target_text = target.map_or(krate, |it: ast::Token<'t>| unquoted(it.text()));
+                    let target_text =
+                        target.map_or(krate, |it: ast::Token<'t>| unquoted(it.text()));
                     let kept = !level || blaze_profile::keeps(target_text, name);
                     return (!kept).then_some(Dropped { target, what: "span" });
                 }
@@ -169,23 +195,34 @@ fn dropped_call<'t>(level: Option<&str>, args: &[Arg<'t>], krate: &str) -> Optio
 /// and `name:` come first, then (for `event!`) its level, then its fields and message. An
 /// event's name is `event <file>:<line>` unless it names one, which is no query's.
 fn dropped_event<'t>(level: Option<&str>, args: &[Arg<'t>], krate: &str) -> Option<Dropped<'t>> {
-    let mut kept_level = level.map(blaze_profile::keeps_level);
+    // The level as written: the macro's, or `event!`'s first argument's last token (`INFO` of
+    // `tracing::Level::INFO`); `Some(None)` for one with no last token.
+    let mut written: Option<Option<&str>> = level.map(Some);
     let (mut target, mut name) = (None, "event");
     for arg in args {
         match arg.key(SyntaxKind::COLON) {
             Some("target") => target = Some(arg.value()?),
             Some("name") => name = unquoted(arg.value()?.text()),
             Some("parent") => {}
-            _ if kept_level.is_none() => kept_level = Some(arg.last.is_some_and(|it| blaze_profile::keeps_level(unquoted(it.text())))),
+            _ if written.is_none() => written = Some(arg.last.map(|it| unquoted(it.text()))),
             _ => break,
         }
     }
+    let level = written??;
     let target_text = target.map_or(krate, |it: ast::Token<'t>| unquoted(it.text()));
-    let kept = !kept_level? || blaze_profile::keeps(target_text, name);
+    // Below the recorder's level (DEBUG, or a level not written) is that level's choice.
+    let kept = !blaze_profile::keeps_level(level)
+        || blaze_profile::logs::keeps_event_named(target_text, name, level);
     (!kept).then_some(Dropped { target, what: "event" })
 }
 
-fn report<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, krate: &str, dropped: Dropped<'t>, fix: Fix) {
+fn report<'t>(
+    cx: &mut Cx<'_, 't>,
+    node: ast::Node<'t>,
+    krate: &str,
+    dropped: Dropped<'t>,
+    fix: Fix,
+) {
     // The tree's offsets are the file's only where the node is written as it is in the tree.
     let Some(range) = cx.range(node) else { return };
     let written = node.text_range();
@@ -218,7 +255,11 @@ fn report<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>, krate: &str, dropped: Dr
         }
         (None, Fix::Path { path }) => {
             let path = TextRange::at(in_file(path.start()), path.len());
-            (path, format!("{}(target = \"blaze\")", cx.snippet(path)), Applicability::MachineApplicable)
+            (
+                path,
+                format!("{}(target = \"blaze\")", cx.snippet(path)),
+                Applicability::MachineApplicable,
+            )
         }
     };
     let span = cx.span(range);
@@ -377,18 +418,28 @@ fn local() {
         );
         assert_eq!(found.matches(DROPS).count(), 4, "{found}");
         assert!(found.contains("info_span!(target: \"blaze\", \"macro_expand\")"), "{found}");
-        assert!(found.contains("span!(target: \"blaze\", tracing::Level::INFO, \"spanned\")"), "{found}");
+        assert!(
+            found.contains("span!(target: \"blaze\", tracing::Level::INFO, \"spanned\")"),
+            "{found}"
+        );
         assert!(found.contains("info_span!(target: \"blaze\", \"elsewhere\")"), "{found}");
         assert!(found.contains("its target \"perf\" does not start with `blaze`"), "{found}");
         assert!(found.contains("info_span!(target: \"blaze\", parent: (), \"orphan\")"), "{found}");
         assert!(found.contains("its module's path, in `main`"), "{found}");
-        for kept in ["kept by its target", "infer_query", "below the level", "a level not written", "not tracing's"] {
+        for kept in [
+            "kept by its target",
+            "infer_query",
+            "below the level",
+            "a level not written",
+            "not tracing's",
+        ] {
             assert!(!found.contains(kept), "{kept}: {found}");
         }
     }
 
-    /// An event of `main` that names no target is dropped, whatever its message, unless it
-    /// names itself as a query's, as the recorder's rule keeps. The fix is a span's.
+    /// An INFO event of `main` that names no target is dropped, whatever its message, unless it
+    /// names itself as a query's, as the recorder's rule keeps; a WARN or ERROR one is kept,
+    /// of any target. The fix is a span's.
     #[test]
     fn an_event_macro_the_recorder_drops_is_found_and_given_the_blaze_target() {
         let found = lint(
@@ -401,7 +452,8 @@ fn events(level: tracing::Level, n: u32) {
     tracing::debug!("below the level");
     tracing::event!(tracing::Level::INFO, "evented");
     tracing::event!(level, "a level not written");
-    tracing::warn!(target: "perf", "elsewhere");
+    tracing::info!(target: "perf", "elsewhere");
+    tracing::error!(target: "perf", "an error of any target");
     tracing::info!(name: "named_query", "a query's name");
     tracing::info!(parent: None, "orphan");
 }
@@ -414,14 +466,24 @@ fn local() {
             FLAGS,
         );
         const DROPS_EVENT: &str = "the flight recorder drops this event";
-        assert_eq!(found.matches(DROPS_EVENT).count(), 5, "{found}");
+        assert_eq!(found.matches(DROPS_EVENT).count(), 4, "{found}");
         assert!(!found.contains(DROPS), "{found}");
-        assert!(found.contains("warn!(target: \"blaze\", \"no unit's step ended for {n} s\")"), "{found}");
         assert!(found.contains("info!(target: \"blaze\", n, \"fields first\")"), "{found}");
-        assert!(found.contains("event!(target: \"blaze\", tracing::Level::INFO, \"evented\")"), "{found}");
+        assert!(
+            found.contains("event!(target: \"blaze\", tracing::Level::INFO, \"evented\")"),
+            "{found}"
+        );
         assert!(found.contains("its target \"perf\" does not start with `blaze`"), "{found}");
         assert!(found.contains("info!(target: \"blaze\", parent: None, \"orphan\")"), "{found}");
-        for kept in ["kept by its target", "below the level", "a level not written", "a query's name", "not tracing's"] {
+        for kept in [
+            "no unit's step ended",
+            "kept by its target",
+            "below the level",
+            "a level not written",
+            "a query's name",
+            "an error of any target",
+            "not tracing's",
+        ] {
             assert!(!found.contains(kept), "{kept}: {found}");
         }
     }
@@ -446,7 +508,10 @@ fn queried() {}
             FLAGS,
         );
         assert_eq!(found.matches(DROPS).count(), 2, "{found}");
-        assert!(found.contains("#[tracing::instrument(target = \"blaze\", skip(x), ret)]"), "{found}");
+        assert!(
+            found.contains("#[tracing::instrument(target = \"blaze\", skip(x), ret)]"),
+            "{found}"
+        );
         // `targeted` writes this too, and is not found: only the fix of `bare` shows it.
         assert!(found.contains("#[tracing::instrument(target = \"blaze\")]"), "{found}");
         for kept in ["level = \"debug\"", "bare_query"] {

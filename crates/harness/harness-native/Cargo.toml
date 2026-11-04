@@ -5,7 +5,6 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-build = "build.rs"
 
 [[bin]]
 name = "harness-native"
@@ -32,6 +31,7 @@ harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
 harness-native-ui-draw = { path = "../harness-native-ui-draw" }
 harness-native-ui-prims = { path = "../harness-native-ui-prims" }
 harness-native-ui-view = { path = "../harness-native-ui-view" }
+harness-native-render = { path = "../harness-native-render" }
 hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
 hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["prefab", "constraint_traits", "pipeline", "script", "script_input", "rest"] }
 harness-vt = { path = "../harness-vt" }

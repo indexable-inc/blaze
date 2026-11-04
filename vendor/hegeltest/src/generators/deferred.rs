@@ -23,10 +23,7 @@ struct Shared<B> {
 
 impl<B> Shared<B> {
     fn new() -> Self {
-        Shared {
-            generator: OnceLock::new(),
-            label: OnceLock::new(),
-        }
+        Shared { generator: OnceLock::new(), label: OnceLock::new() }
     }
 }
 
@@ -56,10 +53,7 @@ struct DeferredGenerator<B> {
 
 impl<B> DeferredGenerator<B> {
     fn get(&self) -> &B {
-        self.inner
-            .generator
-            .get()
-            .unwrap_or_else(|| panic!("DeferredGenerator has not been set"))
+        self.inner.generator.get().unwrap_or_else(|| panic!("DeferredGenerator has not been set"))
     }
 }
 
@@ -145,10 +139,7 @@ impl<T: Send + Sync + 'static> DeferredGeneratorDefinition<T, BoxedPrintableGene
     /// Can be called multiple times to produce independent handles
     /// that all share the same underlying definition.
     pub fn generator(&self) -> BoxedPrintableGenerator<'static, T> {
-        DeferredGenerator {
-            inner: Arc::clone(&self.inner),
-        }
-        .boxed_printable()
+        DeferredGenerator { inner: Arc::clone(&self.inner) }.boxed_printable()
     }
 
     /// Set the implementation for this deferred generator.
@@ -172,10 +163,7 @@ impl<T: Send + Sync + 'static> DeferredGeneratorDefinition<T, BoxedGenerator<'st
     /// Can be called multiple times to produce independent handles
     /// that all share the same underlying definition.
     pub fn generator(&self) -> BoxedGenerator<'static, T> {
-        DeferredGenerator {
-            inner: Arc::clone(&self.inner),
-        }
-        .boxed()
+        DeferredGenerator { inner: Arc::clone(&self.inner) }.boxed()
     }
 
     /// Set the implementation for this deferred generator, which — unlike

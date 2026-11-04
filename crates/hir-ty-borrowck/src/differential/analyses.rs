@@ -16,19 +16,19 @@ use hir_def::{
     expr_store::{Body, BodySourceMap, ExpressionStore},
     hir::ExprId,
 };
+use hir_expand::fixture;
 use hir_ty::{
     InferBodyId, InferenceResult,
     db::HirDatabase as _,
     mir::{LocalId, MirBody, MirSpan, OperandKind, PlaceElem, StatementKind, TerminatorKind},
     next_solver::DbInterner,
 };
-use hir_expand::fixture;
 
 use super::old;
 use crate::{
-    Ctx, Mode, borrowck_in_mode,
+    Ctx, Mode,
     bitset::words_for,
-    budget,
+    borrowck_in_mode, budget,
     cfg::{Cfg, Location},
     decode::{Decoded, raw},
     liveness, loans,
@@ -347,7 +347,8 @@ fn compare_body<'db>(what: &str, ctx: &Ctx<'_, 'db>, body: &MirBody<'db>) {
         mem::map(frame);
     let regions = regions::build(ctx, body, &cfg, &requirements);
     let count = ctx.infcx.num_region_vars();
-    let (live, _) = liveness::region_liveness(ctx, body, &cfg, &decoded, &new_moves, &regions, count);
+    let (live, _) =
+        liveness::region_liveness(ctx, body, &cfg, &decoded, &new_moves, &regions, count);
     let old_live = old::liveness::region_liveness(ctx, body, &cfg, &old_moves, &regions, count);
     assert_eq!(live.len(), old_live.len(), "{what}: regions");
     let last = cfg.points - 1;

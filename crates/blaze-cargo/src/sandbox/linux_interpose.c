@@ -9,8 +9,22 @@
 //     /.blaze-loaded       this library is in the process, said as it loads
 //
 // A process that ran a program which never said it loaded is not traced whole: the supervisor
-// says so as the run ends. What walks `environ` is seen by no call; the launcher keys every
-// traced run by the whole environment for it (`sandbox/v2.rs`).
+// says so as the run ends. What walks `environ` is seen by no call. A run the launcher gives
+// its whole environment it keys by all of it. A run it lends variables to (`sandbox/v2.rs`)
+// gets each as an entry `__BLAZE_LENT=NAME=VALUE`, and the visible names in
+// `__BLAZE_VISIBLE`: this library takes the entries out of the environment as it loads and
+// answers `getenv` from them, saying the read (a library's constructor that runs first is
+// answered from the entries, and its reads said as this one loads). What walks the environment
+// then sees the visible variables alone, which the run's key has, until the process says it
+// walks it (std's `__blaze_environ_walked`; `system`, `popen`): then every lent variable is put
+// back in the environment, and the whole environment is said read, `/.blaze-env/* <why>`.
+//
+// A program the process runs with its own environment gets the lent variables back in it, as
+// with no sandbox, and the visible names in `__BLAZE_VISIBLE_CHILD`: running it is no read.
+// Its own copy of this library lends it what is not visible when its executable exports
+// `__blaze_std_says_walks` (blaze's linker proves std alone walks its environment), and says
+// `/.blaze-env/* <program> does not export ...` as it loads otherwise: a C program, or a shell
+// that takes its environment from `main`'s `envp`, may walk it unseen.
 //
 // Each thing is said once in a thread's scope, which the harness's marker
 // (`access("/.blaze-test/<name>")`, which the supervisor sees itself) starts. The program sees
@@ -27,8 +41,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sched.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
@@ -41,9 +58,15 @@ extern char **environ;
 #define CLOCK_MARK "/.blaze-clock"
 #define LOADED_MARK "/.blaze-loaded"
 #define INTERPOSING "__BLAZE_INTERPOSE"
+#define LENT "__BLAZE_LENT"
+// The visible names, `NAME=NAME=...` (`sandbox/v2.rs`, `VISIBLE`): from the launcher, to the
+// program it lends to; from this library, to each program a process runs, which lends to
+// itself when it proves it says its walks.
+#define VISIBLE "__BLAZE_VISIBLE"
+#define CHILD_VISIBLE "__BLAZE_VISIBLE_CHILD"
 #define PRELOAD "LD_PRELOAD"
-// The longest name said: the supervisor reads a path up to 4096 bytes. A longer one is in the
-// whole environment every traced run reads.
+// The longest name said: the supervisor reads a path up to 4096 bytes. A longer one is said as
+// the whole environment, read.
 #define LONGEST_NAME 4000
 
 static char self[4096];
@@ -70,6 +93,11 @@ static int (*real_posix_spawn)(pid_t *, const char *, const posix_spawn_file_act
                                const posix_spawnattr_t *, char *const[], char *const[]);
 static int (*real_posix_spawnp)(pid_t *, const char *, const posix_spawn_file_actions_t *,
                                 const posix_spawnattr_t *, char *const[], char *const[]);
+static int (*real_unsetenv)(const char *);
+static int (*real_clearenv)(void);
+static int (*real_putenv)(char *);
+static int (*real_system)(const char *);
+static FILE *(*real_popen)(const char *, const char *);
 
 #define REAL(name) (real_##name ? real_##name : (real_##name = dlsym(RTLD_NEXT, #name)))
 
@@ -120,7 +148,8 @@ static int first_time(char kind, const char *name) {
 static void read_var(const char *name) {
     if (!alive || !name) return;
     size_t len = strlen(name);
-    if (len > LONGEST_NAME || !first_time('E', name)) return;
+    if (len > LONGEST_NAME) name = "* a variable's name is too long to say", len = strlen(name);
+    if (!first_time('E', name)) return;
     char path[sizeof ENV_MARK + LONGEST_NAME];
     memcpy(path, ENV_MARK, sizeof ENV_MARK - 1);
     memcpy(path + sizeof ENV_MARK - 1, name, len + 1);
@@ -134,6 +163,11 @@ static void read_clock(void) {
 // ---------------------------------------------------------------------------------------
 // Variables.
 
+static int named(const char *entry, const char *name) {
+    size_t len = strlen(name);
+    return !strncmp(entry, name, len) && entry[len] == '=';
+}
+
 // The value of `name` in `environ`, as the C library's `getenv` finds it.
 static char *lookup(const char *name) {
     size_t len = strlen(name);
@@ -143,14 +177,237 @@ static char *lookup(const char *name) {
     return NULL;
 }
 
+// The variables lent to the process (`NAME=VALUE`), and of each whether the process took it
+// away (`unsetenv`, `clearenv`). Each is the rest of an entry `LENT` the launcher started the
+// process with, or an entry the process was started with whose name is not visible; either
+// stays where the kernel put it. Set as the library loads, before the program runs.
+static char **lent;
+static unsigned char *lent_gone;
+static size_t lent_count;
+// Whether every lent variable is back in `environ`: the process walked its environment.
+static int lent_back;
+static int lent_busy;
+// The names a lending run keeps visible (`NAME=NAME=...`, the value of `VISIBLE` the process
+// was started with), passed on to each program it runs; `NULL` when the run does not lend.
+static const char *visible;
+static size_t visible_len;
+// Set first as the library loads: until then `getenv` comes from other libraries' constructors.
+static int started;
+
+// Whether `entry` (`NAME=VALUE`) is of the variable `name`, `len` bytes.
+static int entry_of(const char *entry, const char *name, size_t len) {
+    return !strncmp(entry, name, len) && entry[len] == '=';
+}
+
+// Whether variables are lent rather than in `environ`.
+static int lending(void) {
+    return lent_count && !__atomic_load_n(&lent_back, __ATOMIC_ACQUIRE);
+}
+
+// The value of `name` lent and not taken away, while it is lent rather than in `environ`.
+static char *lent_value(const char *name) {
+    if (!lending() || !name) return NULL;
+    size_t len = strlen(name);
+    for (size_t i = 0; i < lent_count; i++)
+        if (!lent_gone[i] && entry_of(lent[i], name, len)) return lent[i] + len + 1;
+    return NULL;
+}
+
+// The value of `name` in an entry `LENT` still in `environ`: what a library's constructor
+// that runs before this library's is answered.
+static char *encoded_value(const char *name) {
+    size_t len = strlen(name);
+    for (char **it = environ; it && *it; it++)
+        if (named(*it, LENT) && entry_of(*it + sizeof LENT, name, len)) return *it + sizeof LENT + len + 1;
+    return NULL;
+}
+
+// The process took `name` away: it is not lent any more.
+static void forget(const char *name) {
+    if (!lent_count || !name) return;
+    size_t len = strlen(name);
+    for (size_t i = 0; i < lent_count; i++)
+        if (entry_of(lent[i], name, len)) lent_gone[i] = 1;
+}
+
+// Whether `env` has the variable of `entry` (`NAME=VALUE`).
+static int has(char *const env[], const char *entry) {
+    size_t len = strcspn(entry, "=");
+    for (char *const *it = env; it && *it; it++)
+        if (entry_of(*it, entry, len)) return 1;
+    return 0;
+}
+
+// Whether the variable of `entry` (`NAME=VALUE`) is one the run keeps visible.
+static int is_visible(const char *entry) {
+    size_t len = strcspn(entry, "=");
+    for (const char *at = visible; at && *at;) {
+        size_t n = strcspn(at, "=");
+        if (n == len && !strncmp(at, entry, len)) return 1;
+        at += n;
+        if (*at) at++;
+    }
+    return 0;
+}
+
+// Every lent variable not taken away, and not set by the process since, put back in
+// `environ`, once: a new array of what it has and those, mapped rather than allocated (the
+// process may be a `vfork` or `fork` child, which must not allocate), and never unmapped (a
+// thread may still be reading the one before). One that can't be made ends the process: it
+// would see less than it was given.
+static void lend_back(void) {
+    if (!lending()) return;
+    // The other thread putting them back does it in microseconds.
+    while (__atomic_exchange_n(&lent_busy, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    if (!__atomic_load_n(&lent_back, __ATOMIC_RELAXED)) {
+        size_t have = 0, add = 0;
+        while (environ && environ[have]) have++;
+        for (size_t i = 0; i < lent_count; i++)
+            if (!lent_gone[i] && !has(environ, lent[i])) add++;
+        size_t bytes = (have + add + 1) * sizeof(char *);
+        char **all = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (all == MAP_FAILED) {
+            static const char why[] = "blaze sandbox: the variables lent to this process could not be "
+                                      "put back in its environment as it walked it: out of memory\n";
+            syscall(SYS_write, 2, why, sizeof why - 1);
+            abort();
+        }
+        size_t n = 0;
+        for (size_t i = 0; i < have; i++) all[n++] = environ[i];
+        for (size_t i = 0; i < lent_count; i++)
+            if (!lent_gone[i] && !has(environ, lent[i])) all[n++] = lent[i];
+        all[n] = NULL;
+        environ = all;
+        __atomic_store_n(&lent_back, 1, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&lent_busy, 0, __ATOMIC_RELEASE);
+}
+
+// The process walks its whole environment, as `why` (`* <why>`) says: it read every variable,
+// lent ones too.
+static void walked_whole(const char *why) {
+    read_var(why);
+    lend_back();
+}
+
+// What std calls before it walks the environment (`env::vars`, a `Command` it changes the
+// environment of, which it copies).
+void __blaze_environ_walked(void) {
+    if (alive) walked_whole("* std walked it");
+}
+
+static void out_of_memory(void) {
+    static const char why[] = "blaze sandbox: the variables lent to this process could not be kept: "
+                              "out of memory\n";
+    syscall(SYS_write, 2, why, sizeof why - 1);
+    abort();
+}
+
+// The variables `LENT` entries lend, taken out of `environ` as the library loads: the
+// launcher's program, which it lends to (`sandbox/v2.rs`).
+static void take_lent(void) {
+    size_t n = 0;
+    for (char **it = environ; it && *it; it++)
+        if (named(*it, LENT)) n++;
+    if (!n) return;
+    lent = malloc(n * sizeof *lent);
+    lent_gone = calloc(n, 1);
+    if (!lent || !lent_gone) out_of_memory();
+    for (char **it = environ; it && *it; it++)
+        if (named(*it, LENT)) lent[lent_count++] = *it + sizeof LENT;
+    REAL(unsetenv)(LENT);
+}
+
+// The variables of `environ` that are not visible, taken out of it as the library loads: a
+// program run by a lending process that proves it says its walks lends them to itself.
+static void lend_rest(void) {
+    size_t n = 0;
+    for (char **it = environ; it && *it; it++)
+        if (!is_visible(*it)) n++;
+    if (!n) return;
+    lent = malloc(n * sizeof *lent);
+    lent_gone = calloc(n, 1);
+    if (!lent || !lent_gone) out_of_memory();
+    for (char **it = environ; it && *it && lent_count < n; it++)
+        if (!is_visible(*it)) lent[lent_count++] = *it;
+    char name[LONGEST_NAME + 1];
+    for (size_t i = 0; i < lent_count; i++) {
+        size_t len = strcspn(lent[i], "=");
+        if (len > LONGEST_NAME) {
+            // Not taken away: in `environ` a walk could see it, so every variable is read.
+            lent_gone[i] = 1;
+            read_var("* a variable's name is too long to lend");
+            continue;
+        }
+        memcpy(name, lent[i], len);
+        name[len] = 0;
+        REAL(unsetenv)(name);
+    }
+}
+
+// Whether the program proves std alone walks its environment: its executable exports
+// `__blaze_std_says_walks`, which blaze's linker puts in an executable no other code of which
+// reads `environ` (`docs/v2/requests/usercode.md`, item 6).
+static int proves_walks(void) {
+    void *marker = dlsym(RTLD_DEFAULT, "__blaze_std_says_walks");
+    Dl_info at, program;
+    return marker && dladdr(marker, &at) && dladdr((void *)getauxval(AT_ENTRY), &program) &&
+           at.dli_fbase == program.dli_fbase;
+}
+
+// The names `getenv` was asked before this library loaded, by other libraries' constructors,
+// said as it loads; `early_lost` when one could not be kept.
+#define EARLY 64
+#define EARLY_NAME 128
+static char early[EARLY][EARLY_NAME];
+static unsigned early_count;
+static int early_lost;
+
+static void read_early(const char *name) {
+    if (!name) return;
+    unsigned at = __atomic_fetch_add(&early_count, 1, __ATOMIC_RELAXED);
+    size_t len = strlen(name);
+    if (at >= EARLY || len >= EARLY_NAME) {
+        __atomic_store_n(&early_lost, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    memcpy(early[at], name, len + 1);
+}
+
+static char *value_of(const char *name) {
+    if (!name) return NULL;
+    char *value = lookup(name);
+    if (value) return value;
+    return started ? lent_value(name) : encoded_value(name);
+}
+
 char *getenv(const char *name) {
+    if (!started) read_early(name);
     read_var(name);
-    return lookup(name);
+    return value_of(name);
 }
 
 char *secure_getenv(const char *name) {
+    if (!started) read_early(name);
     read_var(name);
-    return getauxval(AT_SECURE) ? NULL : lookup(name);
+    if (getauxval(AT_SECURE)) return NULL;
+    return value_of(name);
+}
+
+int unsetenv(const char *name) {
+    forget(name);
+    return REAL(unsetenv)(name);
+}
+
+int clearenv(void) {
+    for (size_t i = 0; i < lent_count; i++) lent_gone[i] = 1;
+    return REAL(clearenv)();
+}
+
+// `putenv("NAME")`, with no `=`, takes the variable away.
+int putenv(char *string) {
+    if (!strchr(string, '=')) forget(string);
+    return REAL(putenv)(string);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -200,10 +457,6 @@ static size_t count(char *const envp[]) {
     return n;
 }
 
-static int named(const char *entry, const char *name) {
-    size_t len = strlen(name);
-    return !strncmp(entry, name, len) && entry[len] == '=';
-}
 
 // How long `preload` is to be for the `LD_PRELOAD` of `envp` (none: `NULL`), with this library
 // first.
@@ -213,15 +466,27 @@ static size_t preload_len(char *const envp[]) {
     return sizeof PRELOAD + self_len + 1;
 }
 
-// `envp` with this library in it, in `out` (`count(envp) + 3` entries): `LD_PRELOAD` with it
-// first, in its place, or last when there was none, and its path. `preload` and `interposing`
-// are where those two entries are written. Made on the stack: the process may be a `vfork`
-// child, which must not allocate.
-static void environment(char *const envp[], char **out, char *preload, char *interposing) {
+// How many lent variables a program run with `envp` is given back: all of them, when `envp`
+// is the process's own environment and they are still lent. A program run with an
+// environment the process made itself is given what it made.
+static size_t lent_room(char *const envp[]) {
+    return envp == environ && lending() ? lent_count : 0;
+}
+
+// `envp` with this library in it, in `out` (`count(envp) + lent + 4` entries): every lent
+// variable not taken away nor set again when `lent` is not 0, as the program would have had
+// them with no sandbox (`lent_room`); `LD_PRELOAD` with this library first, in its place, or
+// last when there was none; its path; and the visible names when the run lends (`VISIBLE`),
+// for the program's own interposer. `preload`, `interposing` and `shown` are where those three
+// entries are written. Made on the stack: the process may be a `vfork` child, which must not
+// allocate.
+static void environment(char *const envp[], size_t lent_n, char **out, char *preload,
+                        char *interposing, char *shown) {
     size_t n = 0;
     int put = 0;
     for (char *const *it = envp; it && *it; it++) {
-        if (named(*it, INTERPOSING)) continue;
+        if (named(*it, INTERPOSING) || named(*it, VISIBLE) || named(*it, CHILD_VISIBLE) || named(*it, LENT))
+            continue;
         if (named(*it, PRELOAD)) {
             const char *theirs = *it + sizeof PRELOAD;
             int ours = !strncmp(theirs, self, self_len) &&
@@ -240,6 +505,13 @@ static void environment(char *const envp[], char **out, char *preload, char *int
         }
         out[n++] = *it;
     }
+    out[n] = NULL;
+    for (size_t i = 0, added = 0; i < lent_count && added < lent_n; i++) {
+        if (lent_gone[i] || has(out, lent[i])) continue;
+        out[n++] = lent[i];
+        out[n] = NULL;
+        added++;
+    }
     if (!put) {
         strcpy(preload, PRELOAD "=");
         strcat(preload, self);
@@ -248,14 +520,21 @@ static void environment(char *const envp[], char **out, char *preload, char *int
     strcpy(interposing, INTERPOSING "=");
     strcat(interposing, self);
     out[n++] = interposing;
+    if (visible) {
+        strcpy(shown, CHILD_VISIBLE "=");
+        strcat(shown, visible);
+        out[n++] = shown;
+    }
     out[n] = NULL;
 }
 
 #define WITH_US(envp, env)                                                                 \
-    char *env[count(envp) + 3];                                                            \
+    size_t lent_##env = lent_room(envp);                                                   \
+    char *env[count(envp) + lent_##env + 4];                                               \
     char preload_##env[preload_len(envp)];                                                 \
     char interposing_##env[sizeof INTERPOSING + self_len + 1];                             \
-    environment(envp, env, preload_##env, interposing_##env)
+    char shown_##env[sizeof CHILD_VISIBLE + visible_len + 1];                              \
+    environment(envp, lent_##env, env, preload_##env, interposing_##env, shown_##env)
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!alive) return REAL(execve)(path, argv, envp);
@@ -334,6 +613,18 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
     return REAL(posix_spawnp)(pid, file, actions, attr, argv, env);
 }
 
+// The shell `system` and `popen` start is given the process's own environment by the C
+// library itself, with no call here to hand it the lent variables: they go back in it first.
+int system(const char *command) {
+    if (alive) walked_whole("* system runs a shell with the environment whole");
+    return REAL(system)(command);
+}
+
+FILE *popen(const char *command, const char *type) {
+    if (alive) walked_whole("* popen runs a shell with the environment whole");
+    return REAL(popen)(command, type);
+}
+
 // ---------------------------------------------------------------------------------------
 // Loading.
 
@@ -348,10 +639,30 @@ __attribute__((constructor(101))) static void start(void) {
     REAL(fexecve);
     REAL(posix_spawn);
     REAL(posix_spawnp);
+    REAL(unsetenv);
+    REAL(clearenv);
+    REAL(putenv);
+    REAL(system);
+    REAL(popen);
     const char *me = lookup(INTERPOSING);
-    if (!me || !*me || strlen(me) >= sizeof self) return;
+    if (!me || !*me || strlen(me) >= sizeof self) {
+        started = 1;
+        return;
+    }
     strcpy(self, me);
     self_len = strlen(self);
+    take_lent();
+    // The launcher's program is lent to whatever it is; a program a process runs, when it
+    // proves it says its walks.
+    int launched = lookup(VISIBLE) != NULL;
+    const char *names = launched ? lookup(VISIBLE) : lookup(CHILD_VISIBLE);
+    if (names) {
+        visible = names;
+        visible_len = strlen(names);
+        REAL(unsetenv)(VISIBLE);
+        REAL(unsetenv)(CHILD_VISIBLE);
+    }
+    started = 1;
     const char *preload = lookup(PRELOAD);
     if (preload && !strncmp(preload, self, self_len)) {
         if (preload[self_len] == ':') setenv(PRELOAD, preload + self_len + 1, 1);
@@ -360,4 +671,19 @@ __attribute__((constructor(101))) static void start(void) {
     unsetenv(INTERPOSING);
     alive = 1;
     say(LOADED_MARK);
+    unsigned early_n = __atomic_load_n(&early_count, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < early_n && i < EARLY; i++) read_var(early[i]);
+    if (__atomic_load_n(&early_lost, __ATOMIC_RELAXED))
+        read_var("* a variable was read before the interposer loaded that it could not keep");
+    if (visible && !launched) {
+        if (proves_walks()) {
+            lend_rest();
+        } else {
+            char why[LONGEST_NAME];
+            snprintf(why, sizeof why,
+                     "* %s does not export __blaze_std_says_walks, so it may walk its environment unseen",
+                     program_invocation_name);
+            read_var(why);
+        }
+    }
 }

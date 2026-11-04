@@ -13,8 +13,7 @@ use crate::tests::lint;
 
 /// `dispatch_from_dyn` (with `unsize`) makes `&self` methods dispatchable, as with the real
 /// `core`: without its lang items no trait is dyn-compatible and no vtable call resolves.
-pub(super) const MINICORE: &str =
-    "//- minicore: sized, clone, copy, derive, fn, default, from, deref, builtin_impls, dispatch_from_dyn\n";
+pub(super) const MINICORE: &str = "//- minicore: sized, clone, copy, derive, fn, default, from, deref, builtin_impls, dispatch_from_dyn\n";
 
 pub(super) const ALLOC_STD: &str = r#"
 //- /std/lib.rs crate:std
@@ -356,7 +355,9 @@ fn found_of(out: &str, keep: impl Fn(&str) -> bool) -> Vec<(u32, &'static str)> 
     let mut found = Vec::new();
     let mut lint = None;
     for line in out.lines() {
-        if let Some(message) = line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: ")) {
+        if let Some(message) =
+            line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: "))
+        {
             lint = lint_of(message).filter(|it| keep(it));
             continue;
         }
@@ -380,10 +381,17 @@ fn expected(main: &str) -> Vec<(u32, &'static str)> {
             None => (number, marks),
         };
         for mark in marks.split_whitespace() {
-            let lint = ["hot_clone", "hot_alloc", "hot_alloc_call", "hot_dyn", "default_hasher", "implicit_allocator"]
-                .into_iter()
-                .find(|&it| it == mark)
-                .unwrap_or_else(|| panic!("`{mark}` is not a lint of blaze's"));
+            let lint = [
+                "hot_clone",
+                "hot_alloc",
+                "hot_alloc_call",
+                "hot_dyn",
+                "default_hasher",
+                "implicit_allocator",
+            ]
+            .into_iter()
+            .find(|&it| it == mark)
+            .unwrap_or_else(|| panic!("`{mark}` is not a lint of blaze's"));
             expected.push((number, lint));
         }
     }
@@ -397,10 +405,9 @@ fn check(main: &str) {
     let main = main.trim_start_matches('\n');
     let want = expected(main);
     let crate_wide = main.replace(HOT_ATTR, "#[allow(unused)]");
-    for (source, flags) in [
-        (main, "-A clippy::all"),
-        (crate_wide.as_str(), "-A clippy::all --deny=blaze::hot"),
-    ] {
+    for (source, flags) in
+        [(main, "-A clippy::all"), (crate_wide.as_str(), "-A clippy::all --deny=blaze::hot")]
+    {
         let fixture = format!("{MINICORE}{ALLOC_STD}{MAIN}{source}");
         let out = lint(&fixture, flags);
         assert_eq!(found(&out), want, "with `{flags}`, the findings of:\n{source}\nwere:\n{out}");
@@ -739,6 +746,37 @@ pub fn named(s: &str) -> String { //~ implicit_allocator
     );
 }
 
+/// An `impl Trait`'s bounds name the type they bound (`impl Iterator` is bounded by
+/// `Self: Iterator`), so the walk of a written `impl Trait` meets it again in its own bounds:
+/// it walks each one's bounds once and ends, in argument and return position, with or without
+/// a finding (it once recursed until a pool worker's stack overflowed and the daemon died).
+#[test]
+fn implicit_allocator_ends_on_an_impl_trait_that_names_itself() {
+    check_implicit(
+        r#"
+pub struct Count(u32);
+impl Iterator for Count {
+    type Item = u32;
+}
+
+pub fn takes(_items: impl Iterator<Item = u32>) {}
+pub fn takes_rows(_rows: impl Iterator<Item = Vec<u32>>) {} //~ implicit_allocator
+pub fn gives() -> impl Iterator<Item = u32> {
+    Count(0)
+}
+pub fn gives_nested() -> impl Iterator<Item = impl Iterator<Item = u32>> {
+    Count(0)
+}
+
+pub fn calls() {
+    takes(Count(0));
+    let _ = gives();
+    let _ = gives_nested();
+}
+"#,
+    );
+}
+
 #[test]
 fn hot_dyn() {
     check(
@@ -877,8 +915,8 @@ mod fiber_boundary {
     use base_db::FileId;
     use blaze_diagnostics::emit::{Sources, Style};
     use blaze_hash::HashMap;
-    use std::alloc::Global;
     use hir_expand::fixture;
+    use std::alloc::Global;
 
     use crate::{
         check::{Setup, check},
@@ -934,7 +972,9 @@ pub mod sched {
             let mut texts = Vec::new();
             for krate in hir::Crate::all(&db) {
                 for module in krate.modules(&db) {
-                    let Some(file) = module.definition_source_file_id(&db).file_id() else { continue };
+                    let Some(file) = module.definition_source_file_id(&db).file_id() else {
+                        continue;
+                    };
                     let file = file.file_id(&db);
                     let root = db.file_source_root(file).source_root_id(&db);
                     let root = db.source_root(root).source_root(&db);
@@ -951,7 +991,8 @@ pub mod sched {
                 conf: Conf::default(),
             };
             let name_of = |file: FileId| names.get(&file).cloned();
-            let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
+            let found =
+                check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
             let mut sources = Sources::of(texts);
             crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
                 .expect("every file a lint points into is given")
@@ -977,7 +1018,9 @@ pub mod sched {
         let mut found = Vec::new();
         let mut named = None;
         for line in out.lines() {
-            if let Some(message) = line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: ")) {
+            if let Some(message) =
+                line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: "))
+            {
                 named = named_in(message);
                 continue;
             }
@@ -985,7 +1028,8 @@ pub mod sched {
             let Some(named) = named.take() else { continue };
             let mut parts = at.rsplitn(3, ':');
             let (_column, number, file) = (parts.next(), parts.next(), parts.next());
-            let number = number.and_then(|it| it.parse().ok()).expect("a line number after the path");
+            let number =
+                number.and_then(|it| it.parse().ok()).expect("a line number after the path");
             found.push((file.expect("a path before the line").to_owned(), number, named));
         }
         found.sort_unstable();
@@ -1185,9 +1229,13 @@ pub fn run() {
 #[test]
 fn the_registry_has_blazes_lints_and_group_as_here() {
     use blaze_diagnostics::lints::registry;
-    let registered: Vec<&str> =
-        registry::blaze_lints().iter().filter(|it| it.is_externally_loaded).map(|it| it.name).collect();
-    let here: Vec<String> = super::Lint::ALL.iter().map(|it| format!("blaze::{}", it.name())).collect();
+    let registered: Vec<&str> = registry::blaze_lints()
+        .iter()
+        .filter(|it| it.is_externally_loaded)
+        .map(|it| it.name)
+        .collect();
+    let here: Vec<String> =
+        super::Lint::ALL.iter().map(|it| format!("blaze::{}", it.name())).collect();
     assert_eq!(registered, here);
     let hot = registry::group("blaze::hot").expect("the registry's `blaze::hot`");
     let hot: Vec<&str> = hot.lints.iter().map(|it| it.name).collect();
@@ -1238,10 +1286,20 @@ pub fn by_macro(base: Config) -> Config {
 "#,
         "struct_update",
     );
-    assert_eq!(out.matches("a field added to `Config` is filled here without a decision").count(), 2, "{out}");
+    assert_eq!(
+        out.matches("a field added to `Config` is filled here without a decision").count(),
+        2,
+        "{out}"
+    );
     assert!(out.contains("this `Config` literal takes `b`, `c` from `base`"), "{out}");
-    assert!(out.contains("Config { a: 1, b: base.b, c: base.c }"), "the fix writes the fields out:\n{out}");
-    assert!(out.contains("this `Config` literal takes `b`, `c` from `Default::default()`"), "{out}");
+    assert!(
+        out.contains("Config { a: 1, b: base.b, c: base.c }"),
+        "the fix writes the fields out:\n{out}"
+    );
+    assert!(
+        out.contains("this `Config` literal takes `b`, `c` from `Default::default()`"),
+        "{out}"
+    );
 }
 
 /// `struct_update` checks the workspace's structs only: another crate's may be
@@ -1354,7 +1412,10 @@ pub fn none(k: Kind) -> u32 {
         "wildcard_arm",
     );
     assert!(out.contains("this `_` stands for `Kind::B`, `Kind::C` of `Kind`"), "{out}");
-    assert!(out.contains("Kind::B(..) | Kind::C { .. } => 2,"), "the fix lists the variants:\n{out}");
+    assert!(
+        out.contains("Kind::B(..) | Kind::C { .. } => 2,"),
+        "the fix lists the variants:\n{out}"
+    );
     assert_eq!(out.matches("should be a compile error at every `match`").count(), 1, "{out}");
 }
 
@@ -1405,7 +1466,10 @@ pub fn nested(o: dep::Opt<Kind>) -> u32 {
     assert!(!out.contains("of `Ord3`"), "another crate's enum is not checked:\n{out}");
     assert!(!out.contains("of `Open`"), "a `#[non_exhaustive]` enum is not checked:\n{out}");
     assert!(out.contains("this `_` stands for `Kind::B`, `Kind::C` of `Kind`"), "{out}");
-    assert!(out.contains("dep::Opt::Some(Kind::B | Kind::C) => 2,"), "the nested `_` is written out:\n{out}");
+    assert!(
+        out.contains("dep::Opt::Some(Kind::B | Kind::C) => 2,"),
+        "the nested `_` is written out:\n{out}"
+    );
 }
 
 /// `wildcard_arm`: a guarded `_` and a catch-all binding get help with the variants, no fix; a
@@ -1435,10 +1499,16 @@ pub fn bound(k: Kind) -> Kind {
 "#,
         "wildcard_arm",
     );
-    assert!(out.contains("write the variants out, `Kind::B | Kind::C`, and keep the guard"), "{out}");
+    assert!(
+        out.contains("write the variants out, `Kind::B | Kind::C`, and keep the guard"),
+        "{out}"
+    );
     assert!(!out.contains("Kind::B | Kind::C if hot"), "a guarded arm gets no fix:\n{out}");
     assert!(out.contains("Kind::B | Kind::C => 3,"), "the `_` after the guard is fixed:\n{out}");
-    assert!(out.contains("the catch-all binding `other` stands for `Kind::B`, `Kind::C` of `Kind`"), "{out}");
+    assert!(
+        out.contains("the catch-all binding `other` stands for `Kind::B`, `Kind::C` of `Kind`"),
+        "{out}"
+    );
     assert!(out.contains("bind the variants instead: `other @ (Kind::B | Kind::C)`"), "{out}");
     assert!(!out.contains("Kind::B | Kind::C => other"), "a binding gets no fix:\n{out}");
 }

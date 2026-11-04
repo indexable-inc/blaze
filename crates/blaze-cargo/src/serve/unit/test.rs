@@ -32,13 +32,13 @@ use blaze_cas::Store;
 use blaze_codegen::ExecTable;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
-use blaze_testsel::{Choice, Reached, Selector, Subject};
-use blaze_usercode::test::{
-    self, Attrs, Binary, Config, Filter, Finished, Ignored, Job as TestJob, Mode as TestMode, Outcome, Queue,
-    Reported, ShouldPanic, Suite, Wanted, select,
-};
-use blaze_units::schema::{Mode, Unit};
 use blaze_lower::Db;
+use blaze_testsel::{Choice, Reached, Selector, Subject};
+use blaze_units::schema::{Mode, Unit};
+use blaze_usercode::test::{
+    self, Attrs, Binary, Config, Filter, Finished, Ignored, Job as TestJob, Mode as TestMode,
+    Outcome, Queue, Reported, ShouldPanic, Suite, Wanted, select,
+};
 
 use super::{
     Job, Real, UnitReader, UnitWriter,
@@ -118,7 +118,10 @@ pub(crate) fn filter(selection: &Selection<'_>) -> Result<Filter, ApiError> {
     }
     filter.ignored = match (include, ignored) {
         (true, true) => {
-            return Err(ApiError::new("the options --include-ignored and --ignored are mutually exclusive", None));
+            return Err(ApiError::new(
+                "the options --include-ignored and --ignored are mutually exclusive",
+                None,
+            ));
         }
         (true, false) => Ignored::Include,
         (false, true) => Ignored::Only,
@@ -138,7 +141,10 @@ pub(crate) struct UbTests {
 
 impl UbTests {
     fn find(&self, key: &str) -> Option<&UbTest> {
-        let at = self.by_key.binary_search_by(|it| self.tests[*it as usize].key.as_str().cmp(key)).ok()?;
+        let at = self
+            .by_key
+            .binary_search_by(|it| self.tests[*it as usize].key.as_str().cmp(key))
+            .ok()?;
         Some(&self.tests[self.by_key[at] as usize])
     }
 }
@@ -161,7 +167,11 @@ struct UbTest {
 /// the build's order, each unit's by name as libtest sorts them. Its harness's listing
 /// ([`super::codegen::test_roots`]) gives the same names and attributes as a compiled test
 /// binary's.
-pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+pub(crate) fn ub_tests(
+    job: &Job,
+    reader: &UnitReader,
+    selection: Selection<'_>,
+) -> Result<Vec<String>, Failed> {
     if !selection.all {
         return Err(ApiError::new(
             "`blaze test --ub` runs every test it selects: which tests a change reached is known from \
@@ -183,13 +193,21 @@ pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>)
         let unit = job.unit(at)?;
         let package = package_of(units, unit)?;
         let binary = u32::try_from(binaries.len()).expect("under 2^32 units");
-        binaries.push(super::artifact::executable(unit, job.plan(at)?).unwrap_or_else(|| unit.target.name.clone()));
+        binaries.push(
+            super::artifact::executable(unit, job.plan(at)?)
+                .unwrap_or_else(|| unit.target.name.clone()),
+        );
         let target = target_name(unit);
-        let roots = super::codegen::test_roots(job, reader, at).map_err(|what| ApiError::new(what, Some(unit.target.name.clone())))?;
+        let roots = super::codegen::test_roots(job, reader, at)
+            .map_err(|what| ApiError::new(what, Some(unit.target.name.clone())))?;
         let first = tests.len();
         tests.reserve(roots.tests.len());
         for listed in &roots.tests {
-            let attrs = Attrs { ignore: listed.ignore, should_panic: should_panic(&listed.should_panic), bench: listed.bench };
+            let attrs = Attrs {
+                ignore: listed.ignore,
+                should_panic: should_panic(&listed.should_panic),
+                bench: listed.bench,
+            };
             let ignored = match select::asked(&listed.name, &attrs, &filter) {
                 Wanted::Filtered => continue,
                 Wanted::Ignored => true,
@@ -209,14 +227,22 @@ pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>)
     }
     let mut by_key: Vec<u32> = (0..u32::try_from(tests.len()).expect("under 2^32 tests")).collect();
     blaze_ids::names::sort_by_name_in(&mut by_key, |&it| tests[it as usize].key.as_bytes());
-    if let Some(twice) = by_key.windows(2).find(|it| tests[it[0] as usize].key == tests[it[1] as usize].key) {
+    if let Some(twice) =
+        by_key.windows(2).find(|it| tests[it[0] as usize].key == tests[it[1] as usize].key)
+    {
         let test = &tests[twice[0] as usize];
         let binary = &binaries[test.binary as usize];
-        return Err(ApiError::new(format!("two test units list test `{}` of `{binary}`", test.name), None).into());
+        return Err(ApiError::new(
+            format!("two test units list test `{}` of `{binary}`", test.name),
+            None,
+        )
+        .into());
     }
     let keys = tests.iter().map(|it| it.key.clone()).collect();
     if job.ub.set(UbTests { tests, binaries, by_key }).is_err() {
-        return Err(ApiError::new("`blaze test --ub` selected its tests twice in one job", None).into());
+        return Err(
+            ApiError::new("`blaze test --ub` selected its tests twice in one job", None).into()
+        );
     }
     Ok(keys)
 }
@@ -226,9 +252,9 @@ pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>)
 /// `Bencher`, which the evaluator has no part of).
 pub(crate) fn evaluate(job: &Job, db: &Db, key: &str, ub: Ub) -> Result<TestResult, Failed> {
     let selected = job.ub.get();
-    let test = selected
-        .and_then(|it| it.find(key))
-        .ok_or_else(|| ApiError::new(format!("`blaze test --ub` selected no test `{key}`"), None))?;
+    let test = selected.and_then(|it| it.find(key)).ok_or_else(|| {
+        ApiError::new(format!("`blaze test --ub` selected no test `{key}`"), None)
+    })?;
     let binary = selected.map_or("", |it| it.binaries[test.binary as usize].as_str());
     let result = |outcome, output: String, millis| TestResult {
         name: test.name.clone(),
@@ -279,12 +305,18 @@ pub(crate) enum Ran<'a> {
     /// It panicked with this message.
     Panicked(&'a str),
     /// Undefined behavior, as the checker reports it, and the seed that replays it.
-    Ub { report: &'a str, seed: u64 },
+    Ub {
+        report: &'a str,
+        seed: u64,
+    },
     /// What the evaluator can't run.
     Unsupported(&'a str),
     /// The evaluator stopped with an error of its own (no layout, a MIR lowering error, a stack
     /// overflow, undefined behavior it found itself), on the schedule of `seed`.
-    Stopped { message: &'a str, seed: u64 },
+    Stopped {
+        message: &'a str,
+        seed: u64,
+    },
 }
 
 /// Whether a test that ran as `ran` passed, as libtest's `calc_result` judges it with its
@@ -294,10 +326,14 @@ pub(crate) enum Ran<'a> {
 pub(crate) fn judged(ran: Ran<'_>, expects: &ShouldPanic) -> (TestOutcome, String) {
     match (ran, expects) {
         (Ran::Returned, ShouldPanic::No) => (TestOutcome::Passed, String::new()),
-        (Ran::Returned, _) => (TestOutcome::Failed, "note: test did not panic as expected\n".to_owned()),
+        (Ran::Returned, _) => {
+            (TestOutcome::Failed, "note: test did not panic as expected\n".to_owned())
+        }
         (Ran::Panicked(message), ShouldPanic::No) => (TestOutcome::Failed, format!("{message}\n")),
         (Ran::Panicked(_), ShouldPanic::Yes) => (TestOutcome::Passed, String::new()),
-        (Ran::Panicked(message), ShouldPanic::WithMessage(expected)) if message.contains(expected.as_str()) => {
+        (Ran::Panicked(message), ShouldPanic::WithMessage(expected))
+            if message.contains(expected.as_str()) =>
+        {
             (TestOutcome::Passed, String::new())
         }
         (Ran::Panicked(message), ShouldPanic::WithMessage(expected)) => (
@@ -310,9 +346,10 @@ pub(crate) fn judged(ran: Ran<'_>, expects: &ShouldPanic) -> (TestOutcome, Strin
         (Ran::Unsupported(what), _) => {
             (TestOutcome::Failed, format!("blaze's MIR evaluator can't run this test: {what}\n"))
         }
-        (Ran::Stopped { message, seed }, _) => {
-            (TestOutcome::Failed, format!("blaze's MIR evaluator stopped: {message}\nseed: {seed}\n"))
-        }
+        (Ran::Stopped { message, seed }, _) => (
+            TestOutcome::Failed,
+            format!("blaze's MIR evaluator stopped: {message}\nseed: {seed}\n"),
+        ),
     }
 }
 
@@ -374,7 +411,8 @@ struct Suited {
 impl Suited {
     /// The place of the test `name` among `tests`, its unit's.
     fn find(&self, tests: &[TestOf], name: &str) -> Option<usize> {
-        let at = self.by_name.binary_search_by(|it| tests[*it as usize].name.as_str().cmp(name)).ok()?;
+        let at =
+            self.by_name.binary_search_by(|it| tests[*it as usize].name.as_str().cmp(name)).ok()?;
         Some(self.by_name[at] as usize)
     }
 }
@@ -383,7 +421,8 @@ impl Suited {
 /// whose tests are in the same order: [`start`] checked both are there and agree.
 fn listing(job: &Job, unit: usize) -> (&[TestOf], &ExecTable) {
     let made = job.made[unit].get().expect("a suite's unit was made: `start` checked");
-    let table = made.table.as_ref().expect("a suite's binary has its execution table: `start` checked");
+    let table =
+        made.table.as_ref().expect("a suite's binary has its execution table: `start` checked");
     (&made.tests, table)
 }
 
@@ -421,7 +460,8 @@ pub(crate) fn start(
     let filter = filter(&selection)?;
     let all = selection.all;
     // Keep-going: a binary that can't run is refused, naming it, and every other one runs.
-    let (suites, refused) = each(built.iter().filter(|it| it.profile.test), |artifact| suited(job, artifact));
+    let (suites, refused) =
+        each(built.iter().filter(|it| it.profile.test), |artifact| suited(job, artifact));
     Ok(TestRun {
         job: job.clone(),
         tags,
@@ -468,15 +508,24 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         return Ok(None);
     };
     let Some(at) = unit_of_artifact(job, artifact) else {
-        return Err(ApiError::new(format!("no test unit of `{}` is in the build", artifact.target.name), None));
+        return Err(ApiError::new(
+            format!("no test unit of `{}` is in the build", artifact.target.name),
+            None,
+        ));
     };
     let unit = &units.graph.units[at];
     let package = package_of(units, unit)?;
     let Some(made) = job.made[at].get() else {
-        return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
+        return Err(ApiError::new(
+            format!("the test binary `{program}` was not compiled by this job"),
+            None,
+        ));
     };
     let Some(context) = made.context else {
-        return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
+        return Err(ApiError::new(
+            format!("the test binary `{program}` was not compiled by this job"),
+            None,
+        ));
     };
     let suite = Suite { package: package.name.clone(), target: target_name(unit), context };
     let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
@@ -495,15 +544,23 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     };
     let unsandboxed = match sandboxed && job.input.verbose > 0 {
         // alloc: under `-v`, once per binary
-        true => made.tests.iter().filter(|it| package.tests.outside(&it.name)).map(|it| it.name.clone()).collect(),
+        true => made
+            .tests
+            .iter()
+            .filter(|it| package.tests.outside(&it.name))
+            .map(|it| it.name.clone())
+            .collect(),
         false => Vec::new(),
     };
     // alloc: one flag per test, once per binary
-    let inside: Vec<bool> = made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)).collect();
+    let inside: Vec<bool> =
+        made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)).collect();
     let Some(table) = &made.table else {
         return Err(ApiError::new(
             // alloc: error path
-            format!("the test binary `{program}` has no execution table: its link made none, so its tests can't be selected"),
+            format!(
+                "the test binary `{program}` has no execution table: its link made none, so its tests can't be selected"
+            ),
             None,
         ));
     };
@@ -512,7 +569,9 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     if !agree {
         return Err(ApiError::new(
             // alloc: error path
-            format!("the execution table of the test binary `{program}` lists other tests than its harness"),
+            format!(
+                "the execution table of the test binary `{program}` lists other tests than its harness"
+            ),
             None,
         ));
     }
@@ -525,12 +584,15 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
             None,
         ));
     }
-    let loaded: Option<test::Loaded> = match super::run::launch(job, at, false).map_err(|what| ApiError::new(what, None))? {
+    let loaded: Option<test::Loaded> = match super::run::launch(job, at, false)
+        .map_err(|what| ApiError::new(what, None))?
+    {
         super::run::Launch::File => None,
         // Its processes start from the file its code memory writes, the start hook's variable
         // set, and its fork server attached as one that forks (`Program::command`).
         super::run::Launch::InProcess => {
-            let held = job.shared.dev_runs.loaded(program).map_err(|what| ApiError::new(what, None))?;
+            let held =
+                job.shared.dev_runs.loaded(program).map_err(|what| ApiError::new(what, None))?;
             // clone: a count, once per binary
             Some(test::Loaded(held.program().clone()))
         }
@@ -545,7 +607,11 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         program: PathBuf::from(program),
         env: env.clone(),
         dir: manifest_dir.clone(),
-        read: vec![PathBuf::from(&config.invocation.root), PathBuf::from(&units.target_dir), manifest_dir.clone()],
+        read: vec![
+            PathBuf::from(&config.invocation.root),
+            PathBuf::from(&units.target_dir),
+            manifest_dir.clone(),
+        ],
         write: Vec::new(),
         network: false,
         memory: None,
@@ -558,7 +624,8 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     let outside = (sandboxed && !package.tests.tests.is_empty()).then(|| make(false));
     let tests = &made.tests;
     // alloc: once per binary, a place per test
-    let mut by_name: Vec<u32> = (0..u32::try_from(tests.len()).expect("under 2^32 tests")).collect();
+    let mut by_name: Vec<u32> =
+        (0..u32::try_from(tests.len()).expect("under 2^32 tests")).collect();
     blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name.as_bytes());
     let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
     let selector = job
@@ -585,13 +652,49 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     }))
 }
 
+/// The history's row of a test the queue finished, `suite`'s: none for one not run. Its build
+/// id is its job's, given as the job ends ([`crate::serve::work::RunPuts::test_runs`]). A binary
+/// run whole is one row, named as its binary.
+fn test_run_row(
+    job: &Job,
+    suite: &Suited,
+    done: &Finished,
+) -> Option<blaze_profile::facts::TestRunRow> {
+    use blaze_profile::facts::TestOutcome as Ran;
+    use blaze_usercode::test::Failure;
+    let outcome = match &done.outcome {
+        Outcome::Passed => Ran::Passed,
+        Outcome::Failed(Failure::Code(_)) => Ran::Failed,
+        Outcome::Failed(Failure::TimedOut(_)) => Ran::TimedOut,
+        Outcome::Failed(Failure::Signal(_) | Failure::Lost(_)) => Ran::Crashed,
+        Outcome::NotRun => return None,
+    };
+    let krate =
+        job.unit(suite.unit).ok().and_then(|unit| job.package(unit).ok()).map(|it| it.name.clone()); // clone: the package's name, once per test
+    Some(blaze_profile::facts::TestRunRow {
+        build_id: 0,
+        test: done.test.clone().unwrap_or_else(|| suite.name.clone()), // clone: the history's copy, once per test
+        krate,
+        binary: suite.name.clone(), // clone: as above
+        outcome,
+        dur_ns: i64::try_from(done.took.as_nanos()).unwrap_or(i64::MAX),
+        retries: done.attempts.saturating_sub(1),
+        ended_ns: blaze_profile::clock::mono_ns(),
+    })
+}
+
 impl TestRun {
     fn now(&self) -> Duration {
         self.job.began.elapsed()
     }
 
     /// What finished: reported, and kept for selection.
-    fn finished(&mut self, finished: impl Iterator<Item = Finished>, store: &mut Store, out: &mut Vec<Response>) {
+    fn finished(
+        &mut self,
+        finished: impl Iterator<Item = Finished>,
+        store: &mut Store,
+        out: &mut Vec<Response>,
+    ) {
         let color = self.job.input.color;
         let refused = |what: String| Response::Diagnostic(super::say::refused(what, None, color));
         // clone: a reference count, once per batch of results
@@ -603,14 +706,21 @@ impl TestRun {
                 .and_then(|&at| Some((at, self.suites.get_mut(at as usize)?)))
             else {
                 self.ok = false;
-                out.push(refused(format!("the test queue gave a result of its binary {}, which this run did not give it", done.binary)));
+                out.push(refused(format!(
+                    "the test queue gave a result of its binary {}, which this run did not give it",
+                    done.binary
+                )));
                 continue;
             };
             if let Outcome::Failed(_) = done.outcome {
                 self.ok = false;
             }
+            if let Some(row) = test_run_row(&job, suite, &done) {
+                self.puts.test_runs.push(row);
+            }
             if let Some(report) = test::report(&suite.name, &done) {
-                let outside = matches!(&done.trace, test::Trace::Unknown(why) if why == test::OUTSIDE);
+                let outside =
+                    matches!(&done.trace, test::Trace::Unknown(why) if why == test::OUTSIDE);
                 out.push(Response::TestResult(result(report, executable, outside)));
             }
             let passed = match done.outcome {
@@ -632,7 +742,10 @@ impl TestRun {
             let Some(selector) = suite.selector.as_mut() else {
                 self.ok = false;
                 // alloc: error path
-                out.push(refused(format!("test `{name}` of `{}` ran after its run gave its selector back", suite.name)));
+                out.push(refused(format!(
+                    "test `{name}` of `{}` ran after its run gave its selector back",
+                    suite.name
+                )));
                 continue;
             };
             // What the test reaches is walked only when its record is not whole, which is the
@@ -651,7 +764,11 @@ impl TestRun {
             let record = image::record(done.executed);
             let took = done.took;
             let kept = suite.common.traced(done.trace, &mut suite.disk, |traced| {
-                selector.keep(store, &subject, &blaze_testsel::Ran { passed, took, traced, record: &record })
+                selector.keep(
+                    store,
+                    &subject,
+                    &blaze_testsel::Ran { passed, took, traced, record: &record },
+                )
             });
             let kept = match kept {
                 Ok(it) => it,
@@ -668,7 +785,10 @@ impl TestRun {
                     self.ok = false;
                     suite.kept_all = false;
                     // alloc: error path
-                    out.push(refused(format!("keeping how test `{name}` of the test binary `{}` ran: {error}", suite.name)));
+                    out.push(refused(format!(
+                        "keeping how test `{name}` of the test binary `{}` ran: {error}",
+                        suite.name
+                    )));
                 }
             }
         }
@@ -708,7 +828,9 @@ impl Runs<Real> for TestRun {
         if self.job.input.verbose > 0 {
             for suite in &self.suites {
                 let said = match (suite.outside_why, suite.unsandboxed.as_slice()) {
-                    (Some(why), _) => format!("the tests of `{}` run outside the sandbox: {why}", suite.name),
+                    (Some(why), _) => {
+                        format!("the tests of `{}` run outside the sandbox: {why}", suite.name)
+                    }
                     (None, []) => continue,
                     (None, names) => format!(
                         "{} of `{}` run outside the sandbox: its package's `unsandboxed-tests` names them",
@@ -717,7 +839,12 @@ impl Runs<Real> for TestRun {
                     ),
                 };
                 // alloc: under `-v`, a note per binary with tests outside
-                out.push(Response::Diagnostic(super::say::cargo(Level::Note, said, None, self.job.input.color)));
+                out.push(Response::Diagnostic(super::say::cargo(
+                    Level::Note,
+                    said,
+                    None,
+                    self.job.input.color,
+                )));
             }
         }
         // clone: a reference count, once per run
@@ -743,7 +870,8 @@ impl Runs<Real> for TestRun {
                 match select::asked(&test.name, attrs, &self.filter) {
                     Wanted::Filtered => continue,
                     Wanted::Ignored => {
-                        let report = test::report_unrun(&suite.name, &test.name, Reported::Ignored, None);
+                        let report =
+                            test::report_unrun(&suite.name, &test.name, Reported::Ignored, None);
                         out.push(Response::TestResult(result(report, at, false)));
                         continue;
                     }
@@ -751,11 +879,20 @@ impl Runs<Real> for TestRun {
                 }
                 // Choosing reads no reach: only keeping a run whose record is not whole does.
                 let walk = || table.reached(n);
-                let subject =
-                    Subject { name: &test.name, attrs, outside: test.outside || !inside, reached: Reached::Lazy(&walk) };
+                let subject = Subject {
+                    name: &test.name,
+                    attrs,
+                    outside: test.outside || !inside,
+                    reached: Reached::Lazy(&walk),
+                };
                 match selector.choose(store, &subject, self.all, &mut suite.disk) {
                     Ok(Choice::Cached(kept)) => {
-                        out.push(Response::TestResult(blaze_testsel::api::result(&suite.name, at, &test.name, &kept)));
+                        out.push(Response::TestResult(blaze_testsel::api::result(
+                            &suite.name,
+                            at,
+                            &test.name,
+                            &kept,
+                        )));
                     }
                     Ok(Choice::Run { expected, .. }) => binary.jobs.push(TestJob {
                         // clone: the queue owns its jobs' names, once per test run
@@ -768,7 +905,10 @@ impl Runs<Real> for TestRun {
                     Err(error) => {
                         self.ok = false;
                         out.push(Response::Diagnostic(super::say::refused(
-                            format!("whether test `{}` of `{}` runs: {error}", test.name, suite.name),
+                            format!(
+                                "whether test `{}` of `{}` runs: {error}",
+                                test.name, suite.name
+                            ),
                             None,
                             job.input.color,
                         )));
@@ -792,8 +932,14 @@ impl Runs<Real> for TestRun {
             Err(why) => {
                 self.ok = false;
                 // alloc: error path
-                let what = UnitError::TestDir { dir: path.display().to_string(), why: format!("{why:#}") }.to_string();
-                out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
+                let what =
+                    UnitError::TestDir { dir: path.display().to_string(), why: format!("{why:#}") }
+                        .to_string();
+                out.push(Response::Diagnostic(super::say::refused(
+                    what,
+                    None,
+                    self.job.input.color,
+                )));
                 return self.end();
             }
         };
@@ -806,7 +952,11 @@ impl Runs<Real> for TestRun {
                 self.ok = false;
                 // alloc: error path
                 let what = format!("the tests of this run are sized to blaze's core budget: {why}");
-                out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
+                out.push(Response::Diagnostic(super::say::refused(
+                    what,
+                    None,
+                    self.job.input.color,
+                )));
                 return self.end();
             }
         };

@@ -28,7 +28,10 @@ use crate::check::Cx;
 const LINT: Lint = Lint::WideIndex;
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -58,10 +61,18 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     for (index, field) in candidates {
         let facts = uses.of(FieldId::from(field));
         let Into::One(container) = facts.into else { continue };
-        if facts.as_index == 0 || facts.other || facts.indexed || facts.pushed || facts.iterated || facts.measured {
+        if facts.as_index == 0
+            || facts.other
+            || facts.indexed
+            || facts.pushed
+            || facts.iterated
+            || facts.measured
+        {
             continue;
         }
-        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else { continue };
+        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else {
+            continue;
+        };
         let Some(range) = cx.range(node) else { continue };
         let container = hir::Field::from(container);
         let owner = match container.parent_def(db) {

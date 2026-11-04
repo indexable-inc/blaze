@@ -6,13 +6,18 @@ use std::sync::Arc;
 use blaze_codegen::{Init, InstanceKey, RelocKind, Static, Target};
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
-use object::write::{Object as Builder, Relocation, StandardSection, Symbol as ObjSymbol, SymbolSection};
-use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf};
+use object::write::{
+    Object as Builder, Relocation, StandardSection, Symbol as ObjSymbol, SymbolSection,
+};
+use object::{
+    Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
+    SymbolScope, elf,
+};
 
 use super::{CALLER, Disk, function, id, key, name, output, rel32, returns};
 use crate::premap::{
-    Bind, BindKind, Def, InitEntry, Kind, Placed, PlacedStatic, Prot, Request, SegmentPlace, StaticAt, Strength, layout,
-    prelink_placed,
+    Bind, BindKind, Def, InitEntry, Kind, Placed, PlacedStatic, Prot, Request, SegmentPlace,
+    StaticAt, Strength, layout, prelink_placed,
 };
 use crate::state::State;
 use crate::{Change, Image, Native, NativeKind, Output, OutputKind, Outside};
@@ -33,7 +38,12 @@ fn segments(placed: &Placed) -> Vec<(SegmentPlace, Vec<u8>)> {
     }
     let mut image = vec![0xaa; end];
     placed.write_into(&mut image, &offsets).unwrap();
-    placed.segments.iter().zip(&offsets).map(|(it, at)| (*it, image[*at..][..it.len as usize].to_vec())).collect()
+    placed
+        .segments
+        .iter()
+        .zip(&offsets)
+        .map(|(it, at)| (*it, image[*at..][..it.len as usize].to_vec()))
+        .collect()
 }
 
 fn shared() -> Output {
@@ -66,7 +76,14 @@ fn thread_local(n: u8, bytes: Vec<u8>, align: u32) -> Static {
     Static { align, mutable: false, thread_local: true, ..a_static(n, bytes, Vec::new()) }
 }
 
-fn symbol(name: &str, value: u64, size: u64, kind: SymbolKind, weak: bool, section: object::write::SectionId) -> ObjSymbol {
+fn symbol(
+    name: &str,
+    value: u64,
+    size: u64,
+    kind: SymbolKind,
+    weak: bool,
+    section: object::write::SectionId,
+) -> ObjSymbol {
     ObjSymbol {
         name: name.as_bytes().to_vec(),
         value,
@@ -88,12 +105,15 @@ fn hooked() -> Vec<u8> {
     let data = b.section_id(StandardSection::Data);
     let at = b.append_section_data(data, &[0; 8], 8);
     b.add_symbol(symbol("table", at, 8, SymbolKind::Data, false, data));
-    b.add_relocation(data, Relocation {
-        offset: at,
-        symbol: hook,
-        addend: 0,
-        flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
-    })
+    b.add_relocation(
+        data,
+        Relocation {
+            offset: at,
+            symbol: hook,
+            addend: 0,
+            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+        },
+    )
     .unwrap();
     b.write().unwrap()
 }
@@ -111,7 +131,9 @@ fn rets(names: &[(&str, bool)]) -> Vec<u8> {
 
 /// A GNU archive of `members` (name, bytes, the names it defines), with its symbol index.
 fn archive(members: &[(&str, &[u8], &[&str])]) -> Vec<u8> {
-    let header = |name: &str, size: usize| format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644);
+    let header = |name: &str, size: usize| {
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
+    };
     let names: Vec<&str> = members.iter().flat_map(|it| it.2.iter().copied()).collect();
     let index_len = 4 + 4 * names.len() + names.iter().map(|it| it.len() + 1).sum::<usize>();
     let mut offsets = Vec::new();
@@ -180,10 +202,14 @@ fn tie(item: u8, instance: u8) -> [u8; 64] {
 fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     let f1 = function(1, &returns(1), Vec::new());
     let f2 = function(2, &CALLER, vec![rel32(1, Target::Direct(key(1)))]);
-    let pointers = a_static(20, vec![0; 16], vec![
-        reloc(0, RelocKind::Abs64, Target::Direct(key(1))),
-        reloc(8, RelocKind::Abs64, Target::Extern("table".into())),
-    ]);
+    let pointers = a_static(
+        20,
+        vec![0; 16],
+        vec![
+            reloc(0, RelocKind::Abs64, Target::Direct(key(1))),
+            reloc(8, RelocKind::Abs64, Target::Extern("table".into())),
+        ],
+    );
     let init = Static {
         mutable: false,
         section: Some(".init_array".into()),
@@ -200,7 +226,13 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
         statics: &[&pointers, &init, &local],
         names: &[&("dep_entry".into(), Target::Direct(key(2)))],
         debug_names: &[],
-        natives: &[Native { id: id(60), name: "hooked.o", bytes: &object, kind: NativeKind::Object, order: 0 }],
+        natives: &[Native {
+            id: id(60),
+            name: "hooked.o",
+            bytes: &object,
+            kind: NativeKind::Object,
+            order: 0,
+        }],
         spans: &[],
     };
     let placed = prelink_placed(&request).unwrap();
@@ -208,7 +240,11 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     let written = segments(&placed);
 
     let prots: Vec<Prot> = placed.segments.iter().map(|it| it.prot).collect();
-    assert_eq!(prots, [Prot::ReadOnly, Prot::Code, Prot::ReadOnly, Prot::Data], "read, code, relro, write");
+    assert_eq!(
+        prots,
+        [Prot::ReadOnly, Prot::Code, Prot::ReadOnly, Prot::Data],
+        "read, code, relro, write"
+    );
     assert_eq!(placed.segments[0].addr, BASE, "never slid");
     let mut end = BASE;
     for it in &placed.segments {
@@ -222,37 +258,72 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     assert_eq!(two.1, one.1 + 16, "functions in key order, 16-aligned");
     let at = |addr: u64, len: usize| code_bytes[(addr - code.addr) as usize..][..len].to_vec();
     assert_eq!(at(one.1, 6), returns(1));
-    assert_eq!(at(two.1, 6), [0xe8, 0xeb, 0xff, 0xff, 0xff, 0xc3], "the call reaches f1, 21 bytes back");
+    assert_eq!(
+        at(two.1, 6),
+        [0xe8, 0xeb, 0xff, 0xff, 0xff, 0xc3],
+        "the call reaches f1, 21 bytes back"
+    );
 
     let names: Vec<&str> = linked.names.iter().map(|it| it.name.as_str()).collect();
     assert_eq!(names, ["dep_entry", "hook", "table"]);
     let def = |name: &str| linked.names.iter().find(|it| it.name == name).unwrap().def;
-    assert_eq!(def("dep_entry"), Def { value: two.1, size: 6, kind: Kind::Function, strength: Strength::Strong, order: u32::MAX });
+    assert_eq!(
+        def("dep_entry"),
+        Def {
+            value: two.1,
+            size: 6,
+            kind: Kind::Function,
+            strength: Strength::Strong,
+            order: u32::MAX
+        }
+    );
     let (hook, table) = (def("hook"), def("table"));
-    assert_eq!((hook.size, hook.kind, hook.strength, hook.order), (1, Kind::Function, Strength::Weak, 0));
-    assert_eq!((table.size, table.kind, table.strength, table.order), (8, Kind::Data, Strength::Strong, 0));
+    assert_eq!(
+        (hook.size, hook.kind, hook.strength, hook.order),
+        (1, Kind::Function, Strength::Weak, 0)
+    );
+    assert_eq!(
+        (table.size, table.kind, table.strength, table.order),
+        (8, Kind::Data, Strength::Strong, 0)
+    );
     assert_eq!(at(hook.value, 1), [0xc3], "hook is in the code");
 
     let (data, data_bytes) = &written[3];
-    let word = |addr: u64| u64::from_le_bytes(data_bytes[(addr - data.addr) as usize..][..8].try_into().unwrap());
+    let word = |addr: u64| {
+        u64::from_le_bytes(data_bytes[(addr - data.addr) as usize..][..8].try_into().unwrap())
+    };
     assert_eq!(word(table.value), hook.value, "an address, never slid");
     assert_eq!(
         linked.binds,
-        [Bind { place: table.value, name: "hook".into(), addend: 0, kind: BindKind::Addr, weak: false }],
+        [Bind {
+            place: table.value,
+            name: "hook".into(),
+            addend: 0,
+            kind: BindKind::Addr,
+            weak: false
+        }],
         "a pointer to a weak definition is bound, so a strong one beside the image wins"
     );
 
-    let static_at = |n: u8| linked.statics.iter().find(|it| it.item == ItemKey(id(n))).unwrap().clone();
+    let static_at =
+        |n: u8| linked.statics.iter().find(|it| it.item == ItemKey(id(n))).unwrap().clone();
     let pointers = static_at(20);
     let StaticAt::Addr(pointers_at) = pointers.at else { panic!("{pointers:?}") };
     assert_eq!(pointers.size, 16);
     assert_eq!((word(pointers_at), word(pointers_at + 8)), (one.1, table.value));
     assert_eq!(
         static_at(22),
-        PlacedStatic { item: ItemKey(id(22)), instance: id(122), at: StaticAt::ThreadLocal(BIAS as u64), size: 4 },
+        PlacedStatic {
+            item: ItemKey(id(22)),
+            instance: id(122),
+            at: StaticAt::ThreadLocal(BIAS as u64),
+            size: 4
+        },
         "the image's thread-locals start at the bias"
     );
-    let StaticAt::Addr(init_at) = static_at(21).at else { panic!("the init piece is no thread-local") };
+    let StaticAt::Addr(init_at) = static_at(21).at else {
+        panic!("the init piece is no thread-local")
+    };
     assert_eq!(
         linked.init,
         [InitEntry { rank: 65536, order: [u32::MAX; 3], tie: tie(21, 121), at: init_at, count: 1 }]
@@ -263,7 +334,9 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     let tls = linked.tls.unwrap();
     assert_eq!((tls.init, tls.size, tls.align), (4, 4, 4));
     assert!(data.addr <= tls.template, "the template is in the writable segment");
-    assert!(linked.libraries.is_empty() && linked.unwind.is_empty() && linked.thread_vars.is_empty());
+    assert!(
+        linked.libraries.is_empty() && linked.unwind.is_empty() && linked.thread_vars.is_empty()
+    );
 
     let offsets: Vec<usize> = (1..=placed.segments.len()).map(|it| it * 8 * 4096).collect();
     let mut image = vec![0xaa; (placed.segments.len() + 1) * 8 * 4096];
@@ -274,7 +347,9 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     }
     assert!(image[..offsets[0]].iter().all(|it| *it == 0xaa), "the caller's own bytes");
 
-    let refused = |offsets: &[usize], len: usize| placed.write_into(&mut vec![0; len], offsets).unwrap_err().what;
+    let refused = |offsets: &[usize], len: usize| {
+        placed.write_into(&mut vec![0; len], offsets).unwrap_err().what
+    };
     let mut unaligned = offsets.clone();
     unaligned[1] += 8;
     assert!(refused(&unaligned, image.len()).contains("not on a page"));
@@ -299,7 +374,13 @@ fn a_prelink_lists_the_weak_names_its_code_reaches_directly() {
         statics: &[],
         names: &[],
         debug_names: &[],
-        natives: &[Native { id: id(60), name: "hooked.o", bytes: &object, kind: NativeKind::Object, order: 0 }],
+        natives: &[Native {
+            id: id(60),
+            name: "hooked.o",
+            bytes: &object,
+            kind: NativeKind::Object,
+            order: 0,
+        }],
         spans: &[],
     };
     let linked = prelink_placed(&request).unwrap().linked;
@@ -356,7 +437,9 @@ impl Outside for Dep {
     fn static_at(&self, item: &ItemKey, instance: &ContentId) -> Option<StaticAt> {
         match (item.0, *instance) {
             (it, at) if it == id(40) && at == id(140) => Some(StaticAt::Addr(0x7000_8000)),
-            (it, at) if it == id(41) && at == id(141) => Some(StaticAt::ThreadLocal(BIAS.wrapping_add(8) as u64)),
+            (it, at) if it == id(41) && at == id(141) => {
+                Some(StaticAt::ThreadLocal(BIAS.wrapping_add(8) as u64))
+            }
             _ => None,
         }
     }
@@ -409,7 +492,11 @@ impl Outside for Reaching {
 
 /// `mov eax, fs:[disp32]; ret`, the displacement the thread-local offset of `target`.
 fn thread_load(n: u8, target: Target) -> blaze_codegen::CompiledFunction {
-    function(n, &[0x64, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0xc3], vec![reloc(4, RelocKind::TlsOffset, target)])
+    function(
+        n,
+        &[0x64, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0xc3],
+        vec![reloc(4, RelocKind::TlsOffset, target)],
+    )
 }
 
 fn outside_static(n: u8) -> Target {
@@ -431,23 +518,32 @@ fn calls(n: u8, targets: &[Target]) -> blaze_codegen::CompiledFunction {
 #[test]
 fn a_workspace_link_resolves_against_the_image_beside_it_as_one_whole_link() {
     let extern_ = |name: &str| Target::Extern(name.into());
-    let start = calls(10, &[
-        Target::Direct(key(1)),
-        extern_("dep_strong"),
-        extern_("strong_over_weak"),
-        extern_("weak_late"),
-        extern_("weak_both"),
-        extern_("local_strong"),
-        extern_("arch_only"),
-    ]);
+    let start = calls(
+        10,
+        &[
+            Target::Direct(key(1)),
+            extern_("dep_strong"),
+            extern_("strong_over_weak"),
+            extern_("weak_late"),
+            extern_("weak_both"),
+            extern_("local_strong"),
+            extern_("arch_only"),
+        ],
+    );
     let theirs = thread_load(11, outside_static(41));
     let ours = thread_load(12, outside_static(31));
     let pointer = a_static(30, vec![0; 8], vec![reloc(0, RelocKind::Abs64, outside_static(40))]);
     let local = thread_local(31, vec![9; 8], 8);
-    let object: Arc<[u8]> =
-        rets(&[("weak_both", true), ("strong_over_weak", true), ("weak_late", true), ("local_strong", false)]).into();
+    let object: Arc<[u8]> = rets(&[
+        ("weak_both", true),
+        ("strong_over_weak", true),
+        ("weak_late", true),
+        ("local_strong", false),
+    ])
+    .into();
     let (dup, only) = (rets(&[("dep_strong", false)]), rets(&[("arch_only", false)]));
-    let library: Arc<[u8]> = archive(&[("dup.o", &dup, &["dep_strong"]), ("only.o", &only, &["arch_only"])]).into();
+    let library: Arc<[u8]> =
+        archive(&[("dup.o", &dup, &["dep_strong"]), ("only.o", &only, &["arch_only"])]).into();
     let mut image = Image::beside(name("out/ws"), output(false), &Dep, BIAS).unwrap();
     assert_eq!(image.plan.base, 0x7001_3000, "the image starts on the page after the one beside");
     let change = Change {
@@ -455,8 +551,20 @@ fn a_workspace_link_resolves_against_the_image_beside_it_as_one_whole_link() {
         statics: vec![&pointer, &local],
         names: vec![("_start".into(), Target::Direct(key(10)))],
         natives: vec![
-            Native { id: id(61), name: "rets.o", bytes: &object, kind: NativeKind::Object, order: 3 },
-            Native { id: id(62), name: "libdup.a", bytes: &library, kind: NativeKind::Archive { whole: false }, order: 4 },
+            Native {
+                id: id(61),
+                name: "rets.o",
+                bytes: &object,
+                kind: NativeKind::Object,
+                order: 3,
+            },
+            Native {
+                id: id(62),
+                name: "libdup.a",
+                bytes: &library,
+                kind: NativeKind::Archive { whole: false },
+                order: 4,
+            },
         ],
         ..Change::default()
     };
@@ -467,17 +575,40 @@ fn a_workspace_link_resolves_against_the_image_beside_it_as_one_whole_link() {
     let code = state.addr_of(symbols.find_body(&key(10)).unwrap()).unwrap();
     assert!(code >= 0x7001_3000);
     let targets: Vec<u64> = (0..7).map(|it| call(state, code, 1 + 5 * it)).collect();
-    assert_eq!(targets[..4], [0x7000_0100, 0x7000_0200, 0x7000_0300, 0x7000_0400], "the image beside's");
+    assert_eq!(
+        targets[..4],
+        [0x7000_0100, 0x7000_0200, 0x7000_0300, 0x7000_0400],
+        "the image beside's"
+    );
     assert_eq!(targets[4], addr("weak_both"), "of two weak ones the first on the line");
     assert_eq!(targets[5], addr("local_strong"), "a strong one beats a weak one beside");
-    assert_eq!(targets[6], addr("arch_only"), "an archive member pulled for what is still undefined");
+    assert_eq!(
+        targets[6],
+        addr("arch_only"),
+        "an archive member pulled for what is still undefined"
+    );
     assert!(targets[4..].iter().all(|it| *it >= 0x7001_3000));
 
     let at = |n: u8| state.addr_of(symbols.find_body(&key(n)).unwrap()).unwrap() + 4;
-    assert_eq!(i32::try_from(BIAS + 8).unwrap(), i32_at(state, at(11)), "the image beside's thread-local");
-    assert_eq!(i32::try_from(BIAS + 16).unwrap(), i32_at(state, at(12)), "ours, after its 12 bytes, 8-aligned");
-    let pointer_sym = symbols.find(crate::symbols::SymKey::Static(symbols.find_id(&id(30)).unwrap(), symbols.find_id(&id(130)).unwrap()));
-    assert_eq!(u64_at(state, state.addr_of(pointer_sym.unwrap()).unwrap()), 0x7000_8000, "the image beside's static");
+    assert_eq!(
+        i32::try_from(BIAS + 8).unwrap(),
+        i32_at(state, at(11)),
+        "the image beside's thread-local"
+    );
+    assert_eq!(
+        i32::try_from(BIAS + 16).unwrap(),
+        i32_at(state, at(12)),
+        "ours, after its 12 bytes, 8-aligned"
+    );
+    let pointer_sym = symbols.find(crate::symbols::SymKey::Static(
+        symbols.find_id(&id(30)).unwrap(),
+        symbols.find_id(&id(130)).unwrap(),
+    ));
+    assert_eq!(
+        u64_at(state, state.addr_of(pointer_sym.unwrap()).unwrap()),
+        0x7000_8000,
+        "the image beside's static"
+    );
     assert_eq!(state.tls_at, Some(BIAS + 16));
 
     let mut disk = Disk::default();
@@ -486,9 +617,22 @@ fn a_workspace_link_resolves_against_the_image_beside_it_as_one_whole_link() {
     disk.run(&mut image, effects).unwrap();
     let layout = layout(&image);
     let names: Vec<&str> = layout.names.iter().map(|it| it.0.as_str()).collect();
-    assert_eq!(names, ["_start", "arch_only", "local_strong", "weak_both"], "only what this image defines");
+    assert_eq!(
+        names,
+        ["_start", "arch_only", "local_strong", "weak_both"],
+        "only what this image defines"
+    );
     let def = |name: &str| layout.names.iter().find(|it| it.0 == name).unwrap().1;
-    assert_eq!(def("_start"), Def { value: code, size: 36, kind: Kind::Function, strength: Strength::Strong, order: u32::MAX });
+    assert_eq!(
+        def("_start"),
+        Def {
+            value: code,
+            size: 36,
+            kind: Kind::Function,
+            strength: Strength::Strong,
+            order: u32::MAX
+        }
+    );
     assert_eq!((def("weak_both").strength, def("weak_both").order), (Strength::Weak, 3));
     assert_eq!((def("local_strong").strength, def("arch_only").order), (Strength::Strong, 4));
     assert_eq!(layout.tls_offset, Some(16));
@@ -504,16 +648,28 @@ fn two_strong_definitions_across_the_images_are_the_duplicate_symbol_error() {
     let change = Change {
         added: vec![&start],
         names: vec![("_start".into(), Target::Direct(key(10)))],
-        natives: vec![Native { id: id(61), name: "strong.o", bytes: &object, kind: NativeKind::Object, order: 3 }],
+        natives: vec![Native {
+            id: id(61),
+            name: "strong.o",
+            bytes: &object,
+            kind: NativeKind::Object,
+            order: 3,
+        }],
         ..Change::default()
     };
     let error = image.stage_beside(change, &Dep).unwrap_err();
-    assert!(error.what.contains("duplicate symbol `dep_strong`") && error.what.contains("strong.o"), "{error}");
+    assert!(
+        error.what.contains("duplicate symbol `dep_strong`") && error.what.contains("strong.o"),
+        "{error}"
+    );
 
     let mut image = Image::beside(name("out/ws"), output(false), &Dep, BIAS).unwrap();
     let change = Change {
         added: vec![&start],
-        names: vec![("_start".into(), Target::Direct(key(10))), ("dep_strong".into(), Target::Direct(key(10)))],
+        names: vec![
+            ("_start".into(), Target::Direct(key(10))),
+            ("dep_strong".into(), Target::Direct(key(10))),
+        ],
         ..Change::default()
     };
     let error = image.stage_beside(change, &Dep).unwrap_err();
@@ -522,14 +678,21 @@ fn two_strong_definitions_across_the_images_are_the_duplicate_symbol_error() {
 
 #[test]
 fn a_definition_that_would_win_over_a_weak_one_the_image_beside_reaches_directly_is_an_error() {
-    let start = calls(10, &[Target::Extern("local_strong".into()), Target::Extern("weak_both".into())]);
+    let start =
+        calls(10, &[Target::Extern("local_strong".into()), Target::Extern("weak_both".into())]);
     let object: Arc<[u8]> = rets(&[("weak_both", true), ("local_strong", false)]).into();
     let link = |outside: &Reaching, names: Vec<(String, Target)>| {
         let mut image = Image::beside(name("out/ws"), output(false), outside, BIAS).unwrap();
         let change = Change {
             added: vec![&start],
             names,
-            natives: vec![Native { id: id(61), name: "rets.o", bytes: &object, kind: NativeKind::Object, order: 3 }],
+            natives: vec![Native {
+                id: id(61),
+                name: "rets.o",
+                bytes: &object,
+                kind: NativeKind::Object,
+                order: 3,
+            }],
             ..Change::default()
         };
         image.stage_beside(change, outside).map(|_| ())
@@ -540,12 +703,20 @@ fn a_definition_that_would_win_over_a_weak_one_the_image_beside_reaches_directly
     assert!(error.what.contains("`local_strong` is defined by rets.o in ws"), "{error}");
     assert!(error.what.contains("weakly by the dependency image"), "{error}");
     let error = link(&Reaching("weak_both"), vec![start_name()]).unwrap_err();
-    assert!(error.what.contains("`weak_both` is defined by rets.o"), "a weak one first on the line too: {error}");
-    let error = link(&Reaching("weak_late"), vec![start_name(), ("weak_late".into(), Target::Direct(key(10)))]);
+    assert!(
+        error.what.contains("`weak_both` is defined by rets.o"),
+        "a weak one first on the line too: {error}"
+    );
+    let error = link(
+        &Reaching("weak_late"),
+        vec![start_name(), ("weak_late".into(), Target::Direct(key(10)))],
+    );
     assert!(error.unwrap_err().what.contains("`weak_late` is defined by Rust code"));
 
-    link(&Reaching("weak_late"), vec![start_name()]).expect("the image beside's own weak_late wins: nothing to refuse");
-    link(&Reaching("dep_strong"), vec![start_name()]).expect("only a name that would lose is refused");
+    link(&Reaching("weak_late"), vec![start_name()])
+        .expect("the image beside's own weak_late wins: nothing to refuse");
+    link(&Reaching("dep_strong"), vec![start_name()])
+        .expect("only a name that would lose is refused");
 }
 
 #[test]
@@ -561,7 +732,13 @@ fn an_image_beside_another_is_staged_only_against_it() {
     let error = image.stage_beside(change(), &crate::NoOutside).unwrap_err();
     assert!(error.what.contains("make it again beside that one"), "{error}");
     let mut plain = Image::new(name("out/app"), output(false)).unwrap();
-    assert!(plain.stage_beside(change(), &Dep).unwrap_err().what.contains("not made by `Image::beside`"));
+    assert!(
+        plain
+            .stage_beside(change(), &Dep)
+            .unwrap_err()
+            .what
+            .contains("not made by `Image::beside`")
+    );
 }
 
 #[test]

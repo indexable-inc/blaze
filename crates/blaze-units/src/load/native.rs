@@ -23,7 +23,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use blaze_manifest::Files;
+use blaze_manifest::files::Files;
 use serde::Deserialize;
 
 use crate::query::{LoadError, NativeInput};
@@ -119,12 +119,16 @@ struct PinTarget {
 }
 
 fn wrong(manifest: &Path, what: &str) -> LoadError {
-    LoadError { what: format!("{TABLE} in {}: {what}", manifest.display()), at: Some(manifest.display().to_string()) }
+    LoadError {
+        what: format!("{TABLE} in {}: {what}", manifest.display()),
+        at: Some(manifest.display().to_string()),
+    }
 }
 
 /// The inputs `metadata` (the root manifest's `[workspace.metadata]`) declares, sorted by name.
 fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Declared>, LoadError> {
-    let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("native")) else {
+    let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("native"))
+    else {
         return Ok(Vec::new());
     };
     let table = table.as_table().ok_or_else(|| wrong(manifest, "is a table of inputs by name"))?;
@@ -132,22 +136,32 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
     let mut out: Vec<Declared> = Vec::with_capacity(table.len()); // alloc: a manifest's few inputs, once a load
     for (name, input) in table {
         let wrong = |what: &str| wrong(manifest, &format!("input `{name}`: {what}"));
-        let input = input.as_table().ok_or_else(|| wrong("is a table with `pin`, `env` and `packages`"))?;
+        let input =
+            input.as_table().ok_or_else(|| wrong("is a table with `pin`, `env` and `packages`"))?;
         let (mut pin, mut env, mut packages) = (None, None, None);
         for (key, value) in input {
             match key.as_str() {
                 "pin" => {
-                    let path = value.as_str().ok_or_else(|| wrong("`pin` is a path, as a string"))?;
-                    let absolute = super::files::normal(&root.join(path))
-                        .ok_or_else(|| wrong(&format!("`pin` names `{path}`, which is not a UTF-8 path")))?;
+                    let path =
+                        value.as_str().ok_or_else(|| wrong("`pin` is a path, as a string"))?;
+                    let absolute = super::files::normal(&root.join(path)).ok_or_else(|| {
+                        wrong(&format!("`pin` names `{path}`, which is not a UTF-8 path"))
+                    })?;
                     pin = Some(absolute);
                 }
                 "env" => {
-                    let var = value.as_str().ok_or_else(|| wrong("`env` is a variable's name, as a string"))?;
-                    env = Some(variable(var).map_err(|why| wrong(&format!("`env` is `{var}`, which {why}")))?);
+                    let var = value
+                        .as_str()
+                        .ok_or_else(|| wrong("`env` is a variable's name, as a string"))?;
+                    env = Some(
+                        variable(var)
+                            .map_err(|why| wrong(&format!("`env` is `{var}`, which {why}")))?,
+                    );
                 }
                 "packages" => {
-                    let list = value.as_array().ok_or_else(|| wrong("`packages` is a list of package names"))?;
+                    let list = value
+                        .as_array()
+                        .ok_or_else(|| wrong("`packages` is a list of package names"))?;
                     let mut names = list
                         .iter()
                         .map(|it| {
@@ -162,11 +176,17 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
                     names.sort_unstable();
                     names.dedup();
                     if names.is_empty() {
-                        return Err(wrong("`packages` is empty: it names the packages whose build scripts are given the input"));
+                        return Err(wrong(
+                            "`packages` is empty: it names the packages whose build scripts are given the input",
+                        ));
                     }
                     packages = Some(names);
                 }
-                other => return Err(wrong(&format!("`{other}` is not known (`pin`, `env` and `packages` are)"))),
+                other => {
+                    return Err(wrong(&format!(
+                        "`{other}` is not known (`pin`, `env` and `packages` are)"
+                    )));
+                }
             }
         }
         let (Some(pin), Some(env), Some(packages)) = (pin, env, packages) else {
@@ -180,10 +200,15 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
     for (i, a) in out.iter().enumerate() {
         for b in &out[i + 1..] {
             let theirs: Vec<String> = b.packages.iter().map(package).collect(); // alloc: an error check, once a pair
-            if a.env == b.env && let Some(shared) = a.packages.iter().map(package).find(|it| theirs.contains(it)) {
+            if a.env == b.env
+                && let Some(shared) = a.packages.iter().map(package).find(|it| theirs.contains(it))
+            {
                 return Err(wrong(
                     manifest,
-                    &format!("inputs `{}` and `{}` both give `{shared}`'s build script `{}`", a.name, b.name, a.env),
+                    &format!(
+                        "inputs `{}` and `{}` both give `{shared}`'s build script `{}`",
+                        a.name, b.name, a.env
+                    ),
                 ));
             }
         }
@@ -206,7 +231,8 @@ fn variable(var: &str) -> Result<String, &'static str> {
 
 /// Whether `sha256` is 64 lowercase hex digits.
 fn is_sha256(sha256: &str) -> bool {
-    sha256.len() == 64 && sha256.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
+    sha256.len() == 64
+        && sha256.bytes().all(|it| it.is_ascii_digit() || (b'a'..=b'f').contains(&it))
 }
 
 /// The inputs the root manifest at `manifest` (its `[workspace.metadata]` is `metadata`)
@@ -238,21 +264,36 @@ pub(crate) fn needed<F: Files>(
         let pin_path = Path::new(&input.pin);
         let at = Some(input.pin.clone());
         let bad = |what: String| LoadError {
-            what: format!("the pin of native input `{}` ({TABLE} in {}), {}: {what}", input.name, manifest.display(), input.pin),
+            what: format!(
+                "the pin of native input `{}` ({TABLE} in {}), {}: {what}",
+                input.name,
+                manifest.display(),
+                input.pin
+            ),
             at: at.clone(),
         };
-        let bytes = files.read(pin_path).map_err(|error| bad(format!("can't be read: {error}")))?;
+        // Plain matches, not `map_err`/`ok_or_else` chains: stage 0 (0.20261030.1) can't
+        // resolve those methods here; return to the chains after the next stage-0 promotion.
+        let bytes = match files.read(pin_path) {
+            Ok(it) => it,
+            Err(error) => return Err(bad(format!("can't be read: {error}"))),
+        };
         let shape = "JSON with `release` and `targets` of `name` and `sha256`";
-        let pin: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&bytes).map_err(|error| bad(format!("is not {shape}: {error}")))?;
-        let release =
-            pin.get("release").and_then(|it| it.as_str()).ok_or_else(|| bad(format!("has no `release` string ({shape})")))?;
-        let archives: BTreeMap<String, PinTarget> = pin
-            .get("targets")
-            .map(BTreeMap::<String, PinTarget>::deserialize)
-            .transpose()
-            .map_err(|error| bad(format!("`targets` is not {shape}: {error}")))?
-            .ok_or_else(|| bad(format!("has no `targets` ({shape})")))?;
+        let pin: serde_json::Map<String, serde_json::Value> = match serde_json::from_slice(&bytes) {
+            Ok(it) => it,
+            Err(error) => return Err(bad(format!("is not {shape}: {error}"))),
+        };
+        let release = match pin.get("release") {
+            Some(serde_json::Value::String(it)) => it.as_str(),
+            _ => return Err(bad(format!("has no `release` string ({shape})"))),
+        };
+        let archives: BTreeMap<String, PinTarget> = match pin.get("targets") {
+            None => return Err(bad(format!("has no `targets` ({shape})"))),
+            Some(value) => match BTreeMap::<String, PinTarget>::deserialize(value) {
+                Ok(it) => it,
+                Err(error) => return Err(bad(format!("`targets` is not {shape}: {error}"))),
+            },
+        };
         let release_raw = release;
         let release = release.trim_end_matches('/');
         if !release.starts_with("https://") || release.len() == "https://".len() {
@@ -270,7 +311,10 @@ pub(crate) fn needed<F: Files>(
                 && archive.name != ".."
                 && !archive.name.contains(['/', '\\', '?', '#', '%', '\0']);
             if !one_part {
-                return Err(bad(format!("target `{target}`'s `name` is `{}`, not one file name", archive.name)));
+                return Err(bad(format!(
+                    "target `{target}`'s `name` is `{}`, not one file name",
+                    archive.name
+                )));
             }
             if !is_sha256(&archive.sha256) {
                 return Err(bad(format!(

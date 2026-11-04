@@ -10,8 +10,8 @@ pub(crate) mod lints;
 
 use std::collections::HashMap;
 
-use span::FileId;
 use hir_expand::fixture;
+use span::FileId;
 
 use self::db::TestDB;
 use crate::{
@@ -91,8 +91,14 @@ impl Checked {
 
 /// Whether `diag` is one of `emit::summary`'s closing lines.
 fn closing(diag: &Diag) -> bool {
-    let counted = |message: &str| message.starts_with(|c: char| c.is_ascii_digit()) && (message.ends_with(" warning emitted") || message.ends_with(" warnings emitted"));
-    diag.code.is_none() && (diag.level == Level::FailureNote || diag.message.starts_with("aborting due to ") || counted(&diag.message))
+    let counted = |message: &str| {
+        message.starts_with(|c: char| c.is_ascii_digit())
+            && (message.ends_with(" warning emitted") || message.ends_with(" warnings emitted"))
+    };
+    diag.code.is_none()
+        && (diag.level == Level::FailureNote
+            || diag.message.starts_with("aborting due to ")
+            || counted(&diag.message))
 }
 
 /// The paths of a fixture's files, in order, without their leading `/`.
@@ -127,11 +133,27 @@ pub(crate) fn checked_appending(fixture: &str, module: &'static str) -> Checked 
 
 /// [`checked`] with `extra` beside the test proc macros, each with the source of its
 /// declaration (`fixture::db_with_proc_macros`).
-pub(crate) fn checked_with_proc_macros(fixture: &str, extra: Vec<(String, hir_expand::proc_macro::ProcMacro)>) -> Checked {
-    checked_from(fixture::db_with_proc_macros(fixture, extra), fixture, "", &Options::default(), false, None)
+pub(crate) fn checked_with_proc_macros(
+    fixture: &str,
+    extra: Vec<(String, hir_expand::proc_macro::ProcMacro)>,
+) -> Checked {
+    checked_from(
+        fixture::db_with_proc_macros(fixture, extra),
+        fixture,
+        "",
+        &Options::default(),
+        false,
+        None,
+    )
 }
 
-fn checked_as(fixture: &str, prefix: &str, options: &Options, expand_derives: bool, appended: Option<&'static str>) -> Checked {
+fn checked_as(
+    fixture: &str,
+    prefix: &str,
+    options: &Options,
+    expand_derives: bool,
+    appended: Option<&'static str>,
+) -> Checked {
     checked_from(fixture::db(fixture), fixture, prefix, options, expand_derives, appended)
 }
 
@@ -145,9 +167,13 @@ fn checked_from(
 ) -> Checked {
     // compiletest's `should_emit_metadata`: a `check-pass` or `check-fail` UI test is given
     // `--emit=metadata`.
-    let checks_only = fixture.lines().any(|it| matches!(it.trim(), "//@ check-pass" | "//@ check-fail"));
+    let checks_only =
+        fixture.lines().any(|it| matches!(it.trim(), "//@ check-pass" | "//@ check-fail"));
     let options = &Options {
-        lints: crate::lints::CommandLine { codegen: options.lints.codegen && !checks_only, ..options.lints.clone() },
+        lints: crate::lints::CommandLine {
+            codegen: options.lints.codegen && !checks_only,
+            ..options.lints.clone()
+        },
         ..options.clone()
     };
     let files = fx.files().to_vec();
@@ -172,13 +198,16 @@ fn checked_from(
         names.insert(core, CORE_NAME.to_owned());
     }
     if has_proc_macros {
-        let proc_macros = sysroot.next().expect("a fixture with proc macros has their crate's file");
+        let proc_macros =
+            sysroot.next().expect("a fixture with proc macros has their crate's file");
         names.insert(proc_macros, format!("{prefix}auxiliary/proc_macros.rs"));
     }
     let diags = blaze_query::db::attach(&db, || {
         hir::check::workspace_crates(&db)
             .into_iter()
-            .flat_map(|krate| crate::check::check_crate(&db, krate, Files::new(&names, ""), options))
+            .flat_map(|krate| {
+                crate::check::check_crate(&db, krate, Files::new(&names, ""), options)
+            })
             .collect()
     });
     Checked { db, names, core, diags }
@@ -229,8 +258,18 @@ pub(crate) enum Mode {
     Other,
 }
 
-pub(crate) fn ui_as(mode: Mode, name: &str, edition: &str, source: &str, options: &Options) -> String {
-    ui_fixture_as(mode, &format!("//- /{name} crate:other:main edition:{edition}\n{source}"), options)
+pub(crate) fn ui_as(
+    mode: Mode,
+    name: &str,
+    edition: &str,
+    source: &str,
+    options: &Options,
+) -> String {
+    ui_fixture_as(
+        mode,
+        &format!("//- /{name} crate:other:main edition:{edition}\n{source}"),
+        options,
+    )
 }
 
 /// [`ui_as`] beside core, minicore with `flags` (`crates/test-utils/src/minicore.rs`): what of
@@ -243,7 +282,8 @@ pub(crate) fn ui_core_as(
     source: &str,
     options: &Options,
 ) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}");
+    let fixture =
+        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}");
     ui_fixture_as(mode, &fixture, options)
 }
 
@@ -260,7 +300,9 @@ pub(crate) fn library_features(features: &[&str]) -> String {
          #![stable(feature = \"{LIBRARY_FEATURES}\", since = \"1.0.0\")]\n"
     );
     for feature in features {
-        out.push_str(&format!("#[unstable(feature = \"{feature}\", issue = \"none\")]\npub fn {feature}() {{}}\n"));
+        out.push_str(&format!(
+            "#[unstable(feature = \"{feature}\", issue = \"none\")]\npub fn {feature}() {{}}\n"
+        ));
     }
     out
 }
@@ -268,7 +310,9 @@ pub(crate) fn library_features(features: &[&str]) -> String {
 /// [`ui`] beside a core of the builtin macros of core's prelude the UI tests call, as
 /// `library/core/src/macros/mod.rs` writes them: `compile_error!` and `#[cfg_accessible]`.
 pub(crate) fn ui_builtins(name: &str, edition: &str, source: &str) -> String {
-    let fixture = format!("{BUILTINS_CORE}//- /{name} crate:other:main edition:{edition} deps:core\n{source}");
+    let fixture = format!(
+        "{BUILTINS_CORE}//- /{name} crate:other:main edition:{edition} deps:core\n{source}"
+    );
     ui_fixture_as(Mode::Other, &fixture, &Options::default())
 }
 
@@ -345,7 +389,10 @@ pub(crate) fn compiletest(mode: Mode, options: &Options) -> Options {
     args.extend(["-A", "internal_features", "-A", "incomplete_features"]);
     args.extend(["-A", "unused_parens", "-A", "unused_braces"]);
     let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    let mut opts = crate::lints::CommandLine::parse(&args).expect("compiletest's lint flags are rustc's").lints.opts;
+    let mut opts = crate::lints::CommandLine::parse(&args)
+        .expect("compiletest's lint flags are rustc's")
+        .lints
+        .opts;
     let mut lints = options.lints.clone();
     opts.append(&mut lints.lints.opts);
     lints.lints.opts = opts;
@@ -481,11 +528,12 @@ fn reported(stderr: &str) -> Vec<Reported<'_>> {
         .filter_map(|pair| {
             let error = pair[0].1?;
             let text = &stderr[pair[0].0..pair[1].0];
-            let line = text.lines().find_map(|it| it.trim_start().strip_prefix("--> ")).and_then(|at| {
-                let mut parts = at.rsplitn(3, ':');
-                let _column = parts.next()?;
-                parts.next()?.parse().ok()
-            });
+            let line =
+                text.lines().find_map(|it| it.trim_start().strip_prefix("--> ")).and_then(|at| {
+                    let mut parts = at.rsplitn(3, ':');
+                    let _column = parts.next()?;
+                    parts.next()?.parse().ok()
+                });
             Some(Reported { error, line, text })
         })
         .collect()
@@ -509,8 +557,12 @@ pub(crate) fn assert_reports(stderr: &str, expected: &[Expect<'_>]) {
             None => panic!("expected {expect:?}, not reported in:\n{stderr}"),
         }
     }
-    let unexpected: Vec<&Reported<'_>> =
-        reported.iter().zip(&used).filter(|(it, used)| it.error && !**used).map(|(it, _)| it).collect();
+    let unexpected: Vec<&Reported<'_>> = reported
+        .iter()
+        .zip(&used)
+        .filter(|(it, used)| it.error && !**used)
+        .map(|(it, _)| it)
+        .collect();
     assert!(unexpected.is_empty(), "errors not expected: {unexpected:#?}\nin:\n{stderr}");
 }
 
@@ -520,8 +572,14 @@ fn the_facts_of_an_output_are_its_diagnostics_lines_and_mentions() {
                   = note: expected `u32`, found `u8`\n\nwarning: unused variable: `x`\n  --> $DIR/a.rs:7:9\n\n\
                   error: no main\n  --> $SRC_DIR/core/src/lib.rs:LL:COL\n\n\
                   error: aborting due to 2 previous errors; 1 warning emitted\n";
-    assert_reports(stderr, &[error(3, &["u32", "u8"]), Expect { error: true, line: None, mentions: &["main"] }]);
-    assert_reports(stderr, &[error(3, &[]), warning(7, &["`x`"]), Expect { error: true, line: None, mentions: &[] }]);
+    assert_reports(
+        stderr,
+        &[error(3, &["u32", "u8"]), Expect { error: true, line: None, mentions: &["main"] }],
+    );
+    assert_reports(
+        stderr,
+        &[error(3, &[]), warning(7, &["`x`"]), Expect { error: true, line: None, mentions: &[] }],
+    );
     let missing = std::panic::catch_unwind(|| assert_reports(stderr, &[error(3, &["i32"])]));
     assert!(missing.is_err(), "a mention the error lacks fails");
     let extra = std::panic::catch_unwind(|| assert_reports(stderr, &[error(3, &[])]));

@@ -272,7 +272,8 @@ impl Span {
     }
 
     fn empty(align: usize) -> Span {
-        let ptr = NonNull::new(ptr::without_provenance_mut::<u8>(align)).expect("a nonzero alignment");
+        let ptr =
+            NonNull::new(ptr::without_provenance_mut::<u8>(align)).expect("a nonzero alignment");
         Span { ptr, segment: ptr::null(), len: 0 }
     }
 

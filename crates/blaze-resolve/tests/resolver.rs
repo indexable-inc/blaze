@@ -1115,7 +1115,8 @@ mod validated {
 
     #[test]
     fn missing_dep_feature() {
-        let reg = registry(vec![pkg(&"a"), pkg_dep_with(&"dep", vec![dep("a")], &[("f", &["a/a"])])]);
+        let reg =
+            registry(vec![pkg(&"a"), pkg_dep_with(&"dep", vec![dep("a")], &[("f", &["a/a"])])]);
 
         let deps = vec![dep("dep").with(&["f"])];
         assert!(resolve_and_validated(deps, &reg).is_err());

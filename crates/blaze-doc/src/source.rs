@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use hir::{HirFileId, InFile};
 use base_db::Db;
 use blaze_hash::HashMap;
+use hir::{HirFileId, InFile};
 use std::alloc::Global;
 use syntax::{TextRange, TextSize, view as ast};
 

@@ -2,11 +2,7 @@
 //! header and at most one table. Everything here may wait (DuckDB runs as a process, Flecs
 //! answers on its own thread), so the server calls it on tokio's blocking pool.
 
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::Instant,
-};
+use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -26,6 +22,26 @@ pub struct History {
     pub duckdb: Option<PathBuf>,
     /// The history's directory (`blaze_profile::history::dir_in` of the daemon's state).
     pub dir: PathBuf,
+    /// Run before every query, so it reads each row the daemon recorded before it was asked.
+    pub flush: Flush,
+}
+
+/// Has the daemon that writes the history flush it (the same flush a CLI reader asks for with
+/// `blaze_api::Request::Flush`), answering the flush's number once it committed, or why it
+/// failed. The daemon gives it ([`crate::Config`]); a query whose flush fails is not run.
+#[derive(Clone)]
+pub struct Flush(Arc<dyn Fn() -> Result<u64, String> + Send + Sync>);
+
+impl Flush {
+    pub fn new(flush: impl Fn() -> Result<u64, String> + Send + Sync + 'static) -> Flush {
+        Flush(Arc::new(flush))
+    }
+}
+
+impl fmt::Debug for Flush {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Flush")
+    }
 }
 
 /// What every answer reads.
@@ -78,15 +94,23 @@ impl Answer {
 /// The answer to `request`. `hello` is the session's to answer; asked here it is a bug of the
 /// caller, said as `bad_args`. A message on `stop`, or its sender gone, kills a DuckDB query under
 /// way, answered `cancelled`.
-pub(crate) fn answer(cx: &Context, request: Request, stop: &sql::Stop) -> Result<Answer, WireError> {
+pub(crate) fn answer(
+    cx: &Context,
+    request: Request,
+    stop: &sql::Stop,
+) -> Result<Answer, WireError> {
     match request {
-        Request::Hello { .. } => Err(WireError::new(Kind::BadArgs, "hello is answered by the session")),
+        Request::Hello { .. } => {
+            Err(WireError::new(Kind::BadArgs, "hello is answered by the session"))
+        }
         Request::Builds {} => {
             let sql = "SELECT * FROM builds ORDER BY started_ns";
             Ok(query(cx, "builds", sql, stop)?.0)
         }
         Request::Sql { sql } => Ok(query(cx, "sql", &sql, stop)?.0),
-        Request::Views {} => views_table().map(|table| Answer { table: Some(table), ..Answer::new("views") }),
+        Request::Views {} => {
+            views_table().map(|table| Answer { table: Some(table), ..Answer::new("views") })
+        }
         Request::View { name, args } => {
             let view = views::find(&name).map_err(|it| view_error(&it))?;
             let sql = views::render(view, &args).map_err(|it| view_error(&it))?;
@@ -158,7 +182,16 @@ fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, Wi
                        `blaze explore` passes the one `nix run .#duckdb` pins";
         return Err(WireError::new(Kind::Sql, message).with("query", sql));
     };
-    let query = sql::Query { duckdb, history: &cx.history.dir, sql };
+    (cx.history.flush.0)().map_err(|why| {
+        WireError::new(
+            Kind::Flush,
+            format!(
+                "the history was not flushed before the query, so it would miss recent rows: {why}"
+            ),
+        )
+        .with("query", sql)
+    })?;
+    let query = sql::Query { duckdb, history: &cx.history.dir, scope: sql::Scope::All, sql };
     sql::run_with(&query, stop).map_err(|error| {
         let kind = match (&error, error.kind()) {
             (sql::SqlError::Stopped, _) => Kind::Cancelled,
@@ -175,7 +208,12 @@ fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, Wi
 }
 
 /// The answer of op `op`: the result of `sql`, the SQL in the header; and its row count.
-fn query(cx: &Context, op: &'static str, sql: &str, stop: &sql::Stop) -> Result<(Answer, usize), WireError> {
+fn query(
+    cx: &Context,
+    op: &'static str,
+    sql: &str,
+    stop: &sql::Stop,
+) -> Result<(Answer, usize), WireError> {
     let batches = run(cx, sql, stop)?;
     let table = Table::of(batches);
     let rows = table.as_ref().map_or(0, Table::rows);
@@ -184,11 +222,13 @@ fn query(cx: &Context, op: &'static str, sql: &str, stop: &sql::Stop) -> Result<
 
 /// `Ok` when the history has build `build`, else `no_such_build`.
 fn known_build(cx: &Context, build: u64, stop: &sql::Stop) -> Result<(), WireError> {
-    let found = run(cx, &format!("SELECT build_id FROM builds WHERE build_id = {build} LIMIT 1"), stop)?;
+    let found =
+        run(cx, &format!("SELECT build_id FROM builds WHERE build_id = {build} LIMIT 1"), stop)?;
     if found.iter().any(|it| it.num_rows() > 0) {
         return Ok(());
     }
-    Err(WireError::new(Kind::NoSuchBuild, format!("the history has no build {build}")).with("build", build))
+    Err(WireError::new(Kind::NoSuchBuild, format!("the history has no build {build}"))
+        .with("build", build))
 }
 
 fn view_error(error: &views::ViewError) -> WireError {
@@ -240,18 +280,30 @@ fn world(cx: &Context, path: &str) -> Result<Answer, WireError> {
         let message = "the daemon keeps no build world: blaze_web::Graphs, the Flecs world of the \
                        builds' functions, is not made by the v2 daemon (crates/blaze-cargo) or fed \
                        its builds' records";
-        return Err(WireError::new(Kind::NoWorld, message).with("needs", "blaze_web::Graphs in the daemon"));
+        return Err(
+            WireError::new(Kind::NoWorld, message).with("needs", "blaze_web::Graphs in the daemon")
+        );
     };
     if !path.starts_with('/') {
-        return Err(WireError::new(Kind::BadArgs, format!("the world's path `{path}` does not start with `/`")));
+        return Err(WireError::new(
+            Kind::BadArgs,
+            format!("the world's path `{path}` does not start with `/`"),
+        ));
     }
     let answered = graphs.rest("GET", path).map_err(|why| WireError::new(Kind::NoWorld, why))?;
     if answered.code != 200 {
-        let message = format!("Flecs answered {} to GET {path}: {}", answered.code, String::from_utf8_lossy(&answered.body));
+        let message = format!(
+            "Flecs answered {} to GET {path}: {}",
+            answered.code,
+            String::from_utf8_lossy(&answered.body)
+        );
         return Err(WireError::new(Kind::World, message).with("code", answered.code));
     }
     let world: Value = serde_json::from_slice(&answered.body).map_err(|why| {
-        WireError::new(Kind::World, format!("Flecs's answer to GET {path} is not JSON ({}): {why}", answered.kind))
+        WireError::new(
+            Kind::World,
+            format!("Flecs's answer to GET {path} is not JSON ({}): {why}", answered.kind),
+        )
     })?;
     Ok(Answer::new("world").with("path", path).with("world", world))
 }
@@ -267,7 +319,14 @@ mod tests {
     }
 
     fn cx() -> Context {
-        Context { history: History { duckdb: None, dir: PathBuf::from("/nowhere") }, world: None }
+        Context {
+            history: History {
+                duckdb: None,
+                dir: PathBuf::from("/nowhere"),
+                flush: Flush::new(|| Ok(0)),
+            },
+            world: None,
+        }
     }
 
     #[test]
@@ -311,13 +370,17 @@ mod tests {
     fn a_backwards_range_is_bad_args_before_any_query() {
         let spans = answer(&cx(), Request::Spans { build: 1, t0_ns: 9, t1_ns: 9 });
         assert_eq!(spans.err().map(|it| it.kind), Some(Kind::BadArgs));
-        let tiles = answer(&cx(), Request::Tiles { build: 1, t0_ns: 0, t1_ns: 10, bucket_ns: 0, lane: Lane::Thread });
+        let tiles = answer(
+            &cx(),
+            Request::Tiles { build: 1, t0_ns: 0, t1_ns: 10, bucket_ns: 0, lane: Lane::Thread },
+        );
         assert_eq!(tiles.err().map(|it| it.kind), Some(Kind::BadArgs));
     }
 
     #[test]
     fn with_no_world_the_world_op_names_what_is_missing() {
-        let error = answer(&cx(), Request::World { path: "/entity/flecs".to_owned() }).err().unwrap();
+        let error =
+            answer(&cx(), Request::World { path: "/entity/flecs".to_owned() }).err().unwrap();
         assert_eq!(error.kind, Kind::NoWorld);
         assert!(error.message.contains("blaze_web::Graphs"), "{error}");
     }

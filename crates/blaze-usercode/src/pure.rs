@@ -25,7 +25,7 @@ use blaze_ids::ContentId;
 use crate::{
     Given, RunKey, RunKind,
     index::{self, FindError, Found, KeepError},
-    roots::{NoRoot, Roots, Rooted, verify},
+    roots::{NoRoot, Rooted, Roots, verify},
     run::Value,
     trace::Inputs,
 };
@@ -131,7 +131,14 @@ pub fn retract(
     let Some(what) = crate::run::differs_with_stderr(&hit.value, ran) else { return Ok(None) };
     let record = verify::retraction(&run_key(proof, &roots), &unmarked);
     let mut tickets = Vec::new(); // alloc: the record's tickets, once per retraction
-    match index::keep_into(store, blaze_cas::Unit::SHARED, &record.run, &record.traced, &record.value, &mut tickets) {
+    match index::keep_into(
+        store,
+        blaze_cas::Unit::SHARED,
+        &record.run,
+        &record.traced,
+        &record.value,
+        &mut tickets,
+    ) {
         Ok(()) => Ok(Some((what, tickets))),
         Err(error) => {
             let retracted = tickets.first().copied();
@@ -143,14 +150,21 @@ pub fn retract(
 fn find_error<E: std::fmt::Debug>(error: FindError<E>) -> String {
     match error {
         // alloc: error path
-        FindError::Corrupt(corrupt) => format!("the store's record of a pure build script: {corrupt:?}"),
+        FindError::Corrupt(corrupt) => {
+            format!("the store's record of a pure build script: {corrupt:?}")
+        }
         // alloc: error path
-        FindError::NotAShape { key, why } => format!("the pure build script's shape slot {key:?}: {why}"),
+        FindError::NotAShape { key, why } => {
+            format!("the pure build script's shape slot {key:?}: {why}")
+        }
         // alloc: error path
         FindError::Inputs(error) => format!("hashing what the pure build script reads: {error:?}"),
         // alloc: error path
         FindError::TooManyShapes { run } => {
-            format!("the pure build script's run {run:?} has more than {} shapes", crate::index::MOST_SHAPES)
+            format!(
+                "the pure build script's run {run:?} has more than {} shapes",
+                crate::index::MOST_SHAPES
+            )
         }
     }
 }
@@ -193,7 +207,8 @@ pub const RUNTIME: &[&str] = &[
 pub const RUNTIME: &[&str] =
     &["/usr/lib", "/System", "/Library/Apple", "/private/var/db/dyld", "/nix/store", "/dev"];
 #[cfg(windows)]
-pub const RUNTIME: &[&str] = &["C:\\Windows\\System32", "C:\\Windows\\SysWOW64", "C:\\Windows\\WinSxS"];
+pub const RUNTIME: &[&str] =
+    &["C:\\Windows\\System32", "C:\\Windows\\SysWOW64", "C:\\Windows\\WinSxS"];
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub const RUNTIME: &[&str] = &["/lib", "/usr/lib", "/usr/local/lib", "/libexec"];
 
@@ -205,12 +220,23 @@ pub type Read = Vec<(PathBuf, Option<[u8; 32]>)>;
 /// or an error naming the script and the first effect its proof said it never has. Called
 /// before anything is taken out of the trace (the run's own key's `keyed`), so it sees every
 /// read.
-pub fn check(script: &str, proof: &Proof, places: &Places<'_>, traced: &Traced) -> Result<Read, Error> {
+pub fn check(
+    script: &str,
+    proof: &Proof,
+    places: &Places<'_>,
+    traced: &Traced,
+) -> Result<Read, Error> {
     // alloc: error path
-    let bug = |what: String| Error(format!("the build script of `{script}` was proved pure, but its run {what}: a bug in blaze's purity proof (hir-ty-pure)"));
+    let bug = |what: String| {
+        Error(format!(
+            "the build script of `{script}` was proved pure, but its run {what}: a bug in blaze's purity proof (hir-ty-pure)"
+        ))
+    };
     if let Some(it) = traced.untraceable.first() {
         // alloc: error path
-        return Err(bug(format!("read what can't be traced ({it:?}), which its proof says it never does")));
+        return Err(bug(format!(
+            "read what can't be traced ({it:?}), which its proof says it never does"
+        )));
     }
     if let Some((dir, _)) = traced.dirs.iter().find(|(dir, _)| !runtime(dir, places)) {
         // alloc: error path
@@ -223,19 +249,28 @@ pub fn check(script: &str, proof: &Proof, places: &Places<'_>, traced: &Traced) 
         }
         if path.starts_with(places.target_dir) {
             // alloc: error path
-            return Err(bug(format!("read {} in the target directory, which its proof says it never does", path.display())));
+            return Err(bug(format!(
+                "read {} in the target directory, which its proof says it never does",
+                path.display()
+            )));
         }
         if path.starts_with(places.package) {
             if !proof.reads {
                 // alloc: error path
-                return Err(bug(format!("read {} in its package, which its proof says it never does", path.display())));
+                return Err(bug(format!(
+                    "read {} in its package, which its proof says it never does",
+                    path.display()
+                )));
             }
             read.push((path.clone(), *hash)); // clone: the edge, the path the key keeps
             continue;
         }
         if !runtime(path, places) {
             // alloc: error path
-            return Err(bug(format!("read {}, outside its package and OUT_DIR, which its proof says it never does", path.display())));
+            return Err(bug(format!(
+                "read {}, outside its package and OUT_DIR, which its proof says it never does",
+                path.display()
+            )));
         }
     }
     Ok(read)
@@ -244,13 +279,18 @@ pub fn check(script: &str, proof: &Proof, places: &Places<'_>, traced: &Traced) 
 /// Whether `path` is one the loader or the runtime reads before `main`: [`RUNTIME`]'s, or the
 /// toolchain's.
 fn runtime(path: &Path, places: &Places<'_>) -> bool {
-    RUNTIME.iter().any(|root| path.starts_with(root)) || places.toolchain.iter().any(|root| path.starts_with(root))
+    RUNTIME.iter().any(|root| path.starts_with(root))
+        || places.toolchain.iter().any(|root| path.starts_with(root))
 }
 
 /// What a succeeded run of the pure script `script` printed and wrote, against `proof`.
 pub fn checked_value(script: &str, proof: &Proof, value: &Value) -> Result<(), Error> {
     // alloc: error path
-    let bug = |what: &str| Error(format!("the build script of `{script}` was proved pure, but its run {what}: a bug in blaze's purity proof (hir-ty-pure)"));
+    let bug = |what: &str| {
+        Error(format!(
+            "the build script of `{script}` was proved pure, but its run {what}: a bug in blaze's purity proof (hir-ty-pure)"
+        ))
+    };
     if !proof.prints && (!value.stdout.is_empty() || !value.stderr.is_empty()) {
         return Err(bug("printed, which its proof says it never does"));
     }
@@ -286,7 +326,9 @@ pub fn keep<I: Inputs>(
     let traced = Traced { files: read, dirs: Vec::new(), env, untraceable: Vec::new() };
     let run = run_key(proof, &roots);
     // alloc: error path, why the scan could not be made
-    let (marked, stored) = roots.kept(&traced, value).map_err(|error| KeepError::Scan { run, why: error.to_string() })?;
+    let (marked, stored) = roots
+        .kept(&traced, value)
+        .map_err(|error| KeepError::Scan { run, why: error.to_string() })?;
     verify::keep(store, &roots, &run, marked, stored.encode(), crate::run::ported_differs)
 }
 

@@ -211,7 +211,9 @@ pub(crate) fn decide(here: &Here<'_>) -> Vec<Say> {
     if let Some(reason) = latest.yanked(here.runs) {
         let fix = match here.pin {
             Pin::Version(_) if newest.version != here.runs => Fix::Pin(newest.version.clone()),
-            Pin::None | Pin::Ignored if newest.version != here.runs => Fix::Update(newest.version.clone()),
+            Pin::None | Pin::Ignored if newest.version != here.runs => {
+                Fix::Update(newest.version.clone())
+            }
             _ => Fix::None,
         };
         said.push(Say::Yanked { version: here.runs.to_owned(), reason: reason.to_owned(), fix });
@@ -220,7 +222,8 @@ pub(crate) fn decide(here: &Here<'_>) -> Vec<Say> {
         return said;
     }
     if let Some(version) = here.updated {
-        let url = if version == newest.version { newest.url.clone() } else { release_page(version) };
+        let url =
+            if version == newest.version { newest.url.clone() } else { release_page(version) };
         said.push(Say::Updated { version: version.to_owned(), url });
     }
     match here.pin {
@@ -252,7 +255,9 @@ pub(crate) fn release_page(version: &str) -> String {
 /// last runs.
 pub(crate) fn runs_unpinned<'a>(ours: &'a str, default: Option<&'a str>) -> &'a str {
     match default {
-        Some(default) if Version::parse(ours).is_some() && Version::parse(default).is_some() => default,
+        Some(default) if Version::parse(ours).is_some() && Version::parse(default).is_some() => {
+            default
+        }
         _ => ours,
     }
 }
@@ -283,8 +288,11 @@ pub(crate) fn auto_install<'a>(
         (Some(newest), Some(runs)) => newest > runs,
         _ => false,
     };
-    (mode == Mode::Auto && newer && latest.yanked(&newest.version).is_none() && failed != Some(newest.version.as_str()))
-        .then_some(newest.version.as_str())
+    (mode == Mode::Auto
+        && newer
+        && latest.yanked(&newest.version).is_none()
+        && failed != Some(newest.version.as_str()))
+    .then_some(newest.version.as_str())
 }
 
 #[cfg(test)]
@@ -322,7 +330,11 @@ mod tests {
             reason: "miscompiles drops".to_owned(),
             fix,
         };
-        let pin_behind = |pin: &str, days| Say::PinBehind { pin: pin.to_owned(), newest: "0.20261104.0".to_owned(), days };
+        let pin_behind = |pin: &str, days| Say::PinBehind {
+            pin: pin.to_owned(),
+            newest: "0.20261104.0".to_owned(),
+            days,
+        };
         let update = |it: &str| Fix::Update(it.to_owned());
         #[rustfmt::skip]
         let rows: Vec<(&str, Here<'_>, Vec<Say>)> = vec![

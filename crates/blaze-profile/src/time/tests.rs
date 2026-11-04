@@ -19,8 +19,21 @@ fn ready(thread: u32, t_ns: i64, job: u64, by: Option<u64>, core: u32) -> Switch
 
 /// `job` joining the graph at `t_ns`, having begun on its fiber at `since_ns` as `began_as`,
 /// given to the pool by `by`.
-fn started(thread: u32, t_ns: i64, job: u64, core: u32, since_ns: i64, began_as: u64, by: Option<u64>) -> SwitchIn {
-    SwitchIn { by, since_ns: Some(since_ns), began_as: Some(began_as), ..switch(thread, t_ns, Event::Started, job, core) }
+fn started(
+    thread: u32,
+    t_ns: i64,
+    job: u64,
+    core: u32,
+    since_ns: i64,
+    began_as: u64,
+    by: Option<u64>,
+) -> SwitchIn {
+    SwitchIn {
+        by,
+        since_ns: Some(since_ns),
+        began_as: Some(began_as),
+        ..switch(thread, t_ns, Event::Started, job, core)
+    }
 }
 
 /// A `job` span: the root of a pool job's spans, naming it.
@@ -32,7 +45,14 @@ fn parked(on: WaitedOn, value: u64) -> Event {
     Event::Parked { on, value }
 }
 
-fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start_ns: i64, dur_ns: i64) -> SpanIn {
+fn span(
+    thread: u32,
+    span_id: u64,
+    parent: Option<u64>,
+    name: &str,
+    start_ns: i64,
+    dur_ns: i64,
+) -> SpanIn {
     SpanIn {
         process: P,
         thread,
@@ -83,7 +103,10 @@ fn a_job_parked_on_one_thread_and_resumed_on_another_is_one_lane_whose_states_ad
         None,
     );
     let lane = job_lane(&m, 1);
-    assert_eq!(states(lane), [("running", 0, 10), ("parked_or_queued", 10, 30), ("running", 30, 50)]);
+    assert_eq!(
+        states(lane),
+        [("running", 0, 10), ("parked_or_queued", 10, 30), ("running", 30, 50)]
+    );
     let cores: Vec<_> = lane
         .intervals
         .iter()
@@ -93,7 +116,10 @@ fn a_job_parked_on_one_thread_and_resumed_on_another_is_one_lane_whose_states_ad
         })
         .collect();
     assert_eq!(cores, [1, 2], "each run is on the core it ran on");
-    assert_eq!(lane.totals(), Totals { running_ns: 30, parked_or_queued_ns: 20, ..Totals::default() });
+    assert_eq!(
+        lane.totals(),
+        Totals { running_ns: 30, parked_or_queued_ns: 20, ..Totals::default() }
+    );
     assert_eq!((lane.begin, lane.end), (Begin::Started, End::Ended));
 }
 
@@ -113,7 +139,10 @@ fn a_ready_row_splits_a_wait_into_parked_then_queued_and_names_its_waker() {
         None,
     );
     let lane = job_lane(&m, 2);
-    assert_eq!(states(lane), [("running", 0, 10), ("parked", 10, 20), ("queued", 20, 30), ("running", 30, 40)]);
+    assert_eq!(
+        states(lane),
+        [("running", 0, 10), ("parked", 10, 20), ("queued", 20, 30), ("running", 30, 40)]
+    );
     let waker = m.waits[0].waker.lane().unwrap();
     assert_eq!(m.lanes[waker].id, LaneId::Job { process: P, job: 1 });
     assert_eq!(m.waits[0].waker, Waker::Ready { lane: waker });
@@ -157,11 +186,21 @@ fn a_units_uncovered_time_is_its_running_under_no_child_and_its_waits_are_not_wo
         None,
     );
     let unit = span_time(&m, 1);
-    assert_eq!(unit.totals, Totals { running_ns: 55, parked_or_queued_ns: 45, ..Totals::default() });
+    assert_eq!(
+        unit.totals,
+        Totals { running_ns: 55, parked_or_queued_ns: 45, ..Totals::default() }
+    );
     assert_eq!(unit.totals.total(), 100, "its states add up to its wall time");
-    assert_eq!(unit.uncovered_ns(), 55 - 10 - 5, "running less the query's 10 and the wait span's 5 before its park");
+    assert_eq!(
+        unit.uncovered_ns(),
+        55 - 10 - 5,
+        "running less the query's 10 and the wait span's 5 before its park"
+    );
     assert_eq!(unit.own.waiting_ns(), 10, "the park no wait span names stays the unit's own");
-    assert_eq!(span_time(&m, 3).totals, Totals { running_ns: 5, parked_or_queued_ns: 35, ..Totals::default() });
+    assert_eq!(
+        span_time(&m, 3).totals,
+        Totals { running_ns: 5, parked_or_queued_ns: 35, ..Totals::default() }
+    );
     assert_eq!(m.wait_label(&m.waits[0]), "fact_value(Id(4))");
     assert_eq!(m.waits[0].span, Some(2));
     assert_eq!(m.waits[1].span, None);
@@ -171,7 +210,11 @@ fn a_units_uncovered_time_is_its_running_under_no_child_and_its_waits_are_not_wo
     assert_eq!((rows[0].uncovered_ns, rows[0].unnamed_wait_ns), (40, 10));
     let waits = report::rows(&m, By::Wait, None);
     let keys: Vec<&str> = waits.iter().map(|it| it.key.as_str()).collect();
-    assert_eq!(keys, ["key fact_value", "counter wait with no wait span"], "a wait with no span is named by its kind, not its raw value");
+    assert_eq!(
+        keys,
+        ["key fact_value", "counter wait with no wait span"],
+        "a wait with no span is named by its kind, not its raw value"
+    );
 }
 
 /// Build 53 has no `ended` row the model reads (they carried no build): the old model ran a
@@ -193,7 +236,11 @@ fn a_run_with_no_ended_row_is_unrecorded_to_its_threads_next_switch_and_never_an
     assert_eq!(lane.intervals[0].state, State::Unrecorded { why: Unrecorded::NoEnd });
     assert_eq!((lane.begin, lane.end), (Begin::BeforeRecord, End::Unrecorded));
     assert!(lane.spans.is_empty(), "a span naming no job is its thread's, never a guess by time");
-    assert_eq!(states(job_lane(&m, 2)), [("running", 40, 50), ("parked_or_queued", 50, 60)], "waiting at the build's end");
+    assert_eq!(
+        states(job_lane(&m, 2)),
+        [("running", 40, 50), ("parked_or_queued", 50, 60)],
+        "waiting at the build's end"
+    );
 }
 
 /// The pool opens a job's `job` span before the job joins the graph: the span names the job
@@ -223,7 +270,11 @@ fn a_job_span_is_laid_on_the_job_it_names_by_its_number_before_it_joined_the_gra
 /// A pool job that never joined the graph has one row, `ran`, at its end.
 #[test]
 fn a_ran_row_is_one_run_from_its_since_to_its_end() {
-    let m = model(vec![SwitchIn { since_ns: Some(3), ..switch(1, 10, Event::Ran, 5, 1) }], vec![], Some((0, 10)));
+    let m = model(
+        vec![SwitchIn { since_ns: Some(3), ..switch(1, 10, Event::Ran, 5, 1) }],
+        vec![],
+        Some((0, 10)),
+    );
     let lane = job_lane(&m, 5);
     assert_eq!(states(lane), [("running", 3, 10)]);
     assert_eq!((lane.begin, lane.end), (Begin::Started, End::Ended));
@@ -242,7 +293,11 @@ fn a_run_cut_by_another_jobs_switch_on_its_thread_is_unrecorded_cut() {
         Some((0, 30)),
     );
     let lane = job_lane(&m, 1);
-    assert_eq!(states(lane), [("unrecorded", 0, 30)], "when the run stopped between 0 and 10 is lost");
+    assert_eq!(
+        states(lane),
+        [("unrecorded", 0, 30)],
+        "when the run stopped between 0 and 10 is lost"
+    );
     assert_eq!(lane.intervals[0].state, State::Unrecorded { why: Unrecorded::Cut });
     assert_eq!(m.anomalies.runs_cut, 1);
 }
@@ -297,9 +352,17 @@ fn the_critical_path_crosses_from_a_key_wait_to_the_job_running_the_key() {
         Some((0, 100)),
     );
     let owner = m.lane(LaneId::Job { process: P, job: 1 << 32 | 1 }).unwrap();
-    assert_eq!(m.waits[0].waker, Waker::Owner { lane: owner }, "the owner column names the runner's job");
+    assert_eq!(
+        m.waits[0].waker,
+        Waker::Owner { lane: owner },
+        "the owner column names the runner's job"
+    );
     let path = path::critical(&m);
-    let links: Vec<_> = path.links.iter().map(|it| (it.kind, m.lanes[it.lane].id.job(), it.from_ns, it.to_ns)).collect();
+    let links: Vec<_> = path
+        .links
+        .iter()
+        .map(|it| (it.kind, m.lanes[it.lane].id.job(), it.from_ns, it.to_ns))
+        .collect();
     assert_eq!(
         links,
         [(LinkKind::Ran, Some(1 << 32 | 1), 0, 60), (LinkKind::Ran, Some(1 << 32 | 2), 60, 100)],
@@ -325,11 +388,29 @@ fn the_critical_path_crosses_from_a_jobs_start_to_its_spawner() {
         Some((0, 50)),
     );
     let path = path::critical(&m);
-    let links: Vec<_> = path.links.iter().map(|it| (it.kind, m.lanes[it.lane].id.job(), it.from_ns, it.to_ns)).collect();
-    assert_eq!(links, [(LinkKind::Ran, Some(1), 0, 10), (LinkKind::Spawned, Some(2), 10, 30), (LinkKind::Ran, Some(2), 30, 50)]);
+    let links: Vec<_> = path
+        .links
+        .iter()
+        .map(|it| (it.kind, m.lanes[it.lane].id.job(), it.from_ns, it.to_ns))
+        .collect();
+    assert_eq!(
+        links,
+        [
+            (LinkKind::Ran, Some(1), 0, 10),
+            (LinkKind::Spawned, Some(2), 10, 30),
+            (LinkKind::Ran, Some(2), 30, 50)
+        ]
+    );
     assert_eq!(path.reached, Reached::BuildStart);
-    let alone = model(vec![switch(2, 30, Event::Started, 2, 2), switch(2, 50, Event::Ended, 2, 2)], vec![], Some((0, 50)));
-    assert!(matches!(path::critical(&alone).reached, Reached::LaneStart { .. }), "no row names its spawner");
+    let alone = model(
+        vec![switch(2, 30, Event::Started, 2, 2), switch(2, 50, Event::Ended, 2, 2)],
+        vec![],
+        Some((0, 50)),
+    );
+    assert!(
+        matches!(path::critical(&alone).reached, Reached::LaneStart { .. }),
+        "no row names its spawner"
+    );
 }
 
 /// Job 2 is given to the pool at 15 by a thread that runs no job (a build's driver, the
@@ -350,18 +431,32 @@ fn the_critical_path_crosses_from_a_job_to_the_span_that_gave_it_on_a_thread_wit
     let m = rows(Some(1));
     let path = path::critical(&m);
     let driver = m.lane(LaneId::Thread { process: P, thread: 5 }).unwrap();
-    let links: Vec<_> = path.links.iter().map(|it| (it.kind, it.lane, it.from_ns, it.to_ns)).collect();
+    let links: Vec<_> =
+        path.links.iter().map(|it| (it.kind, it.lane, it.from_ns, it.to_ns)).collect();
     let job = m.lane(LaneId::Job { process: P, job: 2 }).unwrap();
-    assert_eq!(links, [(LinkKind::Ran, driver, 0, 20), (LinkKind::Spawned, job, 20, 30), (LinkKind::Ran, job, 30, 50)]);
+    assert_eq!(
+        links,
+        [
+            (LinkKind::Ran, driver, 0, 20),
+            (LinkKind::Spawned, job, 20, 30),
+            (LinkKind::Ran, job, 30, 50)
+        ]
+    );
     assert_eq!(path.reached, Reached::BuildStart);
     assert_eq!(path.len_ns(), 50, "the path is the wall");
     assert_eq!(m.anomalies.creators_unread, 0);
 
     let unnamed = rows(None);
-    assert!(matches!(path::critical(&unnamed).reached, Reached::LaneStart { .. }), "no row names who gave it");
+    assert!(
+        matches!(path::critical(&unnamed).reached, Reached::LaneStart { .. }),
+        "no row names who gave it"
+    );
     let unread = rows(Some(99));
     assert!(matches!(path::critical(&unread).reached, Reached::LaneStart { .. }));
-    assert_eq!(unread.anomalies.creators_unread, 1, "a creator with no row is counted, not guessed");
+    assert_eq!(
+        unread.anomalies.creators_unread, 1,
+        "a creator with no row is counted, not guessed"
+    );
 }
 
 #[test]
@@ -391,7 +486,13 @@ fn a_thread_no_switch_names_is_a_lane_running_between_its_wait_spans() {
     let lane = &m.lanes[m.lane(LaneId::Thread { process: P, thread: 5 }).unwrap()];
     assert_eq!(
         states(lane),
-        [("running", 0, 10), ("parked_or_queued", 10, 40), ("running", 40, 50), ("unrecorded", 50, 80), ("running", 80, 100)]
+        [
+            ("running", 0, 10),
+            ("parked_or_queued", 10, 40),
+            ("running", 40, 50),
+            ("unrecorded", 50, 80),
+            ("running", 80, 100)
+        ]
     );
     assert_eq!(span_time(&m, 1).uncovered_ns(), 20);
 }
@@ -401,7 +502,11 @@ fn a_spans_folded_children_are_covered_not_its_own() {
     let outer = SpanIn { folded_ns: 6, ..span(5, 1, None, "client", 0, 50) };
     let wait = span(5, 2, Some(1), WAIT_SPAN, 10, 30);
     let m = model(vec![], vec![outer, wait], None);
-    assert_eq!(span_time(&m, 1).uncovered_ns(), 20 - 6, "running 20 under no row, 6 of it under folded children");
+    assert_eq!(
+        span_time(&m, 1).uncovered_ns(),
+        20 - 6,
+        "running 20 under no row, 6 of it under folded children"
+    );
 }
 
 #[test]
@@ -416,7 +521,8 @@ fn the_cores_busy_time_is_each_runs_overlap_with_each_bucket() {
         vec![],
         Some((0, 20)),
     );
-    let busy: Vec<_> = report::core_busy(&m, 10).iter().map(|it| (it.core, it.t0_ns, it.running_ns)).collect();
+    let busy: Vec<_> =
+        report::core_busy(&m, 10).iter().map(|it| (it.core, it.t0_ns, it.running_ns)).collect();
     assert_eq!(busy, [(1, 0, 10), (1, 10, 5), (2, 0, 5), (2, 10, 10)]);
     let util = report::utilization(&m);
     assert_eq!((util.cores, util.running_ns, util.wall_ns), (2, 30, 20));
@@ -496,7 +602,8 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
         let job = tc.draw(gs::integers::<usize>().max_value(jobs - 1));
         let idle = busy.iter().position(Option::is_none);
         let core_of = |thread: u32| thread + 100;
-        let ready_now = matches!(state[job], Job::Parked { ready: false, .. }) && tc.draw(gs::booleans());
+        let ready_now =
+            matches!(state[job], Job::Parked { ready: false, .. }) && tc.draw(gs::booleans());
         match state[job].clone() {
             Job::Parked { wait_span, ready: false } if ready_now => {
                 let by = (0..jobs).find(|it| matches!(state[*it], Job::Running { .. }));
@@ -505,7 +612,18 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
                     _ => None,
                 });
                 let Some(thread) = thread else { continue };
-                switches.push(SwitchIn { by: by.map(id), ..SwitchIn::of(P, thread + 1, t, Event::Ready, id(job), job as u32, core_of(thread)) });
+                switches.push(SwitchIn {
+                    by: by.map(id),
+                    ..SwitchIn::of(
+                        P,
+                        thread + 1,
+                        t,
+                        Event::Ready,
+                        id(job),
+                        job as u32,
+                        core_of(thread),
+                    )
+                });
                 state[job] = Job::Parked { wait_span, ready: true };
             }
             Job::New | Job::Parked { .. } if idle.is_some() => {
@@ -522,12 +640,22 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
                     spans[at].1 = true;
                     open[job].retain(|it| *it != at);
                 }
-                switches.push(SwitchIn::of(P, thread + 1, t, event, id(job), job as u32, core_of(thread)));
+                switches.push(SwitchIn::of(
+                    P,
+                    thread + 1,
+                    t,
+                    event,
+                    id(job),
+                    job as u32,
+                    core_of(thread),
+                ));
                 busy[thread as usize] = Some(job);
                 state[job] = Job::Running { thread };
             }
             Job::Running { thread } => {
-                let row = |event| SwitchIn::of(P, thread + 1, t, event, id(job), job as u32, core_of(thread));
+                let row = |event| {
+                    SwitchIn::of(P, thread + 1, t, event, id(job), job as u32, core_of(thread))
+                };
                 match tc.draw(gs::integers::<u8>().max_value(4)) {
                     0 => {
                         let parent = open[job].last().map(|it| spans[*it].0.span_id);
@@ -553,11 +681,13 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
                         };
                         let wait_span = (on == WaitedOn::Key).then(|| {
                             let parent = open[job].last().map(|it| spans[*it].0.span_id);
-                            let mut it = span(thread + 1, spans.len() as u64 + 1, parent, WAIT_SPAN, t, 0);
+                            let mut it =
+                                span(thread + 1, spans.len() as u64 + 1, parent, WAIT_SPAN, t, 0);
                             it.depth = open[job].len() as u16;
                             it.job = Some(id(job));
                             // The owner column is the runner's job, as `switches.job` names it.
-                            it.owner = Some(id(tc.draw(gs::integers::<usize>().max_value(jobs - 1))));
+                            it.owner =
+                                Some(id(tc.draw(gs::integers::<usize>().max_value(jobs - 1))));
                             open[job].push(spans.len());
                             spans.push((it, false));
                             spans.len() - 1
@@ -598,9 +728,17 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
 fn generated(tc: &TestCase) -> Model {
     let (switches, spans, end) = schedule(tc);
     let empty = switches.is_empty() && spans.is_empty();
-    match Model::build(Input { build: 1, build_row: Some((0, end)), switches, spans, events: Vec::new() }) {
+    match Model::build(Input {
+        build: 1,
+        build_row: Some((0, end)),
+        switches,
+        spans,
+        events: Vec::new(),
+    }) {
         Ok(it) => it,
-        Err(TimeError::Empty { .. }) if empty => model(vec![switch(1, 0, Event::Started, 1, 1)], vec![], Some((0, 1))),
+        Err(TimeError::Empty { .. }) if empty => {
+            model(vec![switch(1, 0, Event::Started, 1, 1)], vec![], Some((0, 1)))
+        }
         Err(error) => panic!("{error}"),
     }
 }
@@ -624,7 +762,13 @@ fn every_spans_states_add_up_to_its_wall_time_and_its_own_time_is_never_negative
     for (span, time) in m.spans.iter().zip(&m.span_time) {
         assert_eq!(time.totals.total(), span.dur_ns, "span {}", span.span_id);
         let own = time.own;
-        for (what, ns) in [("running", own.running_ns), ("parked", own.parked_ns), ("queued", own.queued_ns), ("parked or queued", own.parked_or_queued_ns), ("unrecorded", own.unrecorded_ns)] {
+        for (what, ns) in [
+            ("running", own.running_ns),
+            ("parked", own.parked_ns),
+            ("queued", own.queued_ns),
+            ("parked or queued", own.parked_or_queued_ns),
+            ("unrecorded", own.unrecorded_ns),
+        ] {
             assert!(ns >= 0, "span {}: own {what} {ns}", span.span_id);
         }
     }
@@ -689,8 +833,14 @@ fn the_model_does_not_depend_on_the_order_rows_came_in(tc: TestCase) {
         return;
     }
     let seed = tc.draw(gs::integers::<u64>());
-    let a = Model::build(Input { build: 1, build_row: Some((0, end)), switches: switches.clone(), spans: spans.clone(), events: Vec::new() })
-        .unwrap();
+    let a = Model::build(Input {
+        build: 1,
+        build_row: Some((0, end)),
+        switches: switches.clone(),
+        spans: spans.clone(),
+        events: Vec::new(),
+    })
+    .unwrap();
     let b = Model::build(Input {
         build: 1,
         build_row: Some((0, end)),
@@ -702,7 +852,8 @@ fn the_model_does_not_depend_on_the_order_rows_came_in(tc: TestCase) {
     let lanes = |m: &Model| m.lanes.iter().map(|it| (it.id, states(it))).collect::<Vec<_>>();
     assert_eq!(lanes(&a), lanes(&b));
     let by_id = |m: &Model| {
-        let mut it: Vec<_> = m.spans.iter().zip(&m.span_time).map(|(s, t)| (s.span_id, t.totals, t.own)).collect();
+        let mut it: Vec<_> =
+            m.spans.iter().zip(&m.span_time).map(|(s, t)| (s.span_id, t.totals, t.own)).collect();
         it.sort_by_key(|it| it.0);
         it
     };
@@ -715,12 +866,15 @@ fn event(thread: u32, t_ns: i64, job: Option<u64>, span: Option<u64>, message: &
         process: P,
         thread,
         t_ns,
+        build: None,
         job,
         level: "WARN".to_owned(),
         target: "blaze_cargo::serve::daemon".to_owned(),
         name: "event daemon.rs:1".to_owned(),
         message: Some(message.to_owned()),
         span,
+        event_id: t_ns as u64,
+        fields: Vec::new(),
     }
 }
 
@@ -742,7 +896,9 @@ fn an_event_is_on_its_jobs_lane_else_its_spans_else_its_threads_and_the_trace_an
     let m = Model::build(input).unwrap();
     let job = m.lane(LaneId::Job { process: P, job: 1 });
     let thread = m.lane(LaneId::Thread { process: P, thread: 2 });
-    let lane_of = |message: &str| m.event_lane[m.events.iter().position(|it| it.message.as_deref() == Some(message)).unwrap()];
+    let lane_of = |message: &str| {
+        m.event_lane[m.events.iter().position(|it| it.message.as_deref() == Some(message)).unwrap()]
+    };
     assert!(job.is_some() && thread.is_some());
     assert_eq!(lane_of("of the job"), job);
     assert_eq!(lane_of("in the span"), thread);
@@ -752,9 +908,18 @@ fn an_event_is_on_its_jobs_lane_else_its_spans_else_its_threads_and_the_trace_an
     assert_eq!(times, [5, 10, 30, 45], "events are in time order");
 
     let trace = super::trace::events(&m, |ns| ns as f64 / 1e3);
-    let of_job = trace.iter().find(|it| it["name"] == "WARN of the job").expect("the job's event is an instant");
-    assert_eq!((of_job["ph"].as_str(), of_job["tid"].as_u64()), (Some("i"), Some(super::trace::FIBER_TRACK | 1)));
-    let lost = trace.iter().find(|it| it["name"] == "WARN on no lane").expect("a lane-less event is an instant");
+    let of_job = trace
+        .iter()
+        .find(|it| it["name"] == "WARN of the job")
+        .expect("the job's event is an instant");
+    assert_eq!(
+        (of_job["ph"].as_str(), of_job["tid"].as_u64()),
+        (Some("i"), Some(super::trace::FIBER_TRACK | 1))
+    );
+    let lost = trace
+        .iter()
+        .find(|it| it["name"] == "WARN on no lane")
+        .expect("a lane-less event is an instant");
     assert_eq!(lost["tid"].as_u64(), Some(3), "on its thread's own track");
 
     let page = super::html::page(&m, &path::critical(&m), 10);

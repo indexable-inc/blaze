@@ -11,7 +11,8 @@ pub(crate) struct Code {
 impl Code {
     /// `bytes`, executable.
     pub(crate) fn new(bytes: &[u8]) -> Code {
-        let code = Executable::new(bytes, 0).unwrap_or_else(|it| panic!("executable memory for the stubs: {}", it.what));
+        let code = Executable::new(bytes, 0)
+            .unwrap_or_else(|it| panic!("executable memory for the stubs: {}", it.what));
         Code { code, len: bytes.len() }
     }
 

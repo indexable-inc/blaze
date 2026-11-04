@@ -65,12 +65,7 @@ impl SyntaxText {
         let len = end - start;
         let start = self.range.start() + start;
         let end = start + len;
-        assert!(
-            start <= end,
-            "invalid slice, range: {:?}, slice: {:?}",
-            self.range,
-            asked,
-        );
+        assert!(start <= end, "invalid slice, range: {:?}, slice: {:?}", self.range, asked,);
         let range = TextRange::new(start, end);
         assert!(
             self.range.contains_range(range),

@@ -429,7 +429,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let len = bytes.len() as i64;
         let text = self.blob_addr(ConstBlob {
             bytes,
-            relocs: Vec::new(), // alloc: empty, allocates nothing
+            relocs: Vec::new(),    // alloc: empty, allocates nothing
             fn_relocs: Vec::new(), // alloc: empty, allocates nothing
             align: 1,
             type_ids: Vec::new(), // alloc: empty, allocates nothing

@@ -59,7 +59,8 @@ fn region() -> &'static (Code, Layout) {
     REGION.get_or_init(|| {
         let _ = targets();
         let isa = Isa::host().expect("a host with lazy stubs");
-        let stubs = stub::generate(&isa, COUNT as u32, hook as *const () as u64).expect("the region");
+        let stubs =
+            stub::generate(&isa, COUNT as u32, hook as *const () as u64).expect("the region");
         (Code::new(&stubs.bytes), stubs.layout)
     })
 }
@@ -145,12 +146,37 @@ fn clobber() {
 }
 
 /// Each argument weighed by its position, so a swapped or lost one changes the result.
-extern "C" fn ints(a: u64, b: i32, c: u16, d: i8, e: u64, f: u64, g: u64, h: u64, i: u64, j: u64) -> u64 {
+extern "C" fn ints(
+    a: u64,
+    b: i32,
+    c: u16,
+    d: i8,
+    e: u64,
+    f: u64,
+    g: u64,
+    h: u64,
+    i: u64,
+    j: u64,
+) -> u64 {
     let all = [a, b as u64, u64::from(c), d as u64, e, f, g, h, i, j];
-    all.iter().enumerate().fold(0u64, |sum, (n, it)| sum.wrapping_mul(1_000_003).wrapping_add(it ^ n as u64))
+    all.iter()
+        .enumerate()
+        .fold(0u64, |sum, (n, it)| sum.wrapping_mul(1_000_003).wrapping_add(it ^ n as u64))
 }
 
-extern "C" fn floats(a: f64, b: f32, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, i: f64, j: f32, k: f64) -> f64 {
+extern "C" fn floats(
+    a: f64,
+    b: f32,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+    g: f64,
+    h: f64,
+    i: f64,
+    j: f32,
+    k: f64,
+) -> f64 {
     let all = [a, f64::from(b), c, d, e, f, g, h, i, f64::from(j), k];
     all.iter().enumerate().fold(0.0, |sum, (n, it)| sum * 3.0 + it * (n + 1) as f64)
 }
@@ -177,7 +203,10 @@ extern "C" fn mixed(
 ) -> f64 {
     let ints = [u64::from(a), b, c as u64, u64::from(d), e, f, g, h, l];
     let floats = [x, f64::from(y), z, w, v, u, t, s, k];
-    let ints = ints.iter().enumerate().fold(0u64, |sum, (n, it)| sum.wrapping_mul(31).wrapping_add(it ^ n as u64));
+    let ints = ints
+        .iter()
+        .enumerate()
+        .fold(0u64, |sum, (n, it)| sum.wrapping_mul(31).wrapping_add(it ^ n as u64));
     floats.iter().enumerate().fold(ints as f64, |sum, (n, it)| sum * 0.5 + it * (n + 2) as f64)
 }
 
@@ -239,7 +268,8 @@ fn integers_past_the_registers_go_through_whole() {
     let lazy: F = through(INTS);
     let before = calls(INTS);
     let args = (u64::MAX - 3, -77, 0xbeef, -5, 1 << 40, 6, 7, 8, 0x9999_0000_1111, 10);
-    let direct = ints(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9);
+    let direct =
+        ints(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9);
     let via = lazy(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9);
     assert_eq!(via, direct);
     assert!(calls(INTS) > before, "the call went through the hook");
@@ -277,10 +307,10 @@ fn mixed_integers_and_floats_go_through_whole() {
         u64,
     ) -> f64;
     let lazy: F = through(MIXED);
-    let direct = mixed(
-        200, 1.0, 2, 3.5, -4, 5.25, 6, 7.75, 8, 9.0, 10, 11.5, 12, 13.0, 14, 15.5, 16.25, 17,
-    );
-    let via = lazy(200, 1.0, 2, 3.5, -4, 5.25, 6, 7.75, 8, 9.0, 10, 11.5, 12, 13.0, 14, 15.5, 16.25, 17);
+    let direct =
+        mixed(200, 1.0, 2, 3.5, -4, 5.25, 6, 7.75, 8, 9.0, 10, 11.5, 12, 13.0, 14, 15.5, 16.25, 17);
+    let via =
+        lazy(200, 1.0, 2, 3.5, -4, 5.25, 6, 7.75, 8, 9.0, 10, 11.5, 12, 13.0, 14, 15.5, 16.25, 17);
     assert_eq!(via.to_bits(), direct.to_bits());
 }
 
@@ -318,7 +348,12 @@ fn whole_vector_registers_go_through() {
 
 #[test]
 fn a_variadic_call_keeps_its_vector_count() {
-    type F = unsafe extern "C" fn(*mut libc::c_char, libc::size_t, *const libc::c_char, ...) -> libc::c_int;
+    type F = unsafe extern "C" fn(
+        *mut libc::c_char,
+        libc::size_t,
+        *const libc::c_char,
+        ...
+    ) -> libc::c_int;
     let lazy: F = through(SNPRINTF);
     let format = c"%d %.3f %s %.1f %lld %.2f %.2f %.2f %.2f %.2f %.2f %.2f";
     let word = c"word";

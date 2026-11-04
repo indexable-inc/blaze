@@ -4,7 +4,10 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, items::ui_core, normalized, ui, warning},
+    tests::{
+        Mode, assert_reports, checked, checked_with, compiletest, error, items::ui_core,
+        normalized, ui, warning,
+    },
 };
 
 /// The UI test `items/<name>` against its `.stderr`, as compiletest runs it.
@@ -30,7 +33,9 @@ pub macro define_opaque($($tt:tt)*) {
 /// What rustc writes compiling a test that defines an opaque type with `#[define_opaque]`, from
 /// std's prelude.
 fn ui_opaque(name: &str, source: &str) -> String {
-    let fixture = format!("{DEFINE_OPAQUE_CORE}//- /{name} crate:other:main edition:2015 deps:core\n{source}");
+    let fixture = format!(
+        "{DEFINE_OPAQUE_CORE}//- /{name} crate:other:main edition:2015 deps:core\n{source}"
+    );
     ui_fixture(&fixture)
 }
 
@@ -38,7 +43,8 @@ fn ui_opaque(name: &str, source: &str) -> String {
 /// UI test that is not `run-pass`.
 fn ui_fixture(fixture: &str) -> String {
     let options = compiletest(Mode::Other, &Options::default());
-    let stderr = checked_with(fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = checked_with(fixture, "$DIR/", &options)
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
 }
 
@@ -212,12 +218,18 @@ fn generic_no_mangle() {
 
 #[test]
 fn improper_ctypes_73251_1() {
-    assert_reports(&ui_opaque("lint-73251-1.rs", include_str!("items/lint-73251-1.rs")), &[error(24, &["`Qux`", "opaque"])]);
+    assert_reports(
+        &ui_opaque("lint-73251-1.rs", include_str!("items/lint-73251-1.rs")),
+        &[error(24, &["`Qux`", "opaque"])],
+    );
 }
 
 #[test]
 fn improper_ctypes_73249_2() {
-    assert_reports(&ui_opaque("lint-73249-2.rs", include_str!("items/lint-73249-2.rs")), &[error(27, &["`Qux`", "opaque"])]);
+    assert_reports(
+        &ui_opaque("lint-73249-2.rs", include_str!("items/lint-73249-2.rs")),
+        &[error(27, &["`Qux`", "opaque"])],
+    );
 }
 
 /// A struct of another crate without `repr(C)` is not FFI-safe in an `extern` block or an
@@ -253,7 +265,12 @@ fn main() {}
     let stderr = checked.stderr();
     assert!(!stderr.contains("the type is defined here"), "{stderr}");
     for diag in checked.diags.iter().filter(|it| !crate::tests::closing(it)) {
-        assert!(diag.facts.iter().any(|it| it.what.contains("representation of") && it.what.contains("Bad")), "{diag:?}");
+        assert!(
+            diag.facts
+                .iter()
+                .any(|it| it.what.contains("representation of") && it.what.contains("Bad")),
+            "{diag:?}"
+        );
     }
 }
 
@@ -279,7 +296,11 @@ mod inner {
 fn main() {}
 "#;
     let messages = checked(fixture).messages();
-    assert_eq!(messages, ["clashing_extern_declarations: `clash` redeclared with a different signature"], "{messages:?}");
+    assert_eq!(
+        messages,
+        ["clashing_extern_declarations: `clash` redeclared with a different signature"],
+        "{messages:?}"
+    );
 }
 
 /// `tests/ui/lint/runtime-symbols.rs`, its `core` the symbols `core` declares canonical, with the
@@ -291,7 +312,8 @@ fn runtime_symbols() {
     let fixture = format!(
         "{FFI_STD}//- /runtime-symbols.rs crate:other:main edition:2021 deps:core,std cfg:target_arch=aarch64\n{source}"
     );
-    let stderr = ui_fixture(&fixture).replace("*const i8", "*const U8").replace("*const u8", "*const U8");
+    let stderr =
+        ui_fixture(&fixture).replace("*const i8", "*const U8").replace("*const u8", "*const U8");
     assert_reports(
         &stderr,
         &[
@@ -331,12 +353,15 @@ mod inner {
 pub extern "C" fn memset(s: *mut c_void, c: i64, n: usize) -> *mut c_void { s }
 fn main() {}
 "#;
-    let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
+    let fixture =
+        format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let checked = checked(&fixture);
     let messages = checked.messages();
     assert_eq!(
         messages,
-        ["suspicious_runtime_symbol_definitions: suspicious definition of the runtime `memset` symbol used by the standard library"],
+        [
+            "suspicious_runtime_symbol_definitions: suspicious definition of the runtime `memset` symbol used by the standard library"
+        ],
         "{messages:?}"
     );
     let facts: Vec<&str> = checked.diags[0].facts.iter().map(|it| it.what.as_str()).collect();
@@ -349,7 +374,9 @@ fn main() {}
 #[test]
 fn c_void_returns() {
     let source = include_str!("items/c-void-returns.rs");
-    let fixture = format!("{FFI_STD}//- /c-void-returns.rs crate:other:main edition:2015 deps:core,std\n{source}");
+    let fixture = format!(
+        "{FFI_STD}//- /c-void-returns.rs crate:other:main edition:2015 deps:core,std\n{source}"
+    );
     assert_eq!(ui_fixture(&fixture), include_str!("items/c-void-returns.stderr"));
 }
 
@@ -372,7 +399,8 @@ fn f() {
 }
 fn main() {}
 "#;
-    let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
+    let fixture =
+        format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let messages = checked(&fixture).messages();
     let extern_ = "c_void_returns: declarations returning `c_void` are not compatible with C functions returning `void`";
     assert_eq!(messages, [extern_, extern_], "{messages:?}");
@@ -420,10 +448,13 @@ trait Provided {
 }
 fn main() {}
 "#;
-    let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
+    let fixture =
+        format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let messages = checked(&fixture).messages();
-    let named = "mismatched_lifetime_syntaxes: hiding a lifetime that's named elsewhere is confusing";
-    let eliding = "mismatched_lifetime_syntaxes: eliding a lifetime that's named elsewhere is confusing";
+    let named =
+        "mismatched_lifetime_syntaxes: hiding a lifetime that's named elsewhere is confusing";
+    let eliding =
+        "mismatched_lifetime_syntaxes: eliding a lifetime that's named elsewhere is confusing";
     assert_eq!(messages, [eliding, named], "{messages:?}");
     let options = compiletest(Mode::Other, &Options::default());
     let kept = checked_with(&fixture, "$DIR/", &options).messages();
@@ -477,23 +508,32 @@ trait Tr {
 fn not_async() {}
 fn main() {}
 "#;
-    let fixture = format!("//- minicore: future\n//- /main.rs crate:other:main edition:2021\n{source}");
+    let fixture =
+        format!("//- minicore: future\n//- /main.rs crate:other:main edition:2021\n{source}");
     let messages = checked(&fixture).messages();
     assert_eq!(messages, ["`#[track_caller]` on async functions is a no-op"], "{messages:?}");
-    let gated = format!("//- minicore: future\n//- /main.rs crate:other:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}");
+    let gated = format!(
+        "//- minicore: future\n//- /main.rs crate:other:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}"
+    );
     let messages = checked(&gated).messages();
     assert!(!messages.iter().any(|it| it.contains("no-op")), "{messages:?}");
 }
 
 #[test]
 fn non_local_definitions_consts() {
-    assert_eq!(ui("consts.rs", "2021", include_str!("items/consts.rs")), include_str!("items/consts.stderr"));
+    assert_eq!(
+        ui("consts.rs", "2021", include_str!("items/consts.rs")),
+        include_str!("items/consts.stderr")
+    );
 }
 
 #[test]
 fn non_local_definitions_inside_macro_rules() {
     let source = include_str!("items/inside-macro_rules.rs");
-    assert_eq!(ui("inside-macro_rules.rs", "2021", source), include_str!("items/inside-macro_rules.stderr"));
+    assert_eq!(
+        ui("inside-macro_rules.rs", "2021", source),
+        include_str!("items/inside-macro_rules.stderr")
+    );
 }
 
 /// The `check-pass` tests without a `.stderr`: modules and anonymous constants are transparent.
@@ -502,7 +542,10 @@ fn non_local_definitions_transparent_modules_and_const_anons() {
     let tests = [
         ("module_as_local.rs", include_str!("items/module_as_local.rs")),
         ("convoluted-locals-131474.rs", include_str!("items/convoluted-locals-131474.rs")),
-        ("convoluted-locals-131474-with-mods.rs", include_str!("items/convoluted-locals-131474-with-mods.rs")),
+        (
+            "convoluted-locals-131474-with-mods.rs",
+            include_str!("items/convoluted-locals-131474-with-mods.rs"),
+        ),
         ("convoluted-locals-132427.rs", include_str!("items/convoluted-locals-132427.rs")),
     ];
     for (name, source) in tests {
@@ -537,7 +580,13 @@ fn main() {
     let messages = checked.messages();
     let message = "non_local_definitions: non-local `macro_rules!` definition, `#[macro_export]` macro should be written at top level module";
     assert_eq!(messages, [message, message], "{messages:?}");
-    let helps: Vec<&str> = checked.diags.iter().flat_map(|it| &it.children).map(|it| it.message.as_str()).filter(|it| it.starts_with("remove")).collect();
+    let helps: Vec<&str> = checked
+        .diags
+        .iter()
+        .flat_map(|it| &it.children)
+        .map(|it| it.message.as_str())
+        .filter(|it| it.starts_with("remove"))
+        .collect();
     assert_eq!(
         helps,
         [
@@ -576,7 +625,8 @@ pub(crate) fn f() {}
 //- /outer.rs
 "#;
     let checked = checked(fixture);
-    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("missing_docs")).collect();
+    let messages: Vec<String> =
+        checked.messages().into_iter().filter(|it| it.starts_with("missing_docs")).collect();
     assert_eq!(messages, ["missing_docs: missing documentation for a module"], "{messages:?}");
     let stderr = checked.stderr();
     assert!(stderr.contains("pub mod undocumented;"), "{stderr}");

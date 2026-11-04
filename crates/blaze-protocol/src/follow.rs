@@ -182,7 +182,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blaze-events-warm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("events.1");
-        let record = crate::events::Record { at_ns: 5, event: Event::Ended { step: Step::Codegen, of: None } };
+        let record = crate::events::Record {
+            at_ns: 5,
+            event: Event::Ended { step: Step::Codegen, of: None },
+        };
         let mut ended = Vec::new();
         crate::write_frame(&mut ended, &crate::cbor::to_vec(&record).unwrap()).unwrap();
         std::fs::write(&path, &ended).unwrap();
@@ -197,9 +200,11 @@ mod tests {
             file.write_all(&ended).unwrap();
             let len = len(&path);
             records.clear();
-            blaze_alloc_count::assert_at_most(0, "a warm read of the records written since", || {
-                follow.read_into(&path, len, &mut records)
-            });
+            blaze_alloc_count::assert_at_most(
+                0,
+                "a warm read of the records written since",
+                || follow.read_into(&path, len, &mut records),
+            );
             assert!(matches!(records[..], [Ok(ref it)] if *it == record));
         }
         drop(file);

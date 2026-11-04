@@ -852,8 +852,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let mut shadow = M::Shadow::default();
                 if M::CHECKS {
                     for i in 0..len {
-                        let addr = Address::from_bytes(&bytes[i * size..(i + 1) * size], self.cached_ptr_size)?;
-                        let prov = self.machine.from_exposed(addr.to_usize(self.cached_ptr_size) as u64);
+                        let addr = Address::from_bytes(
+                            &bytes[i * size..(i + 1) * size],
+                            self.cached_ptr_size,
+                        )?;
+                        let prov =
+                            self.machine.from_exposed(addr.to_usize(self.cached_ptr_size) as u64);
                         shadow.put(i * size, &M::Shadow::pointer(size, prov));
                     }
                 }
@@ -948,7 +952,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 .into(),
                             ));
                         }
-                        let (bytes, shadow) = self.read_shadowed(value.interval.addr, lanes.size)?;
+                        let (bytes, shadow) =
+                            self.read_shadowed(value.interval.addr, lanes.size)?;
                         lanes.bytes[range.clone()].copy_from_slice(bytes); // clone: a `Range<usize>`
                         if M::CHECKS {
                             lanes.shadow.put(range.start, &shadow);
@@ -1120,7 +1125,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 if M::CHECKS {
                     self.machine.require_init(&provs, 0..width)?;
                 }
-                let values = bytes.chunks(lane.size()).map(|it| lane.read(it)).collect::<LaneValues>();
+                let values =
+                    bytes.chunks(lane.size()).map(|it| lane.read(it)).collect::<LaneValues>();
                 let (_, counts) = self.read_lanes(offsets)?;
                 check_lanes(op, values.len(), counts.len())?;
                 let (_, ptr_ty) = self.detect_simd_ty(ptrs.ty)?;

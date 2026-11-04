@@ -26,10 +26,16 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingSelfDefaultParams) -> Vec<F
         _ => ("type parameters", names.join(", ")),
     };
     // clone: a handle, on the error path
-    let mut diag =
-        Diag::error(Some("E0393"), format!("the {noun} {list} must be explicitly specified"), span.clone());
+    let mut diag = Diag::error(
+        Some("E0393"),
+        format!("the {noun} {list} must be explicitly specified"),
+        span.clone(),
+    );
     // alloc: the error's text, for an error hir found
-    diag.span_label(span, format!("missing reference{} to {list}", if names.len() == 1 { "" } else { "s" }));
+    diag.span_label(
+        span,
+        format!("missing reference{} to {list}", if names.len() == 1 { "" } else { "s" }),
+    );
     diag.note("because the parameter default references `Self`, the parameter must be specified on the object type");
     // alloc: one error, for an error hir found
     vec![Found::new(diag, Phase::Items)]

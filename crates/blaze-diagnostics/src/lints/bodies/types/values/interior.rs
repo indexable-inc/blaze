@@ -27,7 +27,7 @@ use syntax::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
@@ -61,7 +61,10 @@ impl LatePass for InteriorMutableConsts {
         };
         let Some(method) = method else { return };
         // A deref can do anything, such as reach a thread local (rust-lang/rust#150157).
-        if b.infer.expr_adjustment(receiver).is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_)))) {
+        if b.infer
+            .expr_adjustment(receiver)
+            .is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_))))
+        {
             return;
         }
         let db = b.db();
@@ -94,7 +97,9 @@ impl LatePass for InteriorMutableConsts {
         );
         diag.note("each usage of a `const` item creates a new temporary");
         // alloc: the lint's text, for a lint found
-        diag.note(format!("only the temporaries and never the original `const {const_name}` will be modified"));
+        diag.note(format!(
+            "only the temporaries and never the original `const {const_name}` will be modified"
+        ));
         diag.help(
             "for more details on interior mutability see <https://doc.rust-lang.org/reference/interior-mutability.html>",
         );
@@ -113,10 +118,18 @@ impl LatePass for InteriorMutableConsts {
 fn should_not_be_called_on_const_items(db: &Db, method: FunctionId) -> bool {
     let cfg = method.krate(db).cfg_options(db);
     let attrs = method.lookup(db).source_view(db).value.attrs();
-    expand_cfg_attr_view(attrs, || cfg, |meta, _| match meta {
-        ast::Meta::PathMeta(it) if it.path().is1("rustc_should_not_be_called_on_const_items") => ControlFlow::Break(()),
-        _ => ControlFlow::Continue(()),
-    })
+    expand_cfg_attr_view(
+        attrs,
+        || cfg,
+        |meta, _| match meta {
+            ast::Meta::PathMeta(it)
+                if it.path().is1("rustc_should_not_be_called_on_const_items") =>
+            {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        },
+    )
     .is_some()
 }
 
@@ -126,11 +139,15 @@ fn should_not_be_called_on_const_items(db: &Db, method: FunctionId) -> bool {
 fn static_suggestion(b: &BodyCx<'_, '_, '_>, diag: &mut Diag, konst: ConstId, const_name: &str) {
     let db = b.db();
     let loc = konst.lookup(db);
-    if !matches!(loc.container, ItemContainerId::ModuleId(_)) || konst.krate(db) != b.cx.krate.base() {
+    if !matches!(loc.container, ItemContainerId::ModuleId(_))
+        || konst.krate(db) != b.cx.krate.base()
+    {
         return;
     }
     // alloc: the lint's text, for a lint found
-    let message = format!("for a shared instance of `{const_name}`, consider making it a `static` item instead");
+    let message = format!(
+        "for a shared instance of `{const_name}`, consider making it a `static` item instead"
+    );
     let source = loc.source_view(db);
     let range = (|| {
         if source.file_id.is_macro() {
@@ -148,7 +165,12 @@ fn static_suggestion(b: &BodyCx<'_, '_, '_>, diag: &mut Diag, konst: ConstId, co
         Some((range, before)) => {
             let span = b.cx.span(InFile::new(source.file_id, range));
             // alloc: the lint's text, for a lint found
-            diag.suggestion_verbose(span, message, format!("{before}static "), Applicability::MaybeIncorrect);
+            diag.suggestion_verbose(
+                span,
+                message,
+                format!("{before}static "),
+                Applicability::MaybeIncorrect,
+            );
         }
         None => {
             diag.help(message);

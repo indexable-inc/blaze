@@ -52,11 +52,7 @@ impl IntervalSet {
         };
         set.idx_of_zero = set.index_above('0' as u32);
         let z_above = set.index_above('Z' as u32);
-        set.idx_of_z = if size == 0 {
-            -1
-        } else {
-            z_above.min(size - 1) as isize
-        };
+        set.idx_of_z = if size == 0 { -1 } else { z_above.min(size - 1) as isize };
         Ok(set)
     }
 
@@ -100,9 +96,7 @@ impl IntervalSet {
     /// interval that can contain `elem` — or `None` when every interval
     /// starts above it.
     fn interval_for(&self, elem: u32) -> Option<usize> {
-        self.intervals
-            .partition_point(|&(s, _)| s <= elem)
-            .checked_sub(1)
+        self.intervals.partition_point(|&(s, _)| s <= elem).checked_sub(1)
     }
 
     pub fn contains(&self, elem: u32) -> bool {
@@ -116,11 +110,7 @@ impl IntervalSet {
     pub fn index(&self, value: u32) -> Option<usize> {
         let j = self.interval_for(value)?;
         let (u, v) = self.intervals[j];
-        if value <= v {
-            Some(self.offsets[j] + (value - u) as usize)
-        } else {
-            None
-        }
+        if value <= v { Some(self.offsets[j] + (value - u) as usize) } else { None }
     }
 
     /// Smallest position `i` with `self[i] >= value`, or `self.len()` if
@@ -150,12 +140,8 @@ impl IntervalSet {
         if other.intervals.is_empty() {
             return IntervalSet::new(self.intervals.clone());
         }
-        let mut merged: Vec<(u32, u32)> = self
-            .intervals
-            .iter()
-            .copied()
-            .chain(other.intervals.iter().copied())
-            .collect();
+        let mut merged: Vec<(u32, u32)> =
+            self.intervals.iter().copied().chain(other.intervals.iter().copied()).collect();
         merged.sort_unstable_by_key(|(u, _)| *u);
         let mut result: Vec<(u32, u32)> = Vec::with_capacity(merged.len());
         for (u, v) in merged {

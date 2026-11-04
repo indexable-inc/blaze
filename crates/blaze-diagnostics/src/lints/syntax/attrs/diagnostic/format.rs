@@ -151,9 +151,7 @@ impl<'a> Parser<'a> {
                     None
                 }
             }
-            _ => {
-                Some(Piece::Lit(self.string(idx)))
-            }
+            _ => Some(Piece::Lit(self.string(idx))),
         }
     }
 
@@ -182,12 +180,21 @@ impl<'a> Parser<'a> {
     fn missing_closing_brace(&mut self, arg: &Argument<'_>) {
         let (range, description) = match self.peek() {
             // alloc: as above
-            Some((r, _, c)) => (r.start..r.start, format!("expected `}}`, found `{}`", c.escape_debug())),
+            Some((r, _, c)) => {
+                (r.start..r.start, format!("expected `}}`, found `{}`", c.escape_debug()))
+            }
             // alloc: as above
-            None => (self.end_of_snippet..self.end_of_snippet, "expected `}` but string was terminated".to_owned()),
+            None => (
+                self.end_of_snippet..self.end_of_snippet,
+                "expected `}` but string was terminated".to_owned(),
+            ),
         };
         // alloc: as above
-        self.errors.push(ParseError { description, label: "expected `}`".to_owned(), span: range.start..range.start });
+        self.errors.push(ParseError {
+            description,
+            label: "expected `}`".to_owned(),
+            span: range.start..range.start,
+        });
         if let (Some((_, _, c)), Some((_, _, nc))) = (self.peek(), self.peek_ahead()) {
             match (c, nc) {
                 ('?', '}') => self.missing_colon_before_debug_formatter(),
@@ -243,13 +250,16 @@ impl<'a> Parser<'a> {
                     self.index += 1;
                     let word = self.word();
                     let full_span = start..self.index2range(self.index).start;
-                    self.errors.insert(0, ParseError {
-                        // alloc: as above
-                        description: "raw identifiers are not supported".to_owned(),
-                        // alloc: as above
-                        label: "raw identifier used here".to_owned(),
-                        span: full_span,
-                    });
+                    self.errors.insert(
+                        0,
+                        ParseError {
+                            // alloc: as above
+                            description: "raw identifiers are not supported".to_owned(),
+                            // alloc: as above
+                            label: "raw identifier used here".to_owned(),
+                            span: full_span,
+                        },
+                    );
                     return Some(Position::Named(word));
                 }
                 Some(Position::Named(word))
@@ -347,75 +357,98 @@ impl<'a> Parser<'a> {
         let colon = self.consume_pos(':');
         if let (Some((range, _)), Some(_)) = (question, colon) {
             self.word();
-            self.errors.insert(0, ParseError {
-                // alloc: as above
-                description: "expected format parameter to occur after `:`".to_owned(),
-                // alloc: as above
-                label: "expected `?` to occur after `:`".to_owned(),
-                span: range,
-            });
+            self.errors.insert(
+                0,
+                ParseError {
+                    // alloc: as above
+                    description: "expected format parameter to occur after `:`".to_owned(),
+                    // alloc: as above
+                    label: "expected `?` to occur after `:`".to_owned(),
+                    span: range,
+                },
+            );
         }
     }
 
     fn missing_colon_before_debug_formatter(&mut self) {
         if let Some((range, _)) = self.consume_pos('?') {
-            self.errors.insert(0, ParseError {
-                // alloc: as above
-                description: "expected `}`, found `?`".to_owned(),
-                // alloc: as above
-                label: "expected `:` before `?` to format with `Debug`".to_owned(),
-                span: range,
-            });
+            self.errors.insert(
+                0,
+                ParseError {
+                    // alloc: as above
+                    description: "expected `}`, found `?`".to_owned(),
+                    // alloc: as above
+                    label: "expected `:` before `?` to format with `Debug`".to_owned(),
+                    span: range,
+                },
+            );
         }
     }
 
     fn suggest_rust_debug_printing_macro(&mut self) {
         if let Some((range, _)) = self.consume_pos('=') {
-            self.errors.insert(0, ParseError {
-                description: "python's f-string debug `=` is not supported in rust, use `dbg(x)` instead"
+            self.errors.insert(
+                0,
+                ParseError {
+                    description:
+                        "python's f-string debug `=` is not supported in rust, use `dbg(x)` instead"
+                            // alloc: as above
+                            .to_owned(),
                     // alloc: as above
-                    .to_owned(),
-                // alloc: as above
-                label: "expected `}`".to_owned(),
-                span: range,
-            });
+                    label: "expected `}`".to_owned(),
+                    span: range,
+                },
+            );
         }
     }
 
     fn suggest_format_align(&mut self, alignment: char) {
         if let Some((range, _)) = self.consume_pos(alignment) {
-            self.errors.insert(0, ParseError {
-                description: "expected alignment specifier after `:` in format string; example: `{:>?}`"
+            self.errors.insert(
+                0,
+                ParseError {
+                    description:
+                        "expected alignment specifier after `:` in format string; example: `{:>?}`"
+                            // alloc: as above
+                            .to_owned(),
                     // alloc: as above
-                    .to_owned(),
-                // alloc: as above
-                label: format!("expected `{alignment}` to occur after `:`"),
-                span: range,
-            });
+                    label: format!("expected `{alignment}` to occur after `:`"),
+                    span: range,
+                },
+            );
         }
     }
 
     fn suggest_unsupported_python_numeric_grouping(&mut self) {
         if let Some((range, _)) = self.consume_pos(',') {
-            self.errors.insert(0, ParseError {
-                // alloc: as above
-                description: "python's numeric grouping `,` is not supported in rust format strings".to_owned(),
-                // alloc: as above
-                label: "expected `}`".to_owned(),
-                span: range,
-            });
+            self.errors.insert(
+                0,
+                ParseError {
+                    // alloc: as above
+                    description:
+                        "python's numeric grouping `,` is not supported in rust format strings"
+                            .to_owned(),
+                    // alloc: as above
+                    label: "expected `}`".to_owned(),
+                    span: range,
+                },
+            );
         }
     }
 
     fn suggest_format_missing_colon_for_sign(&mut self) {
         if let Some((range, _)) = self.consume_pos('+') {
-            self.errors.insert(0, ParseError {
-                // alloc: as above
-                description: "the `+` sign flag must appear after `:` in a format string".to_owned(),
-                // alloc: as above
-                label: "expected `:` before `+` sign flag".to_owned(),
-                span: range,
-            });
+            self.errors.insert(
+                0,
+                ParseError {
+                    // alloc: as above
+                    description: "the `+` sign flag must appear after `:` in a format string"
+                        .to_owned(),
+                    // alloc: as above
+                    label: "expected `:` before `+` sign flag".to_owned(),
+                    span: range,
+                },
+            );
         }
     }
 
@@ -435,13 +468,16 @@ impl<'a> Parser<'a> {
             Position::Index(_) => "tuple index access isn't supported",
             Position::Implicit => return,
         };
-        self.errors.insert(0, ParseError {
-            // alloc: as above
-            description: description.to_owned(),
-            // alloc: as above
-            label: "not supported".to_owned(),
-            span: arg.position_span.start..field.position_span.end,
-        });
+        self.errors.insert(
+            0,
+            ParseError {
+                // alloc: as above
+                description: description.to_owned(),
+                // alloc: as above
+                label: "not supported".to_owned(),
+                span: arg.position_span.start..field.position_span.end,
+            },
+        );
     }
 }
 
@@ -488,7 +524,12 @@ pub(super) struct Failed {
 
 /// rustc's `parse_format_string` of `input`, the value of the string literal `snippet`
 /// written at `literal`, as an option of an attribute of `mode`.
-pub(super) fn parse(input: &str, snippet: &str, literal: TextRange, mode: Mode) -> Result<Parsed, Failed> {
+pub(super) fn parse(
+    input: &str,
+    snippet: &str,
+    literal: TextRange,
+    mode: Mode,
+) -> Result<Parsed, Failed> {
     let mut parser = Parser::new(input, Some(snippet));
     // alloc: once per format string of a diagnostic attribute, its arguments
     let mut args = Vec::new();
@@ -641,7 +682,9 @@ impl<'a> FormatArg<'a> {
                 | Mode::DiagnosticOnTypeError,
                 param,
             ) => FormatArg::GenericParam(param),
-            (Mode::DiagnosticOnUnknown | Mode::DiagnosticOnUnmatchedArgs, name) => FormatArg::Disallowed(name),
+            (Mode::DiagnosticOnUnknown | Mode::DiagnosticOnUnmatchedArgs, name) => {
+                FormatArg::Disallowed(name)
+            }
         };
         (it, false)
     }
@@ -721,7 +764,13 @@ fn push_braced(out: &mut String, name: &str) {
 }
 
 /// rustc's `parse_arg`: what `arg` is under `mode` ([`FormatArg::of`]), the warnings it gives.
-fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextRange, is_source_literal: bool) {
+fn parse_arg(
+    arg: &Argument<'_>,
+    mode: Mode,
+    parsed: &mut Parsed,
+    literal: TextRange,
+    is_source_literal: bool,
+) {
     // clone: a range, two integers copied
     let span = slice(literal, arg.position_span.clone(), is_source_literal);
     let (it, takes_spec) = FormatArg::of(arg, mode);
@@ -742,7 +791,11 @@ fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextR
     }
     if !takes_spec && let Some(ty_span) = &arg.ty_span {
         // clone: a range, two integers copied
-        parsed.warnings.push(Warning::Specifier(slice(literal, ty_span.clone(), is_source_literal)));
+        parsed.warnings.push(Warning::Specifier(slice(
+            literal,
+            ty_span.clone(),
+            is_source_literal,
+        )));
     }
 }
 
@@ -770,25 +823,33 @@ mod tests {
 
     #[test]
     fn named_arguments_are_generic_parameters_where_their_names_are() {
-        let it = parsed("a {T} {Self} {U }", "\"a {T} {Self} {U }\"", Mode::DiagnosticOnUnimplemented).unwrap();
+        let it =
+            parsed("a {T} {Self} {U }", "\"a {T} {Self} {U }\"", Mode::DiagnosticOnUnimplemented)
+                .unwrap();
         assert_eq!(it.params, [("T".to_owned(), at(4, 5)), ("U".to_owned(), at(15, 17))]);
         assert!(it.warnings.is_empty());
     }
 
     #[test]
     fn positional_and_indexed_arguments_and_specifiers_are_warned_of() {
-        let it = parsed("{} {1:} {Self:123}", "\"{} {1:} {Self:123}\"", Mode::DiagnosticOnUnimplemented).unwrap();
-        assert_eq!(it.warnings, [
-            Warning::Positional(at(2, 2)),
-            Warning::Indexed(at(5, 6)),
-            Warning::Specifier(at(6, 7)),
-            Warning::Specifier(at(14, 18)),
-        ]);
+        let it =
+            parsed("{} {1:} {Self:123}", "\"{} {1:} {Self:123}\"", Mode::DiagnosticOnUnimplemented)
+                .unwrap();
+        assert_eq!(
+            it.warnings,
+            [
+                Warning::Positional(at(2, 2)),
+                Warning::Indexed(at(5, 6)),
+                Warning::Specifier(at(6, 7)),
+                Warning::Specifier(at(14, 18)),
+            ]
+        );
     }
 
     #[test]
     fn an_unmatched_closing_brace_is_the_error() {
-        let it = parsed("{{Test } thing", "\"{{Test } thing\"", Mode::DiagnosticOnUnimplemented).unwrap_err();
+        let it = parsed("{{Test } thing", "\"{{Test } thing\"", Mode::DiagnosticOnUnimplemented)
+            .unwrap_err();
         assert_eq!(it.description, "unmatched `}` found");
         assert_eq!(it.label, "unmatched `}`");
         assert_eq!(it.at, at(8, 9));
@@ -817,9 +878,11 @@ mod tests {
     fn modes_differ_in_what_names_they_take() {
         let it = parsed("{this} {T}", "\"{this} {T}\"", Mode::DiagnosticOnUnmatchedArgs).unwrap();
         assert_eq!(it.warnings, [Warning::Disallowed(at(9, 10))]);
-        let it = parsed("{this:resolved}", "\"{this:resolved}\"", Mode::RustcOnUnimplemented).unwrap();
+        let it =
+            parsed("{this:resolved}", "\"{this:resolved}\"", Mode::RustcOnUnimplemented).unwrap();
         assert!(it.warnings.is_empty() && it.params.is_empty());
-        let it = parsed("{this:resolved}", "\"{this:resolved}\"", Mode::DiagnosticOnUnimplemented).unwrap();
+        let it = parsed("{this:resolved}", "\"{this:resolved}\"", Mode::DiagnosticOnUnimplemented)
+            .unwrap();
         assert_eq!(it.params, [("this".to_owned(), at(2, 6))]);
         assert_eq!(it.warnings, [Warning::Specifier(at(6, 15))]);
         let it = parsed("{expected}", "\"{expected}\"", Mode::DiagnosticOnMove).unwrap();
@@ -829,7 +892,8 @@ mod tests {
     #[test]
     fn rustc_on_unimplemented_fills_every_placeholder_it_takes_and_prints_back_the_rest() {
         // alloc: a test's parameters
-        let generic_args = [("Self".to_owned(), "fn(u16)".to_owned()), ("Args".to_owned(), "(u8,)".to_owned())];
+        let generic_args =
+            [("Self".to_owned(), "fn(u16)".to_owned()), ("Args".to_owned(), "(u8,)".to_owned())];
         let args = FormatArgs {
             this: "Fn",
             this_resolved: "Fn(u8)",
@@ -847,7 +911,10 @@ mod tests {
         // `diagnostic::on_unimplemented` takes none of `this`'s forms nor `item_context`: they
         // are generic names, printed back without their spec.
         assert_eq!(
-            args.format("{this} {this:resolved} {item_context} {Self}", Mode::DiagnosticOnUnimplemented),
+            args.format(
+                "{this} {this:resolved} {item_context} {Self}",
+                Mode::DiagnosticOnUnimplemented
+            ),
             "{this} {this} {item_context} fn(u16)"
         );
         // A string that does not parse is used as written.

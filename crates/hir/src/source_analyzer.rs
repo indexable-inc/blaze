@@ -24,8 +24,7 @@ use hir_def::{
 use hir_expand::HirFileId;
 use hir_ty::{
     InferBodyId, InferenceResult, LifetimeElisionKind, LifetimeLoweringMode, ParamEnvAndCrate,
-    TyLoweringContext,
-    method_resolution,
+    TyLoweringContext, method_resolution,
     next_solver::{
         DbInterner, EarlyBinder, GenericArgs, ParamEnv, Ty, TypingMode, infer::DbInternerInferExt,
     },
@@ -34,8 +33,8 @@ use rustc_type_ir::inherent::Ty as _;
 use span::{AstIdMap, RealSpanMap};
 
 use crate::{
-    Adt, AnyFunctionId, BuiltinType, Const, EnumVariant, Function, Local, Macro, ModuleDef,
-    Static, Struct, Trait, Type, TypeAlias, TypeOwnerId,
+    Adt, AnyFunctionId, BuiltinType, Const, EnumVariant, Function, Local, Macro, ModuleDef, Static,
+    Struct, Trait, Type, TypeAlias, TypeOwnerId,
     db::HirDatabase,
     semantics::{PathResolution, PathResolutionPerNs},
 };
@@ -57,7 +56,8 @@ pub struct NotInAstIdMap {
 
 impl std::fmt::Display for NotInAstIdMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let map = if self.anchored { "its body's anchor's ast id map" } else { "its file's ast id map" };
+        let map =
+            if self.anchored { "its body's anchor's ast id map" } else { "its file's ast id map" };
         write!(
             f,
             "`{}` ({:?} at {:?} of {:?}) is not in {map}, which resolving a path in its attribute reads",
@@ -228,7 +228,6 @@ impl<'db> SourceAnalyzer<'db> {
         hir_ty::comptime_env::enter_universes(&infcx, env.param_env);
         method_resolution::lookup_impl_const(&infcx, env.param_env, const_id, subs)
     }
-
 }
 
 #[inline]

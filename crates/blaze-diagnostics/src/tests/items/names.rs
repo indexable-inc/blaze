@@ -35,7 +35,10 @@ fn main() {}
 "#;
     let messages = checked(fixture).messages();
     let names = ["E0411", "E0425", "E0401", "E0433"];
-    assert!(!messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))), "{messages:?}");
+    assert!(
+        !messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))),
+        "{messages:?}"
+    );
 }
 
 #[test]
@@ -71,7 +74,10 @@ fn main() {}
 "#;
     let messages = checked(fixture).messages();
     let names = ["E0411", "E0425", "E0401", "E0433", "E0412"];
-    assert!(!messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))), "{messages:?}");
+    assert!(
+        !messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))),
+        "{messages:?}"
+    );
 }
 
 #[test]
@@ -102,7 +108,11 @@ pub fn f<#[cfg(feature = "big")] T: big::Tr>(#[cfg(feature = "big")] _: big::Big
 "#;
     let messages = checked(fixture).messages();
     let unresolved: Vec<&String> = messages.iter().filter(|it| it.starts_with("E0433")).collect();
-    assert_eq!(unresolved.len(), 1, "only `kept`, which no cfg removes, is unresolved: {messages:?}");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "only `kept`, which no cfg removes, is unresolved: {messages:?}"
+    );
     assert!(unresolved[0].contains("`kept`"), "{messages:?}");
 }
 
@@ -129,7 +139,11 @@ pub struct S {
 "#;
     let messages = checked(fixture).messages();
     let unresolved: Vec<&String> = messages.iter().filter(|it| it.starts_with("E0433")).collect();
-    assert_eq!(unresolved.len(), 1, "only `kept`, which no cfg removes, is unresolved: {messages:?}");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "only `kept`, which no cfg removes, is unresolved: {messages:?}"
+    );
     assert!(unresolved[0].contains("`kept`"), "{messages:?}");
 }
 
@@ -246,7 +260,10 @@ For more information about this error, try `rustc --explain E0573`.
 fn a_private_struct_of_a_module_in_a_signature() {
     // tests/ui/privacy/struct-field-and-impl-expose-10545.rs
     let source = "//! Regression test for https://github.com/rust-lang/rust/issues/10545\n\nmod a {\n    struct S;\n    impl S { }\n}\n\nfn foo(_: a::S) { //~ ERROR: struct `S` is private\n}\n\nfn main() {}\n";
-    assert_reports(&ui("struct-field-and-impl-expose-10545.rs", "2015", source), &[error(8, &["`S`"])]);
+    assert_reports(
+        &ui("struct-field-and-impl-expose-10545.rs", "2015", source),
+        &[error(8, &["`S`"])],
+    );
 }
 
 #[test]
@@ -292,10 +309,13 @@ fn main() {
 }
 "#;
     assert_reports(
-        &ui_core("enum-definition-with-outer-generic-parameter-5997.rs", "2015", "assert, panic, unary_ops", source),
-        &[
-            error(3, &[]),
-        ],
+        &ui_core(
+            "enum-definition-with-outer-generic-parameter-5997.rs",
+            "2015",
+            "assert, panic, unary_ops",
+            source,
+        ),
+        &[error(3, &[])],
     );
 }
 

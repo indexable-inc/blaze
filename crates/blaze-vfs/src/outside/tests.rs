@@ -141,7 +141,8 @@ fn an_unwatch_stops_vouching_until_watched_again() {
     let dirs = Dirs::new();
     let (mut sim, mut outside, mut effects) = confirmed(&dirs);
     let generation = dirs.generation();
-    outside.complete(Completion { tag: outside.tag(0, WATCH), done: Done::Unwatched }, &mut effects);
+    outside
+        .complete(Completion { tag: outside.tag(0, WATCH), done: Done::Unwatched }, &mut effects);
     assert_eq!(dirs.dir(0).since(), UNCONFIRMED);
     assert!(!dirs.unchanged_since(path("/tc/lib/a.h"), generation));
     assert!(effects.is_empty(), "made again by the next round, not at once: {effects:?}");
@@ -205,7 +206,8 @@ fn a_change_naming_the_directory_itself_watches_it_again() {
 fn a_change_made_before_a_flush_is_seen_once_it_completes() {
     for seed in 0..64 {
         let dirs = Dirs::new();
-        let mut sim = Sim::new(seed, Faults { max_latency: Duration::from_millis(5), ..Faults::default() });
+        let mut sim =
+            Sim::new(seed, Faults { max_latency: Duration::from_millis(5), ..Faults::default() });
         sim.change(&name("tc/lib/a.h"), b"int a;");
         dirs.want(path("/tc"));
         let mut outside = Outside::new(&dirs, "/", TAGS);
@@ -368,7 +370,10 @@ fn a_directory_wanted_above_others_retires_their_watches() {
     pump(&mut sim, &mut outside, &mut effects);
     // One watch, one flush per round from now on.
     outside.flush(&mut effects);
-    assert_eq!(effects, vec![Effect::Flush { watch: outside.tag(2, WATCH), tag: outside.tag(2, FLUSH) }]);
+    assert_eq!(
+        effects,
+        vec![Effect::Flush { watch: outside.tag(2, WATCH), tag: outside.tag(2, FLUSH) }]
+    );
     pump(&mut sim, &mut outside, &mut effects);
     assert!(outside.flushed());
     assert_eq!((dirs.dir(0).since(), dirs.dir(1).since()), (UNCONFIRMED, UNCONFIRMED));
@@ -397,7 +402,10 @@ fn a_cover_answers_as_the_path_does_without_a_walk() {
     sim.change(&name("tc/lib/a.h"), b"int b;");
     round(&mut sim, &mut outside, &mut effects);
     assert!(!cover.unchanged_since(generation));
-    assert_eq!(cover.unchanged_since(generation), dirs.unchanged_since(path("/tc/lib/a.h"), generation));
+    assert_eq!(
+        cover.unchanged_since(generation),
+        dirs.unchanged_since(path("/tc/lib/a.h"), generation)
+    );
     assert!(cover.unchanged_since(dirs.generation()));
 }
 
@@ -563,7 +571,8 @@ fn wants_past_the_high_water_mark_allocate_nothing() {
     dirs.want(path("/tc"));
     let first: *const super::Entry = dirs.dir(0).entry;
     // More entries than a 64 KB commit step holds (2048), and past index level 7.
-    let wanted: Vec<PathBuf> = (0..5000).map(|at| PathBuf::from(format!("/grown/{at:04}"))).collect();
+    let wanted: Vec<PathBuf> =
+        (0..5000).map(|at| PathBuf::from(format!("/grown/{at:04}"))).collect();
     assert_at_most(0, "wants past the high-water mark", || {
         for dir in &wanted {
             dirs.want(dir);
@@ -601,7 +610,8 @@ fn the_columns_answer_as_a_plain_table_does() {
             wanted.push_str(&format!("/d{}", (seed >> (8 * part)) % 40));
         }
         let covered = reference.iter().any(|it| {
-            wanted == *it || (wanted.starts_with(it.as_str()) && wanted.as_bytes()[it.len()] == b'/')
+            wanted == *it
+                || (wanted.starts_with(it.as_str()) && wanted.as_bytes()[it.len()] == b'/')
         });
         dirs.want(path(&wanted));
         if !covered {
@@ -616,7 +626,9 @@ fn the_columns_answer_as_a_plain_table_does() {
         let key = wanted.as_bytes();
         assert!(dirs.find(key, super::tag(key)).is_some(), "{wanted}");
         let above = reference.iter().filter(|it| {
-            it.len() < wanted.len() && wanted.starts_with(it.as_str()) && wanted.as_bytes()[it.len()] == b'/'
+            it.len() < wanted.len()
+                && wanted.starts_with(it.as_str())
+                && wanted.as_bytes()[it.len()] == b'/'
         });
         let expected = above.map(|it| numbered[it.as_str()]).filter(|&by| by > at as u32).min();
         assert_eq!(dirs.dir(at as u32).subsumed_by(), expected, "{wanted}");

@@ -1,15 +1,22 @@
 use hir_def::{HasModule, signatures::FunctionSignature};
 use hir_expand::EditionedFileId;
+use hir_expand::fixture;
 use span::Edition;
 use syntax::{TextRange, TextSize};
-use hir_expand::fixture;
 
 use crate::{
-    db::HirDatabase, display::DisplayTarget, mir::MirLowerError,
-    mir_pretty::MirEvalErrorPretty as _, next_solver::GenericArgs, setup_tracing, test_db::{TestDB, TestDBExt as _},
+    db::HirDatabase,
+    display::DisplayTarget,
+    mir::MirLowerError,
+    mir_pretty::MirEvalErrorPretty as _,
+    next_solver::GenericArgs,
+    setup_tracing,
+    test_db::{TestDB, TestDBExt as _},
 };
 
-use crate::mir::{MirEvalError, MirOptLevel, MirOptions, interpret_mir, set_interpreter_mir_opt_level};
+use crate::mir::{
+    MirEvalError, MirOptLevel, MirOptions, interpret_mir, set_interpreter_mir_opt_level,
+};
 
 fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError<'_>> {
     let unoptimized = eval_main_at(db, file_id, MirOptLevel::Off);
@@ -62,7 +69,12 @@ pub(super) fn eval_main_at(
         let args = GenericArgs::empty().store();
         let body = match level {
             MirOptLevel::Off => db.monomorphized_runtime_mir_body(func_id.into(), args, env),
-            level => db.monomorphized_optimized_mir_body(func_id.into(), MirOptions::at(level), args, env),
+            level => db.monomorphized_optimized_mir_body(
+                func_id.into(),
+                MirOptions::at(level),
+                args,
+                env,
+            ),
         }
         .map_err(|e| MirEvalError::MirLowerError(func_id, e))?;
         set_interpreter_mir_opt_level(level);
@@ -1521,11 +1533,13 @@ impl Tr for S { fn f(&self) -> u8 { 0 } }
 fn g<T: Tr>(t: &T) { let _x = t.f(); }
 fn main() { g(&S); }
 "#,
-        |e| matches!(
-            innermost(&e),
-            MirEvalError::MirLowerError(_, MirLowerError::RpititValue(message))
-                if message.contains("`f`") && message.contains("{impl Trait#0 of `f`}")
-        ),
+        |e| {
+            matches!(
+                innermost(&e),
+                MirEvalError::MirLowerError(_, MirLowerError::RpititValue(message))
+                    if message.contains("`f`") && message.contains("{impl Trait#0 of `f`}")
+            )
+        },
     );
 }
 
@@ -3255,7 +3269,11 @@ fn main() {}
             .declarations()
             .find_map(|x| match x {
                 hir_def::ModuleDefId::FunctionId(x)
-                    if FunctionSignature::of(&db, x).name.display(&db, Edition::CURRENT).to_string() == "inc" =>
+                    if FunctionSignature::of(&db, x)
+                        .name
+                        .display(&db, Edition::CURRENT)
+                        .to_string()
+                        == "inc" =>
                 {
                     Some(x)
                 }
@@ -3263,7 +3281,10 @@ fn main() {}
             })
             .expect("no inc function found");
         let main_crate = db.module_for_file(file_ids[1].file_id(&db)).krate(&db);
-        let env = crate::ParamEnvAndCrate { param_env: db.trait_environment(inc.into()), krate: main_crate };
+        let env = crate::ParamEnvAndCrate {
+            param_env: db.trait_environment(inc.into()),
+            krate: main_crate,
+        };
         let run = |inherited: Option<bool>| {
             let mut eval = crate::mir::Evaluator::new(&db, inc.into(), Some(env)).unwrap();
             if let Some(checks) = inherited {

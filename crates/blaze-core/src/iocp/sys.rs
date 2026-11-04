@@ -53,8 +53,16 @@ pub(super) const BUFFER: usize = 64 << 10;
 const BACKSLASH: u16 = b'\\' as u16;
 const SLASH: u16 = b'/' as u16;
 const VERBATIM: [u16; 4] = [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH];
-const VERBATIM_UNC: [u16; 8] =
-    [BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH, b'U' as u16, b'N' as u16, b'C' as u16, BACKSLASH];
+const VERBATIM_UNC: [u16; 8] = [
+    BACKSLASH,
+    BACKSLASH,
+    b'?' as u16,
+    BACKSLASH,
+    b'U' as u16,
+    b'N' as u16,
+    b'C' as u16,
+    BACKSLASH,
+];
 
 /// `s` as a NUL-terminated wide string, or an error where it holds a NUL of its own.
 pub(super) fn wide(s: &OsStr) -> io::Result<Vec<u16>> {
@@ -193,7 +201,8 @@ impl Paths {
         let bytes = text.as_bytes();
         // A name std reads as having a prefix or root of its own (which `join` puts in place of
         // the root's), or refuses, or a root that is not Unicode: made as std makes it.
-        if !self.unicode || text.contains('\0') || bytes[0] == b'\\' || bytes.get(1) == Some(&b':') {
+        if !self.unicode || text.contains('\0') || bytes[0] == b'\\' || bytes.get(1) == Some(&b':')
+        {
             // alloc: a name Windows reads as rooted, or one that fails.
             let wide = path(&self.root.join(text))?;
             self.out.clear();
@@ -235,7 +244,9 @@ fn full_path(wide: &[u16], into: &mut Vec<u16>) -> io::Result<()> {
         let room = into.capacity().max(260);
         into.resize(room, 0);
         // SAFETY: a NUL-terminated path, a buffer of the length given, and no part asked for.
-        let len = unsafe { GetFullPathNameW(wide.as_ptr(), room as u32, into.as_mut_ptr(), std::ptr::null_mut()) };
+        let len = unsafe {
+            GetFullPathNameW(wide.as_ptr(), room as u32, into.as_mut_ptr(), std::ptr::null_mut())
+        };
         let len = len as usize;
         if len == 0 {
             return Err(io::Error::last_os_error());
@@ -339,7 +350,8 @@ impl Head {
         // SAFETY: all zeros is an `OVERLAPPED` of no offset and no event: integers, a union of
         // integers and a null handle.
         let mut fresh: OVERLAPPED = unsafe { std::mem::zeroed() };
-        fresh.Anonymous.Anonymous = OVERLAPPED_0_0 { Offset: at as u32, OffsetHigh: (at >> 32) as u32 };
+        fresh.Anonymous.Anonymous =
+            OVERLAPPED_0_0 { Offset: at as u32, OffsetHigh: (at >> 32) as u32 };
         // SAFETY: `overlapped` is the first field of this head's `repr(C)` slot, aligned and
         // live while `self` is; no step of the request is in flight (every caller starts one
         // at once after this), so neither the kernel nor another thread reads or writes it.
@@ -438,7 +450,8 @@ pub(super) struct Port(OwnedHandle);
 impl Port {
     pub(super) fn new() -> io::Result<Port> {
         // SAFETY: no handle to associate; a new port, for one thread at a time.
-        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+        let port =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
         Ok(Port(owned(port)?))
     }
 
@@ -472,7 +485,11 @@ impl Port {
     }
 
     /// Up to `entries.len()` packets, waiting up to `wait` for the first; how many came.
-    pub(super) fn take(&self, entries: &mut [OVERLAPPED_ENTRY], wait: Duration) -> io::Result<usize> {
+    pub(super) fn take(
+        &self,
+        entries: &mut [OVERLAPPED_ENTRY],
+        wait: Duration,
+    ) -> io::Result<usize> {
         let mut got = 0;
         // Rounded up, so a wait shorter than a millisecond is not a spin.
         let ms = match wait.is_zero() {
@@ -537,14 +554,21 @@ mod tests {
     fn a_wide_name_is_the_formatted_one() {
         let mut rng = crate::sim::Rng::new(7);
         for _ in 0..1000 {
-            let (pid, n, count) = (rng.next_u64() as u32, rng.next_u64() >> rng.below(64), rng.below(1000));
+            let (pid, n, count) =
+                (rng.next_u64() as u32, rng.next_u64() >> rng.below(64), rng.below(1000));
             let (name, used) = blaze_alloc_count::measure(|| {
                 let mut name = WideName::<128>::new();
-                name.text(r"\\.\pipe\blaze-").number(u64::from(pid)).text("-").number(n).text("-out-").number(count);
+                name.text(r"\\.\pipe\blaze-")
+                    .number(u64::from(pid))
+                    .text("-")
+                    .number(n)
+                    .text("-out-")
+                    .number(count);
                 name
             });
             assert_eq!(used.allocations, 0);
-            let wanted = wide(OsStr::new(&format!(r"\\.\pipe\blaze-{pid}-{n}-out-{count}"))).unwrap();
+            let wanted =
+                wide(OsStr::new(&format!(r"\\.\pipe\blaze-{pid}-{n}-out-{count}"))).unwrap();
             // SAFETY: the name's units, NUL-terminated within its room.
             let made = unsafe { std::slice::from_raw_parts(name.as_ptr(), wanted.len()) };
             assert_eq!(made, &wanted[..]);
@@ -565,6 +589,10 @@ mod tests {
         assert_eq!(entries[0].lpCompletionKey, KEY_WAKE);
         assert_eq!(entries[0].lpOverlapped as usize, 7);
         assert_eq!(entries[0].dwNumberOfBytesTransferred, 3);
-        assert_eq!(port.take(&mut entries, Duration::ZERO).unwrap(), 0, "the refused packet was posted");
+        assert_eq!(
+            port.take(&mut entries, Duration::ZERO).unwrap(),
+            0,
+            "the refused packet was posted"
+        );
     }
 }

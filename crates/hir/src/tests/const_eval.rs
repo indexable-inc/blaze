@@ -38,21 +38,27 @@ const fn f(x: u32) {
 #[test]
 fn an_unused_const_that_recurses_forever_is_an_error() {
     let db = fixture::db(&format!("{RECURSES}const X: () = f(1);")).into_db();
-    assert_eq!(failures(&db), [(
-        "X".to_owned(),
-        false,
-        "reached the configured maximum number of stack frames".to_owned()
-    )]);
+    assert_eq!(
+        failures(&db),
+        [(
+            "X".to_owned(),
+            false,
+            "reached the configured maximum number of stack frames".to_owned()
+        )]
+    );
 }
 
 #[test]
 fn a_static_is_evaluated_as_a_const_is() {
     let db = fixture::db(&format!("{RECURSES}static S: () = f(1);")).into_db();
-    assert_eq!(failures(&db), [(
-        "S".to_owned(),
-        true,
-        "reached the configured maximum number of stack frames".to_owned()
-    )]);
+    assert_eq!(
+        failures(&db),
+        [(
+            "S".to_owned(),
+            true,
+            "reached the configured maximum number of stack frames".to_owned()
+        )]
+    );
 }
 
 /// rustc evaluates no associated `const` until something uses it (`const_eval_poly` runs on
@@ -78,7 +84,8 @@ fn a_const_with_a_type_error_gets_no_evaluation_error() {
 
 #[test]
 fn values_that_evaluate_get_no_error() {
-    let db = fixture::db("const A: u32 = 1 + 2;\nstatic B: u32 = A * 2;\nconst _: () = ();").into_db();
+    let db =
+        fixture::db("const A: u32 = 1 + 2;\nstatic B: u32 = A * 2;\nconst _: () = ();").into_db();
     let found = failures(&db);
     assert!(found.is_empty(), "{found:?}");
 }

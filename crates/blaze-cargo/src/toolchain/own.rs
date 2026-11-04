@@ -15,7 +15,7 @@ use std::{
     io::{self, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use tokio::sync::mpsc;
@@ -233,9 +233,7 @@ fn fetch_from(
         release.megabytes()
     );
     let start = Instant::now();
-    // The client has no flight recorder: the download is its own step in the client's part of
-    // a `BLAZE_PROFILE` profile and the table it prints, and a span wherever spans are recorded.
-    let step = format!("toolchain download {} ({} bytes)", release.version, release.bytes()); // alloc: once per download
+    // A span in the client's flight recorder, which the client's rows take to the history.
     let _span = tracing::info_span!(target: "blaze", "toolchain download", toolchain = release.version, bytes = release.bytes()).entered();
     let downloads = parent.join(format!(".{name}.download"));
     let staging = parent.join(format!(".{name}.unpacking"));
@@ -251,7 +249,6 @@ fn fetch_from(
         remove_dir(&downloads)?;
         anyhow::Ok(())
     })();
-    blaze_profile::note(&step, blaze_profile::CLIENT, start);
     if let Err(e) = fetched {
         _ = remove_dir(&staging);
         return Err(match e.downcast_ref::<NotPublished>() {
@@ -352,7 +349,8 @@ impl Source {
         let missing = || anyhow::anyhow!("{file} is not there");
         match self {
             Source::Web { http, base } => {
-                let bytes = super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
+                let bytes =
+                    super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
                 Ok(Body::Web { bytes, at: 0 })
             }
             Source::Dir(dir) => {
@@ -371,7 +369,10 @@ impl Source {
 /// What is read of a file, given on in pieces of [`PIECE`] bytes.
 enum Body {
     /// The bytes the server sent, of which the first `at` are given.
-    Web { bytes: Vec<u8>, at: usize },
+    Web {
+        bytes: Vec<u8>,
+        at: usize,
+    },
     File(File),
 }
 
@@ -484,7 +485,8 @@ async fn download(
         None => Ok(()),
     };
     // alloc: once a file
-    let pinned = blaze_fetch::Digest::parse(&format!("sha256:{}", pin.sha256)).map_err(anyhow::Error::new)?;
+    let pinned = blaze_fetch::Digest::parse(&format!("sha256:{}", pin.sha256))
+        .map_err(anyhow::Error::new)?;
     let mut written = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
     // The pin's algorithm and BLAKE3 in one pass, as blaze-fetch checks every download.
     let mut hasher = blaze_fetch::Hashing::new(pinned.algo());
@@ -526,10 +528,13 @@ async fn download(
             Ok(()) if tries + 1 == TRIES => {
                 // alloc: error path, the last failure, as below.
                 let gave_up = super::GaveUp { file: file.to_owned(), tries: TRIES };
-                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes).context(gave_up));
+                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes)
+                    .context(gave_up));
             }
             // alloc: error path, the last failure.
-            Err(e) if tries + 1 == TRIES => return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES })),
+            Err(e) if tries + 1 == TRIES => {
+                return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES }));
+            }
             _ => tries += 1,
         }
         tokio::time::sleep(Duration::from_secs(tries.into())).await;

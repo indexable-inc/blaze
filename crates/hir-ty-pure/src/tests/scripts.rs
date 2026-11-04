@@ -55,7 +55,9 @@ fn impure(crates: &str, says: &str) {
             let said = why.said();
             assert!(said.contains(says), "`{said}` should say `{says}`");
         }
-        Purity::Pure(proof) => panic!("the script should be impure ({says}), but is pure: {proof:?}"),
+        Purity::Pure(proof) => {
+            panic!("the script should be impure ({says}), but is pure: {proof:?}")
+        }
     }
 }
 
@@ -86,9 +88,15 @@ fn main() {
 
 /// The proof of the script `main` in `db` under a bound of `steps`: what it found and the
 /// steps the bound counted, or how it ran out.
-fn bounded(db: &Db, main: FunctionId, steps: u64) -> Result<(ScriptProof, u64), blaze_query::db::OutOfSteps> {
+fn bounded(
+    db: &Db,
+    main: FunctionId,
+    steps: u64,
+) -> Result<(ScriptProof, u64), blaze_query::db::OutOfSteps> {
     // clone: a test's answer
-    blaze_query::db::attach(db, || blaze_query::db::with_steps(steps, || script_proof(db, main).clone()))
+    blaze_query::db::attach(db, || {
+        blaze_query::db::with_steps(steps, || script_proof(db, main).clone())
+    })
 }
 
 /// The script in `crates` with every summary its walk reaches made first, under no bound: what
@@ -109,17 +117,29 @@ fn a_build_scripts_purity_verdict_does_not_depend_on_what_is_cached() {
     let (db, main) = script(RECURSIVE);
     let (cold, cold_taken) = bounded(&db, main, 1 << 20).expect("cold, far within the bound");
     assert!(cold.steps > 2, "the walk reached past `main`: {cold:?}");
-    assert_eq!(u64::from(cold.steps), cold_taken, "the bound counted the walk's instances, each once");
+    assert_eq!(
+        u64::from(cold.steps),
+        cold_taken,
+        "the bound counted the walk's instances, each once"
+    );
     let (db, main) = warmed(RECURSIVE);
     let (warm, warm_taken) = bounded(&db, main, 1 << 20).expect("warm, far within the bound");
-    assert_eq!((&warm, warm_taken), (&cold, cold_taken), "the same verdict and steps, cold or warm");
+    assert_eq!(
+        (&warm, warm_taken),
+        (&cold, cold_taken),
+        "the same verdict and steps, cold or warm"
+    );
 
     let short = u64::from(cold.steps) - 1;
     let (db, main) = script(RECURSIVE);
     let cold = bounded(&db, main, short).expect_err("cold, one step short");
     let (db, main) = warmed(RECURSIVE);
     let warm = bounded(&db, main, short).expect_err("warm, one step short");
-    assert_eq!((cold.steps, warm.steps), (short, short), "both took all they were given: {cold}; {warm}");
+    assert_eq!(
+        (cold.steps, warm.steps),
+        (short, short),
+        "both took all they were given: {cold}; {warm}"
+    );
 }
 
 /// Generics whose home depends on who asks (`hir_ty_mir::mir::home`). `mid::outer` is not
@@ -175,14 +195,22 @@ fn a_build_scripts_steps_follow_each_generic_from_the_crate_that_asks_for_it() {
     );
     let (db, main) = warmed(ACROSS);
     let (warm, warm_taken) = bounded(&db, main, 1 << 20).expect("warm, far within the bound");
-    assert_eq!((&warm, warm_taken), (&cold, cold_taken), "the same verdict and steps, cold or warm");
+    assert_eq!(
+        (&warm, warm_taken),
+        (&cold, cold_taken),
+        "the same verdict and steps, cold or warm"
+    );
 
     let short = u64::from(cold.steps) - 1;
     let (db, main) = script(ACROSS);
     let cold = bounded(&db, main, short).expect_err("cold, one step short");
     let (db, main) = warmed(ACROSS);
     let warm = bounded(&db, main, short).expect_err("warm, one step short");
-    assert_eq!((cold.steps, warm.steps), (short, short), "both took all they were given: {cold}; {warm}");
+    assert_eq!(
+        (cold.steps, warm.steps),
+        (short, short),
+        "both took all they were given: {cold}; {warm}"
+    );
 }
 
 #[test]
@@ -601,14 +629,19 @@ fn same_parts(a: &str, b: &str, how: &str) {
     match (main_a, main_b) {
         (Ok(main_a), Ok(main_b)) => {
             for ((name, a), (_, b)) in main_a.iter().zip(&main_b) {
-                assert_eq!(a, b, "{how}: the {name} part of the identity of `main`'s body (blaze_item_hash)");
+                assert_eq!(
+                    a, b,
+                    "{how}: the {name} part of the identity of `main`'s body (blaze_item_hash)"
+                );
             }
         }
         (main_a, main_b) => {
             assert_eq!(main_a, main_b, "{how}: the identity of `main`'s body (blaze_item_hash)")
         }
     }
-    let names = |parts: &[(String, Result<ContentId, String>)]| parts.iter().map(|it| it.0.clone()).collect::<Vec<_>>();
+    let names = |parts: &[(String, Result<ContentId, String>)]| {
+        parts.iter().map(|it| it.0.clone()).collect::<Vec<_>>()
+    };
     assert_eq!(names(&parts_a), names(&parts_b), "{how}: the instances the walk reaches");
     for ((name, a), (_, b)) in parts_a.iter().zip(&parts_b) {
         assert_eq!(a, b, "{how}: the part of the identity of {name}");

@@ -471,7 +471,8 @@ mod tests {
         assert_ne!(inside, fake, "the call ran on the fiber's stack instead of a new segment");
         assert_ne!(inside, 0);
         assert_eq!(fiber_stack_limit(), fake);
-        let unwound = std::panic::catch_unwind(|| ensure_sufficient_stack(|| panic!("in a segment")));
+        let unwound =
+            std::panic::catch_unwind(|| ensure_sufficient_stack(|| panic!("in a segment")));
         assert!(unwound.is_err());
         assert_eq!(fiber_stack_limit(), fake, "an unwind left the segment's limit behind");
         set_fiber_stack_limit(0);
@@ -575,7 +576,10 @@ mod tests {
     fn panic_text_is_the_copies_it_replaced() {
         // blaze-engine's and hir-ty-codegen's copy, which looked for a `String` first.
         fn kept(panic: &(dyn std::any::Any + Send)) -> Option<&str> {
-            panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied())
+            panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
         }
         let payloads: [Box<dyn std::any::Any + Send>; 6] = [
             Box::new("static text"),

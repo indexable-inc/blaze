@@ -32,7 +32,11 @@ enum Context {
     Fn,
     Loop,
     Closure(InFile<TextRange>),
-    Coroutine { span: InFile<TextRange>, kind: &'static str, source: &'static str },
+    Coroutine {
+        span: InFile<TextRange>,
+        kind: &'static str,
+        source: &'static str,
+    },
     /// A block with no label, by where it starts.
     UnlabeledBlock(InFile<TextSize>),
     UnlabeledIfBlock,
@@ -52,7 +56,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::BreakOutsideOfLoop) -> Vec<Found> 
 }
 
 /// What rustc's loop checker says of the `break` or `continue` at `node`, if anything.
-fn diagnostic<'db>(cx: &Cx<'_, 'db>, d: &hir::BreakOutsideOfLoop, node: InFile<ast::Node<'db>>) -> Option<Diag> {
+fn diagnostic<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::BreakOutsideOfLoop,
+    node: InFile<ast::Node<'db>>,
+) -> Option<Diag> {
     let span = cx.span(node.with_value(node.value.text_range()));
     let name = if d.is_break { "break" } else { "continue" };
     let label = jump_label(node.value);
@@ -88,15 +96,20 @@ fn diagnostic<'db>(cx: &Cx<'_, 'db>, d: &hir::BreakOutsideOfLoop, node: InFile<a
         && let ast::Expr::BlockExpr(block) = to.value
     {
         // clone: a handle, on the error path, for an error hir found
-        let mut diag = Diag::error(Some("E0696"), "`continue` pointing to a labeled block", span.clone());
+        let mut diag =
+            Diag::error(Some("E0696"), "`continue` pointing to a labeled block", span.clone());
         diag.span_label(span, "labeled blocks cannot be `continue`'d");
-        diag.span_label(cx.span(to.with_value(item_range(block.syntax()))), "labeled block the `continue` points to");
+        diag.span_label(
+            cx.span(to.with_value(item_range(block.syntax()))),
+            "labeled block the `continue` points to",
+        );
         return Some(diag);
     }
     match required(&stack, d.is_break)? {
         Context::Closure(closure) => {
             // alloc: clone: the error's parts, for an error hir found
-            let mut diag = Diag::error(Some("E0267"), format!("`{name}` inside of a closure"), span.clone());
+            let mut diag =
+                Diag::error(Some("E0267"), format!("`{name}` inside of a closure"), span.clone());
             // alloc: the error's text, for an error hir found
             diag.span_label(span, format!("cannot `{name}` inside of a closure"));
             diag.span_label(cx.span(closure), "enclosing closure");
@@ -155,7 +168,11 @@ fn outside_loop(spans: Vec<crate::model::Span>, is_break: bool) -> Diag {
 /// rustc's one `OutsideLoop` for all the `break`s whose context is the unlabeled block at
 /// `block`, with its suggestion to label it: given with the first of them, none with the
 /// others.
-fn block_breaks<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, block: InFile<TextSize>) -> Option<Diag> {
+fn block_breaks<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<ast::Node<'db>>,
+    block: InFile<TextSize>,
+) -> Option<Diag> {
     let block_node = node
         .value
         .ancestors()
@@ -167,10 +184,12 @@ fn block_breaks<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, block: InFi
         return None;
     }
     // alloc: the error's parts, for an error hir found
-    let spans = breaks.iter().map(|it| cx.span(node.with_value(it.syntax().text_range()))).collect();
+    let spans =
+        breaks.iter().map(|it| cx.span(node.with_value(it.syntax().text_range()))).collect();
     let mut diag = outside_loop(spans, true);
     // alloc: the error's text, for an error hir found
-    let mut parts = vec![(cx.span(node.with_value(TextRange::empty(block.value))), "'block: ".to_owned())];
+    let mut parts =
+        vec![(cx.span(node.with_value(TextRange::empty(block.value))), "'block: ".to_owned())];
     for it in &breaks {
         let lo = match it.break_token() {
             Some(token) => token.text_range().end(),
@@ -234,7 +253,12 @@ fn breaks_of_block<'db>(
         let (skip, parent_live) = match entered.last().map(|it| (it.contents_only, it.live)) {
             Some(it) => it,
             None => {
-                entered.push(Entered { len: stack.len(), floor, contents_only: root_contents_only, live: false });
+                entered.push(Entered {
+                    len: stack.len(),
+                    floor,
+                    contents_only: root_contents_only,
+                    live: false,
+                });
                 continue;
             }
         };
@@ -296,7 +320,8 @@ fn break_non_loop<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option
         _ => return None,
     };
     let span = cx.span(node.with_value(break_expr.syntax().text_range()));
-    let head = target.with_value(TextRange::new(item_range(target.value.syntax()).start(), head_end));
+    let head =
+        target.with_value(TextRange::new(item_range(target.value.syntax()).start(), head_end));
     let mut diag = Diag::error(
         Some("E0571"),
         // alloc: the error's text, for an error hir found
@@ -370,42 +395,64 @@ enum Target<'db> {
     WhileCondition,
 }
 
-fn target<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, label: Option<&str>) -> Option<Target<'db>> {
+fn target<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<ast::Node<'db>>,
+    label: Option<&str>,
+) -> Option<Target<'db>> {
     for (ancestor, child) in edges(cx, node) {
         let child = child.value;
         let kind = ancestor.value.kind();
         if ast::ClosureExpr::can_cast(kind) || is_item(kind) || ast::ConstArg::can_cast(kind) {
             return None;
         }
-        let in_body = |body: Option<ast::BlockExpr<'_>>| body.is_some_and(|it| it.syntax() == child);
+        let in_body =
+            |body: Option<ast::BlockExpr<'_>>| body.is_some_and(|it| it.syntax() == child);
         let found = match ast::Expr::cast(ancestor.value) {
-            Some(ast::Expr::LoopExpr(it)) if in_body(it.loop_body()) => Some((it.label(), false, ast::Expr::LoopExpr(it))),
-            Some(ast::Expr::WhileExpr(it)) if it.condition().is_some_and(|it| it.syntax() == child) => {
+            Some(ast::Expr::LoopExpr(it)) if in_body(it.loop_body()) => {
+                Some((it.label(), false, ast::Expr::LoopExpr(it)))
+            }
+            Some(ast::Expr::WhileExpr(it))
+                if it.condition().is_some_and(|it| it.syntax() == child) =>
+            {
                 if label.is_none() {
                     return Some(Target::WhileCondition);
                 }
                 Some((it.label(), false, ast::Expr::WhileExpr(it)))
             }
-            Some(ast::Expr::WhileExpr(it)) if in_body(it.loop_body()) => Some((it.label(), false, ast::Expr::WhileExpr(it))),
-            Some(ast::Expr::ForExpr(it)) if in_body(it.loop_body()) => Some((it.label(), false, ast::Expr::ForExpr(it))),
+            Some(ast::Expr::WhileExpr(it)) if in_body(it.loop_body()) => {
+                Some((it.label(), false, ast::Expr::WhileExpr(it)))
+            }
+            Some(ast::Expr::ForExpr(it)) if in_body(it.loop_body()) => {
+                Some((it.label(), false, ast::Expr::ForExpr(it)))
+            }
             Some(ast::Expr::BlockExpr(it))
-                if it.async_token().is_some() || it.gen_token().is_some() || it.const_token().is_some() =>
+                if it.async_token().is_some()
+                    || it.gen_token().is_some()
+                    || it.const_token().is_some() =>
             {
                 return None;
             }
-            Some(ast::Expr::BlockExpr(it)) if it.label().is_some() => Some((it.label(), true, ast::Expr::BlockExpr(it))),
+            Some(ast::Expr::BlockExpr(it)) if it.label().is_some() => {
+                Some((it.label(), true, ast::Expr::BlockExpr(it)))
+            }
             Some(ast::Expr::ArrayExpr(it))
-                if it.semicolon_token().is_some() && it.exprs().nth(1).is_some_and(|len| len.syntax() == child) =>
+                if it.semicolon_token().is_some()
+                    && it.exprs().nth(1).is_some_and(|len| len.syntax() == child) =>
             {
                 return None;
             }
             _ => None,
         };
         if let Some((own, is_block, expr)) = found {
-            let named = |label: &str| own.and_then(ast::Label::lifetime).is_some_and(|it| it.text() == label);
+            let named = |label: &str| {
+                own.and_then(ast::Label::lifetime).is_some_and(|it| it.text() == label)
+            };
             match label {
                 None if !is_block => return Some(Target::Loop(ancestor.with_value(expr))),
-                Some(label) if named(label) => return Some(Target::Loop(ancestor.with_value(expr))),
+                Some(label) if named(label) => {
+                    return Some(Target::Loop(ancestor.with_value(expr)));
+                }
                 _ => {}
             }
         }
@@ -592,7 +639,10 @@ fn visit(
                 && plain
                 && matches!(
                     top,
-                    Context::Normal | Context::AnonConst | Context::UnlabeledBlock(_) | Context::UnlabeledIfBlock
+                    Context::Normal
+                        | Context::AnonConst
+                        | Context::UnlabeledBlock(_)
+                        | Context::UnlabeledIfBlock
                 )
             {
                 *contents_only = true;
@@ -625,7 +675,11 @@ fn visit(
             Some(Context::Coroutine { span, kind, source: "closure" })
         }
         // A `let`'s `else` block is visited as a block, not as an expression.
-        ast::Expr::BlockExpr(_) if node.value.parent().is_some_and(|it| it.kind() == SyntaxKind::LET_ELSE) => None,
+        ast::Expr::BlockExpr(_)
+            if node.value.parent().is_some_and(|it| it.kind() == SyntaxKind::LET_ELSE) =>
+        {
+            None
+        }
         ast::Expr::BlockExpr(it) if !skip => block(top, node, it),
         _ => None,
     }
@@ -688,7 +742,10 @@ pub(crate) mod tests {
     use super::*;
 
     /// `check` given the context of the crate of the one file `source`, and the file's tree.
-    pub(crate) fn with_file(source: &str, check: impl for<'db> FnOnce(&Cx<'_, 'db>, InFile<ast::Node<'db>>)) {
+    pub(crate) fn with_file(
+        source: &str,
+        check: impl for<'db> FnOnce(&Cx<'_, 'db>, InFile<ast::Node<'db>>),
+    ) {
         let checked = crate::tests::checked(&format!("//- /main.rs crate:main\n{source}"));
         let db = &checked.db;
         blaze_query::db::attach(db, || {
@@ -741,7 +798,8 @@ fn main() {}
             .filter_map(ast::BreakExpr::cast)
             .filter(|it| {
                 let stack = contexts(cx, node.with_value(it.syntax()));
-                let in_labeled = it.lifetime().is_none() && stack.last() == Some(&Context::LabeledBlock);
+                let in_labeled =
+                    it.lifetime().is_none() && stack.last() == Some(&Context::LabeledBlock);
                 !in_labeled && required(&stack, true) == Some(Context::UnlabeledBlock(block))
             })
             .collect();
@@ -760,7 +818,10 @@ fn main() {}
             let mut reported = 0;
             for it in root.value.descendants().filter(|it| ast::BreakExpr::can_cast(it.kind())) {
                 let node = root.with_value(it);
-                let Some(Context::UnlabeledBlock(block)) = required(&contexts(cx, node), true) else { continue };
+                let Some(Context::UnlabeledBlock(block)) = required(&contexts(cx, node), true)
+                else {
+                    continue;
+                };
                 let block_node = node
                     .value
                     .ancestors()
@@ -768,7 +829,8 @@ fn main() {}
                     .find(|it| block_start(*it) == block.value)
                     .expect("the block of the context is around the `break`");
                 let ranges = |breaks: Option<Vec<ast::BreakExpr<'_>>>| {
-                    breaks.map(|it| it.iter().map(|it| it.syntax().text_range()).collect::<Vec<_>>())
+                    breaks
+                        .map(|it| it.iter().map(|it| it.syntax().text_range()).collect::<Vec<_>>())
                 };
                 let fast = ranges(breaks_of_block(cx, node, block_node, block));
                 assert_eq!(fast, ranges(plain(cx, node, block_node, block)), "at {:?}", node.value);
@@ -784,7 +846,8 @@ fn main() {}
     #[test]
     fn a_walk_up_allocates_nothing() {
         with_file(BLOCKS, |cx, root| {
-            let deepest = root.value.descendants().max_by_key(|it| it.ancestors().count()).expect("a node");
+            let deepest =
+                root.value.descendants().max_by_key(|it| it.ancestors().count()).expect("a node");
             let node = root.with_value(deepest);
             let depth = node.value.ancestors().count();
             assert_eq!(up(cx, node).count(), depth);
@@ -801,7 +864,8 @@ fn main() {}
             let mut compared = 0;
             for node in root.value.descendants() {
                 let key = |file, it: ast::Node<'_>| (file, it.kind(), it.text_range());
-                let walk: Vec<_> = up(cx, root.with_value(node)).map(|it| key(it.file_id, it.value)).collect();
+                let walk: Vec<_> =
+                    up(cx, root.with_value(node)).map(|it| key(it.file_id, it.value)).collect();
                 let mut parents = Vec::new();
                 let mut at = Some(node);
                 while let Some(it) = at {

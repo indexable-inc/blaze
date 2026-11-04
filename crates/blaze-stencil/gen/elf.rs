@@ -122,7 +122,10 @@ impl<'a> Elf<'a> {
             });
             let at = usize::try_from(at).expect("an offset in memory");
             if at + usize::from(form.bytes()) > code.len() {
-                panic!("stencil `{what}`: a {form:?} hole at {at:#x} is out of its {} bytes", code.len());
+                panic!(
+                    "stencil `{what}`: a {form:?} hole at {at:#x} is out of its {} bytes",
+                    code.len()
+                );
             }
             let place = u16::try_from(at)
                 .unwrap_or_else(|_| panic!("stencil `{what}`: a hole at {at:#x}, past 64 KB"));
@@ -141,7 +144,9 @@ impl<'a> Elf<'a> {
                         panic!("stencil `{what}`: a relocation against `{symbol_name}`, which is no hole")
                     });
                     let addend = i32::try_from(addend).unwrap_or_else(|_| {
-                        panic!("stencil `{what}`: the {kind:?} hole's addend {addend} is past 32 bits")
+                        panic!(
+                            "stencil `{what}`: the {kind:?} hole's addend {addend} is past 32 bits"
+                        )
                     });
                     Hole { at: place, form, kind, addend }
                 }
@@ -152,7 +157,9 @@ impl<'a> Elf<'a> {
                             let inst = insts
                                 .iter()
                                 .find(|it| it.at <= at && at < it.at + it.len)
-                                .unwrap_or_else(|| panic!("stencil `{what}`: a hole at {at:#x} in no instruction"));
+                                .unwrap_or_else(|| {
+                                    panic!("stencil `{what}`: a hole at {at:#x} in no instruction")
+                                });
                             (inst.at + inst.len - at) as i64
                         }
                         // AArch64's `P` is the instruction, which the hole's `at` is.
@@ -200,8 +207,11 @@ impl<'a> Elf<'a> {
         let tail = self.tail(&code, &insts, &holes);
         let faults = match shape {
             Some(shape) if accesses_memory(shape.op) => {
-                let faults: Vec<u16> =
-                    insts.iter().filter(|it| user_access(self.isa, &it.text)).map(|it| it.at as u16).collect();
+                let faults: Vec<u16> = insts
+                    .iter()
+                    .filter(|it| user_access(self.isa, &it.text))
+                    .map(|it| it.at as u16)
+                    .collect();
                 if faults.is_empty() {
                     panic!("stencil `{what}`: no instruction of it accesses the op's memory");
                 }
@@ -220,7 +230,9 @@ impl<'a> Elf<'a> {
             .get(name)
             .unwrap_or_else(|| panic!("stencil `{what}`: LLVM made no symbol `{name}`"));
         if in_section != SymbolSection::Section(section) || address != 0 || size != len as u64 {
-            panic!("stencil `{what}`: its section holds {len} bytes, its function {size} at {address:#x}");
+            panic!(
+                "stencil `{what}`: its section holds {len} bytes, its function {size} at {address:#x}"
+            );
         }
     }
 
@@ -231,10 +243,15 @@ impl<'a> Elf<'a> {
         let mut at = 0;
         while at < code.len() {
             let (len, text) = disasm.inst(&code[at..], at as u64).unwrap_or_else(|| {
-                panic!("stencil `{what}`: bytes at {at:#x} that are no instruction: {:02x?}", &code[at..])
+                panic!(
+                    "stencil `{what}`: bytes at {at:#x} that are no instruction: {:02x?}",
+                    &code[at..]
+                )
             });
             if let Some(why) = refused(self.isa, &text) {
-                self.refusals.borrow_mut().push(format!("stencil `{what}`: `{}` at {at:#x} {why}", text.trim()));
+                self.refusals
+                    .borrow_mut()
+                    .push(format!("stencil `{what}`: `{}` at {at:#x} {why}", text.trim()));
             }
             insts.push(Inst { at, len, text });
             at += len;
@@ -246,11 +263,18 @@ impl<'a> Elf<'a> {
     /// AArch64's `b imm26`), or 0.
     fn tail(&self, code: &[u8], insts: &[Inst], holes: &[Hole]) -> u8 {
         let Some(last) = insts.last() else { return 0 };
-        let next_at = |at: usize| holes.iter().any(|it| it.kind == HoleKind::Next && usize::from(it.at) == at);
+        let next_at = |at: usize| {
+            holes.iter().any(|it| it.kind == HoleKind::Next && usize::from(it.at) == at)
+        };
         match self.isa {
             Isa::X86_64 if last.len == 5 && code[last.at] == 0xe9 && next_at(last.at + 1) => 5,
             Isa::Aarch64 if last.len == 4 && next_at(last.at) => {
-                let insn = u32::from_le_bytes([code[last.at], code[last.at + 1], code[last.at + 2], code[last.at + 3]]);
+                let insn = u32::from_le_bytes([
+                    code[last.at],
+                    code[last.at + 1],
+                    code[last.at + 2],
+                    code[last.at + 3],
+                ]);
                 if insn & 0xfc00_0000 == 0x1400_0000 { 4 } else { 0 }
             }
             _ => 0,
@@ -287,19 +311,21 @@ impl<'a> Elf<'a> {
                 (frame, acc, String::from("q0"), base)
             }
         };
-        for (kind, value, what_value) in
-            [(HoleKind::Result0, &frame, "frame"), (HoleKind::Result1, &acc, "acc"), (HoleKind::Slot0, &facc, "facc")]
-        {
+        for (kind, value, what_value) in [
+            (HoleKind::Result0, &frame, "frame"),
+            (HoleKind::Result1, &acc, "acc"),
+            (HoleKind::Slot0, &facc, "facc"),
+        ] {
             let hole = probe
                 .holes
                 .iter()
                 .find(|it| it.kind == kind)
                 .unwrap_or_else(|| panic!("the {variant} probe has no {kind:?} hole"));
             let at = usize::from(hole.at);
-            let inst = insts
-                .iter()
-                .find(|it| it.at <= at && at < it.at + it.len)
-                .unwrap_or_else(|| panic!("the {variant} probe's {kind:?} hole is in no instruction"));
+            let inst =
+                insts.iter().find(|it| it.at <= at && at < it.at + it.len).unwrap_or_else(|| {
+                    panic!("the {variant} probe's {kind:?} hole is in no instruction")
+                });
             let text = inst.text.split_whitespace().collect::<Vec<_>>().join(" ");
             if !text.contains(&format!("{value}, ")) || !text.contains(&base) {
                 panic!(
@@ -357,7 +383,8 @@ fn refused(isa: Isa, text: &str) -> Option<&'static str> {
         Isa::X86_64 => text.split('#').next().unwrap_or(""),
         Isa::Aarch64 => text.split("//").next().unwrap_or(""),
     };
-    let mut tokens = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|it| !it.is_empty());
+    let mut tokens =
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|it| !it.is_empty());
     let mnemonic = tokens.next().unwrap_or("");
     let reserved: &[&str] = match isa {
         Isa::X86_64 => &["rsp", "esp", "sp", "spl", "rbp", "ebp", "bp", "bpl"],
@@ -372,13 +399,17 @@ fn refused(isa: Isa, text: &str) -> Option<&'static str> {
                 || mnemonic.starts_with("enter")
                 || mnemonic.starts_with("leave")
         }
-        Isa::Aarch64 => mnemonic == "bl" || mnemonic.starts_with("blr") || mnemonic.starts_with("ret"),
+        Isa::Aarch64 => {
+            mnemonic == "bl" || mnemonic.starts_with("blr") || mnemonic.starts_with("ret")
+        }
     };
     if stack {
         return Some("uses the stack or the link register: a stencil is leaf and stackless");
     }
     if tokens.any(|it| reserved.contains(&it)) {
-        return Some("names a register stencils may not touch (the stack, frame or link register, or x18)");
+        return Some(
+            "names a register stencils may not touch (the stack, frame or link register, or x18)",
+        );
     }
     None
 }

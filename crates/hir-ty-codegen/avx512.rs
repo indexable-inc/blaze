@@ -1,8 +1,9 @@
 //! x86's AVX-512 intrinsics of LLVM that `core::arch` calls (`llvm.x86.avx512.*`, those of
 //! AVX512-FP16 and AVX512-BF16, `llvm.x86.avx512fp16.*` and `llvm.x86.avx512bf16.*`, the VNNI
 //! ones of AVX, `llvm.x86.avx2.vpdp*`, and AVX-NE-CONVERT's, `llvm.x86.vcvtne*` and
-//! `llvm.x86.vbcstne*`): the masked conversions, compares, estimates, truncations,
-//! compressions, complex products and dot products. LLVM defines each as the instruction it
+//! `llvm.x86.vbcstne*`, and the gathers of AVX2 and AVX-512, `llvm.x86.avx2.gather.*` and
+//! `llvm.x86.avx512.gather*`): the masked conversions, compares, estimates, truncations,
+//! compressions, gathers, complex products and dot products. LLVM defines each as the instruction it
 //! selects for it, so that instruction is the lowering that agrees with it in every lane: in
 //! how it rounds, saturates and treats a NaN, a denormal or a lane the mask leaves alone, and
 //! in the reciprocal estimates, whose tables only the hardware has. [`lower`] says which
@@ -23,7 +24,10 @@
 
 use std::fmt;
 
-use hir_ty::{TargetFeature, TargetFeatureSet, intrinsic::SimdOp};
+use hir_ty::{
+    TargetFeature, TargetFeatureSet,
+    intrinsic::{SimdOp, X86Gather},
+};
 use smallvec::SmallVec;
 
 /// An operand of the intrinsic as the code generator has it: its size, whether it is an
@@ -151,6 +155,9 @@ pub(super) fn lower(
     result: u32,
     features: TargetFeatureSet,
 ) -> Option<Result<Lowered, String>> {
+    if let Some(gather) = X86Gather::of(name) {
+        return gathered(name, gather, args, result);
+    }
     let mut words = name.strip_prefix("x86.")?.split('.').collect::<SmallVec<[&str; 8]>>();
     let width = match words.last() {
         Some(&(last @ ("128" | "256" | "512"))) => {
@@ -275,13 +282,8 @@ fn lowered(
             let (x, y) = (arg(a, 0), arg(a, 1));
             // alloc: the stub's text, the output
             let text = format!("vcmp{lanes} k0 {{k4}}, {x}, {y}{sae}, {predicate}");
-            let loads = [
-                Load::Vector(a),
-                Load::Vector(a),
-                Load::Immediate,
-                Load::Mask(k),
-                Load::Immediate,
-            ];
+            let loads =
+                [Load::Vector(a), Load::Vector(a), Load::Immediate, Load::Mask(k), Load::Immediate];
             ok(text, &loads, Out::Mask(k))
         }
         // Whether the low halves compare as the predicate says, as 0 or 1, with whether to
@@ -607,9 +609,7 @@ fn lowered(
                 return None;
             }
             let (mnemonic, bytes) = match (op, lanes.as_bytes()) {
-                ("compress", [b'd' | b'q' | b'w' | b'b']) => {
-                    (Concat(["vpcompress", lanes, ""]), a)
-                }
+                ("compress", [b'd' | b'q' | b'w' | b'b']) => (Concat(["vpcompress", lanes, ""]), a),
                 ("compress", b"ps" | b"pd") => (Concat(["vcompress", lanes, ""]), a),
                 ("compress", _) => return None,
                 (_, &[from, to]) => {
@@ -663,6 +663,74 @@ fn lowered(
         }
         _ => None,
     }
+}
+
+/// The gather `name` is (`X86Gather`, whose comment says what it computes) on operands of the
+/// shapes in `args`, `(src, base, offsets, mask, scale)`, giving `result` bytes: the
+/// instruction itself, which reads only the lanes the mask enables and leaves the others
+/// `src`'s, so its lowering agrees with LLVM's in every lane and in which addresses it touches.
+/// `src` is copied into the result's register first and the instruction merges into it; it
+/// clears its mask, a copy in `k4` (AVX-512) or `xmm4`/`ymm4` (AVX2), as it goes, and its
+/// destination, index (register 3) and mask are three different registers, as it requires.
+fn gathered(
+    name: &str,
+    gather: X86Gather,
+    args: &[Given],
+    result: u32,
+) -> Option<Result<Lowered, String>> {
+    let [src, base, offsets, mask, scale] = args else {
+        return None;
+    };
+    if !base.pointer || src.pointer || offsets.pointer || mask.pointer || result != src.bytes {
+        return None;
+    }
+    let lanes = gather.lanes(src.bytes, offsets.bytes)?;
+    let mask_load = if gather.vector_mask {
+        if mask.bytes != src.bytes {
+            return None;
+        }
+        Load::Vector(mask.bytes)
+    } else {
+        if !matches!(mask.bytes, 1 | 2) || lanes > 8 * mask.bytes {
+            return None;
+        }
+        Load::Mask(mask.bytes)
+    };
+    let scale = match scale.constant {
+        Some(it @ (1 | 2 | 4 | 8)) => it,
+        // alloc: the error's message
+        Some(it) => return Some(Err(format!("`llvm.{name}` of scale {it}"))),
+        // alloc: the error's message
+        None => return Some(Err(format!("`llvm.{name}` of a scale that is not a constant"))),
+    };
+    let mnemonic = match (gather.float, gather.index, gather.lane) {
+        (false, 4, 4) => "vpgatherdd",
+        (false, 4, _) => "vpgatherdq",
+        (false, _, 4) => "vpgatherqd",
+        (false, _, _) => "vpgatherqq",
+        (true, 4, 4) => "vgatherdps",
+        (true, 4, _) => "vgatherdpd",
+        (true, _, 4) => "vgatherqps",
+        (true, _, _) => "vgatherqpd",
+    };
+    let (r, from, index) = (reg(src.bytes, 0), arg(src.bytes, 0), arg(offsets.bytes, 2));
+    // The memory operand has no size: the index register says which form it is.
+    // alloc: the stub's text, the output
+    let text = if gather.vector_mask {
+        let k = arg(mask.bytes, 3);
+        format!("vmovaps {r}, {from}\n{mnemonic} {r}, [r11 + {index}*{scale}], {k}")
+    } else {
+        format!("vmovaps {r}, {from}\n{mnemonic} {r} {{k4}}, [r11 + {index}*{scale}]")
+    };
+    let loads = [
+        Load::Vector(src.bytes),
+        Load::Pointer,
+        Load::Vector(offsets.bytes),
+        mask_load,
+        Load::Immediate,
+    ];
+    // alloc: the stub's loads, the output
+    Some(Ok(Lowered { text, loads: loads.to_vec(), out: Out::Vector(result) }))
 }
 
 /// The instruction LLVM selects for the generic intrinsic `op` of `core::intrinsics::simd`
@@ -925,7 +993,8 @@ mod tests {
     fn describe(cases: &[(&str, &str, u32, &[&str])]) -> String {
         let mut out = String::new();
         for &(name, shape, result, features) in cases {
-            let features = features.iter().map(|it| TargetFeature::from_name(it).unwrap()).collect();
+            let features =
+                features.iter().map(|it| TargetFeature::from_name(it).unwrap()).collect();
             let text = match lower(name, &given(shape), result, features) {
                 Some(Ok(it)) => format!("{} {:?}", it.text.replace('\n', "; "), it.out),
                 Some(Err(e)) => e,
@@ -1081,6 +1150,52 @@ x86.vcvtneoph2ps256: vcvtneoph2ps ymm0, ymmword ptr [r11] Vector(32)
 x86.vbcstnebf162ps128: vbcstnebf162ps xmm0, word ptr [r11] Vector(16)
 ";
         assert_eq!(described, expected);
+    }
+
+    /// Each gather of `core::arch` is its instruction, merging into `src` under the mask (a mask
+    /// register for AVX-512's, a vector for AVX2's), at `base` plus each index times the scale.
+    #[test]
+    fn each_gather_is_the_instruction_llvm_selects() {
+        let described = describe(&[
+            ("x86.avx512.gather.qpq.512", "64 p 64 1 4=8", 64, &[]),
+            ("x86.avx512.gather.dps.512", "64 p 64 2 4=4", 64, &[]),
+            ("x86.avx512.gather.dpd.512", "64 p 32 1 4=8", 64, &[]),
+            ("x86.avx512.gather.qpi.512", "32 p 64 1 4=1", 32, &[]),
+            ("x86.avx512.gather3div4.sf", "16 p 16 1 4=2", 16, &[]),
+            ("x86.avx512.gather3siv4.di", "32 p 16 1 4=8", 32, &[]),
+            ("x86.avx2.gather.d.d.256", "32 p 32 32 1=4", 32, &[]),
+            ("x86.avx2.gather.q.d.256", "16 p 32 16 1=4", 16, &[]),
+            ("x86.avx2.gather.d.pd", "16 p 16 16 1=1", 16, &[]),
+            ("x86.avx512.gather.qpq.512", "64 p 64 1 4=3", 64, &[]),
+            ("x86.avx512.gather.qpq.512", "64 p 64 1 4", 64, &[]),
+            ("x86.avx512.gather.qps.512", "64 p 64 1 4=4", 64, &[]),
+        ]);
+        let expected = "\
+x86.avx512.gather.qpq.512: vmovaps zmm0, zmm1; vpgatherqq zmm0 {k4}, [r11 + zmm3*8] Vector(64)
+x86.avx512.gather.dps.512: vmovaps zmm0, zmm1; vgatherdps zmm0 {k4}, [r11 + zmm3*4] Vector(64)
+x86.avx512.gather.dpd.512: vmovaps zmm0, zmm1; vgatherdpd zmm0 {k4}, [r11 + ymm3*8] Vector(64)
+x86.avx512.gather.qpi.512: vmovaps ymm0, ymm1; vpgatherqd ymm0 {k4}, [r11 + zmm3*1] Vector(32)
+x86.avx512.gather3div4.sf: vmovaps xmm0, xmm1; vgatherqps xmm0 {k4}, [r11 + xmm3*2] Vector(16)
+x86.avx512.gather3siv4.di: vmovaps ymm0, ymm1; vpgatherdq ymm0 {k4}, [r11 + xmm3*8] Vector(32)
+x86.avx2.gather.d.d.256: vmovaps ymm0, ymm1; vpgatherdd ymm0, [r11 + ymm3*4], ymm4 Vector(32)
+x86.avx2.gather.q.d.256: vmovaps xmm0, xmm1; vpgatherqd xmm0, [r11 + ymm3*4], xmm4 Vector(16)
+x86.avx2.gather.d.pd: vmovaps xmm0, xmm1; vgatherdpd xmm0, [r11 + xmm3*1], xmm4 Vector(16)
+x86.avx512.gather.qpq.512: `llvm.x86.avx512.gather.qpq.512` of scale 3
+x86.avx512.gather.qpq.512: `llvm.x86.avx512.gather.qpq.512` of a scale that is not a constant
+x86.avx512.gather.qps.512: none
+";
+        assert_eq!(described, expected);
+        let loads = |name: &str, shape: &str, result: u32| {
+            lower(name, &given(shape), result, TargetFeatureSet::EMPTY).unwrap().unwrap().loads
+        };
+        assert_eq!(
+            loads("x86.avx512.gather.qpq.512", "64 p 64 1 4=8", 64),
+            [Load::Vector(64), Load::Pointer, Load::Vector(64), Load::Mask(1), Load::Immediate],
+        );
+        assert_eq!(
+            loads("x86.avx2.gather.q.q", "16 p 16 16 1=2", 16),
+            [Load::Vector(16), Load::Pointer, Load::Vector(16), Load::Vector(16), Load::Immediate],
+        );
     }
 
     #[test]

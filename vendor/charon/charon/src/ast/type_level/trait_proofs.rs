@@ -7,13 +7,37 @@ use serde_state::{DeserializeState, SerializeState};
 /// A proof of a trait predicate.
 ///
 /// This type is hash-consed, `TraitRefContents` contains the actual data.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde_state(state_implements = DedupSerializerState)] // Avoid corecursive impls due to perfect derive
 pub struct TraitRef(pub HashConsed<WithCachedTypeInfo<TraitRefContents>>);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct TraitRefContents {
     pub kind: TraitRefKind,
     /// The predicate that is proven by that trait proof.
@@ -22,8 +46,20 @@ pub struct TraitRefContents {
 }
 
 /// A proof of a higher-ranked trait predicate.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct PolyTraitRef(pub RegionBinder<TraitRef>);
 
 /// Identifier of a trait instance.
@@ -33,9 +69,21 @@ pub struct PolyTraitRef(pub RegionBinder<TraitRef>);
 /// definition. Note that every path designated by `TraitInstanceId` refers
 /// to a *trait instance*, which is why the [`TraitRefKind::Clause`] variant may seem redundant
 /// with some of the other variants.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum TraitRefKind {
     /// A specific top-level implementation item.
     TraitImpl(TraitImplRef),
@@ -144,8 +192,20 @@ pub enum TraitRefKind {
 
 /// Describes a built-in impl. Mostly lists the implemented trait, sometimes with more details
 /// about the contents of the implementation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("Builtin"))]
 pub enum BuiltinImplData {
     /// Auto traits (defined with `auto trait ...`, also `Unpin`).
@@ -192,11 +252,7 @@ pub enum BuiltinImplData {
 
 impl TraitRef {
     pub fn new(kind: TraitRefKind, trait_decl_ref: TraitDeclRef) -> Self {
-        TraitRefContents {
-            kind,
-            trait_decl_ref,
-        }
-        .intern()
+        TraitRefContents { kind, trait_decl_ref }.intern()
     }
 
     pub fn trait_id(&self) -> TraitDeclId {
@@ -217,10 +273,8 @@ impl TraitRef {
         clause_id: TraitClauseId,
     ) -> Option<PolyTraitRef> {
         let trait_decl = krate.trait_decls.get(self.trait_id())?;
-        let trait_decl_ref = trait_decl.implied_clauses[clause_id]
-            .trait_
-            .clone()
-            .substitute_with_tref(&self);
+        let trait_decl_ref =
+            trait_decl.implied_clauses[clause_id].trait_.clone().substitute_with_tref(&self);
         let regions = trait_decl_ref.identity_region_args();
         Some(PolyTraitRef(trait_decl_ref.map(|pred| {
             let kind = TraitRefKind::ParentClause(self.move_under_binder(), clause_id, regions);
@@ -230,10 +284,9 @@ impl TraitRef {
 
     pub fn vtable_ref<'a>(&'a self, krate: &'a TranslatedCrate) -> Option<&'a GlobalDeclRef> {
         match &self.kind {
-            TraitRefKind::TraitImpl(impl_ref) => krate
-                .trait_impls
-                .get(impl_ref.id)
-                .and_then(|timpl| timpl.vtable.as_v_table()),
+            TraitRefKind::TraitImpl(impl_ref) => {
+                krate.trait_impls.get(impl_ref.id).and_then(|timpl| timpl.vtable.as_v_table())
+            }
             TraitRefKind::BuiltinOrAuto { vtable, .. } => vtable.as_ref(),
             _ => None,
         }
@@ -279,11 +332,7 @@ impl PolyTraitRef {
     }
 
     pub fn vtable_ref<'a>(&'a self, krate: &'a TranslatedCrate) -> Option<GlobalDeclRef> {
-        Some(
-            self.0
-                .map_ref_opt(|tref| tref.vtable_ref(krate).cloned())?
-                .erase(),
-        )
+        Some(self.0.map_ref_opt(|tref| tref.vtable_ref(krate).cloned())?.erase())
     }
 }
 

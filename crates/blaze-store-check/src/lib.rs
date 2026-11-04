@@ -113,7 +113,8 @@ impl Setting {
         if self.rate >= 1.0 {
             return true;
         }
-        let drawn = Hasher::new(SAMPLE_DOMAIN).update(&self.seed.to_le_bytes()).id(identity).finish();
+        let drawn =
+            Hasher::new(SAMPLE_DOMAIN).update(&self.seed.to_le_bytes()).id(identity).finish();
         let word = u64::from_le_bytes(drawn.0[..8].try_into().expect("eight bytes"));
         // `rate * 2^64`, below `2^64` as the rate is below one.
         (word as f64) < self.rate * 18_446_744_073_709_551_616.0
@@ -212,7 +213,11 @@ impl std::error::Error for Mismatch {}
 pub enum VerifyError {
     Mismatch(Mismatch),
     /// Computing it again failed, where the store had a value.
-    Recompute { function: String, identity: ContentId, why: String },
+    Recompute {
+        function: String,
+        identity: ContentId,
+        why: String,
+    },
 }
 
 impl fmt::Display for VerifyError {

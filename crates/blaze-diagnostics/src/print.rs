@@ -43,7 +43,10 @@ pub(crate) fn solver_ty_untrimmed(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
 }
 
 /// Generic arguments as rustc's `Itertools::join(", ")` of each prints them: `'a, T, 3`.
-pub(crate) fn solver_args<'db>(cx: &Cx<'_, 'db>, args: &[hir_ty::next_solver::GenericArg<'db>]) -> String {
+pub(crate) fn solver_args<'db>(
+    cx: &Cx<'_, 'db>,
+    args: &[hir_ty::next_solver::GenericArg<'db>],
+) -> String {
     let mut p = Printer::diagnostic(cx.db, cx, Mode::NORMAL, false);
     p.comma_sep_args(args);
     p.finish()
@@ -72,13 +75,20 @@ pub fn ty_untrimmed(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
 /// and printed from `named` (the same type with each variable made for a parameter named by it,
 /// rustc's `ty_infer_name_resolver`; `undecided` when hir does not say), a function item as its
 /// signature.
-pub fn let_type<'db>(cx: &Cx<'_, 'db>, undecided: &hir::Type<'db>, named: Option<&hir::Type<'db>>) -> String {
+pub fn let_type<'db>(
+    cx: &Cx<'_, 'db>,
+    undecided: &hir::Type<'db>,
+    named: Option<&hir::Type<'db>>,
+) -> String {
     let interner = DbInterner::new_with(cx.db, cx.krate.into());
     let undecided = undecided.to_next_solver();
     let named = named.map_or(undecided, hir::Type::to_next_solver);
     let ty = erase::erase(cx.db, interner, undecided, named);
     let ty = match ty.kind() {
-        TyKind::FnDef(..) => Ty::new_fn_ptr(interner, ty.callable_sig(interner).expect("a function item has a signature")),
+        TyKind::FnDef(..) => Ty::new_fn_ptr(
+            interner,
+            ty.callable_sig(interner).expect("a function item has a signature"),
+        ),
         _ => ty,
     };
     ty_in(cx, ty, Mode::NORMAL)

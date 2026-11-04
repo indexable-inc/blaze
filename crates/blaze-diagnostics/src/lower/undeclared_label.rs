@@ -40,18 +40,32 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UndeclaredLabel) -> Vec<Found> {
 }
 
 /// rustc's `UndeclaredLabel`.
-fn undeclared(cx: &Cx<'_, '_>, span: crate::model::Span, name: &str, similar: Option<Similar>) -> Diag {
+fn undeclared(
+    cx: &Cx<'_, '_>,
+    span: crate::model::Span,
+    name: &str,
+    similar: Option<Similar>,
+) -> Diag {
     // alloc: clone: the error's parts, for an error hir found
-    let mut diag = Diag::error(Some("E0426"), format!("use of undeclared label `{name}`"), span.clone());
+    let mut diag =
+        Diag::error(Some("E0426"), format!("use of undeclared label `{name}`"), span.clone());
     // alloc: clone: the error's parts, for an error hir found
     diag.span_label(span.clone(), format!("undeclared label `{name}`"));
     match similar {
         Some(similar) if similar.reachable => {
             diag.span_label(cx.span(similar.at), "a label with a similar name is reachable");
-            diag.suggestion(span, "try using similarly named label", similar.name, Applicability::MaybeIncorrect);
+            diag.suggestion(
+                span,
+                "try using similarly named label",
+                similar.name,
+                Applicability::MaybeIncorrect,
+            );
         }
         Some(similar) => {
-            diag.span_label(cx.span(similar.at), "a label with a similar name exists but is unreachable");
+            diag.span_label(
+                cx.span(similar.at),
+                "a label with a similar name exists but is unreachable",
+            );
         }
         None => {}
     }
@@ -84,7 +98,11 @@ enum Rib<'t> {
 /// one is similar only in the same syntax context (`eq_ctxt`). The ribs are read as the walk
 /// goes up, innermost first, and it stops at the label used; a label's syntax context is
 /// looked up only when its name is the one used or like it.
-pub(crate) fn resolve<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, name: &str) -> Resolution {
+pub(crate) fn resolve<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<ast::Node<'db>>,
+    name: &str,
+) -> Resolution {
     let used = ctxt(cx, node.file_id, node.value.text_range());
     let used_hygiene = used.opaque_and_semiopaque(cx.db);
     let mut similar: Option<Similar> = None;
@@ -153,7 +171,8 @@ fn rib<'t>(it: ast::Node<'t>, child: ast::Node<'_>) -> Option<Rib<'t>> {
                 || ast::Static::can_cast(it.kind())
                 || ast::ConstArg::can_cast(it.kind())
                 || ast::ArrayExpr::cast(it).is_some_and(|array| {
-                    array.semicolon_token().is_some() && array.exprs().nth(1).is_some_and(|len| len.syntax() == child)
+                    array.semicolon_token().is_some()
+                        && array.exprs().nth(1).is_some_and(|len| len.syntax() == child)
                 });
             barrier.then_some(Rib::Barrier)
         }

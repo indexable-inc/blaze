@@ -172,9 +172,7 @@ impl core::ops::Add<Duration> for Instant {
     /// The instant `rhs` after this one, saturating at the clock's maximum
     /// representable point.
     fn add(self, rhs: Duration) -> Instant {
-        Instant {
-            nanos: self.nanos.saturating_add(duration_nanos(rhs)),
-        }
+        Instant { nanos: self.nanos.saturating_add(duration_nanos(rhs)) }
     }
 }
 
@@ -184,9 +182,7 @@ impl core::ops::Sub<Duration> for Instant {
     /// The instant `rhs` before this one, saturating at the clock's zero
     /// point.
     fn sub(self, rhs: Duration) -> Instant {
-        Instant {
-            nanos: self.nanos.saturating_sub(duration_nanos(rhs)),
-        }
+        Instant { nanos: self.nanos.saturating_sub(duration_nanos(rhs)) }
     }
 }
 

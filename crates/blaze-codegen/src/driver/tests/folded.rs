@@ -71,7 +71,11 @@ impl Prepare for Merging {
     }
 
     fn masked(&self, _: &Unit, prepared: &Prepared, _: &crate::template::Refs) -> Option<Masked> {
-        (prepared.body == 0x22).then(|| Masked { shape: vec![0xf0], constants: vec![fold::Constant::Place(0)], size: 100 })
+        (prepared.body == 0x22).then(|| Masked {
+            shape: vec![0xf0],
+            constants: vec![fold::Constant::Place(0)],
+            size: 100,
+        })
     }
 
     fn merge(
@@ -84,7 +88,12 @@ impl Prepare for Merging {
         let body = compiled(key, vec![0xf0], Vec::new());
         let thunks = (members.iter())
             .map(|(unit, ..)| {
-                let call = crate::Relocation { at: 1, kind: RelocKind::PcRel32, target: Target::Direct(key), addend: -4 };
+                let call = crate::Relocation {
+                    at: 1,
+                    kind: RelocKind::PcRel32,
+                    target: Target::Direct(key),
+                    addend: -4,
+                };
                 compiled(unit.instance.key(), vec![0xe9, 0, 0, 0, 0], vec![call])
             })
             .collect();
@@ -115,7 +124,8 @@ fn a_landed_group_holds_every_thunk_it_is_asked_for() {
         let mut program = program();
         let (machine, memo) = (Merging::default(), Memo::new());
         let mut store = Store::default();
-        let first = Build::new(&machine, &program, &policy, &memo).run(&[(1, member())], &store).unwrap();
+        let first =
+            Build::new(&machine, &program, &policy, &memo).run(&[(1, member())], &store).unwrap();
         assert_eq!(first.stats.folded, 2, "2 and 3 fold");
         assert_eq!(machine.merged.load(Ordering::Relaxed), 1);
         store.keep(&first.puts);
@@ -124,6 +134,10 @@ fn a_landed_group_holds_every_thunk_it_is_asked_for() {
         let again = Build::new(&machine, &program, &policy, &memo).run(&[(1, member())], &store);
         let again = again.unwrap_or_else(|errors| panic!("f{edited} edited: {errors:?}"));
         assert_eq!(again.stats.folded, 2, "f{edited} edited: 2 and 3 fold");
-        assert_eq!(machine.merged.load(Ordering::Relaxed), 2, "f{edited} edited: its thunk is merged again");
+        assert_eq!(
+            machine.merged.load(Ordering::Relaxed),
+            2,
+            "f{edited} edited: its thunk is merged again"
+        );
     }
 }

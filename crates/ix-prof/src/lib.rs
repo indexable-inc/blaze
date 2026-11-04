@@ -40,7 +40,9 @@ pub mod core;
 pub mod endpoint;
 #[cfg(all(feature = "http", unix))]
 pub mod http;
+pub mod images;
 pub mod ixprof;
+pub mod jit;
 pub mod json;
 #[cfg(feature = "layer")]
 pub mod layer;
@@ -117,12 +119,19 @@ impl Default for Config {
 #[derive(Debug)]
 pub enum Error {
     /// A variable has a value ix-prof cannot read.
-    Var { var: &'static str, value: String, why: &'static str },
+    Var {
+        var: &'static str,
+        value: String,
+        why: &'static str,
+    },
     /// The sampler cannot run here, and the config asks for it.
     Sampler(String),
     AlreadyStarted,
     Http(String),
-    Write { path: PathBuf, why: String },
+    Write {
+        path: PathBuf,
+        why: String,
+    },
     Format(String),
 }
 
@@ -252,7 +261,9 @@ pub fn start(config: Config) -> Result<Guard, Error> {
     }
     #[cfg(not(feature = "http"))]
     if config.http.is_some() {
-        return Err(Error::Http(format!("{VAR_HTTP} is set but ix-prof was built without its `http` feature")));
+        return Err(Error::Http(format!(
+            "{VAR_HTTP} is set but ix-prof was built without its `http` feature"
+        )));
     }
     #[cfg(not(feature = "sampler"))]
     if config.cpu_hz.is_some() {
@@ -289,32 +300,34 @@ pub fn start(config: Config) -> Result<Guard, Error> {
         symbolized: true,
         labels: config.labels.iter().cloned().collect(),
     };
-    let recorder = Arc::new(Mutex::new(core::Recorder::new(pid, &program, meta, config.limits.clone())));
+    let recorder =
+        Arc::new(Mutex::new(core::Recorder::new(pid, &program, meta, config.limits.clone())));
     let id = live::session_id(pid, start_ns, start_unix_ns, nonce());
     let log = live::Log::new(id.clone(), config.retain_bytes);
     #[cfg(feature = "sampler")]
     let sampler = match config.cpu_hz {
         Some(hz) => {
             let into = Arc::clone(&recorder);
-            let sink: sampler::Sink = Arc::new(move |samples: &[sampler::Sample], names: &[(u64, String)]| {
-                alloc::quiet(|| {
-                    let mut r = into.lock();
-                    for (tid, name) in names {
-                        r.thread(*tid, Some(name));
-                    }
-                    for s in samples {
-                        let span_id = r.innermost(s.tid);
-                        r.cpu_sample(core::RawSample {
-                            thread: s.tid,
-                            t_ns: s.t_ns,
-                            pcs: s.pcs().to_vec(),
-                            span_id,
-                            on_cpu: s.on_cpu,
-                            weight_ns: s.weight_ns,
-                        });
-                    }
+            let sink: sampler::Sink =
+                Arc::new(move |samples: &[sampler::Sample], names: &[(u64, String)]| {
+                    alloc::quiet(|| {
+                        let mut r = into.lock();
+                        for (tid, name) in names {
+                            r.thread(*tid, Some(name));
+                        }
+                        for s in samples {
+                            let span_id = r.innermost(s.tid);
+                            r.cpu_sample(core::RawSample {
+                                thread: s.tid,
+                                t_ns: s.t_ns,
+                                pcs: s.pcs().to_vec(),
+                                span_id,
+                                on_cpu: s.on_cpu,
+                                weight_ns: s.weight_ns,
+                            });
+                        }
+                    });
                 });
-            });
             let it = sampler::start(hz, sink).map_err(|why| Error::Sampler(why.0))?;
             recorder.lock().meta_mut().cpu_sampler = format!("on: {hz} Hz, {}", it.how);
             Some(it)
@@ -509,7 +522,10 @@ impl Guard {
             let mut recorder = session.recorder.lock();
             recorder.advance_clock(clock::now_ns());
             let mut symbols = symbols::Symbolizer::new();
-            (recorder.snapshot(None, None, &mut symbols).to_ixprof(), recorder.meta_mut().program.clone())
+            (
+                recorder.snapshot(None, None, &mut symbols).to_ixprof(),
+                recorder.meta_mut().program.clone(),
+            )
         });
         let bytes = bytes.map_err(|it| Error::Format(it.to_string()))?;
         let name = profile_name(&program, std::process::id(), &session.id);
@@ -563,7 +579,11 @@ fn drain_allocs(session: &Session) {
     }
     if untracked > seen("alloc_untracked") {
         let n = untracked - seen("alloc_untracked");
-        r.drop_records("alloc_untracked", n, "the table of sampled blocks was full: their frees are not seen");
+        r.drop_records(
+            "alloc_untracked",
+            n,
+            "the table of sampled blocks was full: their frees are not seen",
+        );
     }
 }
 
@@ -576,7 +596,10 @@ fn ticker(session: &Session) {
         live::Encoder::new(log.session.clone(), std::process::id())
     };
     while !session.stop.load(Ordering::Relaxed) {
-        #[allow(clippy::disallowed_methods, reason = "the ticker thread's own timer, a driver's: no pool thread or job waits here, and `halt` unparks it")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the ticker thread's own timer, a driver's: no pool thread or job waits here, and `halt` unparks it"
+        )]
         std::thread::park_timeout(session.config.tick);
         alloc::quiet(|| {
             drain_allocs(session);
@@ -599,7 +622,9 @@ fn ticker(session: &Session) {
                     e.1 = "evicted from the recorder before the live stream took it".to_owned();
                 }
                 match encoder.tick(&delta, &mut symbols) {
-                    Ok(tick) => session.log.lock().push(tick, now, &dropped, delta.open_spans.len()),
+                    Ok(tick) => {
+                        session.log.lock().push(tick, now, &dropped, delta.open_spans.len())
+                    }
                     Err(why) => eprintln!("ix-prof: live batch: {why}"),
                 }
             }

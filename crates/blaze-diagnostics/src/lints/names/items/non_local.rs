@@ -75,10 +75,16 @@ impl Owner<'_> {
                 _ => "async closure",
             };
         }
-        let in_assoc = || node.parent().and_then(|it| it.parent()).is_some_and(|it| matches!(it.kind(), SyntaxKind::IMPL | SyntaxKind::TRAIT));
+        let in_assoc = || {
+            node.parent()
+                .and_then(|it| it.parent())
+                .is_some_and(|it| matches!(it.kind(), SyntaxKind::IMPL | SyntaxKind::TRAIT))
+        };
         match node.kind() {
             SyntaxKind::FN if in_assoc() => {
-                let method = ast::Fn::cast(node).and_then(|it| it.param_list()).is_some_and(|it| it.self_param().is_some());
+                let method = ast::Fn::cast(node)
+                    .and_then(|it| it.param_list())
+                    .is_some_and(|it| it.self_param().is_some());
                 if method { "method" } else { "associated function" }
             }
             SyntaxKind::FN => "function",
@@ -88,7 +94,9 @@ impl Owner<'_> {
             SyntaxKind::CLOSURE_EXPR => "closure",
             SyntaxKind::BLOCK_EXPR => {
                 let block = ast::BlockExpr::cast(node);
-                let coroutine = block.filter(|it| it.const_token().is_none()).map(|it| (it.async_token().is_some(), it.gen_token().is_some()));
+                let coroutine = block
+                    .filter(|it| it.const_token().is_none())
+                    .map(|it| (it.async_token().is_some(), it.gen_token().is_some()));
                 match coroutine {
                     Some((true, true)) => "async gen block",
                     Some((false, true)) => "gen block",
@@ -132,7 +140,9 @@ impl Owner<'_> {
             SyntaxKind::FN | SyntaxKind::CONST | SyntaxKind::STATIC => super::def_span(node),
             SyntaxKind::CLOSURE_EXPR => closure_decl_range_view(node),
             SyntaxKind::BLOCK_EXPR => match ast::BlockExpr::cast(node) {
-                Some(it) if it.const_token().is_some() => it.stmt_list().map_or(item_range_view(node), |it| it.syntax().text_range()),
+                Some(it) if it.const_token().is_some() => {
+                    it.stmt_list().map_or(item_range_view(node), |it| it.syntax().text_range())
+                }
                 _ => item_range_view(node),
             },
             _ => node.text_range(),
@@ -161,7 +171,9 @@ fn owners<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Owners<'db> {
             SyntaxKind::FN => {
                 let f = ast::Fn::cast(it);
                 let body = f.and_then(|it| it.body()).is_some_and(|it| it.syntax() == child);
-                if body && f.is_some_and(|it| it.async_token().is_some() || it.gen_token().is_some()) {
+                if body
+                    && f.is_some_and(|it| it.async_token().is_some() || it.gen_token().is_some())
+                {
                     found.push(Owner { node: ancestor, inner: true, kind: Kind::Body, body: true });
                 }
                 found.push(owner(if body { Kind::Body } else { Kind::Other }, body));
@@ -178,30 +190,46 @@ fn owners<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Owners<'db> {
                 found.push(owner(kind, body));
             }
             SyntaxKind::STATIC => {
-                let body = ast::Static::cast(it).and_then(|it| it.body()).is_some_and(|it| it.syntax() == child);
+                let body = ast::Static::cast(it)
+                    .and_then(|it| it.body())
+                    .is_some_and(|it| it.syntax() == child);
                 found.push(owner(if body { Kind::Body } else { Kind::Other }, body));
             }
             SyntaxKind::CLOSURE_EXPR => {
                 let closure = ast::ClosureExpr::cast(it);
                 let body = closure.and_then(|it| it.body()).is_some_and(|it| it.syntax() == child);
-                if body && closure.is_some_and(|it| it.async_token().is_some() || it.gen_token().is_some()) {
+                if body
+                    && closure
+                        .is_some_and(|it| it.async_token().is_some() || it.gen_token().is_some())
+                {
                     found.push(Owner { node: ancestor, inner: true, kind: Kind::Body, body: true });
                 }
                 found.push(owner(Kind::Body, body));
             }
             SyntaxKind::BLOCK_EXPR => {
                 let block = ast::BlockExpr::cast(it);
-                let def = block.is_some_and(|it| it.const_token().is_some() || it.async_token().is_some() || it.gen_token().is_some());
+                let def = block.is_some_and(|it| {
+                    it.const_token().is_some()
+                        || it.async_token().is_some()
+                        || it.gen_token().is_some()
+                });
                 if def {
                     found.push(owner(Kind::Body, true));
                 }
             }
             SyntaxKind::CONST_ARG => found.push(owner(Kind::Body, true)),
             // A repeat count.
-            SyntaxKind::ARRAY_EXPR if ast::ArrayExpr::cast(it).is_some_and(|it| it.semicolon_token().is_some()) => {
+            SyntaxKind::ARRAY_EXPR
+                if ast::ArrayExpr::cast(it).is_some_and(|it| it.semicolon_token().is_some()) =>
+            {
                 let count = it.children().filter(|it| ast::Expr::can_cast(it.kind())).nth(1);
                 if count == Some(child) {
-                    found.push(Owner { node: ancestor.with_value(child), inner: false, kind: Kind::Body, body: true });
+                    found.push(Owner {
+                        node: ancestor.with_value(child),
+                        inner: false,
+                        kind: Kind::Body,
+                        body: true,
+                    });
                 }
             }
             SyntaxKind::IMPL
@@ -250,7 +278,11 @@ fn impl_<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, imp: ast::Impl<'db>) -> Option
     let mut paths: SmallVec<[(ast::Path<'db>, Option<PathResolution<'_>>); 4]> = SmallVec::new();
     let roots = std::iter::once(self_ty.syntax()).chain(imp.trait_().map(|it| it.syntax()));
     for root in roots {
-        for path in root.descendants().filter(|it| it.kind() == SyntaxKind::PATH).filter_map(ast::Path::cast) {
+        for path in root
+            .descendants()
+            .filter(|it| it.kind() == SyntaxKind::PATH)
+            .filter_map(ast::Path::cast)
+        {
             if path.syntax().parent().is_some_and(|it| ast::Path::can_cast(it.kind())) {
                 continue;
             }
@@ -280,7 +312,8 @@ fn impl_<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, imp: ast::Impl<'db>) -> Option
     let start = item_range_view(imp.syntax()).start();
     let end = self_ty.syntax().text_range().end();
     let message = "non-local `impl` definition, `impl` blocks should be written at the same level as their item";
-    let mut diag = Diag::lint("non_local_definitions", message, span(TextRange::new(start, end.max(start))));
+    let mut diag =
+        Diag::lint("non_local_definitions", message, span(TextRange::new(start, end.max(start))));
     for (path, _) in &paths {
         diag.span_label(span(without_args(*path)), format!("`{}` is not local", last_name(*path))); // alloc: a lint that fires
     }
@@ -294,20 +327,33 @@ fn impl_<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, imp: ast::Impl<'db>) -> Option
         && let Some(expansion) = cx.expansion_of(call)
     {
         // alloc: a lint that fires
-        diag.note(format!("the {} `{}` defines the non-local `impl`, and may need to be changed", expansion.kind.descr(), expansion.name));
+        diag.note(format!(
+            "the {} `{}` defines the non-local `impl`, and may need to be changed",
+            expansion.kind.descr(),
+            expansion.name
+        ));
     }
     diag.note("an `impl` is never scoped, even when it is nested inside an item, as it may impact type checking outside of that item, which can be the case if neither the trait or the self type are at the same nesting level as the `impl`");
     let parent_node = parent.node.value;
-    let const_or_static = !parent.inner && matches!(parent_node.kind(), SyntaxKind::CONST | SyntaxKind::STATIC);
+    let const_or_static =
+        !parent.inner && matches!(parent_node.kind(), SyntaxKind::CONST | SyntaxKind::STATIC);
     if const_or_static {
         diag.note("items in an anonymous const item (`const _: () = { ... }`) are treated as in the same scope as the anonymous const's declaration for the purpose of this lint");
-        let named_unit = ast::Const::cast(parent_node).filter(|it| it.underscore_token().is_none()).and_then(|it| {
-            let unit = matches!(it.ty(), Some(ast::Type::TupleType(t)) if t.fields().next().is_none());
-            if unit { it.name() } else { None }
-        });
+        let named_unit = ast::Const::cast(parent_node)
+            .filter(|it| it.underscore_token().is_none())
+            .and_then(|it| {
+                let unit =
+                    matches!(it.ty(), Some(ast::Type::TupleType(t)) if t.fields().next().is_none());
+                if unit { it.name() } else { None }
+            });
         if let Some(name) = named_unit {
             let at = cx.span(parent.node.with_value(name.syntax().text_range()));
-            diag.suggestion(at, "use a const-anon item to suppress this lint", "_", Applicability::MachineApplicable);
+            diag.suggestion(
+                at,
+                "use a const-anon item to suppress this lint",
+                "_",
+                Applicability::MachineApplicable,
+            );
         }
     }
     if let Some((id, _)) = super::item_id(cx, item) {
@@ -316,7 +362,11 @@ fn impl_<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, imp: ast::Impl<'db>) -> Option
     Some(Found::lint(diag, Phase::Late, item.ptr()))
 }
 
-fn macro_rules<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, rules: ast::MacroRules<'db>) -> Option<Found> {
+fn macro_rules<'db>(
+    cx: &Cx<'_, 'db>,
+    item: &Item<'db>,
+    rules: ast::MacroRules<'db>,
+) -> Option<Found> {
     walk::attr(cx, rules, "macro_export")?;
     let owners = owners(cx, item.syntax());
     let depth = depth(&owners);

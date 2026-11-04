@@ -441,7 +441,9 @@ fn apply(
         // asked of which impls it sees may cover other crates. Any other fact is keyed by no
         // asker (`goals::fact_ref_key`), its value one for every crate.
         Rule::FactValue => match arg::<FactRefKey<'_>>(db, key) {
-            Some(it) if it.seen_by(db).is_none_or(|krate| krate == def.krate(db)) => Some(it.fact(db)),
+            Some(it) if it.seen_by(db).is_none_or(|krate| krate == def.krate(db)) => {
+                Some(it.fact(db))
+            }
             _ => None,
         },
         Rule::DepCrate(of) => match crate_of_args(db, key, of) {

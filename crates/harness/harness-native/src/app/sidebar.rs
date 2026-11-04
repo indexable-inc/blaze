@@ -51,7 +51,14 @@ impl Default for TreeScroll {
     }
 }
 
-fn config(w: f32, viewport: f32, content: f32, origin: f32, rev: usize, points_per_pixel: f64) -> SurfaceConfig {
+fn config(
+    w: f32,
+    viewport: f32,
+    content: f32,
+    origin: f32,
+    rev: usize,
+    points_per_pixel: f64,
+) -> SurfaceConfig {
     SurfaceConfig {
         viewport: Vec2::new(f64::from(w), f64::from(viewport)),
         content: Vec2::new(f64::from(w), f64::from(content)),
@@ -96,7 +103,9 @@ impl App {
 
     /// Whether the pointer is over the sidebar's tree (and the sidebar is open).
     fn over_tree(&self) -> bool {
-        let Some(l) = self.world.entity_from_id(self.ids.tree).try_cloned::<&Laid>() else { return false };
+        let Some(l) = self.world.entity_from_id(self.ids.tree).try_cloned::<&Laid>() else {
+            return false;
+        };
         let (x, y) = (self.pointer.x, self.pointer.y);
         self.side_open && x >= l.x && x < l.x + l.w && y >= l.y && y < l.y + l.h
     }
@@ -108,7 +117,8 @@ impl App {
         let tree = w.entity_from_id(self.ids.tree);
         let Some(l) = tree.try_cloned::<&Laid>().filter(|l| l.h > 0.0) else { return };
         let kids = harness_native_ui_node_api::children(tree);
-        let rows: Vec<Laid> = kids.iter().filter_map(|c| c.try_cloned::<&Laid>()).filter(|r| r.h > 0.0).collect();
+        let rows: Vec<Laid> =
+            kids.iter().filter_map(|c| c.try_cloned::<&Laid>()).filter(|r| r.h > 0.0).collect();
         let content = match (rows.first(), rows.last()) {
             (Some(a), Some(b)) => b.y + b.h - a.y,
             _ => 0.0,
@@ -118,7 +128,9 @@ impl App {
         let sel = self.selected();
         if sel != self.tree.shown_sel {
             let name = sel.map(|e| format!("select:{e}"));
-            let row = kids.iter().find(|c| c.try_cloned::<&Action>().is_some_and(|a| Some(a.name.as_str()) == name.as_deref()));
+            let row = kids.iter().find(|c| {
+                c.try_cloned::<&Action>().is_some_and(|a| Some(a.name.as_str()) == name.as_deref())
+            });
             match row.and_then(|r| r.try_cloned::<&Laid>()).filter(|r| r.h > 0.0) {
                 Some(r) => {
                     self.tree.shown_sel = sel;
@@ -159,7 +171,14 @@ impl App {
         self.tree.viewport = l.h;
         self.tree.content = content;
         let t = self.tree.clock.elapsed().as_secs_f64();
-        self.tree.engine.configure(config(l.w, l.h, content, origin, self.tree.rev, 1.0 / f64::from(self.grid.scale.max(0.5))));
+        self.tree.engine.configure(config(
+            l.w,
+            l.h,
+            content,
+            origin,
+            self.tree.rev,
+            1.0 / f64::from(self.grid.scale.max(0.5)),
+        ));
         self.tree.engine.advance(t);
         let y = self.tree.engine.report().y as f32;
         let moving = self.tree.engine.needs_frame() || self.tree.glide.is_some();
@@ -197,7 +216,11 @@ impl App {
             return;
         }
         let since = self.time - self.tree.active_at;
-        let alpha = if since < KNOB_HOLD { 1.0 } else { 1.0 - ((since - KNOB_HOLD) / KNOB_FADE).clamp(0.0, 1.0) };
+        let alpha = if since < KNOB_HOLD {
+            1.0
+        } else {
+            1.0 - ((since - KNOB_HOLD) / KNOB_FADE).clamp(0.0, 1.0)
+        };
         if alpha <= 0.0 {
             return;
         }
@@ -211,6 +234,12 @@ impl App {
         let fill = crate::look::tone(w, "knob");
         let ink = rgba(if self.dark { fill.dark } else { fill.light });
         let rect = [l.x + l.w - knob_w - 1.0, l.y + at, knob_w, len];
-        d.panel(panel_from(ink, [0.0; 4], Shape { radius: knob_w * 0.5, n: 2.0, border: 0.0, feather: 0.0 }, rect, alpha));
+        d.panel(panel_from(
+            ink,
+            [0.0; 4],
+            Shape { radius: knob_w * 0.5, n: 2.0, border: 0.0, feather: 0.0 },
+            rect,
+            alpha,
+        ));
     }
 }

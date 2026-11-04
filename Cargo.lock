@@ -518,8 +518,10 @@ dependencies = [
  "blaze-codegen",
  "blaze-format",
  "blaze-ids",
+ "blaze-profile",
  "blaze-query",
  "blaze-rng",
+ "tracing",
 ]
 
 [[package]]
@@ -1421,6 +1423,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-mir",
  "intern",
+ "ix-prof",
  "libc",
  "parking_lot",
  "parser",
@@ -1539,6 +1542,7 @@ name = "blaze-profile"
 version = "0.0.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
  "blaze-core",

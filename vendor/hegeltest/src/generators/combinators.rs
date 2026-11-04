@@ -24,9 +24,7 @@ impl<'a, T: Clone + Send + Sync + 'a> Generator<T> for SampledFromGenerator<'a, 
     }
 
     fn do_draw(&self, tc: &TestCase) -> T {
-        let indices = integers::<usize>()
-            .min_value(0)
-            .max_value(self.elements.len() - 1);
+        let indices = integers::<usize>().min_value(0).max_value(self.elements.len() - 1);
         let index = indices.do_draw(tc);
         self.elements[index].clone()
     }
@@ -108,10 +106,7 @@ pub trait PrintableAlternatives<T>: Alternatives<T> {
 /// whether it draws silently or printing) injected. Using this from both
 /// draw paths is what keeps their choice streams identical.
 fn draw_one_of<T>(tc: &TestCase, max_index: usize, draw_at: impl FnOnce(usize) -> T) -> T {
-    let index = integers::<usize>()
-        .min_value(0)
-        .max_value(max_index)
-        .do_draw(tc);
+    let index = integers::<usize>().min_value(0).max_value(max_index).do_draw(tc);
     draw_at(index)
 }
 
@@ -121,9 +116,7 @@ impl<'a, T, A: Alternatives<T>> Generator<T> for OneOfGenerator<'a, T, A> {
     }
 
     fn do_draw(&self, tc: &TestCase) -> T {
-        draw_one_of(tc, self.alternatives.max_index(), |index| {
-            self.alternatives.draw_at(tc, index)
-        })
+        draw_one_of(tc, self.alternatives.max_index(), |index| self.alternatives.draw_at(tc, index))
     }
 }
 
@@ -183,11 +176,7 @@ impl<T, G: Generator<T>, R: Alternatives<T>> Alternatives<T> for OneOfCons<G, R>
         1 + self.1.max_index()
     }
     fn draw_at(&self, tc: &TestCase, index: usize) -> T {
-        if index == 0 {
-            tc.draw_silent(&self.0)
-        } else {
-            self.1.draw_at(tc, index - 1)
-        }
+        if index == 0 { tc.draw_silent(&self.0) } else { self.1.draw_at(tc, index - 1) }
     }
     fn label(&self) -> u64 {
         combine_labels(&[self.0.label(), self.1.label()])
@@ -312,9 +301,7 @@ where
     }
 
     fn do_draw(&self, tc: &TestCase) -> Option<T> {
-        self.draw_optional(tc, &mut PrettyPrinter::noop(), |inner, tc, _| {
-            tc.draw_silent(inner)
-        })
+        self.draw_optional(tc, &mut PrettyPrinter::noop(), |inner, tc, _| tc.draw_silent(inner))
     }
 }
 
@@ -323,9 +310,7 @@ where
     G: PrintableGenerator<T>,
 {
     fn do_draw_and_print(&self, tc: &TestCase, printer: &mut PrettyPrinter) -> Option<T> {
-        self.draw_optional(tc, printer, |inner, tc, printer| {
-            tc.draw_and_print(inner, printer)
-        })
+        self.draw_optional(tc, printer, |inner, tc, printer| tc.draw_and_print(inner, printer))
     }
 }
 

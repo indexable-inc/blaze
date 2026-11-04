@@ -177,7 +177,8 @@ impl<W: Words> Fences<W> {
         }
         self.words.word(entry(index)).store(0, Ordering::Release);
         self.used[index / 64] &= !(1 << (index % 64));
-        while self.high > 0 && self.used[(self.high - 1) / 64] & (1 << ((self.high - 1) % 64)) == 0 {
+        while self.high > 0 && self.used[(self.high - 1) / 64] & (1 << ((self.high - 1) % 64)) == 0
+        {
             self.high -= 1;
         }
         self.words.word(W_HIGH).store(self.high as u64, Ordering::Release);
@@ -253,7 +254,8 @@ impl<W: Words> Fences<W> {
             return None;
         }
         for (index, (_, threads)) in processes.iter().enumerate() {
-            let count = many.get(index).copied().unwrap_or_else(|| counts.get(index).copied().unwrap_or(0));
+            let count =
+                many.get(index).copied().unwrap_or_else(|| counts.get(index).copied().unwrap_or(0));
             if count != threads.len() {
                 return None;
             }
@@ -353,11 +355,18 @@ impl Thread {
         for index in 0..SLOTS {
             let at = slot(index);
             let word = words.word(at);
-            if word.load(Ordering::Relaxed) != state(pid, ONLINE) || words.word(at + 1).load(Ordering::SeqCst) != tid {
+            if word.load(Ordering::Relaxed) != state(pid, ONLINE)
+                || words.word(at + 1).load(Ordering::SeqCst) != tid
+            {
                 continue;
             }
             if word
-                .compare_exchange(state(pid, ONLINE), state(pid, CLAIMING), Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(
+                    state(pid, ONLINE),
+                    state(pid, CLAIMING),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_err()
             {
                 continue;
@@ -376,7 +385,10 @@ impl Thread {
             if word.load(Ordering::Relaxed) != FREE {
                 continue;
             }
-            if word.compare_exchange(FREE, state(pid, CLAIMING), Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            if word
+                .compare_exchange(FREE, state(pid, CLAIMING), Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
                 continue;
             }
             words.word(at + 1).store(tid, Ordering::SeqCst);

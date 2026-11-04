@@ -40,9 +40,16 @@ impl TreeFold {
     pub fn merge(&mut self, now: Vec<Listed>, w: WorldRef<'_>) -> Vec<Listed> {
         let keys: HashSet<&str> = now.iter().map(|r| r.0.as_str()).collect();
         let first = self.prev.is_empty();
-        self.entering = if first { HashSet::new() } else { let old: HashSet<&str> = self.prev.iter().map(|r| r.0.as_str()).collect(); keys.iter().filter(|k| !old.contains(*k)).map(|k| (*k).to_owned()).collect() };
+        self.entering = if first {
+            HashSet::new()
+        } else {
+            let old: HashSet<&str> = self.prev.iter().map(|r| r.0.as_str()).collect();
+            keys.iter().filter(|k| !old.contains(*k)).map(|k| (*k).to_owned()).collect()
+        };
         let alive = |r: &model::Row| match *r {
-            model::Row::Obj { e, .. } => w.entity_from_id(e).is_alive() && !w.entity_from_id(e).has(model::Archived::id()),
+            model::Row::Obj { e, .. } => {
+                w.entity_from_id(e).is_alive() && !w.entity_from_id(e).has(model::Archived::id())
+            }
             model::Row::More { parent, .. } => w.entity_from_id(parent).is_alive(),
         };
         for r in &self.prev {
@@ -50,13 +57,15 @@ impl TreeFold {
                 self.leaving.entry(r.0.clone()).or_insert_with(|| r.clone());
             }
         }
-        self.leaving.retain(|k, r| !keys.contains(k.as_str()) && !self.done.contains(k) && alive(&r.2));
+        self.leaving
+            .retain(|k, r| !keys.contains(k.as_str()) && !self.done.contains(k) && alive(&r.2));
         self.done.clear();
         let mut out = now;
         // Each leaving row goes back after the row it followed last frame.
         for (i, r) in self.prev.iter().enumerate() {
             if let Some(l) = self.leaving.get(&r.0) {
-                let after = self.prev[..i].iter().rev().find_map(|p| out.iter().position(|o| o.0 == p.0));
+                let after =
+                    self.prev[..i].iter().rev().find_map(|p| out.iter().position(|o| o.0 == p.0));
                 let at = after.map_or(0, |a| a + 1);
                 if !out.iter().any(|o| o.0 == l.0) {
                     out.insert(at, l.clone());
@@ -82,7 +91,10 @@ impl TreeFold {
                 c.set(RowRest { h });
                 c.set(Motion { omega: tune.omega, zeta: tune.zeta });
                 c.set(Reveal { alpha0: 0.0, dx: 0.0, dy: 0.0, scale0: 1.0 });
-                c.set(Shown { spring: Spring::at(if entering { 0.0 } else { 1.0 }), started: true });
+                c.set(Shown {
+                    spring: Spring::at(if entering { 0.0 } else { 1.0 }),
+                    started: true,
+                });
                 c.add(Clip::id());
             }
             let want = if leaving { 0.0 } else { 1.0 };
@@ -139,15 +151,22 @@ impl App {
     pub(super) fn read_folds(&mut self) {
         let w = self.world.world_ref();
         let mut fresh = Vec::new();
-        w.query::<()>().with((model::Kind::id(), flecs::Wildcard::ID)).without(FoldRead::id()).build().each_entity(|e, ()| fresh.push(*e.id()));
+        w.query::<()>()
+            .with((model::Kind::id(), flecs::Wildcard::ID))
+            .without(FoldRead::id())
+            .build()
+            .each_entity(|e, ()| fresh.push(*e.id()));
         if fresh.is_empty() {
             return;
         }
-        let saved = crate::prefs::get("folds").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        let saved =
+            crate::prefs::get("folds").and_then(|v| v.as_object().cloned()).unwrap_or_default();
         for id in fresh {
             let e = w.entity_from_id(id);
             e.add(FoldRead::id());
-            if let Some(folded) = fold_key(e).and_then(|k| saved.get(&k)).and_then(serde_json::Value::as_bool) {
+            if let Some(folded) =
+                fold_key(e).and_then(|k| saved.get(&k)).and_then(serde_json::Value::as_bool)
+            {
                 if folded {
                     e.add(model::Collapsed::id());
                 } else {
@@ -170,7 +189,8 @@ impl App {
                 }
             });
         }
-        let mut saved = crate::prefs::get("folds").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        let mut saved =
+            crate::prefs::get("folds").and_then(|v| v.as_object().cloned()).unwrap_or_default();
         for t in targets {
             let c = w.entity_from_id(t);
             if fold {
@@ -211,7 +231,9 @@ impl App {
 /// Whether `e` has rows under it in the tree (objects, not archived): what a disclosure folds.
 pub fn has_kids(e: EntityView<'_>) -> bool {
     let mut any = false;
-    e.each_child(|c| any |= c.target(model::Kind::id(), 0).is_some() && !c.has(model::Archived::id()));
+    e.each_child(|c| {
+        any |= c.target(model::Kind::id(), 0).is_some() && !c.has(model::Archived::id())
+    });
     any
 }
 

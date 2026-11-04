@@ -26,7 +26,6 @@ use std::{
 };
 
 use blaze_hash::{FixedHasher, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::bits::Bits;
 use blaze_mem::Frame;
 use hashbrown::HashTable;
@@ -46,6 +45,7 @@ use hir_expand::{
 use intern::sym;
 use smallvec::SmallVec;
 use span::Edition;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasAttrs, HasVisibility, Node},
@@ -283,12 +283,17 @@ impl<'f, 'db> Uses<'f, 'db> {
             krate: cx.krate.base(),
         };
         for tree in &walk.trees {
-            for node in tree.of_kind(|it| matches!(it, SyntaxKind::USE | SyntaxKind::EXTERN_CRATE)) {
+            for node in tree.of_kind(|it| matches!(it, SyntaxKind::USE | SyntaxKind::EXTERN_CRATE))
+            {
                 match node.kind() {
-                    SyntaxKind::USE => uses.use_item(cx, InFile::new(tree.file, ast::Use::cast(node).unwrap())),
-                    SyntaxKind::EXTERN_CRATE => {
-                        uses.extern_crate(cx, walk, InFile::new(tree.file, ast::ExternCrate::cast(node).unwrap()))
+                    SyntaxKind::USE => {
+                        uses.use_item(cx, InFile::new(tree.file, ast::Use::cast(node).unwrap()))
                     }
+                    SyntaxKind::EXTERN_CRATE => uses.extern_crate(
+                        cx,
+                        walk,
+                        InFile::new(tree.file, ast::ExternCrate::cast(node).unwrap()),
+                    ),
                     _ => {}
                 }
             }
@@ -319,8 +324,13 @@ impl<'f, 'db> Uses<'f, 'db> {
             }
         }
         let read = |kind: SyntaxKind| {
-            matches!(kind, SyntaxKind::PATH | SyntaxKind::METHOD_CALL_EXPR | SyntaxKind::FIELD_EXPR | SyntaxKind::MACRO_CALL)
-                || ast::Adt::can_cast(kind)
+            matches!(
+                kind,
+                SyntaxKind::PATH
+                    | SyntaxKind::METHOD_CALL_EXPR
+                    | SyntaxKind::FIELD_EXPR
+                    | SyntaxKind::MACRO_CALL
+            ) || ast::Adt::can_cast(kind)
         };
         for tree in &walk.trees {
             for node in tree.of_kind(read) {
@@ -344,7 +354,13 @@ impl<'f, 'db> Uses<'f, 'db> {
     }
 
     /// What `kind` and `names` resolve to from `module`, through which bindings.
-    pub(super) fn lookup(&self, cx: &Cx<'_, '_>, module: ModuleId, kind: PathKind, names: &[Name]) -> PerNs {
+    pub(super) fn lookup(
+        &self,
+        cx: &Cx<'_, '_>,
+        module: ModuleId,
+        kind: PathKind,
+        names: &[Name],
+    ) -> PerNs {
         let hash = lookup_hash(module, kind, names);
         let found = self
             .lookups
@@ -369,7 +385,10 @@ impl<'f, 'db> Uses<'f, 'db> {
     }
 
     /// The glob trees of `module`, each with its item.
-    pub(super) fn globs_of(&self, module: ModuleId) -> impl Iterator<Item = (&UseItem<'db>, &Tree<'db>)> + '_ {
+    pub(super) fn globs_of(
+        &self,
+        module: ModuleId,
+    ) -> impl Iterator<Item = (&UseItem<'db>, &Tree<'db>)> + '_ {
         self.globs.get(&module).into_iter().flatten().map(|&(i, j)| {
             let item = &self.items[i as usize];
             (item, &item.trees[j as usize])
@@ -408,12 +427,13 @@ impl<'f, 'db> Uses<'f, 'db> {
                 self.use_ids.insert((loc.id.file_id, loc.id.to_ptr(db).text_range().start()), id);
             }
         }
-        let Some(&id) = self.use_ids.get(&(node.file_id, node.value.syntax().text_range().start())) else { return };
+        let Some(&id) = self.use_ids.get(&(node.file_id, node.value.syntax().text_range().start()))
+        else {
+            return;
+        };
         let sources = use_tree_sources_view(db, id);
-        let public = node
-            .value
-            .visibility()
-            .is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
+        let public =
+            node.value.visibility().is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
         let mut trees: Vec<Tree<'db>> = Vec::with_capacity(sources.value.values().count());
         // The trees enclosing the one being added, innermost last: pre-order makes the parent
         // the innermost that still contains it.
@@ -463,13 +483,20 @@ impl<'f, 'db> Uses<'f, 'db> {
         self.items.push(UseItem { node, id, module, public, trees });
     }
 
-    fn extern_crate(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'db>, node: InFile<ast::ExternCrate<'db>>) {
+    fn extern_crate(
+        &mut self,
+        cx: &Cx<'_, 'db>,
+        walk: &Walk<'db>,
+        node: InFile<ast::ExternCrate<'db>>,
+    ) {
         let db = cx.db;
         let Some(decl) = cx.vsema.to_def(node.value) else { return };
         let id = ExternCrateId::from(decl);
         let module = id.lookup(db).container;
         let name = match node.value.rename() {
-            Some(rename) if rename.underscore_token().is_some() => Name::new_symbol_root(sym::underscore),
+            Some(rename) if rename.underscore_token().is_some() => {
+                Name::new_symbol_root(sym::underscore)
+            }
             Some(rename) => match ast::HasName::name(&rename) {
                 Some(it) => it.as_name(),
                 None => return,
@@ -488,25 +515,26 @@ impl<'f, 'db> Uses<'f, 'db> {
                 ast::Meta::TokenTreeMeta(it) => it.path(),
                 _ => None,
             };
-            if path.and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "macro_use") {
+            if path.and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "macro_use")
+            {
                 continue;
             }
             match &meta {
                 ast::Meta::TokenTreeMeta(it) => {
                     let Some(tt) = it.token_tree() else { continue };
-                    for token in tt.syntax().children_with_tokens().filter_map(|it| it.into_token()) {
+                    for token in tt.syntax().children_with_tokens().filter_map(|it| it.into_token())
+                    {
                         if token.kind() == SyntaxKind::IDENT {
-                            macro_use.push((token.text_range(), Some(Name::new_root(token.text()))));
+                            macro_use
+                                .push((token.text_range(), Some(Name::new_root(token.text()))));
                         }
                     }
                 }
                 _ => macro_use.push((attr.syntax().text_range(), None)),
             }
         }
-        let public = node
-            .value
-            .visibility()
-            .is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
+        let public =
+            node.value.visibility().is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
         let renames = node.value.rename().is_some();
         self.crates.push(ExternCrate {
             node,
@@ -547,13 +575,22 @@ impl<'f, 'db> Uses<'f, 'db> {
             }
             let was = self.used.entry(binding).or_insert(used);
             *was = (*was).max(used);
-            at = self.next(cx, binding, name, ns).and_then(|it| it.import).map(|it| (it, Used::Other));
+            at = self
+                .next(cx, binding, name, ns)
+                .and_then(|it| it.import)
+                .map(|it| (it, Used::Other));
         }
     }
 
     /// What `binding` finds `name` as in `ns`: what a single import imports, or what the
     /// module a glob imports from has.
-    pub(super) fn next(&self, cx: &Cx<'_, '_>, binding: Binding, name: &Name, ns: Ns) -> Option<Entry> {
+    pub(super) fn next(
+        &self,
+        cx: &Cx<'_, '_>,
+        binding: Binding,
+        name: &Name,
+        ns: Ns,
+    ) -> Option<Entry> {
         let (_, tree) = self.tree(binding)?;
         let found = match binding {
             Binding::Import(_) => entry(&tree.imported, ns)?,
@@ -569,7 +606,14 @@ impl<'f, 'db> Uses<'f, 'db> {
     /// Counts as used every binding `name` could be found through, from the scopes around
     /// `module` when `lexical`, else in `module`: what it names there, every glob import there,
     /// and for a lexical name the root's `extern crate` items and `#[macro_use]` imports.
-    fn taint(&mut self, cx: &Cx<'_, '_>, module: ModuleId, name: &Name, lexical: bool, except: Option<Binding>) {
+    fn taint(
+        &mut self,
+        cx: &Cx<'_, '_>,
+        module: ModuleId,
+        name: &Name,
+        lexical: bool,
+        except: Option<Binding>,
+    ) {
         let db = cx.db;
         let mut at = Some(module);
         while let Some(id) = at {
@@ -589,7 +633,11 @@ impl<'f, 'db> Uses<'f, 'db> {
                     }
                 }
             }
-            at = if lexical && id.is_block_module(db) { def_map.containing_module(db, id) } else { None };
+            at = if lexical && id.is_block_module(db) {
+                def_map.containing_module(db, id)
+            } else {
+                None
+            };
         }
         if lexical {
             let root: ModuleId = cx.krate.root_module(db).into();
@@ -614,7 +662,8 @@ impl<'f, 'db> Uses<'f, 'db> {
         let count = self.items[item].trees.len();
         // Each tree's prefix as its kind and a range of `flat`; a child's starts with a copy of
         // its parent's.
-        let mut prefixes: SmallVec<[Option<(PathKind, u32, u32)>; 4]> = SmallVec::with_capacity(count);
+        let mut prefixes: SmallVec<[Option<(PathKind, u32, u32)>; 4]> =
+            SmallVec::with_capacity(count);
         let mut flat: SmallVec<[Name; 8]> = SmallVec::new();
         for j in 0..count {
             let tree = self.items[item].trees[j].node;
@@ -624,7 +673,9 @@ impl<'f, 'db> Uses<'f, 'db> {
             };
             let inherited = base.map_or(0, |(_, start, end)| (end - start) as usize);
             let own = match tree.path() {
-                Some(path) => ModPath::from_src_view(cx.db, path, &mut |range| span_map.span_for_range(range).ctx),
+                Some(path) => ModPath::from_src_view(cx.db, path, &mut |range| {
+                    span_map.span_for_range(range).ctx
+                }),
                 None => Some(ModPath::from_kind(if tree.coloncolon_token().is_some() {
                     PathKind::Abs
                 } else {
@@ -632,9 +683,14 @@ impl<'f, 'db> Uses<'f, 'db> {
                 })),
             };
             let prefix = match (base, own) {
-                (Some((kind, start, end)), Some(own)) if start == end && kind == PathKind::Plain => {
+                (Some((kind, start, end)), Some(own))
+                    if start == end && kind == PathKind::Plain =>
+                {
                     let mut kind = own.kind;
-                    if kind == PathKind::Plain && cx.edition == Edition::Edition2015 && !own.segments().is_empty() {
+                    if kind == PathKind::Plain
+                        && cx.edition == Edition::Edition2015
+                        && !own.segments().is_empty()
+                    {
                         kind = PathKind::Abs;
                     }
                     let start = flat.len() as u32;
@@ -650,7 +706,9 @@ impl<'f, 'db> Uses<'f, 'db> {
                     flat.extend_from_slice(own.segments());
                     Some((kind, new, flat.len() as u32))
                 }
-                (Some(base), Some(own)) if own.kind == PathKind::Super(0) && own.segments().is_empty() => {
+                (Some(base), Some(own))
+                    if own.kind == PathKind::Super(0) && own.segments().is_empty() =>
+                {
                     self.items[item].trees[j].self_import = true;
                     Some(base)
                 }
@@ -658,7 +716,15 @@ impl<'f, 'db> Uses<'f, 'db> {
             };
             prefixes.push(prefix);
             let Some((kind, start, end)) = prefix else { continue };
-            self.resolve_tree(cx, item, j, module, kind, &flat[start as usize..end as usize], inherited);
+            self.resolve_tree(
+                cx,
+                item,
+                j,
+                module,
+                kind,
+                &flat[start as usize..end as usize],
+                inherited,
+            );
         }
     }
 
@@ -683,7 +749,11 @@ impl<'f, 'db> Uses<'f, 'db> {
             let per = self.lookup(cx, module, kind, &names[..=k]);
             let used = if k == 0 && kind == PathKind::Plain { Used::Scope } else { Used::Other };
             match entry(&per, Ns::Types) {
-                Some(Entry { def: ModuleDefId::ModuleId(_) | ModuleDefId::AdtId(hir_def::AdtId::EnumId(_)), import, .. }) => {
+                Some(Entry {
+                    def: ModuleDefId::ModuleId(_) | ModuleDefId::AdtId(hir_def::AdtId::EnumId(_)),
+                    import,
+                    ..
+                }) => {
                     if let Some(found) = import
                         && Some(found) != binding
                     {
@@ -735,7 +805,11 @@ impl<'f, 'db> Uses<'f, 'db> {
                 }
             }
         }
-        let source = if tree_kind == TreeKind::Glob { entry(&self.lookup(cx, module, kind, names), Ns::Types).map(|it| it.def) } else { source };
+        let source = if tree_kind == TreeKind::Glob {
+            entry(&self.lookup(cx, module, kind, names), Ns::Types).map(|it| it.def)
+        } else {
+            source
+        };
         let tree = &mut self.items[item].trees[j];
         tree.name = name;
         tree.lexical = lexical;
@@ -751,7 +825,10 @@ impl<'f, 'db> Uses<'f, 'db> {
             self.path(cx, file, path);
             if path.parent_path().is_none()
                 && let Some(parent) = path.syntax().parent()
-                && matches!(parent.kind(), SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT)
+                && matches!(
+                    parent.kind(),
+                    SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT
+                )
             {
                 self.type_relative(cx, path);
             }
@@ -780,7 +857,9 @@ impl<'f, 'db> Uses<'f, 'db> {
                     }
                 }
                 None => {
-                    if let Some(name) = call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref()) {
+                    if let Some(name) =
+                        call.path().and_then(|it| it.segment()).and_then(|it| it.name_ref())
+                    {
                         self.macros_unknown.insert(name.as_name());
                     }
                 }
@@ -791,7 +870,11 @@ impl<'f, 'db> Uses<'f, 'db> {
         {
             for (meta, _) in walk.attrs(owner) {
                 let ast::Meta::TokenTreeMeta(it) = &meta else { continue };
-                if it.path().and_then(|it| it.as_single_name_ref()).is_none_or(|it| it.text() != "derive") {
+                if it
+                    .path()
+                    .and_then(|it| it.as_single_name_ref())
+                    .is_none_or(|it| it.text() != "derive")
+                {
                     continue;
                 }
                 self.derive(cx, node, meta);
@@ -819,12 +902,18 @@ impl<'f, 'db> Uses<'f, 'db> {
                 self.arms_unknown.insert(id);
             }
             for n in 0..names.len() {
-                let used = if n == 0 && kind == PathKind::Plain { Used::Scope } else { Used::Other };
+                let used =
+                    if n == 0 && kind == PathKind::Plain { Used::Scope } else { Used::Other };
                 let per = self.lookup(cx, module, kind, &names[..=n]);
                 let (ns, expected) = if n + 1 == names.len() {
                     (Ns::Macros, expected.map(|it| ModuleDefId::MacroId(it.into())))
                 } else {
-                    (Ns::Types, entry(&per, Ns::Types).map(|it| it.def).filter(|it| matches!(it, ModuleDefId::ModuleId(_))))
+                    (
+                        Ns::Types,
+                        entry(&per, Ns::Types)
+                            .map(|it| it.def)
+                            .filter(|it| matches!(it, ModuleDefId::ModuleId(_))),
+                    )
                 };
                 match (entry(&per, ns), expected) {
                     (Some(found), Some(expected)) if found.def == expected => {
@@ -923,7 +1012,9 @@ impl<'f, 'db> Uses<'f, 'db> {
     /// Marks what `path`, not a `use` tree's, goes through: each prefix in the type namespace
     /// as a module, the whole path in the namespaces hir resolves it in.
     fn path(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, path: ast::Path<'db>) {
-        if path.parent_path().is_some() || path.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::USE_TREE) {
+        if path.parent_path().is_some()
+            || path.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::USE_TREE)
+        {
             return;
         }
         let Some(scope) = cx.vsema.scope(path.syntax()) else { return };
@@ -937,7 +1028,9 @@ impl<'f, 'db> Uses<'f, 'db> {
         chain.reverse();
         let mut done = 0;
         for (i, &prefix) in chain.iter().enumerate() {
-            let Some(mod_path) = ModPath::from_src_view(cx.db, prefix, &mut |range| span_map.span_for_range(range).ctx) else {
+            let Some(mod_path) = ModPath::from_src_view(cx.db, prefix, &mut |range| {
+                span_map.span_for_range(range).ctx
+            }) else {
                 return;
             };
             let names = mod_path.segments();
@@ -1015,9 +1108,10 @@ impl<'f, 'db> Uses<'f, 'db> {
             Some(ast::PathSegmentKind::Type { trait_ref: Some(_), .. }) => false,
             Some(ast::PathSegmentKind::Type { .. } | ast::PathSegmentKind::SelfTypeKw) => true,
             _ => match cx.vsema.resolve_path(qualifier) {
-                Some(PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(_)))) => {
-                    !matches!(cx.vsema.resolve_path(path), Some(PathResolution::Def(ModuleDef::EnumVariant(_))))
-                }
+                Some(PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(_)))) => !matches!(
+                    cx.vsema.resolve_path(path),
+                    Some(PathResolution::Def(ModuleDef::EnumVariant(_)))
+                ),
                 Some(PathResolution::Def(
                     ModuleDef::Adt(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_),
                 ))
@@ -1039,7 +1133,13 @@ impl<'f, 'db> Uses<'f, 'db> {
     /// Records the trait imports a lookup of `name` at `at` could use, and for a method call
     /// or type-relative path (`picked` is `Some`) those type checking uses: the first
     /// candidate of the trait of what it resolves to; every candidate when it does not resolve.
-    fn lookup_trait_item(&mut self, cx: &Cx<'_, 'db>, at: Node<'db>, name: &Name, picked: Option<Option<hir::AssocItem>>) {
+    fn lookup_trait_item(
+        &mut self,
+        cx: &Cx<'_, 'db>,
+        at: Node<'db>,
+        name: &Name,
+        picked: Option<Option<hir::AssocItem>>,
+    ) {
         let Some(scope) = cx.vsema.scope(at) else { return };
         let module = ModuleId::from(scope.module());
         let (start, end) = self.traits_in_scope(cx, module, name);
@@ -1056,13 +1156,17 @@ impl<'f, 'db> Uses<'f, 'db> {
             Some(Some(item)) => {
                 let Some(trait_) = item.container_or_implemented_trait(cx.db) else { return };
                 let trait_ = TraitId::from(trait_);
-                if let Some(&(_, from, to)) = self.trait_rows[rows].iter().find(|(it, _, _)| *it == trait_) {
-                    self.typeck.extend(self.trait_chains[from as usize..to as usize].iter().copied());
+                if let Some(&(_, from, to)) =
+                    self.trait_rows[rows].iter().find(|(it, _, _)| *it == trait_)
+                {
+                    self.typeck
+                        .extend(self.trait_chains[from as usize..to as usize].iter().copied());
                 }
             }
             Some(None) => {
                 for &(_, from, to) in &self.trait_rows[rows] {
-                    self.typeck.extend(self.trait_chains[from as usize..to as usize].iter().copied());
+                    self.typeck
+                        .extend(self.trait_chains[from as usize..to as usize].iter().copied());
                 }
             }
         }
@@ -1085,7 +1189,9 @@ impl<'f, 'db> Uses<'f, 'db> {
             // none on a second look either.
             let level = self.trait_rows.len();
             for trait_ in def_map.module(db, id).traits_in_scope(db) {
-                if self.trait_rows[level..].iter().any(|(it, _, _)| *it == trait_) || !has_value_item(cx, trait_, name) {
+                if self.trait_rows[level..].iter().any(|(it, _, _)| *it == trait_)
+                    || !has_value_item(cx, trait_, name)
+                {
                     continue;
                 }
                 for binding in self.trait_bindings(cx, id, trait_) {
@@ -1104,20 +1210,35 @@ impl<'f, 'db> Uses<'f, 'db> {
     /// What `trait_` is in scope through in `module`: each name it has there, each `_` import
     /// of it, else each glob import that brings it in unnamed; `None` when it is in scope
     /// through none of those.
-    fn trait_bindings(&self, cx: &Cx<'_, '_>, module: ModuleId, trait_: TraitId) -> SmallVec<[Option<Binding>; 2]> {
+    fn trait_bindings(
+        &self,
+        cx: &Cx<'_, '_>,
+        module: ModuleId,
+        trait_: TraitId,
+    ) -> SmallVec<[Option<Binding>; 2]> {
         let db = cx.db;
         let scope = module.def_map(db).module(db, module).scope(db);
         let mut out: SmallVec<[Option<Binding>; 2]> = SmallVec::new();
-        out.extend(scope.types().filter(|(_, it)| it.def == ModuleDefId::TraitId(trait_)).map(|(_, it)| it.import));
+        out.extend(
+            scope
+                .types()
+                .filter(|(_, it)| it.def == ModuleDefId::TraitId(trait_))
+                .map(|(_, it)| it.import),
+        );
         for tree in self.items_of(module).flat_map(|it| it.trees.iter()) {
             if tree.underscore
-                && entry(&tree.imported, Ns::Types).is_some_and(|it| it.def == ModuleDefId::TraitId(trait_))
+                && entry(&tree.imported, Ns::Types)
+                    .is_some_and(|it| it.def == ModuleDefId::TraitId(trait_))
             {
                 out.push(tree.binding);
             }
         }
         if out.is_empty() {
-            for tree in self.items_of(module).flat_map(|it| it.trees.iter()).filter(|it| it.kind == TreeKind::Glob) {
+            for tree in self
+                .items_of(module)
+                .flat_map(|it| it.trees.iter())
+                .filter(|it| it.kind == TreeKind::Glob)
+            {
                 let Some(ModuleDefId::ModuleId(from)) = tree.source else { continue };
                 if from.def_map(db).module(db, from).traits_in_scope(db).any(|it| it == trait_) {
                     out.push(tree.binding);
@@ -1180,7 +1301,9 @@ impl<'f, 'db> Uses<'f, 'db> {
                     }
                     let mut at = found.import;
                     while let Some(binding) = at {
-                        if !self.is_local(cx, binding) || !self.exported_names.insert((binding, *name, ns)) {
+                        if !self.is_local(cx, binding)
+                            || !self.exported_names.insert((binding, *name, ns))
+                        {
                             break;
                         }
                         self.exported.insert(binding);
@@ -1238,9 +1361,15 @@ fn expected<'db>(cx: &Cx<'_, 'db>, path: ast::Path<'db>) -> Expected {
                 None => Expected::Unknown,
             }
         }
-        Some(parent) if ast::Meta::can_cast(parent.kind()) => Expected::of([(Ns::Macros, cx.vsema.resolve_path(path))]),
+        Some(parent) if ast::Meta::can_cast(parent.kind()) => {
+            Expected::of([(Ns::Macros, cx.vsema.resolve_path(path))])
+        }
         _ => match cx.vsema.resolve_path_per_ns(path) {
-            Some(it) => Expected::of([(Ns::Types, it.type_ns), (Ns::Values, it.value_ns), (Ns::Macros, it.macro_ns)]),
+            Some(it) => Expected::of([
+                (Ns::Types, it.type_ns),
+                (Ns::Values, it.value_ns),
+                (Ns::Macros, it.macro_ns),
+            ]),
             None => Expected::Unknown,
         },
     }
@@ -1274,7 +1403,8 @@ fn lookup_hash(module: ModuleId, kind: PathKind, names: &[Name]) -> u64 {
 /// `trait_may_have_item` in the value namespace.
 fn has_value_item(cx: &Cx<'_, '_>, trait_: TraitId, name: &Name) -> bool {
     hir::Trait::from(trait_).items_iter(cx.db).any(|it| {
-        matches!(it, hir::AssocItem::Function(_) | hir::AssocItem::Const(_)) && it.name(cx.db).as_ref() == Some(name)
+        matches!(it, hir::AssocItem::Function(_) | hir::AssocItem::Const(_))
+            && it.name(cx.db).as_ref() == Some(name)
     })
 }
 
@@ -1353,7 +1483,8 @@ fn body() {
             for &binding in &old.typeck {
                 used.entry(binding).or_insert(Used::Other);
             }
-            let mut old_used: Vec<(String, Used)> = used.iter().map(|(&it, &by)| (named(cx.db, it), by)).collect();
+            let mut old_used: Vec<(String, Used)> =
+                used.iter().map(|(&it, &by)| (named(cx.db, it), by)).collect();
             old_used.sort();
             let front = hir_ty::used_imports_with_traits(cx.db, cx.krate.base());
             let mut new_used: Vec<(String, Used)> = front
@@ -1370,10 +1501,12 @@ fn body() {
             assert_eq!(old_used, new_used);
             assert!(old_used.len() >= 9, "{old_used:?}");
             assert!(!old_used.iter().any(|(it, _)| it == "Unused"), "{old_used:?}");
-            let mut old_macro: Vec<String> = old.macro_uses.iter().map(|(it, _)| format!("{it:?}")).collect();
+            let mut old_macro: Vec<String> =
+                old.macro_uses.iter().map(|(it, _)| format!("{it:?}")).collect();
             old_macro.sort();
             old_macro.dedup();
-            let mut new_macro: Vec<String> = front.macro_uses().map(|(it, _)| format!("{it:?}")).collect();
+            let mut new_macro: Vec<String> =
+                front.macro_uses().map(|(it, _)| format!("{it:?}")).collect();
             new_macro.sort();
             assert_eq!(old_macro, new_macro);
         });

@@ -193,26 +193,11 @@ struct VersionData {
 }
 
 const VERSIONS: [VersionData; 5] = [
-    VersionData {
-        name: "17.0.0",
-        delta: "",
-    },
-    VersionData {
-        name: "16.0.0",
-        delta: include_str!("delta-16.0.0.txt"),
-    },
-    VersionData {
-        name: "15.1.0",
-        delta: include_str!("delta-15.1.0.txt"),
-    },
-    VersionData {
-        name: "15.0.0",
-        delta: include_str!("delta-15.0.0.txt"),
-    },
-    VersionData {
-        name: "14.0.0",
-        delta: include_str!("delta-14.0.0.txt"),
-    },
+    VersionData { name: "17.0.0", delta: "" },
+    VersionData { name: "16.0.0", delta: include_str!("delta-16.0.0.txt") },
+    VersionData { name: "15.1.0", delta: include_str!("delta-15.1.0.txt") },
+    VersionData { name: "15.0.0", delta: include_str!("delta-15.0.0.txt") },
+    VersionData { name: "14.0.0", delta: include_str!("delta-14.0.0.txt") },
 ];
 
 /// The `(major, minor, update)` of a version number like `"15.1.0"`;
@@ -262,21 +247,16 @@ impl UnicodeVersion {
                 "unicode_version {s:?} is not a Unicode version number like \"15.1.0\""
             ))
         })?;
-        if let Some(index) = VERSIONS
-            .iter()
-            .position(|version| version_number(version.name) == Some(number))
+        if let Some(index) =
+            VERSIONS.iter().position(|version| version_number(version.name) == Some(number))
         {
             return Ok(UnicodeVersion(index as u8));
         }
         if number > version_number(Self::LATEST.as_str()).unwrap_or_default() {
             return Ok(Self::LATEST);
         }
-        let known = VERSIONS
-            .iter()
-            .rev()
-            .map(|version| version.name)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let known =
+            VERSIONS.iter().rev().map(|version| version.name).collect::<Vec<_>>().join(", ");
         Err(EngineError::InvalidArgument(format!(
             "libhegel has no tables for Unicode {s}: it supports {known} and takes newer versions as {}",
             Self::LATEST.as_str()
@@ -308,9 +288,7 @@ impl UnicodeVersion {
         static TABLES: PerVersion<Tables> = PerVersion::new();
         TABLES.get(self, || match self.newer() {
             None => Tables::latest(),
-            Some(newer) => newer
-                .tables()
-                .with_delta(VERSIONS[usize::from(self.0)].delta),
+            Some(newer) => newer.tables().with_delta(VERSIONS[usize::from(self.0)].delta),
         })
     }
 
@@ -322,9 +300,7 @@ impl UnicodeVersion {
 
     fn case_mapping(self, c: char) -> Option<(u32, u32)> {
         let mappings = self.case_mappings();
-        let i = mappings
-            .binary_search_by_key(&(c as u32), |&(cp, _, _)| cp)
-            .ok()?;
+        let i = mappings.binary_search_by_key(&(c as u32), |&(cp, _, _)| cp).ok()?;
         let (_, lower, upper) = mappings[i];
         Some((lower, upper))
     }
@@ -335,8 +311,7 @@ impl UnicodeVersion {
     /// character whose full lowercase mapping is special-cased, which maps
     /// to that mapping's first codepoint (U+0130 to `i`).
     pub fn to_lower(self, c: char) -> char {
-        self.case_mapping(c)
-            .map_or(c, |(lower, _)| char_of(lower, c))
+        self.case_mapping(c).map_or(c, |(lower, _)| char_of(lower, c))
     }
 
     /// The uppercase form of `c`, or `c` itself when it has none:
@@ -344,8 +319,7 @@ impl UnicodeVersion {
     /// special-cased full mapping as [`to_lower`](Self::to_lower) takes it
     /// (`ß` to `S`).
     pub fn to_upper(self, c: char) -> char {
-        self.case_mapping(c)
-            .map_or(c, |(_, upper)| char_of(upper, c))
+        self.case_mapping(c).map_or(c, |(_, upper)| char_of(upper, c))
     }
 
     /// The General Category table as `(start, end, category)` runs of
@@ -369,16 +343,8 @@ impl UnicodeVersion {
     pub fn category_runs_in(self, lo: u32, hi: u32) -> impl Iterator<Item = (u32, u32, Category)> {
         let table = &self.tables().ranges;
         let hi = hi.min(0x10FFFF);
-        let first = if lo > hi {
-            table.len()
-        } else {
-            table.partition_point(|&(end, _)| end < lo)
-        };
-        let mut start = if first == 0 {
-            0
-        } else {
-            table[first - 1].0 + 1
-        };
+        let first = if lo > hi { table.len() } else { table.partition_point(|&(end, _)| end < lo) };
+        let mut start = if first == 0 { 0 } else { table[first - 1].0 + 1 };
         table[first..].iter().map_while(move |&(end, cat)| {
             let run_start = start;
             start = end + 1;
@@ -414,11 +380,7 @@ impl UnicodeVersion {
         let table = &self.tables().ranges;
         let idx = table
             .binary_search_by(|&(end, _)| {
-                if end < cp {
-                    core::cmp::Ordering::Less
-                } else {
-                    core::cmp::Ordering::Greater
-                }
+                if end < cp { core::cmp::Ordering::Less } else { core::cmp::Ordering::Greater }
             })
             .unwrap_err();
         table[idx].1
@@ -440,9 +402,7 @@ pub(crate) struct PerVersion<T> {
 
 impl<T> PerVersion<T> {
     pub(crate) const fn new() -> PerVersion<T> {
-        PerVersion {
-            cells: [const { OnceBox::new() }; VERSIONS.len()],
-        }
+        PerVersion { cells: [const { OnceBox::new() }; VERSIONS.len()] }
     }
 
     /// The value for `version`, computing it with `init` if this is the
@@ -507,11 +467,7 @@ impl Tables {
             .lines()
             .map(|line| {
                 let [cp, lower, upper] = fields(line, "case.txt");
-                (
-                    hex(cp, "case.txt"),
-                    hex(lower, "case.txt"),
-                    hex(upper, "case.txt"),
-                )
+                (hex(cp, "case.txt"), hex(lower, "case.txt"), hex(upper, "case.txt"))
             })
             .collect();
         Tables { ranges, case }
@@ -635,10 +591,7 @@ fn char_of(cp: u32, c: char) -> char {
 /// (NFKD, e.g. `Ⅰ` → `I`) are *not* applied — they're not part of NFD.
 pub fn nfd_base(cp: u32) -> Option<u32> {
     let table = nfd_bases();
-    table
-        .binary_search_by_key(&cp, |&(c, _)| c)
-        .ok()
-        .map(|idx| table[idx].1)
+    table.binary_search_by_key(&cp, |&(c, _)| c).ok().map(|idx| table[idx].1)
 }
 
 #[cfg(test)]

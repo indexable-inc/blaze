@@ -58,23 +58,34 @@ impl Signature<'_> {
 
 /// Each item of the crate's scopes given to `visit`, in rustc's order, those of traits and
 /// impls after them.
-fn signatures<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module], mut visit: impl FnMut(Signature<'db>)) {
+fn signatures<'db>(
+    cx: &Cx<'_, 'db>,
+    scopes: &[hir::Module],
+    mut visit: impl FnMut(Signature<'db>),
+) {
     let db = cx.db;
     let unshadowed = !cx.krate.shadows_primitive_type(db);
-    let mut push = |node: Option<InFile<ast::Node<'db>>>, item: Option<ItemId>, primitives: bool| {
-        let Some(node) = node else { return };
-        visit(Signature { node, item, primitives });
-    };
+    let mut push =
+        |node: Option<InFile<ast::Node<'db>>>, item: Option<ItemId>, primitives: bool| {
+            let Some(node) = node else { return };
+            visit(Signature { node, item, primitives });
+        };
     for &module in scopes {
         let primitives = unshadowed && !hir_def::ModuleId::from(module).is_block_module(db);
         for def in module.declarations_iter(db) {
             let item = item_id(db, def);
             match def {
-                hir::ModuleDef::Function(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
+                hir::ModuleDef::Function(it) => {
+                    push(syntax_of(cx.vsema.source(it)), item, primitives)
+                }
                 hir::ModuleDef::Adt(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
-                hir::ModuleDef::TypeAlias(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
+                hir::ModuleDef::TypeAlias(it) => {
+                    push(syntax_of(cx.vsema.source(it)), item, primitives)
+                }
                 hir::ModuleDef::Const(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
-                hir::ModuleDef::Static(it) => push(syntax_of(cx.vsema.source(it)), item, primitives),
+                hir::ModuleDef::Static(it) => {
+                    push(syntax_of(cx.vsema.source(it)), item, primitives)
+                }
                 hir::ModuleDef::Trait(it) => {
                     push(syntax_of(cx.vsema.source(it)), item, primitives);
                     for assoc in it.items_iter(db) {
@@ -85,7 +96,11 @@ fn signatures<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module], mut visit: impl FnM
             }
         }
         for imp in module.impl_defs_iter(db) {
-            push(syntax_of(cx.vsema.source(imp)), ImplId::try_from(imp).ok().map(ItemId::Impl), primitives);
+            push(
+                syntax_of(cx.vsema.source(imp)),
+                ImplId::try_from(imp).ok().map(ItemId::Impl),
+                primitives,
+            );
             for assoc in imp.items_iter(db) {
                 push(assoc_syntax(cx, assoc), item_id(db, assoc.into()), primitives);
             }
@@ -93,7 +108,9 @@ fn signatures<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module], mut visit: impl FnM
     }
 }
 
-fn syntax_of<'db, N: ast::AstNode<'db>>(source: Option<InFile<N>>) -> Option<InFile<ast::Node<'db>>> {
+fn syntax_of<'db, N: ast::AstNode<'db>>(
+    source: Option<InFile<N>>,
+) -> Option<InFile<ast::Node<'db>>> {
     source.map(|it| it.map(|it| it.syntax()))
 }
 

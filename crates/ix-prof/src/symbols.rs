@@ -33,7 +33,9 @@ type Reader = gimli::EndianArcSlice<gimli::RunTimeEndian>;
 pub fn demangle(name: &str) -> String {
     match rustc_demangle::try_demangle(name) {
         Ok(it) => format!("{it:#}"),
-        Err(_) => name.strip_prefix('_').filter(|_| cfg!(target_os = "macos")).unwrap_or(name).to_owned(),
+        Err(_) => {
+            name.strip_prefix('_').filter(|_| cfg!(target_os = "macos")).unwrap_or(name).to_owned()
+        }
     }
 }
 
@@ -96,13 +98,15 @@ struct Table {
 }
 
 impl Table {
-    /// Maps the executable at `path` and reads its text symbols. An error names the file and
-    /// what failed.
-    fn read(path: &Path) -> Result<Table, String> {
+    /// Maps the executable opened as `open` (its path `path`, or on Linux `/proc/self/exe`,
+    /// the inode running whatever the path holds now) and reads its text symbols. An error
+    /// names the file and what failed.
+    fn read(open: &Path, path: &Path) -> Result<Table, String> {
         use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
         PARSES.fetch_add(1, Ordering::Relaxed);
-        let data = map(path)?;
-        let object = object::File::parse(data).map_err(|error| format!("parsing {}: {error}", path.display()))?;
+        let data = map(open)?;
+        let object = object::File::parse(data)
+            .map_err(|error| format!("parsing {}: {error}", path.display()))?;
         // Where a name lies in the mapping: object hands out slices of it.
         let place = |name: &[u8]| -> Option<(u32, u32)> {
             let at = (name.as_ptr() as usize).checked_sub(data.as_ptr() as usize)?;
@@ -120,7 +124,9 @@ impl Table {
             })
             .collect();
         let name = |it: &(u64, u32, u32, u32)| &data[it.2 as usize..][..it.3 as usize];
-        symbols.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| name(a).cmp(name(b))));
+        symbols.sort_unstable_by(|a, b| {
+            (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| name(a).cmp(name(b)))
+        });
         symbols.dedup_by_key(|it| it.0);
         // alloc: the table's starts, once a process
         let starts = symbols.iter().map(|it| it.0).collect();
@@ -140,7 +146,9 @@ impl Table {
         let stubs = object
             .sections()
             .find(|it| matches!(it.name(), Ok(live::STUBS_SECTION_MACHO | live::STUBS_SECTION_ELF)))
-            .and_then(|it| Some((it.address()..it.address().saturating_add(it.size()), it.file_range()?.0)));
+            .and_then(|it| {
+                Some((it.address()..it.address().saturating_add(it.size()), it.file_range()?.0))
+            });
         Ok(Table {
             path: path.to_string_lossy().into_owned(),
             data,
@@ -158,14 +166,27 @@ impl Table {
     fn dwarf(&self) -> Option<addr2line::Context<Reader>> {
         use object::{Object, ObjectSection};
         let object = object::File::parse(self.data).ok()?;
-        let endian =
-            if object.is_little_endian() { gimli::RunTimeEndian::Little } else { gimli::RunTimeEndian::Big };
+        let endian = if object.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
         if object.section_by_name(".debug_info").is_some_and(|s| s.size() > 0)
             && let Some(dwarf) = load_dwarf(&object, endian)
         {
             return Some(dwarf);
         }
         // macOS keeps DWARF beside the binary in a .dSYM bundle when dsymutil ran.
+        let dsym = self.dsym()?;
+        let file = std::fs::File::open(&dsym).ok()?;
+        let cache = object::ReadCache::new(file);
+        let object = object::File::parse(&cache).ok()?;
+        load_dwarf(&object, endian)
+    }
+
+    /// Where macOS keeps the executable's DWARF when dsymutil ran: its `.dSYM` bundle's file;
+    /// `None` elsewhere.
+    fn dsym(&self) -> Option<std::path::PathBuf> {
         if !cfg!(target_vendor = "apple") {
             return None;
         }
@@ -173,11 +194,20 @@ impl Table {
         let name = path.file_name()?.to_owned();
         let mut dsym = path.as_os_str().to_owned();
         dsym.push(".dSYM");
-        let dsym = std::path::PathBuf::from(dsym).join("Contents/Resources/DWARF").join(name);
-        let file = std::fs::File::open(&dsym).ok()?;
-        let cache = object::ReadCache::new(file);
-        let object = object::File::parse(&cache).ok()?;
-        load_dwarf(&object, endian)
+        Some(std::path::PathBuf::from(dsym).join("Contents/Resources/DWARF").join(name))
+    }
+
+    /// The executable's DWARF over its mapping (or its `.dSYM`'s, mapped for the process's life
+    /// as the executable is), for [`own_dwarf`].
+    fn static_dwarf(&self) -> Option<addr2line::Context<StaticReader>> {
+        if let Some(it) = static_dwarf_of(self.data) {
+            return Some(it);
+        }
+        let dsym = self.dsym()?;
+        if !dsym.exists() {
+            return None;
+        }
+        static_dwarf_of(map(&dsym).ok()?)
     }
 
     /// The index of the symbol `at` (a file address) falls in: the last to start at or before
@@ -193,7 +223,8 @@ impl Table {
         }
         let i = self.starts.partition_point(|&it| it <= at).checked_sub(1)?;
         let (start, size) = (self.starts[i], self.rest[i].0);
-        (start >= section.start && (size == 0 || at < start.saturating_add(u64::from(size)))).then_some(i)
+        (start >= section.start && (size == 0 || at < start.saturating_add(u64::from(size))))
+            .then_some(i)
     }
 
     /// What `at` (a file address) is when it is in a live image's slot stubs, with the image
@@ -213,14 +244,15 @@ impl Table {
         let from = usize::try_from(file + (start - range.start)).ok()?;
         let bytes = self.data.get(from..from.checked_add(usize::try_from(size).ok()?)?)?;
         // The section's start is slot 0's stub: the stub there says it is this slot's.
-        let slot = u32::try_from(slot).ok().filter(|&it| live::stub_slot(HOST_ARCH, bytes) == Some(it))?;
+        let slot =
+            u32::try_from(slot).ok().filter(|&it| live::stub_slot(HOST_ARCH, bytes) == Some(it))?;
         let target = live::log::Header::this().map(|it| it.target(slot));
         let code = match target {
             Ok(Some(target)) => match target.checked_sub(slide).and_then(|it| self.symbol(it)) {
                 Some(i) => Code::Symbol(i),
                 None => Code::Unnamed(target),
             },
-            Ok(None) => Code::Unread(format!("slot {slot} is past the jump table")),  // alloc: a stub's name, once an address
+            Ok(None) => Code::Unread(format!("slot {slot} is past the jump table")), // alloc: a stub's name, once an address
             Err(why) => Code::Unread(why),
         };
         Some(Stub { slot, offset: at - start, code })
@@ -248,7 +280,8 @@ impl Table {
         let mut demangled = self.demangled.lock();
         let key = u32::try_from(i).unwrap_or(u32::MAX);
         // alloc: a function's demangled name, once a process a function named
-        let name = demangled.entry(key).or_insert_with(|| demangle(self.mangled(i)).into_boxed_str());
+        let name =
+            demangled.entry(key).or_insert_with(|| demangle(self.mangled(i)).into_boxed_str());
         f(name)
     }
 }
@@ -277,7 +310,9 @@ impl Stub {
         let slot = self.slot;
         match &self.code {
             Code::Symbol(i) => table.demangled(*i, |name| format!("stub of {name}")),
-            Code::Unnamed(at) => format!("stub of slot {slot}, whose code at {at:#x} no symbol names"),
+            Code::Unnamed(at) => {
+                format!("stub of slot {slot}, whose code at {at:#x} no symbol names")
+            }
             Code::Unread(why) => format!("stub of slot {slot} (its jump table unread: {why})"),
         }
     }
@@ -287,16 +322,28 @@ impl Stub {
 #[cfg(unix)]
 fn map(path: &Path) -> Result<&'static [u8], String> {
     use std::os::fd::AsRawFd;
-    let file = std::fs::File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
-    let len = file.metadata().map_err(|error| format!("reading the size of {}: {error}", path.display()))?.len();
-    let len = usize::try_from(len).map_err(|_| format!("{} is {len} bytes, past the address space", path.display()))?;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("opening {}: {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("reading the size of {}: {error}", path.display()))?
+        .len();
+    let len = usize::try_from(len)
+        .map_err(|_| format!("{} is {len} bytes, past the address space", path.display()))?;
     if len == 0 {
         return Err(format!("{} is empty", path.display()));
     }
     // SAFETY: a new read-only private mapping of `len` bytes of a file opened above; the
     // mapping outlives the descriptor, which closes as `file` drops.
     let at = unsafe {
-        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
     };
     if at == libc::MAP_FAILED {
         return Err(format!("mapping {}: {}", path.display(), std::io::Error::last_os_error()));
@@ -313,7 +360,8 @@ fn map(path: &Path) -> Result<&'static [u8], String> {
 #[cfg(not(unix))]
 fn map(path: &Path) -> Result<&'static [u8], String> {
     // alloc: the executable's bytes, once a process
-    let bytes = std::fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
     Ok(bytes.leak())
 }
 
@@ -324,7 +372,15 @@ fn own() -> Option<&'static Table> {
     OWN.get_or_init(|| {
         let table = std::env::current_exe()
             .map_err(|error| format!("finding this process's executable: {error}"))
-            .and_then(|path| Table::read(&path));
+            .and_then(|path| {
+                // The running inode: a rebuild that replaced the path left this process's code
+                // in the old file, whose symbols are the ones it runs.
+                #[cfg(target_os = "linux")]
+                let open = Path::new("/proc/self/exe");
+                #[cfg(not(target_os = "linux"))]
+                let open = path.as_path();
+                Table::read(open, &path)
+            });
         if let Err(why) = &table {
             // Said on stderr as ix-prof's other failures are: a symbolizer runs inside the
             // recorder's lock, and a tracing event there would reach ix-prof's own layer.
@@ -395,7 +451,9 @@ impl Image {
             }
         }
         if out.is_empty() {
-            out.push(base(symbol.map_or_else(|| format!("{at:#x}"), |i| table.demangled(i, str::to_owned))));
+            out.push(base(
+                symbol.map_or_else(|| format!("{at:#x}"), |i| table.demangled(i, str::to_owned)),
+            ));
         }
         // addr2line gives the innermost first.
         out.reverse();
@@ -403,7 +461,8 @@ impl Image {
         for (i, f) in out.iter_mut().enumerate() {
             f.inline_depth = i as u16;
             if i == 0 {
-                f.system_name = symbol.map(|it| table.mangled(it).to_owned()).filter(|it| *it != f.function);
+                f.system_name =
+                    symbol.map(|it| table.mangled(it).to_owned()).filter(|it| *it != f.function);
             }
         }
         debug_assert_eq!(depth, out.len());
@@ -494,6 +553,162 @@ pub fn names(pcs: &[u64]) -> BTreeMap<u64, String> {
     out
 }
 
+/// A name for each of `pcs`, return addresses of this same executable as another process
+/// loaded it, `slide` from its file's addresses (a process that ran this executable and is
+/// gone: blaze-profile's crash records). An address in the executable's code is named as
+/// [`names`] names it; any other (a shared library's in that process, whose loads are not
+/// known here) is its bare address.
+pub fn names_slid(pcs: &[u64], slide: u64) -> BTreeMap<u64, String> {
+    let ours = self::slide();
+    let mut out = BTreeMap::new();
+    for &pc in pcs {
+        let name = pc.checked_sub(slide).zip(ours).and_then(|(at, ours)| own()?.name(at, ours));
+        out.insert(pc, name.unwrap_or_else(|| format!("{pc:#x}")));
+    }
+    out
+}
+
+/// How far this executable was loaded from the addresses its file gives, once a process: what a
+/// record of raw addresses keeps so they can be named later ([`names_slid`]).
+pub fn own_slide() -> Option<u64> {
+    slide()
+}
+
+/// Where this executable is loaded (its first byte's address), once a process.
+pub fn own_load_base() -> Option<u64> {
+    own_base()
+}
+
+/// The DWARF reader [`functions`] keeps for the process's life: slices of a mapping that is
+/// never unmapped, never a copy of a section stored uncompressed.
+type StaticReader = gimli::EndianSlice<'static, gimli::RunTimeEndian>;
+
+/// The DWARF of the object file `data`, borrowing its bytes; `None` when it has none.
+fn static_dwarf_of(data: &'static [u8]) -> Option<addr2line::Context<StaticReader>> {
+    use object::{Object, ObjectSection};
+    let object = object::File::parse(data).ok()?;
+    if !object.section_by_name(".debug_info").is_some_and(|s| s.size() > 0) {
+        return None;
+    }
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let dwarf = gimli::Dwarf::load(|id: gimli::SectionId| -> Result<StaticReader, gimli::Error> {
+        let bytes: &'static [u8] =
+            match object.section_by_name(id.name()).map(|it| it.uncompressed_data()) {
+                Some(Ok(std::borrow::Cow::Borrowed(it))) => it,
+                // alloc: a compressed section's bytes, once a process, kept as the mapping is
+                Some(Ok(std::borrow::Cow::Owned(it))) => it.leak(),
+                _ => &[],
+            };
+        Ok(gimli::EndianSlice::new(bytes, endian))
+    })
+    .ok()?;
+    addr2line::Context::from_dwarf(dwarf).ok()
+}
+
+/// The executable's DWARF, read the first time [`functions`] asks, once a process; `None` when
+/// it has none (nor a `.dSYM` on macOS).
+///
+/// Memory: the sections are the mapping's pages ([`Table::data`]), not the heap. The heap holds
+/// what addr2line parses: every unit's address ranges once, then the lines and functions of each
+/// unit an address looked up falls in, kept for the process's life (bounded by the units samples
+/// land in). The [`Symbolizer`]'s reader ([`Table::dwarf`]) instead copies every section each
+/// time one is made, 1.4 GiB building blaze's own tree when blaze-profile made one a flush.
+fn own_dwarf() -> Option<&'static Mutex<addr2line::Context<StaticReader>>> {
+    static DWARF: OnceLock<Option<Mutex<addr2line::Context<StaticReader>>>> = OnceLock::new();
+    DWARF.get_or_init(|| own().and_then(Table::static_dwarf).map(Mutex::new)).as_ref()
+}
+
+/// How [`functions`] names this executable's frames: `dwarf` (functions and the functions
+/// inlined into them), `symbols` (functions from the symbol table: it has no DWARF, so no
+/// inline frames), or `none` (its symbol table could not be read).
+pub fn names_kind() -> &'static str {
+    match own() {
+        Some(_) if own_dwarf().is_some() => "dwarf",
+        Some(_) => "symbols",
+        None => "none",
+    }
+}
+
+/// What [`functions`] names an address no image or code map holds: JIT code no maker
+/// registered ([`crate::jit`]), or a wild address.
+pub const NO_IMAGE: &str = "[code in no image]";
+
+/// Each of `addresses`' frames by function, outermost first: the function its symbol names,
+/// then each function inlined there down to the one the address is in, from DWARF ([`names_kind`]
+/// says whether there is any). Never an offset, so all of a function's samples are one frame.
+/// A return address is looked up at the address before it (the call), which the caller passes.
+///
+/// In this executable: its symbol table and DWARF, a live image's slot stubs as `stub of <f>`.
+/// In a registered code map (wasm proc macros): its function ([`crate::jit::name`]). In a
+/// shared library: its nearest exported symbol (`dladdr`), else `[<file>]`. Elsewhere
+/// [`NO_IMAGE`].
+pub fn functions(addresses: &[u64]) -> BTreeMap<u64, Vec<String>> {
+    let (slide, base) = (slide(), own_base());
+    let mut out = BTreeMap::new();
+    for &pc in addresses {
+        if !out.contains_key(&pc) {
+            out.insert(pc, function_frames(pc, slide, base));
+        }
+    }
+    out
+}
+
+fn function_frames(pc: u64, slide: Option<u64>, base: Option<u64>) -> Vec<String> {
+    if let Some(name) = crate::jit::name(pc) {
+        return vec![name];
+    }
+    let found = loaded(pc);
+    let in_own = found.as_ref().is_none_or(|info| Some(info.0) == base);
+    if in_own
+        && let Some(slide) = slide
+        && let Some(at) = pc.checked_sub(slide)
+        && let Some(table) = own()
+    {
+        if let Some(stub) = table.stub(at, slide) {
+            return vec![stub.function(table)];
+        }
+        if let Some(i) = table.symbol(at) {
+            let mut frames = inlined(at);
+            // The outermost is the code the address is in, which the symbol names.
+            let outer = table.demangled(i, str::to_owned);
+            match frames.first_mut() {
+                Some(first) => *first = outer,
+                None => frames.push(outer),
+            }
+            return frames;
+        }
+    }
+    match found {
+        Some((at, _, Some(name), _)) if Some(at) != base => vec![demangle(&name)],
+        Some((_, Some(file), _, _)) => {
+            vec![format!("[{}]", file.rsplit('/').next().unwrap_or(&file))]
+        }
+        _ => vec![NO_IMAGE.to_owned()],
+    }
+}
+
+/// The functions DWARF says the file address `at` is in, outermost first: the function, then
+/// each inlined into it in turn. Empty with no DWARF.
+fn inlined(at: u64) -> Vec<String> {
+    let Some(dwarf) = own_dwarf() else { return Vec::new() };
+    let context = dwarf.lock();
+    let mut out = Vec::new();
+    if let Ok(mut frames) = context.find_frames(at).skip_all_loads() {
+        while let Ok(Some(frame)) = frames.next() {
+            if let Some(name) = frame.function.as_ref().and_then(|it| it.raw_name().ok()) {
+                out.push(demangle(&name));
+            }
+        }
+    }
+    // addr2line gives the innermost first.
+    out.reverse();
+    out
+}
+
 /// How far the executable was loaded from the addresses its file gives.
 #[cfg(target_os = "macos")]
 fn slide() -> Option<u64> {
@@ -545,7 +760,8 @@ fn loaded(pc: u64) -> Option<(u64, Option<String>, Option<String>, u64)> {
     let text = |ptr: *const libc::c_char| {
         // SAFETY: `dladdr` set it to a NUL-terminated string the loader keeps for the
         // object's life, or left it null.
-        (!ptr.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+        (!ptr.is_null())
+            .then(|| unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
     };
     Some((info.dli_fbase as u64, text(info.dli_fname), text(info.dli_sname), info.dli_saddr as u64))
 }
@@ -612,6 +828,75 @@ mod tests {
         assert!(names[&pc].contains("a_function_to_find"), "{}", names[&pc]);
         let frames = Symbolizer::new().symbolize(&[pc]).remove(0);
         assert!(frames.iter().any(|f| f.function.contains("a_function_to_find")), "{frames:?}");
+    }
+
+    /// Inlined into its caller, or not: blaze's debug code inlines nothing, its release code
+    /// does.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[inline(always)]
+    fn an_inlined_function(n: u64) -> u64 {
+        std::hint::black_box(return_address()) ^ n
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[inline(never)]
+    fn a_caller_of_it(n: u64) -> u64 {
+        an_inlined_function(n)
+    }
+
+    /// The address `return_address`'s call returns to, read from its frame record (frame
+    /// pointers are kept: blaze's samplers walk them).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[inline(never)]
+    fn return_address() -> u64 {
+        let fp: u64;
+        // SAFETY: reads the frame pointer register into a local; no memory touched.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags))
+        };
+        // SAFETY: as above.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
+        };
+        // SAFETY: this function's frame record, which its prologue wrote at `fp`: the caller's
+        // frame pointer, then the return address.
+        unsafe { (fp as *const u64).add(1).read() }
+    }
+
+    /// A return address names the functions it is in, by name with no offset: the inlined one
+    /// innermost, and when it was inlined, the function it was inlined into outside it.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn a_return_address_names_its_function_and_the_function_it_was_inlined_into() {
+        let at = a_caller_of_it(0) - 1;
+        let frames = functions(&[at]).remove(&at).unwrap();
+        assert!(
+            frames.iter().all(|it| !it.contains("+0x")),
+            "frames are named by function, never by offset: {frames:?}"
+        );
+        let inner = frames.last().unwrap();
+        if names_kind() == "dwarf" {
+            // Inlined or not, the address is in `an_inlined_function`: the innermost frame,
+            // and when it was inlined, `a_caller_of_it` is the frame outside it.
+            assert!(inner.contains("an_inlined_function"), "{frames:?}");
+            if frames.len() > 1 {
+                assert!(frames[frames.len() - 2].contains("a_caller_of_it"), "{frames:?}");
+            }
+        } else {
+            // No DWARF: one frame, the function the symbol names (the caller when inlined).
+            assert_eq!(frames.len(), 1, "{frames:?}");
+            assert!(
+                inner.contains("an_inlined_function") || inner.contains("a_caller_of_it"),
+                "{frames:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_in_no_image_is_said_so() {
+        assert_eq!(functions(&[8]).remove(&8).unwrap(), [NO_IMAGE]);
     }
 
     /// Naming addresses again, by either path, reads the executable's symbol table no more:

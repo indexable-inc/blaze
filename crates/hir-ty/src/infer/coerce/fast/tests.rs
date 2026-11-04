@@ -3,8 +3,8 @@ use std::{cell::Cell, path::Path};
 use base_db::{Db, all_crates};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::crate_def_map};
-use rustc_type_ir::UintTy;
 use hir_expand::fixture;
+use rustc_type_ir::UintTy;
 
 use super::super::{AllowTwoPhase, Coerce, HirCoercionDelegate};
 use crate::{
@@ -208,7 +208,10 @@ fn new_and_old_infer_every_fixture_the_same() {
                     infer_body_in(&db, body, None, LoweringMode::Analysis, frame)
                 })
             });
-            assert!(new == old, "{name}, {body:?}: inferred differently\nnew: {new:#?}\nold: {old:#?}");
+            assert!(
+                new == old,
+                "{name}, {body:?}: inferred differently\nnew: {new:#?}\nold: {old:#?}"
+            );
             let plain = without_goal_tables(|| {
                 with_old_inference(|| {
                     frame::task(Tag::Infer, |frame| {
@@ -285,8 +288,7 @@ fn an_empty_round_allocates_nothing() {
         // Each round follows a write to another variable: the logs move, the obligation
         // stays stalled.
         let (warm, measured) = (1500, 64);
-        let others: Vec<_> =
-            (0..warm + measured).map(|_| infcx.next_ty_var(Span::Dummy)).collect();
+        let others: Vec<_> = (0..warm + measured).map(|_| infcx.next_ty_var(Span::Dummy)).collect();
         for &var in &others[..warm] {
             assert!(coerce.coerce_at_root(var, u32).is_ok());
             assert!(fulfill.try_evaluate_obligations(&infcx).is_empty());
@@ -313,8 +315,7 @@ fn a_coercion_from_a_variable_allocates_nothing_once_warm() {
         // Past the touched log's cap, so its buffer and the undo logs are at their high-water
         // marks.
         let (warm, measured) = (1500, 64);
-        let vars: Vec<_> =
-            (0..warm + measured).map(|_| infcx.next_ty_var(Span::Dummy)).collect();
+        let vars: Vec<_> = (0..warm + measured).map(|_| infcx.next_ty_var(Span::Dummy)).collect();
         for &var in &vars[..warm] {
             assert!(coerce.coerce_at_root(var, u32).is_ok());
         }

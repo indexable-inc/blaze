@@ -71,7 +71,13 @@ impl Stillness {
     /// still (asked only when the pool is idle with jobs parked and the loop and the IO threads
     /// are still), `open` whether a request has a node not settled (asked only as a still
     /// stretch begins).
-    pub(super) fn tick(&mut self, now_ns: u64, facts: &Facts, stuck: impl FnOnce() -> bool, open: impl FnOnce() -> bool) -> Turn {
+    pub(super) fn tick(
+        &mut self,
+        now_ns: u64,
+        facts: &Facts,
+        stuck: impl FnOnce() -> bool,
+        open: impl FnOnce() -> bool,
+    ) -> Turn {
         let why = match why(facts, stuck) {
             None => {
                 self.since = None;
@@ -157,7 +163,10 @@ mod tests {
         let parked = Facts { on_pool: 2, pool_idle: true, parked: 3, ..Facts::default() };
         assert_eq!(run(parked, false), None, "a job parked on a wait that can end is movement");
         let (_, turn) = run(parked, true).expect("a wait nothing can end is still");
-        assert_eq!(turn, Turn::Still { quiet_ns: 2_000 * MS, why: Why::Stuck { tasks: 2, parked: 3 } });
+        assert_eq!(
+            turn,
+            Turn::Still { quiet_ns: 2_000 * MS, why: Why::Stuck { tasks: 2, parked: 3 } }
+        );
     }
 
     /// Anything the loop, an IO thread or a busy pool can do moves the build, and a turn that
@@ -175,7 +184,10 @@ mod tests {
         let mut stillness = Stillness::default();
         assert_eq!(stillness.tick(0, &lost, || false, || true), Turn::Began);
         assert_eq!(stillness.tick(1_900 * MS, &lost, || false, || true), Turn::Holds);
-        assert_eq!(stillness.tick(1_950 * MS, &Facts { pool_idle: false, ..lost }, || false, || true), Turn::Moves);
+        assert_eq!(
+            stillness.tick(1_950 * MS, &Facts { pool_idle: false, ..lost }, || false, || true),
+            Turn::Moves
+        );
         assert_eq!(stillness.tick(2_000 * MS, &lost, || false, || true), Turn::Began);
         assert_eq!(stillness.tick(3_999 * MS, &lost, || false, || true), Turn::Holds);
         assert!(matches!(stillness.tick(4_000 * MS, &lost, || false, || true), Turn::Still { .. }));

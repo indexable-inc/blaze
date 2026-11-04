@@ -16,10 +16,16 @@
 //! one character or more. No fix: the count's expression is the loop's, which may borrow what
 //! the `with_capacity` can't see yet.
 
-use hir_def::{DefWithBodyId, hir::{Expr, ExprId}, signatures::FunctionSignature};
+use hir_def::{
+    DefWithBodyId,
+    hir::{Expr, ExprId},
+    signatures::FunctionSignature,
+};
 
 use super::{
-    Finding, Lint, alloc::written_callee, exempt, facts,
+    Finding, Lint,
+    alloc::written_callee,
+    exempt, facts,
     goose_locals::{self, Coll},
     hash_order_output::local_of,
 };
@@ -63,12 +69,15 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             .chain(tail.map(|it| (usize::MAX, it)))
             .collect();
         for made in lets {
-            let Some((coll @ (Coll::Vec | Coll::String), "new" | "default")) = goose_locals::made(cx, analysis, made.init)
+            let Some((coll @ (Coll::Vec | Coll::String), "new" | "default")) =
+                goose_locals::made(cx, analysis, made.init)
             else {
                 continue;
             };
             let parents = parents.get_or_insert_with(|| facts::Parents::of(body));
-            if scratch_on && parents.up(block, 64).any(|it| matches!(body.expr(it), Expr::Loop { .. })) {
+            if scratch_on
+                && parents.up(block, 64).any(|it| matches!(body.expr(it), Expr::Loop { .. }))
+            {
                 continue;
             }
             // The next statement after the `let` that names the local.
@@ -137,7 +146,10 @@ fn pushes_once(
     let Expr::Block { statements, tail, .. } = body.expr(body_expr) else { return None };
     let mut leaves = false;
     let walked = super::general_facts::walk(body, body_expr, |it| {
-        leaves |= matches!(body.expr(it), Expr::Break { .. } | Expr::Continue { .. } | Expr::Return { .. });
+        leaves |= matches!(
+            body.expr(it),
+            Expr::Break { .. } | Expr::Continue { .. } | Expr::Return { .. }
+        );
     });
     if leaves || walked != super::general_facts::Walked::Done {
         return None;

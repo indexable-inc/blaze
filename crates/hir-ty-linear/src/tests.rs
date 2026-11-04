@@ -3,9 +3,7 @@
 //! `unmarked_code_gets_no_error` is the opt-in property: code with no mark gets nothing.
 
 use base_db::all_crates;
-use hir_def::{
-    AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map,
-};
+use hir_def::{AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map};
 use hir_expand::fixture;
 use hir_ty::{InferBodyId, db::HirDatabase, next_solver::TyKind};
 use hir_ty_mir::mir::{AggregateKind, MirBody, MirSpan, Rvalue, StatementKind};
@@ -240,7 +238,10 @@ fn an_unmarked_type_parameter_refuses_a_linear_argument() {
     let found = check(&format!(
         "{TXN}\nfn keep<T>(t: T) -> T {{ t }}\nfn f() {{\n    keep(Txn {{ id: 0 }}).commit();\n}}\n"
     ));
-    expect(&found, &[(&["`Txn`", "type parameter `T`", "does not admit linear types"], "keep(Txn { id: 0 })")]);
+    expect(
+        &found,
+        &[(&["`Txn`", "type parameter `T`", "does not admit linear types"], "keep(Txn { id: 0 })")],
+    );
 }
 
 #[test]

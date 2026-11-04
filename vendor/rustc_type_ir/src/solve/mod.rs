@@ -84,8 +84,17 @@ impl From<RerunNonErased> for NoSolutionOrRerunNonErased {
 /// The entire set can be `Copy`ed because of this requirement.
 ///
 /// Set properties maintained using [`union`](SmallCopySet::union), which deduplicates values.
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, GenericTypeVisitable)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Hash,
+    PartialEq,
+    Eq,
+    TypeVisitable_Generic,
+    TypeFoldable_Generic,
+    GenericTypeVisitable,
+)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub enum SmallCopySet<T: Copy + Debug + Hash + Eq> {
     Empty,
@@ -285,8 +294,7 @@ impl<I: Interner> RerunCondition<I> {
 
 /// Mainly for debugging, to keep track of the source of the rerunning
 /// in [`TypingMode::ErasedNotCoherence`].
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-#[derive(TypeVisitable_Generic, GenericTypeVisitable)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, TypeVisitable_Generic, GenericTypeVisitable)]
 #[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub enum RerunReason {
     NormalizeOpaqueTypeRemoteCrate,
@@ -546,8 +554,17 @@ pub enum ParamEnvSource {
     Global,
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
-#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
+#[derive(
+    Clone,
+    Copy,
+    Hash,
+    PartialEq,
+    Eq,
+    Debug,
+    TypeVisitable_Generic,
+    GenericTypeVisitable,
+    TypeFoldable_Generic,
+)]
 pub enum AliasBoundKind {
     /// Alias bound from the self type of a projection
     SelfBounds,

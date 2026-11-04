@@ -40,17 +40,17 @@ mod driven;
 mod flags;
 mod handle;
 mod index;
+#[cfg(all(test, blaze_check))]
+mod model;
 mod peers;
 mod read;
 pub mod remote;
 mod segment;
 mod sync;
 mod table;
-mod words;
-#[cfg(all(test, blaze_check))]
-mod model;
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
+mod words;
 
 #[cfg(all(test, not(blaze_check)))]
 #[global_allocator]
@@ -61,11 +61,11 @@ use std::{collections::VecDeque, fmt, sync::Arc};
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 pub use crate::disk::content_of;
 use crate::disk::{
@@ -78,10 +78,12 @@ use crate::flags::{FLAGS, Flag, Row};
 pub use crate::handle::Handle;
 pub use crate::peers::SharedConfig;
 pub use crate::read::Pinned;
-use crate::read::{ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View, carry_flags};
-pub use crate::segment::Writer;
+use crate::read::{
+    ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View, carry_flags,
+};
 #[cfg(feature = "test-hooks")]
 pub use crate::segment::HeldPut;
+pub use crate::segment::Writer;
 use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
 use crate::table::{Held, Table};
 
@@ -573,11 +575,19 @@ enum PlacedFile {
     Checking(Vec<Waiter>),
     Writing(Vec<Waiter>),
     /// Written (`wrote`) or checked, being made read-only before anything clones it.
-    Sealing { waiting: Vec<Waiter>, wrote: bool },
+    Sealing {
+        waiting: Vec<Waiter>,
+        wrote: bool,
+    },
     /// There and read-only: `cloning` clones of it are in flight, and it is removed once they
     /// end when `doomed` ([`Store::unplace`]) or `lost` (a clone found it gone); `after`, the
     /// places that wait to be made from it afresh once it is.
-    There { cloning: u32, doomed: bool, lost: bool, after: Vec<Waiter> },
+    There {
+        cloning: u32,
+        doomed: bool,
+        lost: bool,
+        after: Vec<Waiter>,
+    },
     /// Being removed; what waits is written afresh once it is gone.
     Removing(Vec<Waiter>),
 }
@@ -681,13 +691,21 @@ impl Reader {
     }
 
     /// The value of `key` as [`Store::get_in_place`] gives it.
-    pub fn get_in_place<'g>(&'g self, guard: &'g Guard, key: &Key) -> Result<Option<(Heat, Entry<'g>)>, Corrupt> {
+    pub fn get_in_place<'g>(
+        &'g self,
+        guard: &'g Guard,
+        key: &Key,
+    ) -> Result<Option<(Heat, Entry<'g>)>, Corrupt> {
         self.look(guard).get_in_place(key)
     }
 
     /// [`Reader::get`], with the directory the value is kept in: what a reader that must
     /// not take a value from elsewhere (machine code it runs) checks before it uses it.
-    pub fn get_from<'g>(&'g self, guard: &'g Guard, key: &Key) -> Result<Option<(Origin, Entry<'g>)>, Corrupt> {
+    pub fn get_from<'g>(
+        &'g self,
+        guard: &'g Guard,
+        key: &Key,
+    ) -> Result<Option<(Origin, Entry<'g>)>, Corrupt> {
         self.look(guard).get_from(key)
     }
 
@@ -834,41 +852,87 @@ pub type Admit = fn(Kind, &[u8]) -> Result<(), String>;
 enum Op {
     /// The store's directory checked to be the user's alone, before anything in it is read.
     Private,
-    Head { tier: usize },
-    Map { tier: usize, file: FileName, what: Mapped },
-    Truncate { pack: usize },
-    WritePack { pack: usize },
-    Sync { pack: usize },
-    WriteExternal { content: ContentId },
+    Head {
+        tier: usize,
+    },
+    Map {
+        tier: usize,
+        file: FileName,
+        what: Mapped,
+    },
+    Truncate {
+        pack: usize,
+    },
+    WritePack {
+        pack: usize,
+    },
+    Sync {
+        pack: usize,
+    },
+    WriteExternal {
+        content: ContentId,
+    },
     WriteIndex,
     WriteHead,
     /// A pack whose live records were copied on, removed once the head no longer names it.
-    RemovePack { pack: usize },
+    RemovePack {
+        pack: usize,
+    },
     /// `to` removed so `from` can be cloned there; `of`, the content of the whole file of
     /// [`PlacedFile`] it clones.
-    Clear { asked: Tag, from: FileName, to: FileName, of: Option<Source>, bytes: PlacedBytes },
-    Place { asked: Tag, to: FileName, of: Option<Source>, bytes: PlacedBytes },
+    Clear {
+        asked: Tag,
+        from: FileName,
+        to: FileName,
+        of: Option<Source>,
+        bytes: PlacedBytes,
+    },
+    Place {
+        asked: Tag,
+        to: FileName,
+        of: Option<Source>,
+        bytes: PlacedBytes,
+    },
     /// Whether the whole file of `content` is there ([`PlacedFile::Probing`]).
-    Probe { content: ContentId },
+    Probe {
+        content: ContentId,
+    },
     /// The whole file of `content` mapped to be hashed ([`PlacedFile::Checking`]).
-    Check { content: ContentId },
+    Check {
+        content: ContentId,
+    },
     /// Whether the whole file of `content` is still there, after a clone of it for `waiter`
     /// failed with `why`.
-    Recheck { content: ContentId, waiter: Waiter, why: String },
+    Recheck {
+        content: ContentId,
+        waiter: Waiter,
+        why: String,
+    },
     /// Whether the directory of whole files is there, as the store opens.
     LookPlaced,
     /// The directory of whole files listed as the store opens.
     ListPlaced,
     /// A temporary file of it removed.
-    Swept { file: FileName },
+    Swept {
+        file: FileName,
+    },
     /// The whole file of `content` written ([`PlacedFile::Writing`]).
-    MakeFile { content: ContentId },
+    MakeFile {
+        content: ContentId,
+    },
     /// The whole file of `content` made read-only ([`PlacedFile::Sealing`]).
-    Seal { content: ContentId },
+    Seal {
+        content: ContentId,
+    },
     /// The whole file of `content` removed ([`PlacedFile::Removing`]).
-    Unplace { content: ContentId },
+    Unplace {
+        content: ContentId,
+    },
     /// A fetch of `key`, whose value is kept only once `admit` takes it ([`Store::fetch`]).
-    Fetch { key: Key, admit: Admit },
+    Fetch {
+        key: Key,
+        admit: Admit,
+    },
     /// The shared directory listed, for the other writers' stores in it.
     Peers,
     /// Its own empty head written, so the other writers find a store in its directory.
@@ -878,11 +942,20 @@ enum Op {
 #[derive(Clone, Copy, Debug)]
 enum Mapped {
     /// `covers` is `None` for the table the store opened with, else the last batch it holds.
-    Index { covers: Option<u64> },
+    Index {
+        covers: Option<u64>,
+    },
     /// `usable` is how much of the file is the store's as of the commit that asked; `batch`,
     /// the batch of moves waiting for it.
-    Pack { pack: usize, usable: u64, batch: Option<u64> },
-    External { content: ContentId, batch: Option<u64> },
+    Pack {
+        pack: usize,
+        usable: u64,
+        batch: Option<u64>,
+    },
+    External {
+        content: ContentId,
+        batch: Option<u64>,
+    },
 }
 
 impl Mapped {
@@ -976,14 +1049,20 @@ impl Tier {
                 .packs
                 .iter()
                 // clone: the published view owns its names and mappings; once per pack a view
-                .map(|it| PackView { file: it.file.clone(), mapping: it.mapping.clone(), usable: it.usable })
+                .map(|it| PackView {
+                    file: it.file.clone(),
+                    mapping: it.mapping.clone(),
+                    usable: it.usable,
+                })
                 // alloc: the view's packs, exactly sized; once per view
                 .collect(),
             externals: self
                 .externals
                 .iter()
                 // clone: the published view owns its names and mappings; once per external a view
-                .map(|(content, it)| (*content, ExternalView { file: it.file.clone(), mapping: it.mapping.clone() }))
+                .map(|(content, it)| {
+                    (*content, ExternalView { file: it.file.clone(), mapping: it.mapping.clone() })
+                })
                 // alloc: the view's externals; once per view
                 .collect(),
             // clone: an `Arc` (or a dictionary's error) per dictionary, into the view's list; once per view
@@ -1108,7 +1187,8 @@ impl Commit {
 fn header_schema(bytes: &[u8]) -> Option<SchemaHash> {
     let magic = bytes.get(..8)?;
     let schema = bytes.get(8..8 + SCHEMA_PREFIX)?;
-    (magic == blaze_format::MAGIC).then(|| SchemaHash(ContentId(schema.try_into().expect("32 bytes"))))
+    (magic == blaze_format::MAGIC)
+        .then(|| SchemaHash(ContentId(schema.try_into().expect("32 bytes"))))
 }
 
 /// `encoded` behind the schema of the encodings that made it: a columns record's payload.
@@ -1124,20 +1204,30 @@ fn cold_columns(columns: &Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
     let payload = columns_payload(columns, &columns.cold(hot)?);
     if columns.hot_from_cold(&payload[SCHEMA_PREFIX..])? != hot {
         // alloc: the message of an encoding that does not decode back
-        return Err(format!("the cold columns of schema {:x} do not decode to the value", columns.schema().0));
+        return Err(format!(
+            "the cold columns of schema {:x} do not decode to the value",
+            columns.schema().0
+        ));
     }
     Ok(payload)
 }
 
 /// The next colder columns of `hot`, kept at `loc`: warm from hot (or cold, where warm saves
 /// less than an eighth), cold from warm; `None` when that saves less than an eighth too.
-fn colder_columns(columns: &Columns, loc: Loc, hot: &[u8]) -> Result<Option<(Form, Vec<u8>)>, String> {
+fn colder_columns(
+    columns: &Columns,
+    loc: Loc,
+    hot: &[u8],
+) -> Result<Option<(Form, Vec<u8>)>, String> {
     let saves = |payload: &[u8]| payload.len() as u64 + loc.stored / 8 <= loc.stored;
     if loc.form != Form::Warm {
         let payload = columns_payload(columns, &columns.warm(hot)?);
         if columns.hot_from_warm(&payload[SCHEMA_PREFIX..])? != hot {
             // alloc: the message of an encoding that does not decode back
-            return Err(format!("the warm columns of schema {:x} do not decode to the value", columns.schema().0));
+            return Err(format!(
+                "the warm columns of schema {:x} do not decode to the value",
+                columns.schema().0
+            ));
         }
         if saves(&payload) {
             return Ok(Some((Form::Warm, payload)));
@@ -1257,7 +1347,8 @@ impl Store {
 
     /// Whether it has mapped what it needs to answer gets.
     pub fn ready(&self) -> bool {
-        self.broken.is_none() && self.peers_ready().unwrap_or_else(|| self.tiers.iter().all(|it| it.opened))
+        self.broken.is_none()
+            && self.peers_ready().unwrap_or_else(|| self.tiers.iter().all(|it| it.opened))
     }
 
     /// Why it stopped, if it has.
@@ -1389,7 +1480,13 @@ impl Store {
     /// [`Store::complete`] says its ticket is. A second put of a key keeps the first value
     /// wherever it is, and a put whose bytes differ from the value kept is an error the caller
     /// sees (a key that misses an input).
-    pub fn put_in(&mut self, unit: Unit, key: Key, kind: Kind, bytes: &[u8]) -> Result<Ticket, Mismatch> {
+    pub fn put_in(
+        &mut self,
+        unit: Unit,
+        key: Key,
+        kind: Kind,
+        bytes: &[u8],
+    ) -> Result<Ticket, Mismatch> {
         let content = content_of(bytes);
         self.put_hashed(unit, key, kind, content, bytes)
     }
@@ -1403,7 +1500,10 @@ impl Store {
         content: ContentId,
         bytes: &[u8],
     ) -> Result<Ticket, Mismatch> {
-        assert!(unit.0 as usize <= self.tiers[0].units.len(), "{unit:?} is not one this store gave");
+        assert!(
+            unit.0 as usize <= self.tiers[0].units.len(),
+            "{unit:?} is not one this store gave"
+        );
         assert!(self.tiers[0].opened, "a put into a store that is not open");
         self.tidy();
         let look = self.look();
@@ -1488,7 +1588,9 @@ impl Store {
                     }
                     let pack = &self.tiers[0].packs[loc.pack as usize];
                     let payload = loc.offset.checked_add(RECORD_HEADER);
-                    let Some(raw) = payload.and_then(|at| pack.bytes(at, loc.raw)) else { continue };
+                    let Some(raw) = payload.and_then(|at| pack.bytes(at, loc.raw)) else {
+                        continue;
+                    };
                     // A record met by an earlier settle, or put while the store is open, is
                     // sampled already: a settle that meets it again adds nothing.
                     let content = content_of(raw);
@@ -1560,7 +1662,8 @@ impl Store {
                     continue;
                 }
                 let long = bytes.len() >= cold::LONG_FROM;
-                let stored = if long { cold::compress_long(&bytes) } else { batch.compress(&bytes) };
+                let stored =
+                    if long { cold::compress_long(&bytes) } else { batch.compress(&bytes) };
                 let stored = match stored {
                     Ok(stored) => stored,
                     Err(why) => {
@@ -1699,7 +1802,10 @@ impl Store {
             // slot nothing checked: it must be the record that was read.
             Ok((header, _)) if header.stored != loc.stored || header.raw != loc.raw => {
                 // alloc: a problem reported
-                self.problems.push(format!("{:x} is not moved: its record is not the one its index names", key.0));
+                self.problems.push(format!(
+                    "{:x} is not moved: its record is not the one its index names",
+                    key.0
+                ));
                 None
             }
             Ok((header, bytes)) => Some((header.content, bytes)),
@@ -1779,7 +1885,8 @@ impl Store {
                     && pack.usable == pack.committed
                     && pack.committed > PACK_HEADER
                     && pack.dead * 2 >= pack.committed - PACK_HEADER
-                    && own.packs.iter().rposition(|it| it.unit == pack.unit && !it.removed) != Some(at)
+                    && own.packs.iter().rposition(|it| it.unit == pack.unit && !it.removed)
+                        != Some(at)
                     && !own.dictionaries.iter().any(|it| it.pack as usize == at)
             })
             // alloc: once a settle (idle), the packs it may rewrite, which it appends to as it goes
@@ -1937,7 +2044,9 @@ impl Store {
         let plan = match found.and_then(|found| Ok((found, look.record(found, key)?.0))) {
             // alloc: the error of a corrupt value
             Err(corrupt) => Plan::Refused(corrupt.to_string()),
-            Ok((found, header)) if clones_from_file(&header, found.place.form()) => Plan::File(header.content, header.raw),
+            Ok((found, header)) if clones_from_file(&header, found.place.form()) => {
+                Plan::File(header.content, header.raw)
+            }
             Ok((found, _)) => match look.read(found, key) {
                 // alloc: the error of a corrupt value
                 Err(corrupt) => Plan::Refused(corrupt.to_string()),
@@ -1983,7 +2092,12 @@ impl Store {
                 effects.push(Effect::Write { file: to.clone(), bytes, tag });
                 self.tags.ops.insert(tag, Op::Place { asked: tag, to, of: None, bytes: placed });
             }
-            Plan::Refused(why) => self.placed.push(Placed { tag, to, result: Err(why), bytes: PlacedBytes::default() }),
+            Plan::Refused(why) => self.placed.push(Placed {
+                tag,
+                to,
+                result: Err(why),
+                bytes: PlacedBytes::default(),
+            }),
         }
         Some(tag)
     }
@@ -2082,7 +2196,9 @@ impl Store {
         let dir = self.placed_dir();
         if let Some(why) = problem {
             // alloc: the error that breaks the store
-            let what = format!("looking through it as the store opened, to sweep an earlier run's leftovers: {why}");
+            let what = format!(
+                "looking through it as the store opened, to sweep an earlier run's leftovers: {why}"
+            );
             tracing::error!(target: "blaze", %dir, "{what}");
             return self.fail(dir, what);
         }
@@ -2107,7 +2223,10 @@ impl Store {
         match self.look_tries < FAILURES_MOST {
             true => self.ask_placed(effects),
             // alloc: the error that breaks the store
-            false => self.placed_look_done(Some(format!("failed {FAILURES_MOST} times, the last: {}", describe(done))), effects),
+            false => self.placed_look_done(
+                Some(format!("failed {FAILURES_MOST} times, the last: {}", describe(done))),
+                effects,
+            ),
         }
     }
 
@@ -2131,7 +2250,8 @@ impl Store {
                 continue;
             }
             let name = file.as_str().rsplit('/').next().unwrap_or("");
-            let named = name.len() == 2 * size_of::<ContentId>() && name.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'));
+            let named = name.len() == 2 * size_of::<ContentId>()
+                && name.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'));
             if named {
                 self.placed_on_open.kept += 1;
                 self.placed_on_open.kept_bytes += meta.len;
@@ -2181,7 +2301,13 @@ impl Store {
 
     /// `waiter`'s path cleared and the whole file of `content` cloned there; `written`, the
     /// bytes it wrote to make that file.
-    fn clone_file(&mut self, content: ContentId, waiter: Waiter, written: u64, effects: &mut Vec<Effect>) {
+    fn clone_file(
+        &mut self,
+        content: ContentId,
+        waiter: Waiter,
+        written: u64,
+        effects: &mut Vec<Effect>,
+    ) {
         let from = self.placed_file(&content);
         let Waiter { asked, to, key, raw, retried } = waiter;
         let bytes = PlacedBytes { cloned: raw, written, copied: 0 };
@@ -2194,7 +2320,10 @@ impl Store {
     /// A clone of the whole file of `content` ended: it goes once it is let go of (or found gone)
     /// and no other clone of it is in flight.
     fn cloned(&mut self, content: ContentId, effects: &mut Vec<Effect>) {
-        let Some(PlacedFile::There { cloning, doomed, lost, after }) = self.files.get_mut(&content) else { return };
+        let Some(PlacedFile::There { cloning, doomed, lost, after }) = self.files.get_mut(&content)
+        else {
+            return;
+        };
         *cloning -= 1;
         if *cloning == 0 && (*doomed || *lost) {
             let after = std::mem::take(after);
@@ -2205,15 +2334,25 @@ impl Store {
     /// A clone from the whole file of `content` failed with `why`: when the file is gone (removed
     /// outside the daemon) or no regular file (a symbolic link, a FIFO), it is written again and
     /// `waiter` placed from it, once; when it is there, the clone's failure is the place's.
-    fn rechecked(&mut self, content: ContentId, waiter: Waiter, why: &str, done: &Done, effects: &mut Vec<Effect>) {
+    fn rechecked(
+        &mut self,
+        content: ContentId,
+        waiter: Waiter,
+        why: &str,
+        done: &Done,
+        effects: &mut Vec<Effect>,
+    ) {
         let file = self.placed_file(&content);
-        let link = why.contains(blaze_core::CLONE_THROUGH_A_LINK) || why.contains(blaze_core::CLONE_OF_NO_FILE);
+        let link = why.contains(blaze_core::CLONE_THROUGH_A_LINK)
+            || why.contains(blaze_core::CLONE_OF_NO_FILE);
         if !link && !matches!(done, Done::Stat(None)) {
             // alloc: one waiter refused, its error naming the file it cloned
             return self.refuse_waiting(vec![waiter], &format!("cloning {file}: {why}"));
         }
         // alloc: a problem reported
-        self.placed_problem(format!("{file} could not be cloned from ({why}), and is written again"));
+        self.placed_problem(format!(
+            "{file} could not be cloned from ({why}), and is written again"
+        ));
         match self.files.get_mut(&content) {
             Some(PlacedFile::There { cloning, lost, after, .. }) => {
                 *lost = true;
@@ -2246,7 +2385,10 @@ impl Store {
                     Ok(bytes)
                 }
                 // alloc: an error, once per place that fails
-                Ok(_) => Err(format!("the store no longer has the value of {:?} it was asked to place", waiter.key)),
+                Ok(_) => Err(format!(
+                    "the store no longer has the value of {:?} it was asked to place",
+                    waiter.key
+                )),
                 // alloc: the error of a corrupt value
                 Err(corrupt) => Err(corrupt.to_string()),
             };
@@ -2268,13 +2410,24 @@ impl Store {
     fn refuse_waiting(&mut self, waiting: Vec<Waiter>, why: &str) {
         for Waiter { asked, to, .. } in waiting {
             // alloc: an error, once per place that fails
-            self.placed.push(Placed { tag: asked, to, result: Err(why.to_owned()), bytes: PlacedBytes::default() });
+            self.placed.push(Placed {
+                tag: asked,
+                to,
+                result: Err(why.to_owned()),
+                bytes: PlacedBytes::default(),
+            });
         }
     }
 
     /// `waiting` placed from the whole file of `content` once it is read-only again; `wrote`,
     /// whether this run wrote it.
-    fn seal(&mut self, content: ContentId, waiting: Vec<Waiter>, wrote: bool, effects: &mut Vec<Effect>) {
+    fn seal(
+        &mut self,
+        content: ContentId,
+        waiting: Vec<Waiter>,
+        wrote: bool,
+        effects: &mut Vec<Effect>,
+    ) {
         let file = self.placed_file(&content);
         self.files.insert(content, PlacedFile::Sealing { waiting, wrote });
         let tag = self.tags.ask(Op::Seal { content });
@@ -2294,7 +2447,9 @@ impl Store {
         let Some(state) = self.files.remove(&content) else { return };
         let file = self.placed_file(&content);
         match (op, state, done) {
-            (Op::Probe { .. }, PlacedFile::Probing(waiting), Done::Stat(Some(meta))) if !meta.dir && meta.len == waiting[0].raw => {
+            (Op::Probe { .. }, PlacedFile::Probing(waiting), Done::Stat(Some(meta)))
+                if !meta.dir && meta.len == waiting[0].raw =>
+            {
                 // A file of the right length this run did not write (an earlier run's, or one
                 // changed outside): its bytes are checked against its name before anything
                 // clones it.
@@ -2324,7 +2479,9 @@ impl Store {
                     self.seal(content, waiting, false, effects);
                 } else {
                     // alloc: a problem reported
-                    self.placed_problem(format!("{file} holds bytes of {found:x}, not of its name, and is written again"));
+                    self.placed_problem(format!(
+                        "{file} holds bytes of {found:x}, not of its name, and is written again"
+                    ));
                     self.remove_file(content, waiting, effects);
                 }
             }
@@ -2333,7 +2490,12 @@ impl Store {
             }
             (Op::Seal { .. }, PlacedFile::Sealing { waiting, wrote }, Done::Moded) => {
                 // alloc: empty, allocates nothing
-                let there = PlacedFile::There { cloning: waiting.len() as u32, doomed: false, lost: false, after: Vec::new() };
+                let there = PlacedFile::There {
+                    cloning: waiting.len() as u32,
+                    doomed: false,
+                    lost: false,
+                    after: Vec::new(),
+                };
                 self.files.insert(content, there);
                 for (at, waiter) in waiting.into_iter().enumerate() {
                     // The first place made the file: its bytes are written once, for all.
@@ -2348,9 +2510,11 @@ impl Store {
                 // ([`Store::rechecked`]); otherwise they are refused and the next place writes
                 // it again.
                 let why = describe(&done);
-                let swapped = why.contains(blaze_core::SEAL_THROUGH_A_LINK) || why.contains(blaze_core::SEAL_OF_NO_FILE);
+                let swapped = why.contains(blaze_core::SEAL_THROUGH_A_LINK)
+                    || why.contains(blaze_core::SEAL_OF_NO_FILE);
                 // alloc: the places split, once per seal that fails
-                let (mut again, refused): (Vec<Waiter>, Vec<Waiter>) = waiting.into_iter().partition(|it| swapped && !it.retried);
+                let (mut again, refused): (Vec<Waiter>, Vec<Waiter>) =
+                    waiting.into_iter().partition(|it| swapped && !it.retried);
                 // alloc: an error, once per place that fails
                 let why = format!("making {file} read-only: {why}");
                 if !refused.is_empty() {
@@ -2377,7 +2541,13 @@ impl Store {
                     self.make_file(content, waiting, effects);
                 }
             }
-            (_, PlacedFile::Probing(waiting) | PlacedFile::Checking(waiting) | PlacedFile::Writing(waiting), done) => {
+            (
+                _,
+                PlacedFile::Probing(waiting)
+                | PlacedFile::Checking(waiting)
+                | PlacedFile::Writing(waiting),
+                done,
+            ) => {
                 // alloc: an error, once per place that fails
                 let why = format!("{file}: {}", describe(&done));
                 self.refuse_waiting(waiting, &why);
@@ -2517,7 +2687,10 @@ impl Store {
                 }
                 Done::Private(Some((file, access))) => {
                     // alloc: the error that breaks the store
-                    self.fail(file, format!("{access}, and the store and all in it must be the user's alone"))
+                    self.fail(
+                        file,
+                        format!("{access}, and the store and all in it must be the user's alone"),
+                    )
                 }
                 done => {
                     // clone: the name of what failed, on an error path
@@ -2562,7 +2735,12 @@ impl Store {
                     if let Some(source) = of {
                         self.cloned(source.content, effects);
                     }
-                    self.placed.push(Placed { tag: asked, to, result: Err(describe(&done)), bytes: PlacedBytes::default() });
+                    self.placed.push(Placed {
+                        tag: asked,
+                        to,
+                        result: Err(describe(&done)),
+                        bytes: PlacedBytes::default(),
+                    });
                 }
             },
             Op::Place { asked, to, of, bytes } => {
@@ -2570,13 +2748,17 @@ impl Store {
                     self.cloned(source.content, effects);
                 }
                 match (done, of) {
-                    (Done::Cloned | Done::Written, _) => self.placed.push(Placed { tag: asked, to, result: Ok(()), bytes }),
+                    (Done::Cloned | Done::Written, _) => {
+                        self.placed.push(Placed { tag: asked, to, result: Ok(()), bytes })
+                    }
                     (done, Some(Source { content, key, retried: false })) => {
                         // Whether the file it cloned from is gone or no file, which is made
                         // again once.
                         let waiter = Waiter { asked, to, key, raw: bytes.cloned, retried: true };
                         let why = describe(&done);
-                        if why.contains(blaze_core::CLONE_THROUGH_A_LINK) || why.contains(blaze_core::CLONE_OF_NO_FILE) {
+                        if why.contains(blaze_core::CLONE_THROUGH_A_LINK)
+                            || why.contains(blaze_core::CLONE_OF_NO_FILE)
+                        {
                             self.rechecked(content, waiter, &why, &done, effects);
                         } else {
                             let file = self.placed_file(&content);
@@ -2586,11 +2768,18 @@ impl Store {
                     }
                     (done, _) => {
                         let result = Err(describe(&done));
-                        self.placed.push(Placed { tag: asked, to, result, bytes: PlacedBytes::default() });
+                        self.placed.push(Placed {
+                            tag: asked,
+                            to,
+                            result,
+                            bytes: PlacedBytes::default(),
+                        });
                     }
                 }
             }
-            Op::Recheck { content, waiter, why } => self.rechecked(content, waiter, &why, &done, effects),
+            Op::Recheck { content, waiter, why } => {
+                self.rechecked(content, waiter, &why, &done, effects)
+            }
             Op::LookPlaced => match done {
                 // None yet: nothing placed.
                 Done::Stat(None) => self.placed_look_done(None, effects),
@@ -2598,17 +2787,26 @@ impl Store {
                     let tag = self.tags.ask(Op::ListPlaced);
                     effects.push(Effect::List { dir: self.placed_dir(), tag });
                 }
-                Done::Stat(Some(_)) => self.placed_look_done(Some("it is a file, not a directory".into()), effects),
+                Done::Stat(Some(_)) => {
+                    self.placed_look_done(Some("it is a file, not a directory".into()), effects)
+                }
                 done => self.placed_look_failed(&done, effects),
             },
             Op::ListPlaced => self.placed_listed(done, effects),
             Op::Swept { file } => {
                 if !matches!(done, Done::Removed) {
                     // alloc: a problem reported
-                    self.placed_problem(format!("{file}, a temporary file of an earlier run, was left behind: {}", describe(&done)));
+                    self.placed_problem(format!(
+                        "{file}, a temporary file of an earlier run, was left behind: {}",
+                        describe(&done)
+                    ));
                 }
             }
-            op @ (Op::Probe { .. } | Op::Check { .. } | Op::MakeFile { .. } | Op::Seal { .. } | Op::Unplace { .. }) => {
+            op @ (Op::Probe { .. }
+            | Op::Check { .. }
+            | Op::MakeFile { .. }
+            | Op::Seal { .. }
+            | Op::Unplace { .. }) => {
                 self.file_step(op, done, effects);
             }
             Op::Fetch { key, admit } => {
@@ -2741,7 +2939,14 @@ impl Store {
     }
 
     /// Copies the record at `at` of a segment's chunk into its pack; gives its length there.
-    fn drain_record(&mut self, number: usize, at_chunk: ChunkRef, chunk: &Chunk, at: u64, batch: &mut Batch) -> u64 {
+    fn drain_record(
+        &mut self,
+        number: usize,
+        at_chunk: ChunkRef,
+        chunk: &Chunk,
+        at: u64,
+        batch: &mut Batch,
+    ) -> u64 {
         // SAFETY: `drain` passes an `at` below what the chunk published, and a writer publishes
         // only past whole records (`Own::end_put`, `Own::keep`, `Own::roll` publish after `at`
         // moved past the record), so the record at `at` is all below what was published.
@@ -2756,7 +2961,10 @@ impl Store {
         // SAFETY: as above, for the payload after the header, whose length that header gives.
         let payload = unsafe { chunk.bytes(at + FRAME + RECORD_HEADER, header.stored) }
             .expect("a published record is in its chunk");
-        assert!(unit as usize <= self.tiers[0].units.len(), "a put into unit {unit}, which this store did not give");
+        assert!(
+            unit as usize <= self.tiers[0].units.len(),
+            "a put into unit {unit}, which this store did not give"
+        );
         let here = Seg {
             chunk: at_chunk,
             segment: number as u32,
@@ -2861,7 +3069,9 @@ impl Store {
         }
         let held = Held::writer(&*self.shared);
         let own = &self.tiers[0];
-        let mut spots = std::iter::once(&own.delta).chain(&own.prev).filter_map(|table| table.get(held, key).map(|(_, spot)| spot));
+        let mut spots = std::iter::once(&own.delta)
+            .chain(&own.prev)
+            .filter_map(|table| table.get(held, key).map(|(_, spot)| spot));
         let Some(first) = spots.next() else {
             // alloc: the error that breaks the store
             return Err(format!(
@@ -2902,13 +3112,23 @@ impl Store {
     /// record it points at was drained already (its move waits in a batch committed with or
     /// before this copy's), or another record stands in for it (`copy_homes`). `at` is where
     /// the drain of segment `number`, in `at_chunk`, is ([`Store::drained`]).
-    fn copy_home(&self, number: usize, at_chunk: ChunkRef, at: u64, key: &Key, batch: &Batch) -> Option<Seg> {
+    fn copy_home(
+        &self,
+        number: usize,
+        at_chunk: ChunkRef,
+        at: u64,
+        key: &Key,
+        batch: &Batch,
+    ) -> Option<Seg> {
         let held = Held::writer(&*self.shared);
         let own = &self.tiers[0];
         // The first table that holds the key, as a reader finds it.
-        let place = std::iter::once(&own.delta).chain(&own.prev).find_map(|table| table.get(held, key).map(|(_, spot)| spot.place));
+        let place = std::iter::once(&own.delta)
+            .chain(&own.prev)
+            .find_map(|table| table.get(held, key).map(|(_, spot)| spot.place));
         let Some(Place::Segment(seg)) = place else { return None };
-        (!self.drained(number, at_chunk, at, seg, batch) && !self.copy_homes.contains_key(key)).then_some(seg)
+        (!self.drained(number, at_chunk, at, seg, batch) && !self.copy_homes.contains_key(key))
+            .then_some(seg)
     }
 
     /// Whether the record at `seg` was drained: its move (or a copy's standing for it) waits
@@ -2924,7 +3144,11 @@ impl Store {
         } else {
             // A chunk behind the drain is in the batch that drained it to its end, until that
             // batch's moves are made; one ahead of it is in no batch.
-            self.pending.iter().chain([batch]).flat_map(|it| &it.chunks).any(|&(it, chunk)| it == segment && chunk == seg.chunk)
+            self.pending
+                .iter()
+                .chain([batch])
+                .flat_map(|it| &it.chunks)
+                .any(|&(it, chunk)| it == segment && chunk == seg.chunk)
         }
     }
 
@@ -2950,7 +3174,11 @@ impl Store {
                 for it in &batch.moves {
                     let pack = &packs[it.to.pack as usize];
                     if pack.removed || pack.retiring {
-                        lost.get_or_insert(Lost::Retired { batch: batch.id, key: it.key, to: it.to });
+                        lost.get_or_insert(Lost::Retired {
+                            batch: batch.id,
+                            key: it.key,
+                            to: it.to,
+                        });
                         continue;
                     }
                     // A move that takes no spot is of a record whose key left its place another
@@ -2962,7 +3190,8 @@ impl Store {
                     // no key finds.
                     // The spot swapped out stays readable in its table until a collect after
                     // its grace, which begins after this swap and before the chunks'.
-                    let in_prev = prev.as_deref().and_then(|table| Some((table, it.make_in(table, held)?)));
+                    let in_prev =
+                        prev.as_deref().and_then(|table| Some((table, it.make_in(table, held)?)));
                     if it.make_in(delta, held).is_none()
                         && let Some((prev, (row, spot))) = in_prev
                     {
@@ -3024,7 +3253,10 @@ impl Store {
                     return self.fail(
                         file.clone(),
                         // alloc: the error that breaks the store
-                        format!("batch {batch} moved {:x} into {file} after a settle retired it", key.0),
+                        format!(
+                            "batch {batch} moved {:x} into {file} after a settle retired it",
+                            key.0
+                        ),
                     );
                 }
                 Some(Lost::Apart { batch, key, from, to, place, content }) => {
@@ -3066,7 +3298,8 @@ impl Store {
                 (spot.place, table.get(&spot.key)),
                 (Place::Pack(loc), Some((_, Ok(at)))) if at == loc
             );
-            if !indexed && let Ok((at, _)) = fresh.insert(Held::writer(&fresh), spot.at(spot.place)) {
+            if !indexed && let Ok((at, _)) = fresh.insert(Held::writer(&fresh), spot.at(spot.place))
+            {
                 carry_flags(&own.delta, row, &fresh, at);
             }
         }
@@ -3148,7 +3381,10 @@ impl Store {
     /// Publishes what readers see, and frees the view it replaces at task boundaries.
     fn publish(&mut self) {
         // clone: the view readers share, made once a publish (see `Tier::view`), with an `Arc` of the encodings
-        let view = View { tiers: self.tiers.iter().map(Tier::view).collect(), columns: self.columns.clone() };
+        let view = View {
+            tiers: self.tiers.iter().map(Tier::view).collect(),
+            columns: self.columns.clone(),
+        };
         let old = self.shared.publish(view);
         self.limbo.retire(old);
     }
@@ -3233,7 +3469,9 @@ impl Store {
             cold::train(&samples).and_then(|dictionary| {
                 cold::Prepared::new(dictionary)
                     // alloc: the error's message
-                    .map_err(|why| format!("the dictionary trained on {} values {why}", samples.len()))
+                    .map_err(|why| {
+                        format!("the dictionary trained on {} values {why}", samples.len())
+                    })
             })
         };
         let training = &mut self.training[kind.code() as usize];
@@ -3311,7 +3549,8 @@ impl Store {
             // alloc: once per commit, the files it writes, sorted, held in the `Commit`
             own.externals.iter().filter(|(_, it)| !it.committed).map(|(it, _)| *it).collect();
         externals.sort_unstable();
-        let compact = !self.index_mapping && self.migrating.is_none() && own.delta.len() >= INDEX_AFTER;
+        let compact =
+            !self.index_mapping && self.migrating.is_none() && own.delta.len() >= INDEX_AFTER;
         if packs.is_empty() && externals.is_empty() && !compact {
             // Nothing to write and no commit in flight: every record drained is in what a
             // commit wrote already, and a put that wrote none (it lost its key to another
@@ -3365,7 +3604,10 @@ impl Store {
             for (_, what) in bad {
                 self.problems
                     // alloc: a problem reported
-                    .push(format!("a slot of {} left out of the next index: {what}", own.index_file()));
+                    .push(format!(
+                        "a slot of {} left out of the next index: {what}",
+                        own.index_file()
+                    ));
             }
             let bytes = index::build_index(&entries);
             let slot = match own.head.index {
@@ -3435,7 +3677,8 @@ impl Store {
         // The moves and the keys taken live only while the entries are listed: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
             // Each key's waiting moves, oldest batch first and in drain order, as they are made.
-            let mut moves: HashMap<Key, Vec<&Move, &blaze_mem::Frame>, &blaze_mem::Frame> = HashMap::new_in(frame);
+            let mut moves: HashMap<Key, Vec<&Move, &blaze_mem::Frame>, &blaze_mem::Frame> =
+                HashMap::new_in(frame);
             for it in self.pending.iter().chain([&self.draining]).flat_map(|it| &it.moves) {
                 moves.entry(it.key).or_insert_with(|| Vec::new_in(frame)).push(it);
             }
@@ -3447,9 +3690,10 @@ impl Store {
             for (_, spot) in own.delta.iter(held) {
                 let loc = match spot.place {
                     Place::Pack(loc) => Some(loc),
-                    Place::Segment(_) => {
-                        moves.get(&spot.key).and_then(|it| it.iter().find(|it| it.takes(spot))).map(|it| it.to)
-                    }
+                    Place::Segment(_) => moves
+                        .get(&spot.key)
+                        .and_then(|it| it.iter().find(|it| it.takes(spot)))
+                        .map(|it| it.to),
                 };
                 if let Some(loc) = loc {
                     taken.insert(spot.key);
@@ -3499,7 +3743,12 @@ impl Store {
                     // driver that can, a long write skips the page cache.
                     let tag = self.tags.ask(Op::WritePack { pack: at });
                     // clone: the effect owns its file name; once per pack a commit
-                    effects.push(Effect::WriteAt { file: pack.file.clone(), at: pack.committed, bytes, tag });
+                    effects.push(Effect::WriteAt {
+                        file: pack.file.clone(),
+                        at: pack.committed,
+                        bytes,
+                        tag,
+                    });
                     commit.steps += 1;
                 }
             }
@@ -3546,7 +3795,11 @@ impl Store {
             commit.head_sent = true;
             commit.steps += 1;
             let tag = self.tags.ask(Op::WriteHead);
-            effects.push(Effect::Write { file: own.file(HEAD_FILE), bytes: commit.head.encode(), tag });
+            effects.push(Effect::Write {
+                file: own.file(HEAD_FILE),
+                bytes: commit.head.encode(),
+                tag,
+            });
         }
         // alloc: empty, allocates nothing
         Vec::new()
@@ -3574,16 +3827,27 @@ impl Store {
         }
         let mut batch = commit.batch;
         for content in &commit.externals {
-            let external = self.tiers[0].externals.get_mut(content).expect("a file the commit wrote");
+            let external =
+                self.tiers[0].externals.get_mut(content).expect("a file the commit wrote");
             external.committed = true;
             // clone: the op and the effect own the name; once per file a commit
             let file = external.file.clone();
-            self.ask_map(0, file, Mapped::External { content: *content, batch: Some(batch.id) }, effects);
+            self.ask_map(
+                0,
+                file,
+                Mapped::External { content: *content, batch: Some(batch.id) },
+                effects,
+            );
         }
         for &(at, to) in &commit.packs {
             // clone: the op and the effect own the name; once per pack a commit
             let file = self.tiers[0].packs[at].file.clone();
-            self.ask_map(0, file, Mapped::Pack { pack: at, usable: to, batch: Some(batch.id) }, effects);
+            self.ask_map(
+                0,
+                file,
+                Mapped::Pack { pack: at, usable: to, batch: Some(batch.id) },
+                effects,
+            );
         }
         batch.maps = commit.externals.len() + commit.packs.len();
         if let Some((slot, covers)) = commit.index {
@@ -3624,7 +3888,8 @@ impl Store {
         }
         let broken = self.broken.as_ref().map(ToString::to_string).unwrap_or_default();
         // alloc: once, as the store breaks
-        let waiting = std::mem::take(&mut self.held).into_iter().map(|(_, waiter)| waiter).collect();
+        let waiting =
+            std::mem::take(&mut self.held).into_iter().map(|(_, waiter)| waiter).collect();
         self.refuse_waiting(waiting, &broken);
     }
 
@@ -3685,13 +3950,16 @@ impl Store {
             .externals
             .iter()
             .map(|it| {
-                (it.content, External {
-                    len: it.len,
-                    file: tier.file(&disk::external_file(&it.content)),
-                    mapping: None,
-                    memory: None,
-                    committed: true,
-                })
+                (
+                    it.content,
+                    External {
+                        len: it.len,
+                        file: tier.file(&disk::external_file(&it.content)),
+                        mapping: None,
+                        memory: None,
+                        committed: true,
+                    },
+                )
             })
             // alloc: opening, once per tier
             .collect();
@@ -3712,7 +3980,10 @@ impl Store {
         contents.sort_unstable();
         for content in contents {
             // clone: opening, once per external; the op and the effect own the name
-            maps.push((externals[content].file.clone(), Mapped::External { content: *content, batch: None }));
+            maps.push((
+                externals[content].file.clone(),
+                Mapped::External { content: *content, batch: None },
+            ));
         }
         tier.dictionaries = head
             .dictionaries
@@ -3728,7 +3999,8 @@ impl Store {
         tier.packs = packs;
         tier.externals = externals;
         // alloc: opening, once per tier
-        tier.unit_of = head.units.iter().enumerate().map(|(at, it)| (*it, Unit(at as u32 + 1))).collect();
+        tier.unit_of =
+            head.units.iter().enumerate().map(|(at, it)| (*it, Unit(at as u32 + 1))).collect();
         // clone: opening, once per tier
         tier.units = head.units.clone();
         tier.head = head;
@@ -3893,7 +4165,8 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     if let Some(index) = tier.head.index {
         let file = tier.index_file();
         // clone: the error that stops the opening
-        let mapped = tier.index.as_ref().ok_or_else(|| (file.clone(), "it was not mapped".to_owned()))?;
+        let mapped =
+            tier.index.as_ref().ok_or_else(|| (file.clone(), "it was not mapped".to_owned()))?;
         let bytes = mapped.mapping.bytes();
         if bytes.len() as u64 != index.len {
             // alloc: the error that stops the opening
@@ -3902,12 +4175,18 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         let check = crc::crc32c(bytes);
         if check != index.check {
             // alloc: the error that stops the opening
-            return Err((file, format!("its CRC-32C is {check:08x}, not the {:08x} its head names", index.check)));
+            return Err((
+                file,
+                format!("its CRC-32C is {check:08x}, not the {:08x} its head names", index.check),
+            ));
         }
         let count = mapped.table().count();
         if count != index.count {
             // alloc: the error that stops the opening
-            return Err((file, format!("it holds {count} values, not the {} its head names", index.count)));
+            return Err((
+                file,
+                format!("it holds {count} values, not the {} its head names", index.count),
+            ));
         }
     }
     // alloc: opening, once per tier, the records past its index table
@@ -3916,9 +4195,18 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         // clone: the error that stops the opening
         let fail = |why: String| (pack.file.clone(), why);
         let all = pack.mapping.as_ref().ok_or_else(|| fail("it was not mapped".into()))?.bytes();
-        let all = usize::try_from(pack.committed).ok().and_then(|committed| all.get(..committed)).ok_or_else(
+        let all = usize::try_from(pack.committed)
+            .ok()
+            .and_then(|committed| all.get(..committed))
+            .ok_or_else(
             // alloc: the error that stops the opening
-            || fail(format!("it is {} bytes, shorter than the {} its head names", all.len(), pack.committed)),
+            || {
+                fail(format!(
+                    "it is {} bytes, shorter than the {} its head names",
+                    all.len(),
+                    pack.committed
+                ))
+            },
         )?;
         disk::check_pack_header(all, pack.unit).map_err(|why| fail(why.into()))?;
         let mut at = pack.indexed.max(PACK_HEADER);
@@ -3927,7 +4215,9 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                 let next = at.next_multiple_of(disk::BLOCK);
                 if next == at || all[at as usize..next as usize].iter().any(|&it| it != 0) {
                     // alloc: the error that stops the opening
-                    return Err(fail(format!("at {at} is neither a record nor the zeros that end a commit")));
+                    return Err(fail(format!(
+                        "at {at} is neither a record nor the zeros that end a commit"
+                    )));
                 }
                 at = next;
                 continue;
@@ -3935,10 +4225,16 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             let header = RecordHeader::decode(&all[at as usize..])
                 // alloc: the error that stops the opening
                 .map_err(|why| fail(format!("the record at {at}: {why}")))?;
-            let end = at.checked_add(header.span()).filter(|&end| end <= pack.committed).ok_or_else(
-                // alloc: the error that stops the opening
-                || fail(format!("the record at {at} runs past the {} bytes its head names", pack.committed)),
-            )?;
+            let end =
+                at.checked_add(header.span()).filter(|&end| end <= pack.committed).ok_or_else(
+                    // alloc: the error that stops the opening
+                    || {
+                        fail(format!(
+                            "the record at {at} runs past the {} bytes its head names",
+                            pack.committed
+                        ))
+                    },
+                )?;
             if header.form != Form::Dictionary {
                 let loc = Loc {
                     pack: number as u32,
@@ -3948,7 +4244,12 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                     stored: header.stored,
                     raw: header.raw,
                 };
-                found.push(Spot::new(header.key, header.content, Place::Pack(loc), Ticket::DURABLE));
+                found.push(Spot::new(
+                    header.key,
+                    header.content,
+                    Place::Pack(loc),
+                    Ticket::DURABLE,
+                ));
             }
             at = end;
         }
@@ -3971,23 +4272,30 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             // alloc: the error of a dictionary that cannot be read
             .ok_or_else(|| format!("at {at} is outside {}", pack.file))
             // alloc: the error of a dictionary that cannot be read
-            .and_then(|bytes| RecordHeader::decode(bytes).map_err(|why| format!("at {at} of {}: {why}", pack.file)))
-            .and_then(|header| match header.form == Form::Dictionary && header.kind == dictionary.kind {
-                true => pack
-                    .bytes(at + RECORD_HEADER, header.stored)
-                    .filter(|bytes| content_of(bytes) == header.content)
-                    // alloc: opening, once per dictionary, whose bytes the prepared dictionary keeps
-                    .map(|bytes| bytes.to_vec())
+            .and_then(|bytes| {
+                RecordHeader::decode(bytes)
+                    .map_err(|why| format!("at {at} of {}: {why}", pack.file))
+            })
+            .and_then(|header| {
+                match header.form == Form::Dictionary && header.kind == dictionary.kind {
+                    true => pack
+                        .bytes(at + RECORD_HEADER, header.stored)
+                        .filter(|bytes| content_of(bytes) == header.content)
+                        // alloc: opening, once per dictionary, whose bytes the prepared dictionary keeps
+                        .map(|bytes| bytes.to_vec())
+                        // alloc: the error of a dictionary that cannot be read
+                        .ok_or_else(|| format!("at {at} of {} is not what was recorded", pack.file))
+                        .and_then(|bytes| {
+                            cold::Prepared::new(bytes)
+                                .map(Arc::new)
+                                // alloc: the error of a dictionary that cannot be read
+                                .map_err(|why| format!("at {at} of {} {why}", pack.file))
+                        }),
                     // alloc: the error of a dictionary that cannot be read
-                    .ok_or_else(|| format!("at {at} of {} is not what was recorded", pack.file))
-                    .and_then(|bytes| {
-                        cold::Prepared::new(bytes)
-                            .map(Arc::new)
-                            // alloc: the error of a dictionary that cannot be read
-                            .map_err(|why| format!("at {at} of {} {why}", pack.file))
-                    }),
-                // alloc: the error of a dictionary that cannot be read
-                false => Err(format!("at {at} of {} is not a dictionary of its kind", pack.file)),
+                    false => {
+                        Err(format!("at {at} of {} is not a dictionary of its kind", pack.file))
+                    }
+                }
             });
     }
     Ok(())

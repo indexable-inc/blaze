@@ -1,0 +1,9 @@
+[package]
+name = "corpus-sessions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+corpus-once = { path = "../once" }
+corpus-settles = { path = "../settles" }

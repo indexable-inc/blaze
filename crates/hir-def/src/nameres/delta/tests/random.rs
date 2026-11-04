@@ -22,24 +22,26 @@ use test_utils::FixtureWithProjectMeta;
 
 use super::{Loaded, check_db, facts_exempt, summary};
 use crate::nameres::facts::tests::{
-    Exempt, extra_proc_macros,
+    Exempt,
     differential::{MACRO_EXPANSION, NAMERES, fixtures},
+    extra_proc_macros,
     generated::{Gen, MODULE_NAMES, MacroBody, Model, Module, TYPE_NAMES, UseTail, VALUE_NAMES},
     with_fast_path,
 };
 
 /// Runs `property` over `cases` scripts, or `HEGEL_TEST_CASES` of them where that is set.
 fn run_scripts(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
 /// Checks `loaded`'s database, failing the case with `what` and the step.
 fn check(loaded: &Loaded, what: &str, exempt: &Exempt) {
     let mut failures = String::new();
-    if let Err(payload) =
-        panic::catch_unwind(AssertUnwindSafe(|| check_db(&loaded.db, what, exempt, true, &mut failures)))
-    {
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| {
+        check_db(&loaded.db, what, exempt, true, &mut failures)
+    })) {
         panic!("{what}: panicked: {}", message(&*payload));
     }
     assert!(failures.is_empty(), "{failures}");
@@ -112,10 +114,46 @@ const SNIPPETS: &[&str] = &[
 const RENAMES: &[&str] = &["S", "T", "foo", "m", "Renamed", "a", "b", "E", "mac"];
 
 const KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "macro_rules", "match", "mod", "move",
-    "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
-    "type", "union", "unsafe", "use", "where", "while",
+    "as",
+    "async",
+    "await",
+    "break",
+    "const",
+    "continue",
+    "crate",
+    "dyn",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "impl",
+    "in",
+    "let",
+    "loop",
+    "macro_rules",
+    "match",
+    "mod",
+    "move",
+    "mut",
+    "pub",
+    "ref",
+    "return",
+    "self",
+    "Self",
+    "static",
+    "struct",
+    "super",
+    "trait",
+    "true",
+    "type",
+    "union",
+    "unsafe",
+    "use",
+    "where",
+    "while",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -166,7 +204,8 @@ fn depths(lines: &[&str]) -> Vec<i64> {
 /// Whether a line opens a module body: an item inserted after it is in that module.
 fn opens_module(line: &str) -> bool {
     let line = line.trim();
-    line.ends_with('{') && (line.starts_with("mod ") || line.starts_with("pub mod ") || line.contains(" mod "))
+    line.ends_with('{')
+        && (line.starts_with("mod ") || line.starts_with("pub mod ") || line.contains(" mod "))
 }
 
 fn insert(text: &str, at: u64, snippet: &str) -> Option<String> {
@@ -257,7 +296,9 @@ fn apply_text_edit(loaded: &Loaded, edit: TextEdit) -> Option<(FileId, String)> 
             insert(&text, within, SNIPPETS[(snippet % SNIPPETS.len() as u64) as usize])
         }
         TextEdit::Remove { .. } => remove(&text, within),
-        TextEdit::Rename { to, .. } => rename(&text, within, RENAMES[(to % RENAMES.len() as u64) as usize]),
+        TextEdit::Rename { to, .. } => {
+            rename(&text, within, RENAMES[(to % RENAMES.len() as u64) as usize])
+        }
     }?;
     Some((file, new))
 }
@@ -265,8 +306,12 @@ fn apply_text_edit(loaded: &Loaded, edit: TextEdit) -> Option<(FileId, String)> 
 /// The fixtures of the test files that load, by name, with what the comparison with `facts`
 /// leaves out of each.
 fn all_fixtures() -> &'static [(String, &'static str, Exempt)] {
-    #[expect(clippy::disallowed_types, reason = "the process's one test fixture list: test cases share the parsed fixtures")]
-    static ALL: std::sync::OnceLock<Vec<(String, &'static str, Exempt)>> = std::sync::OnceLock::new();
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's one test fixture list: test cases share the parsed fixtures"
+    )]
+    static ALL: std::sync::OnceLock<Vec<(String, &'static str, Exempt)>> =
+        std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         let mut out = Vec::new();
         for &(file, source) in NAMERES.iter().chain(MACRO_EXPANSION) {
@@ -303,7 +348,9 @@ fn every_fixture_loads_like_a_fresh_run() {
         }));
         match result {
             Ok(out) => failures.push_str(&out),
-            Err(payload) => failures.push_str(&format!("== {name}: panicked: {}\n{text}\n", message(&*payload))),
+            Err(payload) => {
+                failures.push_str(&format!("== {name}: panicked: {}\n{text}\n", message(&*payload)))
+            }
         }
     }
     assert!(failures.is_empty(), "{failures}");
@@ -321,7 +368,11 @@ fn edit_scripts_over_the_fixtures() {
 }
 
 /// `fixture` maintained through `edits`, one write each, checked after each.
-fn fixture_script((name, text, exempt): &(String, &'static str, Exempt), edits: &[TextEdit], fast_path: bool) {
+fn fixture_script(
+    (name, text, exempt): &(String, &'static str, Exempt),
+    edits: &[TextEdit],
+    fast_path: bool,
+) {
     with_fast_path(fast_path, || {
         let mut loaded = Loaded::new(text);
         check(&loaded, &format!("{name} (fast path {fast_path}), loaded"), exempt);
@@ -342,13 +393,17 @@ fn batched_edits_over_the_fixtures() {
     let all = all_fixtures();
     run_scripts(64, |tc| {
         let fixture = tc.draw(gs::integers::<usize>().max_value(all.len() - 1));
-        let edits = tc.draw(gs::vecs(gs::tuples!(text_edit(), text_edit())).min_size(1).max_size(4));
+        let edits =
+            tc.draw(gs::vecs(gs::tuples!(text_edit(), text_edit())).min_size(1).max_size(4));
         fixture_batches(&all[fixture], &edits);
     });
 }
 
 /// `fixture` maintained through `batches`, each pair of edits one write, checked after each.
-fn fixture_batches((name, text, exempt): &(String, &'static str, Exempt), batches: &[(TextEdit, TextEdit)]) {
+fn fixture_batches(
+    (name, text, exempt): &(String, &'static str, Exempt),
+    batches: &[(TextEdit, TextEdit)],
+) {
     let mut loaded = Loaded::new(text);
     for (step, &(first, second)) in batches.iter().enumerate() {
         let mut texts: Vec<(FileId, String)> = Vec::new();
@@ -368,7 +423,10 @@ fn fixture_batches((name, text, exempt): &(String, &'static str, Exempt), batche
 }
 
 fn fixture_named(name: &str) -> &'static (String, &'static str, Exempt) {
-    all_fixtures().iter().find(|it| it.0 == name).unwrap_or_else(|| panic!("no fixture `{name}` loads"))
+    all_fixtures()
+        .iter()
+        .find(|it| it.0 == name)
+        .unwrap_or_else(|| panic!("no fixture `{name}` loads"))
 }
 
 /// Scripts the fixture tests above once failed, as they printed them: their draws are fresh
@@ -377,7 +435,11 @@ fn fixture_named(name: &str) -> &'static (String, &'static str, Exempt) {
 fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
     // 2026-10-31: the maintained map kept a module, `company_name::network::v1::ip_address`,
     // the fresh one did not have.
-    fixture_script(fixture_named("tests/macros.rs::nested_include#0"), &[TextEdit::Remove { at: 1 }], false);
+    fixture_script(
+        fixture_named("tests/macros.rs::nested_include#0"),
+        &[TextEdit::Remove { at: 1 }],
+        false,
+    );
     // 2026-10-31: the fresh map reported an attribute `S` unresolved, the maintained one did not.
     fixture_batches(
         fixture_named("../macro_expansion_tests/builtin_derive_macro.rs::coerce_pointee_errors#0"),
@@ -394,7 +456,9 @@ fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
     // positions after the walk found `bar`'s parent group through `group_of`, as of the last
     // run, and panicked ("a round-0 module its parent does not declare").
     fixture_script(
-        fixture_named("tests/mod_resolution.rs::module_resolution_decl_inside_inline_module_with_path_attribute#0"),
+        fixture_named(
+            "tests/mod_resolution.rs::module_resolution_decl_inside_inline_module_with_path_attribute#0",
+        ),
         &[TextEdit::Rename { at: 0, to: 0 }, TextEdit::Remove { at: 0 }],
         false,
     );
@@ -420,7 +484,11 @@ fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
     // 2026-11-01: `reexport_2::Placeholder` reached by `use reexport_1::*` and `pub use
     // reexport_1::*`: the fresh map credited the `pub use`, the maintained one the `use`, both
     // `pub`. The two globs' shared edge kept the first glob when the second widened it.
-    fixture_script(fixture_named("tests/globs.rs::regression_18580#0"), &[TextEdit::Remove { at: 1024 }], false);
+    fixture_script(
+        fixture_named("tests/globs.rs::regression_18580#0"),
+        &[TextEdit::Remove { at: 1024 }],
+        false,
+    );
     // 2026-11-01: the maintained `crate::a` kept `struct Ok` from `foo!()`, which the fresh map did
     // not have after the edit.
     fixture_script(
@@ -431,7 +499,9 @@ fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
     // 2026-11-01: removing `#![crate_type="proc-macro"]` left the maintained root censored, its
     // `S` and fn `pub(crate)`.
     fixture_batches(
-        fixture_named("tests/uses.rs::a_derive_helper_before_its_derive_resolves_as_rustc_s_compat_helper#0"),
+        fixture_named(
+            "tests/uses.rs::a_derive_helper_before_its_derive_resolves_as_rustc_s_compat_helper#0",
+        ),
         &[
             (TextEdit::Insert { at: 0, snippet: 0 }, TextEdit::Insert { at: 513, snippet: 0 }),
             (TextEdit::Remove { at: 0 }, TextEdit::Remove { at: 1 }),
@@ -498,17 +568,44 @@ impl Generated {
 #[derive(Debug, Clone, Copy)]
 enum ModelEdit {
     /// An item the model's generator picks (`seed`), inserted into a module.
-    AddItem { module: u64, at: u64, seed: u64 },
-    RemoveItem { module: u64, at: u64 },
+    AddItem {
+        module: u64,
+        at: u64,
+        seed: u64,
+    },
+    RemoveItem {
+        module: u64,
+        at: u64,
+    },
     /// A struct, function, alias or inline module of a module renamed.
-    Rename { module: u64, at: u64, to: u64 },
+    Rename {
+        module: u64,
+        at: u64,
+        to: u64,
+    },
     /// An inline module added.
-    AddModule { parent: u64, at: u64, name: u64 },
+    AddModule {
+        parent: u64,
+        at: u64,
+        name: u64,
+    },
     /// A `macro_rules!` added (its body picked by `seed`), and a call of it.
-    AddMacro { module: u64, seed: u64, call_in: u64 },
-    ToggleMacroUse { module: u64 },
-    AddExtra { file: u64, kind: u64, name: u64 },
-    RemoveExtra { at: u64 },
+    AddMacro {
+        module: u64,
+        seed: u64,
+        call_in: u64,
+    },
+    ToggleMacroUse {
+        module: u64,
+    },
+    AddExtra {
+        file: u64,
+        kind: u64,
+        name: u64,
+    },
+    RemoveExtra {
+        at: u64,
+    },
 }
 
 /// The edits weighted 4 : 3 : 2 : 1 : 1 : 1 : 2 : 1, in [`ModelEdit`]'s order.
@@ -537,7 +634,10 @@ fn pick<T: Copy>(from: &[T], at: u64) -> T {
 fn reachable(model: &Model, module: usize) -> bool {
     let mut at = module;
     while let Some(parent) = model.modules[at].parent {
-        let declared = model.modules[parent].items.iter().any(|it| matches!(it, Gen::Mod(child) if *child == at));
+        let declared = model.modules[parent]
+            .items
+            .iter()
+            .any(|it| matches!(it, Gen::Mod(child) if *child == at));
         if !declared {
             return false;
         }
@@ -549,7 +649,10 @@ fn reachable(model: &Model, module: usize) -> bool {
 /// Whether a file module is `module` or below it: renaming `module` would move its file.
 fn holds_a_file(model: &Model, module: usize) -> bool {
     !model.modules[module].inline
-        || model.modules[module].items.iter().any(|it| matches!(it, Gen::Mod(child) if holds_a_file(model, *child)))
+        || model.modules[module]
+            .items
+            .iter()
+            .any(|it| matches!(it, Gen::Mod(child) if holds_a_file(model, *child)))
 }
 
 impl ModelEdit {
@@ -557,7 +660,8 @@ impl ModelEdit {
     /// moved or made: that would make a file the fixture has not got.
     fn apply(self, generated: &mut Generated, files: &[(String, FileId)]) -> bool {
         let model = &mut generated.model;
-        let live: Vec<usize> = (0..model.modules.len()).filter(|&it| reachable(model, it)).collect();
+        let live: Vec<usize> =
+            (0..model.modules.len()).filter(|&it| reachable(model, it)).collect();
         let module = |at: u64| live[(at % live.len() as u64) as usize];
         match self {
             ModelEdit::AddItem { module: m, at, seed } => {
@@ -692,7 +796,8 @@ fn texts(loaded: &Loaded, generated: &Generated) -> Vec<(FileId, String)> {
 /// The crate generated from `seed`, maintained through `edits`, checked after each.
 fn generated_script(seed: u64, edits: &[ModelEdit], fast_path: bool) {
     with_fast_path(fast_path, || {
-        let mut generated = Generated { model: Model::generate(&mut SplitMix64::new(seed)), extras: Vec::new() };
+        let mut generated =
+            Generated { model: Model::generate(&mut SplitMix64::new(seed)), extras: Vec::new() };
         let mut loaded = Loaded::new(&generated.fixture());
         let what = |step: &str| format!("generated {seed:#x} (fast path {fast_path}), {step}");
         check(&loaded, &what("loaded"), &Exempt::NONE);
@@ -755,7 +860,8 @@ fn undoing_a_script_restores_the_first_map() {
     run_scripts(48, |tc| {
         let seed: u64 = tc.draw(gs::integers());
         let edits = tc.draw(gs::vecs(model_edit()).min_size(1).max_size(6));
-        let first = Generated { model: Model::generate(&mut SplitMix64::new(seed)), extras: Vec::new() };
+        let first =
+            Generated { model: Model::generate(&mut SplitMix64::new(seed)), extras: Vec::new() };
         let mut loaded = Loaded::new(&first.fixture());
         let krate = loaded.krate();
         let before = summary(&loaded.db, krate);
@@ -794,7 +900,17 @@ fn the_text_edits_keep_items_whole() {
         assert!(!removed.contains("pub struct S;"), "{removed}");
     }
     // Names, not keywords, strings or `$crate`.
-    let renamed: Vec<String> = (0..16).filter_map(|at| rename("pub use $crate::a as b; // c\n\"d\"", at, "Z")).collect();
-    assert!(renamed.iter().all(|it| it.contains("$crate") && it.contains("\"d\"") && it.contains("// c")), "{renamed:?}");
-    assert!(renamed.iter().any(|it| it.contains("::Z as b")) && renamed.iter().any(|it| it.contains("as Z")), "{renamed:?}");
+    let renamed: Vec<String> =
+        (0..16).filter_map(|at| rename("pub use $crate::a as b; // c\n\"d\"", at, "Z")).collect();
+    assert!(
+        renamed
+            .iter()
+            .all(|it| it.contains("$crate") && it.contains("\"d\"") && it.contains("// c")),
+        "{renamed:?}"
+    );
+    assert!(
+        renamed.iter().any(|it| it.contains("::Z as b"))
+            && renamed.iter().any(|it| it.contains("as Z")),
+        "{renamed:?}"
+    );
 }

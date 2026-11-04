@@ -71,7 +71,9 @@ impl CrateEnv {
     /// The env after `op`, for the crate-level ops; `None` when `op` leaves it as it is.
     pub(crate) fn after(&self, op: &DeclOp) -> Option<CrateEnv> {
         let mut next = match op {
-            DeclOp::ExternPrelude { .. } | DeclOp::MacroUsePrelude { .. } | DeclOp::Prelude { .. } => {
+            DeclOp::ExternPrelude { .. }
+            | DeclOp::MacroUsePrelude { .. }
+            | DeclOp::Prelude { .. } => {
                 // clone: a crate-level op (the root's `extern crate`s, its prelude): a handful per crate
                 self.clone()
             }
@@ -92,7 +94,10 @@ impl CrateEnv {
 }
 
 /// Replaces the entry of `entry.0` in `list`, or appends `entry`, keeping the list exact-size.
-fn set_or_push<T: Copy>(list: &mut Box<[(Name, T, Option<ExternCrateId>)]>, entry: (Name, T, Option<ExternCrateId>)) {
+fn set_or_push<T: Copy>(
+    list: &mut Box<[(Name, T, Option<ExternCrateId>)]>,
+    entry: (Name, T, Option<ExternCrateId>),
+) {
     if let Some(it) = list.iter_mut().find(|it| it.0 == entry.0) {
         *it = entry;
         return;
@@ -198,7 +203,10 @@ impl<A: Allocator + Clone> SideTables<A> {
     }
 
     /// The derive helpers of `item`, made empty if it has none yet.
-    pub(crate) fn derive_helpers_of(&mut self, item: AstId<ast::Item>) -> &mut Vec<DeriveHelper, A> {
+    pub(crate) fn derive_helpers_of(
+        &mut self,
+        item: AstId<ast::Item>,
+    ) -> &mut Vec<DeriveHelper, A> {
         let alloc = self.alloc();
         self.derive_helpers.entry(item).or_insert_with(|| Vec::new_in(alloc))
     }

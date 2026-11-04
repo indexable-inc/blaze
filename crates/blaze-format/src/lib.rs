@@ -37,8 +37,8 @@ use std::{
 use blaze_ids::{ContentId, Fingerprint};
 use serde::{Deserialize, Serialize};
 
-pub use crate::schema::{Part, SCHEMA_DOMAIN, schema, schema_of};
 pub use crate::placed::Placed;
+pub use crate::schema::{Part, SCHEMA_DOMAIN, schema, schema_of};
 
 #[cfg(target_endian = "big")]
 compile_error!("blaze's format is little-endian, as every target blaze runs on is");
@@ -212,7 +212,11 @@ pub fn check_field_shallow<F: Record>(
 }
 
 /// The bytes of the field of type `F` at `offset` in `record`, inside it and aligned for `F`.
-fn field_bytes<'a, F: Record>(record: &'a [u8], offset: usize, buffer: &[u8]) -> Result<&'a [u8], FormatError> {
+fn field_bytes<'a, F: Record>(
+    record: &'a [u8],
+    offset: usize,
+    buffer: &[u8],
+) -> Result<&'a [u8], FormatError> {
     let at = (record.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
     let at = at + offset as u64;
     let Some(end) = offset.checked_add(size_of::<F>()).filter(|&end| end <= record.len()) else {
@@ -331,8 +335,7 @@ fn offset(field_at: u64, target_at: u64) -> i32 {
 fn position<F>(field: &F, buffer: &[u8]) -> Result<u64, FormatError> {
     let (address, base) = (field as *const F as usize, buffer.as_ptr() as usize);
     let at = address.wrapping_sub(base);
-    match address >= base && at.checked_add(size_of::<F>()).is_some_and(|end| end <= buffer.len())
-    {
+    match address >= base && at.checked_add(size_of::<F>()).is_some_and(|end| end <= buffer.len()) {
         true => Ok(at as u64),
         false => Err(FormatError::OutOfBounds { at: at as u64 }),
     }
@@ -347,7 +350,9 @@ fn target<T>(field_at: u64, offset: i32, count: u32, buffer: &[u8]) -> Result<us
         return Err(bad);
     }
     let target = target as u64;
-    let len = (size_of::<T>() as u64).checked_mul(count as u64).ok_or(FormatError::OutOfBounds { at: field_at })?;
+    let len = (size_of::<T>() as u64)
+        .checked_mul(count as u64)
+        .ok_or(FormatError::OutOfBounds { at: field_at })?;
     if target.checked_add(len).is_none_or(|end| end > field_at) {
         return Err(bad);
     }
@@ -389,7 +394,10 @@ impl<T: Record> Rel<T> {
     }
 
     /// [`Rel::follow`], the `T` checked with all it reaches when `DEEP`: [`Record::check`].
-    fn follow_as<'a, const DEEP: bool>(&'a self, buffer: &'a [u8]) -> Result<Option<&'a T>, FormatError> {
+    fn follow_as<'a, const DEEP: bool>(
+        &'a self,
+        buffer: &'a [u8],
+    ) -> Result<Option<&'a T>, FormatError> {
         if self.offset == 0 {
             return Ok(None);
         }
@@ -1061,7 +1069,10 @@ impl fmt::Display for FormatError {
             FormatError::Header(what) => write!(f, "not a blaze buffer: {what}"),
             FormatError::Invalid { at, what } => write!(f, "invalid record at byte {at}: {what}"),
             FormatError::Bound { at, what, found, bound } => {
-                write!(f, "invalid record at byte {at}: {what}: found {found}, past its bound {bound}")
+                write!(
+                    f,
+                    "invalid record at byte {at}: {what}: found {found}, past its bound {bound}"
+                )
             }
             FormatError::Zero { at, what } => {
                 write!(f, "invalid record at byte {at}: {what} is 0, which names nothing")

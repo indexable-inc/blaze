@@ -91,7 +91,8 @@ const USE: u8 = 15;
 /// An ast id for each of `kinds`, of the `ErasedFileAstIdKind` each item kind's syntax is
 /// (`span::ast_id`: the kind in the top 5 bits), its hash the item's place plus one.
 fn ast_ids(kinds: &[u8]) -> Vec<u32> {
-    (1..).zip(kinds)
+    (1..)
+        .zip(kinds)
         .map(|(hash, &kind)| {
             let erased: u32 = match kind {
                 CONST => 11,
@@ -209,7 +210,9 @@ fn ctx() -> u32 {
 
 /// A span's words: its range, its anchor's file and ast id, its context.
 fn span(w: &mut Words, start: u32, end: u32) {
-    for word in [start, end, EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT).as_u32(), 0, ctx()] {
+    for word in
+        [start, end, EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT).as_u32(), 0, ctx()]
+    {
         w.u32(word);
     }
 }
@@ -362,7 +365,11 @@ fn every_kind() -> Valid {
         type_aliases: vec![[3, PUB_CRATE]],
         unions: vec![[4, PRIV_EXPLICIT]],
         uses: vec![[PUB, 2]],
-        use_trees: vec![[SINGLE, 0, NONE, 0, 0], [GLOB, NONE, NONE, 0, 0], [PREFIXED, 0, NONE, 0, 2]],
+        use_trees: vec![
+            [SINGLE, 0, NONE, 0, 0],
+            [GLOB, NONE, NONE, 0, 0],
+            [PREFIXED, 0, NONE, 0, 2],
+        ],
         use_tree_lists: vec![0, 1],
         ..Columns::default()
     };
@@ -373,7 +380,8 @@ fn every_kind() -> Valid {
 fn valid() -> &'static [Valid] {
     static VALID: OnceLock<Vec<Valid>> = OnceLock::new();
     VALID.get_or_init(|| {
-        let empty = Valid { bytes: blaze_format::to_bytes(&ItemTree::default()), columns: Vec::new() };
+        let empty =
+            Valid { bytes: blaze_format::to_bytes(&ItemTree::default()), columns: Vec::new() };
         vec![empty, items(), token_tree(), every_kind()]
     })
 }
@@ -399,7 +407,10 @@ mod tests {
         for (at, valid) in super::valid().iter().enumerate() {
             let tree = super::decode(&Aligned::copy_from(&valid.bytes))
                 .unwrap_or_else(|error| panic!("valid tree {at} does not decode: {error}"));
-            assert!(blaze_format::to_bytes(&tree) == valid.bytes, "valid tree {at} is written as other bytes");
+            assert!(
+                blaze_format::to_bytes(&tree) == valid.bytes,
+                "valid tree {at} is written as other bytes"
+            );
         }
     }
 }

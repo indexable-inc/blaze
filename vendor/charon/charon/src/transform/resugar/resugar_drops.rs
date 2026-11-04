@@ -41,9 +41,7 @@ impl UllbcPass for Transform {
                     && let Some(flag) = place.as_local()
                     && body.locals.locals[flag].drop_flag_for.is_some()
                 {
-                    flag_uses[flag]
-                        .assignments
-                        .push(StmtLoc::new(block_id, statement_id));
+                    flag_uses[flag].assignments.push(StmtLoc::new(block_id, statement_id));
                 }
             }
 
@@ -62,30 +60,22 @@ impl UllbcPass for Transform {
                 // Detect a simple pattern: `if drop_flag { unconditional_drop } else {}`.
                 if true_target != false_target
                     && predecessor_counts[true_target] == 1
-                    && let TerminatorKind::Drop {
-                        kind: DropKind::Precise,
-                        place,
-                        target,
-                        ..
-                    } = &drop_block.terminator.kind
+                    && let TerminatorKind::Drop { kind: DropKind::Precise, place, target, .. } =
+                        &drop_block.terminator.kind
                     && place == flagged_place
                     && drop_block.statements.is_empty()
                     && *target == false_target
                 {
                     flag_uses[flag].resugared_if_count += 1;
-                    conditional_drops.push(ConditionalDrop {
-                        switch_block: block_id,
-                        drop_block: true_target,
-                    });
+                    conditional_drops
+                        .push(ConditionalDrop { switch_block: block_id, drop_block: true_target });
                 }
             }
         }
 
         for drop in conditional_drops {
             let mut terminator = body.body[drop.drop_block].terminator.kind.take();
-            let TerminatorKind::Drop { kind, .. } = &mut terminator else {
-                unreachable!()
-            };
+            let TerminatorKind::Drop { kind, .. } = &mut terminator else { unreachable!() };
             *kind = DropKind::Conditional;
             body.body[drop.switch_block].terminator.kind = terminator;
         }

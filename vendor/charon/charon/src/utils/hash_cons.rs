@@ -142,11 +142,7 @@ mod intern_table {
                     // result in a different pointer. NO MORE EARLY RETURN until we fix that.
                 }
                 // If we are still the sole owner, we can now mutate in-place.
-                if Arc::get_mut(arc).is_some() {
-                    Self::Unique(x)
-                } else {
-                    Self::new_not_unique(x)
-                }
+                if Arc::get_mut(arc).is_some() { Self::Unique(x) } else { Self::new_not_unique(x) }
             }
             fn new_not_unique(x: &'a mut HashConsed<T>) -> Self {
                 Self::NotUnique(x, ManuallyDrop::new(x.inner().clone()))
@@ -347,8 +343,7 @@ fn test_hash_cons_dedup() {
     use crate::utils::dedup::DedupSerializer;
     use serde_state::{DeserializeState, SerializeState};
     type Ty = HashConsed<TyKind>;
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    #[derive(SerializeState, DeserializeState)]
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, SerializeState, DeserializeState)]
     #[serde_state(state = DedupSerializer)]
     enum TyKind {
         Bool,
@@ -362,9 +357,7 @@ fn test_hash_cons_dedup() {
     let triple = HashConsed::new(TyKind::Pair(bool1, pair));
 
     let state = DedupSerializer::default();
-    let json_val = triple
-        .serialize_state(&state, serde_json::value::Serializer)
-        .unwrap();
+    let json_val = triple.serialize_state(&state, serde_json::value::Serializer).unwrap();
     let state = DedupSerializer::default();
     let round_tripped = Ty::deserialize_state(&state, json_val).unwrap();
 

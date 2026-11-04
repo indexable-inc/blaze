@@ -116,15 +116,28 @@ fn the_walks_over_the_crates_that_name_find_what_the_walks_over_every_crate_find
             let blanket: Vec<_> = loaded
                 .iter()
                 .flat_map(|&dep| {
-                    TraitImpls::for_crate_and_trait(&db, dep, trait_).blanket_impls(trait_).iter().copied()
+                    TraitImpls::for_crate_and_trait(&db, dep, trait_)
+                        .blanket_impls(trait_)
+                        .iter()
+                        .copied()
                 })
                 .collect();
-            assert_eq!(TraitImpls::blanket_in_crate_and_deps(&db, krate, trait_), &blanket[..], "{}", what("the blanket impls"));
+            assert_eq!(
+                TraitImpls::blanket_in_crate_and_deps(&db, krate, trait_),
+                &blanket[..],
+                "{}",
+                what("the blanket impls")
+            );
             let every: Vec<_> = loaded
                 .iter()
                 .flat_map(|&dep| TraitImpls::in_crate_for_trait(&db, dep, trait_).iter().copied())
                 .collect();
-            assert_eq!(TraitImpls::in_crate_and_deps_for_trait(&db, krate, trait_), &every[..], "{}", what("the impls"));
+            assert_eq!(
+                TraitImpls::in_crate_and_deps_for_trait(&db, krate, trait_),
+                &every[..],
+                "{}",
+                what("the impls")
+            );
         }
     }
     assert!(compared > 40, "{compared} reads compared");
@@ -135,7 +148,8 @@ fn the_walks_over_the_crates_that_name_find_what_the_walks_over_every_crate_find
 fn only_a_crate_that_can_name_the_trait_and_the_type_is_asked() {
     let db = fixture::db(FIXTURE).into_db();
     let named = |name| crate_named(&db, name);
-    let (main, a, b, c, d, core) = (named("main"), named("a"), named("b"), named("c"), named("d"), named("core"));
+    let (main, a, b, c, d, core) =
+        (named("main"), named("a"), named("b"), named("c"), named("d"), named("core"));
     let loaded = loaded_crates(&db, main);
     for krate in [a, b, c, d, core] {
         assert!(loaded.contains(&krate), "{krate:?} is loaded for main");

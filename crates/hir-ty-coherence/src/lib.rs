@@ -219,7 +219,11 @@ pub fn check_impl(db: &Db, impl_: ImplId) -> Vec<CoherenceError> {
     if ImplSignature::of(db, impl_).flags.contains(ImplFlags::NEGATIVE) {
         found.push(error(
             Rule::RelaxedNegative,
-            format_args!("`{}` is a negative impl over the sealed trait `{}`", this(), sealed_name()),
+            format_args!(
+                "`{}` is a negative impl over the sealed trait `{}`",
+                this(),
+                sealed_name()
+            ),
             None,
         ));
         return found;
@@ -535,11 +539,7 @@ fn impl_text(db: &Db, krate: Crate, impl_: AnyImplId) -> String {
     let at = match impl_ {
         AnyImplId::ImplId(id) => {
             let owner = id.lookup(db).container.krate(db);
-            if owner == krate {
-                String::new()
-            } else {
-                format!(" in crate `{}`", owner.named(db))
-            }
+            if owner == krate { String::new() } else { format!(" in crate `{}`", owner.named(db)) }
         }
         AnyImplId::BuiltinDeriveImplId(_) => " (derived)".to_owned(),
     };

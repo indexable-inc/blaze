@@ -19,7 +19,10 @@ use hir_def::{
 use hir_ty::{
     InferBodyId,
     db::HirDatabase as _,
-    mir::{BasicBlockId, LocalId, MirBody, MirSpan, OperandKind, StatementKind, StoredPlace, TerminatorKind},
+    mir::{
+        BasicBlockId, LocalId, MirBody, MirSpan, OperandKind, StatementKind, StoredPlace,
+        TerminatorKind,
+    },
     next_solver::TyKind,
 };
 use rustc_type_ir::inherent::IntoKind as _;
@@ -56,7 +59,8 @@ const DIAGNOSTIC: [(&str, Kind); 5] = [
 ];
 
 /// std's lock guards with no diagnostic item, by name in std.
-const STD: &[&str] = &["MappedMutexGuard", "MappedRwLockReadGuard", "MappedRwLockWriteGuard", "ReentrantLockGuard"];
+const STD: &[&str] =
+    &["MappedMutexGuard", "MappedRwLockReadGuard", "MappedRwLockWriteGuard", "ReentrantLockGuard"];
 
 /// `lock_api`'s guards, by name.
 const LOCK_API: &[&str] = &[
@@ -89,7 +93,8 @@ impl Guards {
         let db = cx.db();
         let krate = cx.krate();
         Guards {
-            diagnostic: DIAGNOSTIC.map(|(name, _)| krate.diagnostic_item_adt(db, &intern::Symbol::intern(name))),
+            diagnostic: DIAGNOSTIC
+                .map(|(name, _)| krate.diagnostic_item_adt(db, &intern::Symbol::intern(name))),
         }
     }
 
@@ -100,16 +105,29 @@ impl Guards {
         }
         let name = adt.name(db);
         let krate = adt.module(db).krate(db);
-        let named = |names: &[&str], krate_name| names.contains(&name.as_str()) && facts::crate_is(db, krate, krate_name);
+        let named = |names: &[&str], krate_name| {
+            names.contains(&name.as_str()) && facts::crate_is(db, krate, krate_name)
+        };
         (named(STD, "std") || named(LOCK_API, "lock_api")).then_some(Kind::Lock)
     }
 
     /// The guard of kind `kind` that `ty` holds: itself, or one in its arguments or fields.
-    pub(crate) fn in_ty<'db>(&self, db: &'db Db, ty: &hir::Type<'db>, kind: Kind) -> Option<hir::Type<'db>> {
+    pub(crate) fn in_ty<'db>(
+        &self,
+        db: &'db Db,
+        ty: &hir::Type<'db>,
+        kind: Kind,
+    ) -> Option<hir::Type<'db>> {
         self.find(db, ty, kind, DEPTH)
     }
 
-    fn find<'db>(&self, db: &'db Db, ty: &hir::Type<'db>, kind: Kind, depth: u32) -> Option<hir::Type<'db>> {
+    fn find<'db>(
+        &self,
+        db: &'db Db,
+        ty: &hir::Type<'db>,
+        kind: Kind,
+        depth: u32,
+    ) -> Option<hir::Type<'db>> {
         if ty.is_reference() || ty.is_raw_ptr() {
             return None;
         }
@@ -122,7 +140,9 @@ impl Guards {
         if let Some(found) = ty.type_arguments().find_map(|it| self.find(db, &it, kind, depth)) {
             return Some(found);
         }
-        if let Some(found) = ty.tuple_fields(db).iter().find_map(|it| self.find(db, it, kind, depth)) {
+        if let Some(found) =
+            ty.tuple_fields(db).iter().find_map(|it| self.find(db, it, kind, depth))
+        {
             return Some(found);
         }
         // A library struct's fields are its own business: std's and core's never hold a guard
@@ -149,7 +169,11 @@ pub(crate) struct Body<'db> {
 
 /// The runtime bodies of `def`'s function: its own, each closure's (nested ones too) and each
 /// `async` block's (an `async fn`'s body is one), in the order of their expressions.
-pub(crate) fn bodies<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, def: DefWithBodyId) -> Vec<Body<'db>> {
+pub(crate) fn bodies<'db>(
+    db: &'db Db,
+    analysis: &hir::BodyAnalysis<'db>,
+    def: DefWithBodyId,
+) -> Vec<Body<'db>> {
     // alloc: the bodies of one function, a few
     let mut out = Vec::new();
     if let Ok(mir) = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)) {
@@ -160,7 +184,9 @@ pub(crate) fn bodies<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, def: D
         let Expr::Closure { closure_kind, .. } = expr else { continue };
         let ty = infer.expr_ty(id);
         let mir = match (closure_kind, ty.kind()) {
-            (ClosureKind::Closure, TyKind::Closure(closure, _)) => db.runtime_mir_body_for_closure(closure.0),
+            (ClosureKind::Closure, TyKind::Closure(closure, _)) => {
+                db.runtime_mir_body_for_closure(closure.0)
+            }
             (ClosureKind::Coroutine { .. }, TyKind::Coroutine(coroutine, _)) => {
                 db.runtime_mir_body_for_coroutine(coroutine.0)
             }
@@ -171,7 +197,10 @@ pub(crate) fn bodies<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, def: D
             mir,
             expr: Some(id),
             coroutine: matches!(closure_kind, ClosureKind::Coroutine { .. }),
-            async_fn: matches!(closure_kind, ClosureKind::Coroutine { source: CoroutineSource::Fn, .. }),
+            async_fn: matches!(
+                closure_kind,
+                ClosureKind::Coroutine { source: CoroutineSource::Fn, .. }
+            ),
         });
     }
     out
@@ -247,7 +276,12 @@ pub(crate) fn maybe_init(mir: &MirBody<'_>, local: LocalId) -> Vec<bool> {
 
 /// Whether `local` may hold a value at the terminator of `block`, given whether it may at its
 /// start.
-pub(crate) fn init_before_terminator(mir: &MirBody<'_>, block: BasicBlockId, local: LocalId, mut init: bool) -> bool {
+pub(crate) fn init_before_terminator(
+    mir: &MirBody<'_>,
+    block: BasicBlockId,
+    local: LocalId,
+    mut init: bool,
+) -> bool {
     for statement in &mir.basic_blocks[block].statements {
         match &statement.kind {
             StatementKind::Assign(place, rvalue) => {
@@ -284,7 +318,12 @@ pub(crate) fn block_index(block: BasicBlockId) -> usize {
 }
 
 /// A local as a message names it: the binding it holds, or a temporary of its type.
-pub(crate) fn say_local<'db>(cx: &Cx<'db, '_>, analysis: &hir::BodyAnalysis<'db>, mir: &MirBody<'db>, local: LocalId) -> String {
+pub(crate) fn say_local<'db>(
+    cx: &Cx<'db, '_>,
+    analysis: &hir::BodyAnalysis<'db>,
+    mir: &MirBody<'db>,
+    local: LocalId,
+) -> String {
     let db = cx.db();
     let ty = analysis.ty(mir.locals[local].ty.as_ref());
     let shown = ty.display(db, cx.krate().to_display_target(db));

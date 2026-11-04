@@ -16,12 +16,12 @@
 use std::hash::BuildHasher as _;
 
 use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_items::ItemId;
 use either::Either;
 use hashbrown::HashTable;
 use hir::{InFile, PathResolution};
+use std::alloc::Global;
 use syntax::{
     TextRange, TextSize,
     view::{self as ast, AstNode, HasAttrs, HasName as _},
@@ -270,7 +270,9 @@ fn plant(
                 it.ns == binding.ns && it.key == binding.key && scope.name(it.name) == name
             };
             let Some(&old) = planted.find(hash, same) else {
-                planted.insert_unique(hash, index as u32, |&at| hash_of(scope, &scope.bindings[at as usize]));
+                planted.insert_unique(hash, index as u32, |&at| {
+                    hash_of(scope, &scope.bindings[at as usize])
+                });
                 continue;
             };
             let old = &scope.bindings[old as usize];
@@ -329,7 +331,10 @@ fn conflict(
             false => "definition",
         };
         // alloc: the error's label
-        diag.span_label(cx.span(old.head), format!("previous {what} of the {} `{name}` here", old.kind));
+        diag.span_label(
+            cx.span(old.head),
+            format!("previous {what} of the {} `{name}` here", old.kind),
+        );
     }
     // alloc: the error's note
     diag.note(format!(
@@ -387,7 +392,12 @@ fn remove(cx: &Cx<'_, '_>, diag: &mut Diag, binding: &Binding) {
     let range = binding.range.value;
     let (closing_brace, until_next) = until_next_binding(text, range, use_end);
     if !closing_brace {
-        diag.suggestion(cx.span(InFile::new(file, until_next)), "remove unnecessary import", "", Applicability::MaybeIncorrect);
+        diag.suggestion(
+            cx.span(InFile::new(file, until_next)),
+            "remove unnecessary import",
+            "",
+            Applicability::MaybeIncorrect,
+        );
         return;
     }
     match to_previous_binding(text, until_next) {
@@ -457,7 +467,8 @@ fn rename(cx: &Cx<'_, '_>, diag: &mut Diag, scope: &Scope, binding: &Binding) {
     let (at, code) = match &binding.origin {
         Origin::Import(import) => {
             let snippet = cx.root(file).text();
-            let snippet = snippet.get(usize::from(range.start())..usize::from(range.end())).unwrap_or("");
+            let snippet =
+                snippet.get(usize::from(range.start())..usize::from(range.end())).unwrap_or("");
             let pos = import.source_end.checked_sub(range.start());
             match pos {
                 Some(pos) if usize::from(pos) <= snippet.len() => {
@@ -472,7 +483,9 @@ fn rename(cx: &Cx<'_, '_>, diag: &mut Diag, scope: &Scope, binding: &Binding) {
             }
         }
         // alloc: the error's suggestion
-        Origin::ExternCrate(it) => (range, format!("extern crate {} as {suggested};", scope.name(it.source))),
+        Origin::ExternCrate(it) => {
+            (range, format!("extern crate {} as {suggested};", scope.name(it.source)))
+        }
         Origin::Def => return,
     };
     diag.suggestion(cx.span(InFile::new(file, at)), message, code, Applicability::MaybeIncorrect);
@@ -480,7 +493,12 @@ fn rename(cx: &Cx<'_, '_>, diag: &mut Diag, scope: &Scope, binding: &Binding) {
 
 /// The bindings of a module or block, in the order rustc plants them: items and `extern crate`s
 /// as written (those a macro wrote after), then single imports.
-fn module_scope<'db>(cx: &Cx<'_, 'db>, scope: &mut Scope, uses: &mut UseTrees<'db>, module: hir::Module) {
+fn module_scope<'db>(
+    cx: &Cx<'_, 'db>,
+    scope: &mut Scope,
+    uses: &mut UseTrees<'db>,
+    module: hir::Module,
+) {
     let db = cx.db;
     let container = if is_block(cx, module) { "block" } else { "module" };
     scope.reset(module, container);
@@ -514,12 +532,24 @@ fn enum_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, enum_: hi
     let item = Some(ItemId::Adt(hir::Adt::from(enum_).into()));
     for variant in list.variants().filter(|&it| cx.cfg_enabled(it.syntax())) {
         let Some(name) = variant.name() else { continue };
-        let key = hir_def::nameres::binding_key_at(cx.db, source.file_id, name.syntax().text_range());
+        let key =
+            hir_def::nameres::binding_key_at(cx.db, source.file_id, name.syntax().text_range());
         let name = scope.intern(name.text());
         let node = variant.syntax();
-        let (range, head) = (source.with_value(item_range(node)), source.with_value(head_range(node)));
+        let (range, head) =
+            (source.with_value(item_range(node)), source.with_value(head_range(node)));
         for (ns, kind) in [(Ns::Type, "type"), (Ns::Value, "value")] {
-            scope.bindings.push(Binding { name, key, ns, origin: Origin::Def, res: None, kind, range, head, item });
+            scope.bindings.push(Binding {
+                name,
+                key,
+                ns,
+                origin: Origin::Def,
+                res: None,
+                kind,
+                range,
+                head,
+                item,
+            });
         }
     }
 }
@@ -531,12 +561,16 @@ fn trait_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, trait_: 
     let item = Some(ItemId::Trait(trait_.into()));
     for assoc in trait_.items_iter(db) {
         let (name, ns, at) = match assoc {
-            hir::AssocItem::Function(it) => (it.name(db), Ns::Value, cx.vsema.source(it).map(ranges)),
+            hir::AssocItem::Function(it) => {
+                (it.name(db), Ns::Value, cx.vsema.source(it).map(ranges))
+            }
             hir::AssocItem::Const(it) => {
                 let Some(name) = it.name(db) else { continue };
                 (name, Ns::Value, cx.vsema.source(it).map(ranges))
             }
-            hir::AssocItem::TypeAlias(it) => (it.name(db), Ns::Type, cx.vsema.source(it).map(ranges)),
+            hir::AssocItem::TypeAlias(it) => {
+                (it.name(db), Ns::Type, cx.vsema.source(it).map(ranges))
+            }
         };
         let Some((range, head)) = at else { continue };
         if name.as_str() == "_" {
@@ -544,7 +578,17 @@ fn trait_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, trait_: 
         }
         let name = scope.intern(name.as_str());
         let kind = ns.descr();
-        scope.bindings.push(Binding { name, key: None, ns, origin: Origin::Def, res: None, kind, range, head, item });
+        scope.bindings.push(Binding {
+            name,
+            key: None,
+            ns,
+            origin: Origin::Def,
+            res: None,
+            kind,
+            range,
+            head,
+            item,
+        });
     }
 }
 
@@ -584,10 +628,22 @@ fn item_bindings(cx: &Cx<'_, '_>, scope: &mut Scope, def: hir::ModuleDef) {
     };
     let item = item_id(db, def);
     let name = scope.intern(name.as_str());
-    let key = hir_def::ModuleDefId::try_from(def).ok().and_then(|it| hir_def::nameres::def_binding_key(db, it));
+    let key = hir_def::ModuleDefId::try_from(def)
+        .ok()
+        .and_then(|it| hir_def::nameres::def_binding_key(db, it));
     for &ns in namespaces {
         let kind = kind_of(ns, def);
-        scope.bindings.push(Binding { name, key, ns, origin: Origin::Def, res: Some(def), kind, range, head, item });
+        scope.bindings.push(Binding {
+            name,
+            key,
+            ns,
+            origin: Origin::Def,
+            res: Some(def),
+            kind,
+            range,
+            head,
+            item,
+        });
     }
 }
 
@@ -603,7 +659,10 @@ fn kind_of(ns: Ns, def: hir::ModuleDef) -> &'static str {
 }
 
 /// The span and head of a definition's syntax: a module's `mod` item, else the item.
-fn def_ranges(cx: &Cx<'_, '_>, def: hir::ModuleDef) -> Option<(InFile<TextRange>, InFile<TextRange>)> {
+fn def_ranges(
+    cx: &Cx<'_, '_>,
+    def: hir::ModuleDef,
+) -> Option<(InFile<TextRange>, InFile<TextRange>)> {
     let db = cx.db;
     Some(match def {
         hir::ModuleDef::Module(it) => ranges(it.declaration_source_view(db)?),
@@ -656,7 +715,12 @@ fn extern_crate_binding(cx: &Cx<'_, '_>, scope: &mut Scope, decl: hir::ExternCra
 
 /// The single imports of a `use` item, each in every namespace its path resolves in (globs
 /// and `_` bind no name that can conflict).
-fn import_bindings<'db>(cx: &Cx<'_, 'db>, scope: &mut Scope, uses: &mut UseTrees<'db>, item: InFile<ast::Use<'db>>) {
+fn import_bindings<'db>(
+    cx: &Cx<'_, 'db>,
+    scope: &mut Scope,
+    uses: &mut UseTrees<'db>,
+    item: InFile<ast::Use<'db>>,
+) {
     let Some(tree) = item.value.use_tree() else { return };
     let site = Import {
         source_end: TextSize::from(0),

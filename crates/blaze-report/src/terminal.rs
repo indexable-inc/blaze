@@ -69,7 +69,8 @@ impl Config {
     /// `[terminal]` of `text`, a `config.toml`; the defaults for what it does not set. An
     /// error names the key and what it takes.
     pub fn from_toml(text: &str) -> Result<Config, String> {
-        let table: toml::Table = toml::from_str(text).map_err(|error| format!("config.toml is not TOML: {error}"))?;
+        let table: toml::Table =
+            toml::from_str(text).map_err(|error| format!("config.toml is not TOML: {error}"))?;
         let mut config = Config::DEFAULT;
         let Some(terminal) = table.get("terminal") else { return Ok(config) };
         let Some(terminal) = terminal.as_table() else {
@@ -77,7 +78,9 @@ impl Config {
         };
         for (key, value) in terminal {
             // alloc: an error, once
-            let bad = |wants: &str| format!("config.toml's `terminal.{key}` takes {wants}, not `{value}`");
+            let bad = |wants: &str| {
+                format!("config.toml's `terminal.{key}` takes {wants}, not `{value}`")
+            };
             let word = || value.as_str();
             match key.as_str() {
                 "color" => {
@@ -113,7 +116,9 @@ impl Config {
                         .and_then(|it| u64::try_from(it).ok())
                         .ok_or_else(|| bad("a number of seconds"))?
                 }
-                "tmux_passthrough" => config.tmux_passthrough = value.as_bool().ok_or_else(|| bad("true or false"))?,
+                "tmux_passthrough" => {
+                    config.tmux_passthrough = value.as_bool().ok_or_else(|| bad("true or false"))?
+                }
                 _ => {
                     // alloc: an error, once
                     return Err(format!(
@@ -171,7 +176,12 @@ impl Default for Terminal {
 
 /// What the terminal of a stream does, from `config`, the variables `var` gives, whether the
 /// stream is a terminal, and its width.
-pub fn detect(config: &Config, var: impl Fn(&str) -> Option<String>, terminal: bool, width: Option<u16>) -> Terminal {
+pub fn detect(
+    config: &Config,
+    var: impl Fn(&str) -> Option<String>,
+    terminal: bool,
+    width: Option<u16>,
+) -> Terminal {
     let set = |name: &str| var(name).is_some_and(|it| !it.is_empty());
     let term = var("TERM").unwrap_or_default();
     let program = var("TERM_PROGRAM").unwrap_or_default();
@@ -196,11 +206,18 @@ pub fn detect(config: &Config, var: impl Fn(&str) -> Option<String>, terminal: b
         return none;
     }
     let muxed = set("TMUX") || term.starts_with("screen") || term.starts_with("tmux");
-    let kind = Kind::of(&program, &term, set("WT_SESSION"), set("KITTY_WINDOW_ID"), var("ConEmuANSI").as_deref() == Some("ON"));
+    let kind = Kind::of(
+        &program,
+        &term,
+        set("WT_SESSION"),
+        set("KITTY_WINDOW_ID"),
+        var("ConEmuANSI").as_deref() == Some("ON"),
+    );
     let version = var("TERM_PROGRAM_VERSION").unwrap_or_default();
     // Ghostty draws OSC 9;4 since 1.2.
     let ghostty_progress = kind == Kind::Ghostty && at_least(&version, 1, 2);
-    let shows_progress = ghostty_progress || matches!(kind, Kind::WezTerm | Kind::WindowsTerminal | Kind::ConEmu);
+    let shows_progress =
+        ghostty_progress || matches!(kind, Kind::WezTerm | Kind::WindowsTerminal | Kind::ConEmu);
     let notifier = match kind {
         Kind::Ghostty | Kind::WezTerm | Kind::Foot => Some(Notifier::Osc777),
         Kind::ITerm => Some(Notifier::Osc9),

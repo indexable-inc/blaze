@@ -113,7 +113,10 @@ enum Answer {
 /// scope) triples checked in one revision, across every crate being checked.
 const PICK_BITS: u32 = 16;
 
-#[expect(clippy::disallowed_types, reason = "the process's one method pick table: shared across all databases")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one method pick table: shared across all databases"
+)]
 static PICKS: std::sync::LazyLock<Table<PickKey, View, Cached>> =
     std::sync::LazyLock::new(|| Table::new(PICK_BITS));
 
@@ -179,8 +182,11 @@ impl PickKey {
         scope: ScopeItems,
     ) -> Option<PickKey> {
         let infcx = ctx.infcx;
-        let self_ty =
-            if self_ty.has_infer() { infcx.deeply_resolve_ignoring_regions(self_ty) } else { self_ty };
+        let self_ty = if self_ty.has_infer() {
+            infcx.deeply_resolve_ignoring_regions(self_ty)
+        } else {
+            self_ty
+        };
         if self_ty.has_non_region_infer()
             || self_ty.has_placeholders()
             || self_ty.has_opaque_types()
@@ -232,9 +238,7 @@ fn typing_mode_key(mode: TypingMode<'_>) -> (u32, u32) {
     match mode {
         TypingMode::Coherence => (0, 0),
         TypingMode::Typeck { defining_opaque_types_and_generators: defs } => (1, defs.index()),
-        TypingMode::PostTypeckThroughBorrowck { defining_opaque_types: defs } => {
-            (2, defs.index())
-        }
+        TypingMode::PostTypeckThroughBorrowck { defining_opaque_types: defs } => (2, defs.index()),
         TypingMode::PostBorrowck { defined_opaque_types: defs } => (3, defs.index()),
         TypingMode::Reflection => (4, 0),
         TypingMode::PostAnalysis => (5, 0),
@@ -377,7 +381,10 @@ struct CachedSteps {
 /// probed in a revision.
 const STEPS_BITS: u32 = 14;
 
-#[expect(clippy::disallowed_types, reason = "the process's one autoderef steps table: shared across all databases")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one autoderef steps table: shared across all databases"
+)]
 static STEPS: std::sync::LazyLock<Table<StepsKey, View, CachedSteps>> =
     std::sync::LazyLock::new(|| Table::new(STEPS_BITS));
 
@@ -411,10 +418,7 @@ pub(super) fn with_steps<'db, R>(
         bits: typing_tag
             | flag(interner.regions(), FLAG_REGIONS)
             | flag(ctx.features.arbitrary_self_types, FLAG_ARBITRARY_SELF_TYPES)
-            | flag(
-                ctx.features.arbitrary_self_types_pointers,
-                FLAG_ARBITRARY_SELF_TYPES_POINTERS,
-            ),
+            | flag(ctx.features.arbitrary_self_types_pointers, FLAG_ARBITRARY_SELF_TYPES_POINTERS),
     };
     let guard = blaze_reclaim::enter();
     if let Some(cached) = STEPS.get(&guard, &key, revision) {
@@ -424,8 +428,12 @@ pub(super) fn with_steps<'db, R>(
     let (steps, reads) = blaze_query::db::capture_reads(db, compute);
     match reads {
         Some(reads) => {
-            let cached =
-                STEPS.insert(&guard, key, revision, CachedSteps { steps: erase::steps(steps), reads });
+            let cached = STEPS.insert(
+                &guard,
+                key,
+                revision,
+                CachedSteps { steps: erase::steps(steps), reads },
+            );
             f(erase::unerase_steps(&cached.steps))
         }
         None => f(&steps),
@@ -460,7 +468,9 @@ mod erase {
         unsafe { mem::transmute::<&'a Pick<'static>, &'a Pick<'db>>(pick) }
     }
 
-    pub(super) fn steps(steps: MethodAutoderefStepsResult<'_>) -> MethodAutoderefStepsResult<'static> {
+    pub(super) fn steps(
+        steps: MethodAutoderefStepsResult<'_>,
+    ) -> MethodAutoderefStepsResult<'static> {
         // SAFETY: as in `pick`.
         unsafe {
             mem::transmute::<MethodAutoderefStepsResult<'_>, MethodAutoderefStepsResult<'static>>(
@@ -474,9 +484,10 @@ mod erase {
     ) -> &'a MethodAutoderefStepsResult<'db> {
         // SAFETY: as in `unerase_pick`.
         unsafe {
-            mem::transmute::<&'a MethodAutoderefStepsResult<'static>, &'a MethodAutoderefStepsResult<'db>>(
-                steps,
-            )
+            mem::transmute::<
+                &'a MethodAutoderefStepsResult<'static>,
+                &'a MethodAutoderefStepsResult<'db>,
+            >(steps)
         }
     }
 }

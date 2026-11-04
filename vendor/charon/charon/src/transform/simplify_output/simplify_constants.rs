@@ -36,10 +36,7 @@ fn new_promoted_global(
         })
         .count();
     let disambiguator = Disambiguator::new(promoted_count);
-    name.name.push(PathElem::Builtin(
-        BuiltinPathElem::PromotedConst,
-        disambiguator,
-    ));
+    name.name.push(PathElem::Builtin(BuiltinPathElem::PromotedConst, disambiguator));
     let ty = value.ty().clone();
     let id = krate.global_decls.push_with(|def_id| GlobalDecl {
         def_id,
@@ -54,10 +51,7 @@ fn new_promoted_global(
         value,
     });
     krate.item_names.insert(id.into(), name);
-    GlobalDeclRef {
-        id,
-        generics: Box::new(GenericArgs::empty()),
-    }
+    GlobalDeclRef { id, generics: Box::new(GenericArgs::empty()) }
 }
 
 /// If the constant value is a constant ADT, push `Assign::Aggregate` statements
@@ -118,8 +112,7 @@ fn transform_constant_expr(
                     let fn_ptr = transform_constant_expr(ctx, fn_ptr);
                     let ptr_ty = TyKind::RawPtr(base.ty.clone(), RefKind::Shared).into_ty();
                     let cast = UnOp::Cast(CastKind::RawPtr(ptr_ty.clone()));
-                    ctx.rval_to_place(Rvalue::UnaryOp(cast, fn_ptr), ptr_ty)
-                        .deref()
+                    ctx.rval_to_place(Rvalue::UnaryOp(cast, fn_ptr), ptr_ty).deref()
                 }
                 GlobalPlaceKind::Global(GlobalProvenance::TypeId(_)) => {
                     let kind = ConstantExprKind::Opaque("pointer into a `TypeId`".into());
@@ -152,15 +145,12 @@ fn transform_constant_expr(
                     ConstProjectionElem::Field(variant_id, field_id) => {
                         ProjectionElem::Field(variant_id, field_id)
                     }
-                    ConstProjectionElem::Index(i) => ProjectionElem::Index {
-                        offset: op(i),
-                        from_end: false,
-                    },
-                    ConstProjectionElem::Subslice { from, to } => ProjectionElem::Subslice {
-                        from: op(from),
-                        to: op(to),
-                        from_end: false,
-                    },
+                    ConstProjectionElem::Index(i) => {
+                        ProjectionElem::Index { offset: op(i), from_end: false }
+                    }
+                    ConstProjectionElem::Subslice { from, to } => {
+                        ProjectionElem::Subslice { from: op(from), to: op(to), from_end: false }
+                    }
                     ConstProjectionElem::Offset {
                         count,
                         ref ty,
@@ -210,11 +200,7 @@ fn transform_constant_expr(
             return Operand::Const(val);
         }
         ConstantExprKind::Adt(variant, fields) => {
-            let fields = fields
-                .iter()
-                .cloned()
-                .map(|x| transform_constant_expr(ctx, x))
-                .collect();
+            let fields = fields.iter().cloned().map(|x| transform_constant_expr(ctx, x)).collect();
 
             // Build an `Aggregate` rvalue.
             let tref = val.ty().kind().as_adt().unwrap();
@@ -224,16 +210,10 @@ fn transform_constant_expr(
         ConstantExprKind::Array(fields)
             if let TyKind::Array(ty, _, ty_is_sized) = val.ty().kind() =>
         {
-            let fields = fields
-                .iter()
-                .cloned()
-                .map(|x| transform_constant_expr(ctx, x))
-                .collect_vec();
+            let fields =
+                fields.iter().cloned().map(|x| transform_constant_expr(ctx, x)).collect_vec();
             let len = ConstantExpr::mk_usize(fields.len() as u128);
-            Rvalue::Aggregate(
-                AggregateKind::Array(ty.clone(), len, ty_is_sized.clone()),
-                fields,
-            )
+            Rvalue::Aggregate(AggregateKind::Array(ty.clone(), len, ty_is_sized.clone()), fields)
         }
         ConstantExprKind::Cast(value, kind) => {
             let value = transform_constant_expr(ctx, value.clone());
@@ -268,11 +248,7 @@ fn transform_constant_expr(
 fn transform_operand(ctx: &mut UllbcStatementTransformCtx<'_>, op: &mut Operand) {
     // Transform the constant operands (otherwise do nothing)
     take_mut::take(op, |op| {
-        if let Operand::Const(val) = op {
-            transform_constant_expr(ctx, val)
-        } else {
-            op
-        }
+        if let Operand::Const(val) = op { transform_constant_expr(ctx, val) } else { op }
     })
 }
 
@@ -284,12 +260,9 @@ impl UllbcPass for Transform {
 
     fn transform_function(&self, ctx: &mut TransformCtx, fun_decl: &mut FunDecl) {
         fun_decl.transform_ullbc_statements(ctx, |ctx, st| {
-            let assigns_const = matches!(
-                st.kind,
-                StatementKind::Assign(_, Rvalue::Use(Operand::Const(_), _))
-            );
-            st.kind
-                .dyn_visit_in_body_mut(|op: &mut Operand| transform_operand(ctx, op));
+            let assigns_const =
+                matches!(st.kind, StatementKind::Assign(_, Rvalue::Use(Operand::Const(_), _)));
+            st.kind.dyn_visit_in_body_mut(|op: &mut Operand| transform_operand(ctx, op));
             // If we turned `x = const c` into `tmp = rval; x = move tmp`, assign `rval` directly.
             if assigns_const
                 && let StatementKind::Assign(_, rval) = &mut st.kind
@@ -303,8 +276,7 @@ impl UllbcPass for Transform {
             }
         });
         fun_decl.transform_ullbc_terminators(ctx, |ctx, term| {
-            term.kind
-                .dyn_visit_in_body_mut(|op: &mut Operand| transform_operand(ctx, op));
+            term.kind.dyn_visit_in_body_mut(|op: &mut Operand| transform_operand(ctx, op));
         });
         if let Some(body) = fun_decl.body.as_unstructured_mut() {
             for block in body.body.iter_mut() {

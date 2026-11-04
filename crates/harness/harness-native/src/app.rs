@@ -5,34 +5,32 @@
 //!
 //! The frame loop is den's (den-native ui/native.rs): write `Viewport`, `PointerState` and `Paint`, typeset, `progress`,
 //! typeset again while sizes move, then turn the painted nodes into Metal instances (`emit`).
-use crate::draw::{ATLAS_SIZE, Draw};
+use crate::draw::Draw;
 use crate::link::Link;
-use crate::pack::{Frame, GlyphInst, PanelInst};
-use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
+use crate::pack::Frame;
 use crate::pane::TermNode;
-use harness_vt::MouseTracking;
-use crate::text::{Face, Fonts, GlyphCache, Layout, SUBPX, Style, TypeLook};
+use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
+use crate::text::TypeLook;
 use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{APP, Clock, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_model::{self as model, Msg};
+use harness_native_render::paint::{Painter, panel_from};
 use harness_native_ui_draw_api::{Paint, PaintKind};
 use harness_native_ui_input_api::{Action, Activated, Hovered, PointerState, Pressed};
-use harness_native_ui_layout::typeset;
-use harness_native_ui_layout_api::{Intrinsic, Size, SizeKind, Sizing, Viewport};
-use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
+use harness_native_ui_layout_api::{Size, SizeKind, Sizing, Viewport};
+use harness_native_ui_look_api::{Fill, Rgba, Shape};
 use harness_native_ui_node_api::{Laid, Level};
-use harness_native_ui_text_api::{Icon, Mark, OneLine, Text, Truncate, TruncateMode};
 use harness_native_ui_view::{self as view, View, for_each};
+use harness_vt::MouseTracking;
 use std::collections::{BTreeSet, HashMap};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-mod panes;
-mod fold;
-mod sidebar;
 mod archive;
+mod fold;
 mod keys;
+mod panes;
+mod sidebar;
 mod stats;
 pub use stats::TICK as STATS_TICK;
 mod ghostty;
@@ -61,7 +59,6 @@ const SCENE: &[(&str, &str)] = &[
 /// The terminal's font size at zoom 1 (points) when the Ghostty config sets none (src/app/ghostty.rs).
 const TERM_SIZE: f32 = 13.0;
 const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
-
 
 pub use crate::term::Mods as KeyMods;
 
@@ -139,9 +136,8 @@ pub struct Bump {
 
 pub struct App {
     pub world: World,
-    fonts: Fonts,
-    cache: GlyphCache,
-    layouts: HashMap<(String, u32, u32, bool, u8, u32), Rc<Layout>>,
+    /// Fonts, glyph atlas, layouts and pictures, and the paint pass shared with harness-video (harness-native-render).
+    paint: Painter,
     terms: model::Terms,
     /// The parsers of runs and stages being read, by entity id.
     run_terms: model::Terms,
@@ -227,7 +223,8 @@ fn rgba(c: Rgba) -> [f32; 4] {
 fn script_error(e: EntityView<'_>) -> Option<String> {
     e.try_get::<&flecs::Script>(|s| {
         // SAFETY: `error` is null or a NUL-terminated string owned by the EcsScript component, alive for this call.
-        (!s.error.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(s.error) }.to_string_lossy().into_owned())
+        (!s.error.is_null())
+            .then(|| unsafe { std::ffi::CStr::from_ptr(s.error) }.to_string_lossy().into_owned())
     })
     .flatten()
 }
@@ -240,7 +237,11 @@ enum PalGlyph {
 }
 
 fn clip_text(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_owned() } else { format!("{}\u{2026}", s.chars().take(n - 1).collect::<String>()) }
+    if s.chars().count() <= n {
+        s.to_owned()
+    } else {
+        format!("{}\u{2026}", s.chars().take(n - 1).collect::<String>())
+    }
 }
 
 /// `~` for the home directory at the front of a path.
@@ -249,11 +250,6 @@ fn tilde(p: &str) -> String {
         Ok(h) if !h.is_empty() && p.starts_with(&h) => format!("~{}", &p[h.len()..]),
         _ => p.to_owned(),
     }
-}
-
-fn set_of(s: &TextStyle) -> Style {
-    let size = if s.size > 0.0 { s.size } else { 14.0 };
-    Style { size, bold: s.bold != 0, line: if s.line > 0.0 { s.line } else { (size * 1.3).round() } }
 }
 
 impl App {
@@ -303,7 +299,9 @@ impl App {
         }
         let w = world.world_ref();
         // The rule's delay for a finished run with no session, from the scene's token (seconds).
-        world.set(model::ArchiveAfter { ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64 });
+        world.set(model::ArchiveAfter {
+            ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64,
+        });
         harness_native_ui_layout::install(w);
         harness_native_ui_input::install(w);
         harness_native_ui_motion::install(w);
@@ -313,21 +311,36 @@ impl App {
         let app_id = *app.id();
         // Each kicked Bump rings back to rest on its HoverLift's spring.
         world.system_named::<(&mut Bump, &HoverLift)>("Bump").each_iter(|it, _, (b, m)| {
-            if settle(&mut b.spring, 0.0, Tune { omega: m.omega.max(1.0), zeta: m.zeta.max(0.05) }, it.delta_time()) {
+            if settle(
+                &mut b.spring,
+                0.0,
+                Tune { omega: m.omega.max(1.0), zeta: m.zeta.max(0.05) },
+                it.delta_time(),
+            ) {
                 moving(&it.world());
             }
         });
         world.system_named::<&mut HoverAmt>("Hover").each_iter(move |it, row, h| {
             let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
             // On it, or on a part of it that takes the pointer itself (a row's disclosure chevron).
-            let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| std::iter::successors(Some(t), |n| n.parent()).take(4).any(|n| n.id() == e.id()));
+            let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| {
+                std::iter::successors(Some(t), |n| n.parent()).take(4).any(|n| n.id() == e.id())
+            });
             if settle(&mut h.spring, f32::from(u8::from(on)), Tune { omega: 34.0, zeta: 1.0 }, dt) {
                 moving(&w);
             }
         });
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
-        let host = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "This Mac".into());
-        let (terms, run_terms) = model::install(w, &host, &crate::link::sock().display().to_string(), rx);
+        let host = std::process::Command::new("scutil")
+            .args(["--get", "ComputerName"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "This Mac".into());
+        let (terms, run_terms) =
+            model::install(w, &host, &crate::link::sock().display().to_string(), rx);
         let key_file = keys::KeyFile::watch(wake.clone());
         let look = ghostty::Look::new(wake.clone());
         let link = Link::start(tx, wake);
@@ -335,12 +348,17 @@ impl App {
         let root = View::root(w, "hn.Window");
         let side = root.child("hn.SideClip").child("hn.Sidebar");
         let device = side.child("hn.DeviceRow");
-        let side_w = crate::prefs::get("sidebar_width").and_then(|v| v.as_f64()).map(|w| (w as f32).clamp(SIDE_MIN, SIDE_MAX));
+        let side_w = crate::prefs::get("sidebar_width")
+            .and_then(|v| v.as_f64())
+            .map(|w| (w as f32).clamp(SIDE_MIN, SIDE_MAX));
         if let Some(w) = side_w {
             set_side_width(side.entity(), w);
         }
         let tree = side.child("hn.Tree");
-        let archive_row = side.child("hn.SideFoot").child("hn.ArchiveRow").props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
+        let archive_row = side
+            .child("hn.SideFoot")
+            .child("hn.ArchiveRow")
+            .props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
         archive_row.set(HoverAmt::default());
         // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
         root.child("hn.Seam");
@@ -348,14 +366,21 @@ impl App {
         let bar = View::root(w, "hn.TitleBar");
         let bar_title = bar.part("title").map_or(0, View::id);
         let bar_sub = bar.part("sub").map_or(0, View::id);
-        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title, bar_sub };
-        let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
-        let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
+        let ids = Ids {
+            tree: tree.id(),
+            device: device.id(),
+            main: main.id(),
+            archive_row: archive_row.id(),
+            palette: None,
+            bar: bar.id(),
+            bar_title,
+            bar_sub,
+        };
+        let mut paint = Painter::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
+        let grid = Grid::new(&mut paint.fonts, TERM_SIZE, 2.0);
         let mut app = Self {
             world,
-            fonts,
-            cache: GlyphCache::new(ATLAS_SIZE),
-            layouts: HashMap::new(),
+            paint,
             terms,
             run_terms,
             watching: HashMap::new(),
@@ -378,7 +403,11 @@ impl App {
             saved: None,
             // The older `archived` (or `trashed`) session ids, read once (the next save writes `closed` and drops them).
             closed: crate::prefs::keys("closed")
-                .or_else(|| crate::prefs::ids("archived").or_else(|| crate::prefs::ids("trashed")).map(|ids| ids.into_iter().map(|i| format!("s{i}")).collect()))
+                .or_else(|| {
+                    crate::prefs::ids("archived")
+                        .or_else(|| crate::prefs::ids("trashed"))
+                        .map(|ids| ids.into_iter().map(|i| format!("s{i}")).collect())
+                })
                 .unwrap_or_default(),
             pinned: crate::prefs::keys("pinned").unwrap_or_default(),
             pending_archive: false,
@@ -508,7 +537,9 @@ impl App {
         let o = self.world.entity_from_id(e);
         let start = o.try_cloned::<&model::Created>().map(|c| c.ms).filter(|&m| m > 0)?;
         let end = o.try_cloned::<&model::Ended>().map(|c| c.ms);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         Some(fmt_dur(end.unwrap_or(now).saturating_sub(start)))
     }
 
@@ -522,7 +553,9 @@ impl App {
             _ => None,
         };
         match (head, took) {
-            (Some(h), Some(t)) if status != "pending" && status != "skipped" => format!("{h} \u{00B7} {t}"),
+            (Some(h), Some(t)) if status != "pending" && status != "skipped" => {
+                format!("{h} \u{00B7} {t}")
+            }
             (Some(h), _) => h,
             (None, Some(t)) => t,
             (None, None) => String::new(),
@@ -566,7 +599,10 @@ impl App {
         // Folds kept in native.json land on objects before their rows are read.
         self.read_folds();
         let w = self.world.world_ref();
-        let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
+        let up = w
+            .lookup(model::LOCAL)
+            .target(model::Link::id(), 0)
+            .is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
         self.sync_marks(up);
         let w = self.world.world_ref();
         let rows = model::tree(w);
@@ -578,7 +614,11 @@ impl App {
         }
         // Nothing selected (or it went): the first running object, else the first.
         if self.restore.is_none() && self.selected().is_none() && !rows.is_empty() {
-            let first = rows.iter().find(|(e, _)| self.status_of(*e) == "running").or(rows.first()).map(|(e, _)| *e);
+            let first = rows
+                .iter()
+                .find(|(e, _)| self.status_of(*e) == "running")
+                .or(rows.first())
+                .map(|(e, _)| *e);
             model::select(w, first);
         }
         // A spawn's or a deep link's session, once the list has it (and after the restore, which it overrides).
@@ -622,7 +662,10 @@ impl App {
         // The device row.
         let dev = w.lookup(model::LOCAL);
         let device = View::of(w.entity_from_id(self.ids.device));
-        let host = dev.try_cloned::<&model::Device>().map(|d| d.host.as_str().to_owned()).unwrap_or_default();
+        let host = dev
+            .try_cloned::<&model::Device>()
+            .map(|d| d.host.as_str().to_owned())
+            .unwrap_or_default();
         let link = dev.target(model::Link::id(), 0).map_or(0, |t| *t.id());
         let (link_tone, link_word) = if link == *w.component_id::<model::Up>() {
             (tone(w, "running"), format!("{}", rows.len()))
@@ -642,11 +685,14 @@ impl App {
             set_if(d, if link == *w.component_id::<model::Up>() { clear } else { link_tone });
         }
         let tree = View::of(w.entity_from_id(self.ids.tree));
-        let hint: HashMap<u64, usize> = rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
+        let hint: HashMap<u64, usize> =
+            rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
         let info: Vec<(String, &str, model::Row)> = model::rows(w)
             .into_iter()
             .map(|r| match r {
-                model::Row::Obj { e, .. } if self.run_of(e).is_some() => (format!("o{e}"), "hn.RunRow", r),
+                model::Row::Obj { e, .. } if self.run_of(e).is_some() => {
+                    (format!("o{e}"), "hn.RunRow", r)
+                }
                 model::Row::Obj { e, .. } => (format!("o{e}"), "hn.ObjRow", r),
                 model::Row::More { parent, .. } => (format!("more{parent}"), "hn.MoreRow", r),
             })
@@ -663,15 +709,27 @@ impl App {
             let (e, depth) = match r {
                 model::Row::Obj { e, depth } => (e, depth),
                 model::Row::More { parent, hidden, depth, unfolded } => {
-                    row.props("hn.MoreRow", &[("obj", Prop::Uint(parent)), ("depth", Prop::Int(depth as i64)), ("hidden", Prop::Int(hidden as i64)), ("unfolded", Prop::Bool(unfolded))]);
+                    row.props(
+                        "hn.MoreRow",
+                        &[
+                            ("obj", Prop::Uint(parent)),
+                            ("depth", Prop::Int(depth as i64)),
+                            ("hidden", Prop::Int(hidden as i64)),
+                            ("unfolded", Prop::Bool(unfolded)),
+                        ],
+                    );
                     return;
                 }
             };
             let o = w.entity_from_id(e);
             let status = me.status_of(e);
-            let failed = status == "killed" || o.try_cloned::<&model::ExitCode>().is_some_and(|c| c.code != 0);
+            let failed = status == "killed"
+                || o.try_cloned::<&model::ExitCode>().is_some_and(|c| c.code != 0);
             // One line: the part is a ui.Line, cut with an ellipsis to the room its row leaves it when drawn.
-            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+            let name = o
+                .try_cloned::<&model::Name>()
+                .map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
             let common = [
                 ("obj", Prop::Uint(e)),
                 ("name", Prop::Str(&name)),
@@ -691,20 +749,49 @@ impl App {
                 };
                 let meta = me.run_meta(e);
                 let keep = failed || matches!(status, "lost" | "pending" | "skipped");
-                row.props("hn.RunRow", &[&common[..], &[("state", Prop::Str(state)), ("meta", Prop::Str(&meta)), ("keep", Prop::Bool(keep))]].concat());
+                row.props(
+                    "hn.RunRow",
+                    &[
+                        &common[..],
+                        &[
+                            ("state", Prop::Str(state)),
+                            ("meta", Prop::Str(&meta)),
+                            ("keep", Prop::Bool(keep)),
+                        ],
+                    ]
+                    .concat(),
+                );
             } else {
                 // A session: its kind's mark, its shortcut on hover, a failure's exit code as a small red badge.
-                let hint = hint.get(&e).filter(|&&i| i < 9).map(|i| me.hint(&format!("Select{}", i + 1))).unwrap_or_default();
+                let hint = hint
+                    .get(&e)
+                    .filter(|&&i| i < 9)
+                    .map(|i| me.hint(&format!("Select{}", i + 1)))
+                    .unwrap_or_default();
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
                 let badge = match (status, code) {
                     ("killed", _) => "\u{2715}".to_owned(),
                     (_, Some(c)) => c.to_string(),
                     _ => String::new(),
                 };
-                row.props("hn.ObjRow", &[&common[..], &[("kind", Prop::Str(model::kind_name(o))), ("badge", Prop::Str(&badge)), ("hint", Prop::Str(&hint))]].concat());
+                row.props(
+                    "hn.ObjRow",
+                    &[
+                        &common[..],
+                        &[
+                            ("kind", Prop::Str(model::kind_name(o))),
+                            ("badge", Prop::Str(&badge)),
+                            ("hint", Prop::Str(&hint)),
+                        ],
+                    ]
+                    .concat(),
+                );
             }
         });
-        self.fold.animate(self.world.entity_from_id(self.ids.tree), crate::look::tune(self.world.world_ref(), "tree_fold"));
+        self.fold.animate(
+            self.world.entity_from_id(self.ids.tree),
+            crate::look::tune(self.world.world_ref(), "tree_fold"),
+        );
         self.sync_panes();
         self.sync_title();
         self.sync_archive();
@@ -721,11 +808,20 @@ impl App {
             Some(o) => {
                 let e = *o.id();
                 let kind = model::kind_name(o);
-                let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-                let t = o.try_cloned::<&model::Title>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-                let cwd = o.try_cloned::<&model::Cwd>().map(|n| tilde(n.s.as_str())).unwrap_or_default();
+                let name = o
+                    .try_cloned::<&model::Name>()
+                    .map(|n| n.s.as_str().to_owned())
+                    .unwrap_or_default();
+                let t = o
+                    .try_cloned::<&model::Title>()
+                    .map(|n| n.s.as_str().to_owned())
+                    .unwrap_or_default();
+                let cwd =
+                    o.try_cloned::<&model::Cwd>().map(|n| tilde(n.s.as_str())).unwrap_or_default();
                 let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
-                let join = |v: Vec<String>| v.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  \u{00B7}  ");
+                let join = |v: Vec<String>| {
+                    v.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  \u{00B7}  ")
+                };
                 match (self.run_of(e), model::pane_kind(o)) {
                     // A run: its id and command (one line), then where and how it stands.
                     (Some((n, stage)), _) => {
@@ -737,7 +833,8 @@ impl App {
                     _ => {
                         // The program-set title (OSC 0/2) never names anything (agents' titles are spinner frames and
                         // "Claude Code"): only a shell's shows, in place of its directory.
-                        let place = if kind == "shell" && !t.is_empty() && t != name { t } else { cwd };
+                        let place =
+                            if kind == "shell" && !t.is_empty() && t != name { t } else { cwd };
                         let state = match (self.status_of(e), code) {
                             ("exited", Some(c)) => format!("exited {c}"),
                             (s, _) => s.to_owned(),
@@ -748,11 +845,18 @@ impl App {
             }
             None => ("harness".to_owned(), String::new()),
         };
-        self.title = if sel.is_some() { format!("{} \u{2014} harness", clip_text(&title, 60)) } else { "harness".to_owned() };
+        self.title = if sel.is_some() {
+            format!("{} \u{2014} harness", clip_text(&title, 60))
+        } else {
+            "harness".to_owned()
+        };
         // The prefab's ink while the window is key, at half its alpha while it is not.
         let focused = self.focused;
         let ink = |part: &str| {
-            let mut f = view::prefab(w, "hn.TitleBar").and_then(|p| p.lookup_child(part)).and_then(|c| c.try_cloned::<&Fill>()).unwrap_or_default();
+            let mut f = view::prefab(w, "hn.TitleBar")
+                .and_then(|p| p.lookup_child(part))
+                .and_then(|c| c.try_cloned::<&Fill>())
+                .unwrap_or_default();
             if !focused {
                 f.dark.a *= 0.5;
                 f.light.a *= 0.5;
@@ -771,7 +875,10 @@ impl App {
                 b.set(sz);
             }
         }
-        for (id, text, part) in [(self.ids.bar_title, clip_text(&title, 80), "title"), (self.ids.bar_sub, clip_text(&sub, 90), "sub")] {
+        for (id, text, part) in [
+            (self.ids.bar_title, clip_text(&title, 80), "title"),
+            (self.ids.bar_sub, clip_text(&sub, 90), "sub"),
+        ] {
             if id != 0 {
                 let v = View::of(w.entity_from_id(id)).text(&text);
                 set_if(v, ink(part));
@@ -805,11 +912,18 @@ impl App {
     fn sync_marks(&mut self, up: bool) {
         let w = self.world.world_ref();
         let mut objs: Vec<(u64, String)> = Vec::new();
-        self.world.new_query::<&model::Object>().each_entity(|e, o| objs.push((*e.id(), format!("s{}", o.id))));
-        self.world.new_query::<&model::Run>().each_entity(|e, r| objs.push((*e.id(), format!("r{}", r.n))));
+        self.world
+            .new_query::<&model::Object>()
+            .each_entity(|e, o| objs.push((*e.id(), format!("s{}", o.id))));
+        self.world
+            .new_query::<&model::Run>()
+            .each_entity(|e, r| objs.push((*e.id(), format!("r{}", r.n))));
         for (e, key) in &objs {
             let e = w.entity_from_id(*e);
-            for (on, tag) in [(self.closed.contains(key), *w.component_id::<model::Closed>()), (self.pinned.contains(key), *w.component_id::<model::Pinned>())] {
+            for (on, tag) in [
+                (self.closed.contains(key), *w.component_id::<model::Closed>()),
+                (self.pinned.contains(key), *w.component_id::<model::Pinned>()),
+            ] {
                 if e.has(tag) != on {
                     if on {
                         e.add(tag);
@@ -845,8 +959,11 @@ impl App {
     /// selected.
     fn sync_archive(&mut self) {
         let w = self.world.world_ref();
-        let lit = self.selected().is_some_and(|s| s == model::archive_view(w) || w.entity_from_id(s).has(model::Archived::id()));
-        View::of(w.entity_from_id(self.ids.archive_row)).props("hn.ArchiveRow", &[("selected", Prop::Bool(lit))]);
+        let lit = self.selected().is_some_and(|s| {
+            s == model::archive_view(w) || w.entity_from_id(s).has(model::Archived::id())
+        });
+        View::of(w.entity_from_id(self.ids.archive_row))
+            .props("hn.ArchiveRow", &[("selected", Prop::Bool(lit))]);
     }
 
     /// Close object `e` (cmd+W, a Kill): it goes to the Archive whatever the rule says (and loses its pin); the archive
@@ -869,7 +986,8 @@ impl App {
         for name in ["icon", "count"] {
             let Some(p) = row.part(name) else { continue };
             let e = p.entity();
-            if let (Some(m), Some(mut b)) = (e.try_cloned::<&HoverLift>(), e.try_cloned::<&Bump>()) {
+            if let (Some(m), Some(mut b)) = (e.try_cloned::<&HoverLift>(), e.try_cloned::<&Bump>())
+            {
                 b.spring.v = m.omega;
                 e.set(b);
             }
@@ -934,7 +1052,9 @@ impl App {
                 if hit.is_none() && c.try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y)) {
                     hit = c.try_cloned::<&Action>().and_then(|a| {
                         let n = a.name.as_str();
-                        n.strip_prefix("select:").or_else(|| n.strip_prefix("arch:open:")).and_then(|s| s.parse::<u64>().ok())
+                        n.strip_prefix("select:")
+                            .or_else(|| n.strip_prefix("arch:open:"))
+                            .and_then(|s| s.parse::<u64>().ok())
                     });
                 }
             });
@@ -966,28 +1086,74 @@ impl App {
         let w = self.world.world_ref();
         let mut out: Vec<(String, PalGlyph, String, String, Do)> = vec![
             // Each hint is the binding that runs the same action (scene/20-keys.flecs, or the user's keys.flecs).
-            ("new-claude".into(), PalGlyph::Kind("claude"), "New claude".into(), self.hint("SpawnClaude"), Do::New("claude")),
-            ("new-codex".into(), PalGlyph::Kind("codex"), "New codex".into(), self.hint("SpawnCodex"), Do::New("codex")),
-            ("new-cursor".into(), PalGlyph::Kind("cursor"), "New cursor".into(), self.hint("SpawnCursor"), Do::New("cursor")),
-            ("new-sh".into(), PalGlyph::Kind("shell"), "New sh".into(), self.hint("SpawnShell"), Do::New("shell")),
+            (
+                "new-claude".into(),
+                PalGlyph::Kind("claude"),
+                "New claude".into(),
+                self.hint("SpawnClaude"),
+                Do::New("claude"),
+            ),
+            (
+                "new-codex".into(),
+                PalGlyph::Kind("codex"),
+                "New codex".into(),
+                self.hint("SpawnCodex"),
+                Do::New("codex"),
+            ),
+            (
+                "new-cursor".into(),
+                PalGlyph::Kind("cursor"),
+                "New cursor".into(),
+                self.hint("SpawnCursor"),
+                Do::New("cursor"),
+            ),
+            (
+                "new-sh".into(),
+                PalGlyph::Kind("shell"),
+                "New sh".into(),
+                self.hint("SpawnShell"),
+                Do::New("shell"),
+            ),
         ];
         for (i, e) in self.objects().into_iter().enumerate() {
             let o = w.entity_from_id(e);
-            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
+            let name =
+                o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
             let hint = if i < 9 { self.hint(&format!("Select{}", i + 1)) } else { String::new() };
-            out.push((format!("obj{e}"), PalGlyph::Kind(model::kind_name(o)), name, hint, Do::Select(e)));
+            out.push((
+                format!("obj{e}"),
+                PalGlyph::Kind(model::kind_name(o)),
+                name,
+                hint,
+                Do::Select(e),
+            ));
         }
         // The Archive, then what is in it (newest first; a run by its id and command).
         let view = model::archive_view(w);
-        out.push(("archive".into(), PalGlyph::Char(crate::look::ARCHIVE_ICON), "Open Archive".into(), String::new(), Do::Select(view)));
+        out.push((
+            "archive".into(),
+            PalGlyph::Char(crate::look::ARCHIVE_ICON),
+            "Open Archive".into(),
+            String::new(),
+            Do::Select(view),
+        ));
         for e in model::archived(w).into_iter().rev() {
             let o = w.entity_from_id(e);
-            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+            let name = o
+                .try_cloned::<&model::Name>()
+                .map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default();
             let name = match self.run_of(e) {
                 Some((n, _)) => format!("r{n}  {name}"),
                 None => name,
             };
-            out.push((format!("arc{e}"), PalGlyph::Kind(model::kind_name(o)), name, "archived".into(), Do::Archived(e)));
+            out.push((
+                format!("arc{e}"),
+                PalGlyph::Kind(model::kind_name(o)),
+                name,
+                "archived".into(),
+                Do::Archived(e),
+            ));
         }
         // While searching, every run the world holds that is not listed yet (in the tree, or found in older history by
         // the daemon's search), newest first.
@@ -1002,14 +1168,47 @@ impl App {
             runs.sort_unstable_by(|a, b| b.cmp(a));
             for (n, e) in runs {
                 let o = w.entity_from_id(e);
-                let cmd = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
-                out.push((format!("run{e}"), PalGlyph::Kind("proc"), format!("r{n}  {cmd}"), "run".into(), Do::Select(e)));
+                let cmd = o
+                    .try_cloned::<&model::Name>()
+                    .map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                out.push((
+                    format!("run{e}"),
+                    PalGlyph::Kind("proc"),
+                    format!("r{n}  {cmd}"),
+                    "run".into(),
+                    Do::Select(e),
+                ));
             }
         }
-        out.push(("kill".into(), PalGlyph::Char("\u{2715}"), "Kill current object".into(), self.hint("Archive"), Do::Kill));
-        out.push(("sidebar".into(), PalGlyph::Char("\u{25E7}"), "Toggle sidebar".into(), self.hint("ToggleSidebar"), Do::Sidebar));
-        out.push(("zoom-in".into(), PalGlyph::Char("+"), "Zoom in".into(), self.hint("ZoomIn"), Do::Zoom(1)));
-        out.push(("zoom-out".into(), PalGlyph::Char("\u{2212}"), "Zoom out".into(), self.hint("ZoomOut"), Do::Zoom(-1)));
+        out.push((
+            "kill".into(),
+            PalGlyph::Char("\u{2715}"),
+            "Kill current object".into(),
+            self.hint("Archive"),
+            Do::Kill,
+        ));
+        out.push((
+            "sidebar".into(),
+            PalGlyph::Char("\u{25E7}"),
+            "Toggle sidebar".into(),
+            self.hint("ToggleSidebar"),
+            Do::Sidebar,
+        ));
+        out.push((
+            "zoom-in".into(),
+            PalGlyph::Char("+"),
+            "Zoom in".into(),
+            self.hint("ZoomIn"),
+            Do::Zoom(1),
+        ));
+        out.push((
+            "zoom-out".into(),
+            PalGlyph::Char("\u{2212}"),
+            "Zoom out".into(),
+            self.hint("ZoomOut"),
+            Do::Zoom(-1),
+        ));
         let q = self.palette.as_ref().map(|p| p.query.to_lowercase()).unwrap_or_default();
         out.retain(|(_, _, name, _, _)| fuzzy(&name.to_lowercase(), &q));
         out
@@ -1049,7 +1248,11 @@ impl App {
                     }
                 };
                 let card = root.part("card");
-                let shown = if p.query.is_empty() { "Search objects and commands\u{2026}".to_owned() } else { p.query.clone() };
+                let shown = if p.query.is_empty() {
+                    "Search objects and commands\u{2026}".to_owned()
+                } else {
+                    p.query.clone()
+                };
                 if let Some(t) = card.and_then(|c| c.part("query")).and_then(|q| q.part("text")) {
                     t.text(&shown);
                 }
@@ -1057,7 +1260,11 @@ impl App {
                 let at = p.at.min(entries.len().saturating_sub(1));
                 let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
                 if let Some(items) = card.and_then(|c| c.part("items")) {
-                    let rows = entries.into_iter().enumerate().take(12).map(|(i, (k, g, n, h, _))| (k, (i, g, n, h)));
+                    let rows = entries
+                        .into_iter()
+                        .enumerate()
+                        .take(12)
+                        .map(|(i, (k, g, n, h, _))| (k, (i, g, n, h)));
                     for_each(items, "hn.PalRow", rows, |row, (i, g, n, h), new| {
                         if new {
                             row.set(HoverAmt::default());
@@ -1089,7 +1296,13 @@ impl App {
     // ---- the frame ----
 
     /// One frame at `points` (the window's size in points) on a display of `backing` pixels a point.
-    pub fn frame(&mut self, points: (f32, f32), backing: f32, dt: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) -> Draw {
+    pub fn frame(
+        &mut self,
+        points: (f32, f32),
+        backing: f32,
+        dt: f32,
+        upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8]),
+    ) -> Draw {
         self.time += dt;
         self.pending = self.pending.saturating_sub(1);
         self.stats_begin();
@@ -1100,7 +1313,7 @@ impl App {
         let scale = backing * z;
         if self.grid.scale != scale {
             // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
-            self.grid = Grid::new(&mut self.fonts, self.look.size, scale);
+            self.grid = Grid::new(&mut self.paint.fonts, self.look.size, scale);
         }
         self.step_sidebar(dt);
         self.lay_chrome(z);
@@ -1143,18 +1356,23 @@ impl App {
         }
         self.sync_terms();
         let mut d = Draw {
-            frame: Frame { view: [view.0, view.1], scale, time: self.time, dark: f32::from(u8::from(self.dark)), live: scale, textfx: [1.0, 0.0], tune: [0.82, 1.12, 1.0, 0.0], slug: [0.0, 1.0, 1.0, 0.0] },
+            frame: Frame {
+                view: [view.0, view.1],
+                scale,
+                time: self.time,
+                dark: f32::from(u8::from(self.dark)),
+                live: scale,
+                textfx: [1.0, 0.0],
+                tune: [0.82, 1.12, 1.0, 0.0],
+                slug: [0.0, 1.0, 1.0, 0.0],
+            },
             // Clear: the window's vibrancy shows through everywhere the scene paints nothing.
             clear: [0.0; 4],
             ..Draw::default()
         };
         self.emit(&mut d, scale, upload);
-        if self.cache.overflowed() {
-            self.cache.clear();
+        if self.paint.end_frame() {
             self.poke();
-        }
-        if self.layouts.len() > 4096 {
-            self.layouts.clear();
         }
         self.stats_end(&d);
         d
@@ -1218,7 +1436,12 @@ impl App {
         // Folded, the lights come back while the pointer is over their corner: as wide as they reach, as tall as the strip.
         let z = self.zoom();
         let (px, py) = (self.pointer.x, self.pointer.y);
-        let corner = !self.side_open && self.chrome.strip > 0.0 && px >= 0.0 && py >= 0.0 && px < self.chrome.title_x / z && py < self.chrome.strip / z;
+        let corner = !self.side_open
+            && self.chrome.strip > 0.0
+            && px >= 0.0
+            && py >= 0.0
+            && px < self.chrome.title_x / z
+            && py < self.chrome.strip / z;
         let target = f32::from(u8::from(corner));
         if !self.corner_x.settled(target) {
             let tune = crate::look::tune(self.world.world_ref(), "lights");
@@ -1249,62 +1472,9 @@ impl App {
         crate::look::breathing(self.world.world_ref())
     }
 
-    /// `text` cut (with an ellipsis) to the longest front that the typesetter sets within `room` points.
-    fn fit_text(&mut self, text: &str, style: &TextStyle, room: f32) -> String {
-        let width = |me: &mut Self, t: &str| me.layout(t, style, 1.0e5).lines.iter().map(|l| l.width).fold(0.0, f32::max);
-        if width(self, text) <= room {
-            return text.to_owned();
-        }
-        let chars: Vec<char> = text.chars().collect();
-        let (mut lo, mut hi) = (0usize, chars.len());
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            let t: String = chars[..mid].iter().collect::<String>() + "\u{2026}";
-            if width(self, &t) <= room {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        chars[..lo].iter().collect::<String>().trim_end().to_owned() + "\u{2026}"
-    }
-
     /// Size every `Text` node with the typesetter; how many changed.
     fn typeset(&mut self) -> usize {
-        let wanted = typeset::wanted(self.world.world_ref());
-        let sizes: Vec<Intrinsic> = wanted
-            .iter()
-            .map(|t| {
-                let one = self.layout(&t.text, &t.style, 1.0e5);
-                let w = one.lines.iter().map(|l| l.width).fold(0.0, f32::max).ceil();
-                let at = t.at.unwrap_or(w);
-                let lay = if t.one_line || at + 0.5 >= w { one } else { self.layout(&t.text, &t.style, at) };
-                let st = set_of(&t.style);
-                let h = lay.lines.last().map_or(st.line, |l| l.top + l.height).max(st.line);
-                let [base, last] = [lay.lines.first(), lay.lines.last()].map(|l| l.map_or(0.0, |l| l.baseline));
-                Intrinsic { w, h, at, base, last }
-            })
-            .collect();
-        typeset::apply(self.world.world_ref(), &wanted, &sizes)
-    }
-
-    fn layout(&mut self, text: &str, style: &TextStyle, width: f32) -> Rc<Layout> {
-        let st = set_of(style);
-        let code = style.role == 9;
-        let medium = !code && !st.bold && style.weight == 500;
-        let key = (text.to_owned(), st.size.to_bits(), st.line.to_bits(), st.bold, u8::from(code) | u8::from(medium) << 1, width.to_bits());
-        if let Some(l) = self.layouts.get(&key) {
-            return l.clone();
-        }
-        let lay = Rc::new(if code {
-            Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
-        } else if medium {
-            Layout::in_face(&mut self.fonts, text, Face::Medium, st, width)
-        } else {
-            Layout::new(&mut self.fonts, text, st, width)
-        });
-        self.layouts.insert(key, lay.clone());
-        lay
+        self.paint.typeset(self.world.world_ref())
     }
 
     /// What was activated this frame: a row selects its object, a palette entry runs.
@@ -1337,7 +1507,11 @@ impl App {
                 if again && fold::has_kids(self.world.entity_from_id(e)) {
                     self.toggle_fold_of(e, alt);
                 }
-            } else if let Some(e) = a.strip_prefix("toggle:").or_else(|| a.strip_prefix("collapse:")).and_then(|s| s.parse().ok()) {
+            } else if let Some(e) = a
+                .strip_prefix("toggle:")
+                .or_else(|| a.strip_prefix("collapse:"))
+                .and_then(|s| s.parse().ok())
+            {
                 self.tree_focus = true;
                 self.toggle_fold_of(e, alt);
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
@@ -1389,7 +1563,8 @@ impl App {
             let e = w.entity_from_id(id);
             let Some(laid) = e.try_cloned::<&Laid>() else { continue };
             // Where the draw pass says it goes (moved by a transition, mid-slide on a MatchedGeometry), before its scale.
-            let laid = if p.w > 0.0 || p.h > 0.0 { Laid { x: p.x, y: p.y, w: p.w, h: p.h } } else { laid };
+            let laid =
+                if p.w > 0.0 || p.h > 0.0 { Laid { x: p.x, y: p.y, w: p.w, h: p.h } } else { laid };
             // A breathing dot dims and brightens; a hover-only part fades with its row's hover.
             p.alpha *= crate::look::alpha(w, e, lo);
             let is_term = e.has(TermNode::id());
@@ -1405,111 +1580,49 @@ impl App {
                 self.emit_spark(d, e, rect, p.alpha);
                 continue;
             }
-            let (np, ng) = (d.panels.len(), d.glyphs.len());
             // A HoverLift node: how far its row's hover and its bump have moved it (read before the drawing borrows self).
             let motion = e.try_cloned::<&HoverLift>().map(|m| {
-                let hover = e.parent().and_then(|r| r.try_cloned::<&HoverAmt>()).map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
+                let hover = e
+                    .parent()
+                    .and_then(|r| r.try_cloned::<&HoverAmt>())
+                    .map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
                 let bump = e.try_cloned::<&Bump>().map_or(0.0, |b| b.spring.x);
-                (-(m.lift * hover + m.kick_lift * bump), (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1))
+                (
+                    -(m.lift * hover + m.kick_lift * bump),
+                    (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1),
+                )
             });
-            match p.kind {
-                PaintKind::Plate => {
-                    let fill = e.try_cloned::<&Fill>().unwrap_or_default();
-                    let edge = e.try_cloned::<&Edge>().unwrap_or_default();
-                    let mut shape = e.try_cloned::<&Shape>().unwrap_or_default();
-                    if shape.n <= 0.0 {
-                        shape.n = 4.0;
-                    }
-                    let (fc, ec) = if dark { (fill.dark, edge.dark) } else { (fill.light, edge.light) };
-                    let mut panel = panel_from(rgba(fc), rgba(ec), shape, rect, p.alpha);
-                    if let Some(l) = e.try_cloned::<&Lift>() {
-                        panel.fx = [l.blur, l.alpha, 0.0, 0.0];
-                        panel.fx2[0] = l.dy;
-                    }
-                    if fc.a > 0.0 || ec.a > 0.0 || panel.fx[1] > 0.0 {
-                        d.panel(panel);
-                    }
-                    let wash = |c: Rgba, r: [f32; 4], radius: f32, a: f32| panel_from(rgba(c), [0.0; 4], Shape { radius, n: shape.n, border: 0.0, feather: 0.0 }, r, p.alpha * a);
-                    let hover = e.try_cloned::<&HoverLook>().zip(e.try_cloned::<&HoverAmt>().map(|h| h.spring.x.clamp(0.0, 1.0)));
-                    if let Some((l, h)) = hover.filter(|(_, h)| *h > 0.004) {
-                        let r = [rect[0] - l.pad, rect[1] - l.pad, rect[2] + 2.0 * l.pad, rect[3] + 2.0 * l.pad];
-                        d.panel(wash(if dark { l.dark } else { l.light }, r, if l.radius < 0.0 { shape.radius + l.pad } else { l.radius }, h));
-                    }
-                    if let Some(l) = e.try_cloned::<&PressLook>().filter(|_| held == Some(id)) {
-                        d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
-                    }
-                    if is_term {
-                        self.emit_term(id, d, sc, upload);
-                    }
+            let at = match self.paint.node(d, e, &p, laid, dark, held == Some(id), sc, upload) {
+                Ok(at) => at,
+                Err(err) => {
+                    eprintln!("harness-native: paint: {err}");
+                    continue;
                 }
-                PaintKind::Glyphs => {
-                    let Some(text) = e.try_cloned::<&Text>() else { continue };
-                    let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    let truncate = e.try_cloned::<&Truncate>().map(|t| t.mode).or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail));
-                    let lay = if let Some(mode) = truncate {
-                        // One line, never wrapped: cut with an ellipsis (at its end, middle or start) to the width layout gave it.
-                        let room = laid.w.max(1.0) + 0.5;
-                        let cut = typeset::elide(text.s.as_str(), mode, room, |t| self.layout(t, &style, 1.0e5).lines.iter().map(|l| l.width).fold(0.0, f32::max));
-                        self.layout(&cut, &style, 1.0e5)
-                    } else {
-                        self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5)
-                    };
-                    emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x, laid.y), ink, p.alpha, sc, upload);
+            };
+            let (np, ng) = (at.panels, at.glyphs);
+            let turn = (p.kind == PaintKind::Icon).then(|| crate::look::turn(e)).flatten();
+            if is_term && p.kind == PaintKind::Plate {
+                self.emit_term(id, d, sc, upload);
+            }
+            // A disclosure chevron turns about its middle.
+            if let Some(turn) = turn {
+                for g in &mut d.glyphs[ng..] {
+                    g.clip[2] = turn;
                 }
-                PaintKind::Icon => {
-                    // A ui.Symbol: its glyph (a Nerd Font icon) set by the typesetter, centred in its rect.
-                    let Some(icon) = e.try_cloned::<&Icon>() else { continue };
-                    let turn = crate::look::turn(e);
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    // 14 in a 16 box, as SF Symbols sit in a sidebar row.
-                    let style = TextStyle { size: laid.h.min(laid.w + 2.0) * 0.875, line: laid.h, ..TextStyle::default() };
-                    let lay = self.layout(icon.glyph.as_str(), &style, 1.0e5);
-                    let gw = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
-                    emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x + (laid.w - gw) * 0.5, laid.y), ink, p.alpha, sc, upload);
-                    // A disclosure chevron turns about its middle.
-                    if let Some(turn) = turn {
-                        for g in &mut d.glyphs[ng..] {
-                            g.clip[2] = turn;
-                        }
-                    }
-                }
-                PaintKind::Mark => {
-                    // A ui.Icon: its vector mark (icons.rs) drawn from its outline, optically sized in its box.
-                    let Some(mark) = e.try_cloned::<&Mark>().and_then(|m| crate::icons::mark(m.name.as_str())) else { continue };
-                    let ink = e.try_cloned::<&Fill>().map_or([0.9, 0.9, 0.92, 1.0], |f| rgba(if dark { f.dark } else { f.light }));
-                    let side = laid.w.min(laid.h);
-                    let (r, uv) = crate::icons::place(mark, laid.x + (laid.w - side) * 0.5, laid.y + (laid.h - side) * 0.5, side);
-                    let col = [ink[0], ink[1], ink[2], ink[3] * p.alpha];
-                    d.glyph(GlyphInst { rect: r, uv, col_d: col, col_l: col, anim: [-1.0e9, 30.0, 0.0, 1.0], kind: [0.0, 0.0, 0.0, 1.0], band: mark.band, gdata: mark.gdata, ..GlyphInst::default() });
-                }
-                PaintKind::Picture | PaintKind::Ribbon => {}
             }
             // A HoverLift node: its glyphs risen and scaled about its centre by its row's hover and its bump.
             if let Some((dy, k)) = motion {
                 let (cx, cy) = (laid.x + laid.w * 0.5, laid.y + laid.h * 0.5);
                 for g in &mut d.glyphs[ng..] {
-                    g.rect = [cx + (g.rect[0] - cx) * k, cy + (g.rect[1] - cy) * k + dy, g.rect[2] * k, g.rect[3] * k];
-                }
-            }
-            // A transition's scale: what this node drew, scaled about its corner.
-            if (p.scale - 1.0).abs() > 1e-4 && p.scale > 0.0 {
-                let (ox, oy, k) = (laid.x, laid.y, p.scale);
-                for panel in &mut d.panels[np..] {
-                    panel.rect = [ox + (panel.rect[0] - ox) * k, oy + (panel.rect[1] - oy) * k, panel.rect[2] * k, panel.rect[3] * k];
-                }
-                for g in &mut d.glyphs[ng..] {
-                    g.rect = [ox + (g.rect[0] - ox) * k, oy + (g.rect[1] - oy) * k, g.rect[2] * k, g.rect[3] * k];
+                    g.rect = [
+                        cx + (g.rect[0] - cx) * k,
+                        cy + (g.rect[1] - cy) * k + dy,
+                        g.rect[2] * k,
+                        g.rect[3] * k,
+                    ];
                 }
             }
             if p.clipped {
-                let band = [p.clip_y, p.clip_y + p.clip_h];
-                for panel in &mut d.panels[np..] {
-                    panel.clip[..2].copy_from_slice(&band);
-                }
-                for glyph in &mut d.glyphs[ng..] {
-                    glyph.clip[..2].copy_from_slice(&band);
-                }
                 // Cut to the tree's band: soft at an edge with more of the tree beyond it.
                 if let Some(fade) = self.tree_fade(&p) {
                     for panel in &mut d.panels[np..] {
@@ -1529,7 +1642,10 @@ impl App {
     fn palette_type(&mut self, chars: &str) {
         let time = self.time;
         let Some(p) = self.palette.as_mut() else { return };
-        let typed: String = chars.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
+        let typed: String = chars
+            .chars()
+            .filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))
+            .collect();
         if !typed.is_empty() {
             p.query.push_str(&typed);
             p.at = 0;
@@ -1553,9 +1669,15 @@ impl App {
     /// terminal's grid origin and columns, the selection pill's drawn y and the tree's scroll.
     pub fn probe(&self) -> String {
         let w = self.world.world_ref();
-        let grid = self.focused_term().and_then(|t| w.entity_from_id(t).try_cloned::<&crate::pane::TermGrid>());
-        let pill = w.try_lookup("ui_matched::hn_selection").and_then(|h| h.try_cloned::<&harness_native_ui_motion_api::Matched>());
-        let drawn = pill.and_then(|m| w.entity_from_id(m.owner).try_cloned::<&harness_native_ui_motion_api::Drawn>());
+        let grid = self
+            .focused_term()
+            .and_then(|t| w.entity_from_id(t).try_cloned::<&crate::pane::TermGrid>());
+        let pill = w
+            .try_lookup("ui_matched::hn_selection")
+            .and_then(|h| h.try_cloned::<&harness_native_ui_motion_api::Matched>());
+        let drawn = pill.and_then(|m| {
+            w.entity_from_id(m.owner).try_cloned::<&harness_native_ui_motion_api::Drawn>()
+        });
         format!(
             "side={:.4} open={} grid_x={:.2} cols={} pill_y={:.2} pill_v={:.1} scroll={:.2}",
             self.side_x.x,
@@ -1564,7 +1686,9 @@ impl App {
             grid.map_or(0, |g| g.cols),
             drawn.map_or(-1.0, |d| d.y),
             pill.map_or(0.0, |m| m.y.v),
-            w.entity_from_id(self.ids.tree).try_cloned::<&harness_native_ui_layout_api::ScrollState>().map_or(0.0, |s| s.y)
+            w.entity_from_id(self.ids.tree)
+                .try_cloned::<&harness_native_ui_layout_api::ScrollState>()
+                .map_or(0.0, |s| s.y)
         )
     }
 
@@ -1582,7 +1706,10 @@ impl App {
         }
         let n = objs.len() as i64;
         // From an archived (or no) object: the first or the last of the tree.
-        let at = self.selected().and_then(|s| objs.iter().position(|&e| e == s)).map_or(if by > 0 { -1 } else { n }, |i| i as i64);
+        let at = self
+            .selected()
+            .and_then(|s| objs.iter().position(|&e| e == s))
+            .map_or(if by > 0 { -1 } else { n }, |i| i as i64);
         self.select(Some(objs[(at + by).rem_euclid(n) as usize]));
     }
 
@@ -1596,7 +1723,12 @@ impl App {
     }
 
     fn spawn(&mut self, kind: &str) {
-        let cwd = self.selected().and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>()).map(|c| c.s.as_str().to_owned()).filter(|c| !c.is_empty()).or_else(|| std::env::var("HOME").ok());
+        let cwd = self
+            .selected()
+            .and_then(|e| self.world.entity_from_id(e).try_cloned::<&model::Cwd>())
+            .map(|c| c.s.as_str().to_owned())
+            .filter(|c| !c.is_empty())
+            .or_else(|| std::env::var("HOME").ok());
         let (cols, rows) = self.focused_cells().unwrap_or((120, 40));
         let slot = self.spawned.clone();
         self.link.spawn(kind, cwd, cols, rows, move |id| *slot.lock().unwrap() = Some(id));
@@ -1609,7 +1741,12 @@ impl App {
             if self.status_of(e) == "running" {
                 self.link.kill_run(n);
             }
-            let up = self.world.entity_from_id(e).parent().filter(|p| p.has(model::Object::id())).map(|p| *p.id());
+            let up = self
+                .world
+                .entity_from_id(e)
+                .parent()
+                .filter(|p| p.has(model::Object::id()))
+                .map(|p| *p.id());
             self.archive_object(e);
             self.select(up);
             return;
@@ -1617,7 +1754,11 @@ impl App {
         let Some(sid) = self.session_of(e) else { return };
         // The next object takes its place.
         let objs = self.objects();
-        let next = objs.iter().position(|&o| o == e).and_then(|i| objs.get(i + 1).or_else(|| i.checked_sub(1).and_then(|j| objs.get(j)))).copied();
+        let next = objs
+            .iter()
+            .position(|&o| o == e)
+            .and_then(|i| objs.get(i + 1).or_else(|| i.checked_sub(1).and_then(|j| objs.get(j))))
+            .copied();
         self.link.kill(sid);
         self.archive_object(e);
         self.select(next);
@@ -1714,51 +1855,5 @@ impl RowLooks {
 fn set_if(v: View<'_>, fill: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(fill) {
         v.set(fill);
-    }
-}
-
-/// den's `panel_from`: a plate of `fill` with `edge` and `shape` at `alpha`.
-fn panel_from(fill: [f32; 4], edge: [f32; 4], shape: Shape, rect: [f32; 4], alpha: f32) -> PanelInst {
-    PanelInst {
-        rect,
-        fill_d: fill,
-        fill_l: fill,
-        edge_d: edge,
-        edge_l: edge,
-        shape: [shape.radius, shape.n, shape.border, shape.feather],
-        fx: [0.0; 4],
-        fx2: [0.0, alpha, 0.0, 0.0],
-        lens: [0.0; 4],
-        fx3: [0.0; 4],
-        clip: [0.0; 4],
-    }
-}
-
-/// A layout's glyphs at `(ox, oy)` in `ink`, snapped to the device pixel grid with den's subpixel steps.
-#[allow(clippy::too_many_arguments)]
-fn emit_layout(d: &mut Draw, fonts: &Fonts, cache: &mut GlyphCache, lay: &Layout, (ox, oy): (f32, f32), ink: [f32; 4], alpha: f32, sc: f32, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
-    let asz = cache.size as f32;
-    let mut col = ink;
-    col[3] *= alpha;
-    for line in &lay.lines {
-        for g in &line.glyphs {
-            let base_px = ((oy + line.baseline - g.y) * sc).round();
-            let xp = (ox + g.x) * sc;
-            let ix = xp.floor();
-            let sub = (((xp - ix) * SUBPX as f32).floor() as u32).min(SUBPX - 1);
-            let Some(e) = cache.get(fonts, g.font, g.id, sc, sub, upload) else { continue };
-            if e.w == 0 {
-                continue;
-            }
-            d.glyph(GlyphInst {
-                rect: [(ix + e.left as f32) / sc, (base_px - e.top as f32) / sc, e.w as f32 / sc, e.h as f32 / sc],
-                uv: [e.x as f32 / asz, e.y as f32 / asz, (e.x + e.w) as f32 / asz, (e.y + e.h) as f32 / asz],
-                col_d: col,
-                col_l: col,
-                anim: [-1.0e9, 30.0, 0.0, 1.0],
-                kind: [f32::from(u8::from(e.colour)), 0.0, 0.0, 0.0],
-                ..Default::default()
-            });
-        }
     }
 }

@@ -44,7 +44,9 @@ fn by_pattern(x: u8) {
 fn main_crate(db: &Db) -> Crate {
     *all_crates(db)
         .iter()
-        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == "main"))
+        .find(|it| {
+            it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == "main")
+        })
         .unwrap()
 }
 

@@ -12,11 +12,11 @@ use super::{
     args::{ArgParser, LitKind, MetaItem, MetaItemOrLit, MetaList, NameValue},
     parsers::parse_version,
 };
-use syntax::TextRange;
 use crate::{
     checks::features::attributes,
     model::{Diag, Level, MultiSpan},
 };
+use syntax::TextRange;
 
 /// rustc's `parse_cfg_entry` of `item`: whether it is a predicate (`false` once it gave an
 /// error).
@@ -86,8 +86,11 @@ fn version(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit, list: &MetaList) -
         return false;
     };
     if parse_version(text).is_none() {
-        let mut diag =
-            Diag::new(Level::Warning, None, "unknown version literal format, assuming it refers to a future version");
+        let mut diag = Diag::new(
+            Level::Warning,
+            None,
+            "unknown version literal format, assuming it refers to a future version",
+        );
         diag.span = MultiSpan::of(cx.span(lit.range));
         cx.emit_err(diag);
     }
@@ -110,7 +113,14 @@ fn target(cx: &mut Accept<'_, '_, '_>, meta: &MetaItem, list: &MetaList) -> bool
             return false;
         }
         let range = TextRange::new(name.range.start(), value.args_range().end());
-        attributes::try_gate_target(cx.cx, &cx.session.features, cx.attr.file, &name.name, range, &mut out);
+        attributes::try_gate_target(
+            cx.cx,
+            &cx.session.features,
+            cx.attr.file,
+            &name.name,
+            range,
+            &mut out,
+        );
         for diag in out.drain(..) {
             cx.emit_err(diag);
         }

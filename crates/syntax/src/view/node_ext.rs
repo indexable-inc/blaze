@@ -7,8 +7,8 @@ use crate::{
     NodeOrToken, SyntaxKind, T, TextSize, WalkEvent,
     view::{
         self as ast, AstChildren, AstNode, AstToken, ChildrenWithTokens, Element, HasAttrs,
-        HasGenericArgs, HasGenericParams, HasLoopBody, HasModuleItem, HasName, HasTypeBounds,
-        Node, Preorder, RangeItem, RangeOp, Token, support,
+        HasGenericArgs, HasGenericParams, HasLoopBody, HasModuleItem, HasName, HasTypeBounds, Node,
+        Preorder, RangeItem, RangeOp, Token, support,
     },
 };
 
@@ -344,10 +344,7 @@ pub enum PathSegmentKind<'t> {
 
 impl<'t> ast::PathSegment<'t> {
     pub fn parent_path(self) -> ast::Path<'t> {
-        self.syntax
-            .parent()
-            .and_then(ast::Path::cast)
-            .expect("segments are always nested in paths")
+        self.syntax.parent().and_then(ast::Path::cast).expect("segments are always nested in paths")
     }
 
     pub fn crate_token(self) -> Option<Token<'t>> {
@@ -726,8 +723,7 @@ impl<'t> ast::RecordPatField<'t> {
     }
 
     pub fn for_field_name(field_name: ast::Name<'t>) -> Option<ast::RecordPatField<'t>> {
-        let candidate =
-            field_name.syntax.ancestors().nth(2).and_then(ast::RecordPatField::cast)?;
+        let candidate = field_name.syntax.ancestors().nth(2).and_then(ast::RecordPatField::cast)?;
         match candidate.field_name()? {
             NameOrNameRef::Name(name) if name == field_name => Some(candidate),
             _ => None,

@@ -20,9 +20,7 @@ pub struct Transform {
 
 impl Transform {
     fn replace_mem_discriminant_call(&self, block: &mut BlockData) {
-        if let TerminatorKind::Call {
-            call, dest, target, ..
-        } = &block.terminator.kind
+        if let TerminatorKind::Call { call, dest, target, .. } = &block.terminator.kind
             && let FnOperand::Regular(fn_ptr) = &call.func
             && let FnPtrKind::Fun(fun_id) = fn_ptr.kind.as_ref()
             && self.discriminant_intrinsics.contains(fun_id)
@@ -98,10 +96,8 @@ impl Transform {
         };
 
         // Map from discriminants to variant indices. The discriminant can be of any integer type.
-        let discr_to_id: HashMap<IntegerValue, VariantId> = variants
-            .iter_enumerated()
-            .map(|(id, variant)| (variant.discriminant, id))
-            .collect();
+        let discr_to_id: HashMap<IntegerValue, VariantId> =
+            variants.iter_enumerated().map(|(id, variant)| (variant.discriminant, id)).collect();
 
         // Replace the branch values with discriminant constants.
         let mut covered_discriminants: HashSet<IntegerValue> = HashSet::default();
@@ -144,9 +140,7 @@ impl Transform {
             .filter_map(|(id, _)| id.as_fun())
             .copied()
             .collect();
-        CowBox::Owned(Box::new(Transform {
-            discriminant_intrinsics,
-        }))
+        CowBox::Owned(Box::new(Transform { discriminant_intrinsics }))
     }
 }
 

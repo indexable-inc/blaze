@@ -59,15 +59,27 @@ fn extra(var: Result<String, VarError>) -> Result<u64, String> {
     match var {
         Err(VarError::NotPresent) => Ok(0),
         Err(VarError::NotUnicode(raw)) => Err(format!("{ENV}={raw:?} is not a count of seeds")),
-        Ok(text) => text.trim().parse().map_err(|e| format!("{ENV}={text:?} is not a count of seeds: {e}")),
+        Ok(text) => {
+            text.trim().parse().map_err(|e| format!("{ENV}={text:?} is not a count of seeds: {e}"))
+        }
     }
 }
 
 /// The function of `seed` at `size`, or the generator's panic naming the seed.
-fn generated(seed: u64, size: usize, target: &Target, isa: &dyn TargetIsa) -> Result<Program, String> {
-    panic::catch_unwind(AssertUnwindSafe(|| program::generate(seed, size, target, isa))).map_err(|panic| {
-        format!("seed {seed} at size {size}: the generator panics, a bug of the generator: {}", message(&*panic))
-    })
+fn generated(
+    seed: u64,
+    size: usize,
+    target: &Target,
+    isa: &dyn TargetIsa,
+) -> Result<Program, String> {
+    panic::catch_unwind(AssertUnwindSafe(|| program::generate(seed, size, target, isa))).map_err(
+        |panic| {
+            format!(
+                "seed {seed} at size {size}: the generator panics, a bug of the generator: {}",
+                message(&*panic)
+            )
+        },
+    )
 }
 
 /// What the interpreter returns for `func` on `args`: anything else is a bug of the generator.
@@ -75,7 +87,9 @@ fn interpret(func: &ir::Function, args: &[DataValue]) -> Result<Vec<DataValue>, 
     let bug = |why: String| format!("{why}, a bug of the generator\ninput: {args:?}");
     match interp::run(&[func], 0, args) {
         Ok(Run::Returned(values)) if values.len() == func.signature.returns.len() => Ok(values),
-        Ok(Run::Returned(values)) => Err(bug(format!("the interpreter returns {} values", values.len()))),
+        Ok(Run::Returned(values)) => {
+            Err(bug(format!("the interpreter returns {} values", values.len())))
+        }
         Ok(Run::Trapped(code)) => Err(bug(format!("the interpreter traps ({code:?})"))),
         Err(e) => Err(bug(e)),
     }
@@ -84,7 +98,10 @@ fn interpret(func: &ir::Function, args: &[DataValue]) -> Result<Vec<DataValue>, 
 fn message(panic: &(dyn Any + Send)) -> String {
     match panic.downcast_ref::<&str>() {
         Some(text) => (*text).to_owned(),
-        None => panic.downcast_ref::<String>().cloned().unwrap_or_else(|| "a panic with no message".to_owned()),
+        None => panic
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "a panic with no message".to_owned()),
     }
 }
 
@@ -99,7 +116,9 @@ fn check(seed: u64, size: usize, target: &Target, isa: &dyn TargetIsa) -> Result
         .map_err(|e| format!("Cranelift refuses the function, a bug of the generator: {e}"))?;
     let code = match panic::catch_unwind(AssertUnwindSafe(|| crate::compile(func, target))) {
         Ok(Ok(code)) => code,
-        Ok(Err(e)) => return Err(format!("the stencil backend refuses what Cranelift compiles: {e}")),
+        Ok(Err(e)) => {
+            return Err(format!("the stencil backend refuses what Cranelift compiles: {e}"));
+        }
         Err(panic) => return Err(format!("the stencil backend panics: {}", message(&*panic))),
     };
     let tys: Vec<ir::Type> = program.sig.returns.iter().map(|ret| ret.value_type).collect();
@@ -110,15 +129,26 @@ fn check(seed: u64, size: usize, target: &Target, isa: &dyn TargetIsa) -> Result
             let args = program::inputs(seed, k, &program.sig);
             let want = interpret(func, &args)?;
             let reference = Run::Returned(want.clone());
-            let (ours, theirs) = (stencil.values_forked(0, &args), reference_code.values_forked(0, &args));
+            let (ours, theirs) =
+                (stencil.values_forked(0, &args), reference_code.values_forked(0, &args));
             let why = match (&ours, &theirs) {
-                (Outcome::Returned(a), Outcome::Returned(b)) if !interp::same_all(&tys, a, b, interp::Nans::Exact) => {
+                (Outcome::Returned(a), Outcome::Returned(b))
+                    if !interp::same_all(&tys, a, b, interp::Nans::Exact) =>
+                {
                     Some("the stencil code's results are not Cranelift's, bit for bit".to_owned())
                 }
                 _ => None,
             }
-            .or_else(|| interp::agrees(&tys, &reference, &theirs).err().map(|e| format!("Cranelift's code: {e}")))
-            .or_else(|| interp::agrees(&tys, &reference, &ours).err().map(|e| format!("the stencil code: {e}")));
+            .or_else(|| {
+                interp::agrees(&tys, &reference, &theirs)
+                    .err()
+                    .map(|e| format!("Cranelift's code: {e}"))
+            })
+            .or_else(|| {
+                interp::agrees(&tys, &reference, &ours)
+                    .err()
+                    .map(|e| format!("the stencil code: {e}"))
+            });
             if let Some(why) = why {
                 return Err(format!(
                     "{why}\ninput {k}: {args:?}\ninterpreter: {want:?}\nCranelift:   {theirs:?}\nstencil:     {ours:?}"
@@ -127,15 +157,22 @@ fn check(seed: u64, size: usize, target: &Target, isa: &dyn TargetIsa) -> Result
         }
         Ok(())
     };
-    panic::catch_unwind(AssertUnwindSafe(run))
-        .unwrap_or_else(|panic| Err(format!("linking or calling the code panics: {}", message(&*panic))))
+    panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|panic| {
+        Err(format!("linking or calling the code panics: {}", message(&*panic)))
+    })
 }
 
 /// The smallest size at which seed `seed`, failing at `size` with `why`, still fails, and how:
 /// halving while it fails, then bisecting between the last size that passed and the last that
 /// failed.
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn shrink(seed: u64, size: usize, why: String, target: &Target, isa: &dyn TargetIsa) -> (usize, String) {
+fn shrink(
+    seed: u64,
+    size: usize,
+    why: String,
+    target: &Target,
+    isa: &dyn TargetIsa,
+) -> (usize, String) {
     let mut smallest = (size, why);
     let mut passed = None;
     while smallest.0 > 0 && passed.is_none() {
@@ -176,7 +213,9 @@ fn random_functions_mean_the_same_in_every_backend() {
             Ok(program) => program.func.display().to_string(),
             Err(e) => e,
         };
-        failures.push(format!("seed {seed} fails at size {size}, and at {smallest} at the smallest:\n{why}\n{clif}"));
+        failures.push(format!(
+            "seed {seed} fails at size {size}, and at {smallest} at the smallest:\n{why}\n{clif}"
+        ));
         if failures.len() == FAILURES {
             break;
         }
@@ -200,10 +239,16 @@ fn the_generator_makes_valid_programs_the_interpreter_runs() {
         let arch = arch(target);
         for seed in 0..EVERYWHERE {
             let size = size(seed);
-            let program = generated(seed, size, target, &*isa).unwrap_or_else(|e| panic!("{triple}: {e}"));
+            let program =
+                generated(seed, size, target, &*isa).unwrap_or_else(|e| panic!("{triple}: {e}"));
             let clif = program.func.display().to_string();
-            let again = generated(seed, size, target, &*isa).unwrap_or_else(|e| panic!("{triple}: {e}"));
-            assert_eq!(clif, again.func.display().to_string(), "{triple}: seed {seed} makes two functions");
+            let again =
+                generated(seed, size, target, &*isa).unwrap_or_else(|e| panic!("{triple}: {e}"));
+            assert_eq!(
+                clif,
+                again.func.display().to_string(),
+                "{triple}: seed {seed} makes two functions"
+            );
             if let Err(e) = verify_function(&program.func, isa.flags()) {
                 panic!("{triple}: seed {seed}: the verifier: {e}\n{clif}");
             }
@@ -226,8 +271,11 @@ fn the_generator_makes_valid_programs_the_interpreter_runs() {
     }
     for target in &host::TARGETS[..2] {
         let isa = program::isa_of(target);
-        let never: Vec<Op> =
-            table::candidates(isa).iter().map(|it| it.op).filter(|op| drawn[arch(target)][*op as usize] == 0).collect();
+        let never: Vec<Op> = table::candidates(isa)
+            .iter()
+            .map(|it| it.op)
+            .filter(|op| drawn[arch(target)][*op as usize] == 0)
+            .collect();
         assert!(never.is_empty(), "{isa:?}: ops the generator never drew: {never:?}");
     }
     let Features { brifs, direct, tables, loops, edges } = features;
@@ -243,13 +291,20 @@ fn every_target_compiles_what_the_generator_makes() {
         let isa = host::isa(target);
         let triple = host::triple(target);
         for seed in 0..EVERYWHERE {
-            let program = generated(seed, size(seed), target, &*isa).unwrap_or_else(|e| panic!("{triple}: {e}"));
+            let program = generated(seed, size(seed), target, &*isa)
+                .unwrap_or_else(|e| panic!("{triple}: {e}"));
             let func = &program.func;
             if let Err(e) = host::cranelift_caught(func, &*isa) {
-                panic!("{triple}: seed {seed}: Cranelift refuses it, a bug of the generator: {e}\n{}", func.display());
+                panic!(
+                    "{triple}: seed {seed}: Cranelift refuses it, a bug of the generator: {e}\n{}",
+                    func.display()
+                );
             }
             if let Err(e) = crate::compile(func, target) {
-                panic!("{triple}: seed {seed}: the stencil backend refuses what Cranelift compiles: {e}\n{}", func.display());
+                panic!(
+                    "{triple}: seed {seed}: the stencil backend refuses what Cranelift compiles: {e}\n{}",
+                    func.display()
+                );
             }
         }
     }

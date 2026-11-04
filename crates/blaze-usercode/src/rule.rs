@@ -29,7 +29,11 @@ pub struct CargoRule {
 
 /// Adds cargo's rule to what `traced` has, as `inputs` has it now, when the run read what
 /// can't be traced; leaves it as it is otherwise.
-pub fn widen<I: Inputs>(traced: &mut Traced, rule: &CargoRule, inputs: &mut I) -> Result<(), I::Error> {
+pub fn widen<I: Inputs>(
+    traced: &mut Traced,
+    rule: &CargoRule,
+    inputs: &mut I,
+) -> Result<(), I::Error> {
     if traced.untraceable.is_empty() {
         return Ok(());
     }
@@ -113,7 +117,9 @@ mod tests {
         fn entry(&mut self, path: &Path) -> Result<crate::trace::Entry, String> {
             Ok(match (self.dirs.contains_key(path), self.files.get(path)) {
                 (true, _) => crate::trace::Entry::Dir,
-                (false, Some(hash)) => crate::trace::Entry::File(blaze_ids::ContentId(*hash), blaze_vfs::Mode::Regular),
+                (false, Some(hash)) => {
+                    crate::trace::Entry::File(blaze_ids::ContentId(*hash), blaze_vfs::Mode::Regular)
+                }
                 (false, None) => crate::trace::Entry::Missing,
             })
         }
@@ -151,15 +157,20 @@ mod tests {
                 ("/p/data/a".into(), [3; 32]),
             ]
             .into(),
-            dirs: [("/p".into(), vec!["build.rs", "src", "data"]), ("/p/src".into(), vec!["lib.rs"]), ("/p/data".into(), vec!["a"])]
-                .into(),
+            dirs: [
+                ("/p".into(), vec!["build.rs", "src", "data"]),
+                ("/p/src".into(), vec!["lib.rs"]),
+                ("/p/data".into(), vec!["a"]),
+            ]
+            .into(),
             env: vec![("VERSION".into(), "1".into())],
         }
     }
 
     #[test]
     fn a_run_traced_whole_keeps_only_what_it_read() {
-        let mut traced = Traced { files: vec![("/p/build.rs".into(), Some([1; 32]))], ..Traced::default() };
+        let mut traced =
+            Traced { files: vec![("/p/build.rs".into(), Some([1; 32]))], ..Traced::default() };
         let before = traced.clone();
         widen(&mut traced, &of_directives(&[], &[]), &mut fixed()).unwrap();
         assert_eq!(traced, before);

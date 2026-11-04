@@ -29,7 +29,10 @@ pub struct Working {
 impl Working {
     /// A file whose view bytes are the first `end` of the text `parse` is of.
     pub fn new(path: &str, edition: Edition, end: usize, parse: Parse<SourceFile>) -> Working {
-        assert!(parse.root().file().text().is_char_boundary(end), "the view's bytes end inside the text");
+        assert!(
+            parse.root().file().text().is_char_boundary(end),
+            "the view's bytes end inside the text"
+        );
         let base = parse.clone(); // clone: two `Arc` counts, once per file opened
         Working { path: path.into(), edition, end, parse, base, splices: Vec::new() }
     }
@@ -150,8 +153,14 @@ mod tests {
             ops,
             [Op::Edit { at: 7, len: 2, path: "lib.rs".to_owned(), bytes: b"{ 1 }".to_vec() }]
         );
-        assert_eq!(file.to_now(TextRange::new(10.into(), 12.into())), Some(TextRange::new(13.into(), 15.into())));
-        assert_eq!(file.to_now(TextRange::new(3.into(), 4.into())), Some(TextRange::new(3.into(), 4.into())));
+        assert_eq!(
+            file.to_now(TextRange::new(10.into(), 12.into())),
+            Some(TextRange::new(13.into(), 15.into()))
+        );
+        assert_eq!(
+            file.to_now(TextRange::new(3.into(), 4.into())),
+            Some(TextRange::new(3.into(), 4.into()))
+        );
         assert_eq!(file.to_now(TextRange::new(8.into(), 9.into())), None);
     }
 

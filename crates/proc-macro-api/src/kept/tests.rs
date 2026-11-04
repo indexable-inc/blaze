@@ -5,7 +5,7 @@ use blaze_core::{Traced, Untraceable};
 use blaze_ids::ContentId;
 use blaze_usercode::{RunKey, index};
 use hir_expand::proc_macro::ProcMacroKind;
-use span::{EditionedFileId, Edition, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
+use span::{Edition, EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
 
 use super::{CACHE, Call, LIBRARY, Mode, given, read, written};
 
@@ -25,7 +25,10 @@ fn tree(name: &str, at: Span) -> tt::TopSubtree {
         at,
         [
             tt::Leaf::Ident(tt::Ident::new("struct", at)),
-            tt::Leaf::Ident(tt::Ident::new(name, Span { range: TextRange::new(7.into(), 8.into()), ..at })),
+            tt::Leaf::Ident(tt::Ident::new(
+                name,
+                Span { range: TextRange::new(7.into(), 8.into()), ..at },
+            )),
             tt::Leaf::Punct(tt::Punct { char: ';', spacing: tt::Spacing::Alone, span: at }),
         ],
     )
@@ -148,7 +151,8 @@ fn the_same_call_in_another_checkout_gives_the_same_key() {
 fn a_file_read_under_the_crates_package_is_keyed_by_its_place_in_it() {
     let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: Inputs::new().key() };
     let read = |home: &str, hash: u8| {
-        let env: Env = [("CARGO_MANIFEST_DIR".to_owned(), format!("{home}/p"))].into_iter().collect();
+        let env: Env =
+            [("CARGO_MANIFEST_DIR".to_owned(), format!("{home}/p"))].into_iter().collect();
         let traced = Traced {
             files: vec![(PathBuf::from(format!("{home}/p/schema.json")), Some([hash; 32]))],
             ..Traced::default()
@@ -212,7 +216,12 @@ fn an_output_is_written_against_its_calls_spans_and_read_back_in_another() {
     assert!(read(b"not an expansion", &spans).is_err());
 }
 
-fn derive<'a>(subtree: &'a tt::TopSubtree, attrs: Option<&'a tt::TopSubtree>, env: &'a Env, site: Span) -> Call<'a> {
+fn derive<'a>(
+    subtree: &'a tt::TopSubtree,
+    attrs: Option<&'a tt::TopSubtree>,
+    env: &'a Env,
+    site: Span,
+) -> Call<'a> {
     Call {
         name: "Serialize",
         kind: ProcMacroKind::CustomDerive,
@@ -263,7 +272,9 @@ fn an_attribute_none_and_an_empty_one_are_other_calls() {
     let inputs = Inputs::new();
     let toolchain = ContentId::of("test toolchain", b"nightly");
     let empty = tt::TopSubtree::empty(tt::DelimSpan::from_single(inputs.site));
-    let key = |attrs| given(&toolchain, &derive(&inputs.subtree, attrs, &inputs.env, inputs.site)).0.finish();
+    let key = |attrs| {
+        given(&toolchain, &derive(&inputs.subtree, attrs, &inputs.env, inputs.site)).0.finish()
+    };
     assert_ne!(key(None), key(Some(&empty)));
 }
 
@@ -298,9 +309,17 @@ fn the_cache_has_one_mode_besides_keeping() {
 }
 
 /// A daemon's [`super::Keeping`], over a store of its own in `dir`, its shell passing `path`.
-fn daemon(sim: &mut blaze_core::sim::Sim, dir: &str, path: &str) -> (blaze_cas::Store, super::Keeping) {
+fn daemon(
+    sim: &mut blaze_core::sim::Sim,
+    dir: &str,
+    path: &str,
+) -> (blaze_cas::Store, super::Keeping) {
     let mut effects = Vec::new();
-    let config = blaze_cas::Config { dir: blaze_core::FileName::new(dir).unwrap(), layers: Vec::new(), tags: 1 << 48 };
+    let config = blaze_cas::Config {
+        dir: blaze_core::FileName::new(dir).unwrap(),
+        layers: Vec::new(),
+        tags: 1 << 48,
+    };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);
@@ -308,7 +327,11 @@ fn daemon(sim: &mut blaze_core::sim::Sim, dir: &str, path: &str) -> (blaze_cas::
     assert!(store.ready());
     let environment = super::Environment::new();
     environment.pass(vec![("PATH".into(), path.into())]).unwrap();
-    let expansions = super::Expansions { store: store.reader(), toolchain: ContentId::of(LIBRARY, b"toolchain"), environment };
+    let expansions = super::Expansions {
+        store: store.reader(),
+        toolchain: ContentId::of(LIBRARY, b"toolchain"),
+        environment,
+    };
     (store, super::Keeping::new(expansions).unwrap())
 }
 
@@ -326,12 +349,17 @@ fn two_daemons_in_one_process_each_read_their_own_store_and_shell() {
     assert!(!second.expansions.store.has(&guard, &key), "the second daemon read the first's store");
     drop(guard);
 
-    let traced = Traced { env: vec![("PATH".into(), Some("/one/bin".into()))], ..Traced::default() };
+    let traced =
+        Traced { env: vec![("PATH".into(), Some("/one/bin".into()))], ..Traced::default() };
     let shape = index::Shape::of(&traced).encode();
     let reported = index::VALUES.traced(&traced);
     let call = Env::default();
     assert_eq!(first.reads_now(&call, &shape), Ok(reported));
-    assert_ne!(second.reads_now(&call, &shape), Ok(reported), "the second daemon read the first's shell");
+    assert_ne!(
+        second.reads_now(&call, &shape),
+        Ok(reported),
+        "the second daemon read the first's shell"
+    );
 
     let nothing = super::Keeps::Nothing("a test that keeps nothing");
     assert_eq!(nothing.keeping().err(), Some(super::NotKept { why: "a test that keeps nothing" }));
@@ -348,22 +376,36 @@ fn a_verified_expansions_reads_change_once_it_is_retracted() {
     use blaze_core::sim::{Faults, Sim};
     let mut sim = Sim::new(7, Faults::default());
     let (mut store, keeping) = daemon(&mut sim, "verified", "/bin");
-    let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"call") };
+    let run =
+        RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"call") };
     let traced = Traced { env: vec![("PATH".into(), Some("/bin".into()))], ..Traced::default() };
     let unmarked = index::result_key(&run, &traced);
     let depends = index::depends_key(&run, &unmarked);
     let shape = index::Shape::of(&traced).encode();
-    let (reported_shape, reported) = super::verified_reads(&depends, &shape, index::VALUES.traced(&traced));
+    let (reported_shape, reported) =
+        super::verified_reads(&depends, &shape, index::VALUES.traced(&traced));
     let call = Env::default();
-    assert_eq!(keeping.reads_now(&call, &reported_shape), Ok(reported), "unchanged while it is not retracted");
+    assert_eq!(
+        keeping.reads_now(&call, &reported_shape),
+        Ok(reported),
+        "unchanged while it is not retracted"
+    );
     // A test that keeps nothing has no store to ask: it says so, never guesses.
     assert!(super::reads_in(&[], &call, &reported_shape).unwrap_err().contains("with the store"));
 
     let record = blaze_usercode::roots::verify::retraction(&run, &unmarked);
-    let put = super::Put { keep: super::Keep::Durable { run: record.run, traced: record.traced }, value: record.value, what: "retraction".to_owned() };
+    let put = super::Put {
+        keep: super::Keep::Durable { run: record.run, traced: record.traced },
+        value: record.value,
+        what: "retraction".to_owned(),
+    };
     let published = super::publish(&mut store, vec![put]);
     assert!(published.refused.is_empty() && !published.durable.is_empty(), "{published:?}");
-    assert_ne!(keeping.reads_now(&call, &reported_shape), Ok(reported), "a retracted expansion's reads changed");
+    assert_ne!(
+        keeping.reads_now(&call, &reported_shape),
+        Ok(reported),
+        "a retracted expansion's reads changed"
+    );
     // A plain shape is as it was.
     assert_eq!(keeping.reads_now(&call, &shape), Ok(index::VALUES.traced(&traced)));
 }
@@ -381,7 +423,8 @@ fn a_front_end_is_not_kept_past_a_retraction_its_daemon_publishes() {
     let mut sim = Sim::new(8, Faults::default());
     let (mut store, keeping) = daemon(&mut sim, "retractions", "/bin");
     let traced = Traced { env: vec![("PATH".into(), Some("/bin".into()))], ..Traced::default() };
-    let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"served") };
+    let run =
+        RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"served") };
     let unmarked = index::result_key(&run, &traced);
     let record = blaze_usercode::roots::verify::retraction(&run, &unmarked);
     let at = keeping.retractions_now();
@@ -404,7 +447,11 @@ fn a_front_end_is_not_kept_past_a_retraction_its_daemon_publishes() {
     let guard = blaze_cas::enter();
     assert!(keeping.expansions.store.has(&guard, &index::depends_key(&run, &unmarked)));
     drop(guard);
-    assert_eq!(keeping.retractions_now(), retracted, "a record counts once: the next front end is kept");
+    assert_eq!(
+        keeping.retractions_now(),
+        retracted,
+        "a record counts once: the next front end is kept"
+    );
     // A build script's record, published by `blaze-cargo`'s runs, moves it too.
     let keeps = super::Keeps::In(keeping);
     keeps.retracted();
@@ -422,13 +469,17 @@ fn a_front_end_stamped_at_an_epoch_has_seen_every_record_counted_in_it() {
     let mut sim = Sim::new(10, Faults::default());
     let (mut store, keeping) = daemon(&mut sim, "stamped", "/bin");
     let traced = Traced { env: vec![("PATH".into(), Some("/bin".into()))], ..Traced::default() };
-    let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"stamped") };
+    let run =
+        RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"stamped") };
     let unmarked = index::result_key(&run, &traced);
     let depends = index::depends_key(&run, &unmarked);
     let at = keeping.retractions_now();
     // The record is taken last, after the batch's other puts (`Keeping::publish` appends the
     // daemon's durable queue).
-    keeping.put(super::Put::of(blaze_usercode::roots::verify::retraction(&run, &unmarked), "retraction".to_owned()));
+    keeping.put(super::Put::of(
+        blaze_usercode::roots::verify::retraction(&run, &unmarked),
+        "retraction".to_owned(),
+    ));
     let others: Vec<super::Put> = (0..4u8)
         .map(|n| super::Put {
             keep: super::Keep::Run {
@@ -442,9 +493,15 @@ fn a_front_end_stamped_at_an_epoch_has_seen_every_record_counted_in_it() {
     let mut checked = false;
     let published = keeping.publish_then(&mut store, others, |store, epoch| {
         assert_eq!(epoch, at, "not bumped before the record is readable");
-        assert!(store.get(&depends).unwrap().is_some(), "the bump comes before its record is in the store");
+        assert!(
+            store.get(&depends).unwrap().is_some(),
+            "the bump comes before its record is in the store"
+        );
         let guard = blaze_cas::enter();
-        assert!(keeping.expansions.store.has(&guard, &depends), "a lowering's reader would not see the record");
+        assert!(
+            keeping.expansions.store.has(&guard, &depends),
+            "a lowering's reader would not see the record"
+        );
         checked = true;
     });
     assert!(checked, "a publish with a record bumps the epoch");
@@ -467,7 +524,10 @@ fn a_record_readable_before_its_put_fails_still_moves_the_epoch() {
     let mut sim = Sim::new(11, Faults::default());
     let (mut store, keeping) = daemon(&mut sim, "refused-record", "/bin");
     let traced = Traced { env: vec![("PATH".into(), Some("/bin".into()))], ..Traced::default() };
-    let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"refused record") };
+    let run = RunKey {
+        code: ContentId::of(LIBRARY, b"lib"),
+        given: ContentId::of("test", b"refused record"),
+    };
     let unmarked = index::result_key(&run, &traced);
     let depends = index::depends_key(&run, &unmarked);
     let record = blaze_usercode::roots::verify::retraction(&run, &unmarked);
@@ -481,7 +541,10 @@ fn a_record_readable_before_its_put_fails_still_moves_the_epoch() {
     keeping.put(super::Put::of(record, "retraction".to_owned()));
     let published = keeping.publish(&mut store, Vec::new());
     assert_eq!(published.refused.len(), 1, "{published:?}");
-    assert!(store.get(&depends).unwrap().is_some(), "the record is readable though its put was refused");
+    assert!(
+        store.get(&depends).unwrap().is_some(),
+        "the record is readable though its put was refused"
+    );
     // Readable, so waited on: its value's put landed before the shapes ran out, and a crash
     // before it is durable would forget a record every checkout already read.
     let ticket = published.durable.iter().next().expect("the record's landed put is waited on");
@@ -506,13 +569,19 @@ fn a_job_waits_for_its_retraction_even_when_another_task_takes_puts_first() {
     let (mut store, keeping) = daemon(&mut sim, "durable", "/bin");
     let (mut other_store, other) = daemon(&mut sim, "durable-other", "/bin");
     let traced = Traced { env: vec![("PATH".into(), Some("/bin".into()))], ..Traced::default() };
-    let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"taken first") };
+    let run = RunKey {
+        code: ContentId::of(LIBRARY, b"lib"),
+        given: ContentId::of("test", b"taken first"),
+    };
     let unmarked = index::result_key(&run, &traced);
     let record = blaze_usercode::roots::verify::retraction(&run, &unmarked);
     // The maker's task puts the record on a worker; another job's task on another worker
     // takes its puts after that, as `plane::run_measured` does after each task.
     std::thread::scope(|scope| {
-        scope.spawn(|| keeping.put(super::Put::of(record, "the record of `M`".to_owned()))).join().unwrap();
+        scope
+            .spawn(|| keeping.put(super::Put::of(record, "the record of `M`".to_owned())))
+            .join()
+            .unwrap();
         let taken = scope.spawn(super::take_puts).join().unwrap();
         assert!(
             taken.iter().all(|it| it.what != "the record of `M`"),
@@ -539,7 +608,11 @@ fn a_job_waits_for_its_retraction_even_when_another_task_takes_puts_first() {
 #[test]
 #[should_panic(expected = "a durable put goes through its daemon's `Keeping::put`")]
 fn a_durable_put_through_a_threads_puts_is_refused() {
-    let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"refused") };
+    let run =
+        RunKey { code: ContentId::of(LIBRARY, b"lib"), given: ContentId::of("test", b"refused") };
     let unmarked = blaze_cas::Key(ContentId::of("test", b"unmarked"));
-    super::put(super::Put::of(blaze_usercode::roots::verify::retraction(&run, &unmarked), "retraction".to_owned()));
+    super::put(super::Put::of(
+        blaze_usercode::roots::verify::retraction(&run, &unmarked),
+        "retraction".to_owned(),
+    ));
 }

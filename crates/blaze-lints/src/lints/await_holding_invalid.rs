@@ -85,14 +85,18 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return out };
     let db = cx.db();
     let guards = Guards::new(cx);
-    let kinds = [(Kind::Lock, Implemented::AwaitHoldingLock), (Kind::Cell, Implemented::AwaitHoldingRefcellRef)];
+    let kinds = [
+        (Kind::Lock, Implemented::AwaitHoldingLock),
+        (Kind::Cell, Implemented::AwaitHoldingRefcellRef),
+    ];
     let function_name = guards::function_name(cx, analysis);
     for body in guards::bodies(db, analysis, def) {
         if !body.coroutine {
             continue;
         }
         let mir = body.mir;
-        let held = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |frame| mir.held_locals_in(frame));
+        let held =
+            blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |frame| mir.held_locals_in(frame));
         // The block that yields at each yield point and its `.await`, by the yield's index.
         let awaits: Vec<Option<(BasicBlockId, Option<TextRange>)>> = (held.yields.iter()) // alloc: one per yield of one body
             .map(|point| {
@@ -119,7 +123,12 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
                 .map(|(point, yielded)| {
                     point.kept.contains(&at)
                         && yielded.is_some_and(|(id, _)| {
-                            guards::init_before_terminator(mir, id, local, init_in[guards::block_index(id)])
+                            guards::init_before_terminator(
+                                mir,
+                                id,
+                                local,
+                                init_in[guards::block_index(id)],
+                            )
                         })
                 })
                 .collect();
@@ -131,7 +140,8 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
                     continue;
                 }
                 let Some(guard) = guards.in_ty(db, &ty, kind) else { continue };
-                let Some(range) = guards::first_assigned(mir, local).and_then(|it| guards::range_of(analysis, it))
+                let Some(range) = guards::first_assigned(mir, local)
+                    .and_then(|it| guards::range_of(analysis, it))
                 else {
                     continue;
                 };
@@ -198,7 +208,10 @@ pub async fn borrowed(c: &RefCell<Vec<u32>>) -> usize {
         assert!(found.contains("`guard`, a `MutexGuard<"), "{found}");
         assert!(found.contains("holds the lock across an `.await` in `held`"), "{found}");
         assert!(found.contains("index.html#await_holding_refcell_ref"), "{found}");
-        assert!(found.contains("holds the `RefCell` borrow across an `.await` in `borrowed`"), "{found}");
+        assert!(
+            found.contains("holds the `RefCell` borrow across an `.await` in `borrowed`"),
+            "{found}"
+        );
         assert!(found.contains("this `.await` suspends with it held"), "{found}");
     }
 

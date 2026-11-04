@@ -37,7 +37,10 @@ mod variants;
 mod visibility;
 mod walk;
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one check, dropped with it, not global state"
+)]
 use std::cell::OnceCell;
 
 use blaze_items::ItemId;
@@ -63,24 +66,33 @@ mod gives {
 
     pub(super) const LIFETIMES: LintSet =
         LintSet::of(&[LintId::named("single_use_lifetimes"), LintId::named("unused_lifetimes")]);
-    pub(super) const STATICS: LintSet =
-        LintSet::of(&[LintId::named("invalid_type_param_default"), LintId::named("uninhabited_static")]);
+    pub(super) const STATICS: LintSet = LintSet::of(&[
+        LintId::named("invalid_type_param_default"),
+        LintId::named("uninhabited_static"),
+    ]);
     pub(super) const CTYPES: LintSet = LintSet::of(&[
         LintId::named("improper_ctypes"),
         LintId::named("improper_ctypes_definitions"),
         LintId::named("uses_power_alignment"),
     ]);
-    pub(super) const VARIANT_SIZES: LintSet = LintSet::of(&[LintId::named("variant_size_differences")]);
+    pub(super) const VARIANT_SIZES: LintSet =
+        LintSet::of(&[LintId::named("variant_size_differences")]);
     pub(super) const NAMING: LintSet =
         LintSet::of(&[LintId::named("non_snake_case"), LintId::named("non_upper_case_globals")]);
     pub(super) const COPY: LintSet = LintSet::of(&[LintId::named("missing_copy_implementations")]);
-    pub(super) const TYPE_ALIAS_BOUNDS: LintSet = LintSet::of(&[LintId::named("type_alias_bounds")]);
-    pub(super) const MANGLE: LintSet =
-        LintSet::of(&[LintId::named("no_mangle_const_items"), LintId::named("no_mangle_generic_items")]);
+    pub(super) const TYPE_ALIAS_BOUNDS: LintSet =
+        LintSet::of(&[LintId::named("type_alias_bounds")]);
+    pub(super) const MANGLE: LintSet = LintSet::of(&[
+        LintId::named("no_mangle_const_items"),
+        LintId::named("no_mangle_generic_items"),
+    ]);
     pub(super) const PUBLICITY: LintSet = LintSet::of(&[LintId::named("unreachable_pub")]);
-    pub(super) const TRACK_CALLER: LintSet = LintSet::of(&[LintId::named("ungated_async_fn_track_caller")]);
-    pub(super) const DROP: LintSet = LintSet::of(&[LintId::named("drop_bounds"), LintId::named("dyn_drop")]);
-    pub(super) const DEBUG: LintSet = LintSet::of(&[LintId::named("missing_debug_implementations")]);
+    pub(super) const TRACK_CALLER: LintSet =
+        LintSet::of(&[LintId::named("ungated_async_fn_track_caller")]);
+    pub(super) const DROP: LintSet =
+        LintSet::of(&[LintId::named("drop_bounds"), LintId::named("dyn_drop")]);
+    pub(super) const DEBUG: LintSet =
+        LintSet::of(&[LintId::named("missing_debug_implementations")]);
     pub(super) const DOCS: LintSet = LintSet::of(&[LintId::named("missing_docs")]);
     pub(super) const ASYNC_FN: LintSet = LintSet::of(&[LintId::named("async_fn_in_trait")]);
     pub(super) const NON_LOCAL: LintSet = LintSet::of(&[LintId::named("non_local_definitions")]);
@@ -88,14 +100,17 @@ mod gives {
         LintId::named("invalid_runtime_symbol_definitions"),
         LintId::named("suspicious_runtime_symbol_definitions"),
     ]);
-    pub(super) const LIFETIME_SYNTAX: LintSet = LintSet::of(&[LintId::named("mismatched_lifetime_syntaxes")]);
+    pub(super) const LIFETIME_SYNTAX: LintSet =
+        LintSet::of(&[LintId::named("mismatched_lifetime_syntaxes")]);
     pub(super) const C_VOID: LintSet = LintSet::of(&[LintId::named("c_void_returns")]);
-    pub(super) const CLASHING: LintSet = LintSet::of(&[LintId::named("clashing_extern_declarations")]);
+    pub(super) const CLASHING: LintSet =
+        LintSet::of(&[LintId::named("clashing_extern_declarations")]);
 }
 
 /// What `rustc_hir_analysis` and resolve's late pass lint of items, given whatever else failed.
 pub(super) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let (lifetimes, statics) = (cx.any_may_fire(&gives::LIFETIMES), cx.any_may_fire(&gives::STATICS));
+    let (lifetimes, statics) =
+        (cx.any_may_fire(&gives::LIFETIMES), cx.any_may_fire(&gives::STATICS));
     if !lifetimes && !statics {
         return Vec::new(); // alloc: empty, allocates nothing
     }
@@ -125,12 +140,20 @@ impl<'db> Walk<'db> {
 }
 
 /// `check_private_in_public`: `private_interfaces` and `private_bounds`.
-pub(super) fn private_in_public<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, effective: &Effective) -> Vec<Found> {
+pub(super) fn private_in_public<'db>(
+    cx: &Cx<'_, 'db>,
+    walk: &Walk<'db>,
+    effective: &Effective,
+) -> Vec<Found> {
     privacy::lints(cx, &walk.items, effective)
 }
 
 /// rustc's late module pass over each item, in the order of `BuiltinCombinedLateLintModPass`.
-pub(super) fn after_abort<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, effective: &Effective) -> Vec<Found> {
+pub(super) fn after_abort<'db>(
+    cx: &Cx<'_, 'db>,
+    walk: &Walk<'db>,
+    effective: &Effective,
+) -> Vec<Found> {
     let items = &walk.items;
     let may = |lints: &LintSet| cx.any_may_fire(lints);
     let (ctypes, naming, copy, type_alias, mangle, publicity) = (
@@ -217,7 +240,10 @@ pub(super) fn after_abort<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>, effective: &E
 }
 
 /// What the late passes read of the crate itself, read once for all of its items.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one check, dropped with it, not global state"
+)]
 pub(super) struct Krate {
     pub(super) anonymous_lifetime_in_impl_trait: bool,
     pub(super) async_fn_track_caller: bool,
@@ -234,7 +260,10 @@ pub(super) struct Krate {
 }
 
 impl Krate {
-    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: a memo of one check, dropped with it, not global state"
+    )]
     fn of(cx: &Cx<'_, '_>) -> Krate {
         let features = UnstableFeatures::query(cx.db, cx.krate.base());
         let enabled = |name: &str| features.is_enabled(&Symbol::intern(name));
@@ -275,7 +304,9 @@ pub(crate) fn def_span<'t>(node: ast::Node<'t>) -> TextRange {
         node.children().find_map(N::cast)
     }
     let range = item_range_view(node);
-    let until = |end: Option<TextSize>| TextRange::new(range.start(), end.unwrap_or(range.end()).max(range.start()));
+    let until = |end: Option<TextSize>| {
+        TextRange::new(range.start(), end.unwrap_or(range.end()).max(range.start()))
+    };
     let end_of = |it: Option<ast::Node<'t>>| it.map(|it| it.text_range().end());
     let named = |name: Option<ast::Name<'t>>, generics: Option<ast::GenericParamList<'t>>| {
         let name = end_of(name.map(|it| it.syntax()));
@@ -284,13 +315,17 @@ pub(crate) fn def_span<'t>(node: ast::Node<'t>) -> TextRange {
     match node.kind() {
         SyntaxKind::FN => ast::Fn::cast(node).map_or(range, signature_range_view),
         SyntaxKind::IMPL => def_range_view(node),
-        SyntaxKind::CONST | SyntaxKind::STATIC => until(end_of(child::<ast::Type<'t>>(node).map(|it| it.syntax()))),
+        SyntaxKind::CONST | SyntaxKind::STATIC => {
+            until(end_of(child::<ast::Type<'t>>(node).map(|it| it.syntax())))
+        }
         SyntaxKind::RECORD_FIELD | SyntaxKind::TUPLE_FIELD | SyntaxKind::EXTERN_BLOCK => range,
         SyntaxKind::USE_TREE => node.text_range(),
-        SyntaxKind::TRAIT | SyntaxKind::TYPE_ALIAS => match child::<ast::TypeBoundList<'t>>(node).and_then(|it| it.bounds().last()) {
-            Some(bound) => until(end_of(Some(bound.syntax()))),
-            None => named(child(node), child(node)),
-        },
+        SyntaxKind::TRAIT | SyntaxKind::TYPE_ALIAS => {
+            match child::<ast::TypeBoundList<'t>>(node).and_then(|it| it.bounds().last()) {
+                Some(bound) => until(end_of(Some(bound.syntax()))),
+                None => named(child(node), child(node)),
+            }
+        }
         SyntaxKind::EXTERN_CRATE => {
             let rename = child::<ast::Rename<'t>>(node).and_then(|it| it.name());
             let name_ref = child::<ast::NameRef<'t>>(node).map(|it| it.syntax().text_range().end());
@@ -323,8 +358,11 @@ fn core_path(cx: &Cx<'_, '_>, module: &str, name: &str) -> Option<String> {
     }
     let core = core?;
     let root = core.root_module(cx.db);
-    let module = root.children(cx.db).find(|it| it.name(cx.db).is_some_and(|it| it.as_str() == module))?;
-    module.declarations_iter(cx.db).find(|it| it.name(cx.db).is_some_and(|it| it.as_str() == name))?;
+    let module =
+        root.children(cx.db).find(|it| it.name(cx.db).is_some_and(|it| it.as_str() == module))?;
+    module
+        .declarations_iter(cx.db)
+        .find(|it| it.name(cx.db).is_some_and(|it| it.as_str() == name))?;
     let krate = if std { "std" } else { "core" };
     // alloc: once per check, when the first `Drop` bound is found and its lint fires
     Some(format!("{krate}::{}::{name}", module.name(cx.db)?.as_str()))
@@ -339,10 +377,18 @@ fn item_id<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Option<(ItemId, String)> 
     }
     let sema = &cx.vsema;
     let id = match node.value {
-        ast::Item::Fn(it) => ItemId::Function(FunctionId::try_from(sema.to_def2(node.with_value(it))?).ok()?),
-        ast::Item::Struct(it) => ItemId::Adt(AdtId::StructId(sema.to_def2(node.with_value(it))?.into())),
-        ast::Item::Enum(it) => ItemId::Adt(AdtId::EnumId(sema.to_def2(node.with_value(it))?.into())),
-        ast::Item::Union(it) => ItemId::Adt(AdtId::UnionId(sema.to_def2(node.with_value(it))?.into())),
+        ast::Item::Fn(it) => {
+            ItemId::Function(FunctionId::try_from(sema.to_def2(node.with_value(it))?).ok()?)
+        }
+        ast::Item::Struct(it) => {
+            ItemId::Adt(AdtId::StructId(sema.to_def2(node.with_value(it))?.into()))
+        }
+        ast::Item::Enum(it) => {
+            ItemId::Adt(AdtId::EnumId(sema.to_def2(node.with_value(it))?.into()))
+        }
+        ast::Item::Union(it) => {
+            ItemId::Adt(AdtId::UnionId(sema.to_def2(node.with_value(it))?.into()))
+        }
         ast::Item::Trait(it) => ItemId::Trait(sema.to_def2(node.with_value(it))?.into()),
         ast::Item::Const(it) => ItemId::Const(sema.to_def2(node.with_value(it))?.into()),
         ast::Item::Static(it) => ItemId::Static(sema.to_def2(node.with_value(it))?.into()),

@@ -41,10 +41,10 @@
 mod cores;
 mod domain;
 pub mod fiber;
-mod giveway;
 #[cfg(all(test, not(blaze_check)))]
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod fiber_tests;
+mod giveway;
 mod graph;
 mod host;
 mod ids;
@@ -57,32 +57,34 @@ use std::{collections::VecDeque, fmt};
 use blaze_core::wheel::Wheel;
 
 pub use cores::{CoreInfo, Cores, Distances, LEVELS, Level, MAX_CORES, ShapeError};
-pub use fiber::{
-    Carried, Given, Idle, IdleReason, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, observe_idle, observe_spawner,
-    on_fiber,
-};
-pub(crate) use domain::Scheduler;
 #[cfg(test)]
 pub(crate) use domain::LOCKS_TAKEN;
+pub(crate) use domain::Scheduler;
 pub(crate) use fiber::spawner;
-pub(crate) use host::{
-    Driven, Host, Turn, Turns, check_stall, check_stall_any, fire_due, fire_due_any, idle, job_begins, job_in_graph, join_pool,
-    leave_pool, open_scope_on, ready, stop_begins, stop_ended, stop_pool, swap_core, until_due, until_due_any, waits_of,
+pub use fiber::{
+    Carried, Given, Idle, IdleReason, NoWait, Switch, SwitchEvent, carry, current_job, miss,
+    observe, observe_idle, observe_spawner, on_fiber,
 };
-pub(crate) use giveway::{GaveWay, NoProgress};
 #[cfg(test)]
 pub(crate) use giveway::GIVE_WAYS_WITHOUT_PROGRESS;
+pub(crate) use giveway::{GaveWay, NoProgress};
+pub(crate) use host::{
+    Driven, Host, Turn, Turns, check_stall, check_stall_any, fire_due, fire_due_any, idle,
+    job_begins, job_in_graph, join_pool, leave_pool, open_scope_on, ready, stop_begins, stop_ended,
+    stop_pool, swap_core, until_due, until_due_any, waits_of,
+};
 pub use host::{
-    Event, EventWait, claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, now, observed, open_scope,
-    release, stall_while_quiet, stuck_while_quiet, wait, waits_now,
+    Event, EventWait, claim, claim_for, close_scope, count_towards, innermost_scope, job_here,
+    key_done, now, observed, open_scope, release, stall_while_quiet, stuck_while_quiet, wait,
+    waits_now,
 };
 pub(crate) use host::{before_claim, gave_way_on, set_give_way_aside};
 
 use crate::Key;
 use cores::{any_in, first_from, get, set};
 pub use graph::StallWait;
-pub use stack::FIBER_STACK;
 use graph::{Graph, Home, Life, On, Waited};
+pub use stack::FIBER_STACK;
 
 /// How many slot jobs a core runs in a row before it looks at its inbox and queues (Tokio's
 /// `MAX_LIFO_POLLS_PER_TICK`).
@@ -159,12 +161,24 @@ pub struct Spawn {
 impl Spawn {
     /// A job of the driver's, on the least loaded core.
     pub const fn root() -> Spawn {
-        Spawn { parent: None, hint: Affinity::Any, critical: false, background: false, counter: None }
+        Spawn {
+            parent: None,
+            hint: Affinity::Any,
+            critical: false,
+            background: false,
+            counter: None,
+        }
     }
 
     /// A job of `parent`'s, on its core.
     pub const fn child(parent: JobId) -> Spawn {
-        Spawn { parent: Some(parent), hint: Affinity::Spawner, critical: false, background: false, counter: None }
+        Spawn {
+            parent: Some(parent),
+            hint: Affinity::Spawner,
+            critical: false,
+            background: false,
+            counter: None,
+        }
     }
 
     pub const fn hint(mut self, hint: Affinity) -> Spawn {
@@ -325,7 +339,12 @@ const STALL_NAMED: usize = 64;
 
 impl fmt::Display for Stalled {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "stalled: nothing can run and no wait can end ({} jobs wait), so job {} fails: ", self.waits.len(), self.job.0)?;
+        write!(
+            f,
+            "stalled: nothing can run and no wait can end ({} jobs wait), so job {} fails: ",
+            self.waits.len(),
+            self.job.0
+        )?;
         say_waits(f, &self.waits)
     }
 }
@@ -368,7 +387,9 @@ fn say_waits(f: &mut fmt::Formatter<'_>, waits: &[(JobId, StallWait)]) -> fmt::R
                 }
             }
             StallWait::Counter(counter) => write!(f, "counter {} (a scope's jobs)", counter.0)?,
-            StallWait::Pool(member) => write!(f, "every job of the pool of member {member}, which it stops")?,
+            StallWait::Pool(member) => {
+                write!(f, "every job of the pool of member {member}, which it stops")?
+            }
         }
     }
     if waits.len() > STALL_NAMED {
@@ -456,7 +477,14 @@ struct Job {
 
 const _: () = assert!(size_of::<Job>() <= 16);
 
-const VACANT: Job = Job { state: JobState::Vacant, critical: false, background: false, timed: false, core: NONE, global: NONE };
+const VACANT: Job = Job {
+    state: JobState::Vacant,
+    critical: false,
+    background: false,
+    timed: false,
+    core: NONE,
+    global: NONE,
+};
 
 /// One driver's cores, queues and clock: where its jobs run. Its job ids are its own.
 pub(crate) struct Place {
@@ -604,7 +632,15 @@ impl Place {
 
     /// `job` is new, world id `global`; `spawner` is its parent's local id when its parent
     /// runs here.
-    fn spawn(&mut self, job: u32, global: JobId, spawner: Option<u32>, hint: Affinity, critical: bool, background: bool) {
+    fn spawn(
+        &mut self,
+        job: u32,
+        global: JobId,
+        spawner: Option<u32>,
+        hint: Affinity,
+        critical: bool,
+        background: bool,
+    ) {
         let need = job as usize + 1;
         if self.jobs.len() < need {
             self.jobs.resize(need, VACANT);
@@ -617,7 +653,11 @@ impl Place {
             self.jobs[j].state
         );
         let spawner = spawner.map(|parent| {
-            assert!(self.job_state(parent) == JobState::Running, "job {}'s parent is not running", global.0);
+            assert!(
+                self.job_state(parent) == JobState::Running,
+                "job {}'s parent is not running",
+                global.0
+            );
             self.jobs[parent as usize].core
         });
         let home = match hint {
@@ -626,7 +666,12 @@ impl Place {
                 None => self.least_loaded(critical, |_, _| true),
             },
             Affinity::Core(core) => {
-                assert!((core.0 as usize) < self.cores.len(), "job {} hinted to core {}, past the shape", global.0, core.0);
+                assert!(
+                    (core.0 as usize) < self.cores.len(),
+                    "job {} hinted to core {}, past the shape",
+                    global.0,
+                    core.0
+                );
                 core.0
             }
             Affinity::L3(l3) => match spawner.filter(|&core| self.cores.in_l3(core, l3)) {
@@ -639,7 +684,14 @@ impl Place {
             },
             Affinity::Any => self.least_loaded(critical, |_, _| true),
         };
-        self.jobs[j] = Job { state: JobState::Queued, critical, background, timed: false, core: home, global: global.0 };
+        self.jobs[j] = Job {
+            state: JobState::Queued,
+            critical,
+            background,
+            timed: false,
+            core: home,
+            global: global.0,
+        };
         if spawner == Some(home) {
             self.enqueue(home, job);
             self.refresh(home);
@@ -701,7 +753,9 @@ impl Place {
         if !asked {
             return Yielded::Stay;
         }
-        let Some(big) = self.search_parked(core, Some(self.cores.big())) else { return Yielded::Stay };
+        let Some(big) = self.search_parked(core, Some(self.cores.big())) else {
+            return Yielded::Stay;
+        };
         self.vacate(core);
         self.jobs[j].state = JobState::Queued;
         self.hand(big, job);
@@ -749,7 +803,12 @@ impl Place {
 
     fn core_idle(&mut self, core: CoreId) {
         let c = core.0 as usize;
-        assert!(self.running[c] == NONE, "core {} idle while it runs job {}", core.0, self.running[c]);
+        assert!(
+            self.running[c] == NONE,
+            "core {} idle while it runs job {}",
+            core.0,
+            self.running[c]
+        );
         if self.core_state[c] == CoreState::Parked {
             self.unpark(core.0);
         }
@@ -1022,19 +1081,19 @@ impl Place {
     #[blaze::nonblocking]
     fn steal_for(&mut self, thief: u32) -> Option<u32> {
         let start = thief as usize + 1;
-        let found = self
-            .cores
-            .tiers(thief)
-            .find_map(|(level, mask)| first_from(&self.stealable, mask, None, start).map(|victim| (level, victim)));
+        let found = self.cores.tiers(thief).find_map(|(level, mask)| {
+            first_from(&self.stealable, mask, None, start).map(|victim| (level, victim))
+        });
         let Some((level, victim)) = found else {
             // Background work, oldest first, one job at a time: no core has other work.
-            let (level, victim) = self
-                .cores
-                .tiers(thief)
-                .find_map(|(level, mask)| first_from(&self.stealable_later, mask, None, start).map(|victim| (level, victim)))?;
+            let (level, victim) = self.cores.tiers(thief).find_map(|(level, mask)| {
+                first_from(&self.stealable_later, mask, None, start).map(|victim| (level, victim))
+            })?;
             self.stats.steals[level as usize] += 1;
             self.record_steal(thief, victim);
-            let job = self.later[victim as usize].pop_front().expect("a core with background work has a job in it");
+            let job = self.later[victim as usize]
+                .pop_front()
+                .expect("a core with background work has a job in it");
             self.refresh(victim);
             return Some(job);
         };
@@ -1047,7 +1106,11 @@ impl Place {
     fn steal_half(&mut self, thief: u32, victim: u32) -> u32 {
         let (t, v) = (thief as usize, victim as usize);
         let big = self.cores.is_big(thief);
-        let from_urgent = if big { !self.urgent[v].is_empty() } else { self.queue[v].is_empty() && !self.urgent[v].is_empty() };
+        let from_urgent = if big {
+            !self.urgent[v].is_empty()
+        } else {
+            self.queue[v].is_empty() && !self.urgent[v].is_empty()
+        };
         let job = if from_urgent || !self.queue[v].is_empty() {
             let queues = if from_urgent { &mut self.urgent } else { &mut self.queue };
             let take = queues[v].len().div_ceil(2);
@@ -1086,7 +1149,9 @@ impl Place {
 
     /// While a core is parked, `core`'s stealable jobs go one each to the nearest parked cores.
     fn balance(&mut self, core: u32) {
-        while self.parked_count > 0 && (get(&self.stealable, core) || get(&self.stealable_later, core)) {
+        while self.parked_count > 0
+            && (get(&self.stealable, core) || get(&self.stealable_later, core))
+        {
             let job = self.take_oldest(core);
             let thief = self
                 .nearest_parked(core, self.jobs[job as usize].critical)
@@ -1132,24 +1197,42 @@ impl Place {
                 || !self.queue[c].is_empty()
                 || !self.urgent[c].is_empty();
             assert_eq!(get(&self.stealable, core), held, "core {c}'s stealable bit");
-            assert_eq!(get(&self.stealable_later, core), !self.later[c].is_empty(), "core {c}'s background bit");
-            assert_eq!(get(&self.parked, core), self.core_state[c] == CoreState::Parked, "core {c}'s parked bit");
+            assert_eq!(
+                get(&self.stealable_later, core),
+                !self.later[c].is_empty(),
+                "core {c}'s background bit"
+            );
+            assert_eq!(
+                get(&self.parked, core),
+                self.core_state[c] == CoreState::Parked,
+                "core {c}'s parked bit"
+            );
             match self.core_state[c] {
                 CoreState::Parked => {
                     parked += 1;
                     assert!(
-                        !held && self.later[c].is_empty() && self.running[c] == NONE && self.reserved[c] == NONE,
+                        !held
+                            && self.later[c].is_empty()
+                            && self.running[c] == NONE
+                            && self.reserved[c] == NONE,
                         "parked core {c} holds work"
                     );
                 }
-                CoreState::Woken => assert!(self.running[c] == NONE && self.reserved[c] != NONE, "woken core {c}"),
-                CoreState::Busy => assert!(self.running[c] != NONE && self.reserved[c] == NONE, "busy core {c}"),
+                CoreState::Woken => {
+                    assert!(self.running[c] == NONE && self.reserved[c] != NONE, "woken core {c}")
+                }
+                CoreState::Busy => {
+                    assert!(self.running[c] != NONE && self.reserved[c] == NONE, "busy core {c}")
+                }
             }
             let critical_small = self.running[c] != NONE
                 && self.jobs[self.running[c] as usize].critical
                 && !self.cores.is_big(core);
             assert_eq!(get(&self.critical_small, core), critical_small, "core {c}'s critical bit");
-            assert!(!get(&self.yield_sent, core) || critical_small, "core {c} asked to move no critical job");
+            assert!(
+                !get(&self.yield_sent, core) || critical_small,
+                "core {c} asked to move no critical job"
+            );
             if self.running[c] != NONE {
                 let job = self.running[c] as usize;
                 assert_eq!(self.jobs[job].state, JobState::Running, "core {c} runs job {job}");
@@ -1158,10 +1241,15 @@ impl Place {
             // A job's queue is its class when queued: `set_critical` on a queued job leaves it
             // there, so either queue may hold either class.
             let queued = self.inbox[c].iter().chain(&self.queue[c]).chain(&self.urgent[c]).copied();
-            let queued = queued.chain([self.slot[c], self.reserved[c]].into_iter().filter(|&it| it != NONE));
+            let queued =
+                queued.chain([self.slot[c], self.reserved[c]].into_iter().filter(|&it| it != NONE));
             for job in queued {
                 seen[job as usize] += 1;
-                assert_eq!(self.jobs[job as usize].state, JobState::Queued, "job {job} held by core {c}");
+                assert_eq!(
+                    self.jobs[job as usize].state,
+                    JobState::Queued,
+                    "job {job} held by core {c}"
+                );
                 assert_eq!(self.jobs[job as usize].core, core, "job {job} held by core {c}");
                 assert!(
                     !self.jobs[job as usize].background || job == self.reserved[c],
@@ -1170,22 +1258,48 @@ impl Place {
             }
             for &job in &self.later[c] {
                 seen[job as usize] += 1;
-                assert_eq!(self.jobs[job as usize].state, JobState::Queued, "job {job} in core {c}'s background queue");
-                assert_eq!(self.jobs[job as usize].core, core, "job {job} in core {c}'s background queue");
-                assert!(self.jobs[job as usize].background, "job {job} raised but in core {c}'s background queue");
+                assert_eq!(
+                    self.jobs[job as usize].state,
+                    JobState::Queued,
+                    "job {job} in core {c}'s background queue"
+                );
+                assert_eq!(
+                    self.jobs[job as usize].core, core,
+                    "job {job} in core {c}'s background queue"
+                );
+                assert!(
+                    self.jobs[job as usize].background,
+                    "job {job} raised but in core {c}'s background queue"
+                );
             }
         }
         assert_eq!(parked, self.parked_count, "parked count");
         if parked > 0 {
-            assert!(self.stealable.iter().all(|&it| it == 0), "a job is stealable while a core is parked");
-            assert!(self.stealable_later.iter().all(|&it| it == 0), "background work waits while a core is parked");
+            assert!(
+                self.stealable.iter().all(|&it| it == 0),
+                "a job is stealable while a core is parked"
+            );
+            assert!(
+                self.stealable_later.iter().all(|&it| it == 0),
+                "background work waits while a core is parked"
+            );
         }
         for (job, record) in self.jobs.iter().enumerate() {
             let state = record.state;
             let held = seen[job];
-            assert_eq!(held, u32::from(state == JobState::Queued), "job {job} ({state:?}) is held {held} times");
-            assert!(!record.timed || state == JobState::Suspended, "job {job} timed while {state:?}");
-            assert!(!record.background || state == JobState::Queued, "background job {job} {state:?}, not queued");
+            assert_eq!(
+                held,
+                u32::from(state == JobState::Queued),
+                "job {job} ({state:?}) is held {held} times"
+            );
+            assert!(
+                !record.timed || state == JobState::Suspended,
+                "job {job} timed while {state:?}"
+            );
+            assert!(
+                !record.background || state == JobState::Queued,
+                "background job {job} {state:?}, not queued"
+            );
         }
     }
 }
@@ -1291,7 +1405,11 @@ impl World {
         assert!(self.domain != 0 && other.domain != 0, "a `Sched`'s world joins no other");
         let mut jobs = Vec::new(); // alloc: a join of two schedulers, rare
         let mut counters = Vec::new(); // alloc: as above
-        self.graph.absorb(std::mem::replace(&mut other.graph, Graph::new(0)), &mut jobs, &mut counters);
+        self.graph.absorb(
+            std::mem::replace(&mut other.graph, Graph::new(0)),
+            &mut jobs,
+            &mut counters,
+        );
         for job in jobs {
             ids::move_job(JobId(job), self.domain);
         }
@@ -1419,7 +1537,9 @@ impl World {
     /// A timed wait is no wait in the graph and is left to its clock. How many woke.
     pub(crate) fn stop_own(&mut self, member: u32, reason: StopReason) -> usize {
         let dropper = match reason {
-            StopReason::Dropper { dropper, .. } if self.graph.life(dropper) == Life::Live => Some(dropper),
+            StopReason::Dropper { dropper, .. } if self.graph.life(dropper) == Life::Live => {
+                Some(dropper)
+            }
             // The thread dropping the pool is no live job: no wait leads to it.
             StopReason::Dropper { .. } => return 0,
             StopReason::Bound { .. } => None,
@@ -1471,11 +1591,13 @@ impl World {
     }
 
     pub(crate) fn place(&self, member: u32) -> &Place {
-        find(&self.members, member).unwrap_or_else(|| panic!("member {member} is not of this world"))
+        find(&self.members, member)
+            .unwrap_or_else(|| panic!("member {member} is not of this world"))
     }
 
     fn place_mut(&mut self, member: u32) -> &mut Place {
-        find_mut(&mut self.members, member).unwrap_or_else(|| panic!("member {member} is not of this world"))
+        find_mut(&mut self.members, member)
+            .unwrap_or_else(|| panic!("member {member} is not of this world"))
     }
 
     /// A world id for a new job: the process's ([`ids`]). A [`Sched`] names its own.
@@ -1540,7 +1662,8 @@ impl World {
         let spawner = how.parent.and_then(|parent| {
             let home = self.graph.home(parent);
             let running = home.member != NONE
-                && find(&self.members, home.member).is_some_and(|place| place.job_state(home.local) == JobState::Running);
+                && find(&self.members, home.member)
+                    .is_some_and(|place| place.job_state(home.local) == JobState::Running);
             assert!(running, "job {}'s parent {} is not running", job.0, parent.0);
             (home.member == member).then_some(home.local)
         });
@@ -1579,28 +1702,34 @@ impl World {
 
     fn is_running(&self, member: u32, local: u32) -> bool {
         if member & OWN != 0 {
-            return find(&self.own, member).is_some_and(|own| own.state.get(local as usize) == Some(&OwnState::Running));
+            return find(&self.own, member)
+                .is_some_and(|own| own.state.get(local as usize) == Some(&OwnState::Running));
         }
         find(&self.members, member).is_some_and(|place| place.job_state(local) == JobState::Running)
     }
 
     fn own_mut(&mut self, member: u32) -> &mut Own {
         assert!(member & OWN != 0, "member {member} has a placement");
-        find_mut(&mut self.own, member).unwrap_or_else(|| panic!("member {member} is not of this world"))
+        find_mut(&mut self.own, member)
+            .unwrap_or_else(|| panic!("member {member} is not of this world"))
     }
 
     /// A new member of its own placement ([`World`]), numbered with [`OWN`], and with
     /// [`CLIENT`] for a thread on no fiber (`client`): its jobs run outside the graph.
     pub(crate) fn join_own(&mut self, client: bool) -> u32 {
         let bits = OWN | if client { CLIENT } else { 0 };
-        let member = if self.domain == 0 { self.own.len() as u32 | bits } else { ids::take_member(bits) };
+        let member =
+            if self.domain == 0 { self.own.len() as u32 | bits } else { ids::take_member(bits) };
         let room = if client { 1 } else { 64 };
-        self.own.push((member, Own {
-            state: Vec::with_capacity(room),
-            token: Vec::with_capacity(room),
-            free: Vec::with_capacity(room),
-            woken: Vec::with_capacity(room),
-        }));
+        self.own.push((
+            member,
+            Own {
+                state: Vec::with_capacity(room),
+                token: Vec::with_capacity(room),
+                free: Vec::with_capacity(room),
+                woken: Vec::with_capacity(room),
+            },
+        ));
         member
     }
 
@@ -1610,7 +1739,11 @@ impl World {
     ///
     /// Where one of its jobs is still in the graph.
     pub(crate) fn leave_own(&mut self, member: u32) {
-        let at = self.own.iter().position(|it| it.0 == member).unwrap_or_else(|| panic!("member {member} left twice"));
+        let at = self
+            .own
+            .iter()
+            .position(|it| it.0 == member)
+            .unwrap_or_else(|| panic!("member {member} left twice"));
         let own = self.own.remove(at).1;
         let live = own.state.iter().filter(|&&it| it != OwnState::Free).count();
         assert_eq!(live, 0, "member {member} left with {live} jobs in the wait graph");
@@ -1619,7 +1752,12 @@ impl World {
     /// A running job of `member` (of its own placement) joins the graph, counted towards
     /// `counter` if given: its world id. `token` is what [`World::take_woken`] hands back when
     /// it wakes.
-    pub(crate) fn add_own(&mut self, member: u32, token: usize, counter: Option<CounterId>) -> JobId {
+    pub(crate) fn add_own(
+        &mut self,
+        member: u32,
+        token: usize,
+        counter: Option<CounterId>,
+    ) -> JobId {
         let own = self.own_mut(member);
         let local = match own.free.pop() {
             Some(local) => local,
@@ -1712,12 +1850,21 @@ impl World {
     /// `key` is made by `job`, which is live but need not be running: a waiter claims a run's
     /// flight for its runner when it first waits for it. `false` when the key has a flight.
     pub(crate) fn claim_for(&mut self, key: Key, job: JobId, scope: Option<CounterId>) -> bool {
-        assert!(self.graph.life(job) == Life::Live, "key {key:?} claimed for job {}, not live", job.0);
+        assert!(
+            self.graph.life(job) == Life::Live,
+            "key {key:?} claimed for job {}, not live",
+            job.0
+        );
         self.graph.claim_in(key, job, scope)
     }
 
     /// `job`, running on `member`, waits for `on`; its core runs something else.
-    pub(crate) fn suspended(&mut self, member: u32, job: JobId, on: Wait) -> Result<Suspend, Cycle> {
+    pub(crate) fn suspended(
+        &mut self,
+        member: u32,
+        job: JobId,
+        on: Wait,
+    ) -> Result<Suspend, Cycle> {
         let (home, local) = self.assert_running(job, "suspended");
         assert_eq!(home, member, "job {} suspended on a member not its own", job.0);
         if member & OWN != 0 {
@@ -1791,7 +1938,10 @@ impl World {
             self.touch(home.member);
             at = next;
         }
-        panic!("the waits from job {} go on past every job of the graph: a cycle the graph let in", waiter.0);
+        panic!(
+            "the waits from job {} go on past every job of the graph: a cycle the graph let in",
+            waiter.0
+        );
     }
 
     /// The clock of the timed waits of members of their own placement reads `now`: each due by
@@ -1907,11 +2057,21 @@ impl World {
     /// `job`, live, gave way: its wait for `flight`, the run of `asked` (which the caller names
     /// `named`) by `to`, closed a cycle. Its next ask waits for that run to end first
     /// ([`giveway`]).
-    pub(crate) fn gave_way(&mut self, job: JobId, asked: Key, named: Box<str>, flight: Key, to: JobId) {
+    pub(crate) fn gave_way(
+        &mut self,
+        job: JobId,
+        asked: Key,
+        named: Box<str>,
+        flight: Key,
+        to: JobId,
+    ) {
         assert!(self.graph.life(job) == Life::Live, "job {} gave way while not live", job.0);
         let owner = self.observed(to);
         let last = self.gave_way.remove(&job.0);
-        self.gave_way.insert(job.0, GaveWay::after(last, job, giveway::Run { asked, named, flight, to, owner }));
+        self.gave_way.insert(
+            job.0,
+            GaveWay::after(last, job, giveway::Run { asked, named, flight, to, owner }),
+        );
     }
 
     /// `job`'s last give-way, if it remembers one.
@@ -1973,9 +2133,19 @@ impl World {
             place.audit();
             for job in &place.jobs {
                 if job.state == JobState::Suspended {
-                    assert_ne!(self.graph.waits(job.global), job.timed, "job {}'s wait", job.global);
+                    assert_ne!(
+                        self.graph.waits(job.global),
+                        job.timed,
+                        "job {}'s wait",
+                        job.global
+                    );
                 } else if matches!(job.state, JobState::Queued | JobState::Running) {
-                    assert!(!self.graph.waits(job.global), "job {} waits while {:?}", job.global, job.state);
+                    assert!(
+                        !self.graph.waits(job.global),
+                        "job {} waits while {:?}",
+                        job.global,
+                        job.state
+                    );
                 }
             }
         }

@@ -79,8 +79,10 @@ pub(crate) fn instruments_section(format: Format, name: &str) -> bool {
         Format::Pe => !name.contains('$'),
         Format::MachO => {
             let mut parts = name.split(',').map(str::trim);
-            let (segment, section) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
-            let objc = segment == "__OBJC" || (segment == "__DATA" && section.starts_with("__objc_"));
+            let (segment, section) =
+                (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+            let objc =
+                segment == "__OBJC" || (segment == "__DATA" && section.starts_with("__objc_"));
             let cfstring = segment == "__DATA" && section == "__cfstring";
             !objc && !cfstring && parts.next() != Some("cstring_literals")
         }
@@ -102,7 +104,10 @@ pub(crate) fn instrumented_static(format: Format, it: &Static) -> Option<u64> {
 
 /// The same of a datum: every one but a function's language-specific data area, which is
 /// its unwinder's table and no global of the program.
-pub(crate) fn instrumented_data(data: &blaze_codegen::Data, lsda: Option<&ContentId>) -> Option<u64> {
+pub(crate) fn instrumented_data(
+    data: &blaze_codegen::Data,
+    lsda: Option<&ContentId>,
+) -> Option<u64> {
     let size = data.bytes.len() as u64;
     (lsda != Some(&data.id) && u64::from(data.align) <= MIN_REDZONE && size > 0).then_some(size)
 }
@@ -181,7 +186,8 @@ const X86_REGISTER_FIELDS: [Field; 3] = [
 
 /// AArch64: `adrp x0, D + 8`, `add x0, x0, :lo12:D + 8`, `adrp x1, D`, `ldr x1, [x1, :lo12:D]`,
 /// `b callee`.
-const A64_REGISTER: [u8; 20] = words_le([0x9000_0000, 0x9100_0000, 0x9000_0001, 0xf940_0021, 0x1400_0000]);
+const A64_REGISTER: [u8; 20] =
+    words_le([0x9000_0000, 0x9100_0000, 0x9000_0001, 0xf940_0021, 0x1400_0000]);
 const A64_REGISTER_FIELDS: [Field; 5] = [
     field(0, Apply::A64Page21, 0, HEADER as i64),
     field(4, Apply::A64Lo12 { shift: 0 }, 0, HEADER as i64),
@@ -196,7 +202,10 @@ pub(crate) fn register(arch: Arch) -> Result<Stub, LinkError> {
     match arch {
         Arch::X86_64 => Ok(Stub { code: &X86_REGISTER, fields: &X86_REGISTER_FIELDS }),
         Arch::Aarch64 => Ok(Stub { code: &A64_REGISTER, fields: &A64_REGISTER_FIELDS }),
-        Arch::Wasm32 | Arch::Wasm64 => Err(error(None, "AddressSanitizer on wasm: a module has no constructors to register globals in")),
+        Arch::Wasm32 | Arch::Wasm64 => Err(error(
+            None,
+            "AddressSanitizer on wasm: a module has no constructors to register globals in",
+        )),
     }
 }
 
@@ -212,7 +221,7 @@ const X86_AT_EXIT: [u8; 42] = [
     0xe8, 0, 0, 0, 0, // call __asan_register_globals
     0x48, 0x8d, 0x3d, 0, 0, 0, 0, // lea rdi, [rip + destructor]
     0x31, 0xf6, // xor esi, esi
-    0x48, 0x8d, 0x15, 0, 0, 0, 0, // lea rdx, [rip + __dso_handle]
+    0x48, 0x8d, 0x15, 0, 0, 0, 0,    // lea rdx, [rip + __dso_handle]
     0x58, // pop rax
     0xe9, 0, 0, 0, 0, // jmp __cxa_atexit
 ];
@@ -260,7 +269,10 @@ pub(crate) fn at_exit(arch: Arch) -> Result<Stub, LinkError> {
     match arch {
         Arch::X86_64 => Ok(Stub { code: &X86_AT_EXIT, fields: &X86_AT_EXIT_FIELDS }),
         Arch::Aarch64 => Ok(Stub { code: &A64_AT_EXIT, fields: &A64_AT_EXIT_FIELDS }),
-        Arch::Wasm32 | Arch::Wasm64 => Err(error(None, "AddressSanitizer on wasm: a module has no constructors to register globals in")),
+        Arch::Wasm32 | Arch::Wasm64 => Err(error(
+            None,
+            "AddressSanitizer on wasm: a module has no constructors to register globals in",
+        )),
     }
 }
 
@@ -284,7 +296,11 @@ const X86_CALLS: Calls = Calls {
         0x48, 0x8d, 0x35, 0, 0, 0, 0, // lea rsi, [rip + end]
         0xe8, 0, 0, 0, 0, // call init
     ],
-    fields: &[field(3, Apply::Rel32, 0, -4), field(10, Apply::Rel32, 1, -4), field(15, Apply::X86Branch32, 2, -4)],
+    fields: &[
+        field(3, Apply::Rel32, 0, -4),
+        field(10, Apply::Rel32, 1, -4),
+        field(15, Apply::X86Branch32, 2, -4),
+    ],
     epilogue: &[0x58, 0xc3],
 };
 
@@ -298,11 +314,16 @@ const WIN64_CALLS: Calls = Calls {
         0x48, 0x8d, 0x15, 0, 0, 0, 0, // lea rdx, [rip + end]
         0xe8, 0, 0, 0, 0, // call init
     ],
-    fields: &[field(3, Apply::Rel32, 0, -4), field(10, Apply::Rel32, 1, -4), field(15, Apply::X86Branch32, 2, -4)],
+    fields: &[
+        field(3, Apply::Rel32, 0, -4),
+        field(10, Apply::Rel32, 1, -4),
+        field(15, Apply::X86Branch32, 2, -4),
+    ],
     epilogue: &[0x48, 0x83, 0xc4, 0x28, 0xc3],
 };
 
-const A64_CALL: [u8; 20] = words_le([0x9000_0000, 0x9100_0000, 0x9000_0001, 0x9100_0021, 0x9400_0000]);
+const A64_CALL: [u8; 20] =
+    words_le([0x9000_0000, 0x9100_0000, 0x9000_0001, 0x9100_0021, 0x9400_0000]);
 const A64_PROLOGUE: [u8; 8] = words_le([0xa9bf_7bfd, 0x9100_03fd]);
 const A64_EPILOGUE: [u8; 8] = words_le([0xa8c1_7bfd, 0xd65f_03c0]);
 
@@ -328,7 +349,9 @@ pub(crate) fn calls(format: Format, arch: Arch) -> Result<&'static Calls, LinkEr
         (Format::Pe, Arch::X86_64) => Ok(&WIN64_CALLS),
         (_, Arch::X86_64) => Ok(&X86_CALLS),
         (_, Arch::Aarch64) => Ok(&A64_CALLS),
-        (_, Arch::Wasm32 | Arch::Wasm64) => Err(error(None, "SanitizerCoverage on wasm: a module has no sections for its arrays")),
+        (_, Arch::Wasm32 | Arch::Wasm64) => {
+            Err(error(None, "SanitizerCoverage on wasm: a module has no sections for its arrays"))
+        }
     }
 }
 
@@ -343,8 +366,12 @@ pub(crate) const INIT: [&str; 4] = [
 
 /// COFF's bounds of each section: `$A` sorts before the arrays' `$M` and `$Z` after, as
 /// compiler-rt's `sanitizer_coverage_win_sections.cpp` brackets them; each an empty piece.
-const COFF_BOUNDS: [(&str, &str); 4] =
-    [(".SCOV$CA", ".SCOV$CZ"), (".SCOV$BA", ".SCOV$BZ"), (".SCOV$GA", ".SCOV$GZ"), (".SCOVP$A", ".SCOVP$Z")];
+const COFF_BOUNDS: [(&str, &str); 4] = [
+    (".SCOV$CA", ".SCOV$CZ"),
+    (".SCOV$BA", ".SCOV$BZ"),
+    (".SCOV$GA", ".SCOV$GZ"),
+    (".SCOVP$A", ".SCOVP$Z"),
+];
 
 /// Each section's elements' alignment: where its first array starts, which its start bound
 /// must be at.
@@ -412,7 +439,10 @@ impl<'a> Stage<'a> {
         }
         match self.output.format {
             Format::Wasm => {
-                return Err(error(None, "a sanitized wasm image: wasm has no sanitizer runtimes or sections for coverage"));
+                return Err(error(
+                    None,
+                    "a sanitized wasm image: wasm has no sanitizer runtimes or sections for coverage",
+                ));
             }
             Format::Pe if !sanitize.sanitizers.is_empty() => {
                 return Err(error(
@@ -442,7 +472,11 @@ impl<'a> Stage<'a> {
     fn msan_options(&mut self) {
         let sanitize = self.output.sanitize;
         let options = [
-            ("__msan_track_origins", i32::from(sanitize.track_origins), sanitize.track_origins != 0),
+            (
+                "__msan_track_origins",
+                i32::from(sanitize.track_origins),
+                sanitize.track_origins != 0,
+            ),
             ("__msan_keep_going", 1, sanitize.recover.contains(Sanitizers::MEMORY)),
         ];
         for (name, value, wanted) in options {
@@ -555,7 +589,8 @@ impl<'a> Stage<'a> {
 
     /// A piece of `stub`'s code, its fields of `targets`, the names among them seen.
     fn code(&mut self, sym: Sym, stub: Stub, targets: &[Sym]) {
-        let fixups = collect_in(stub.fields.iter().map(|it| fixup(it, targets, 0)), self.arena).leak();
+        let fixups =
+            collect_in(stub.fields.iter().map(|it| fixup(it, targets, 0)), self.arena).leak();
         let (class, rank) = self.core_class(&Class::Text);
         let piece = NewPiece { rank, ..piece_of(sym, class, 16, stub.code.len() as u64, fixups) };
         self.make(&piece, Content::Bytes(stub.code));
@@ -570,7 +605,13 @@ impl<'a> Stage<'a> {
     /// LLVM's `priority`: ELF's `.init_array.N` and `.fini_array.N`, Mach-O's
     /// `__mod_init_func` below every input's (and above a dev run's start hook), COFF's
     /// `.CRT$XC` as LLVM names a priority below 200.
-    fn constructor(&mut self, key: &[u8], code: Sym, priority: u32, fini: bool) -> Result<Sym, LinkError> {
+    fn constructor(
+        &mut self,
+        key: &[u8],
+        code: Sym,
+        priority: u32,
+        fini: bool,
+    ) -> Result<Sym, LinkError> {
         let sym = self.synthetic(POINTER, key);
         if self.new.home(sym).is_some() {
             return Ok(sym);
@@ -582,7 +623,10 @@ impl<'a> Stage<'a> {
             (Format::Elf, true) => Some(".fini_array."),
             (Format::Pe, false) => Some(".CRT$XCC"),
             (Format::MachO | Format::Pe, true) => {
-                return Err(error(None, "a destructor array on Mach-O or COFF, whose loaders call none at exit"));
+                return Err(error(
+                    None,
+                    "a destructor array on Mach-O or COFF, whose loaders call none at exit",
+                ));
             }
             (Format::Wasm, _) => return Err(error(None, "a constructor in a wasm module")),
         };
@@ -595,12 +639,18 @@ impl<'a> Stage<'a> {
                     left /= 10;
                 }
                 let digits = std::str::from_utf8(&digits).expect("digits");
-                self.writer.section(joined(&mut name, &[prefix, digits]), false, false, false).map_err(|it| error(None, it))?
+                self.writer
+                    .section(joined(&mut name, &[prefix, digits]), false, false, false)
+                    .map_err(|it| error(None, it))?
             }
             None => (Class::InitArray, priority),
         };
         let class = self.new.class_id(&class);
-        let fixups = collect_in([Fixup { at: 0, apply: Apply::Abs64, target: code, addend: 0, minus: None }], self.arena).leak();
+        let fixups = collect_in(
+            [Fixup { at: 0, apply: Apply::Abs64, target: code, addend: 0, minus: None }],
+            self.arena,
+        )
+        .leak();
         let piece = NewPiece { rank, ..piece_of(sym, class, 8, 8, fixups) };
         self.make(&piece, Content::Zero);
         Ok(sym)
@@ -661,7 +711,9 @@ impl<'a> Stage<'a> {
         let mut out = [false; 4];
         if let Some(piece) = ctor.and_then(|it| self.new.piece(it)) {
             for fixup in piece.fixups() {
-                if let Some(kind) = INIT.iter().position(|it| self.symbols.name_of(fixup.target) == Some(*it)) {
+                if let Some(kind) =
+                    INIT.iter().position(|it| self.symbols.name_of(fixup.target) == Some(*it))
+                {
                     out[kind] = true;
                 }
             }
@@ -694,7 +746,8 @@ impl<'a> Stage<'a> {
         let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(len, |_| 0);
         bytes[..calls.prologue.len()].copy_from_slice(calls.prologue);
         bytes[len - calls.epilogue.len()..].copy_from_slice(calls.epilogue);
-        let mut fixups: FrameVec<'a, Fixup> = Vec::with_capacity_in(kinds * calls.fields.len(), self.arena);
+        let mut fixups: FrameVec<'a, Fixup> =
+            Vec::with_capacity_in(kinds * calls.fields.len(), self.arena);
         let mut at = calls.prologue.len();
         for kind in (0..4).filter(|it| present[*it]) {
             bytes[at..at + calls.call.len()].copy_from_slice(calls.call);
@@ -723,16 +776,22 @@ impl<'a> Stage<'a> {
                 Ok((start, end))
             }
             Format::MachO => {
-                let (segment, section) = SANCOV_MACHO[kind].split_once(',').expect("SEGMENT,section");
-                let start = self.sym_name(joined(&mut name, &["section$start$", segment, "$", section]));
-                let end = self.sym_name(joined(&mut name, &["section$end$", segment, "$", section]));
+                let (segment, section) =
+                    SANCOV_MACHO[kind].split_once(',').expect("SEGMENT,section");
+                let start =
+                    self.sym_name(joined(&mut name, &["section$start$", segment, "$", section]));
+                let end =
+                    self.sym_name(joined(&mut name, &["section$end$", segment, "$", section]));
                 Ok((start, end))
             }
             Format::Pe => {
                 let (start, end) = COFF_BOUNDS[kind];
                 Ok((self.coff_bound(start, ALIGN[kind])?, self.coff_bound(end, 1)?))
             }
-            Format::Wasm => Err(error(None, "SanitizerCoverage on wasm: a module has no sections for its arrays")),
+            Format::Wasm => Err(error(
+                None,
+                "SanitizerCoverage on wasm: a module has no sections for its arrays",
+            )),
         }
     }
 
@@ -741,7 +800,8 @@ impl<'a> Stage<'a> {
     fn coff_bound(&mut self, name: &str, align: u64) -> Result<Sym, LinkError> {
         let sym = self.synthetic(BOUND, name.as_bytes());
         if self.new.home(sym).is_none() {
-            let (class, rank) = self.writer.section(name, true, false, false).map_err(|it| error(None, it))?;
+            let (class, rank) =
+                self.writer.section(name, true, false, false).map_err(|it| error(None, it))?;
             let class = self.new.class_id(&class);
             let piece = NewPiece { rank, ..piece_of(sym, class, align, 0, &[]) };
             self.make(&piece, Content::Zero);
@@ -775,7 +835,9 @@ impl<'a> Stage<'a> {
                 let size = bytes
                     .get(at..at + 8)
                     .map(|it| u64::from_le_bytes(it.try_into().expect("8 bytes")))
-                    .ok_or_else(|| error(None, "AddressSanitizer's descriptor array is not in its region"))?;
+                    .ok_or_else(|| {
+                        error(None, "AddressSanitizer's descriptor array is not in its region")
+                    })?;
                 match self.new.home(fixup.target) {
                     Some((id, 0)) if !self.fresh.contains(id) => entries.push((fixup.target, size)),
                     _ => gone.push(fixup.target),
@@ -786,7 +848,9 @@ impl<'a> Stage<'a> {
         let format = self.output.format;
         for it in &change.statics {
             if let Some(size) = instrumented_static(format, it) {
-                let (Some(item), Some(instance)) = (self.symbols.find_id(&it.item.0), self.symbols.find_id(&it.instance)) else {
+                let (Some(item), Some(instance)) =
+                    (self.symbols.find_id(&it.item.0), self.symbols.find_id(&it.instance))
+                else {
                     continue;
                 };
                 if let Some(sym) = self.symbols.find(SymKey::Static(item, instance)) {
@@ -841,8 +905,16 @@ impl<'a> Stage<'a> {
             put(bytes, SIZE, size);
             put(bytes, SIZE_WITH_REDZONE, size + redzone(size));
             let (name, odr) = self.entry_pieces(sym)?;
-            for (field, target) in [(BEG, sym), (NAME, name), (MODULE_NAME, module), (ODR_INDICATOR, odr)] {
-                fixups.push(Fixup { at: at + field, apply: Apply::Abs64, target, addend: 0, minus: None });
+            for (field, target) in
+                [(BEG, sym), (NAME, name), (MODULE_NAME, module), (ODR_INDICATOR, odr)]
+            {
+                fixups.push(Fixup {
+                    at: at + field,
+                    apply: Apply::Abs64,
+                    target,
+                    addend: 0,
+                    minus: None,
+                });
             }
         }
         let (class, rank) = self.core_class(&Class::Data);
@@ -860,7 +932,12 @@ impl<'a> Stage<'a> {
         }
     }
 
-    fn fresh_data_entry(&self, data: &blaze_codegen::Data, size: u64, entries: &mut FrameVec<'a, (Sym, u64)>) {
+    fn fresh_data_entry(
+        &self,
+        data: &blaze_codegen::Data,
+        size: u64,
+        entries: &mut FrameVec<'a, (Sym, u64)>,
+    ) {
         let Some(id) = self.symbols.find_id(&data.id) else { return };
         if let Some(sym) = self.symbols.find(SymKey::Data(id)) {
             self.fresh_entry(sym, size, entries);
@@ -884,7 +961,12 @@ impl<'a> Stage<'a> {
                 SymKey::Static(item, _) => (b"static ", item),
                 SymKey::Data(id) => (b"data ", id),
                 // alloc: error path
-                _ => return Err(error(None, format!("an AddressSanitizer global of {}", self.symbols.describe(sym)))),
+                _ => {
+                    return Err(error(
+                        None,
+                        format!("an AddressSanitizer global of {}", self.symbols.describe(sym)),
+                    ));
+                }
             };
             let id = self.symbols.content(id).0;
             let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(prefix.len() + 17, |_| 0);
@@ -924,17 +1006,25 @@ impl<'a> Stage<'a> {
     /// gives the bounds of by the linker's symbols moved or grew: an incremental link relays
     /// a section in place, and nothing else refers to those symbols' values changing.
     pub fn coverage_moved(&mut self) {
-        if !self.output.sanitize.coverage.is_on() || self.full || !matches!(self.output.format, Format::Elf | Format::MachO) {
+        if !self.output.sanitize.coverage.is_on()
+            || self.full
+            || !matches!(self.output.format, Format::Elf | Format::MachO)
+        {
             return;
         }
-        let Some((ctor, _)) = self.find_synthetic(CODE, b"sancov").and_then(|it| self.new.home(it)) else { return };
+        let Some((ctor, _)) = self.find_synthetic(CODE, b"sancov").and_then(|it| self.new.home(it))
+        else {
+            return;
+        };
         if self.write.contains(ctor) {
             return;
         }
         for kind in 0..4 {
             let Some(class) = self.sancov_class_of(kind) else { continue };
             let region = |state: &crate::state::State| {
-                state.space_of(&class).map(|at| (state.spaces[at].region.addr, state.spaces[at].region.size))
+                state
+                    .space_of(&class)
+                    .map(|at| (state.spaces[at].region.addr, state.spaces[at].region.size))
             };
             if region(&self.new) != region(self.old) {
                 self.write.insert(ctor);
@@ -945,7 +1035,13 @@ impl<'a> Stage<'a> {
 }
 
 /// A synthesized piece's fields: rank 0, the order of the core's pieces, not zeroed.
-fn piece_of<'x>(sym: Sym, class: ClassId, align: u64, size: u64, fixups: &'x [Fixup]) -> NewPiece<'x> {
+fn piece_of<'x>(
+    sym: Sym,
+    class: ClassId,
+    align: u64,
+    size: u64,
+    fixups: &'x [Fixup],
+) -> NewPiece<'x> {
     NewPiece {
         sym,
         class,

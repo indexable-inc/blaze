@@ -52,7 +52,12 @@ impl Res {
     }
 
     /// `res`, written as the path `Self` alone in a value or a pattern when `self_ctor`.
-    pub(super) fn path(cx: &Cx<'_, '_>, defs: &Defs, res: PathResolution<'_>, self_ctor: bool) -> Res {
+    pub(super) fn path(
+        cx: &Cx<'_, '_>,
+        defs: &Defs,
+        res: PathResolution<'_>,
+        self_ctor: bool,
+    ) -> Res {
         match res {
             PathResolution::Def(def) => Res::def(defs, def),
             PathResolution::SelfType(_) if self_ctor => Res::SelfCtor,
@@ -62,7 +67,9 @@ impl Res {
             },
             // `Self` in a trait: rustc's `Res::SelfTyParam { trait_ }`.
             PathResolution::TypeParam(it) => match it.parent(cx.db) {
-                GenericDef::Trait(trait_) if it.is_implicit(cx.db) => Res::of(defs, Id::Trait(trait_.into())),
+                GenericDef::Trait(trait_) if it.is_implicit(cx.db) => {
+                    Res::of(defs, Id::Trait(trait_.into()))
+                }
                 _ => Res::None,
             },
             PathResolution::Local(_)
@@ -77,7 +84,9 @@ impl Res {
         match def {
             ModuleDef::Function(it) => Res::function(defs, it),
             ModuleDef::Adt(it) => Res::of(defs, Id::Adt(AdtId::from(it))),
-            ModuleDef::EnumVariant(it) => defs.get(Id::Variant(it.into())).map_or(Res::None, Res::Variant),
+            ModuleDef::EnumVariant(it) => {
+                defs.get(Id::Variant(it.into())).map_or(Res::None, Res::Variant)
+            }
             ModuleDef::Const(it) => Res::assoc(defs, Id::Const(it.into())),
             ModuleDef::Static(it) => Res::of(defs, Id::Static(it.into())),
             ModuleDef::Trait(it) => Res::of(defs, Id::Trait(it.into())),

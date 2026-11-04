@@ -49,10 +49,7 @@ fn run_native_replays_persisted_failure_on_second_run() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().to_string_lossy().into_owned();
 
-    let settings = Settings::new()
-        .test_cases(50)
-        .seed(Some(42))
-        .database(Some(db_path.clone()));
+    let settings = Settings::new().test_cases(50).seed(Some(42)).database(Some(db_path.clone()));
     let key = Some("replay-smoke");
 
     let first_failures = std::sync::Mutex::new(Vec::<i128>::new());
@@ -74,16 +71,9 @@ fn run_native_replays_persisted_failure_on_second_run() {
             _ => ds.mark_complete(&TestCaseResult::Overrun),
         }
     });
+    assert!(!result.unwrap().failures.is_empty(), "first run must have failed");
     assert!(
-        !result.unwrap().failures.is_empty(),
-        "first run must have failed"
-    );
-    assert!(
-        first_failures
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|&n| n >= 1_000_000),
+        first_failures.lock().unwrap().iter().any(|&n| n >= 1_000_000),
         "first run never observed n>=1_000_000"
     );
 
@@ -107,10 +97,7 @@ fn run_native_replays_persisted_failure_on_second_run() {
         ds.mark_complete(&TestCaseResult::Valid);
     });
 
-    let first = observed_first
-        .lock()
-        .unwrap()
-        .expect("second run never received a test case");
+    let first = observed_first.lock().unwrap().expect("second run never received a test case");
     assert!(
         first >= 1_000_000,
         "expected first replayed test case to satisfy n>=1_000_000, got n={}",
@@ -133,11 +120,8 @@ fn run_native_shrinks_predicate_boundary_seed_sweep() {
     let mut hits = 0u32;
     let mut shrunk_values = Vec::<i128>::new();
     for seed in 0u64..50 {
-        let settings = Settings::new()
-            .test_cases(100)
-            .seed(Some(seed))
-            .derandomize(true)
-            .database(None);
+        let settings =
+            Settings::new().test_cases(100).seed(Some(seed)).derandomize(true).database(None);
         let result = run_native(&settings, None, |ds| mark_above_million(&*ds)).unwrap();
         let blob = result.failures[0]
             .reproduce_blob
@@ -191,10 +175,7 @@ fn replay_above_million_blob(blob: &str) -> i128 {
 /// gate that surfaces total regressions on the lucky-seed path.
 #[test]
 fn run_native_shrinks_predicate_boundary_to_exact_value() {
-    let settings = Settings::new()
-        .test_cases(200)
-        .seed(Some(0xc0ffee))
-        .database(None);
+    let settings = Settings::new().test_cases(200).seed(Some(0xc0ffee)).database(None);
 
     let result = run_native(&settings, None, |ds| mark_above_million(&*ds)).unwrap();
     let blob = result.failures[0]
@@ -220,10 +201,7 @@ fn run_native_replays_persisted_failure_with_unbounded_int_schema() {
 
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().to_string_lossy().into_owned();
-    let settings = Settings::new()
-        .test_cases(100)
-        .seed(Some(7))
-        .database(Some(db_path));
+    let settings = Settings::new().test_cases(100).seed(Some(7)).database(Some(db_path));
     let key = Some("replay-unbounded");
 
     let predicate = |n: i128| n >= 1_000_000;
@@ -245,10 +223,7 @@ fn run_native_replays_persisted_failure_with_unbounded_int_schema() {
         ds.mark_complete(&TestCaseResult::Valid);
     });
     assert!(!result.unwrap().failures.is_empty());
-    let shrunk = last
-        .lock()
-        .unwrap()
-        .expect("first run never observed the failure");
+    let shrunk = last.lock().unwrap().expect("first run never observed the failure");
 
     let observed_first = std::sync::Mutex::new(None::<i128>);
     let _ = run_native(&settings, key, |ds| {
@@ -315,10 +290,7 @@ fn discover_reproduce_blob() -> String {
     let settings = quiet_settings(200).seed(Some(7));
     let result = run_native(&settings, None, |ds| mark_large_interesting(&*ds)).unwrap();
     assert!(!result.failures.is_empty(), "property should have failed");
-    result.failures[0]
-        .reproduce_blob
-        .clone()
-        .expect("native failure should carry a reproduce blob")
+    result.failures[0].reproduce_blob.clone().expect("native failure should carry a reproduce blob")
 }
 
 #[test]
@@ -330,10 +302,7 @@ fn data_source_for_blob_replays_the_counterexample() {
         panic!("expected an integer draw");
     };
     let n = v.to_i128().unwrap();
-    assert!(
-        n >= 1_000_000,
-        "replayed value {n} should still violate the property"
-    );
+    assert!(n >= 1_000_000, "replayed value {n} should still violate the property");
     ds.mark_complete(&TestCaseResult::Valid);
 }
 
@@ -437,24 +406,16 @@ fn data_source_for_blob_replays_nondeterministic_state_with_a_continuation_budge
     let blob = encode_nd_failure(&state).unwrap();
     let lines: Arc<Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&lines);
-    let settings = quiet_settings(1)
-        .verbosity(Verbosity::Debug)
-        .output(Output::callback(move |line| {
+    let settings =
+        quiet_settings(1).verbosity(Verbosity::Debug).output(Output::callback(move |line| {
             sink.lock().unwrap().push(line.to_string());
         }));
     let ds = data_source_for_blob(&settings, &blob).unwrap();
     assert!(
-        lines
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.contains("replaying nondeterministic failure blob")),
+        lines.lock().unwrap().iter().any(|l| l.contains("replaying nondeterministic failure blob")),
         "debug verbosity names the replay"
     );
-    assert!(
-        ds.generate_boolean(0.5, None).unwrap(),
-        "the stored graph serves the draw"
-    );
+    assert!(ds.generate_boolean(0.5, None).unwrap(), "the stored graph serves the draw");
     ds.generate_boolean(0.5, None).unwrap();
     ds.mark_complete(&TestCaseResult::Valid);
 }

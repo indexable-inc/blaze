@@ -5,12 +5,12 @@
 //! `compiler/rustc_lint/src/lints.rs` (`OverflowingInt`, `OverflowingBinHex`, ..) (MIT or
 //! Apache-2.0).
 
-use hir_ty::db::HirDatabase;
 use hir::InFile;
 use hir_def::{
     HasModule,
     hir::{Expr, ExprId, Literal},
 };
+use hir_ty::db::HirDatabase;
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_apfloat::{
     Float as _,
@@ -68,7 +68,12 @@ pub(super) fn may_overflow(
 /// value. The folded value is exact unless the literal wrapped, which needs at least 34
 /// characters (`0x` and 32 hex digits for `2^127`; 39 decimal digits): the length of the
 /// literal's syntax pointer, which costs no parse, tells.
-pub(super) fn pat_may_overflow(b: &BodyCx<'_, '_, '_>, expr: ExprId, lit: &Literal, pointer_bits: Option<u16>) -> bool {
+pub(super) fn pat_may_overflow(
+    b: &BodyCx<'_, '_, '_>,
+    expr: ExprId,
+    lit: &Literal,
+    pointer_bits: Option<u16>,
+) -> bool {
     let (value, negated) = match *lit {
         Literal::Int(value, _) => (value.unsigned_abs(), value < 0),
         Literal::Uint(value, _) => (value, false),
@@ -84,7 +89,13 @@ pub(super) fn pat_may_overflow(b: &BodyCx<'_, '_, '_>, expr: ExprId, lit: &Liter
 
 /// Whether an integer literal of magnitude `value` is out of the range of the type of `expr`
 /// (rustc's checks of `lint_int_literal` and `lint_uint_literal`, before they read the source).
-fn int_overflows(b: &BodyCx<'_, '_, '_>, expr: ExprId, value: u128, negated: bool, pointer_bits: Option<u16>) -> bool {
+fn int_overflows(
+    b: &BodyCx<'_, '_, '_>,
+    expr: ExprId,
+    value: u128,
+    negated: bool,
+    pointer_bits: Option<u16>,
+) -> bool {
     match util::ty(b, expr).kind() {
         TyKind::Int(t) => {
             let t = match (t, pointer_bits) {
@@ -110,7 +121,9 @@ fn int_overflows(b: &BodyCx<'_, '_, '_>, expr: ExprId, value: u128, negated: boo
 /// Whether the float literal `expr`, `lit` lowered, is infinite in its type: rustc's
 /// `float_is_infinite`, on the lowered literal's text.
 fn float_overflows(b: &BodyCx<'_, '_, '_>, expr: ExprId, lit: &Literal) -> bool {
-    let (TyKind::Float(t), Literal::Float(value, _)) = (util::ty(b, expr).kind(), lit) else { return false };
+    let (TyKind::Float(t), Literal::Float(value, _)) = (util::ty(b, expr).kind(), lit) else {
+        return false;
+    };
     match t {
         FloatTy::F16 => value.to_f16().is_infinite(),
         FloatTy::F32 => value.to_f32().is_infinite(),
@@ -121,7 +134,12 @@ fn float_overflows(b: &BodyCx<'_, '_, '_>, expr: ExprId, lit: &Literal) -> bool 
 
 /// rustc's `lint_literal` of the literal `expr`, `negation` the `-` expression it is the
 /// operand of; a pattern's literal says itself whether it has a `-`.
-pub(super) fn lint_literal(b: &BodyCx<'_, '_, '_>, expr: ExprId, negation: Option<ExprId>, out: &mut Vec<Found>) {
+pub(super) fn lint_literal(
+    b: &BodyCx<'_, '_, '_>,
+    expr: ExprId,
+    negation: Option<ExprId>,
+    out: &mut Vec<Found>,
+) {
     let negation = match negation {
         Some(it) => match util::span(b, it) {
             Some(span) => Some(span),
@@ -161,7 +179,9 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_, '_>, expr: ExprId, negation: Optio
         TyKind::Float(t) => {
             let text = match &lit.kind {
                 ast::LiteralKind::FloatNumber(number) => number.value_string(),
-                ast::LiteralKind::IntNumber(number) if is_float_suffix(number.suffix()) => number.value_string(),
+                ast::LiteralKind::IntNumber(number) if is_float_suffix(number.suffix()) => {
+                    number.value_string()
+                }
                 _ => return,
             };
             let infinite = match t {
@@ -176,7 +196,8 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_, '_>, expr: ExprId, negation: Optio
             let ty = t.name_str();
             let written = snippet(b, &lit.span).unwrap_or(text);
             // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
-            let mut diag = Diag::lint(LINT, format!("literal out of range for `{ty}`"), lit.span.clone());
+            let mut diag =
+                Diag::lint(LINT, format!("literal out of range for `{ty}`"), lit.span.clone());
             // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
             diag.note(format!(
                 "the literal `{written}` does not fit into the type `{ty}` and will be converted to `{ty}::INFINITY`"
@@ -213,7 +234,8 @@ fn refuse_arbitrary(
     // clone: a span or node handle, for a literal `may_overflow` found
     let span = negation.unwrap_or_else(|| lit.span.clone());
     // alloc: the error's text, for a literal `may_overflow` found
-    let written = snippet(b, &span).unwrap_or_else(|| if negative { format!("-{value}") } else { value.to_string() });
+    let written = snippet(b, &span)
+        .unwrap_or_else(|| if negative { format!("-{value}") } else { value.to_string() });
     // alloc: the error's text, for a literal `may_overflow` found
     let mut diag = Diag::error(None, format!("literal `{written}` out of range for `{ty}`"), span);
     // alloc: the error's text, for a literal `may_overflow` found
@@ -418,7 +440,9 @@ fn report_bin_hex_error(
     let mut diag = Diag::lint(LINT, format!("literal out of range for `{name}`"), span.clone());
     if negative {
         // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
-        diag.note(format!("the literal `{repr}` (decimal `{value}`) does not fit into the type `{name}`"));
+        diag.note(format!(
+            "the literal `{repr}` (decimal `{value}`) does not fit into the type `{name}`"
+        ));
         // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         diag.note(format!("and the value `-{repr}` will become `{actually}{name}`"));
     } else {
@@ -478,7 +502,10 @@ fn report_bin_hex_error(
 /// The cast `expr` is the operand of, if it is one's (rustc's `parent_hir_node` an
 /// `ExprKind::Cast`).
 fn parent_cast(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<ExprId> {
-    b.exprs().iter().copied().find(|&it| matches!(b.store().expr(it), Expr::Cast { expr: inner, .. } if inner == expr))
+    b.exprs()
+        .iter()
+        .copied()
+        .find(|&it| matches!(b.store().expr(it), Expr::Cast { expr: inner, .. } if inner == expr))
 }
 
 /// rustc's `lint_overflowing_range_endpoint`: the end of an exclusive range (`0..256` of `u8`,
@@ -520,9 +547,12 @@ fn lint_overflowing_range_endpoint(
     let literal = value - 1;
     let message = "use an inclusive range instead";
     // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
-    let mut diag = Diag::lint(LINT, format!("range endpoint is out of range for `{ty}`"), range_span.clone());
+    let mut diag =
+        Diag::lint(LINT, format!("range endpoint is out of range for `{ty}`"), range_span.clone());
     if span.lo == lit.span.lo {
-        let Some(start) = b.expr_span(start.expr).and_then(|it| snippet(b, &it)) else { return false };
+        let Some(start) = b.expr_span(start.expr).and_then(|it| snippet(b, &it)) else {
+            return false;
+        };
         diag.suggestion(
             range_span.shrink_to_lo().to(&lit.span.shrink_to_hi()),
             message,
@@ -533,7 +563,10 @@ fn lint_overflowing_range_endpoint(
     } else {
         diag.suggestion_with_style(
             // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
-            vec![(span.shrink_to_lo(), "=".to_owned()), (lit.span.clone(), format!("{literal}{suffix}"))],
+            vec![
+                (span.shrink_to_lo(), "=".to_owned()),
+                (lit.span.clone(), format!("{literal}{suffix}")),
+            ],
             message,
             Applicability::MachineApplicable,
             SuggestionStyle::ShowCode,
@@ -578,12 +611,15 @@ fn lint_int_literal(
     // clone: a span or node handle, for a literal `may_overflow` found
     let span = negation.unwrap_or_else(|| lit.span.clone());
     // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
-    let written = snippet(b, &span).unwrap_or_else(|| if negative { format!("-{value}") } else { value.to_string() });
+    let written = snippet(b, &span)
+        .unwrap_or_else(|| if negative { format!("-{value}") } else { value.to_string() });
     let ty = t.name_str();
     // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
     let mut diag = Diag::lint(LINT, format!("literal out of range for `{ty}`"), span);
     // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
-    diag.note(format!("the literal `{written}` does not fit into the type `{ty}` whose range is `{min}..={max}`"));
+    diag.note(format!(
+        "the literal `{written}` does not fit into the type `{ty}` whose range is `{min}..={max}`"
+    ));
     if let Some(suggestion_ty) = type_suggestion(util::ty(b, lit.expr), value, negative) {
         // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         diag.help(format!("consider using the type `{suggestion_ty}` instead"));
@@ -652,7 +688,9 @@ fn lint_uint_literal(b: &BodyCx<'_, '_, '_>, lit: &Lit<'_>, t: UintTy, out: &mut
     // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
     let mut diag = Diag::lint(LINT, format!("literal out of range for `{ty}`"), lit.span.clone());
     // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
-    diag.note(format!("the literal `{written}` does not fit into the type `{ty}` whose range is `0..={max}`"));
+    diag.note(format!(
+        "the literal `{written}` does not fit into the type `{ty}` whose range is `0..={max}`"
+    ));
     // clone: a span or node handle, for a literal `may_overflow` found
     out.push(b.lint(diag, Phase::Late, lit.at.clone()));
 }

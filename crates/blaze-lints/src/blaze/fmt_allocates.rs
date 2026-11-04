@@ -29,13 +29,25 @@ const LINT: Lint = Lint::FmtAllocates;
 const UP: usize = 24;
 
 /// core's formatting traits.
-const FMT_TRAITS: &[&str] =
-    &["Display", "Debug", "LowerHex", "UpperHex", "Octal", "Binary", "LowerExp", "UpperExp", "Pointer"];
+const FMT_TRAITS: &[&str] = &[
+    "Display", "Debug", "LowerHex", "UpperHex", "Octal", "Binary", "LowerExp", "UpperExp",
+    "Pointer",
+];
 
 /// The calls that build a `String`.
 const MAKERS: &[&str] = &[
-    "to_string", "format", "from", "collect", "to_owned", "into", "concat", "join", "repeat", "replace",
-    "to_uppercase", "to_lowercase",
+    "to_string",
+    "format",
+    "from",
+    "collect",
+    "to_owned",
+    "into",
+    "concat",
+    "join",
+    "repeat",
+    "replace",
+    "to_uppercase",
+    "to_lowercase",
 ];
 
 /// `Formatter`'s methods that write what they are given.
@@ -56,7 +68,9 @@ fn in_fmt(cx: &Cx<'_, '_>, analysis: &hir::BodyAnalysis<'_>) -> bool {
     if f.name(db).as_str() != "fmt" {
         return false;
     }
-    let Some(trait_) = f.as_assoc_item(db).and_then(|it| it.implemented_trait(db)) else { return false };
+    let Some(trait_) = f.as_assoc_item(db).and_then(|it| it.implemented_trait(db)) else {
+        return false;
+    };
     let krate = trait_.module(db).krate(db);
     FMT_TRAITS.contains(&trait_.name(db).as_str())
         && ["core", "std", "alloc"].iter().any(|it| facts::crate_is(db, krate, it))
@@ -82,7 +96,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let db = cx.db();
     let body = analysis.body();
     let infer = analysis.infer();
-    let Some(string) = cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern("String")) else { return found };
+    let Some(string) = cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern("String")) else {
+        return found;
+    };
     let parents = facts::Parents::of(body);
     let walk = Walk { db, def, body, analysis, parents: &parents };
     for (id, expr) in body.exprs() {
@@ -133,29 +149,36 @@ impl Walk<'_, '_> {
                         continue;
                     }
                     let pat = statements.iter().find_map(|it| match it {
-                        Statement::Let { pat, initializer: Some(init), else_branch: None, .. } if init == at => {
-                            Some(pat)
-                        }
+                        Statement::Let {
+                            pat, initializer: Some(init), else_branch: None, ..
+                        } if init == at => Some(pat),
                         _ => None,
                     });
                     let Some(pat) = pat else { return false };
-                    let Pat::Bind { id: local, subpat: None } = self.body.pat(pat) else { return false };
+                    let Pat::Bind { id: local, subpat: None } = self.body.pat(pat) else {
+                        return false;
+                    };
                     let db = self.db;
                     // alloc: the uses of one local, a few
                     let uses: Vec<ExprId> = self
                         .body
                         .exprs()
                         .filter(|(id, expr)| {
-                            matches!(expr, Expr::Path(_)) && local_of(db, self.def, self.body, *id) == Some(local)
+                            matches!(expr, Expr::Path(_))
+                                && local_of(db, self.def, self.body, *id) == Some(local)
                         })
                         .map(|(id, _)| id)
                         .collect();
                     return !uses.is_empty() && uses.iter().all(|&it| self.written(it, depth + 1));
                 }
-                Expr::MethodCall { receiver, .. } if receiver != at && self.formatter_write(parent, receiver) => {
+                Expr::MethodCall { receiver, .. }
+                    if receiver != at && self.formatter_write(parent, receiver) =>
+                {
                     return true;
                 }
-                Expr::Closure { .. } | Expr::Loop { .. } | Expr::Match { .. } | Expr::If { .. } => return false,
+                Expr::Closure { .. } | Expr::Loop { .. } | Expr::Match { .. } | Expr::If { .. } => {
+                    return false;
+                }
                 _ => at = parent,
             }
         }
@@ -173,7 +196,8 @@ impl Walk<'_, '_> {
         let ty = self.analysis.ty(infer.expr_ty(receiver)).strip_references();
         ty.as_adt().is_some_and(|it| {
             let krate = it.module(db).krate(db);
-            it.name(db).as_str() == "Formatter" && ["core", "std", "alloc"].iter().any(|name| facts::crate_is(db, krate, name))
+            it.name(db).as_str() == "Formatter"
+                && ["core", "std", "alloc"].iter().any(|name| facts::crate_is(db, krate, name))
         })
     }
 }

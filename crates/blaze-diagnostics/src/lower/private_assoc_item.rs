@@ -35,13 +35,20 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateAssocItem) -> Vec<Found> {
         hir::AssocItem::TypeAlias(_) => "associated type",
     };
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(Some("E0624"), format!("{kind} `{name}` is private"), name_span.clone());
+    let mut diag =
+        Diag::error(Some("E0624"), format!("{kind} `{name}` is private"), name_span.clone());
     // alloc: the error's text, for an error hir found
     diag.span_label(name_span, format!("private {kind}"));
     let defined = match d.item {
-        hir::AssocItem::Function(f) => cx.vsema.source(f).map(|it| it.map(|it| def_range(it.syntax()))),
-        hir::AssocItem::Const(c) => cx.vsema.source(c).map(|it| it.map(|it| def_range(it.syntax()))),
-        hir::AssocItem::TypeAlias(t) => cx.vsema.source(t).map(|it| it.map(|it| def_range(it.syntax()))),
+        hir::AssocItem::Function(f) => {
+            cx.vsema.source(f).map(|it| it.map(|it| def_range(it.syntax())))
+        }
+        hir::AssocItem::Const(c) => {
+            cx.vsema.source(c).map(|it| it.map(|it| def_range(it.syntax())))
+        }
+        hir::AssocItem::TypeAlias(t) => {
+            cx.vsema.source(t).map(|it| it.map(|it| def_range(it.syntax())))
+        }
     };
     if let Some(defined) = defined {
         // alloc: the error's text, for an error hir found
@@ -62,7 +69,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateAssocItem) -> Vec<Found> {
     {
         let receiver = receiver.original;
         // alloc: the error's text, for an error hir found
-        diag.fact_opt(cx.method_fact(&receiver, &name), format!("what `{name}` is on `{}`", cx.ty(&receiver)));
+        diag.fact_opt(
+            cx.method_fact(&receiver, &name),
+            format!("what `{name}` is on `{}`", cx.ty(&receiver)),
+        );
     }
     code_fact(cx, &mut diag, d.expr_or_pat.map(|it| it.syntax_node_ptr()));
     // alloc: the error's parts, for an error hir found
@@ -77,7 +87,9 @@ fn name_range(node: either::Either<ast::Expr<'_>, ast::Pat<'_>>) -> Option<TextR
         }
         either::Either::Left(ast::Expr::PathExpr(it)) => it.path()?,
         either::Either::Right(ast::Pat::PathPat(it)) => it.path()?,
-        either::Either::Right(ast::Pat::IdentPat(it)) => return Some(it.name()?.syntax().text_range()),
+        either::Either::Right(ast::Pat::IdentPat(it)) => {
+            return Some(it.name()?.syntax().text_range());
+        }
         either::Either::Right(ast::Pat::TupleStructPat(it)) => it.path()?,
         either::Either::Right(ast::Pat::RecordPat(it)) => it.path()?,
         either::Either::Left(ast::Expr::RecordExpr(it)) => it.path()?,

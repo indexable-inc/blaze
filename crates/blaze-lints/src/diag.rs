@@ -49,16 +49,25 @@ pub enum CheckError {
     /// A lint looked up `path` of `core`, `alloc` or `std`, which [`crate::famous`]'s `KNOWN`
     /// does not list, in the lints of the file `file`: a lint's bug. The lint can't run there, so
     /// the crate's lints are not given as if it had.
-    NotKnown { file: String, path: String },
+    NotKnown {
+        file: String,
+        path: String,
+    },
     /// A fiber lint (`held_across_wait`, `blocking_on_pool`, `unnamed_wait`) run over `file`
     /// reads the may-suspend check, which checks nothing in this crate's graph: `why`
     /// ([`hir_ty_suspend::Unchecked`], said). The lint can't run, so the crate's lints are not
     /// given as if it had found nothing.
-    SuspendUnchecked { file: String, why: String },
+    SuspendUnchecked {
+        file: String,
+        why: String,
+    },
     /// A lint run over `file` resolved a path whose resolution looked up an item the analysis'
     /// ast id map does not hold: `why` ([`hir::NotInAstIdMap`], said). A bug in the analysis;
     /// the crate's lints are not given as if the path had resolved to nothing.
-    NotInAstIdMap { file: String, why: String },
+    NotInAstIdMap {
+        file: String,
+        why: String,
+    },
 }
 
 impl std::fmt::Display for CheckError {
@@ -136,7 +145,9 @@ pub(crate) fn place(
         span.hi += offset;
         name.clone_into(&mut span.file);
     } else if let Some(id) = span.file.strip_prefix(FILE_ID) {
-        let id = span::FileId::from_raw(id.parse().expect("a span's file number, as `of_file` wrote it"));
+        let id = span::FileId::from_raw(
+            id.parse().expect("a span's file number, as `of_file` wrote it"),
+        );
         span.file = name_of(id).ok_or(Unnamed { file: id })?;
     }
     match &mut span.expansion {
@@ -169,9 +180,16 @@ mod tests {
         diag.span_label(of_file(span::FileId::from_raw(7), range), "there");
         let name_of = |file: span::FileId| (file.index() == 7).then(|| "src/other.rs".to_owned());
         assert_eq!(place_diag(&mut diag, 100, "src/lib.rs", &name_of), Ok(()));
-        assert_eq!((diag.span.primary[0].file.as_str(), diag.span.primary[0].lo, diag.span.primary[0].hi), ("src/lib.rs", 102, 105));
-        assert_eq!((diag.span.labels[0].0.file.as_str(), diag.span.labels[0].0.lo), ("src/other.rs", 2));
-        let mut unnamed = Diag::lint("clippy::needless_bool", "x", of_file(span::FileId::from_raw(8), range));
+        assert_eq!(
+            (diag.span.primary[0].file.as_str(), diag.span.primary[0].lo, diag.span.primary[0].hi),
+            ("src/lib.rs", 102, 105)
+        );
+        assert_eq!(
+            (diag.span.labels[0].0.file.as_str(), diag.span.labels[0].0.lo),
+            ("src/other.rs", 2)
+        );
+        let mut unnamed =
+            Diag::lint("clippy::needless_bool", "x", of_file(span::FileId::from_raw(8), range));
         assert_eq!(
             place_diag(&mut unnamed, 0, "src/lib.rs", &name_of),
             Err(Unnamed { file: span::FileId::from_raw(8) }),

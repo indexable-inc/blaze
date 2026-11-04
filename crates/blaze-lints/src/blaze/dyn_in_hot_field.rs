@@ -47,7 +47,10 @@ const MODULES: usize = 4096;
 const WRAPPERS: &[&str] = &["Box", "Option", "Rc", "Arc", "Cell", "RefCell", "Mutex", "RwLock"];
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -172,7 +175,9 @@ pub(super) fn peel(body: &Body, expr: ExprId) -> ExprId {
 fn in_collection(cx: &Cx<'_, '_>, target: hir::Adt) -> bool {
     let db = cx.db();
     let holds = |ty: &hir::Type<'_>| holds(db, ty, target, false, DEPTH);
-    let in_fn = |f: hir::Function| f.assoc_fn_params(db).iter().any(|it| holds(it.ty())) || holds(&f.ret_type(db));
+    let in_fn = |f: hir::Function| {
+        f.assoc_fn_params(db).iter().any(|it| holds(it.ty())) || holds(&f.ret_type(db))
+    };
     // alloc: the worklist of one crate's modules
     let mut modules = vec![cx.krate().root_module(db)];
     let mut seen = 0;
@@ -191,7 +196,9 @@ fn in_collection(cx: &Cx<'_, '_>, target: hir::Adt) -> bool {
                         hir::Adt::Struct(s) => s.fields(db),
                         hir::Adt::Union(u) => u.fields(db),
                         // alloc: one enum's fields
-                        hir::Adt::Enum(e) => e.variants(db).into_iter().flat_map(|v| v.fields(db)).collect(),
+                        hir::Adt::Enum(e) => {
+                            e.variants(db).into_iter().flat_map(|v| v.fields(db)).collect()
+                        }
                     };
                     fields.iter().any(|field| holds(&field.ty(db)))
                 }
@@ -240,7 +247,9 @@ fn holds(db: &base_db::Db, ty: &hir::Type<'_>, target: hir::Adt, many: bool, dep
         return many;
     }
     let wrapper = WRAPPERS.contains(&adt.name(db).as_str())
-        && ["core", "alloc", "std"].iter().any(|it| facts::crate_is(db, adt.module(db).krate(db), it));
+        && ["core", "alloc", "std"]
+            .iter()
+            .any(|it| facts::crate_is(db, adt.module(db).krate(db), it));
     let many = many || !wrapper;
     ty.type_arguments().any(|it| holds(db, &it, target, many, depth - 1))
 }

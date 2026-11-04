@@ -95,12 +95,7 @@ impl Layout {
             Tree::Group { .. } => Part::Group,
             Tree::Repeat { .. } => Part::Repeat,
         };
-        self.nodes.push(Node {
-            part,
-            start: at,
-            end: at,
-            children: Vec::new(),
-        });
+        self.nodes.push(Node { part, start: at, end: at, children: Vec::new() });
         derives.push(false);
         self.nodes.len() - 1
     }
@@ -244,29 +239,15 @@ impl Layout {
                 continue;
             };
             let half = items.len() / 2;
-            moves.push(Coarse::Delete {
-                start: items[0].0,
-                end: last.1,
-            });
+            moves.push(Coarse::Delete { start: items[0].0, end: last.1 });
             if half > 0 {
-                moves.push(Coarse::Delete {
-                    start: items[items.len() - half].0,
-                    end: last.1,
-                });
-                moves.push(Coarse::Delete {
-                    start: items[items.len() - 1].0,
-                    end: last.1,
-                });
+                moves.push(Coarse::Delete { start: items[items.len() - half].0, end: last.1 });
+                moves.push(Coarse::Delete { start: items[items.len() - 1].0, end: last.1 });
             }
         }
         for (ancestor, descendant) in self.hoists() {
             let (a, d) = (&self.nodes[ancestor], &self.nodes[descendant]);
-            moves.push(Coarse::Hoist {
-                start: a.start,
-                end: a.end,
-                from: d.start,
-                to: d.end,
-            });
+            moves.push(Coarse::Hoist { start: a.start, end: a.end, from: d.start, to: d.end });
         }
         for (id, start, end) in self.leaves() {
             moves.push(Coarse::Smallest { id, start, end });
@@ -289,12 +270,7 @@ impl Layout {
             let candidate = match mv {
                 Coarse::Ignored => cut(text, &self.ignored()),
                 Coarse::Delete { start, end } => splice(text, start, end, &[]),
-                Coarse::Hoist {
-                    start,
-                    end,
-                    from,
-                    to,
-                } => splice(text, start, end, &text[from..to]),
+                Coarse::Hoist { start, end, from, to } => splice(text, start, end, &text[from..to]),
                 Coarse::Smallest { id, start, end } => splice(text, start, end, &smallest(id)?),
             };
             let mut hasher = FxHasher::default();
@@ -314,19 +290,10 @@ pub enum Coarse {
     Delete { start: usize, end: usize },
     /// The text from `start` to `end` replaced by the text from `from` to
     /// `to` within it, a node of the same rule.
-    Hoist {
-        start: usize,
-        end: usize,
-        from: usize,
-        to: usize,
-    },
+    Hoist { start: usize, end: usize, from: usize, to: usize },
     /// The leaf from `start` to `end` replaced by the smallest text known
     /// for its terminal.
-    Smallest {
-        id: TermId,
-        start: usize,
-        end: usize,
-    },
+    Smallest { id: TermId, start: usize, end: usize },
 }
 
 /// `text` with `start..end` replaced by `with`.

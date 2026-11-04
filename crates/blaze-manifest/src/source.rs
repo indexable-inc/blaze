@@ -16,9 +16,9 @@ pub use blaze_source::{
 
 /// The source of the package whose manifest is at `manifest_path`: its directory.
 pub fn for_manifest_path(manifest_path: &Path) -> anyhow::Result<SourceId> {
-    let dir = manifest_path
-        .parent()
-        .ok_or_else(|| anyhow!("the manifest path `{}` has no directory", manifest_path.display()))?;
+    let dir = manifest_path.parent().ok_or_else(|| {
+        anyhow!("the manifest path `{}` has no directory", manifest_path.display())
+    })?;
     SourceId::for_path(dir)
 }
 
@@ -127,7 +127,8 @@ mod tests {
     /// (`src/cargo/core/source_id.rs`: a registry is ``registry `name` ``).
     #[test]
     fn a_package_reads_as_cargo_names_it() {
-        let crates_io = SourceId::for_alt_registry(&url(CRATES_IO_INDEX), CRATES_IO_REGISTRY).unwrap();
+        let crates_io =
+            SourceId::for_alt_registry(&url(CRATES_IO_INDEX), CRATES_IO_REGISTRY).unwrap();
         assert!(crates_io.is_crates_io());
         assert_eq!(id(crates_io), "a v1.2.3");
         let sparse = SourceId::for_registry(&url(CRATES_IO_HTTP_INDEX)).unwrap();

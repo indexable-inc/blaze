@@ -53,7 +53,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     }
     let db = cx.db();
     let body = analysis.body();
-    let limit = u64::try_from(cx.conf().int("large-box-threshold", DEFAULT_LIMIT as i64)).unwrap_or(DEFAULT_LIMIT);
+    let limit = u64::try_from(cx.conf().int("large-box-threshold", DEFAULT_LIMIT as i64))
+        .unwrap_or(DEFAULT_LIMIT);
     let arrays = cx.on(Implemented::LargeStackArrays).then(|| large_stack_arrays::limit(cx));
     let frames = cx.on(Implemented::LargeStackFrames).then(|| large_stack_frames::limit(cx));
     let large_move = cx.on_blaze(Lint::LargeMove);
@@ -62,7 +63,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let Expr::Call { args, .. } = expr else { continue };
         let [arg] = &*args else { continue };
         let Some(callee) = general_facts::callee(db, analysis, id) else { continue };
-        let boxed = callee.self_adt.is_some_and(|it| facts::adt_is(db, it, "alloc", "Box") || facts::adt_is(db, it, "std", "Box"));
+        let boxed = callee.self_adt.is_some_and(|it| {
+            facts::adt_is(db, it, "alloc", "Box") || facts::adt_is(db, it, "std", "Box")
+        });
         if callee.name != "new" || !boxed || callee.trait_.is_some() {
             continue;
         }
@@ -87,7 +90,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         if frames.is_some_and(|it| size > it) {
             continue;
         }
-        let place = matches!(body.expr(*arg), Expr::Path(_) | Expr::Field { .. } | Expr::Index { .. } | Expr::UnaryOp { .. });
+        let place = matches!(
+            body.expr(*arg),
+            Expr::Path(_) | Expr::Field { .. } | Expr::Index { .. } | Expr::UnaryOp { .. }
+        );
         if place && large_move {
             continue;
         }
@@ -128,7 +134,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 fn built_in_place(cx: &Cx<'_, '_>, arg: ExprId) -> bool {
     let Some(analysis) = cx.analysis() else { return false };
     let db = cx.db();
-    let plain = |id: ExprId| analysis.ty(analysis.infer().expr_ty(id)).drop_glue(db) == DropGlue::None;
+    let plain =
+        |id: ExprId| analysis.ty(analysis.infer().expr_ty(id)).drop_glue(db) == DropGlue::None;
     if !plain(arg) {
         return false;
     }
@@ -136,7 +143,9 @@ fn built_in_place(cx: &Cx<'_, '_>, arg: ExprId) -> bool {
         Expr::Call { callee, args } if general_facts::callee(db, analysis, arg).is_some() => {
             plain(callee) && args.iter().all(|&it| plain(it))
         }
-        Expr::MethodCall { receiver, args, .. } => plain(receiver) && args.iter().all(|&it| plain(it)),
+        Expr::MethodCall { receiver, args, .. } => {
+            plain(receiver) && args.iter().all(|&it| plain(it))
+        }
         _ => in_one_block(cx, arg),
     }
 }
@@ -157,8 +166,12 @@ fn in_one_block(cx: &Cx<'_, '_>, id: ExprId) -> bool {
     match body.expr(id) {
         Expr::Literal(_) => true,
         Expr::Path(_) => small(id),
-        Expr::Array(Array::Repeat { initializer, .. }) => small(initializer) && in_one_block(cx, initializer),
-        Expr::Array(Array::ElementList { elements }) => elements.iter().all(|&it| small(it) && in_one_block(cx, it)),
+        Expr::Array(Array::Repeat { initializer, .. }) => {
+            small(initializer) && in_one_block(cx, initializer)
+        }
+        Expr::Array(Array::ElementList { elements }) => {
+            elements.iter().all(|&it| small(it) && in_one_block(cx, it))
+        }
         Expr::Tuple { exprs } => exprs.iter().all(|&it| in_one_block(cx, it)),
         // A struct's fields are each built in their place; an enum variant's or a union's are
         // not, so they are small.
@@ -168,7 +181,9 @@ fn in_one_block(cx: &Cx<'_, '_>, id: ExprId) -> bool {
             fields.iter().all(|it| (fieldwise || small(it.expr)) && in_one_block(cx, it.expr))
         }
         Expr::Call { callee, args } => match constructor(cx, callee) {
-            Some(fieldwise) => args.iter().all(|&it| (fieldwise || small(it)) && in_one_block(cx, it)),
+            Some(fieldwise) => {
+                args.iter().all(|&it| (fieldwise || small(it)) && in_one_block(cx, it))
+            }
             None => false,
         },
         _ => false,

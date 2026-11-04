@@ -208,15 +208,25 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         let me = task(sched::job_here());
         let claim = loop {
             let waiter = Waiter::new();
-            let (number, runner) = match self.runs.ask(key, me, sched::innermost_scope(), &waiter, &mut claim_flight) {
+            let (number, runner) = match self.runs.ask(
+                key,
+                me,
+                sched::innermost_scope(),
+                &waiter,
+                &mut claim_flight,
+            ) {
                 Asked::Run(claim) => break claim,
                 Asked::Itself => {
-                    panic!("key {} is asked by the task that runs it: its value depends on itself", hex(&key))
+                    panic!(
+                        "key {} is asked by the task that runs it: its value depends on itself",
+                        hex(&key)
+                    )
                 }
                 Asked::Wait { flight, runner } => (flight, runner),
             };
             let left = Left { runs: &self.runs, key, waiter: &waiter };
-            let waiting = Waiting::begin(crate::wait::WaitKind::Key, &mut named, || Some(observed(runner)));
+            let waiting =
+                Waiting::begin(crate::wait::WaitKind::Key, &mut named, || Some(observed(runner)));
             let got = wait(&waiter, key, flight(number), &mut named);
             drop(waiting);
             drop(left);
@@ -237,13 +247,17 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         key: Key,
         run: impl FnOnce() -> Result<V, Cancelled>,
     ) -> Option<Result<V, Cancelled>> {
-        let claim = match self.runs.claim_if_idle(key, task(sched::job_here()), sched::innermost_scope()) {
-            Idle::Claimed(claim) => claim,
-            Idle::Busy => return None,
-            Idle::Itself => {
-                panic!("key {} is asked by the task that runs it: its value depends on itself", hex(&key))
-            }
-        };
+        let claim =
+            match self.runs.claim_if_idle(key, task(sched::job_here()), sched::innermost_scope()) {
+                Idle::Claimed(claim) => claim,
+                Idle::Busy => return None,
+                Idle::Itself => {
+                    panic!(
+                        "key {} is asked by the task that runs it: its value depends on itself",
+                        hex(&key)
+                    )
+                }
+            };
         let mut ending = Ending { runs: &self.runs, claim, ended: false };
         let result = run();
         ending.end(result.as_ref().ok());
@@ -270,14 +284,21 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     ///
     /// As [`Flights::hold`]: a second hold by the task that holds `key` is [`NotHeld::ByThisTask`]
     /// for the caller to name what it held twice, never a panic or a wait on itself.
-    pub fn hold_named(&self, key: Key, mut named: impl FnMut(&mut String)) -> Result<Held<'_, V>, NotHeld> {
+    pub fn hold_named(
+        &self,
+        key: Key,
+        mut named: impl FnMut(&mut String),
+    ) -> Result<Held<'_, V>, NotHeld> {
         let me = task(sched::job_here());
         let claim = match self.runs.claim_if_idle(key, me, sched::innermost_scope()) {
             Idle::Claimed(claim) => claim,
             Idle::Busy => return Err(NotHeld::Busy),
             Idle::Itself => return Err(NotHeld::ByThisTask),
         };
-        Ok(Held { run: Ending { runs: &self.runs, claim, ended: false }, _span: Waiting::holding(&mut named, me) })
+        Ok(Held {
+            run: Ending { runs: &self.runs, claim, ended: false },
+            _span: Waiting::holding(&mut named, me),
+        })
     }
 
     /// How many keys are running now.
@@ -474,7 +495,12 @@ impl Drop for Waiting {
 /// next ask (`sched::gave_way_on`).
 /// The runner writes every waiter's end before it ends the flight, so once the wait is over the
 /// end is there.
-fn wait<V>(waiter: &Waiter<V>, key: Key, flight: Key, named: &mut impl FnMut(&mut String)) -> Result<Option<V>, Cancelled> {
+fn wait<V>(
+    waiter: &Waiter<V>,
+    key: Key,
+    flight: Key,
+    named: &mut impl FnMut(&mut String),
+) -> Result<Option<V>, Cancelled> {
     if waiter.is_running()
         && let Err(cycle) = sched::wait(Wait::Key(flight))
     {
@@ -484,7 +510,9 @@ fn wait<V>(waiter: &Waiter<V>, key: Key, flight: Key, named: &mut impl FnMut(&mu
         sched::gave_way_on(key, asked.into_boxed_str(), flight, &cycle);
         return Err(give_way());
     }
-    Ok(waiter.ended().unwrap_or_else(|| unreachable!("a wait on a run's flight ended before the run wrote its waiters")))
+    Ok(waiter.ended().unwrap_or_else(|| {
+        unreachable!("a wait on a run's flight ended before the run wrote its waiters")
+    }))
 }
 
 fn hex(key: &Key) -> String {
@@ -556,7 +584,9 @@ mod tests {
                 flights.get_or_run(key(1_000_000), || panic!("the waiter ran a held key"))
             });
             until("the waiter to link itself", || flights.runs.waiters(&key(1_000_000)) == 1);
-            held.extend((1..1000u32).map(|n| flights.hold(key(1_000_000 + n)).expect("nobody holds it")));
+            held.extend(
+                (1..1000u32).map(|n| flights.hold(key(1_000_000 + n)).expect("nobody holds it")),
+            );
             let (buckets, _) = flights.runs.size();
             assert!(buckets > LEAST, "a thousand runs under way grew the table of {LEAST} buckets");
             for n in 0..20_000u32 {
@@ -597,7 +627,8 @@ mod tests {
         assert_eq!(flights.run_if_idle(key(1), || Ok(7)), Some(Ok(7)));
         let (started, finish) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
         let runner = std::thread::spawn({
-            let (flights, started, finish) = (Arc::clone(&flights), Arc::clone(&started), Arc::clone(&finish));
+            let (flights, started, finish) =
+                (Arc::clone(&flights), Arc::clone(&started), Arc::clone(&finish));
             move || {
                 flights.get_or_run(key(2), || {
                     started.wait();
@@ -669,7 +700,10 @@ mod tests {
     /// `WARM + 1` times, and what the waiter got. The two threads met before they are measured:
     /// a thread's first wait on another's run joins their schedulers, once
     /// ([`crate::sched::Scheduler`]).
-    fn miss_then_hit<V: Clone + Send + Sync + 'static>(flights: &Flights<V>, value: V) -> (Used, Used, V) {
+    fn miss_then_hit<V: Clone + Send + Sync + 'static>(
+        flights: &Flights<V>,
+        value: V,
+    ) -> (Used, Used, V) {
         const WARM: usize = 2;
         let at = key(1);
         let linked = || flights.runs.waiters(&at) > 0;
@@ -716,14 +750,22 @@ mod tests {
             miss_then_hit(&numbers, round);
         }
         let (runner, waiter, got) = miss_then_hit(&numbers, 99);
-        assert_eq!((runner.allocations, waiter.allocations, got), (0, 0, 99), "{runner:?} {waiter:?}");
+        assert_eq!(
+            (runner.allocations, waiter.allocations, got),
+            (0, 0, 99),
+            "{runner:?} {waiter:?}"
+        );
 
         let vectors = Flights::<Vec<u64>>::new();
         for round in 0..4 {
             miss_then_hit(&vectors, vec![round; 8]);
         }
         let (runner, waiter, got) = miss_then_hit(&vectors, vec![7; 8]);
-        assert_eq!((runner.allocations, waiter.allocations), (1, 0), "the runner clones for its one waiter");
+        assert_eq!(
+            (runner.allocations, waiter.allocations),
+            (1, 0),
+            "the runner clones for its one waiter"
+        );
         assert_eq!(got, vec![7; 8]);
         assert_eq!(vectors.running(), 0);
     }
@@ -773,19 +815,24 @@ mod tests {
     fn random_waits_end_and_run_each_key_once_at_a_time() {
         const KEYS: usize = 24;
         let topology = Topology {
-            cpus: (0..4).map(|id| Cpu { id, group: id / 2, socket: 0, node: 0, fast: true }).collect(),
+            cpus: (0..4)
+                .map(|id| Cpu { id, group: id / 2, socket: 0, node: 0, fast: true })
+                .collect(),
         };
         for seed in 0..12u64 {
             let mut rng = Rng::new(seed);
             let deps: Vec<Vec<usize>> = (0..KEYS)
                 .map(|at| {
                     let after = (KEYS - at - 1) as u64;
-                    (0..rng.below(4).min(after)).map(|_| at + 1 + rng.below(after) as usize).collect()
+                    (0..rng.below(4).min(after))
+                        .map(|_| at + 1 + rng.below(after) as usize)
+                        .collect()
                 })
                 .collect();
             let mut expected = vec![0u64; KEYS];
             for at in (0..KEYS).rev() {
-                expected[at] = at as u64 * 1000 + deps[at].iter().map(|&it| expected[it]).sum::<u64>();
+                expected[at] =
+                    at as u64 * 1000 + deps[at].iter().map(|&it| expected[it]).sum::<u64>();
             }
             let tasks: Vec<Vec<usize>> = (0..64)
                 .map(|_| (0..1 + rng.below(4)).map(|_| rng.below(KEYS as u64) as usize).collect())

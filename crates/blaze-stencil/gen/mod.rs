@@ -47,7 +47,8 @@ pub fn main(out: &Path) {
             match library {
                 Ok(bytes) => {
                     let path = out.join(variant.file());
-                    std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                    std::fs::write(&path, bytes)
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 }
                 Err(refusals) => refused.extend(refusals),
             }

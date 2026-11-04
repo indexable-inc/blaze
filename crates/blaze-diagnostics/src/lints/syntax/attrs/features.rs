@@ -61,7 +61,8 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner<'_>]) -> 
 /// incomplete or internal, the language ones first, each in the order written.
 fn incomplete_or_internal(cx: &Cx<'_, '_>, krate: &Owner<'_>, emitted: &mut Vec<Emitted>) {
     // alloc: setup, once per crate: the features of its root
-    let enabled: Vec<Named<'_>> = named(krate).filter(|it| table::removed(it.name).is_none()).collect();
+    let enabled: Vec<Named<'_>> =
+        named(krate).filter(|it| table::removed(it.name).is_none()).collect();
     let (lang, lib): (Vec<&Named<'_>>, Vec<&Named<'_>>) =
         enabled.iter().partition(|it| table::is_lang(it.name));
     for feature in lang.into_iter().chain(lib) {
@@ -71,7 +72,9 @@ fn incomplete_or_internal(cx: &Cx<'_, '_>, krate: &Owner<'_>, emitted: &mut Vec<
             let mut diag = Diag::lint(
                 "incomplete_features",
                 // alloc: the diagnostic's text, as is each below
-                format!("the feature `{name}` is incomplete and may not be safe to use and/or cause compiler crashes"),
+                format!(
+                    "the feature `{name}` is incomplete and may not be safe to use and/or cause compiler crashes"
+                ),
                 span,
             );
             if let Some(n) = table::issue(name) {
@@ -80,7 +83,9 @@ fn incomplete_or_internal(cx: &Cx<'_, '_>, krate: &Owner<'_>, emitted: &mut Vec<
             }
             if HAS_MIN_FEATURES.contains(&name) {
                 // alloc: as above
-                diag.help(format!("consider using `min_{name}` instead, which is more stable and complete"));
+                diag.help(format!(
+                    "consider using `min_{name}` instead, which is more stable and complete"
+                ));
             }
             diag
         } else if table::internal(name) {
@@ -145,7 +150,9 @@ fn features(list: ast::TokenTree<'_>) -> Vec<(&str, TextRange)> {
     for it in list.token_trees_and_tokens() {
         match it {
             NodeOrToken::Token(token) if token.kind().is_trivia() || is_delimiter(list, token) => {}
-            NodeOrToken::Token(token) if token.kind() == T![,] => items.push(std::mem::take(&mut item)),
+            NodeOrToken::Token(token) if token.kind() == T![,] => {
+                items.push(std::mem::take(&mut item))
+            }
             _ => item.push(it),
         }
     }
@@ -181,13 +188,16 @@ fn is_delimiter(list: ast::TokenTree<'_>, token: ast::Token<'_>) -> bool {
 fn is_meta_item(item: &[NodeOrToken<ast::TokenTree<'_>, ast::Token<'_>>]) -> bool {
     match item {
         [] => false,
-        [NodeOrToken::Token(token)] if token.kind().is_literal() || matches!(token.kind(), T![true] | T![false]) => true,
+        [NodeOrToken::Token(token)]
+            if token.kind().is_literal() || matches!(token.kind(), T![true] | T![false]) =>
+        {
+            true
+        }
         _ => {
-            let is_path = |it: &&NodeOrToken<ast::TokenTree<'_>, ast::Token<'_>>| {
-                matches!(it, NodeOrToken::Token(it) if is_ident(it.kind()) || matches!(it.kind(), T![:] | T![::]))
-            };
+            let is_path = |it: &&NodeOrToken<ast::TokenTree<'_>, ast::Token<'_>>| matches!(it, NodeOrToken::Token(it) if is_ident(it.kind()) || matches!(it.kind(), T![:] | T![::]));
             let path = item.iter().take_while(is_path).count();
-            let ends_in_ident = matches!(item[..path].last(), Some(NodeOrToken::Token(it)) if is_ident(it.kind()));
+            let ends_in_ident =
+                matches!(item[..path].last(), Some(NodeOrToken::Token(it)) if is_ident(it.kind()));
             if path == 0 || !ends_in_ident {
                 return false;
             }

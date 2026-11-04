@@ -19,11 +19,7 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
         } else {
             '='
         });
-        out.push(if chunk.len() > 2 {
-            B64_ALPHABET[(n & 0x3f) as usize] as char
-        } else {
-            '='
-        });
+        out.push(if chunk.len() > 2 { B64_ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
     }
     out
 }

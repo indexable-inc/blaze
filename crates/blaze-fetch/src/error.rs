@@ -77,13 +77,17 @@ impl fmt::Display for FetchError {
                     Failure::Transient(_) => "the last of",
                     Failure::Permanent(_) => "try",
                 };
-                let tries_said = if *tries == 1 { "1 try".to_owned() } else { format!("{tries} tries") }; // alloc: error path
-                write!(f, "fetching {from} (pinned {pin}) failed after {tries_said}; {how} them: {}", last.said())
+                let tries_said =
+                    if *tries == 1 { "1 try".to_owned() } else { format!("{tries} tries") }; // alloc: error path
+                write!(
+                    f,
+                    "fetching {from} (pinned {pin}) failed after {tries_said}; {how} them: {}",
+                    last.said()
+                )
             }
-            FetchError::WaitedTooLong { pin, waited } => write!(
-                f,
-                "another request was fetching {pin} and did not finish within {waited:?}"
-            ),
+            FetchError::WaitedTooLong { pin, waited } => {
+                write!(f, "another request was fetching {pin} and did not finish within {waited:?}")
+            }
             FetchError::NoLeader { pin, rounds } => write!(
                 f,
                 "the requests fetching {pin} finished {rounds} times without the store having it"
@@ -97,19 +101,17 @@ impl fmt::Display for FetchError {
             FetchError::Store { pin: None, what } => write!(f, "the store: {what}"),
             FetchError::Io { what, error } => write!(f, "{what}: {error}"),
             FetchError::Tree { from, refused } => write!(f, "{from}: {refused}"),
-            FetchError::NoGit { from } => write!(
-                f,
-                "{from} is a git source, and this fetcher was made with no git driver"
-            ),
+            FetchError::NoGit { from } => {
+                write!(f, "{from} is a git source, and this fetcher was made with no git driver")
+            }
             FetchError::TooBig { from, most } => write!(
                 f,
                 "{from} is longer than the limit of {most} bytes, so it was stopped and nothing of it was kept \
                  (`most_bytes` in the request raises it)"
             ),
-            FetchError::Length { object, expected, actual } => write!(
-                f,
-                "the store's {object} is {actual} bytes, and its index says {expected}"
-            ),
+            FetchError::Length { object, expected, actual } => {
+                write!(f, "the store's {object} is {actual} bytes, and its index says {expected}")
+            }
         }
     }
 }
@@ -125,7 +127,7 @@ pub fn redact(url: &str) -> String {
     let authority = rest.find('/').unwrap_or(rest.len());
     match rest[..authority].rfind('@') {
         Some(user) => format!("{scheme}{}", &rest[user + 1..]), // alloc: as above
-        None => url.to_owned(), // alloc: as above
+        None => url.to_owned(),                                 // alloc: as above
     }
 }
 
@@ -136,9 +138,14 @@ pub fn scrub(text: &str) -> String {
     let mut out = String::with_capacity(text.len()); // alloc: a message, once a message
     let mut rest = text;
     while let Some(at) = rest.find("://") {
-        let scheme = rest[..at].rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))).map_or(0, |it| it + 1);
+        let scheme = rest[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |it| it + 1);
         let end = rest[at..]
-            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '<' | '>' | '(' | ')' | '[' | ']'))
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '\'' | '"' | '`' | '<' | '>' | '(' | ')' | '[' | ']')
+            })
             .map_or(rest.len(), |it| at + it);
         out.push_str(&rest[..scheme]);
         out.push_str(&redact(&rest[scheme..end]));

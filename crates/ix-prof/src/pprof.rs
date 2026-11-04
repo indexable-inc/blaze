@@ -108,7 +108,8 @@ impl View {
             }
         }
         // Functions: one a (name, system name, file, start line).
-        let mut functions: BTreeMap<(&str, Option<&str>, Option<&str>, Option<u32>), u64> = BTreeMap::new();
+        let mut functions: BTreeMap<(&str, Option<&str>, Option<&str>, Option<u32>), u64> =
+            BTreeMap::new();
         for f in &self.frames {
             let next = functions.len() as u64 + 1;
             functions
@@ -124,7 +125,9 @@ impl View {
             let at = match (f.kind, &f.module, f.address) {
                 (FrameKind::Native, Some(module), Some(address)) => {
                     *by_address.entry((module.as_str(), address)).or_insert_with(|| {
-                        let mapping = mappings.get(&(module.as_str(), f.build_id.as_deref().unwrap_or(""))).copied();
+                        let mapping = mappings
+                            .get(&(module.as_str(), f.build_id.as_deref().unwrap_or("")))
+                            .copied();
                         locations.push((mapping, address, Vec::new()));
                         locations.len() - 1
                     })
@@ -193,7 +196,12 @@ impl View {
             levels.sort_by_key(|it| std::cmp::Reverse(it.inline_depth));
             for f in levels {
                 let mut line = Vec::new();
-                let fid = functions[&(f.function.as_str(), f.system_name.as_deref(), f.file.as_deref(), f.start_line)];
+                let fid = functions[&(
+                    f.function.as_str(),
+                    f.system_name.as_deref(),
+                    f.file.as_deref(),
+                    f.start_line,
+                )];
                 int(&mut line, 1, fid as i64);
                 int(&mut line, 2, i64::from(f.line.unwrap_or(0)));
                 int(&mut line, 3, i64::from(f.column.unwrap_or(0)));
@@ -210,7 +218,8 @@ impl View {
             int(&mut body, 5, i64::from(start_line.unwrap_or(0)));
             bytes(&mut out, 5, &body);
         }
-        let period = self.period.as_ref().map(|(vt, p)| (strings.id(&vt.name), strings.id(&vt.unit), *p));
+        let period =
+            self.period.as_ref().map(|(vt, p)| (strings.id(&vt.name), strings.id(&vt.unit), *p));
         let default = self.sample_types.get(self.default_type).map(|it| strings.id(&it.name));
         // The string table goes last so every id above is in it.
         let mut tail = Vec::new();
@@ -236,7 +245,8 @@ impl View {
     /// The view as a gzipped `profile.proto`, what `go tool pprof` reads.
     pub fn to_pprof(&self) -> Vec<u8> {
         let proto = self.to_pprof_proto();
-        let mut gz = flate2::GzBuilder::new().mtime(0).write(Vec::new(), flate2::Compression::default());
+        let mut gz =
+            flate2::GzBuilder::new().mtime(0).write(Vec::new(), flate2::Compression::default());
         gz.write_all(&proto).expect("writing to a Vec does not fail");
         gz.finish().expect("writing to a Vec does not fail")
     }
@@ -286,7 +296,10 @@ impl<'a> Wire<'a> {
     fn varint(&mut self) -> Result<u64, Error> {
         let mut v = 0u64;
         for shift in (0..64).step_by(7) {
-            let b = *self.buf.get(self.at).ok_or_else(|| Error("a varint runs past the end".to_owned()))?;
+            let b = *self
+                .buf
+                .get(self.at)
+                .ok_or_else(|| Error("a varint runs past the end".to_owned()))?;
             self.at += 1;
             v |= u64::from(b & 0x7f) << shift;
             if b < 0x80 {
@@ -318,7 +331,11 @@ impl<'a> Wire<'a> {
                 self.skip(4)?;
                 Value::Fixed
             }
-            w => return Err(Error(format!("field {field} has wire type {w}, which pprof does not use"))),
+            w => {
+                return Err(Error(format!(
+                    "field {field} has wire type {w}, which pprof does not use"
+                )));
+            }
         };
         Ok(Some((field, value)))
     }
@@ -354,7 +371,10 @@ fn as_int(v: &Value<'_>) -> u64 {
     }
 }
 
-fn message<'a>(b: &'a [u8], mut each: impl FnMut(u32, &Value<'a>) -> Result<(), Error>) -> Result<(), Error> {
+fn message<'a>(
+    b: &'a [u8],
+    mut each: impl FnMut(u32, &Value<'a>) -> Result<(), Error>,
+) -> Result<(), Error> {
     let mut w = Wire::new(b);
     while let Some((field, value)) = w.next()? {
         each(field, &value)?;
@@ -505,12 +525,9 @@ fn decode(proto: &[u8]) -> Result<View, Error> {
             .cloned()
             .ok_or_else(|| Error(format!("string index {i} is past the table's {}", strings.len())))
     };
-    let nonempty = |i: i64| -> Result<Option<String>, Error> { s(i).map(|it| (!it.is_empty()).then_some(it)) };
-    let mut view = View {
-        time_nanos: time,
-        duration_nanos: duration,
-        ..View::default()
-    };
+    let nonempty =
+        |i: i64| -> Result<Option<String>, Error> { s(i).map(|it| (!it.is_empty()).then_some(it)) };
+    let mut view = View { time_nanos: time, duration_nanos: duration, ..View::default() };
     for (t, u) in &sample_types {
         view.sample_types.push(ValueType { name: s(*t)?, unit: s(*u)? });
     }
@@ -539,7 +556,11 @@ fn decode(proto: &[u8]) -> Result<View, Error> {
             let system_name = nonempty(sys)?.filter(|it| *it != function);
             let kind = if module.is_some() { FrameKind::Native } else { FrameKind::Span };
             view.frames.push(Frame {
-                function: if function.is_empty() { format!("{:#x}", loc.address) } else { function },
+                function: if function.is_empty() {
+                    format!("{:#x}", loc.address)
+                } else {
+                    function
+                },
                 system_name,
                 file: nonempty(file)?,
                 line: (*line > 0).then_some(*line as u32),
@@ -566,9 +587,9 @@ fn decode(proto: &[u8]) -> Result<View, Error> {
     for (locs, values, labels) in samples {
         let mut stack = Vec::new();
         for loc in locs {
-            let ids = frames_of_location
-                .get(&loc)
-                .ok_or_else(|| Error(format!("a sample names location {loc}, which is not in the profile")))?;
+            let ids = frames_of_location.get(&loc).ok_or_else(|| {
+                Error(format!("a sample names location {loc}, which is not in the profile"))
+            })?;
             // Innermost first: the deepest inline level first.
             stack.extend(ids.iter().rev().copied());
         }

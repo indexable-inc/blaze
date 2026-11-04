@@ -49,12 +49,12 @@ use hir_def::{DefWithBodyId, deps::ImageStore};
 use parking_lot::Mutex;
 
 pub use facts::{BodyFacts, Classified, Step};
-pub use value::step_value;
 pub(crate) use infer::inference;
 #[cfg(test)]
 use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
 pub use mir::location_literals;
+pub use value::step_value;
 
 use crate::next_solver::goal_store::{FactRef, solver_version};
 use pending::{Counts, Offered, Pending, Tallies};
@@ -160,10 +160,15 @@ impl Store {
         let found = match self.find(db, def, step, &base) {
             None => Lookup::Miss,
             Some((found, answer_key)) => {
-                match record::open_answer(found.bytes(), &answer_key).and_then(|body| decode(&*self.facts, body)) {
+                match record::open_answer(found.bytes(), &answer_key)
+                    .and_then(|body| decode(&*self.facts, body))
+                {
                     Ok(value) => Lookup::Hit { value, verify: self.mode == Mode::Verify },
                     Err(why) => {
-                        self.fail(format_args!("the stored {} of {def:?} (answer {answer_key:x}): {why}", what(step)));
+                        self.fail(format_args!(
+                            "the stored {} of {def:?} (answer {answer_key:x}): {why}",
+                            what(step)
+                        ));
                         Lookup::Miss
                     }
                 }
@@ -175,30 +180,47 @@ impl Store {
 
     /// The answer record of the first slot of `base` whose facts hash the same now, and its
     /// answer key.
-    fn find(&self, db: &Db, def: DefWithBodyId, step: Step, base: &ContentId) -> Option<(hir_def::deps::ImageBuf, ContentId)> {
+    fn find(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        step: Step,
+        base: &ContentId,
+    ) -> Option<(hir_def::deps::ImageBuf, ContentId)> {
         for n in 0..SLOTS {
             let shape_key = record::shape_key(base, n);
             let shape = match self.images.get(&record::shape_at(step, &shape_key)) {
                 Ok(Some(shape)) => shape,
                 Ok(None) => return None,
                 Err(why) => {
-                    self.fail(format_args!("reading the shape of the {} of {def:?} in slot {n}: {why}", what(step)));
+                    self.fail(format_args!(
+                        "reading the shape of the {} of {def:?} in slot {n}: {why}",
+                        what(step)
+                    ));
                     return None;
                 }
             };
             let shape = match ShapeRef::open(shape.bytes(), base) {
                 Ok(shape) => shape,
                 Err(why) => {
-                    self.fail(format_args!("the shape of the {} of {def:?} in slot {n}: {why}", what(step)));
+                    self.fail(format_args!(
+                        "the shape of the {} of {def:?} in slot {n}: {why}",
+                        what(step)
+                    ));
                     return None;
                 }
             };
-            let Some(answer_key) = self.answer_key_now(db, def, &shape_key, shape) else { continue };
+            let Some(answer_key) = self.answer_key_now(db, def, &shape_key, shape) else {
+                continue;
+            };
             match self.images.get(&record::answer_at(step, &answer_key)) {
                 Ok(Some(found)) => return Some((found, answer_key)),
                 Ok(None) => {}
                 Err(why) => {
-                    self.fail(format_args!("reading the answer of the {} of {def:?} in slot {n}: {why}", what(step)));
+                    self.fail(format_args!(
+                        "reading the answer of the {} of {def:?} in slot {n}: {why}",
+                        what(step)
+                    ));
                     return None;
                 }
             }
@@ -315,7 +337,9 @@ impl Store {
     fn write(&self, entry: &pending::Entry<'_>) -> Result<Wrote, String> {
         let (step, def) = (entry.step, entry.def);
         // alloc: error text
-        let error = |doing: &str, why: String| format!("the item store: {doing} the {} of {def:?}: {why}", what(step));
+        let error = |doing: &str, why: String| {
+            format!("the item store: {doing} the {} of {def:?}: {why}", what(step))
+        };
         let mut wrote = Wrote::Kept;
         let mut slot = None;
         for n in 0..SLOTS {
@@ -334,7 +358,11 @@ impl Store {
                         slot = Some(shape_key);
                         break;
                     }
-                    Err(why) => match self.images.get(&at).map_err(|why| error("reading the shape of", why))? {
+                    Err(why) => match self
+                        .images
+                        .get(&at)
+                        .map_err(|why| error("reading the shape of", why))?
+                    {
                         Some(kept) if kept.bytes() == entry.shape => {
                             slot = Some(shape_key);
                             break;
@@ -427,8 +455,12 @@ static INSTALLED: AtomicUsize = AtomicUsize::new(0);
 /// The installed stores, each a `Box` of [`install`], freed through [`LIMBO`] once unlinked.
 static REGISTRY: [AtomicPtr<Store>; STORES] = [const { AtomicPtr::new(ptr::null_mut()) }; STORES];
 
-#[expect(clippy::disallowed_types, reason = "the process's one body store reclamation pool: all unlinked stores are retired together")]
-static LIMBO: std::sync::LazyLock<Mutex<Limbo>> = std::sync::LazyLock::new(|| Mutex::new(Limbo::new()));
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one body store reclamation pool: all unlinked stores are retired together"
+)]
+static LIMBO: std::sync::LazyLock<Mutex<Limbo>> =
+    std::sync::LazyLock::new(|| Mutex::new(Limbo::new()));
 
 /// Runs `f` on the item store of `db`, if one is installed.
 #[inline]
@@ -513,7 +545,12 @@ pub fn capture<R>(db: &Db, run: impl FnOnce() -> R) -> (R, Option<blaze_query::d
 /// `false`, so the check runs as without a store; a stored pass whose check fails is the build's
 /// error.
 #[inline]
-pub fn lookup_passed(db: &Db, def: DefWithBodyId, checker: &'static str, check: impl FnOnce() -> bool) -> bool {
+pub fn lookup_passed(
+    db: &Db,
+    def: DefWithBodyId,
+    checker: &'static str,
+    check: impl FnOnce() -> bool,
+) -> bool {
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return false;
     }
@@ -521,11 +558,18 @@ pub fn lookup_passed(db: &Db, def: DefWithBodyId, checker: &'static str, check: 
 }
 
 #[inline(never)]
-fn lookup_passed_in(db: &Db, def: DefWithBodyId, checker: &'static str, check: impl FnOnce() -> bool) -> bool {
-    let found = lookup(db, def, Step::Borrowck, passed_schema(checker), |_, bytes| match bytes.is_empty() {
-        true => Ok(()),
-        // alloc: the reason a record does not read
-        false => Err(String::from("a borrow check's answer with bytes")),
+fn lookup_passed_in(
+    db: &Db,
+    def: DefWithBodyId,
+    checker: &'static str,
+    check: impl FnOnce() -> bool,
+) -> bool {
+    let found = lookup(db, def, Step::Borrowck, passed_schema(checker), |_, bytes| {
+        match bytes.is_empty() {
+            true => Ok(()),
+            // alloc: the reason a record does not read
+            false => Err(String::from("a borrow check's answer with bytes")),
+        }
     });
     match found {
         Lookup::Off | Lookup::Miss => false,
@@ -543,7 +587,12 @@ fn lookup_passed_in(db: &Db, def: DefWithBodyId, checker: &'static str, check: i
 /// [`capture`], around the check): its verdict, for the flush to store. A failing verdict is
 /// never offered.
 #[inline]
-pub fn offer_passed(db: &Db, def: DefWithBodyId, checker: &'static str, reads: Option<blaze_query::db::Reads>) {
+pub fn offer_passed(
+    db: &Db,
+    def: DefWithBodyId,
+    checker: &'static str,
+    reads: Option<blaze_query::db::Reads>,
+) {
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -574,7 +623,8 @@ pub fn install(
         let _task = blaze_reclaim::enter();
         for slot in &REGISTRY {
             // SAFETY: as in `with_store`, under `_task`.
-            if unsafe { slot.load(Ordering::Acquire).as_ref() }.is_some_and(|it| it.nonce == nonce) {
+            if unsafe { slot.load(Ordering::Acquire).as_ref() }.is_some_and(|it| it.nonce == nonce)
+            {
                 // alloc: error text
                 return Err(String::from("this database has an item store installed already"));
             }
@@ -591,7 +641,10 @@ pub fn install(
         error: Mutex::new(None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
-        if slot.compare_exchange(ptr::null_mut(), store, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if slot
+            .compare_exchange(ptr::null_mut(), store, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
             INSTALLED.fetch_add(1, Ordering::Relaxed);
             // SAFETY: `Box::into_raw` never gives null.
             return Ok(Installed { at, store: unsafe { NonNull::new_unchecked(store) } });
@@ -652,15 +705,27 @@ impl Installed {
         // alloc: flush, once per build: one entry per step offered
         let entries: Vec<pending::Entry<'_>> = taken.iter().flat_map(pending::entries).collect();
         // alloc: flush, as above
-        #[expect(clippy::disallowed_types, reason = "body write results, set once per entry in this flush: not global")]
-        let results: Vec<std::sync::OnceLock<Result<Wrote, String>>> = entries.iter().map(|_| std::sync::OnceLock::new()).collect();
+        #[expect(
+            clippy::disallowed_types,
+            reason = "body write results, set once per entry in this flush: not global"
+        )]
+        let results: Vec<std::sync::OnceLock<Result<Wrote, String>>> =
+            entries.iter().map(|_| std::sync::OnceLock::new()).collect();
         store.images.for_each(entries.len(), &|at| {
             _ = results[at].set(store.write(&entries[at]));
         });
         let Tallies { refused, counts } = tallies;
         let Counts { unhashable, no_identity, unshareable, unencodable, dropped, steps } = counts;
-        let mut flushed =
-            Flushed { refused, unhashable, no_identity, unshareable, unencodable, dropped, steps, ..Flushed::default() };
+        let mut flushed = Flushed {
+            refused,
+            unhashable,
+            no_identity,
+            unshareable,
+            unencodable,
+            dropped,
+            steps,
+            ..Flushed::default()
+        };
         for result in results {
             let wrote = result.into_inner().unwrap_or_else(|| {
                 panic!("`ImageStore::for_each` did not run every task of an item store flush")

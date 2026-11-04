@@ -16,13 +16,20 @@ use base_db::Db;
 use blaze_ids::bits::BitSet;
 use either::Either;
 use hir::InFile;
-use hir_def::{CallableDefId, DefWithBodyId, FunctionId, GenericDefId, ItemContainerId, Lookup, hir::generics::GenericParams};
+use hir_def::{
+    CallableDefId, DefWithBodyId, FunctionId, GenericDefId, ItemContainerId, Lookup,
+    hir::generics::GenericParams,
+};
 use hir_ty::{
     ParamEnvAndCrate,
     db::HirDatabase,
-    mir::{BasicBlockId, MirBody, MirSpan, Operand, OperandKind, StoredPlace, Terminator, TerminatorKind},
+    mir::{
+        BasicBlockId, MirBody, MirSpan, Operand, OperandKind, StoredPlace, Terminator,
+        TerminatorKind,
+    },
     next_solver::{
-        CallableIdWrapper, DbInterner, GenericArg, GenericArgKind, GenericArgs, ParamEnv, Ty, TyKind, TypingMode,
+        CallableIdWrapper, DbInterner, GenericArg, GenericArgKind, GenericArgs, ParamEnv, Ty,
+        TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
@@ -49,13 +56,18 @@ pub(super) fn calls(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
     // alloc: empty, allocates nothing
     let Some(mir) = b.mir() else { return Vec::new() };
     let params = mir.param_locals.len();
-    if !has_terminator(mir, |it| matches!(it, TerminatorKind::Call { args, .. } if args.len() == params)) {
+    if !has_terminator(
+        mir,
+        |it| matches!(it, TerminatorKind::Call { args, .. } if args.len() == params),
+    ) {
         // alloc: empty, allocates nothing
         return Vec::new();
     }
     let types = Types::new(b, func);
     let trait_args = types.trait_args();
-    let trait_args = trait_args.as_ref().map_or(&[][..], |(args, count)| &args.as_slice()[..(*count).min(args.len())]);
+    let trait_args = trait_args
+        .as_ref()
+        .map_or(&[][..], |(args, count)| &args.as_slice()[..(*count).min(args.len())]);
     lint(b, search(mir, |terminator| types.calls_itself(mir, terminator, trait_args)))
 }
 
@@ -85,7 +97,9 @@ pub(super) fn drops(b: &BodyCx<'_, '_, '_>) -> Vec<Found> {
 /// Whether a block of `mir` ends in a terminator `kind` holds of: the one pass over the
 /// blocks that lets a body with no candidate skip building an inference context.
 fn has_terminator(mir: &MirBody<'_>, kind: impl Fn(&TerminatorKind) -> bool) -> bool {
-    mir.basic_blocks.iter().any(|(_, block)| block.terminator.as_ref().is_some_and(|it| kind(&it.kind)))
+    mir.basic_blocks
+        .iter()
+        .any(|(_, block)| block.terminator.as_ref().is_some_and(|it| kind(&it.kind)))
 }
 
 /// A function or method whose body type and match checked: rustc builds an error MIR of one
@@ -111,7 +125,11 @@ fn lint(b: &BodyCx<'_, '_, '_>, calls: Option<Vec<MirSpan>>) -> Vec<Found> {
     let Some(function) = ast::Fn::cast(node.value) else { return Vec::new() };
     let span = b.cx.span(InFile::new(node.file_id, signature_range_view(function)));
     // clone: a lint's span, for a lint found
-    let mut diag = Diag::lint("unconditional_recursion", "function cannot return without recursing", span.clone());
+    let mut diag = Diag::lint(
+        "unconditional_recursion",
+        "function cannot return without recursing",
+        span.clone(),
+    );
     diag.span_label(span, "cannot return without recursing");
     for site in sites {
         diag.span_label(site, "recursive call site");
@@ -165,7 +183,9 @@ fn search(mir: &MirBody<'_>, recursive: impl Fn(&Terminator) -> bool) -> Option<
         // rustc's `ignore_edge`: every successor but an unwind edge next to another one and the
         // imaginary edge of a `FalseEdge` (which `successors` leaves out).
         match &terminator.kind {
-            TerminatorKind::Call { target: None, cleanup: Some(cleanup), .. } => stack.push((*cleanup, false)),
+            TerminatorKind::Call { target: None, cleanup: Some(cleanup), .. } => {
+                stack.push((*cleanup, false))
+            }
             kind => stack.extend(kind.successors().into_iter().map(|it| (it, false))),
         }
     }
@@ -214,7 +234,9 @@ impl<'db> Types<'db> {
     /// arguments, which a call must have to call the same method: the identity arguments and
     /// how many of them are the trait's.
     fn trait_args(&self) -> Option<(GenericArgs<'db>, usize)> {
-        let ItemContainerId::TraitId(trait_) = self.func.lookup(self.db).container else { return None };
+        let ItemContainerId::TraitId(trait_) = self.func.lookup(self.db).container else {
+            return None;
+        };
         let count = GenericParams::of(self.db, trait_.into()).len();
         Some((GenericArgs::identity_for_item(self.interner, self.func.into()), count))
     }
@@ -236,31 +258,41 @@ impl<'db> Types<'db> {
     /// has, of the function itself once the method an impl gives is found, with the trait's
     /// arguments of its own. rustc's MIR has its regions erased, so a lifetime of the trait's
     /// identity arguments is never equal to the call's.
-    fn calls_itself(&self, mir: &MirBody<'db>, terminator: &Terminator, trait_args: &[GenericArg<'db>]) -> bool {
+    fn calls_itself(
+        &self,
+        mir: &MirBody<'db>,
+        terminator: &Terminator,
+        trait_args: &[GenericArg<'db>],
+    ) -> bool {
         let TerminatorKind::Call { func, args, .. } = &terminator.kind else { return false };
         if args.len() != mir.param_locals.len() {
             return false;
         }
         let Some(ty) = self.operand_ty(mir, func) else { return false };
-        let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(callee)), call_args) = ty.kind() else {
+        let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(callee)), call_args) =
+            ty.kind()
+        else {
             return false;
         };
-        let (Either::Left(callee), call_args) = self.db.lookup_impl_method(self.env, callee, call_args.skip_binder()) else {
+        let (Either::Left(callee), call_args) =
+            self.db.lookup_impl_method(self.env, callee, call_args.skip_binder())
+        else {
             return false;
         };
         callee == self.func
             && call_args.len() >= trait_args.len()
-            && trait_args
-                .iter()
-                .zip(call_args.iter())
-                .all(|(want, got)| !matches!(want.kind(), GenericArgKind::Lifetime(_)) && *want == got)
+            && trait_args.iter().zip(call_args.iter()).all(|(want, got)| {
+                !matches!(want.kind(), GenericArgKind::Lifetime(_)) && *want == got
+            })
     }
 
     /// The type `drop` of a `Drop` impl drops (`RecursiveDrop::drop_for`): what its one argument
     /// is a reference to. rustc's MIR has its regions erased, so a type with a lifetime in it is
     /// never equal to a dropped one, and is not looked for.
     fn drop_for(&self) -> Option<Ty<'db>> {
-        let ItemContainerId::ImplId(impl_) = self.func.lookup(self.db).container else { return None };
+        let ItemContainerId::ImplId(impl_) = self.func.lookup(self.db).container else {
+            return None;
+        };
         let trait_ = self.db.impl_trait(impl_)?.skip_binder().def_id.0;
         if Some(trait_) != self.interner.lang_items().Drop {
             return None;

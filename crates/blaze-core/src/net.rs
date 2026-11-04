@@ -27,7 +27,10 @@ use crate::{Address, RECV_MOST};
 pub(crate) enum Listener {
     /// `path` is the file it made and its identity, removed when it is dropped while the name
     /// is still that file; `None` for an inherited one.
-    Unix { listener: UnixListener, path: Option<(PathBuf, Made)> },
+    Unix {
+        listener: UnixListener,
+        path: Option<(PathBuf, Made)>,
+    },
     Tcp(TcpListener),
 }
 
@@ -127,9 +130,10 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
             }
             let temporary = crate::fs::temporary_next_to(&path);
             let listener = bind(&temporary)?;
-            let placed = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-                .and_then(|()| Made::of(&temporary))
-                .and_then(|made| std::fs::rename(&temporary, &path).map(|()| made));
+            let placed =
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+                    .and_then(|()| Made::of(&temporary))
+                    .and_then(|made| std::fs::rename(&temporary, &path).map(|()| made));
             let made = match placed {
                 Ok(made) => made,
                 Err(error) => {
@@ -163,8 +167,13 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
         let is = std::fs::metadata(tmp)?;
         // SAFETY: no pointers; the call cannot fail.
         let user = unsafe { libc::geteuid() };
-        if (is.uid() != user && is.uid() != 0) || (is.mode() & 0o002 != 0 && is.mode() & 0o1000 == 0) {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "another user can replace what is in it"));
+        if (is.uid() != user && is.uid() != 0)
+            || (is.mode() & 0o002 != 0 && is.mode() & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "another user can replace what is in it",
+            ));
         }
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "no directory to bind in"));
@@ -172,7 +181,8 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
         let dir = std::path::absolute(dir)?;
         std::fs::DirBuilder::new().mode(0o700).create(&short)?;
         let alias = short.join("d");
-        let bound = std::os::unix::fs::symlink(&dir, &alias).and_then(|()| UnixListener::bind(alias.join(name)));
+        let bound = std::os::unix::fs::symlink(&dir, &alias)
+            .and_then(|()| UnixListener::bind(alias.join(name)));
         _ = std::fs::remove_dir_all(&short);
         bound
     };
@@ -211,7 +221,13 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
         let mut len = size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: `value` and `len` are valid for writes of the sizes `len` says.
         let got = unsafe {
-            libc::getsockopt(copy.as_raw_fd(), libc::SOL_SOCKET, name, (&raw mut value).cast(), &raw mut len)
+            libc::getsockopt(
+                copy.as_raw_fd(),
+                libc::SOL_SOCKET,
+                name,
+                (&raw mut value).cast(),
+                &raw mut len,
+            )
         };
         if got < 0 {
             return Err(io::Error::last_os_error());
@@ -260,7 +276,10 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
 
 /// Whether the stream socket `fd` listens, by `SO_ACCEPTCONN` (`option` reads a socket option).
 #[cfg(not(target_os = "macos"))]
-fn accepting(_fd: &OwnedFd, option: impl Fn(libc::c_int) -> io::Result<libc::c_int>) -> io::Result<bool> {
+fn accepting(
+    _fd: &OwnedFd,
+    option: impl Fn(libc::c_int) -> io::Result<libc::c_int>,
+) -> io::Result<bool> {
     Ok(option(libc::SO_ACCEPTCONN)? != 0)
 }
 
@@ -270,7 +289,10 @@ fn accepting(_fd: &OwnedFd, option: impl Fn(libc::c_int) -> io::Result<libc::c_i
 /// `socket_fdinfo`; its type and family, read from the same description, are checked against
 /// what `getsockopt` says so a layout other than this one is an error, never a wrong answer.
 #[cfg(target_os = "macos")]
-fn accepting(fd: &OwnedFd, option: impl Fn(libc::c_int) -> io::Result<libc::c_int>) -> io::Result<bool> {
+fn accepting(
+    fd: &OwnedFd,
+    option: impl Fn(libc::c_int) -> io::Result<libc::c_int>,
+) -> io::Result<bool> {
     const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
     // `socket_fdinfo` is a 24-byte `proc_fileinfo`, then `socket_info`: a 136-byte
     // `vinfo_stat`, `soi_so` and `soi_pcb` (8 bytes each), then `soi_type`, `soi_protocol`,
@@ -285,21 +307,35 @@ fn accepting(fd: &OwnedFd, option: impl Fn(libc::c_int) -> io::Result<libc::c_in
     let pid = unsafe { libc::getpid() };
     // SAFETY: `info` is valid for writes of `size` bytes, and the call writes at most that.
     let got = unsafe {
-        libc::proc_pidfdinfo(pid, fd.as_raw_fd(), PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), size)
+        libc::proc_pidfdinfo(
+            pid,
+            fd.as_raw_fd(),
+            PROC_PIDFDSOCKETINFO,
+            info.as_mut_ptr().cast(),
+            size,
+        )
     };
     if got <= 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `info` is plain bytes, 2048 of them, all initialized.
-    let bytes = unsafe { std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), std::mem::size_of_val(&info)) };
-    let int = |at: usize| libc::c_int::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+    let bytes = unsafe {
+        std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), std::mem::size_of_val(&info))
+    };
+    let int =
+        |at: usize| libc::c_int::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
     if (got as usize) < OPTIONS + 2
         || int(TYPE) != option(libc::SO_TYPE)?
-        || int(FAMILY) != libc::AF_UNIX && int(FAMILY) != libc::AF_INET && int(FAMILY) != libc::AF_INET6
+        || int(FAMILY) != libc::AF_UNIX
+            && int(FAMILY) != libc::AF_INET
+            && int(FAMILY) != libc::AF_INET6
     {
-        return Err(io::Error::other("the kernel's description of the socket is not laid out as <sys/proc_info.h> says"));
+        return Err(io::Error::other(
+            "the kernel's description of the socket is not laid out as <sys/proc_info.h> says",
+        ));
     }
-    let options = libc::c_short::from_ne_bytes(bytes[OPTIONS..OPTIONS + 2].try_into().expect("2 bytes"));
+    let options =
+        libc::c_short::from_ne_bytes(bytes[OPTIONS..OPTIONS + 2].try_into().expect("2 bytes"));
     Ok(libc::c_int::from(options) & libc::SO_ACCEPTCONN != 0)
 }
 
@@ -307,7 +343,9 @@ fn not_connectable(at: &Address) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         // alloc: an error path.
-        format!("{at:?}: an inherited socket is listened on, never connected to; connect to its name"),
+        format!(
+            "{at:?}: an inherited socket is listened on, never connected to; connect to its name"
+        ),
     )
 }
 

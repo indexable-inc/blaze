@@ -248,6 +248,27 @@ impl<'a> EntityView<'a> {
         if self.is_alive() { self.w.name(self.id).unwrap_or_default() } else { String::new() }
     }
 
+    /// The entity's full path from the root, its ancestors' names joined by `.` as a script names it (`launch.intro.logo`;
+    /// `#123` for an unnamed one), for errors that name the thing.
+    #[must_use]
+    pub fn path(self) -> String {
+        if !self.is_alive() {
+            return format!("#{} (not alive)", self.id);
+        }
+        // SAFETY: live world and entity; flecs returns a string it allocated with its OS API, freed here with the same.
+        unsafe {
+            let p = sys::ecs_get_path_w_sep(self.w.as_ptr(), 0, self.id, c".".as_ptr(), core::ptr::null());
+            if p.is_null() {
+                return format!("#{}", self.id);
+            }
+            let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+            if let Some(free) = sys::ecs_os_api.free_ {
+                free(p.cast());
+            }
+            s
+        }
+    }
+
     /// Name the entity (unique among its parent's children; a prefab's named children are named on every instance too).
     /// Inside a system the name lands at the end of the system, as other writes do.
     pub fn set_name(self, name: &str) -> Self {

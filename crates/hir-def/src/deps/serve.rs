@@ -8,16 +8,15 @@
 //! A crate's image is under its key ([`keys`]) when it has no [`Reads`]; else under its key,
 //! the names it read (a slot's bytes) and their values ([`filed`]).
 
-use std::{
-    ops::Range,
-    sync::Arc,
-};
+use std::{ops::Range, sync::Arc};
 
 use base_db::{Crate, Db, Env};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
-use hir_expand::{InFile, MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id};
+use hir_expand::{
+    InFile, MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id,
+};
+use std::alloc::Global;
 use syntax::ast::HasName;
 
 use crate::{
@@ -122,8 +121,13 @@ pub struct Served {
 /// cover, so the image would be served where the crate resolves otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
-    /// Its def map depends on the macros of the session (`#[macro_export]` from a proc macro
-    /// crate of the session): what they expand to is not in the key.
+    /// Its def map's collection ran a proc-macro call whose output may depend on its session's
+    /// state (`StateUse::Session`: its crate's state is not known, or does not settle, or the
+    /// call was not shown to give the same from either state). An image is not refused for
+    /// what such a call read (each expansion states that: `ExpansionReads`), but because an
+    /// image's expansions are not run, so the session's state is not built for the calls of
+    /// the crate a later query expands (bodies), which would then run from another state than
+    /// rustc's. A stateless crate's calls, and a settled crate's shown ones, refuse nothing.
     SessionMacros,
     /// A procedural macro's expansion of it whose reads are not known, and why.
     ProcMacro { call: String, why: &'static str },
@@ -233,8 +237,12 @@ pub fn serve(
         .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
     // alloc: setup: one slot per crate, once per serve
-    #[expect(clippy::disallowed_types, reason = "fetched image results, set once per crate in a serve: not global")]
-    let found: Vec<std::sync::OnceLock<Fetched>> = order.iter().map(|_| std::sync::OnceLock::new()).collect();
+    #[expect(
+        clippy::disallowed_types,
+        reason = "fetched image results, set once per crate in a serve: not global"
+    )]
+    let found: Vec<std::sync::OnceLock<Fetched>> =
+        order.iter().map(|_| std::sync::OnceLock::new()).collect();
     {
         let db = &*db;
         images.for_each(order.len(), &|at| {
@@ -378,7 +386,11 @@ fn withdraw_moved(db: &mut Db, written: &base_db::Written<'_>) {
 /// The crates given an image or frozen bytes that `written` moved the files of, or of a crate
 /// they depend on: what [`withdraw_moved`] takes away.
 fn moved_served(db: &Db, written: &base_db::Written<'_>) -> Vec<Crate> {
-    if written.set.is_empty() && written.added.is_empty() && written.removed.is_empty() && written.roots.is_empty() {
+    if written.set.is_empty()
+        && written.added.is_empty()
+        && written.removed.is_empty()
+        && written.roots.is_empty()
+    {
         // alloc: none, an empty list
         return Vec::new();
     }
@@ -440,7 +452,11 @@ fn reaches_moved(
         return it;
     }
     let it = moved.contains(&krate)
-        || krate.data(db).dependencies.iter().any(|dep| reaches_moved(db, dep.crate_id, moved, memo));
+        || krate
+            .data(db)
+            .dependencies
+            .iter()
+            .any(|dep| reaches_moved(db, dep.crate_id, moved, memo));
     memo.insert(krate, it);
     it
 }
@@ -449,7 +465,8 @@ fn reaches_moved(
 /// maintainers go over the crate graph again: from here on each resolves as a fresh crate.
 fn withdraw(db: &mut Db, gone: &[Crate]) {
     // clone: what was served, once per write that withdraws an image
-    let mut images = DepImages::try_get(&*db).map(|it| (**it.images(&*db)).clone()).unwrap_or_default();
+    let mut images =
+        DepImages::try_get(&*db).map(|it| (**it.images(&*db)).clone()).unwrap_or_default();
     let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
     let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
     for krate in gone {
@@ -472,7 +489,7 @@ fn set_images(db: &mut Db, images: HashMap<Crate, Image, Global>) {
             it.set_images(db).with_durability(Durability::HIGH).to(images);
         }
         None => {
-            _ = DepImages::builder(images).durability(Durability::HIGH).new(db);
+            _ = DepImages::new(db, Durability::HIGH, images);
         }
     }
 }
@@ -614,7 +631,9 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
         }
     }
     let missing = def_map.diagnostics(db).iter().find_map(|it| match &it.kind {
-        DefDiagnosticKind::UnresolvedModule { ast, candidates } => Some((it.in_module, ast, candidates)),
+        DefDiagnosticKind::UnresolvedModule { ast, candidates } => {
+            Some((it.in_module, ast, candidates))
+        }
         _ => None,
     });
     if let Some((parent, ast, candidates)) = missing {
@@ -622,7 +641,8 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
             Some(name) => name.text().to_string(), // alloc: error text
             None => "_".to_owned(),                // alloc: error text
         };
-        let declared = InFile::new(ast.file_id, ast.to_range(db)).original_node_file_range_rooted(db);
+        let declared =
+            InFile::new(ast.file_id, ast.to_range(db)).original_node_file_range_rooted(db);
         let anchor = ast.file_id.original_file_respecting_includes(db).file_id(db);
         // alloc: why a crate is refused, once per refused crate
         let what = format!(
@@ -666,7 +686,10 @@ pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> O
                 format!("reads {}", shown_path(db, file))
             }
             // alloc: as above
-            Err(why) => format!("names a file no source root has ({})", why.kind().render_to_string(db).message),
+            Err(why) => format!(
+                "names a file no source root has ({})",
+                why.kind().render_to_string(db).message
+            ),
         };
         let name = match expander {
             hir_expand::builtin::EagerExpander::Include => "include!",
@@ -674,7 +697,8 @@ pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> O
             _ => "include_bytes!",
         };
         // alloc: as above
-        let what = format!("`{name}` of crate {} at {} {read}", krate.named(db), call_site(db, loc));
+        let what =
+            format!("`{name}` of crate {} at {} {read}", krate.named(db), call_site(db, loc));
         Err(Refused::OutsideSourceRoot { what })
     });
     refused.err()
@@ -683,7 +707,7 @@ pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> O
 /// The path the source root has `file` at, as an error shows it.
 fn shown_path(db: &Db, file: base_db::FileId) -> String {
     match db.path_for_file(file) {
-        Some(path) => path.to_string(), // alloc: error text
+        Some(path) => path.to_string(),                 // alloc: error text
         None => format!("{file:?}, which has no path"), // alloc: error text
     }
 }

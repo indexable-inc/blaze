@@ -43,9 +43,7 @@ impl GroupWidths<'_> {
 fn find_group(p: &SubPattern, g: u32) -> Option<&SubPattern> {
     for op in &p.data {
         let found = match op {
-            OpCode::Subpattern {
-                group: Some(id), p, ..
-            } if *id == g => Some(p),
+            OpCode::Subpattern { group: Some(id), p, .. } if *id == g => Some(p),
             OpCode::Subpattern { p, .. } | OpCode::AtomicGroup(p) => find_group(p, g),
             OpCode::Branch(alternatives) => alternatives.iter().find_map(|a| find_group(a, g)),
             OpCode::MaxRepeat { item, .. }
@@ -152,10 +150,7 @@ pub fn get_width_within(
     p: &SubPattern,
     groups: &[Option<(u64, Option<u64>)>],
 ) -> (u64, Option<u64>) {
-    let mut groups = GroupWidths {
-        widths: groups.to_vec(),
-        pattern: None,
-    };
+    let mut groups = GroupWidths { widths: groups.to_vec(), pattern: None };
     width_of(p, &mut groups)
 }
 
@@ -164,10 +159,7 @@ pub fn get_width_within(
 /// group is: the width of a lookbehind's body, which the parser requires
 /// to be one number, where the matcher starts it.
 pub fn get_width_in(p: &SubPattern, pattern: &SubPattern) -> (u64, Option<u64>) {
-    let mut groups = GroupWidths {
-        widths: Vec::new(),
-        pattern: Some(pattern),
-    };
+    let mut groups = GroupWidths { widths: Vec::new(), pattern: Some(pattern) };
     width_of(p, &mut groups)
 }
 

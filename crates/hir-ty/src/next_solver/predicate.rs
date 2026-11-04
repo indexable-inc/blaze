@@ -16,8 +16,7 @@ use smallvec::SmallVec;
 use crate::next_solver::{
     GenericArg, TraitIdWrapper, default_types, impl_foldable_for_interned_slice,
     impl_foldable_for_stored_type, impl_stored_interned, impl_stored_interned_slice,
-    interned_slice, interner::table,
-    persist,
+    interned_slice, interner::table, persist,
 };
 
 use super::{Binder, BoundVarKinds, DbInterner, Region, Ty};
@@ -432,10 +431,11 @@ impl<'db> rustc_type_ir::TypeSuperFoldable<DbInterner<'db>> for Clauses<'db> {
     ) -> Result<Self, F::Error> {
         let clauses = self.as_slice();
         let mut iter = clauses.iter().copied().enumerate();
-        let first_change = iter.by_ref().find_map(|(i, clause)| match clause.try_fold_with(folder) {
-            Ok(new) if new == clause => None,
-            new => Some((i, new)),
-        });
+        let first_change =
+            iter.by_ref().find_map(|(i, clause)| match clause.try_fold_with(folder) {
+                Ok(new) if new == clause => None,
+                new => Some((i, new)),
+            });
         match first_change {
             None => Ok(self),
             Some((_, Err(error))) => Err(error),
@@ -1029,8 +1029,8 @@ impl<'db> rustc_type_ir::inherent::Clause<DbInterner<'db>> for Clause<'db> {
 
 #[cfg(test)]
 mod tests {
-    use rustc_type_ir::inherent::Clause as _;
     use blaze_query::db::FromId;
+    use rustc_type_ir::inherent::Clause as _;
 
     use super::*;
     use crate::next_solver::{AliasTermKind, GenericArgs, TraitAssocTyId};
@@ -1064,7 +1064,9 @@ mod tests {
             well_formed: clause(ClauseKind::WellFormed(types.u8.into())),
             projection: clause(ClauseKind::Projection(ProjectionClause {
                 projection_term: AliasTerm::from_checked_parts(
-                    AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(id::<hir_def::TypeAliasId>(5)) },
+                    AliasTermKind::ProjectionTy {
+                        def_id: TraitAssocTyId::from(id::<hir_def::TypeAliasId>(5)),
+                    },
                     args,
                 ),
                 term: types.u8.into(),

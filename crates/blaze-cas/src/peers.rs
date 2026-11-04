@@ -23,8 +23,8 @@
 
 use blaze_core::{Done, Effect, FileName};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
+use std::alloc::Global;
 
 use crate::{Config, FAILURES_MOST, HEAD_FILE, Head, Op, Store, Tier};
 
@@ -85,7 +85,8 @@ impl Peers {
 /// The directory of `writer` in the shared directory `root`.
 fn writer_dir(root: &FileName, writer: &ContentId) -> FileName {
     // alloc: setup, once per store
-    FileName::new(&format!("{root}/{WRITER_PREFIX}{writer:x}")).expect("a writer's directory stays in the shared one")
+    FileName::new(&format!("{root}/{WRITER_PREFIX}{writer:x}"))
+        .expect("a writer's directory stays in the shared one")
 }
 
 impl Store {
@@ -110,7 +111,8 @@ impl Store {
             done: 0,
         };
         // alloc: empty, no layers: allocates nothing
-        let mut store = Store::new(Config { dir: own, layers: Vec::new(), tags: config.tags }, Some(peers));
+        let mut store =
+            Store::new(Config { dir: own, layers: Vec::new(), tags: config.tags }, Some(peers));
         store.ask_private(effects);
         store
     }
@@ -246,7 +248,8 @@ impl Store {
             Done::Entries(entries) => entries,
             done => {
                 // clone: the name of what failed, on an error path
-                let root = self.peers.as_ref().expect("a listing is of a shared store").root.clone();
+                let root =
+                    self.peers.as_ref().expect("a listing is of a shared store").root.clone();
                 if self.retry(&root, &done) {
                     let tag = self.tags.ask(Op::Peers);
                     effects.push(Effect::Entries { dir: root, tag });
@@ -267,7 +270,10 @@ impl Store {
                     // clone: the error that breaks the store
                     let root = peers.root.clone();
                     // alloc: the error that breaks the store
-                    return self.fail(root, format!("it holds more than {} writers' stores", TIERS_MOST - 1));
+                    return self.fail(
+                        root,
+                        format!("it holds more than {} writers' stores", TIERS_MOST - 1),
+                    );
                 }
                 None => {
                     let at = self.tiers.len();
@@ -328,4 +334,3 @@ impl Store {
         }
     }
 }
-

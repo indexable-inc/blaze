@@ -11,8 +11,7 @@
 use blaze_ids::bits::BitSet;
 use hir::InFile;
 use hir_lint_levels::{
-    Event, LevelCx, Levels, Malformed, SetId, Sink, Source,
-    attrs as front,
+    Event, LevelCx, Levels, Malformed, SetId, Sink, Source, attrs as front,
     builder::{COMMAND_LINE, ExpectId},
 };
 use syntax::{
@@ -75,7 +74,13 @@ pub(super) struct Said<'a, 'b, 'db> {
 impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
     pub(super) fn new(cx: &'a Cx<'b, 'db>) -> Self {
         // alloc: empty, allocates nothing
-        Said { cx, early: Vec::new(), lower: Vec::new(), hir: Vec::new(), fulfilled: BitSet::default() }
+        Said {
+            cx,
+            early: Vec::new(),
+            lower: Vec::new(),
+            hir: Vec::new(),
+            fulfilled: BitSet::default(),
+        }
     }
 
     pub(super) fn fulfill(&mut self, id: ExpectId) {
@@ -92,7 +97,16 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
 
     /// `diag` of a lint at its level in `set` as it is now (rustc's `emit_span_lint` from the
     /// builder), with `code` for its code when it has one of its own.
-    fn lint(&mut self, levels: &Levels<'db>, lcx: &LevelCx<'_, 'db>, set: SetId, pre: bool, place: Place, diag: Diag, code: Option<&str>) {
+    fn lint(
+        &mut self,
+        levels: &Levels<'db>,
+        lcx: &LevelCx<'_, 'db>,
+        set: SetId,
+        pre: bool,
+        place: Place,
+        diag: Diag,
+        code: Option<&str>,
+    ) {
         let name = diag.lint_name().expect("a lint's diagnostic");
         let lint = registry::lint(name).unwrap_or_else(|| panic!("no lint `{name}`"));
         let spec = levels.spec(lcx, lint, set);
@@ -121,9 +135,19 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
     }
 
     /// What rustc says of a name on the command line, `given` (`tool::` and `name`).
-    fn command_line(&mut self, levels: &Levels<'db>, lcx: &LevelCx<'_, 'db>, given: &str, tool: Option<&str>, name: &str, level: Level, checked: &Checked) {
+    fn command_line(
+        &mut self,
+        levels: &Levels<'db>,
+        lcx: &LevelCx<'_, 'db>,
+        given: &str,
+        tool: Option<&str>,
+        name: &str,
+        level: Level,
+        checked: &Checked,
+    ) {
         // alloc: a diagnostic's note, made only for one
-        let requested = || format!("requested on the command line with `{} {given}`", level.to_cmd_flag());
+        let requested =
+            || format!("requested on the command line with `{} {given}`", level.to_cmd_flag());
         let lint = |name: &str, message: String| {
             // alloc: a diagnostic's code
             Diag::new(crate::model::Level::Warning, Some(Code::Lint(name.to_owned())), message)
@@ -131,7 +155,10 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
         match checked {
             Checked::Renamed(new) => {
                 // alloc: a diagnostic's message
-                let mut diag = lint("renamed_and_removed_lints", format!("lint `{given}` has been renamed to `{new}`"));
+                let mut diag = lint(
+                    "renamed_and_removed_lints",
+                    format!("lint `{given}` has been renamed to `{new}`"),
+                );
                 // alloc: as above
                 diag.help(format!("use the new name `{new}`"));
                 diag.note(requested());
@@ -140,7 +167,10 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
             }
             Checked::Removed(reason) => {
                 // alloc: a diagnostic's message
-                let mut diag = lint("renamed_and_removed_lints", format!("lint `{given}` has been removed: {reason}"));
+                let mut diag = lint(
+                    "renamed_and_removed_lints",
+                    format!("lint `{given}` has been removed: {reason}"),
+                );
                 diag.note(requested());
                 // alloc: empty, allocates nothing
                 self.lint(levels, lcx, COMMAND_LINE, true, Vec::new(), diag, None);
@@ -148,10 +178,15 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
             Checked::NoLint { suggest } => {
                 // alloc: a diagnostic's message
                 let mut diag = lint("unknown_lints", format!("unknown lint: `{given}`"));
-                if *suggest && let Some((replace, from_rustc)) = registry::suggestion(&lcx.store, name, tool) {
+                if *suggest
+                    && let Some((replace, from_rustc)) =
+                        registry::suggestion(&lcx.store, name, tool)
+                {
                     diag.help(match from_rustc {
                         // alloc: as above
-                        true => format!("a lint with a similar name exists in `rustc` lints: `{replace}`"),
+                        true => format!(
+                            "a lint with a similar name exists in `rustc` lints: `{replace}`"
+                        ),
                         // alloc: as above
                         false => format!("did you mean: `{replace}`"),
                     });
@@ -164,7 +199,9 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
                 let mut diag = lint(
                     "renamed_and_removed_lints",
                     // alloc: a diagnostic's message
-                    format!("lint name `{given}` is deprecated and may not have an effect in the future"),
+                    format!(
+                        "lint name `{given}` is deprecated and may not have an effect in the future"
+                    ),
                 );
                 // alloc: as above
                 diag.help(format!("change it to {new}"));
@@ -217,10 +254,17 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
                 let mut diag = lint_diag(
                     "renamed_and_removed_lints",
                     // alloc: a diagnostic's message
-                    format!("lint name `{name}` is deprecated and may not have an effect in the future"),
+                    format!(
+                        "lint name `{name}` is deprecated and may not have an effect in the future"
+                    ),
                 );
                 // clone: the diagnostic's suggestion
-                diag.suggestion(span(), "change it to", new.clone(), Applicability::MachineApplicable);
+                diag.suggestion(
+                    span(),
+                    "change it to",
+                    new.clone(),
+                    Applicability::MachineApplicable,
+                );
                 self.lint(levels, lcx, set, false, self.place(node), diag, None);
             }
             Checked::NoTool => {
@@ -237,20 +281,27 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
             }
             Checked::Renamed(new) => {
                 // alloc: a diagnostic's message
-                let mut diag = lint_diag("renamed_and_removed_lints", format!("lint `{}` has been renamed to `{new}`", full()));
+                let mut diag = lint_diag(
+                    "renamed_and_removed_lints",
+                    format!("lint `{}` has been renamed to `{new}`", full()),
+                );
                 diag.suggestion(span(), "use the new name", *new, Applicability::MachineApplicable);
                 self.lint(levels, lcx, set, false, self.place(node), diag, None);
             }
             Checked::Removed(why) => {
                 // alloc: a diagnostic's message
-                let diag = lint_diag("renamed_and_removed_lints", format!("lint `{}` has been removed: {why}", full()));
+                let diag = lint_diag(
+                    "renamed_and_removed_lints",
+                    format!("lint `{}` has been removed: {why}", full()),
+                );
                 self.lint(levels, lcx, set, false, self.place(node), diag, None);
             }
             Checked::NoLint { suggest } => {
                 // alloc: a diagnostic's message
                 let mut diag = lint_diag("unknown_lints", format!("unknown lint: `{}`", full()));
                 if *suggest
-                    && let Some((replace, from_rustc)) = registry::suggestion(&lcx.store, name, tool.map(|(tool, _)| tool))
+                    && let Some((replace, from_rustc)) =
+                        registry::suggestion(&lcx.store, name, tool.map(|(tool, _)| tool))
                 {
                     let message = match from_rustc {
                         true => "a lint with a similar name exists in `rustc` lints",
@@ -266,7 +317,13 @@ impl<'a, 'b, 'db> Said<'a, 'b, 'db> {
 }
 
 impl<'db> Sink<'db> for Said<'_, '_, 'db> {
-    fn event(&mut self, levels: &Levels<'db>, lcx: &LevelCx<'_, 'db>, set: SetId, event: Event<'_, 'db>) {
+    fn event(
+        &mut self,
+        levels: &Levels<'db>,
+        lcx: &LevelCx<'_, 'db>,
+        set: SetId,
+        event: Event<'_, 'db>,
+    ) {
         let cx = self.cx;
         match event {
             Event::ForceWarnWarnings => {
@@ -293,7 +350,11 @@ impl<'db> Sink<'db> for Said<'_, '_, 'db> {
                 let place = self.place(node);
                 if levels.is_early() {
                     // clone: a diagnostic lowering gives too, once per malformed attribute
-                    self.lower.push(Emitted { when: When::Lower, place: place.clone(), diag: diag.clone() });
+                    self.lower.push(Emitted {
+                        when: When::Lower,
+                        place: place.clone(),
+                        diag: diag.clone(),
+                    });
                 }
                 self.push(levels, pre, place, diag);
             }
@@ -306,7 +367,8 @@ impl<'db> Sink<'db> for Said<'_, '_, 'db> {
                 };
                 let span = cx.span(*at);
                 // alloc: an error's message
-                let message = format!("{}({name}) incompatible with previous forbid", new.level.as_str());
+                let message =
+                    format!("{}({name}) incompatible with previous forbid", new.level.as_str());
                 let mut diag = match groups {
                     // clone: the error's span, used twice
                     true => Diag::lint("forbidden_lint_groups", message, span.clone()),
@@ -327,7 +389,9 @@ impl<'db> Sink<'db> for Said<'_, '_, 'db> {
                     }
                     Source::CommandLine { name, .. } => {
                         // alloc: an error's note
-                        diag.note(format!("`forbid` lint level was set on command line (`-F {name}`)"));
+                        diag.note(format!(
+                            "`forbid` lint level was set on command line (`-F {name}`)"
+                        ));
                     }
                 }
                 match groups {
@@ -354,9 +418,15 @@ impl<'db> Sink<'db> for Said<'_, '_, 'db> {
                 }
                 diag.help(match at {
                     // alloc: a warning's help
-                    None => format!("add `-Zcrate-attr=\"feature({})\"` to the command-line options to enable", feature.name),
+                    None => format!(
+                        "add `-Zcrate-attr=\"feature({})\"` to the command-line options to enable",
+                        feature.name
+                    ),
                     // alloc: as above
-                    Some(_) => format!("add `#![feature({})]` to the crate attributes to enable", feature.name),
+                    Some(_) => format!(
+                        "add `#![feature({})]` to the crate attributes to enable",
+                        feature.name
+                    ),
                 });
                 // alloc: a warning's note
                 diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
@@ -366,7 +436,10 @@ impl<'db> Sink<'db> for Said<'_, '_, 'db> {
             }
             Event::CrateLevelOnly { node, level, name, at } => {
                 // alloc: a warning's message
-                let message = format!("{}({name}) is ignored unless specified at crate level", level.as_str());
+                let message = format!(
+                    "{}({name}) is ignored unless specified at crate level",
+                    level.as_str()
+                );
                 let diag = Diag::lint("unused_attributes", message, cx.span(at));
                 self.lint(levels, lcx, set, false, self.place(node), diag, None);
             }
@@ -385,7 +458,11 @@ fn malformed(at: Span, label: &str) -> Diag {
 /// Where the HIR has the `#[expect]`s of `node`, for the order rustc checks them in
 /// (`ModuleItems::owners`): the crate, then free items, trait items, impl items and foreign
 /// items, each in order; the owner is the item `node` is in.
-pub(super) fn owner_rank<'db>(cx: &Cx<'_, 'db>, lcx: &LevelCx<'_, 'db>, node: InFile<ast::Node<'db>>) -> (u8, Place) {
+pub(super) fn owner_rank<'db>(
+    cx: &Cx<'_, 'db>,
+    lcx: &LevelCx<'_, 'db>,
+    node: InFile<ast::Node<'db>>,
+) -> (u8, Place) {
     let sema = &cx.vsema;
     let up = |at| front::parent(lcx.db, lcx.krate, at);
     let mut at = node;
@@ -397,10 +474,12 @@ pub(super) fn owner_rank<'db>(cx: &Cx<'_, 'db>, lcx: &LevelCx<'_, 'db>, node: In
         let around = up(at);
         if ast::Item::can_cast(kind) && kind != SyntaxKind::MACRO_CALL {
             let rank = match around.map(|it| it.value.kind()) {
-                Some(SyntaxKind::ASSOC_ITEM_LIST) => match around.and_then(up).map(|it| it.value.kind()) {
-                    Some(SyntaxKind::TRAIT) => 2,
-                    _ => 3,
-                },
+                Some(SyntaxKind::ASSOC_ITEM_LIST) => {
+                    match around.and_then(up).map(|it| it.value.kind()) {
+                        Some(SyntaxKind::TRAIT) => 2,
+                        _ => 3,
+                    }
+                }
                 Some(SyntaxKind::EXTERN_ITEM_LIST) => 4,
                 _ => 1,
             };

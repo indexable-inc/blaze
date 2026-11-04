@@ -63,9 +63,7 @@ enum FindIntegerState {
 
 impl FindInteger {
     pub(crate) fn new() -> Self {
-        FindInteger {
-            state: FindIntegerState::Linear(1),
-        }
+        FindInteger { state: FindIntegerState::Linear(1) }
     }
 
     /// The next value to evaluate the predicate at, or the converged
@@ -104,22 +102,14 @@ impl FindInteger {
             FindIntegerState::Grow { lo, hi } => Self::narrow_or_done(lo, hi),
             FindIntegerState::Narrow { lo, hi } => {
                 let mid = lo + (hi - lo) / 2;
-                if ok {
-                    Self::narrow_or_done(mid, hi)
-                } else {
-                    Self::narrow_or_done(lo, mid)
-                }
+                if ok { Self::narrow_or_done(mid, hi) } else { Self::narrow_or_done(lo, mid) }
             }
             FindIntegerState::Done(v) => FindIntegerState::Done(v),
         };
     }
 
     fn narrow_or_done(lo: usize, hi: usize) -> FindIntegerState {
-        if lo + 1 < hi {
-            FindIntegerState::Narrow { lo, hi }
-        } else {
-            FindIntegerState::Done(lo)
-        }
+        if lo + 1 < hi { FindIntegerState::Narrow { lo, hi } } else { FindIntegerState::Done(lo) }
     }
 }
 
@@ -138,9 +128,7 @@ enum BinSearchState<T> {
 
 impl BinSearchDown {
     pub(super) fn new(lo: i128, hi: i128) -> Self {
-        BinSearchDown {
-            state: BinSearchState::CheckLo { lo, hi },
-        }
+        BinSearchDown { state: BinSearchState::CheckLo { lo, hi } }
     }
 
     /// The next value to evaluate the predicate at, or the converged
@@ -174,11 +162,7 @@ impl BinSearchDown {
             BinSearchState::CheckLo { lo, hi } => Self::narrow_or_done(lo, hi),
             BinSearchState::Narrow { lo, hi } => {
                 let mid = lo + (hi - lo) / 2;
-                if ok {
-                    Self::narrow_or_done(lo, mid)
-                } else {
-                    Self::narrow_or_done(mid, hi)
-                }
+                if ok { Self::narrow_or_done(lo, mid) } else { Self::narrow_or_done(mid, hi) }
             }
             BinSearchState::Done(v) => BinSearchState::Done(v),
         };
@@ -203,9 +187,7 @@ pub(super) struct BinSearchDownBig {
 
 impl BinSearchDownBig {
     pub(super) fn new(lo: BigInt, hi: BigInt) -> Self {
-        BinSearchDownBig {
-            state: BinSearchState::CheckLo { lo, hi },
-        }
+        BinSearchDownBig { state: BinSearchState::CheckLo { lo, hi } }
     }
 
     /// The next value to evaluate the predicate at, or the converged
@@ -240,22 +222,14 @@ impl BinSearchDownBig {
                 BinSearchState::CheckLo { lo, hi } => Self::narrow_or_done(lo, hi),
                 BinSearchState::Narrow { lo, hi } => {
                     let mid = &lo + (&hi - &lo) / 2;
-                    if ok {
-                        Self::narrow_or_done(lo, mid)
-                    } else {
-                        Self::narrow_or_done(mid, hi)
-                    }
+                    if ok { Self::narrow_or_done(lo, mid) } else { Self::narrow_or_done(mid, hi) }
                 }
                 BinSearchState::Done(v) => BinSearchState::Done(v),
             };
     }
 
     fn narrow_or_done(lo: BigInt, hi: BigInt) -> BinSearchState<BigInt> {
-        if &lo + 1 < hi {
-            BinSearchState::Narrow { lo, hi }
-        } else {
-            BinSearchState::Done(hi)
-        }
+        if &lo + 1 < hi { BinSearchState::Narrow { lo, hi } } else { BinSearchState::Done(hi) }
     }
 }
 

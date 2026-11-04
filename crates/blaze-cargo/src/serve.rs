@@ -13,8 +13,8 @@
 //!   daemon ([`daemon::Failed`]).
 //! - It stops on `blaze stop` ([`blaze_api::Request::Stop`]) or SIGTERM, writing its image first.
 //! - It keeps the profile history in `<state>/profile` on the thread `blaze-history`, samples
-//!   its CPUs, and answers `blaze explore`, `blaze debug live` and `blaze debug sql --live`
-//!   itself ([`observe`]).
+//!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
+//!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
 mod daemon;
 mod fetch;
@@ -129,7 +129,9 @@ pub fn machine() -> anyhow::Result<PathBuf> {
     };
     // A relative one is taken against the current directory, as cargo takes its homes (review
     // round 6, C4).
-    std::path::absolute(&dir).with_context(|| format!("the machine's shared directory {} against the current directory", dir.display()))
+    std::path::absolute(&dir).with_context(|| {
+        format!("the machine's shared directory {} against the current directory", dir.display())
+    })
 }
 
 /// The content identity of the code that computes what the front end keeps in the store, and
@@ -210,7 +212,8 @@ pub struct RecordCode(pub blaze_ids::ContentId);
 impl RecordCode {
     /// Of the 64 hex digits `blaze_codegen_code::emit_all` sets `BLAZE_RECORD_CODE` to.
     pub fn from_hex(hex: &str) -> Result<RecordCode, String> {
-        code_of_hex(hex, "the code identity of what makes a unit's record", "BLAZE_RECORD_CODE").map(RecordCode)
+        code_of_hex(hex, "the code identity of what makes a unit's record", "BLAZE_RECORD_CODE")
+            .map(RecordCode)
     }
 }
 
@@ -266,7 +269,11 @@ pub struct RecordMakers {
 impl RecordMakers {
     /// The three as one ID: what the standard library's shared directory is named by.
     pub fn id(&self) -> blaze_ids::ContentId {
-        blaze_ids::Hasher::new(RECORD_MAKERS).id(&self.front_end).id(&self.codegen).id(&self.record).finish()
+        blaze_ids::Hasher::new(RECORD_MAKERS)
+            .id(&self.front_end)
+            .id(&self.codegen)
+            .id(&self.record)
+            .finish()
     }
 }
 
@@ -299,12 +306,15 @@ pub fn record_makers() -> Result<RecordMakers, String> {
 /// it ([`RecordMakers`]).
 pub fn build_of(exe: &Path) -> anyhow::Result<blaze_api::Build> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(exe).with_context(|| format!("reading blaze itself, {}", exe.display()))?;
+    let mut file = std::fs::File::open(exe)
+        .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
     let before = executable(exe, &file)?;
     let mut hasher = blaze_ids::Hasher::new("blaze v2 build id 1");
     let mut chunk = vec![0u8; 1 << 20]; // alloc: one buffer, once per start
     loop {
-        let read = file.read(&mut chunk).with_context(|| format!("reading blaze itself, {}", exe.display()))?;
+        let read = file
+            .read(&mut chunk)
+            .with_context(|| format!("reading blaze itself, {}", exe.display()))?;
         if read == 0 {
             break;
         }
@@ -318,15 +328,21 @@ pub fn build_of(exe: &Path) -> anyhow::Result<blaze_api::Build> {
 
 /// The open file `file` of `exe` as a [`blaze_api::Executable`]: what changes when its bytes do.
 pub fn executable(exe: &Path, file: &std::fs::File) -> anyhow::Result<blaze_api::Executable> {
-    let meta = file.metadata().with_context(|| format!("reading what blaze itself, {}, is", exe.display()))?;
-    let modified =
-        meta.modified().with_context(|| format!("the modification time of blaze itself, {}", exe.display()))?;
-    let modified_ns = modified.duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_nanos() as u64);
+    let meta = file
+        .metadata()
+        .with_context(|| format!("reading what blaze itself, {}, is", exe.display()))?;
+    let modified = meta
+        .modified()
+        .with_context(|| format!("the modification time of blaze itself, {}", exe.display()))?;
+    let modified_ns =
+        modified.duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_nanos() as u64);
     #[cfg(unix)]
     let inode = std::os::unix::fs::MetadataExt::ino(&meta);
     #[cfg(not(unix))]
     let inode = 0;
-    let path = exe.to_str().with_context(|| format!("blaze itself, {}, is not at a UTF-8 path", exe.display()))?;
+    let path = exe
+        .to_str()
+        .with_context(|| format!("blaze itself, {}, is not at a UTF-8 path", exe.display()))?;
     Ok(blaze_api::Executable { path: path.to_owned(), len: meta.len(), modified_ns, inode })
 }
 
@@ -341,7 +357,8 @@ fn writer_of(state: &Path) -> anyhow::Result<blaze_ids::ContentId> {
 pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
     let text = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
     let Some(rest) = text.strip_prefix('/') else { bail!("{text} is not an absolute path") };
-    FileName::new(rest.trim_end_matches('/')).with_context(|| format!("{text} has an empty, `.` or `..` part"))
+    FileName::new(rest.trim_end_matches('/'))
+        .with_context(|| format!("{text} has an empty, `.` or `..` part"))
 }
 
 #[cfg(feature = "native")]
@@ -361,12 +378,17 @@ struct Args {
 
 #[cfg(feature = "native")]
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
-    let mut parsed = Args { socket: None, http: None, activated: false, ready: None, stall: None, memory: None };
+    let mut parsed =
+        Args { socket: None, http: None, activated: false, ready: None, stall: None, memory: None };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        let arg = arg.into_string().map_err(|it| anyhow::anyhow!("{} is not UTF-8", it.to_string_lossy()))?;
+        let arg = arg
+            .into_string()
+            .map_err(|it| anyhow::anyhow!("{} is not UTF-8", it.to_string_lossy()))?;
         let (flag, inline) = match arg.split_once('=') {
-            Some((flag, value)) if flag.starts_with("--") => (flag.to_owned(), Some(value.to_owned())),
+            Some((flag, value)) if flag.starts_with("--") => {
+                (flag.to_owned(), Some(value.to_owned()))
+            }
             _ => (arg.clone(), None),
         };
         let mut value = || -> anyhow::Result<String> {
@@ -384,16 +406,21 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
             "--socket" => parsed.socket = Some(PathBuf::from(value()?)),
             "--ready-fd" => {
                 let fd = value()?;
-                parsed.ready = Some(fd.parse().with_context(|| format!("--ready-fd {fd} is no descriptor"))?);
+                parsed.ready =
+                    Some(fd.parse().with_context(|| format!("--ready-fd {fd} is no descriptor"))?);
             }
             "--http" => {
                 let at = value()?;
-                parsed.http = Some(at.parse().with_context(|| format!("--http {at} is no address and port"))?);
+                parsed.http = Some(
+                    at.parse().with_context(|| format!("--http {at} is no address and port"))?,
+                );
             }
             "--stall-bound" => {
                 let secs = value()?;
                 let bound = secs.parse::<u64>().ok().filter(|it| *it > 0).with_context(|| {
-                    format!("--stall-bound {secs}: the stall bound is a whole number of seconds above 0")
+                    format!(
+                        "--stall-bound {secs}: the stall bound is a whole number of seconds above 0"
+                    )
                 })?;
                 parsed.stall = Some(std::time::Duration::from_secs(bound));
             }
@@ -425,19 +452,26 @@ pub(crate) fn told_memory(what: &str, gb: &str) -> anyhow::Result<(u64, String)>
         .filter(|it| it.is_finite() && *it > 0.0)
         .map(|it| it * f64::from(1u32 << 30))
         .filter(|it| *it >= 1.0 && *it < u64::MAX as f64)
-        .with_context(|| format!("{what} {gb:?}: the memory the daemon runs under is a number of GiB above 0"))?;
+        .with_context(|| {
+            format!("{what} {gb:?}: the memory the daemon runs under is a number of GiB above 0")
+        })?;
     // alloc: the limit's name, once per daemon start
     Ok((bytes as u64, format!("{what}={}", gb.trim())))
 }
 
 /// The limit the engine was told: `--memory-gb`'s (`flag`), else [`MEMORY_VAR`]'s (`var`, as
 /// the environment has it), else none, when the budgets are the machine's.
-pub(crate) fn told_limit(flag: Option<(u64, String)>, var: Option<std::ffi::OsString>) -> anyhow::Result<Option<(u64, String)>> {
+pub(crate) fn told_limit(
+    flag: Option<(u64, String)>,
+    var: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<(u64, String)>> {
     if flag.is_some() {
         return Ok(flag);
     }
     let Some(var) = var else { return Ok(None) };
-    let text = var.into_string().map_err(|it| anyhow::anyhow!("{MEMORY_VAR} {} is not UTF-8", it.to_string_lossy()))?;
+    let text = var
+        .into_string()
+        .map_err(|it| anyhow::anyhow!("{MEMORY_VAR} {} is not UTF-8", it.to_string_lossy()))?;
     told_memory(MEMORY_VAR, &text).map(Some)
 }
 
@@ -586,7 +620,9 @@ impl std::fmt::Display for Before {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Before::None => f.write_str("no daemon ran on this state before it"),
-            Before::Stopped(pid) => write!(f, "the daemon before it on this state (pid {pid}) stopped"),
+            Before::Stopped(pid) => {
+                write!(f, "the daemon before it on this state (pid {pid}) stopped")
+            }
             Before::Ended(pid) => write!(
                 f,
                 "the daemon before it on this state (pid {pid}) ended without finishing its stop (killed, as an \
@@ -601,7 +637,10 @@ impl std::fmt::Display for Before {
 const STOPPED: &str = "stopped";
 
 #[cfg(unix)]
-fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<(stdx::file_lock::Locked, Before)> {
+fn hold(
+    state: &Path,
+    ready: Option<&mut std::fs::File>,
+) -> anyhow::Result<(stdx::file_lock::Locked, Before)> {
     use std::{
         io::{Read as _, Seek as _, Write as _},
         os::unix::fs::OpenOptionsExt as _,
@@ -645,18 +684,25 @@ fn hold(state: &Path, ready: Option<&mut std::fs::File>) -> anyhow::Result<(stdx
                 .with_context(|| format!("starting the thread that waits on {}", lock.display()))?;
             match word.recv_timeout(BEFORE_ENDS) {
                 Ok(Ok(file)) => file,
-                Ok(Err(error)) => bail!("locking the daemon's state at {}: {error}", lock.display()),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Err(StillRuns { pid, lock }.into()),
+                Ok(Err(error)) => {
+                    bail!("locking the daemon's state at {}: {error}", lock.display())
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    return Err(StillRuns { pid, lock }.into());
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    bail!("the thread waiting on the daemon's lock {} ended without a word", lock.display())
+                    bail!(
+                        "the thread waiting on the daemon's lock {} ended without a word",
+                        lock.display()
+                    )
                 }
             }
         }
     };
     let mut before = String::new();
-    file.rewind()
-        .and_then(|()| file.read_to_string(&mut before))
-        .with_context(|| format!("reading how the daemon before this one ended from its lock {}", lock.display()))?;
+    file.rewind().and_then(|()| file.read_to_string(&mut before)).with_context(|| {
+        format!("reading how the daemon before this one ended from its lock {}", lock.display())
+    })?;
     let before = Before::of(&before);
     file.set_len(0)
         .and_then(|()| file.rewind())
@@ -713,7 +759,9 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     };
     #[cfg(not(unix))]
     if args.activated {
-        bail!("blaze serve --activated: socket activation is systemd's and launchd's, and this system has neither");
+        bail!(
+            "blaze serve --activated: socket activation is systemd's and launchd's, and this system has neither"
+        );
     }
     // First too: nothing this process starts may inherit the pipe.
     #[cfg(unix)]
@@ -724,7 +772,8 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         None => None,
     };
     let socket = match args.socket {
-        Some(socket) => std::path::absolute(&socket).with_context(|| format!("the socket {}", socket.display()))?,
+        Some(socket) => std::path::absolute(&socket)
+            .with_context(|| format!("the socket {}", socket.display()))?,
         None => socket()?,
     };
     let mut ready = ready;
@@ -739,7 +788,8 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let engine = engine(serving, ready.as_mut())?;
     let mut running = start(engine, "blaze serve", ready.as_mut())?;
     // blaze's update check (docs/install.md, "Updates"), off the loop, for the daemon's life.
-    let _updates = crate::release::watch_updates().context("starting the daemon's update check thread")?;
+    let _updates =
+        crate::release::watch_updates().context("starting the daemon's update check thread")?;
     let ran = listen(&mut running.daemon, ready);
     let marked = match ran {
         Ok(()) => running.stopped(),
@@ -789,9 +839,13 @@ struct Held {
 
 /// The engine, its state found and held, its driver made, before it starts: `ready`, the pipe
 /// of `blaze serve --ready-fd`, hears if it waits for the engine before it on the same state.
-pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> anyhow::Result<Engine> {
+pub(crate) fn engine(
+    serving: Serving,
+    ready: Option<&mut std::fs::File>,
+) -> anyhow::Result<Engine> {
     let state = state()?;
-    std::fs::create_dir_all(&state).with_context(|| format!("making the daemon's state directory {}", state.display()))?;
+    std::fs::create_dir_all(&state)
+        .with_context(|| format!("making the daemon's state directory {}", state.display()))?;
     // Held until the engine ends: the next one on this state waits on it.
     #[cfg(unix)]
     let (lock, before) = hold(&state, ready)?;
@@ -802,7 +856,8 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     let stalls = state.join("stalls");
     std::fs::create_dir_all(&stalls).with_context(|| format!("making {}", stalls.display()))?;
     if let Some(parent) = serving.socket.as_deref().and_then(Path::parent) {
-        std::fs::create_dir_all(parent).with_context(|| format!("making the socket's directory {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("making the socket's directory {}", parent.display()))?;
     }
     let token = match serving.http {
         Some(_) => Some(
@@ -816,22 +871,34 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     let paths = Paths {
         state,
         socket: serving.socket,
-        launcher: std::env::current_exe().context("the path of blaze itself, which launches the sandbox")?,
+        launcher: std::env::current_exe()
+            .context("the path of blaze itself, which launches the sandbox")?,
     };
     // dyn: the sandbox's `Confine`, asked once per spawn
-    let confine: Arc<dyn Confine> = Arc::new(blaze_usercode::confine::Launcher { program: paths.launcher.clone() });
+    let confine: Arc<dyn Confine> =
+        Arc::new(blaze_usercode::confine::Launcher { program: paths.launcher.clone() });
     // The process's one budget (`BLAZE_CORES`), read as `blaze serve` started and its priority
     // lowered then ([`crate::cli::main`]): a command setting another is refused before any
     // request, with every other setting it differs in ([`settings`]).
-    let cores = blaze_core::cores::get().context("the number of cores the daemon's plane works on")?;
+    let cores =
+        blaze_core::cores::get().context("the number of cores the daemon's plane works on")?;
     tracing::info!(target: "blaze", "{cores}");
     let threads = cores.budget.get();
     // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
-    let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
-    let (profiling, keeper) = observe::keep_history(&paths.state, duckdb).map_err(|why| anyhow::anyhow!(why))?;
+    let duckdb =
+        observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
+    // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
+    // a value that names no level stops the daemon, naming it.
+    let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;
+    let (profiling, keeper) =
+        observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?;
     // Fixed for the daemon's life before any job: a build's tasks only read it.
-    let sysroot = crate::toolchain::sysroot()
-        .with_context(|| format!("blaze's toolchain ({}) is not on this machine: `blaze toolchain` installs it", crate::toolchain::name()))?;
+    let sysroot = crate::toolchain::sysroot().with_context(|| {
+        format!(
+            "blaze's toolchain ({}) is not on this machine: `blaze toolchain` installs it",
+            crate::toolchain::name()
+        )
+    })?;
     tracing::info!(sysroot = %sysroot.display(), "blaze's toolchain");
     // Which blaze this is, for clients to compare: no stored value is keyed by it.
     let build = build_of(&paths.launcher)?;
@@ -841,12 +908,17 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     // either writes there is made by the same code from the same inputs (AGENTS.md rule 22).
     let makers = record_makers().map_err(|why| anyhow::anyhow!(why))?;
     let std = machine()?.join("std").join(format!("{:x}", makers.id()));
-    std::fs::create_dir_all(&std).with_context(|| format!("making the standard library's shared directory {}", std.display()))?;
+    std::fs::create_dir_all(&std).with_context(|| {
+        format!("making the standard library's shared directory {}", std.display())
+    })?;
     // Its lease, held for the daemon's life: no collector, this daemon's or another
     // process's, renames the shared store away while this daemon may read or write it
     // (docs/gc.md, "Leases"). Its record says when a daemon last started on it.
-    let std_lease = blaze_gc::lease::Lease::hold(&std).map_err(|why| anyhow::anyhow!("the standard library's shared directory: {why}"))?;
-    if let Some(why) = blaze_gc::record::touch(&std, None, &[], blaze_gc::record::now_ns()).map_err(|why| anyhow::anyhow!(why))? {
+    let std_lease = blaze_gc::lease::Lease::hold(&std)
+        .map_err(|why| anyhow::anyhow!("the standard library's shared directory: {why}"))?;
+    if let Some(why) = blaze_gc::record::touch(&std, None, &[], blaze_gc::record::now_ns())
+        .map_err(|why| anyhow::anyhow!(why))?
+    {
         tracing::warn!(target: "blaze", dir = %std.display(), "the shared store's record did not read and was written afresh: {why}");
     }
     let host = crate::toolchain::host()
@@ -876,7 +948,8 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
         socket: paths.socket.as_deref().map(file_name).transpose()?,
         http: serving.http.zip(token),
         budget: Some(
-            blaze_graph::arena::machine_budget(1 << 30, told).context("the memory the daemon's tasks may hold")?,
+            blaze_graph::arena::machine_budget(1 << 30, told)
+                .context("the memory the daemon's tasks may hold")?,
         ),
         threads,
         io: 16,
@@ -906,6 +979,9 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     }
     signals::catch();
     signals::record_ends();
+    // After `record_ends`, which leaves a signal something handles alone: the crash record's
+    // handler goes in front of what is there and hands each signal on to it.
+    blaze_profile::crash::install();
     plane::record_panics();
     plane::record_alloc_failures();
     // Each query run is progress to the stall watchdog: a check inside queries for minutes is
@@ -931,7 +1007,9 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
         .confined(confine)
         .scratch(&scratch)
         // alloc: an error path
-        .with_context(|| format!("making {}, where each sandboxed spawn gets its directory", scratch.display()))?;
+        .with_context(|| {
+            format!("making {}, where each sandboxed spawn gets its directory", scratch.display())
+        })?;
     let held = Held {
         #[cfg(unix)]
         lock,
@@ -981,7 +1059,11 @@ impl Running {
 /// The engine's daemon started over its state, its store installed and its collector set:
 /// what `who` (`blaze serve`, or the one-shot build's `blaze`) says of the start goes to
 /// stderr, and `ready` hears each phase.
-pub(crate) fn start(engine: Engine, who: &str, mut ready: Option<&mut std::fs::File>) -> anyhow::Result<Running> {
+pub(crate) fn start(
+    engine: Engine,
+    who: &str,
+    mut ready: Option<&mut std::fs::File>,
+) -> anyhow::Result<Running> {
     let Engine { options, steps, runner, driver, keeper, held } = engine;
     match begin(driver, options, steps, runner, who, held.before, ready.as_deref_mut()) {
         Ok(daemon) => Ok(Running { daemon, keeper, held }),
@@ -1025,13 +1107,17 @@ fn begin(
     daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
     // under blaze's root and the shared stores of the machine's directory.
-    let root = builds()?.parent().map(std::path::Path::to_path_buf).context("blaze's build directories have no root")?;
+    let root = builds()?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .context("blaze's build directories have no root")?;
     // What no build dir may be or hold, made once here: one that does not make stops the start,
     // named (review round 6, C5).
     job::protected(&root).map_err(|why| anyhow::anyhow!("{who}: {why}"))?;
     // `<root>/gc.json` sets the levels of free space and whether the daemon collects on its
     // own; one that does not read stops the start.
-    let settings = blaze_gc::settings::GcSettings::read(&root, blaze_gc::pace::Levels::default()).map_err(|why| anyhow::anyhow!(why))?;
+    let settings = blaze_gc::settings::GcSettings::read(&root, blaze_gc::pace::Levels::default())
+        .map_err(|why| anyhow::anyhow!(why))?;
     if settings.auto {
         daemon.collect(gc::Gc::new(gc::areas(&root, &machine()?), &state()?, settings.levels));
     } else {
@@ -1045,7 +1131,10 @@ fn begin(
 
 /// `blaze serve`'s loop: the daemon listens, answers until it stops, and says how it stopped.
 #[cfg(feature = "native")]
-fn listen(daemon: &mut Daemon<blaze_core::Native, unit::Real>, mut ready: Option<std::fs::File>) -> anyhow::Result<()> {
+fn listen(
+    daemon: &mut Daemon<blaze_core::Native, unit::Real>,
+    mut ready: Option<std::fs::File>,
+) -> anyhow::Result<()> {
     // `start` bound the socket; a turn hears how the bind went, so a refused one stops here,
     // named, before the CLI is told it listens and connects at once.
     let turning = daemon.turn();
@@ -1053,7 +1142,10 @@ fn listen(daemon: &mut Daemon<blaze_core::Native, unit::Real>, mut ready: Option
         bail!("blaze serve: listening at {}: {why}", daemon.listening());
     }
     if !turning {
-        bail!("blaze serve: stopped in its first turn, before it listened at {}", daemon.listening());
+        bail!(
+            "blaze serve: stopped in its first turn, before it listened at {}",
+            daemon.listening()
+        );
     }
     // Armed before the CLI is told it listens: from then on a SIGTERM ends the daemon within
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn

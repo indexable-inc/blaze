@@ -23,6 +23,7 @@
 //!   span its `job` span names as its `creator` (a job given by a thread on no fiber, the
 //!   daemon's loop): the critical path crosses from a job's start to it.
 
+pub mod cpu;
 pub mod html;
 pub mod load;
 pub mod path;
@@ -59,12 +60,36 @@ pub struct SwitchIn {
     pub began_as: Option<u64>,
     /// `switches.queued_ns`: how long a `started` or `ran` job waited for a core before it began.
     pub queued_ns: Option<i64>,
+    /// `switches.cpu_ns`: the thread's CPU time read at the switch ([`cpu`]); `None` when not
+    /// read.
+    pub cpu_ns: Option<i64>,
 }
 
 impl SwitchIn {
     /// A row of `event` and nothing past the switch's own columns.
-    pub fn of(process: u32, thread: u32, t_ns: i64, event: Event, job: u64, fiber: u32, core: u32) -> SwitchIn {
-        SwitchIn { process, thread, t_ns, event, job, fiber, core, by: None, since_ns: None, began_as: None, queued_ns: None }
+    pub fn of(
+        process: u32,
+        thread: u32,
+        t_ns: i64,
+        event: Event,
+        job: u64,
+        fiber: u32,
+        core: u32,
+    ) -> SwitchIn {
+        SwitchIn {
+            process,
+            thread,
+            t_ns,
+            event,
+            job,
+            fiber,
+            core,
+            by: None,
+            since_ns: None,
+            began_as: None,
+            queued_ns: None,
+            cpu_ns: None,
+        }
     }
 }
 
@@ -74,7 +99,10 @@ pub enum Event {
     Started,
     /// Waiting for `on` and its value; [`WaitedOn::Moved`] is no wait, only a move to another
     /// core, so what follows it is queued time.
-    Parked { on: WaitedOn, value: u64 },
+    Parked {
+        on: WaitedOn,
+        value: u64,
+    },
     /// The parked job became runnable, woken by the row's `by`: from here to its resume it is
     /// queued.
     Ready,
@@ -110,11 +138,16 @@ impl Event {
             RAN => Event::Ran,
             PARKED => {
                 let (kind, value) = wait.ok_or_else(|| bad("a park with no wait_kind"))?;
-                let on = waited_on(kind).ok_or_else(|| bad("a park whose wait_kind is none the recorder writes"))?;
+                let on = waited_on(kind)
+                    .ok_or_else(|| bad("a park whose wait_kind is none the recorder writes"))?;
                 let value = match (on, value) {
                     (WaitedOn::Moved | WaitedOn::Nothing, _) => 0,
                     (_, Some(value)) => value,
-                    (_, None) => return Err(bad("a park on a job, key, counter or deadline with no wait_value")),
+                    (_, None) => {
+                        return Err(bad(
+                            "a park on a job, key, counter or deadline with no wait_value",
+                        ));
+                    }
                 };
                 Event::Parked { on, value }
             }
@@ -127,7 +160,10 @@ impl Event {
         match (event, waited) {
             (Switched::Parked, Some((on, value))) => Ok(Event::Parked { on, value }),
             // alloc: an error
-            (Switched::Parked, None) => Err(TimeError::BadSwitch { event: event.name().to_owned(), why: "a park with no wait" }),
+            (Switched::Parked, None) => Err(TimeError::BadSwitch {
+                event: event.name().to_owned(),
+                why: "a park with no wait",
+            }),
             (Switched::Started, _) => Ok(Event::Started),
             (Switched::Resumed, _) => Ok(Event::Resumed),
             (Switched::Ended, _) => Ok(Event::Ended),
@@ -152,9 +188,16 @@ impl Event {
 }
 
 fn waited_on(name: &str) -> Option<WaitedOn> {
-    [WaitedOn::Job, WaitedOn::Key, WaitedOn::Counter, WaitedOn::Until, WaitedOn::Moved, WaitedOn::Nothing]
-        .into_iter()
-        .find(|it| it.name() == name)
+    [
+        WaitedOn::Job,
+        WaitedOn::Key,
+        WaitedOn::Counter,
+        WaitedOn::Until,
+        WaitedOn::Moved,
+        WaitedOn::Nothing,
+    ]
+    .into_iter()
+    .find(|it| it.name() == name)
 }
 
 /// A span as the model takes it: the columns of `spans` it reads.
@@ -180,8 +223,8 @@ pub struct SpanIn {
     pub creator: Option<u64>,
     pub start_ns: i64,
     pub dur_ns: i64,
-    /// `spans.self_cpu_ns`: its job's CPU while it was open, less the spans under it; `None`
-    /// when not counted.
+    /// `spans.self_cpu_ns`: its CPU while it was the innermost span its thread was inside
+    /// ([`cpu`]); `None` when not counted.
     pub self_cpu_ns: Option<i64>,
     /// `spans.folded_ns`: its children too short for a row each ([`crate::flight::FOLD_BELOW`]),
     /// summed; 0 when none was. They ran inside it, so its uncovered time leaves them out.
@@ -194,22 +237,32 @@ pub const WAIT_SPAN: &str = "wait";
 /// The name of a job's root span ([`crate::span::Job`]): the span that names its job and creator.
 pub const JOB_SPAN: &str = <crate::span::Job as crate::span::Span>::NAME;
 
-/// Which of a build's spans [`load::rows`] read. One build can hold hundreds of millions of
-/// spans (192 million in build 24 of a 52-minute cold build, 2026-11-03), more than the model
-/// can hold, so past [`load::SPAN_BUDGET`] it reads the spans at or past `floor_ns`, every
-/// root [`JOB_SPAN`] and [`WAIT_SPAN`] and every span the record never ended, and none of the
-/// shorter ones. Taken by duration, the spans read keep every parent they have: a child lies
-/// inside its parent, so is never longer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Which of a build's spans the model read ([`load::modelled`]). One build can hold hundreds of
+/// millions of spans (240 million in build 9 of a 186-minute self-build, 2026-11-04), more than
+/// the model can hold, so past [`load::SPAN_BUDGET`] it reads, in a first pass, the spans at or
+/// past `floor_ns` and every span the record never ended; then, in a second, the spans of the
+/// lanes that first model's critical path crosses, down to their own floor ([`PathRead`]). Taken
+/// by duration, the spans read keep every parent they have: a child lies inside its parent, so is
+/// never longer. What the first pass left out of the root `job` spans and the `wait` spans is
+/// summed in DuckDB instead ([`CutGroup`]), so a report still says what they were.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpanCut {
-    /// The least duration of a span read; 0 when every span was.
+    /// The least duration of a span the first pass read; 0 when every span was.
     pub floor_ns: i64,
     /// The build's spans, all told.
     pub spans: u64,
-    /// Of them, those read.
+    /// Of them, those read, in both passes.
     pub read: u64,
-    /// The durations of those not read, summed: a nested one's time is also its parent's.
+    /// The durations of those the first pass did not read, summed: a nested one's time is also
+    /// its parent's.
     pub cut_ns: i64,
+    /// The second pass, over the critical path's lanes; `None` when nothing was cut.
+    pub path: Option<PathRead>,
+    /// The root `job` spans and the `wait` spans under `floor_ns` by name, crate and subject
+    /// (a job's function, a wait's `awaits`): the [`load::CUT_GROUPS`] that took the most time.
+    pub groups: Vec<CutGroup>,
+    /// The same spans by name alone, every one of them: `krate` and `subject` are `None`.
+    pub totals: Vec<CutGroup>,
 }
 
 impl SpanCut {
@@ -217,6 +270,38 @@ impl SpanCut {
     pub fn cut(&self) -> u64 {
         self.spans.saturating_sub(self.read)
     }
+}
+
+/// The second pass of [`SpanCut`]: the spans of the lanes the first model's critical path
+/// crossed, read under the first pass's floor down to `floor_ns`, so the path's work, its phases
+/// and the waits on it are named from every span its lanes hold (or every one past `floor_ns`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PathRead {
+    /// The least duration of a span read for the path's lanes; 0: all of them.
+    pub floor_ns: i64,
+    /// The lanes whose spans were read.
+    pub lanes: u64,
+    /// The spans the second pass added.
+    pub spans: u64,
+    /// Lanes on the final model's critical path whose spans the second pass did not read: the
+    /// first model's path did not cross them, or they passed [`load::PATH_STRETCHES`]. Their
+    /// spans are those past `SpanCut::floor_ns` alone.
+    pub lanes_unread: u64,
+}
+
+/// Spans the first pass of [`SpanCut`] did not read, summed in DuckDB: how many, their time, the
+/// longest and their CPU.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CutGroup {
+    /// [`JOB_SPAN`] or [`WAIT_SPAN`].
+    pub name: String,
+    pub krate: Option<String>,
+    /// A job span's function (its closure's type), a wait span's `awaits`.
+    pub subject: Option<String>,
+    pub spans: u64,
+    pub dur_ns: i64,
+    pub max_ns: i64,
+    pub self_cpu_ns: i64,
 }
 
 /// The name of a pool worker's span of its own work between jobs (`blaze_graph::pool::Driving`):
@@ -249,20 +334,44 @@ impl SpanIn {
     }
 }
 
-/// An event as the model takes it: the columns of `events` it reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An event as the model takes it: the columns of `events` it reads, and its rows of
+/// `event_fields`. A profiled process's part keeps its events so too.
+#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct EventIn {
     pub process: u32,
     pub thread: u32,
     pub t_ns: i64,
+    /// The build it was part of.
+    #[serde(default)]
+    pub build: Option<u64>,
     /// The job running on the thread, as a switch's `job` names it.
     pub job: Option<u64>,
     pub level: String,
     pub target: String,
     pub name: String,
+    /// Its message alone.
     pub message: Option<String>,
     /// The span it happened in, as a span's `span_id`.
     pub span: Option<u64>,
+    /// Its id in its process, as `events.event_id`.
+    #[serde(default)]
+    pub event_id: u64,
+    /// Its fields other than its message, in the order it recorded them: each key and value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, crate::logs::Value)>,
+}
+
+impl EventIn {
+    /// Its message, then each field as `key=value`: a label.
+    pub fn said(&self) -> String {
+        let message = self.message.as_deref().unwrap_or("(its text was let go)");
+        match self.fields.is_empty() {
+            // alloc: a label, once an event a report
+            true => message.to_owned(),
+            // alloc: a label, once an event a report
+            false => format!("{message} {}", crate::logs::fields_text(&self.fields)),
+        }
+    }
 }
 
 /// A build's rows.
@@ -299,6 +408,7 @@ impl Input {
                     since_ns: it.since_ns,
                     began_as: it.began_as,
                     queued_ns: it.queued_ns,
+                    cpu_ns: it.cpu_ns.map(|it| it as i64),
                 })
             })
             // alloc: the dump's switches, once a dump
@@ -327,6 +437,19 @@ impl Input {
                 folded_ns: it.folded_ns,
             });
         }
+        // alloc: the dump's fields by event, once a dump
+        let mut fields: HashMap<u64, Vec<(String, crate::logs::Value)>, Global> =
+            HashMap::new_in(Global);
+        for it in &read.fields {
+            let key = flight::meta(it.site)
+                .and_then(|meta| meta.fields().iter().nth(usize::from(it.index)))
+                .map_or("?", |it| it.name());
+            // alloc: a field, once a field a dump
+            fields
+                .entry(it.event_id)
+                .or_default()
+                .push((key.to_owned(), crate::logs::Value::of(it.value)));
+        }
         let events = read
             .events
             .iter()
@@ -336,6 +459,7 @@ impl Input {
                     process,
                     thread: it.thread,
                     t_ns: it.t_ns,
+                    build: (it.build != 0).then_some(u64::from(it.build)),
                     job: (it.job != 0).then_some(it.job),
                     // alloc: an event's labels, once an event a dump
                     level: meta.map_or("?", |it| it.level().as_str()).to_owned(),
@@ -343,6 +467,8 @@ impl Input {
                     name: meta.map_or("?", |it| it.name()).to_owned(),
                     message: text(it.message),
                     span: (it.span != 0).then_some(it.span),
+                    event_id: it.event_id,
+                    fields: fields.remove(&it.event_id).unwrap_or_default(),
                 }
             })
             // alloc: the dump's events, once a dump
@@ -356,24 +482,57 @@ pub enum TimeError {
     /// The history has no build that ended or whose daemon died.
     NoBuild,
     /// The build has no switch and no span.
-    Empty { build: u64 },
+    Empty {
+        build: u64,
+    },
     /// A `switches` row the model can't read.
-    BadSwitch { event: String, why: &'static str },
+    BadSwitch {
+        event: String,
+        why: &'static str,
+    },
     /// A column of the rows read is missing or of a type the reader does not take.
-    BadColumn { table: &'static str, column: &'static str, why: &'static str },
+    BadColumn {
+        table: &'static str,
+        column: &'static str,
+        why: &'static str,
+    },
     /// DuckDB's query over the history failed.
-    Sql { doing: &'static str, error: crate::sql::SqlError },
+    Sql {
+        doing: &'static str,
+        error: crate::sql::SqlError,
+    },
     /// A derived table's batch could not be made.
-    Arrow { table: &'static str, error: arrow_schema::ArrowError },
+    Arrow {
+        table: &'static str,
+        error: arrow_schema::ArrowError,
+    },
     /// A derived table could not be written into the history.
     History(crate::history::HistoryError),
-    Io { path: std::path::PathBuf, doing: &'static str, error: std::io::Error },
+    /// The rows of a daemon that died could not be read back from its flight recorder's
+    /// mapping, or written into the history ([`crate::history::recover_dead`]).
+    Postmortem(crate::history::HistoryError),
+    Io {
+        path: std::path::PathBuf,
+        doing: &'static str,
+        error: std::io::Error,
+    },
     /// The rows of build `build` come from more than one process: each daemon numbered a build
     /// so in one history. Read as one build, their workers and windows would be summed.
-    ManyProcesses { build: u64, processes: Vec<OfProcess> },
+    ManyProcesses {
+        build: u64,
+        processes: Vec<OfProcess>,
+    },
     /// Build `build` holds more spans than the model reads ([`load::SPAN_BUDGET`]) even at the
-    /// highest floor tried: `read` at `floor_ns`, of `spans`.
-    TooManySpans { build: u64, spans: u64, read: u64, floor_ns: i64, budget: u64 },
+    /// highest floor tried: `read` at `floor_ns`, of `spans`. The highest floor keeps only the
+    /// spans the record never ended (a few for each thread), so this is the hard bound, not a
+    /// size a build reaches: every other span is read past a floor or summed in DuckDB.
+    TooManySpans {
+        build: u64,
+        spans: u64,
+        read: u64,
+        floor_ns: i64,
+        budget: u64,
+    },
 }
 
 /// A process's rows of a build ([`TimeError::ManyProcesses`]): how many, and from when to when.
@@ -388,20 +547,48 @@ pub struct OfProcess {
 impl fmt::Display for TimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TimeError::NoBuild => f.write_str("the history has no build that ended or whose daemon died: name one with --build"),
-            TimeError::Empty { build } => write!(f, "build {build} has no switch and no span in the history"),
-            TimeError::BadSwitch { event, why } => write!(f, "a switches row of event `{event}` can't be read: {why}"),
-            TimeError::BadColumn { table, column, why } => write!(f, "the column {table}.{column} {why}"),
+            TimeError::NoBuild => f.write_str(
+                "the history has no build that ended or whose daemon died: name one with --build",
+            ),
+            TimeError::Empty { build } => {
+                write!(f, "build {build} has no switch and no span in the history")
+            }
+            TimeError::BadSwitch { event, why } => {
+                write!(f, "a switches row of event `{event}` can't be read: {why}")
+            }
+            TimeError::BadColumn { table, column, why } => {
+                write!(f, "the column {table}.{column} {why}")
+            }
             TimeError::Sql { doing, error } => write!(f, "{doing}: {error}"),
-            TimeError::Arrow { table, error } => write!(f, "making the rows of the derived table {table}: {error}"),
-            TimeError::History(error) => write!(f, "writing a derived table into the history: {error}"),
-            TimeError::Io { path, doing, error } => write!(f, "{doing} {}: {error}", path.display()),
+            TimeError::Arrow { table, error } => {
+                write!(f, "making the rows of the derived table {table}: {error}")
+            }
+            TimeError::History(error) => {
+                write!(f, "writing a derived table into the history: {error}")
+            }
+            TimeError::Postmortem(error) => {
+                write!(f, "reading back the last rows of a daemon that died: {error}")
+            }
+            TimeError::Io { path, doing, error } => {
+                write!(f, "{doing} {}: {error}", path.display())
+            }
             TimeError::ManyProcesses { build, processes } => {
-                write!(f, "build {build}'s rows come from {} processes, so they are no one build:", processes.len())?;
+                write!(
+                    f,
+                    "build {build}'s rows come from {} processes, so they are no one build:",
+                    processes.len()
+                )?;
                 for (i, it) in processes.iter().enumerate() {
                     let secs = |ns: i64| ns as f64 / 1e9;
                     let sep = if i == 0 { " " } else { "; " };
-                    write!(f, "{sep}pid {} wrote {} rows from {:.1} s to {:.1} s", it.process, it.rows, secs(it.from_ns), secs(it.to_ns))?;
+                    write!(
+                        f,
+                        "{sep}pid {} wrote {} rows from {:.1} s to {:.1} s",
+                        it.process,
+                        it.rows,
+                        secs(it.from_ns),
+                        secs(it.to_ns)
+                    )?;
                 }
                 write!(
                     f,
@@ -412,9 +599,9 @@ impl fmt::Display for TimeError {
             }
             TimeError::TooManySpans { build, spans, read, floor_ns, budget } => write!(
                 f,
-                "build {build} has {spans} spans, and even taking only those of {:.1} s or more, every root job and wait \
-                 span and every unended one, the model would hold {read}, past its bound of {budget} \
-                 (time::load::SPAN_BUDGET): read it with `blaze debug sql` over the spans view instead",
+                "build {build} has {spans} spans, and even taking only those of {:.1} s or more and every unended one, \
+                 the model would hold {read}, past its bound of {budget} (time::load::SPAN_BUDGET): so many spans the \
+                 record never ended is a recorder bug; read the build with `blaze debug sql` over the spans view",
                 *floor_ns as f64 / 1e9
             ),
         }
@@ -554,7 +741,9 @@ impl State {
 
     pub fn wait(self) -> Option<usize> {
         match self {
-            State::Parked { wait } | State::Queued { wait } | State::ParkedOrQueued { wait } => Some(wait),
+            State::Parked { wait } | State::Queued { wait } | State::ParkedOrQueued { wait } => {
+                Some(wait)
+            }
             State::Running { .. } | State::Unrecorded { .. } => None,
         }
     }
@@ -875,11 +1064,25 @@ pub struct Model {
 impl Model {
     /// The model of `input`.
     pub fn build(input: Input) -> Result<Model, TimeError> {
-        let Input { build, build_row, mut switches, spans, mut events } = input;
-        let bounds = bounds(build, build_row, &switches, &spans)?;
+        let Input { build, build_row, mut switches, spans, events } = input;
+        Model::of(build, build_row, &mut switches, spans, events)
+    }
+
+    /// The model of a build's rows, with `switches` sorted in place and left to the caller, so a
+    /// second model of the same switches and other spans needs no second read of them
+    /// ([`load::modelled`]).
+    pub fn of(
+        build: u64,
+        build_row: Option<(i64, i64)>,
+        switches: &mut [SwitchIn],
+        spans: Vec<SpanIn>,
+        mut events: Vec<EventIn>,
+    ) -> Result<Model, TimeError> {
+        let bounds = bounds(build, build_row, switches, &spans)?;
         switches.sort_by_key(|it| (it.process, it.t_ns, it.event.rank()));
-        let threads = thread_rows(&switches);
-        let workers = workers(&switches, bounds);
+        let switches: &[SwitchIn] = switches;
+        let threads = thread_rows(switches);
+        let workers = workers(switches, bounds);
         let mut builder = Builder {
             bounds,
             threads,
@@ -895,7 +1098,7 @@ impl Model {
             began_as: Vec::new(),
             anomalies: Anomalies::default(),
         };
-        builder.job_lanes(&switches);
+        builder.job_lanes(switches);
         let ready_by = std::mem::take(&mut builder.ready_by);
         let spawned_by = std::mem::take(&mut builder.spawned_by);
         let mut model = builder.finish(build, spans, workers);
@@ -915,19 +1118,33 @@ impl Model {
     /// Puts each event on its lane: the job its row names, else its span's, else its thread's.
     fn lay_events(&mut self, events: Vec<EventIn>) {
         // alloc: once a model with events
-        let spans: HashMap<(u32, u64), usize, Global> =
-            if events.is_empty() { HashMap::new_in(Global) } else { self.spans.iter().enumerate().map(|(i, it)| ((it.process, it.span_id), i)).collect() };
+        let spans: HashMap<(u32, u64), usize, Global> = if events.is_empty() {
+            HashMap::new_in(Global)
+        } else {
+            self.spans.iter().enumerate().map(|(i, it)| ((it.process, it.span_id), i)).collect()
+        };
         self.event_lane = events
             .iter()
             .map(|it| {
                 it.job
                     .and_then(|job| self.job_lane(it.process, job))
-                    .or_else(|| it.span.and_then(|span| spans.get(&(it.process, span))).and_then(|&i| self.span_time[i].lane))
-                    .or_else(|| self.lane(LaneId::Thread { process: it.process, thread: it.thread }))
+                    .or_else(|| {
+                        it.span
+                            .and_then(|span| spans.get(&(it.process, span)))
+                            .and_then(|&i| self.span_time[i].lane)
+                    })
+                    .or_else(|| {
+                        self.lane(LaneId::Thread { process: it.process, thread: it.thread })
+                    })
             })
             // alloc: once a model
             .collect();
         self.events = events;
+    }
+
+    /// Its spans, the rest let go: a second model of the same build takes them ([`load::modelled`]).
+    pub fn into_spans(self) -> Vec<SpanIn> {
+        self.spans
     }
 
     /// The lane `id`, if the model has it.
@@ -1001,7 +1218,13 @@ impl Model {
             (idle, queued, at) = (idle + i64::from(d_idle), queued + i64::from(d_queued), t);
         }
         let workers = u32::try_from(self.workers.len()).unwrap_or(u32::MAX);
-        IdleWithWork { workers, wall_ns: self.bounds.wall_ns(), idle_ns, with_work_ns, submits_said }
+        IdleWithWork {
+            workers,
+            wall_ns: self.bounds.wall_ns(),
+            idle_ns,
+            with_work_ns,
+            submits_said,
+        }
     }
 
     /// The outermost span `span` is inside, itself included.
@@ -1040,9 +1263,13 @@ fn thread_rows(switches: &[SwitchIn]) -> Threads {
 fn workers(switches: &[SwitchIn], bounds: Bounds) -> Vec<Worker> {
     // A BTreeMap: the workers come out in order.
     // alloc: once a model
-    let mut workers: std::collections::BTreeMap<(u32, u32), (Vec<(i64, i64)>, Option<i64>, bool)> = std::collections::BTreeMap::new();
+    let mut workers: std::collections::BTreeMap<(u32, u32), (Vec<(i64, i64)>, Option<i64>, bool)> =
+        std::collections::BTreeMap::new();
     for it in switches {
-        let on_worker = matches!(it.event, Event::Idle | Event::Woke | Event::Started | Event::Resumed | Event::Ran);
+        let on_worker = matches!(
+            it.event,
+            Event::Idle | Event::Woke | Event::Started | Event::Resumed | Event::Ran
+        );
         if !on_worker {
             continue;
         }
@@ -1077,12 +1304,25 @@ fn workers(switches: &[SwitchIn], bounds: Bounds) -> Vec<Worker> {
         .collect()
 }
 
-fn bounds(build: u64, row: Option<(i64, i64)>, switches: &[SwitchIn], spans: &[SpanIn]) -> Result<Bounds, TimeError> {
-    let first = switches.iter().map(|it| it.since_ns.unwrap_or(it.t_ns)).chain(spans.iter().map(|it| it.start_ns)).min();
+fn bounds(
+    build: u64,
+    row: Option<(i64, i64)>,
+    switches: &[SwitchIn],
+    spans: &[SpanIn],
+) -> Result<Bounds, TimeError> {
+    let first = switches
+        .iter()
+        .map(|it| it.since_ns.unwrap_or(it.t_ns))
+        .chain(spans.iter().map(|it| it.start_ns))
+        .min();
     let last = switches.iter().map(|it| it.t_ns).chain(spans.iter().map(SpanIn::end_ns)).max();
     let (Some(first), Some(last)) = (first, last) else { return Err(TimeError::Empty { build }) };
     Ok(match row {
-        Some((start, dur)) => Bounds { start_ns: start.min(first), end_ns: (start + dur).max(last), from: BoundsFrom::Build },
+        Some((start, dur)) => Bounds {
+            start_ns: start.min(first),
+            end_ns: (start + dur).max(last),
+            from: BoundsFrom::Build,
+        },
         None => Bounds { start_ns: first, end_ns: last, from: BoundsFrom::Record },
     })
 }
@@ -1107,8 +1347,15 @@ enum Doing {
     /// Before its first row: nothing of it is in the record.
     Nothing,
     /// Running on `thread`, whose last row of this job was at `last`.
-    Running { core: u32, thread: u32, last: i64 },
-    Waiting { wait: usize, ready: bool },
+    Running {
+        core: u32,
+        thread: u32,
+        last: i64,
+    },
+    Waiting {
+        wait: usize,
+        ready: bool,
+    },
 }
 
 impl Builder {
@@ -1160,7 +1407,9 @@ impl Builder {
                 self.began_as.push(((process, began_as), lane));
             }
         }
-        let queued_ns = first.filter(|it| matches!(it.event, Event::Started | Event::Ran)).and_then(|it| it.queued_ns);
+        let queued_ns = first
+            .filter(|it| matches!(it.event, Event::Started | Event::Ran))
+            .and_then(|it| it.queued_ns);
         let mut end = End::RecordEnd;
         let mut at = first.map_or(self.bounds.start_ns, |it| it.t_ns);
         let mut doing = Doing::Nothing;
@@ -1193,10 +1442,17 @@ impl Builder {
                         self.anomalies.runs_cut += 1;
                         push(&mut intervals, at, t, State::Unrecorded { why: Unrecorded::Cut });
                     } else {
-                        push(&mut intervals, at, t, State::Running { core: Some(core), thread, end: RunEnd::Switch });
+                        push(
+                            &mut intervals,
+                            at,
+                            t,
+                            State::Running { core: Some(core), thread, end: RunEnd::Switch },
+                        );
                     }
                 }
-                Doing::Waiting { wait, ready } => push(&mut intervals, at, t, self.waiting(wait, ready)),
+                Doing::Waiting { wait, ready } => {
+                    push(&mut intervals, at, t, self.waiting(wait, ready))
+                }
             }
             at = t;
             doing = match row.event {
@@ -1245,29 +1501,61 @@ impl Builder {
         if end != End::Ended {
             let record_end = self.bounds.end_ns.max(at);
             match doing {
-                Doing::Running { core, thread, last } => match self.thread_next(process, thread, last) {
-                    // Its thread went on to other work, and no row says when this job stopped.
-                    Some(next) => {
-                        end = End::Unrecorded;
-                        push(&mut intervals, at, next, State::Unrecorded { why: Unrecorded::NoEnd });
+                Doing::Running { core, thread, last } => {
+                    match self.thread_next(process, thread, last) {
+                        // Its thread went on to other work, and no row says when this job stopped.
+                        Some(next) => {
+                            end = End::Unrecorded;
+                            push(
+                                &mut intervals,
+                                at,
+                                next,
+                                State::Unrecorded { why: Unrecorded::NoEnd },
+                            );
+                        }
+                        None if self.bounds.from == BoundsFrom::Record => {
+                            push(
+                                &mut intervals,
+                                at,
+                                record_end,
+                                State::Running { core: Some(core), thread, end: RunEnd::RecordEnd },
+                            );
+                        }
+                        // The build ended, and its rows hold no end of this run.
+                        None => {
+                            end = End::Unrecorded;
+                            push(
+                                &mut intervals,
+                                at,
+                                record_end,
+                                State::Unrecorded { why: Unrecorded::NoEnd },
+                            );
+                        }
                     }
-                    None if self.bounds.from == BoundsFrom::Record => {
-                        push(&mut intervals, at, record_end, State::Running { core: Some(core), thread, end: RunEnd::RecordEnd });
-                    }
-                    // The build ended, and its rows hold no end of this run.
-                    None => {
-                        end = End::Unrecorded;
-                        push(&mut intervals, at, record_end, State::Unrecorded { why: Unrecorded::NoEnd });
-                    }
-                },
-                Doing::Waiting { wait, ready } => push(&mut intervals, at, record_end, self.waiting(wait, ready)),
+                }
+                Doing::Waiting { wait, ready } => {
+                    push(&mut intervals, at, record_end, self.waiting(wait, ready))
+                }
                 Doing::Nothing => {}
             }
         }
-        let fiber = rows.iter().find(|it| matches!(it.event, Event::Started | Event::Resumed | Event::Ran)).map(|it| it.fiber);
+        let fiber = rows
+            .iter()
+            .find(|it| matches!(it.event, Event::Started | Event::Resumed | Event::Ran))
+            .map(|it| it.fiber);
         // alloc: a lane's sums, once a lane a model
-        let mut lane =
-            Lane { id, fiber, begin, end, spawner: None, creator: None, queued_ns, intervals, spans: Vec::new(), before: Vec::new() };
+        let mut lane = Lane {
+            id,
+            fiber,
+            begin,
+            end,
+            spawner: None,
+            creator: None,
+            queued_ns,
+            intervals,
+            spans: Vec::new(),
+            before: Vec::new(),
+        };
         lane.sum();
         self.lanes.push(lane);
     }
@@ -1306,7 +1594,10 @@ impl Builder {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Laid {
     Job(usize),
-    Thread { process: u32, thread: u32 },
+    Thread {
+        process: u32,
+        thread: u32,
+    },
     /// A pool worker's own span ([`WORKER_SPAN`]) or one under it: on no lane.
     Worker,
 }
@@ -1331,7 +1622,14 @@ impl Model {
         // alloc: once a model
         let mut order: Vec<usize> = (0..self.spans.len()).collect();
         // By span id on a tie, never by row order: the model must not depend on how rows came.
-        order.sort_by_key(|&i| (self.spans[i].start_ns, self.spans[i].depth, self.spans[i].process, self.spans[i].span_id));
+        order.sort_by_key(|&i| {
+            (
+                self.spans[i].start_ns,
+                self.spans[i].depth,
+                self.spans[i].process,
+                self.spans[i].span_id,
+            )
+        });
         // alloc: once a model
         let mut laid: Vec<Option<Laid>> = vec![None; self.spans.len()];
         // alloc: once a model
@@ -1357,7 +1655,8 @@ impl Model {
         // A BTreeMap: the thread lanes are made in order, after the jobs', so the lanes stay
         // sorted by id.
         // alloc: once a model
-        let mut threads: std::collections::BTreeMap<(u32, u32), Vec<usize>> = std::collections::BTreeMap::new();
+        let mut threads: std::collections::BTreeMap<(u32, u32), Vec<usize>> =
+            std::collections::BTreeMap::new();
         for (i, it) in placed {
             match it {
                 Laid::Job(lane) => {
@@ -1365,7 +1664,9 @@ impl Model {
                     self.span_time[i].lane = Some(lane);
                 }
                 // alloc: a thread lane's spans, once a lane a model
-                Laid::Thread { process, thread } => threads.entry((process, thread)).or_default().push(i),
+                Laid::Thread { process, thread } => {
+                    threads.entry((process, thread)).or_default().push(i)
+                }
                 Laid::Worker => {}
             }
         }
@@ -1475,8 +1776,18 @@ impl Model {
             t = to;
         }
         let id = LaneId::Thread { process, thread };
-        let mut lane =
-            Lane { id, fiber: None, begin: Begin::FirstSpan, end: End::LastSpan, spawner: None, creator: None, queued_ns: None, intervals, spans, before: Vec::new() };
+        let mut lane = Lane {
+            id,
+            fiber: None,
+            begin: Begin::FirstSpan,
+            end: End::LastSpan,
+            spawner: None,
+            creator: None,
+            queued_ns: None,
+            intervals,
+            spans,
+            before: Vec::new(),
+        };
         lane.sum();
         self.lanes.push(lane);
     }
@@ -1487,13 +1798,15 @@ impl Model {
         let mut wait_spans: Vec<Vec<usize>> = Vec::with_capacity(self.lanes.len());
         for lane in &self.lanes {
             // alloc: a lane's wait spans, once a lane a model
-            wait_spans.push(lane.spans.iter().copied().filter(|&i| self.spans[i].is_wait()).collect());
+            wait_spans
+                .push(lane.spans.iter().copied().filter(|&i| self.spans[i].is_wait()).collect());
         }
         // alloc: once a model
         let ready: HashMap<usize, Option<u64>, Global> = ready_by.iter().copied().collect();
         let jobs = &self.jobs;
-        let named =
-            |process: u32, job: u64, found: fn(usize) -> Waker| jobs.get(&(process, job)).copied().map_or(Waker::NoLane { job }, found);
+        let named = |process: u32, job: u64, found: fn(usize) -> Waker| {
+            jobs.get(&(process, job)).copied().map_or(Waker::NoLane { job }, found)
+        };
         for w in 0..self.waits.len() {
             let wait = &self.waits[w];
             let process = self.lanes[wait.lane].id.process();
@@ -1503,14 +1816,18 @@ impl Model {
                 (None, Some(_)) => {
                     let spans = &wait_spans[wait.lane];
                     let at = spans.partition_point(|&i| self.spans[i].start_ns <= wait.parked_ns);
-                    at.checked_sub(1).map(|at| spans[at]).filter(|&i| self.spans[i].end_ns() >= wait.parked_ns)
+                    at.checked_sub(1)
+                        .map(|at| spans[at])
+                        .filter(|&i| self.spans[i].end_ns() >= wait.parked_ns)
                 }
             };
             let owner = span.and_then(|it| self.spans[it].owner);
             let waker = match (ready.get(&w), wait.on, owner) {
                 (Some(&Some(by)), _, _) => named(process, by, |lane| Waker::Ready { lane }),
                 (Some(&None), _, _) => Waker::NoJob,
-                (None, Some(WaitedOn::Job), _) => named(process, wait.value, |lane| Waker::Awaited { lane }),
+                (None, Some(WaitedOn::Job), _) => {
+                    named(process, wait.value, |lane| Waker::Awaited { lane })
+                }
                 (None, _, Some(owner)) => named(process, owner, |lane| Waker::Owner { lane }),
                 (None, _, None) => Waker::Unknown,
             };
@@ -1535,7 +1852,11 @@ impl Model {
                 // What of it fell outside its lane's lifetime, the record says nothing of.
                 totals.unrecorded_ns += span.dur_ns.max(0) - totals.total();
                 self.span_time[i].totals = totals;
-                let Some(p) = self.parent[i].filter(|&p| self.span_time[p].lane == self.span_time[i].lane) else { continue };
+                let Some(p) =
+                    self.parent[i].filter(|&p| self.span_time[p].lane == self.span_time[i].lane)
+                else {
+                    continue;
+                };
                 under[p].add(totals);
                 let parent = &self.spans[p];
                 let escapes = span.start_ns < parent.start_ns || span.end_ns() > parent.end_ns();

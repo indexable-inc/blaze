@@ -184,7 +184,9 @@ impl Fetcher {
     fn handle(&self, from: impl FnOnce() -> Producer) -> Result<&'static Handle, FetchError> {
         match self.store {
             StoreOf::Given(store) => Ok(store),
-            StoreOf::Installed => Handle::installed().ok_or_else(|| FetchError::NoStore { from: from() }),
+            StoreOf::Installed => {
+                Handle::installed().ok_or_else(|| FetchError::NoStore { from: from() })
+            }
             StoreOf::Unkept => Err(FetchError::NoStore { from: from() }),
         }
     }
@@ -201,7 +203,11 @@ impl Fetcher {
 
     /// [`Fetcher::get`], asking with `headers` (a registry's token). They are no part of what is
     /// kept or looked up: the pin is.
-    pub fn get_with(&self, source: &Source, headers: &[(&str, &str)]) -> Result<Object, FetchError> {
+    pub fn get_with(
+        &self,
+        source: &Source,
+        headers: &[(&str, &str)],
+    ) -> Result<Object, FetchError> {
         let objects = Objects::new(self.handle(|| source.producer())?);
         let pin = source.digest();
         let origin = source.origin();
@@ -217,11 +223,15 @@ impl Fetcher {
                     }
                     return match source {
                         Source::Url { url, digest } => self.download(objects, url, digest, headers),
-                        Source::Git { repo, rev, digest } => self.git_tree(objects, repo, rev, digest),
+                        Source::Git { repo, rev, digest } => {
+                            self.git_tree(objects, repo, rev, digest)
+                        }
                     };
                 }
                 Role::Follow(follower) => match follower.wait(self.wait_most) {
-                    Waited::TimedOut { waited } => return Err(FetchError::WaitedTooLong { pin: *pin, waited }),
+                    Waited::TimedOut { waited } => {
+                        return Err(FetchError::WaitedTooLong { pin: *pin, waited });
+                    }
                     Waited::LeaderEnded => {
                         if let Some(object) = objects.lookup(origin)? {
                             return Ok(object);
@@ -239,7 +249,13 @@ impl Fetcher {
         self.objects()?.read(object)
     }
 
-    fn download(&self, objects: Objects<'_>, url: &str, pin: &Digest, headers: &[(&str, &str)]) -> Result<Object, FetchError> {
+    fn download(
+        &self,
+        objects: Objects<'_>,
+        url: &str,
+        pin: &Digest,
+        headers: &[(&str, &str)],
+    ) -> Result<Object, FetchError> {
         let part = Part::new(&self.scratch)?;
         self.download_to(&part, url, pin, headers)?;
         let from = Producer::Url(redact(url));
@@ -249,7 +265,12 @@ impl Fetcher {
     /// `url`'s body, downloaded, checked against `pin` and not kept: for a process with no store
     /// ([`StoreOf::Unkept`]). It is never single-flight (with no store, a follower would have
     /// nothing to read), and a mismatch gives no bytes.
-    pub fn download_verified(&self, url: &str, pin: &Digest, headers: &[(&str, &str)]) -> Result<Verified, FetchError> {
+    pub fn download_verified(
+        &self,
+        url: &str,
+        pin: &Digest,
+        headers: &[(&str, &str)],
+    ) -> Result<Verified, FetchError> {
         let part = Part::new(&self.scratch)?;
         self.download_to(&part, url, pin, headers)?;
         // alloc: the download, whole, as the caller is given it; once a download
@@ -263,7 +284,13 @@ impl Fetcher {
 
     /// `url`'s body into `part`, tried as the policy says, each try from nothing; a body past
     /// the byte limit stops its transfer and is [`FetchError::TooBig`], not tried again.
-    fn download_to(&self, part: &Part, url: &str, pin: &Digest, headers: &[(&str, &str)]) -> Result<(), FetchError> {
+    fn download_to(
+        &self,
+        part: &Part,
+        url: &str,
+        pin: &Digest,
+        headers: &[(&str, &str)],
+    ) -> Result<(), FetchError> {
         let from = Producer::Url(redact(url));
         let mut attempts = Attempts::new(self.policy);
         let start = Instant::now();
@@ -280,7 +307,9 @@ impl Fetcher {
                         got += bytes.len() as u64;
                         if got > most {
                             too_big = true;
-                            return Err(std::io::Error::other(format!("the body is past the limit of {most} bytes"))); // alloc: error path
+                            return Err(std::io::Error::other(format!(
+                                "the body is past the limit of {most} bytes"
+                            ))); // alloc: error path
                         }
                         file.write_all(bytes)
                     });
@@ -288,7 +317,9 @@ impl Fetcher {
                         return Err(FetchError::TooBig { from, most });
                     }
                     let asked = asked.and_then(|()| {
-                        file.flush().map_err(|e| Failure::Permanent(format!("writing {}: {e}", part.path.display()))) // alloc: error path
+                        file.flush().map_err(|e| {
+                            Failure::Permanent(format!("writing {}: {e}", part.path.display()))
+                        }) // alloc: error path
                     });
                     match asked {
                         Ok(()) => return Ok(()),
@@ -299,12 +330,20 @@ impl Fetcher {
                     let _span = tracing::info_span!(target: "blaze", "blaze-fetch waits to try again", url = %from).entered();
                     wait_out(until.saturating_sub(start.elapsed()));
                 }
-                Decision::GiveUp { tries, last } => return Err(FetchError::GaveUp { from, pin: *pin, tries, last }),
+                Decision::GiveUp { tries, last } => {
+                    return Err(FetchError::GaveUp { from, pin: *pin, tries, last });
+                }
             }
         }
     }
 
-    fn git_tree(&self, objects: Objects<'_>, repo: &str, rev: &str, pin: &Digest) -> Result<Object, FetchError> {
+    fn git_tree(
+        &self,
+        objects: Objects<'_>,
+        repo: &str,
+        rev: &str,
+        pin: &Digest,
+    ) -> Result<Object, FetchError> {
         let from = Producer::Git { repo: redact(repo), rev: rev.to_owned() }; // alloc: once a fetch
         let refused = |why: String| FetchError::GaveUp {
             from: from.clone(), // clone: error path
@@ -318,7 +357,9 @@ impl Fetcher {
         let git = self.git.as_ref().ok_or_else(|| FetchError::NoGit { from: from.clone() })?; // clone: error path
         let scratch = Scratch::new(&self.scratch)?;
         let root = {
-            let _span = tracing::info_span!(target: "blaze", "blaze-fetch git checkout", repo = %from).entered();
+            let _span =
+                tracing::info_span!(target: "blaze", "blaze-fetch git checkout", repo = %from)
+                    .entered();
             git.checkout(repo, rev, &scratch.0).map_err(refused)?
         };
         // The byte limit covers a checkout as it covers a download: the scratch directory whole
@@ -344,15 +385,24 @@ impl Fetcher {
             if materialized(object, &at)? {
                 return Ok(at);
             }
-            remove_any(&at).map_err(io(format!("removing {}, which is not {}", at.display(), object.blake3)))?; // alloc: error path
+            remove_any(&at).map_err(io(format!(
+                "removing {}, which is not {}",
+                at.display(),
+                object.blake3
+            )))?; // alloc: error path
         }
-        let part = dir.join(format!(".{}{PART}{}-{}", object.blake3.hex(), std::process::id(), next())); // alloc: once a materialize
+        let part =
+            dir.join(format!(".{}{PART}{}-{}", object.blake3.hex(), std::process::id(), next())); // alloc: once a materialize
         let written = match object.form {
             Form::Blob => write_object(objects, object.blake3, &part, Kind::File).and_then(|len| {
                 if len == object.len {
                     Ok(())
                 } else {
-                    Err(FetchError::Length { object: object.blake3, expected: object.len, actual: len })
+                    Err(FetchError::Length {
+                        object: object.blake3,
+                        expected: object.len,
+                        actual: len,
+                    })
                 }
             }),
             Form::Tree => {
@@ -362,24 +412,29 @@ impl Fetcher {
                     refused,
                 })?;
                 std::fs::create_dir(&part).map_err(io(format!("creating {}", part.display())))?; // alloc: error path
-                entries
-                    .iter()
-                    .try_for_each(|entry| {
-                        let at = directories_under(&part, &entry.path)?;
-                        let len = write_object(objects, entry.blake3, &at, entry.kind)?;
-                        if len == entry.len {
-                            Ok(())
-                        } else {
-                            Err(FetchError::Length { object: entry.blake3, expected: entry.len, actual: len })
-                        }
-                    })
+                entries.iter().try_for_each(|entry| {
+                    let at = directories_under(&part, &entry.path)?;
+                    let len = write_object(objects, entry.blake3, &at, entry.kind)?;
+                    if len == entry.len {
+                        Ok(())
+                    } else {
+                        Err(FetchError::Length {
+                            object: entry.blake3,
+                            expected: entry.len,
+                            actual: len,
+                        })
+                    }
+                })
             }
         };
         let placed = written.and_then(|()| match std::fs::rename(&part, &at) {
             Ok(()) => Ok(()),
             // Another materialize of it got there first: its copy is checked as any other.
             Err(_) if at.exists() && materialized(object, &at)? => Ok(()),
-            Err(error) => Err(FetchError::Io { what: format!("renaming {} to {}", part.display(), at.display()), error }), // alloc: error path
+            Err(error) => Err(FetchError::Io {
+                what: format!("renaming {} to {}", part.display(), at.display()),
+                error,
+            }), // alloc: error path
         });
         if placed.is_err() {
             _ = remove_any(&part);
@@ -395,7 +450,9 @@ pub fn verify(from: Producer, pin: &Digest, bytes: &[u8]) -> Result<Hashed, Fetc
     let hashed = Hashed::of(pin.algo(), bytes);
     match crate::decisions::verdict(pin, &hashed) {
         crate::decisions::Verdict::Matches => Ok(hashed),
-        crate::decisions::Verdict::Mismatch { expected, actual } => Err(FetchError::Mismatch { from, expected, actual }),
+        crate::decisions::Verdict::Mismatch { expected, actual } => {
+            Err(FetchError::Mismatch { from, expected, actual })
+        }
     }
 }
 
@@ -418,7 +475,8 @@ fn materialized(object: &Object, at: &Path) -> Result<bool, FetchError> {
 
 /// The BLAKE3 of the file at `at`, read a piece at a time.
 fn hash_file(at: &Path) -> Result<Blake3, FetchError> {
-    let io = |error: std::io::Error| FetchError::Io { what: format!("reading {}", at.display()), error }; // alloc: error path
+    let io =
+        |error: std::io::Error| FetchError::Io { what: format!("reading {}", at.display()), error }; // alloc: error path
     let mut file = std::fs::File::open(at).map_err(io)?;
     let mut hashing = blaze_ids::b3::Hasher::new();
     let mut buffer = vec![0; 64 << 10]; // alloc: one buffer, once a check of a materialized file
@@ -449,8 +507,10 @@ struct Part {
 
 impl Part {
     fn new(scratch: &Path) -> Result<Part, FetchError> {
-        std::fs::create_dir_all(scratch)
-            .map_err(|error| FetchError::Io { what: format!("creating {}", scratch.display()), error })?; // alloc: error path
+        std::fs::create_dir_all(scratch).map_err(|error| FetchError::Io {
+            what: format!("creating {}", scratch.display()),
+            error,
+        })?; // alloc: error path
         let path = scratch.join(format!("{PART}{}-{}", std::process::id(), next())); // alloc: once a download
         Ok(Part { path })
     }
@@ -459,7 +519,8 @@ impl Part {
     /// made anew with `create_new` (`O_EXCL`), so a file or symlink someone else put at the
     /// name is refused, never written through.
     fn create(&self) -> Result<std::fs::File, FetchError> {
-        let io = |error| FetchError::Io { what: format!("creating {}", self.path.display()), error }; // alloc: error path
+        let io =
+            |error| FetchError::Io { what: format!("creating {}", self.path.display()), error }; // alloc: error path
         match std::fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -481,8 +542,10 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(under: &Path) -> Result<Scratch, FetchError> {
         let dir = under.join(format!("{PART}git-{}-{}", std::process::id(), next())); // alloc: once a checkout
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| FetchError::Io { what: format!("creating {}", dir.display()), error })?; // alloc: error path
+        std::fs::create_dir_all(&dir).map_err(|error| FetchError::Io {
+            what: format!("creating {}", dir.display()),
+            error,
+        })?; // alloc: error path
         Ok(Scratch(dir))
     }
 }
@@ -507,7 +570,12 @@ fn remove_any(at: &Path) -> std::io::Result<()> {
 /// Every file and symlink under `root`, by its `/`-separated path, none in a `.git` and none
 /// of `markers` at the root; past `most` bytes of files, [`FetchError::TooBig`] naming `from`,
 /// before the file that passes it is read.
-fn read_tree(root: &Path, markers: &[&str], most: u64, from: &Producer) -> Result<Vec<TreeFile>, FetchError> {
+fn read_tree(
+    root: &Path,
+    markers: &[&str],
+    most: u64,
+    from: &Producer,
+) -> Result<Vec<TreeFile>, FetchError> {
     let mut total = 0u64;
     let io = |at: &Path| {
         let what = format!("reading {}", at.display()); // alloc: error path
@@ -521,7 +589,10 @@ fn read_tree(root: &Path, markers: &[&str], most: u64, from: &Producer) -> Resul
             let at = entry.path();
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
-                return Err(FetchError::Io { what: at.display().to_string(), error: std::io::Error::other("its name is not UTF-8") }); // alloc: error path
+                return Err(FetchError::Io {
+                    what: at.display().to_string(),
+                    error: std::io::Error::other("its name is not UTF-8"),
+                }); // alloc: error path
             };
             if name.eq_ignore_ascii_case(".git") || (under.is_empty() && markers.contains(&name)) {
                 continue;
@@ -533,9 +604,16 @@ fn read_tree(root: &Path, markers: &[&str], most: u64, from: &Producer) -> Resul
             } else if kind.is_symlink() {
                 let target = std::fs::read_link(&at).map_err(io(&at))?;
                 let Some(target) = target.to_str() else {
-                    return Err(FetchError::Io { what: at.display().to_string(), error: std::io::Error::other("it points to a path that is not UTF-8") }); // alloc: error path
+                    return Err(FetchError::Io {
+                        what: at.display().to_string(),
+                        error: std::io::Error::other("it points to a path that is not UTF-8"),
+                    }); // alloc: error path
                 };
-                files.push(TreeFile { path, kind: Kind::Link, bytes: target.replace('\\', "/").into_bytes() }); // alloc: a link's target, once a link
+                files.push(TreeFile {
+                    path,
+                    kind: Kind::Link,
+                    bytes: target.replace('\\', "/").into_bytes(),
+                }); // alloc: a link's target, once a link
             } else if kind.is_file() {
                 let metadata = entry.metadata().map_err(io(&at))?;
                 total = total.saturating_add(metadata.len());
@@ -546,7 +624,10 @@ fn read_tree(root: &Path, markers: &[&str], most: u64, from: &Producer) -> Resul
                 let kind = if is_executable(&metadata) { Kind::Exec } else { Kind::File };
                 files.push(TreeFile { path, kind, bytes });
             } else {
-                return Err(FetchError::Io { what: at.display().to_string(), error: std::io::Error::other("it is neither a file, a directory nor a symlink") }); // alloc: error path
+                return Err(FetchError::Io {
+                    what: at.display().to_string(),
+                    error: std::io::Error::other("it is neither a file, a directory nor a symlink"),
+                }); // alloc: error path
             }
         }
     }
@@ -575,11 +656,20 @@ pub(crate) fn directories_under(root: &Path, path: &str) -> Result<PathBuf, Fetc
         if parts.peek().is_none() {
             break;
         }
-        let io = |error: std::io::Error| FetchError::Io { what: format!("making the directory {}", at.display()), error }; // alloc: error path
+        let io = |error: std::io::Error| FetchError::Io {
+            what: format!("making the directory {}", at.display()),
+            error,
+        }; // alloc: error path
         match std::fs::symlink_metadata(&at) {
             Ok(it) if it.is_dir() => {}
-            Ok(_) => return Err(io(std::io::Error::other("something not a directory is in its place, and nothing is written through it"))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&at).map_err(io)?,
+            Ok(_) => {
+                return Err(io(std::io::Error::other(
+                    "something not a directory is in its place, and nothing is written through it",
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&at).map_err(io)?
+            }
             Err(e) => return Err(io(e)),
         }
     }
@@ -591,7 +681,10 @@ fn dir_len(dir: &Path) -> Result<u64, FetchError> {
     let mut total = 0u64;
     let mut dirs = vec![dir.to_owned()]; // alloc: once a checkout measured
     while let Some(dir) = dirs.pop() {
-        let io = |error: std::io::Error| FetchError::Io { what: format!("measuring {}", dir.display()), error }; // alloc: error path
+        let io = |error: std::io::Error| FetchError::Io {
+            what: format!("measuring {}", dir.display()),
+            error,
+        }; // alloc: error path
         for entry in std::fs::read_dir(&dir).map_err(io)? {
             let entry = entry.map_err(io)?;
             let kind = entry.file_type().map_err(io)?;
@@ -608,8 +701,14 @@ fn dir_len(dir: &Path) -> Result<u64, FetchError> {
 /// The object filed under `blake3` written as a new file of `kind` at `at`, whose directory is
 /// there, read-only, a chunk at a time from the store: its length. Nothing is there before it
 /// (`create_new`, which follows no symlink), so nothing is written through one.
-fn write_object(objects: Objects<'_>, blake3: Blake3, at: &Path, kind: Kind) -> Result<u64, FetchError> {
-    let io = |error: std::io::Error| FetchError::Io { what: format!("writing {}", at.display()), error }; // alloc: error path
+fn write_object(
+    objects: Objects<'_>,
+    blake3: Blake3,
+    at: &Path,
+    kind: Kind,
+) -> Result<u64, FetchError> {
+    let io =
+        |error: std::io::Error| FetchError::Io { what: format!("writing {}", at.display()), error }; // alloc: error path
     match kind {
         Kind::Link => {
             let mut target = Vec::new(); // alloc: a link's target, once a link
@@ -617,14 +716,18 @@ fn write_object(objects: Objects<'_>, blake3: Blake3, at: &Path, kind: Kind) -> 
                 target.extend_from_slice(piece);
                 Ok(())
             })?;
-            let to = std::str::from_utf8(&target).map_err(|_| io(std::io::Error::other("the link's target is not UTF-8")))?;
+            let to = std::str::from_utf8(&target)
+                .map_err(|_| io(std::io::Error::other("the link's target is not UTF-8")))?;
             #[cfg(unix)]
             return std::os::unix::fs::symlink(to, at).map(|()| len).map_err(io);
             #[cfg(not(unix))]
-            return Err(io(std::io::Error::other(format!("it is a symlink to {to} ({len} bytes), and this platform has none to write")))); // alloc: error path
+            return Err(io(std::io::Error::other(format!(
+                "it is a symlink to {to} ({len} bytes), and this platform has none to write"
+            )))); // alloc: error path
         }
         Kind::File | Kind::Exec => {
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(at).map_err(io)?;
+            let mut file =
+                std::fs::OpenOptions::new().write(true).create_new(true).open(at).map_err(io)?;
             let len = objects.read_into(blake3, &mut |piece| file.write_all(piece).map_err(io))?;
             file.flush().map_err(io)?;
             let mut permissions = file.metadata().map_err(io)?.permissions();
@@ -651,7 +754,10 @@ fn scrubbed(failure: Failure) -> Failure {
 }
 
 /// Holds this thread for a wait the core decided: the driver's one timer.
-#[allow(clippy::disallowed_methods, reason = "the driver's timer: `Attempts` decides the wait, from the clock it is given")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the driver's timer: `Attempts` decides the wait, from the clock it is given"
+)]
 fn wait_out(wait: Duration) {
     std::thread::sleep(wait);
 }

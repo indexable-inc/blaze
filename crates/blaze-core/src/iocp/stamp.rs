@@ -95,14 +95,23 @@ fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
     debug_assert_eq!(wide.last(), Some(&0));
     // SAFETY: a NUL-terminated path; no security attributes or template.
     sys::owned(unsafe {
-        CreateFileW(wide.as_ptr(), rights, SHARE_ALL, std::ptr::null(), OPEN_EXISTING, flags, std::ptr::null_mut())
+        CreateFileW(
+            wide.as_ptr(),
+            rights,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
     })
 }
 
 /// Whether a name has a character Windows keeps out of names, so nothing is there by it: a
 /// `\` or `:` would name another file or a stream of one.
 fn unnameable(name: &str) -> bool {
-    name.bytes().any(|it| it < 0x20 || matches!(it, b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|'))
+    name.bytes()
+        .any(|it| it < 0x20 || matches!(it, b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|'))
 }
 
 /// The stamp of what `handle` is open on.
@@ -152,9 +161,15 @@ fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
     path.clear();
     path.extend_from_slice(prefix);
     path.push(u16::from(b'\\'));
-    path.extend(name.encode_utf16().map(|it| if it == u16::from(b'/') { u16::from(b'\\') } else { it }));
+    path.extend(
+        name.encode_utf16().map(|it| if it == u16::from(b'/') { u16::from(b'\\') } else { it }),
+    );
     path.push(0);
-    match open(path, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT) {
+    match open(
+        path,
+        FILE_READ_ATTRIBUTES,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    ) {
         Ok(handle) => stamp_of(&handle).unwrap_or(Stamp::UNKNOWN),
         Err(error) => match error.raw_os_error().map(|it| it as u32) {
             Some(
@@ -177,13 +192,15 @@ fn sweepers(names: usize, cores: usize) -> usize {
 /// cannot be opened.
 pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     // alloc: an error path.
-    let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", root.display()));
+    let named =
+        |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", root.display()));
     let mut prefix = sys::path(root).map_err(named)?;
     open(&prefix, 0, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
     trim(&mut prefix);
     // alloc: the stamps the sweep answers with, once per sweep.
     let mut out = vec![Stamp::GONE; names.len()];
-    let threads = sweepers(names.len(), std::thread::available_parallelism().map_or(1, |it| it.get()));
+    let threads =
+        sweepers(names.len(), std::thread::available_parallelism().map_or(1, |it| it.get()));
     if threads == 1 {
         let mut path = Vec::with_capacity(prefix.len() + 256);
         for (at, stamp) in out.iter_mut().enumerate() {
@@ -222,13 +239,16 @@ fn entry(bytes: &[u8]) -> Option<(&[u8], Stamp)> {
         _ => u32_at(64)?,
     };
     let name = bytes.get(104..104 + name_len)?;
-    Some((name, Stamp {
-        ino: i64_at(96)? as u64,
-        size: i64_at(40)? as u64,
-        mtime_ns: ns(i64_at(24)?),
-        ctime_ns: ns(i64_at(32)?),
-        mode: mode(attributes, tag),
-    }))
+    Some((
+        name,
+        Stamp {
+            ino: i64_at(96)? as u64,
+            size: i64_at(40)? as u64,
+            mtime_ns: ns(i64_at(24)?),
+            ctime_ns: ns(i64_at(32)?),
+            mode: mode(attributes, tag),
+        },
+    ))
 }
 
 /// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
@@ -243,7 +263,8 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
 
 fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(FileName, Stamp)>> {
     // alloc: an error path.
-    let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", dir.display()));
+    let named =
+        |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", dir.display()));
     let wide = sys::path(dir).map_err(named)?;
     let handle = open(&wide, FILE_LIST_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
     let mut class = FileIdBothDirectoryRestartInfo;
@@ -254,7 +275,12 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
         // SAFETY: an open directory handle and a buffer of the length given, 8-aligned as the
         // class's entries are.
         let ok = unsafe {
-            GetFileInformationByHandleEx(handle.as_raw_handle(), class, buffer.as_mut_ptr().cast(), LISTING as u32)
+            GetFileInformationByHandleEx(
+                handle.as_raw_handle(),
+                class,
+                buffer.as_mut_ptr().cast(),
+                LISTING as u32,
+            )
         };
         if ok == 0 {
             return match sys::last() {
@@ -269,7 +295,12 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
         // SAFETY: the call filled the buffer, which is read as bytes while it is not written.
         let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), LISTING) };
         let mut at = 0;
-        let malformed = || named(io::Error::new(io::ErrorKind::InvalidData, "an entry of the listing past its end"));
+        let malformed = || {
+            named(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "an entry of the listing past its end",
+            ))
+        };
         loop {
             let rest = bytes.get(at..).ok_or_else(malformed)?;
             let (leaf, stamp) = entry(rest).ok_or_else(malformed)?;
@@ -281,7 +312,10 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
             let start = text.len();
             for unit in char::decode_utf16(units) {
                 let Ok(unit) = unit else {
-                    return Err(named(io::Error::new(io::ErrorKind::InvalidData, "a name that is not UTF-8")));
+                    return Err(named(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "a name that is not UTF-8",
+                    )));
                 };
                 text.push(unit);
             }
@@ -324,7 +358,10 @@ mod tests {
         let bytes = listing_entry(0, "lib.rs", FILE_ATTRIBUTE_READONLY, 0, 42);
         let (name, stamp) = entry(&bytes).unwrap();
         assert_eq!(name, "lib.rs".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
-        assert_eq!(stamp, Stamp { ino: 42, size: 7, mtime_ns: 3000, ctime_ns: 4000, mode: 0o100444 });
+        assert_eq!(
+            stamp,
+            Stamp { ino: 42, size: 7, mtime_ns: 3000, ctime_ns: 4000, mode: 0o100444 }
+        );
         assert_eq!(entry(&bytes[..bytes.len() - 1]), None);
     }
 
@@ -334,7 +371,13 @@ mod tests {
         let cloud = 0x9000_001A;
         let link = listing_entry(0, "l", FILE_ATTRIBUTE_REPARSE_POINT, symlink, 1);
         assert!(entry(&link).unwrap().1.is_link());
-        let junction = listing_entry(0, "j", FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY, 0xA000_0003, 1);
+        let junction = listing_entry(
+            0,
+            "j",
+            FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY,
+            0xA000_0003,
+            1,
+        );
         assert!(entry(&junction).unwrap().1.is_link());
         let placeholder = listing_entry(0, "c", FILE_ATTRIBUTE_REPARSE_POINT, cloud, 1);
         assert!(entry(&placeholder).unwrap().1.is_file());
@@ -364,7 +407,9 @@ mod tests {
 
     #[test]
     fn names_windows_keeps_out_of_names_are_gone() {
-        assert!(unnameable("a\\b") && unnameable("a:b") && unnameable("x?") && unnameable("t\u{1}"));
+        assert!(
+            unnameable("a\\b") && unnameable("a:b") && unnameable("x?") && unnameable("t\u{1}")
+        );
         assert!(!unnameable("src/lib.rs") && !unnameable("ünïcode.rs"));
     }
 }

@@ -66,6 +66,9 @@ pub enum Kind {
     Encode,
     /// The page stopped the request: DuckDB was killed before it answered.
     Cancelled,
+    /// The daemon could not flush the history before the query (`ops::Flush`), so the query
+    /// was not run: it would have missed the rows recorded since the last flush.
+    Flush,
 }
 
 impl Kind {
@@ -83,6 +86,7 @@ impl Kind {
             Kind::Overloaded => "overloaded",
             Kind::Encode => "encode",
             Kind::Cancelled => "cancelled",
+            Kind::Flush => "flush",
         }
     }
 }
@@ -168,14 +172,21 @@ mod tests {
             parse(br#"{"op":"sql","sql":"select 1"}"#),
             Ok(Request::Sql { sql: "select 1".to_owned() })
         );
-        let Ok(Request::View { name, args }) = parse(br#"{"op":"view","name":"slowest","args":{"n":5}}"#)
+        let Ok(Request::View { name, args }) =
+            parse(br#"{"op":"view","name":"slowest","args":{"n":5}}"#)
         else {
             panic!("a view request parses");
         };
         assert_eq!((name.as_str(), args.get("n")), ("slowest", Some(&Value::from(5))));
         assert_eq!(
             parse(br#"{"op":"tiles","build":3,"t0_ns":-5,"t1_ns":100,"bucket_ns":10}"#),
-            Ok(Request::Tiles { build: 3, t0_ns: -5, t1_ns: 100, bucket_ns: 10, lane: Lane::Thread })
+            Ok(Request::Tiles {
+                build: 3,
+                t0_ns: -5,
+                t1_ns: 100,
+                bucket_ns: 10,
+                lane: Lane::Thread
+            })
         );
         assert_eq!(
             parse(br#"{"op":"tiles","build":3,"t0_ns":0,"t1_ns":100,"bucket_ns":10,"lane":"job"}"#),
@@ -207,7 +218,8 @@ mod tests {
 
     #[test]
     fn an_error_header_has_its_kind_message_and_detail() {
-        let header = WireError::new(Kind::Sql, "no such table").with("query", "select * from x").header();
+        let header =
+            WireError::new(Kind::Sql, "no such table").with("query", "select * from x").header();
         let error = &header["error"];
         assert_eq!(error["kind"], "sql");
         assert_eq!(error["message"], "no such table");

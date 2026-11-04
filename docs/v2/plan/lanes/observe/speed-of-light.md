@@ -1,14 +1,14 @@
 ---
-status: plan
-summary: lane observe's speed of light: what the always-on flight recorder, the stall watchdog and the CPU sampler in blaze-profile cost per span, per plot, per sample and in memory, the bound the hardware sets, and how to measure that together they stay under 1% of a warm no-op build and of a test build.
-date: 2026-10-31
+status: current
+summary: lane observe's speed of light: what the always-on flight recorder, the stall watchdog and the CPU sampler in blaze-profile cost per span, per plot, per sample and in memory, where the recorder reads thread CPU (at switches and boundaries, never once a span), the bound the hardware sets, and how to measure that together they stay under 1% of a warm no-op build and of a test build.
+date: 2026-11-04
 ---
 # Lane observe: speed of light
 
 The bar: the recorder and the sampler together cost under 1% of a warm no-op build and of a
 test build, so they stay on in production. The counts here are read from the code in
-`crates/blaze-profile` (nothing was built or run for this pass); the bounds are arithmetic. The
-measurement that turns them into numbers is at the end.
+`crates/blaze-profile` as of 2026-11-04; the bounds are arithmetic. The measurement that turns
+them into numbers is at the end, and the recorder measures its own cost as it runs (below).
 
 ## A span
 
@@ -28,11 +28,45 @@ the callsite's cached interest. Nothing allocates and nothing locks on a span wi
 shards); the spans that carry them are per query or per function compiled, never per memo hit.
 The site table is filled once per callsite (`register`, under a lock, at interest time).
 
+Thread CPU is not read on any of these steps. Until 2026-11-04 open and close each read
+`CLOCK_THREAD_CPUTIME_ID` (a syscall on macOS, about 100 ns each: about 210 ns a span against
+the 15 to 30 ns below) and a span whose self CPU was above 0 wrote a second 64-byte row (`cols`)
+for it. Now a span's enter and exit read the cycle counter once each to add the ticks it was
+the innermost span to its slot, and its self CPU rides in its own row (below, "Self CPU").
+
 The bound: two clock reads, two cache lines written at open and one at close, one atomic
-read-modify-write and one fence. On aarch64 the clock is `CNTVCT_EL0` (a few cycles) and the fence is a `dmb ish`
+read-modify-write and one fence (plus a counter read at enter and at exit). On aarch64 the clock is `CNTVCT_EL0` (a few cycles) and the fence is a `dmb ish`
 (tens of cycles); on x86_64 it is `rdtsc` (about 25 cycles each) and the fence is free (x86
 stores are already release). Expected: 15 to 30 ns a span on Apple M-series, 25 to 50 ns on
 x86_64, most of it `tracing`'s dispatch and the fence.
+
+## Self CPU
+
+A span's `self_cpu_ns` is the CPU its thread spent while it was the innermost span the thread
+was inside (`time::cpu`). The recorder reads thread CPU once at each boundary of a running
+stretch and writes it as a CPU row (plot byte `0xf7`): every fiber switch but `ready` (a job
+parked, resumed, started, ended, a worker idle or woke), a wait span's open and close, a thread
+going idle long enough (`time::cpu::GAP`, 10 µs) between roots, a root closing at least
+`ROOT_AGE` (20 µs) into a stretch, any close at least `AGE` (250 µs) into one, and a few rare
+ones (a held span dropped, a ring claimed, a mark, a read). Each stretch has one rate, CPU over
+wall ticks; a span's ticks as the innermost span in each stretch are turned into CPU at that
+rate. A span that saw its stretch end writes its known CPU in a `cols` row as before; a span
+that closes inside its stretch (most) carries its ticks in the top 24 bits of its row's alloc
+word, as a share of its duration, and the reader resolves it at the ring's next CPU row; until
+that row is written the history's cursor holds the span back (at most `flight::HOLD_MAX`, 1 s).
+
+Error: a span's derived self CPU is off from what two per-span reads gave by at most the
+smaller of its time in a stretch and the stretch's off-CPU time, summed over the stretches it
+spans (a stretch is short, and blaze's workers are rarely preempted, so this is near 0), plus a
+tick at each enter and exit, a nanosecond of rounding a stretch, and its duration over 2^23
+from the share's 24 bits. `time::cpu`'s test checks it on a synthetic timeline. What changed in
+meaning: a span never entered (opened and closed without `.entered()`) now counts 0; before, it
+counted its job's CPU while it was open.
+
+The recorder times itself: 1 call in `flight::COST_SAMPLE` (64) of its span paths, chosen at
+random, and every CPU read, into the counters `profile cost ns`, `profile spans made` and
+`profile cpu reads` (`flight::cost`), which the history writes with each build's flush and
+`blaze slow`'s `recorder:` line says as a cost a span.
 
 ## A plot
 
@@ -42,14 +76,16 @@ matter.
 
 ## Memory
 
-Each thread that records holds one ring of `CAP` = 16384 rows, 64 bytes each: 1 MiB of address
-space, plus 64 open-span slots (4.6 KiB). It is allocated zeroed and never written up front, so
-a page is committed only once rows reach it: a pool thread that records a few spans holds a few
-pages. A thread that records steadily commits the whole 1 MiB after 16384 rows. With 64 such
-threads that is 64 MiB, which is the ring's real cost; at 5,000 spans a second a ring holds the
-last 3 s. The
-rings of threads that ended are reused, never freed, so the total is bounded by the most threads
-alive at once. Halving `CAP` halves both the memory and the window.
+Each thread that records holds one ring of `CAP` = 32768 rows, 64 bytes each: 2 MiB of address
+space. Its open-span slots (`SLOTS_OPEN` = 16384, since a thread holds the open spans of every
+fiber parked off it) come in chunks of `CHUNK` = 256 slots, each allocated only once the
+thread's open spans reach it, so a thread with few open spans holds one chunk. The ring is
+allocated zeroed and never written up front, so a page is committed only once rows reach it: a
+pool thread that records a few spans holds a few pages. A thread that records steadily commits
+the whole 2 MiB after 32768 rows. With 64 such threads that is 128 MiB, which is the ring's real
+cost; the history's drain thread reads every ring every `history::DRAIN` (50 ms), so the window
+a ring must hold is that, not seconds. The rings of threads that ended are reused, never freed,
+so the total is bounded by the most threads alive at once.
 
 The site table is 4095 slots of 8 bytes (32 KiB, static). The open-span stack is 32 ids per ring.
 
@@ -98,9 +134,11 @@ belongs at debug level, which `release_max_level_info` compiles out.
 
 ## How to measure it
 
-1. The per-span and per-plot cost: in release, run
-   `blaze test -p blaze-profile --release -- --ignored --nocapture what_a_span_and_a_plot_cost`.
-   It prints the nanoseconds of a span and of a plot through the installed recorder.
+1. The per-span cost: the `blaze-bench` benchmark `record` (`record/root`, `record/nested`),
+   with a budget of 30 ns a span each, paired against its base. The ignored test
+   `what_a_span_and_a_plot_cost` in `blaze-profile` prints a span's and a plot's nanoseconds too.
+   On a real build, `blaze slow`'s `recorder:` line gives the recorder's own measured cost a
+   span and its CPU reads over the build.
 2. The spans a build records: `blaze debug profile` after a warm no-op build and after a test
    build writes the flight recorder's trace; its `X` events (spans) and `C` events (plots)
    over the build's window give the counts. `blaze_profile::flight::progress()` before and
@@ -111,5 +149,5 @@ belongs at debug level, which `release_max_level_info` compiles out.
    started and not (`blaze serve` starts it; the measurement build leaves out that one call),
    20 runs each, the difference of the medians.
 
-Not measured yet: this lane does not build. The coordinator runs the four steps and records
-the numbers here.
+Not measured yet for the CPU-at-boundaries recorder: the coordinator runs the four steps and
+records the numbers here.

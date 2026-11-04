@@ -32,7 +32,10 @@ mod generics;
 mod items;
 mod types;
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one check, dropped with it, not global state"
+)]
 use std::{cell::OnceCell, ops::ControlFlow};
 
 use hir::{HirFileId, InFile};
@@ -51,7 +54,10 @@ use crate::{
 
 /// One pass over the nodes [`Walk`] holds: each node costs a `kind` read and a `match` on it;
 /// only the kinds a check looks at are cast, and nothing is allocated unless an error fires.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one check, dropped with it, not global state"
+)]
 pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Found> {
     let features = OnceCell::new();
     let mut out = Out::default();
@@ -84,7 +90,10 @@ impl Out {
 }
 
 /// The validator at one tree of the walk.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one check, dropped with it, not global state"
+)]
 struct V<'v, 'a, 'db> {
     cx: &'v Cx<'a, 'db>,
     walk: &'v Walk<'db>,
@@ -170,7 +179,8 @@ impl<'db> V<'_, '_, 'db> {
                     .and_then(|it| it.as_single_name_ref())
                     .is_some_and(|it| it.text() == "feature");
                 let Some(tt) = meta.token_tree().filter(|_| is_feature) else { continue };
-                for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
+                for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token)
+                {
                     if token.kind() == SyntaxKind::IDENT {
                         // alloc: as above
                         features.push(unraw(token.text()).to_owned());
@@ -197,20 +207,31 @@ impl<'db> V<'_, '_, 'db> {
     fn attr(&self, node: ast::Node<'_>, name: &str) -> Option<TextRange> {
         let owner = ast::AnyHasAttrs::cast(node)?;
         let cfg = self.walk.cfg;
-        hir_expand::attrs::expand_cfg_attr_view(ast::attrs_including_inner(&owner), || cfg, |meta, attr| {
-            if is_named(meta, name) { ControlFlow::Break(attr_range(meta, attr)) } else { ControlFlow::Continue(()) }
-        })
+        hir_expand::attrs::expand_cfg_attr_view(
+            ast::attrs_including_inner(&owner),
+            || cfg,
+            |meta, attr| {
+                if is_named(meta, name) {
+                    ControlFlow::Break(attr_range(meta, attr))
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
     }
 
     /// Each attribute of `node` once `cfg_attr` is expanded, with the `#[..]` it is written in.
     fn each_attr<'t>(&self, node: ast::Node<'t>, mut f: impl FnMut(ast::Meta<'t>, ast::Attr<'t>)) {
         let Some(owner) = ast::AnyHasAttrs::cast(node) else { return };
         let cfg = self.walk.cfg;
-        let _: Option<()> =
-            hir_expand::attrs::expand_cfg_attr_view(ast::attrs_including_inner(&owner), || cfg, |meta, attr| {
+        let _: Option<()> = hir_expand::attrs::expand_cfg_attr_view(
+            ast::attrs_including_inner(&owner),
+            || cfg,
+            |meta, attr| {
                 f(meta, attr);
                 ControlFlow::Continue(())
-            });
+            },
+        );
     }
 
     fn has_attr(&self, node: ast::Node<'_>, name: &str) -> bool {
@@ -231,7 +252,8 @@ impl<'db> V<'_, '_, 'db> {
                 SyntaxKind::ASSOC_ITEM_LIST => {
                     let Some(parent) = at.value.parent() else { return Ctxt::Free };
                     if ast::Trait::can_cast(parent.kind()) {
-                        return ast::Trait::cast(parent).map_or(Ctxt::Free, |it| Ctxt::Trait(at.with_value(it)));
+                        return ast::Trait::cast(parent)
+                            .map_or(Ctxt::Free, |it| Ctxt::Trait(at.with_value(it)));
                     }
                     if let Some(it) = ast::Impl::cast(parent) {
                         return match it.trait_() {
@@ -247,7 +269,9 @@ impl<'db> V<'_, '_, 'db> {
                         None => Ctxt::Free,
                     };
                 }
-                SyntaxKind::ITEM_LIST | SyntaxKind::SOURCE_FILE | SyntaxKind::STMT_LIST => return Ctxt::Free,
+                SyntaxKind::ITEM_LIST | SyntaxKind::SOURCE_FILE | SyntaxKind::STMT_LIST => {
+                    return Ctxt::Free;
+                }
                 _ => {}
             }
         }
@@ -286,10 +310,12 @@ impl<'db> Iterator for Ancestors<'_, 'db> {
             self.next = match kind {
                 SyntaxKind::MACRO_CALL => Some(at.value),
                 // A derive's call is its meta, in the `#[..]` on the item.
-                _ if kind == SyntaxKind::ATTR || ast::Meta::can_cast(kind) => (at.value.ancestors())
-                    .find(|it| it.kind() == SyntaxKind::ATTR)
-                    .and_then(|it| it.parent())
-                    .and_then(|it| it.parent()),
+                _ if kind == SyntaxKind::ATTR || ast::Meta::can_cast(kind) => {
+                    (at.value.ancestors())
+                        .find(|it| it.kind() == SyntaxKind::ATTR)
+                        .and_then(|it| it.parent())
+                        .and_then(|it| it.parent())
+                }
                 _ => at.value.parent(),
             };
         }
@@ -396,6 +422,8 @@ fn feature_err(feature: &str, message: impl Into<String>, span: Span) -> Diag {
     // alloc: the error's help
     diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
     // alloc: the error's note
-    diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
+    diag.note(format!(
+        "this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"
+    ));
     diag
 }
