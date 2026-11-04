@@ -90,8 +90,8 @@ Commands:
                 `--all`, `-- RUSTFMT_ARGS`), or the `.rs` files named; `blaze fmt --help`
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
-    status      What the daemon is doing
-    toolchain   Download the Rust blaze builds with, once, unless rustup has it
+    status      What the daemon is doing (`--json`: one object, docs/cargo.md)
+    toolchain   Download the Rust blaze builds with, once (`--json`: its name, host and sysroot)
     daemon      install: the system starts the daemon on demand; uninstall
     codegen-inputs --format=json   Each instance the last build made, with its code hash
     trace --out PATH               Every result of the last build, with its edges, as CBOR
@@ -189,6 +189,25 @@ pub fn words(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
     words
 }
 
+/// The words after `blaze status` or `blaze toolchain`: `--json` or nothing, whether JSON was
+/// asked; any other word refused, naming it and the command.
+fn json_flag(command: &str, words: Vec<OsString>) -> Result<bool, String> {
+    let mut json = false;
+    for word in words {
+        match word.to_str() {
+            Some("--json") => json = true,
+            // alloc: the refusal, once
+            _ => {
+                return Err(format!(
+                    "`blaze {command}` takes only `--json`, not `{}`",
+                    word.to_string_lossy()
+                ));
+            }
+        }
+    }
+    Ok(json)
+}
+
 /// Whether stderr is colored when nothing says how: clap's choice for its own errors.
 fn auto_color() -> bool {
     place::color(Some("auto"), |name| std::env::var(name).ok(), io::stderr().is_terminal())
@@ -234,19 +253,40 @@ pub fn command(words: Vec<OsString>) -> i32 {
             Exit::Failed.code()
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
-        Asked::Status => {
-            said(daemon::status(&mut io::stdout().lock(), &mut io::stderr().lock(), auto_color()))
-        }
-        Asked::Toolchain => match crate::toolchain::ensure() {
-            Ok(chosen) => {
-                println!("{chosen}");
-                0
-            }
+        Asked::Status(words) => match json_flag("status", words) {
+            Ok(json) => said(daemon::status(
+                &mut io::stdout().lock(),
+                &mut io::stderr().lock(),
+                auto_color(),
+                json,
+            )),
             Err(what) => {
                 eprint!("{}", say::error(&what, auto_color()));
-                Exit::Failed.code()
+                Exit::Usage.code()
             }
         },
+        Asked::Toolchain(words) => {
+            let json = match json_flag("toolchain", words) {
+                Ok(json) => json,
+                Err(what) => {
+                    eprint!("{}", say::error(&what, auto_color()));
+                    return Exit::Usage.code();
+                }
+            };
+            match crate::toolchain::ensure().and_then(|chosen| match json {
+                true => crate::toolchain::json(&chosen),
+                false => Ok(format!("{chosen}\n")),
+            }) {
+                Ok(text) => {
+                    print!("{text}");
+                    0
+                }
+                Err(what) => {
+                    eprint!("{}", say::error(&what, auto_color()));
+                    Exit::Failed.code()
+                }
+            }
+        }
         Asked::Daemon(verb) => said(daemon::units(verb, &mut io::stderr().lock(), auto_color())),
         Asked::Inspect(what, words) => inspect::main(what, words, auto_color()),
         Asked::Explore(words) => observe::explore(words, auto_color()),

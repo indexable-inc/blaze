@@ -88,7 +88,8 @@ a build first needs it.
     blaze fmt   [RUSTFMT_ARGS] FILE.rs...
     blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
     blaze stop
-    blaze status
+    blaze status [--json]
+    blaze toolchain [--json]
     blaze daemon install | uninstall
     blaze codegen-inputs --format=json
     blaze trace --out PATH
@@ -157,7 +158,31 @@ rustc's diagnostic, `build-finished`), written as cargo and rustc write them
 (`crates/blaze-cargo/src/cli/json.rs`), which is what rust-analyzer's check-on-save and other
 editors read. The wording of a diagnostic is blaze's (`crates/blaze-diagnostics`), not always
 rustc's. `status` prints the daemon's process, the requests it has served, the checkouts it
-watches and the memory it holds of its budget. `stop` has the daemon write its state and end.
+watches and the memory it holds of its budget (`--json`: one object, [The daemon](#the-daemon)).
+`stop` has the daemon write its state and end.
+
+Under a JSON `--message-format` every `build`, `check`, `run`, `test` and `bench` ends its build
+with one `build-finished` line on stdout, the last of its JSON messages and before anything the
+program or the tests print. cargo's has only `success`; blaze's carries what a tool would
+otherwise read from the human `Finished` line and the daemon's log, each field always present,
+`null` where there is nothing to say:
+
+    {"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}
+
+- `success`: as cargo's.
+- `profile`: the profile's name, `null` when the build placed nothing (it failed first).
+- `served`: `daemon`, or `in-process` for the seed's one-shot engine (docs/future/bootstrap.md).
+- `took_ms`: from the command's start to the build's end.
+- `build_id`: the daemon's id of the build, which the profile history's rows carry
+  (`blaze slow --build N`, `blaze debug sql`); `null` with no work report.
+- `units`: the units made again (`built`) and replayed from the store as they were
+  (`replayed`); `null` for a request that sent no work report (a load that failed).
+- `links`: each image linked, by how: its first link, spliced into the last one, unchanged, or
+  laid out whole again (`full`, which the `link:` line on stderr says why of).
+
+`--message-format=json-render-diagnostics` keeps the diagnostics rendered on stderr as the
+human format has them and puts only the JSON messages on stdout: what harness/storelib.py's
+`split_build_output` reads (`crates/blaze-cargo/src/cli/json.rs`, `build_finished`).
 
 `doc` takes `cargo doc`'s flags (`--open`, `--no-deps`, `--document-private-items`, `--lib`,
 `--bins`, `--bin`, `--examples`, `--example`, and the package, feature, profile and target
@@ -855,7 +880,22 @@ error. `blaze status` prints:
     memory: 1.3 GiB of 30.1 GiB
 
 the requests it is answering, how many views (a workspace at a checkout) it holds, and what it
-holds of its budget.
+holds of its budget. `blaze status --json` prints one object instead, for a script or an agent,
+and starts no daemon:
+
+    {"format":1,"version":"blaze 0.1.0 (...)","api_schema":38,"home":"/Users/me/.cache/blaze","state":"/Users/me/.cache/blaze/v2","socket":"/Users/me/.cache/blaze/v2.sock","daemon":{"pid":10969,"build":"<64 hex>","exe":"/usr/local/bin/blaze","uptime_ms":5230000,"memory_bytes":1395864371,"budget_bytes":32319628083,"bugs":0,"requests":[7],"views":2,"history":null,"settings":{"BLAZE_DAEMON_MEMORY_GB":null}}}
+
+`format` is the object's own shape (a new number when a field changes meaning or goes);
+`version` and `api_schema` are this blaze's (`blaze --version`, the daemon API's schema);
+`home` is blaze's root (`BLAZE_HOME`, else `blaze` in the user's cache directory), `state` the
+daemon's directory under it and `socket` where the CLI connects. `daemon` is `null` when none
+answers; else its pid, the hash of its executable as it started (`build`) and that file, how
+long it has run, its memory and budget in bytes, the bugs it went on past (every site's summed;
+the human `blaze status` lists each), the requests under way, its views, the profile history's
+last error and the settings it was started with. `blaze toolchain --json` is the same for the
+Rust blaze builds with: `{"name","nightly","rustc","release","commit","host","sysroot"}`, the
+host's tuple among them, what a script asks instead of `rustc -vV`
+([toolchain.md](toolchain.md)).
 
 A build whose tasks run while no span closes, no query completes and no task or step ends for
 the stall bound fails with an error naming what each thread is inside, and the daemon stops

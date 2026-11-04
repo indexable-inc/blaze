@@ -75,7 +75,7 @@ def main():
         with open(os.path.join(work, f"said-{label}.txt"), "w") as kept:
             kept.write(said)
         row = dict(step=label, build_s=round(took, 3), ready_s=round(ready, 3), states=states,
-                   built=bench.how_built(ran.stderr), peak_mb=max(sampler.peak_mb, used["largest_mb"]),
+                   built=bench.how_built(ran), peak_mb=max(sampler.peak_mb, used["largest_mb"]),
                    resident_mb=daemon.resident_mb(), compiled=bench.compiled(said), steps_s=bench.cold_steps(said),
                    store=from_store(said))
         edits = []
@@ -83,7 +83,7 @@ def main():
             bench.write_edit(side.ws, edit, back)
             took, ran, used = bench.metered(side, build, daemon)
             assert ran.returncode == 0, f"{label}: the edit: {ran.stderr[-3000:]}"
-            built = bench.how_built(ran.stderr)
+            built = bench.how_built(ran)
             said = daemon.said(1 if built == "daemon" else 0)
             with open(os.path.join(work, f"said-{label}-{'back' if back else 'edit'}.txt"), "w") as kept:
                 kept.write(said)

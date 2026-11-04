@@ -291,11 +291,118 @@ pub fn build_script(out: &mut String, ran: BuildScriptRanRef<'_>) {
     out.push('}');
 }
 
-/// `build-finished`, without its newline.
-pub fn build_finished(out: &mut String, success: bool) {
+/// How a build was served: by the daemon `blaze` connects to (or starts), or by the engine the
+/// seed runs in its own process for the one command (docs/future/bootstrap.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Served {
+    Daemon,
+    InProcess,
+}
+
+impl Served {
+    /// This blaze's: the daemon where it is built with blaze-cargo's `native` feature.
+    pub const HERE: Served = if cfg!(feature = "native") { Served::Daemon } else { Served::InProcess };
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Served::Daemon => "daemon",
+            Served::InProcess => "in-process",
+        }
+    }
+}
+
+/// What the request's units came to ([`blaze_api::Worked`]): units made again and units
+/// replayed from the store as they were, then each image linked by how.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Work {
+    /// The daemon's id of the build: the history's `build_id`, which `blaze slow --build N`
+    /// and `blaze debug sql` take.
+    pub build_id: Option<u64>,
+    pub built: u64,
+    pub replayed: u64,
+    pub first: u64,
+    pub spliced: u64,
+    pub unchanged: u64,
+    pub full: u64,
+}
+
+impl Work {
+    pub fn of(worked: &blaze_api::Worked) -> Work {
+        let mut work = Work {
+            build_id: worked.build_id,
+            built: worked.compiled,
+            replayed: worked.found,
+            ..Work::default()
+        };
+        for it in &worked.links {
+            match it.how {
+                blaze_api::LinkHow::First => work.first += 1,
+                blaze_api::LinkHow::Spliced => work.spliced += 1,
+                blaze_api::LinkHow::Unchanged => work.unchanged += 1,
+                blaze_api::LinkHow::Full { .. } => work.full += 1,
+            }
+        }
+        work
+    }
+}
+
+/// What `build-finished` says of a build, beyond cargo's `success`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Finished<'a> {
+    pub success: bool,
+    /// The profile's name (`dev`, `release`, a custom one), once the build placed its outputs.
+    pub profile: Option<&'a str>,
+    pub served: Served,
+    /// From the command's start to the build's end, in milliseconds.
+    pub took_ms: u64,
+    /// `None` for a request that sent no work report (a failed load, `doc`).
+    pub work: Option<Work>,
+}
+
+/// `build-finished`, without its newline: cargo's `reason` and `success` first, then blaze's
+/// own fields, each always present (`null` where unknown), so a reader's shape never varies:
+/// `{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,
+/// "build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,
+/// "full":0}}`. docs/cargo.md names each field.
+pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
     out.push_str(r#"{"reason":"build-finished","success":"#);
-    boolean(out, success);
-    out.push('}');
+    boolean(out, finished.success);
+    out.push_str(r#","profile":"#);
+    opt(out, finished.profile);
+    out.push_str(r#","served":"#);
+    quote(out, finished.served.name());
+    out.push_str(r#","took_ms":"#);
+    num(out, finished.took_ms);
+    out.push_str(r#","build_id":"#);
+    match finished.work.and_then(|it| it.build_id) {
+        Some(id) => num(out, id),
+        None => out.push_str("null"),
+    }
+    match finished.work {
+        Some(work) => {
+            out.push_str(r#","units":{"built":"#);
+            num(out, work.built);
+            out.push_str(r#","replayed":"#);
+            num(out, work.replayed);
+            out.push_str(r#"},"links":{"first":"#);
+            num(out, work.first);
+            out.push_str(r#","spliced":"#);
+            num(out, work.spliced);
+            out.push_str(r#","unchanged":"#);
+            num(out, work.unchanged);
+            out.push_str(r#","full":"#);
+            num(out, work.full);
+            out.push_str("}}");
+        }
+        None => out.push_str(r#","units":null,"links":null}"#),
+    }
+}
+
+/// The name of the profile a `Finished` text names (`` `dev` profile [unoptimized + debuginfo]
+/// ``, blaze-units' `plan::finished`): what is between its backticks. `None` for a text not of
+/// that form, which no build of this blaze sends.
+pub fn profile_name(finished: &str) -> Option<&str> {
+    finished.strip_prefix('`')?.split_once('`').map(|(name, _)| name)
 }
 
 /// `compiler-message` of `unit`, without its newline. With `ansi`

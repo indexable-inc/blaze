@@ -16,8 +16,9 @@ run` prints the value. Under blaze it has to as well:
             manifest names in `build-script-env`, for a script that does not say it reads it
 BLAZE_BIN names the compiler, with blaze beside it.
 """
-import os, re, shutil, subprocess, tempfile
+import os, shutil, subprocess, tempfile
 
+import storelib
 from blaze_cli import base_env
 
 REPRO = {
@@ -68,7 +69,10 @@ def main():
         base.pop("SDK_DIR", None)
         base.pop("VENDOR_DIR", None)
         written(ws, files)
-        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=ws, env=base, capture_output=True)
+        locked = blaze("lock")
+        if locked.returncode != 0:
+            raise SystemExit(f"FAIL {name}: `blaze lock` in {ws} exited {locked.returncode}: "
+                             f"{locked.stderr.strip()[-1500:]}")
 
     def blaze(*args, **env):
         ran = subprocess.run(["blaze", *args], cwd=ws, env=dict(base, **env),
@@ -76,8 +80,7 @@ def main():
         return ran
 
     def daemon():
-        found = re.search(r"^daemon: pid (\d+)", blaze("status").stdout, re.M)
-        return found and int(found[1])
+        return storelib.daemon_pid(shutil.which("blaze", path=base["PATH"]) or "blaze", base, ws)
 
     # Without the variable the run fails as the script's (the panic itself is in the worker's log).
     def check(label, ran, printed=None):

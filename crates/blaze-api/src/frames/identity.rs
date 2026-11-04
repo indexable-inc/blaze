@@ -558,6 +558,7 @@ impl Gen {
                     outcome: ServedPart::ALL[(g.next() % 3) as usize],
                     package: g.text(),
                 }),
+                build_id: self.maybe(Gen::wide),
                 compiled: self.wide(),
                 steps_us: self.many(depth, |g| {
                     (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
@@ -601,6 +602,7 @@ impl Gen {
                 requests: self.many(depth, Gen::wide),
                 settings: self
                     .many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
+                uptime_ms: self.wide(),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
                 build: crate::Build {

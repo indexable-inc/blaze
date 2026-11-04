@@ -22,7 +22,7 @@ The result has every sample and the median of each; the table printed at the end
 """
 import glob, json, os, shutil, statistics, subprocess, sys, tempfile, time
 
-import blaze_cli, memory
+import blaze_cli, memory, storelib
 from bench import PROJECTS, options
 from blaze_cli import Side, fetch, how_built, wait_warm
 
@@ -32,11 +32,8 @@ SETTLE_SECS = 120
 
 
 def daemon_pid(side):
-    _, status = side.cargo("status")
-    for line in status.stdout.splitlines():
-        if line.startswith("daemon: pid "):
-            return int(line.split()[2].rstrip(","))
-    return None
+    """The pid of `side`'s daemon, by `blaze status --json`; None when none runs."""
+    return storelib.daemon_pid("blaze", side.env, side.ws)
 
 
 def settled(home):
@@ -72,7 +69,7 @@ def started(side, label):
         waited, states = wait_warm(side, side.ws)
     if states != ["ready"]:
         raise SystemExit(f"{label}: the daemon did not get ready: {states}\n{ran.stderr[-3000:]}")
-    return took, took + waited, max(sampler.peak_mb, used["largest_mb"]), how_built(ran.stderr)
+    return took, took + waited, max(sampler.peak_mb, used["largest_mb"]), how_built(ran)
 
 
 def sequence(name, spec, source, variant, work):

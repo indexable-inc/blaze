@@ -136,6 +136,21 @@ fn built() -> Response {
     }
 }
 
+/// The `build-finished` line of a build that succeeded in [`printed`]'s 1234 ms, with
+/// `profile` and `work` as the printer was given them (json/tests.rs holds the line's form).
+fn finished_line(profile: Option<&str>, work: Option<json::Work>) -> String {
+    let mut out = String::new();
+    let finished = json::Finished {
+        success: true,
+        profile,
+        served: json::Served::HERE,
+        took_ms: 1234,
+        work,
+    };
+    json::build_finished(&mut out, &finished);
+    out
+}
+
 /// What the printer wrote to stdout and stderr of `responses`, ended with `ok`.
 fn printed(shown: Shown, responses: &[Response], ok: bool) -> (String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -232,6 +247,7 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
         }],
         reran: 2,
         served: Vec::new(),
+        build_id: None,
         compiled: 1,
         critical_path_us: 1500,
         steps_us: vec![(blaze_api::NodeKind::Link, 40)],
@@ -243,12 +259,16 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
     };
     let (out, err) =
         printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
+    let work = json::Work { built: 1, replayed: 3, spliced: 1, ..json::Work::default() };
     assert_eq!(
         out,
         "{\"reason\": \"blaze-work\", \"reran\": 2, \"green\": 40, \"compiled\": 1, \"found\": 3, \"link\": \
          \"patched\", \"critical_path_us\": 1500, \"links\": [{\"path\": \"target/debug/foo\", \"how\": \
          \"spliced\", \"why\": []}], \"steps_us\": {\"link\": 40}, \"placed\": {\"cloned\": 0, \"written\": 0, \
-         \"copied\": 0}}\n{\"reason\":\"build-finished\",\"success\":true}\n"
+         \"copied\": 0}}\n"
+            .to_owned()
+            + &finished_line(None, Some(work))
+            + "\n"
     );
     assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "{err}");
     let (out, err) = printed(
@@ -287,6 +307,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
                 package: "serde".to_owned(),
             },
         ],
+        build_id: None,
         compiled: 0,
         critical_path_us: 7,
         steps_us: Vec::new(),
@@ -298,6 +319,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
     };
     let (out, _) =
         printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
+    let finished = finished_line(None, Some(json::Work::default())) + "\n";
     assert_eq!(
         out,
         concat!(
@@ -308,8 +330,9 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
              \"why\": null}\n",
             "{\"reason\": \"blaze-served\", \"package\": \"serde\", \"outcome\": \"checked\", \"bodies\": \"refused\", \
              \"why\": \"the \\\"std\\\" feature\"}\n",
-            "{\"reason\":\"build-finished\",\"success\":true}\n",
         )
+        .to_owned()
+            + &finished
     );
     let (out, _) =
         printed(Shown::default(), &[Response::Work(worked), Response::Done { ok: true }], true);
@@ -417,7 +440,7 @@ fn rustcs_summary_is_skipped_under_json_too() {
     );
     let (out, _) =
         printed(json, &[Response::Diagnostic(emitted), Response::Done { ok: true }], true);
-    assert_eq!(out, "{\"reason\":\"build-finished\",\"success\":true}\n");
+    assert_eq!(out, finished_line(None, None) + "\n");
 }
 
 #[test]
@@ -558,7 +581,7 @@ fn lines_of_one_stream_in_one_write_and_both_in_the_order_made() {
         "{}",
         log[2].1
     );
-    assert_eq!(log[3].1, "{\"reason\":\"build-finished\",\"success\":true}\n");
+    assert_eq!(log[3].1, finished_line(Some("dev"), None) + "\n");
 }
 
 /// A build's responses: each unit starting, warnings, artifacts, a unit ending.
@@ -676,7 +699,7 @@ fn json_on_stdout_and_status_on_stderr() {
         r#""message":{"rendered":"warning: unused variable: `x`\n --> src/lib.rs:1:5\n\n","#
     ));
     assert!(lines[1].starts_with(r#"{"reason":"compiler-artifact","#));
-    assert_eq!(lines[2], r#"{"reason":"build-finished","success":true}"#);
+    assert_eq!(lines[2], finished_line(Some("dev"), None));
     // No "generated" line: cargo counts a unit's warnings where it renders them.
     assert_eq!(
         err,

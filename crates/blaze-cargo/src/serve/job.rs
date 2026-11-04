@@ -5491,6 +5491,8 @@ impl<S: Steps> Jobs<S> {
             reran: stats.ran,
             green: stats.cached + stats.joined,
             served: std::mem::take(&mut job.served),
+            // The history's `build_id` of the same build ([`Job::row`]).
+            build_id: job.request.map(|it| u64::from(it.0)),
             compiled,
             found: fresh,
             link: link_kind(&links),

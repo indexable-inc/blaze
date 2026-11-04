@@ -56,7 +56,7 @@ def main():
             _, mine = ours.cargo("run")
             wanted, printed = f"{value} {value} {tag}", program_output(mine)[1]
             differs = "" if printed == wanted else f"printed {printed!r}, not {wanted!r}"
-            how = how_built(mine.stderr)
+            how = how_built(mine)
             bad = mine.returncode != 0 or how != "daemon" or bool(differs)
             wrong += bad
             print(f"{'WRONG' if bad else 'right'}  left {value}, tag {tag}: {how}; "

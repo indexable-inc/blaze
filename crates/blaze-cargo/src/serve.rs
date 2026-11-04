@@ -109,8 +109,8 @@ pub fn sources() -> anyhow::Result<PathBuf> {
 }
 
 /// blaze's root of this process ([`blaze_manifest::home::root`]), which [`state`],
-/// [`builds`] and [`sources`] are under.
-fn root() -> anyhow::Result<PathBuf> {
+/// [`builds`] and [`sources`] are under; `blaze status --json` names it as `home`.
+pub fn root() -> anyhow::Result<PathBuf> {
     blaze_manifest::home::process_root()
         .map_err(anyhow::Error::msg)?
         .context("no BLAZE_HOME, XDG_CACHE_HOME or HOME says where blaze keeps its state and build directories")

@@ -105,7 +105,7 @@ class Build:
             before, counted = Usage.total(pids), meter.snapshot()
             took, ran = side.cargo("build", *build)
             after, counted = Usage.total(pids), meter.since(counted)
-            built = how_built(ran.stderr)
+            built = how_built(ran)
             if ran.returncode != 0 or built != "daemon":
                 raise SystemExit(f"{self.name} {kind}: built by {built} (exit {ran.returncode}):\n{ran.stderr[-2000:]}")
             said = daemon.said(1 if edit else 0)

@@ -402,10 +402,10 @@ pub enum Asked {
     Cargo(Box<Invocation>),
     /// `blaze stop`: the daemon made durable and ended.
     Stop,
-    /// `blaze status`: what the daemon is doing.
-    Status,
-    /// `blaze toolchain`: blaze's Rust, downloaded once unless rustup has it.
-    Toolchain,
+    /// `blaze status [--json]`: what the daemon is doing, with the words after it.
+    Status(Vec<OsString>),
+    /// `blaze toolchain [--json]`: blaze's Rust, downloaded once, with the words after it.
+    Toolchain(Vec<OsString>),
     /// `blaze daemon install` or `blaze daemon uninstall`: the units that socket-activate it.
     Daemon(DaemonVerb),
     /// `blaze codegen-inputs`, `blaze trace` or `blaze tables`: what the daemon's last build of
@@ -745,8 +745,8 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             }
             Some("--version" | "-V") => return Ok(Asked::Version),
             Some("stop") => return Ok(Asked::Stop),
-            Some("status") => return Ok(Asked::Status),
-            Some("toolchain") => return Ok(Asked::Toolchain),
+            Some("status") => return Ok(Asked::Status(words.collect())),
+            Some("toolchain") => return Ok(Asked::Toolchain(words.collect())),
             Some("explore") => return Ok(Asked::Explore(words.collect())),
             Some("debug") => return Ok(Asked::Debug(words.collect())),
             Some("explain") => return Ok(Asked::Explain(words.collect())),

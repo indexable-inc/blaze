@@ -359,7 +359,7 @@ def main(args: Input) -> None:
     print(f"work: {work}", flush=True)
     build_env = eng.env(home, store, extra={"CARGO_HOME": str(cargo_home)})
     try:
-        rep.extra["toolchain_identity"] = step(rep, "toolchain", lambda: engine.toolchain_identity(engine.scrubbed()))
+        rep.extra["toolchain_identity"] = step(rep, "toolchain", lambda: engine.toolchain_identity(eng.blaze, engine.scrubbed()))
         copies = step(rep, "copy", lambda: copy(work))
         step(rep, "fetch", lambda: fetch(copies["workspace"], cargo_home, work))
         try:

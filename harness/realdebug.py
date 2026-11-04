@@ -240,7 +240,7 @@ def project(tally, name, work):
     with open(os.path.join(ws, check["panic"][0]), "a") as source:
         source.write("// built again\n")
     took, ran = ours.cargo("build", *build)
-    built = how_built(ran.stderr)
+    built = how_built(ran)
     tally.say(f"{name}: built", "by the daemon" if built == "daemon" else "NOT BY THE DAEMON", f"{built}; {'; '.join(states)[:80]}; {took:.2f}s")
     binary = os.path.join(ws, "target", "debug", check["binary"])
     verify(tally, name, binary)

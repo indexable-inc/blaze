@@ -16,7 +16,8 @@ Writes SOAKROWS.md next to this file.
 """
 import argparse, glob, os, re, shutil, signal, subprocess, sys, tempfile, time
 
-from blaze_cli import HERE, BLAZE, TOOLCHAIN, Scratch, Side, base_env, difference, how_built, program_output, test_results, wait_warm
+import storelib
+from blaze_cli import HERE, BLAZE, TOOLCHAIN, Scratch, Side, base_env, difference, how_built, machine_format, program_output, read_build, test_results, wait_warm
 
 GIT = ["git", "-c", "user.name=blaze", "-c", "user.email=blaze@localhost", "-c", "advice.detachedHead=false"]
 OTHER_TOOLCHAIN = "1.94.0"
@@ -77,7 +78,7 @@ class Row:
         _, ran = side.cargo("build")
         if ran.returncode:
             raise Wrong(f"the first build failed: {ran.stderr[-300:]}")
-        if "daemon: not running" in side.cargo("status")[1].stdout:
+        if storelib.daemon_pid("blaze", side.env, side.ws) is None:
             raise Wrong(f"no daemon after the first build: {ran.stderr[-300:]}")
         _, states = wait_warm(side, os.path.realpath(ws or self.ws))
         return states
@@ -91,7 +92,7 @@ class Row:
         shutil.rmtree(self.path("target-scratch", ws=ws), ignore_errors=True)
         read = test_results if command == "test" else program_output
         differs = difference(read(ours), read(fresh))
-        how = how_built(ours.stderr)
+        how = how_built(ours)
         self.built.append(f"{label}: {how}")
         if differs:
             raise Wrong(f"{label} ({how}): {differs}")
@@ -102,9 +103,17 @@ class Row:
         return how, ours
 
     def status(self, env=None):
-        text = Side(self.ws, dict(self.env, **(env or {})), True).cargo("status")[1].stdout
-        pid = re.search(r"^daemon: pid (\d+)", text, re.M)
-        return (int(pid[1]) if pid else None), [int(p) for p in re.findall(r"worker: pid (\d+)", text)], text
+        """`blaze status --json` of the daemon this row's blaze (with `env`) asks."""
+        return storelib.blaze_status("blaze", dict(self.env, **(env or {})), self.ws)
+
+    def pid(self, env=None):
+        """The pid of that daemon; None when none runs."""
+        daemon = self.status(env).daemon
+        return daemon.pid if daemon else None
+
+    def said(self, env=None):
+        """What `blaze status` says of the daemon, for people: kept in the row's notes."""
+        return Side(self.ws, dict(self.env, **(env or {})), True).cargo("status")[1].stdout
 
     def panics(self):
         logs = [os.path.join(self.home, "daemon.log"), *glob.glob(os.path.join(self.home, "**", "log"), recursive=True)]
@@ -118,7 +127,7 @@ class Row:
 
     def stop(self, env=None):
         Side(self.ws, dict(self.env, **(env or {})), True).cargo("stop")
-        pid = self.status(env)[0]
+        pid = self.pid(env)
         try:
             os.kill(pid or 0, signal.SIGKILL) if pid else None
         except ProcessLookupError:
@@ -183,7 +192,7 @@ def symlinked_root(row):
     env = {"PWD": link}
     row.both("cold through the link", args=args, ws=link, env=env)
     wait_warm(Side(link, row.env, True), row.ws)
-    row.notes.append("status after a build through the link:\n" + row.status()[2])
+    row.notes.append("status after a build through the link:\n" + row.said())
     row.edit()
     row.both("edited, through the link", args=args, ws=link, env=env, want=f"mark {row.mark}")
     row.edit(os.path.join(link, "core/src/lib.rs"))
@@ -281,7 +290,7 @@ def worktree_recreated(row):
     shutil.rmtree(tree)
     row.git("worktree", "prune")
     time.sleep(2.5)
-    row.notes.append("status with the worktree deleted:\n" + row.status()[2])
+    row.notes.append("status with the worktree deleted:\n" + row.said())
     row.git("worktree", "add", "-q", tree, "three")
     row.both("deleted and added again", ws=tree, want="mark 1003")
     wait_warm(Side(tree, row.env, True), tree)
@@ -381,10 +390,10 @@ def non_utf8_root(row):
     shutil.copytree(row.ws.encode(), ws, ignore=lambda _, names: [it for it in names if it.startswith(b"target")])
     run = lambda argv, env: subprocess.run(argv, cwd=ws, env=env, capture_output=True, text=True, errors="replace", timeout=1800)
     for label in ("cold", "edited"):
-        ours = run(["blaze", "run"], row.env)
+        ours = read_build(run(["blaze", "run", *machine_format("run", ())], row.env))
         _, fresh = Scratch(os.fsdecode(ws), row.env).cargo("run", timeout=1800)
         shutil.rmtree(os.path.join(ws, b"target-scratch"), ignore_errors=True)
-        how = how_built(ours.stderr)
+        how = how_built(ours)
         row.built.append(f"{label}: {how}")
         if (ours.returncode, ours.stdout) != (fresh.returncode, fresh.stdout):
             raise Wrong(f"{label} ({how}): {ours.returncode} {ours.stdout[-200:]!r} {ours.stderr[-300:]!r}, and from nothing {fresh.returncode} {fresh.stdout[-200:]!r}")
@@ -506,12 +515,12 @@ def binary_replaced(row):
     row.warm()
     row.edit()
     row.both("before", want=f"mark {row.mark}")
-    first = row.status()[0]
+    first = row.pid()
 
     another_build(source, bin)
     row.edit()
     row.both("the binary replaced under the daemon", want=f"mark {row.mark}")
-    second = row.status()[0]
+    second = row.pid()
     if second in (None, first) or os.path.exists(f"/proc/{first}/exe") and "Z" not in open(f"/proc/{first}/stat").read().split(")")[-1].split()[0]:
         raise Wrong(f"the daemon of the build that is gone is still there: {first} then {second}")
     row.notes.append(f"daemon {first} was replaced by {second}")
@@ -523,7 +532,7 @@ def binary_replaced(row):
     older = {"PATH": old + os.pathsep + path}
     row.edit()
     row.both("an older client and a newer daemon", env=older, want=f"mark {row.mark}")
-    third = row.status(older)[0]
+    third = row.pid(older)
     row.notes.append(f"the older client replaced daemon {second} by {third}")
     row.edit()
     row.both("and the newer client again", want=f"mark {row.mark}")
@@ -533,7 +542,7 @@ def binary_replaced(row):
     # worker for, by a client that is the same build from another place.
     twin = os.path.join(row.dir, "bin-twin")
     shutil.copytree(bin, twin, copy_function=shutil.copy2)
-    daemon = row.status()[0]
+    daemon = row.pid()
     os.remove(os.path.join(bin, "blaze-engine"))
     second_ws = os.path.join(row.dir, "ws2")
     row.copy(second_ws)
@@ -543,7 +552,7 @@ def binary_replaced(row):
     # starts the one that is there.
     time.sleep(3)
     row.both("the build after that", ws=second_ws, env=apart, want="mark 1000")
-    after = row.status(apart)[0]
+    after = row.pid(apart)
     if after in (None, daemon):
         raise Wrong(f"the daemon whose binary was deleted is still the one asked: {daemon} then {after}")
     wait_warm(Side(second_ws, dict(row.env, **apart), True), second_ws)
@@ -557,25 +566,21 @@ def binary_replaced(row):
 
 
 def memory_ceiling(row):
-    """With a ceiling below what one worker holds, the worker asked longest ago is stopped,
-    and its workspace builds right after."""
+    """With a ceiling below what one workspace holds, a second workspace loads, and the first
+    builds right after, and is loaded again."""
     second = os.path.join(row.dir, "ws2")
     row.copy(second)
     row.warm()
     row.edit()
     how, _ = row.both("the first workspace, loaded", want=f"mark {row.mark}")
-    _, first_workers, text = row.status()
-    row.notes.append("one workspace loaded:\n" + text)
+    row.notes.append("one workspace loaded:\n" + row.said())
     row.warm(ws=second)
     time.sleep(3)
-    _, workers, text = row.status()
-    row.notes.append("a second loaded, three seconds later:\n" + text)
-    if any(worker in workers for worker in first_workers):
-        raise Wrong(f"the worker asked longest ago is still there: {first_workers} of {workers}")
-    if not workers:
-        raise Wrong("the worker asked last was stopped too")
+    # blaze has no workers to stop any more, and its status names none: what is checked is
+    # that both workspaces build right under the ceiling.
+    row.notes.append("a second loaded, three seconds later:\n" + row.said())
     row.edit()
-    row.both("the first workspace, its worker stopped", want=f"mark {row.mark}")
+    row.both("the first workspace, after the second", want=f"mark {row.mark}")
     wait_warm(Side(row.ws, row.env, True), row.ws)
     row.edit()
     how, _ = row.both("the first workspace, loaded again", want=f"mark {row.mark}")
@@ -583,22 +588,19 @@ def memory_ceiling(row):
         raise Wrong(f"it was not loaded again: {how}")
     row.both("its tests", command="test")
     time.sleep(3)
-    row.notes.append("after the first was asked again:\n" + row.status()[2])
+    row.notes.append("after the first was asked again:\n" + row.said())
     log = open(os.path.join(row.home, "daemon.log"), errors="replace").read()
     row.notes.append("\n".join(l for l in log.splitlines() if "BLAZE_MEMORY_MAX" in l))
 
 
 def no_ceiling(row):
-    """The same two workspaces with no ceiling: both workers stay."""
+    """The same two workspaces with no ceiling: the first's edit is the daemon's."""
     second = os.path.join(row.dir, "ws2")
     row.copy(second)
     row.warm()
     row.warm(ws=second)
     time.sleep(3)
-    _, workers, text = row.status()
-    row.notes.append(text)
-    if len(workers) != 2:
-        raise Wrong(f"{len(workers)} workers for two workspaces")
+    row.notes.append(row.said())
     row.edit()
     how, _ = row.both("the first workspace", want=f"mark {row.mark}")
     if how != "daemon":
@@ -607,8 +609,8 @@ def no_ceiling(row):
 
 def in_a_control_group(row, allowed=6 << 30):
     """A daemon started in a control group that allows 6 GB, as a container, a CI job or a
-    systemd unit is, has its workers hold at most half of that, not half of the machine's
-    memory, and builds."""
+    systemd unit is, budgets at most half of that (`blaze status --json`'s `budget_bytes`), not
+    half of the machine's memory, and builds."""
     scope = ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={allowed}"]
     if not sys.platform.startswith("linux") or not shutil.which("systemd-run"):
         raise NotRun("it starts a control group with systemd-run, on Linux")
@@ -621,11 +623,11 @@ def in_a_control_group(row, allowed=6 << 30):
     if ran.returncode:
         raise Wrong(f"the first build failed: {ran.stderr[-300:]}")
     wait_warm(side, row.ws)
-    text = row.status()[2]
-    row.notes.append(text)
-    most = re.search(r"workers hold at most (\d+) MB", text)
-    if not most or int(most[1]) > allowed // 2 >> 20:
-        raise Wrong(f"the workers may hold more than half of the {allowed >> 20} MB the control group allows: {text.strip()[-300:]}")
+    row.notes.append(row.said())
+    daemon = row.status().daemon
+    if daemon is None or daemon.budget_bytes > allowed // 2:
+        raise Wrong(f"the daemon may hold more than half of the {allowed >> 20} MB the control group allows: "
+                    f"{'no daemon runs' if daemon is None else f'its budget is {daemon.budget_bytes >> 20} MB'}")
     row.edit()
     how, _ = row.both("a body edited", want=f"mark {row.mark}")
     if how != "daemon":

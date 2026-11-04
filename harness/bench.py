@@ -484,10 +484,8 @@ class Daemon:
         self.side, self.read, self.peak, self.sampled = side, {}, 0, 0
 
     def pid(self):
-        _, status = self.side.cargo("status")
-        # v2's first line is `pid: N`, v1's `daemon: pid N, ...`.
-        found = re.search(r"^(?:pid: |daemon: pid )(\d+)", status.stdout, re.M)
-        return int(found[1]) if found else None
+        """The daemon's pid, as `blaze status --json` says it; None when none runs."""
+        return storelib.daemon_pid("blaze", self.side.env, self.side.ws)
 
     def resident_mb(self):
         """What the daemon and every process below it (its workers) hold now."""
@@ -539,6 +537,8 @@ def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
     if own:
         sampler.start()
     took, ran, used = memory.run(side.argv(command, *args), side.ws, side.env, 7200, sampler=sampler, meter=meter)
+    # As `Side.cargo` reads it: `side.argv` added the format its build is read by.
+    blaze_cli.read_build(ran, cut=side.blaze and bool(blaze_cli.machine_format(command, args)))
     if own:
         sampler.stop()
     used = dict(peak_mb=max(sampler.peak_mb, used["largest_mb"]), largest_mb=max(used["largest_mb"], sampler.largest_mb))
@@ -782,7 +782,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         for side, ran in (("blaze", mine), ("cargo", other)):
             if ran.returncode != 0:
                 raise Failed(f"{name} {backend}: the {side} build failed:\n{ran.stderr[-3000:]}")
-        built = how_built(mine.stderr)
+        built = how_built(mine)
         if built != "daemon":
             # A build cargo did has the daemon load again; the next one is not timed against that.
             wait_warm(ours, ws)
@@ -857,7 +857,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         ours.env.update(BLAZE_HOME=home(turn))
         daemon = Daemon(ours)
         took, warm, mine, used, counted = cold_blaze(ours, "empty store", daemon, meter)
-        said, built, peak = daemon.said(), how_built(mine.stderr), daemon.peak_mb()
+        said, built, peak = daemon.said(), how_built(mine), daemon.peak_mb()
         # The images this daemon has linked: each later link of one is an edit of it.
         linked = {image for image, _ in links(said + mine.stderr)}
         reference, other, cargo_used = metered(theirs, build)
@@ -996,7 +996,7 @@ def test_suite(name, spec, ours, theirs, ws, wrong):
         differs = test_verdict(said, frozenset(spec.get("test_known", ())))
         if differs:
             wrong.append(f"tests ({label}): {differs}")
-        return dict(wall_s=took, cargo_s=reference, built=how_built(mine.stderr), said=said_cargo, said_blaze=said, differs=differs)
+        return dict(wall_s=took, cargo_s=reference, built=how_built(mine), said=said_cargo, said_blaze=said, differs=differs)
 
     first = [tests("first runs") for _ in range(3)]
     edited, still = [], []
@@ -1103,7 +1103,7 @@ def measure_stress(crate, backend, runs, work):
                 counted = meter.since(before, meter.settle())
             side.cargo("stop")
             rows.append(dict(wall_s=took + warm, build_s=took, warm_s=warm, peak_mb=max(sampler.peak_mb, used["largest_mb"]),
-                             built=how_built(ran.stderr), counts=counted))
+                             built=how_built(ran), counts=counted))
         median = lambda key: round(statistics.median(r[key] for r in rows), 3)
         peaks = [r["peak_mb"] for r in rows]
         phase = dict(wall_s=median("wall_s"), build_s=median("build_s"), warm_s=median("warm_s"),
@@ -1200,7 +1200,7 @@ def machine():
         load=", ".join(f"{v:.1f}" for v in os.getloadavg()),
         memory_gib=round(int(memory) / 1024 / 1024) if memory else None,
         os=platform.system(), arch=platform.machine(), kernel=platform.release(),
-        rustc=first_line("rustc", "-V"), cc=first_line("cc", "--version"), ld=first_line("ld", "--version"),
+        rustc=storelib.blaze_toolchain(blaze_cli.BLAZE, dict(os.environ)).rustc, cc=first_line("cc", "--version"), ld=first_line("ld", "--version"),
         llvm=first_line("llvm-config", "--version"),
         incremental=os.environ.get("CARGO_INCREMENTAL", "profile default (on for dev)"),
         wrapper=None, linker="the toolchain's default (cc)",

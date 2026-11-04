@@ -81,7 +81,7 @@ def main():
                     for back in (False, True):
                         bench.write_edit(ws, spec["edits"][kind], back)
                         took, ran = ours.cargo("build", *build)
-                        walls.append((round(took, 3), bench.how_built(ran.stderr)[:40]))
+                        walls.append((round(took, 3), bench.how_built(ran)[:40]))
             phase(kind, began, walls=walls, peak_mb=sampler.peak_mb, resident_mb=daemon.resident_mb())
         ours.cargo("stop")
         # The second daemon writes its logs where the first did.

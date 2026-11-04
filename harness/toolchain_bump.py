@@ -5,8 +5,9 @@ dated nightly in harness/toolchain; everything that mirrors that rustc moves wit
     uv run --frozen python harness/toolchain_bump.py '{}'
                                               the newest nightly that has every component blaze needs
     uv run --frozen python harness/toolchain_bump.py '{"date": "2026-11-02"}'
-    uv run --frozen python harness/toolchain_bump.py checks '{}'
-                                              after a bump, in an ix VM: build blaze and run the
+    uv run --frozen python harness/toolchain_bump.py checks '{"stage0": "/path/to/blaze"}'
+                                              after a bump, in an ix VM: build blaze with the
+                                               blaze given (stage 0, never cargo) and run the
                                                checks that prove blaze and the nightly agree
 
 The JSON is inline, a file's path, or `-` for stdin.
@@ -38,7 +39,7 @@ A bump, in order (each step names itself when it fails, and stops there):
 What it leaves to you, which it prints at the end: answers.py --write on each of x86-64 Linux,
 AArch64 Linux and arm64 macOS (the target specs depend on the host rustc was built for), the
 code that mirrors rustc by hand (the Rust ABI in the code generator, vtable.rs, type_id.rs,
-symbol names, new intrinsics and lang items: the checks find them), and `checks '{}'`. That
+symbol names, new intrinsics and lang items: the checks find them), and `checks`. That
 includes blaze's proc-macro server, crates/blaze-macro-eval, which speaks the pinned
 `library/proc_macro` bridge's protocol by hand and checks it at load (`protocol::check`), so a
 bridge that changed is an error there to fix, not a copy to re-vendor. The rustc
@@ -59,6 +60,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import ci
+import storelib
 from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -268,19 +270,30 @@ async def bump(date):
 blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`,
     then commit crates/blaze-units/src/stdlib/rustc.json;
-  - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
-  - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM (`nix develop -c ...`;
-    the release profile is LLVM's, which every native blaze has);
+  - `blaze build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
+  - `uv run --frozen python harness/toolchain_bump.py checks '{{"stage0": "/path/to/blaze"}}'` in an
+    ix VM (the release profile is LLVM's, which every native blaze has);
   - the full tier (the train and the crates' own test suites) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
 
 
-async def checks():
-    """Builds blaze and runs its pins and the fast tier against the pinned nightly, in parallel."""
+async def checks(stage0):
+    """Builds blaze with blaze (`stage0`, never cargo) and runs its pins and the fast tier
+    against the pinned nightly, in parallel."""
     name = (await asyncio.to_thread(Path(PIN).read_text)).strip()
+    if not (os.path.isfile(stage0) and os.access(stage0, os.X_OK)):
+        raise Failed(f"build: stage0 {stage0!r} is no executable file")
+    # RUSTUP_TOOLCHAIN for the harnesses' own uses of the nightly; blaze reads none of it.
     env = dict(os.environ, RUSTUP_TOOLCHAIN=name)
-    await run("build", "cargo", "build", "-p", "blaze-engine", "--release", env=env, bound=3600)
-    env.setdefault("BLAZE_BIN", os.path.join(ROOT, "target/release/blaze-engine"))
+    argv = [stage0, "build", "-p", "blaze-engine", "--release", "--bins",
+            "--message-format=json-render-diagnostics"]
+    out = await run("build", *argv, env=env, bound=3600)
+    engine = storelib.artifact(out, "blaze-engine")
+    if not engine:
+        raise Failed(f"build: `{' '.join(argv)}` printed no executable of `blaze-engine`")
+    if not os.path.isfile(os.path.join(os.path.dirname(engine), "blaze")):
+        raise Failed(f"build: `{' '.join(argv)}` left no `blaze` beside {engine}")
+    env["BLAZE_BIN"] = engine
     harness = [
         ["toolchain_pins.py", "{}"],
         *(["ci.py", "run", json.dumps({"part": part})]
@@ -312,7 +325,8 @@ class Bump:
 
 @dataclass(frozen=True)
 class Checks:
-    pass
+    # A blaze binary that builds this tree (stage 0: a release, or a blaze built earlier).
+    stage0: str
 
 
 def main():
@@ -324,8 +338,7 @@ def main():
         fail("toolchain_bump.py", "usage: toolchain_bump.py [checks] JSON (see the top of the file)")
     given = argv[0]
     if checking:
-        parse(Checks, given, "toolchain_bump.py")
-        work = checks()
+        work = checks(parse(Checks, given, "toolchain_bump.py").stage0)
     else:
         options = parse(Bump, given, "toolchain_bump.py")
         if options.date and not re.fullmatch(r"\d{4}-\d\d-\d\d", options.date):

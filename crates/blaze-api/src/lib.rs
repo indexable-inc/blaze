@@ -80,8 +80,9 @@ use serde::{Deserialize, Serialize};
 /// [`UnitOf::doctest`]. 31: [`Response::Unchecked`]. 32: [`LinkHow::Unchanged`]. 33:
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
 /// [`Status::settings`]. 36: an [`ApiError`] is its [`Report`] (docs/v2/plan/structured-output.md),
-/// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`].
-pub const SCHEMA: u32 = 37;
+/// [`Response::Report`], and [`Behind::id`]. 37: [`RebuildCause::Unfinished`]. 38:
+/// [`Worked::build_id`] and [`Status::uptime_ms`], for `build-finished` and `blaze status --json`.
+pub const SCHEMA: u32 = 38;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -1052,7 +1053,8 @@ pub struct Worked {
     /// [`LinkKind::Placed`] when any of [`Worked::links`] laid its image out whole: one that is
     /// neither [`LinkHow::Spliced`] nor [`LinkHow::Unchanged`].
     pub link: LinkKind,
-    /// Functions found in the store.
+    /// Units started that were fresh: replayed from the store as they were, nothing made
+    /// again (the daemon's `Job::fresh`).
     pub found: u64,
     /// Queries verified green.
     pub green: u64,
@@ -1065,7 +1067,11 @@ pub struct Worked {
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
     /// whether its check outcome and its bodies were served.
     pub served: Vec<ServedCrate>,
-    /// Functions whose code was generated.
+    /// The daemon's id of the build: the plane request the history's rows carry as
+    /// `build_id` (`blaze slow --build N`, `blaze debug sql`). `None` for a request that never
+    /// opened one.
+    pub build_id: Option<u64>,
+    /// Units started that were made again (the daemon's `Job::compiled`).
     pub compiled: u64,
     /// The measured run time of the request's nodes, summed by kind: each kind that ran at
     /// all, in [`NodeKind::ALL`]'s order.
@@ -1471,6 +1477,9 @@ pub struct Status {
     /// whose own environment says otherwise restarts an idle daemon, or refuses at once, before
     /// it sends a request, never builds under the daemon's values.
     pub settings: Vec<Setting>,
+    /// How long the daemon has run, on its driver's clock (which starts with it), as of this
+    /// answer.
+    pub uptime_ms: u64,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
 }

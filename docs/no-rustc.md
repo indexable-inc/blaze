@@ -276,7 +276,7 @@ Each step is one run. "Queries" are runs that compile nothing: `-vV`, `--print`,
 compiling, checking or linking a crate, a build script, a proc macro, a doctest example, a
 build script's probe, or an `asm!` block. bevy has no test step in bench.py, and its native
 libraries (ALSA, udev, Wayland, X11, Vulkan) and C compiler came from a nixpkgs shell. The
-scripts are in `harness/norustc/`: setup.sh, wrap.sh, count.py, classify.py and left.py.
+scripts are in `harness/norustc/`: setup.sh (now setup.py, which builds blaze with blaze and counts blaze's own toolchain), wrap.sh, count.py, classify.py and left.py.
 
 `blaze build` and `test`, rustc runs per step (compiles + queries):
 
@@ -446,15 +446,16 @@ Done (the `no-rustc-abc` lane, [#97](https://github.com/indexable-inc/blaze/pull
 above. `harness/norustc.py`, in the fast tier on every platform and backend CI has, builds a
 small workspace (`harness/norustc/fixture`: a program with an `asm!` block, a library with unit
 tests, doctests and features the root package uses through another library, a proc macro, and a
-path dependency outside the workspace with a build script) through a copy of the toolchain whose
-rustc, rustdoc and cargo log every run, in five scenarios: a cold build, edits, tests, doctests
+path dependency outside the workspace with a build script) through a copy of blaze's own
+toolchain (the sysroot `blaze toolchain --json` names, put where blaze looks for it in the run's
+home and first on PATH) whose rustc, rustdoc and cargo log every run, in five scenarios: a cold build, edits, tests, doctests
 and check. A count above `harness/norustc/baseline.json` fails the release train; a lower one says to
 lower it (`norustc.py --record`). The baselines are CI's: a 96-core dev host counts more, its
 spares asking more. `harness/rustcsites.py`, in the fmt job, counts the places in `crates/` that
 start rustc, rustdoc or cargo, or read which to start, per file against
 `harness/norustc/sites.json`, and fails on a new one. Not done: one function every start goes
-through, with `blaze-engine cargo status` printing the counts, and the bench apps counted nightly
-(`harness/norustc/count.py` is still run by hand). The doctest bug: the doctest process planned
+through, with `blaze status` printing the counts, and the bench apps counted nightly
+(`harness/norustc/count.py` is still run by hand, after `harness/norustc/setup.py`). The doctest bug: the doctest process planned
 the workspace's root package and ran the build scripts with the member's features, which the
 root does not have; it now selects the package (`--package`, from `CARGO_PKG_NAME`) and plans
 the package rustdoc runs the examples in. That still built the library as a build of its package

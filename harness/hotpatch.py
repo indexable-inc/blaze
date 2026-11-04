@@ -70,11 +70,12 @@ class Tool:
         raise SystemExit(f"{self.name} {step}: the program did not run {value} in {STEP_SECS}s:\n" + "\n".join(self.lines()[-10:]))
 
     def build(self, step):
-        command = [*(["blaze"] if self.name == "blaze" else ["cargo"]), "build"]
+        """The finished build; blaze's has its `build-finished` line read (`blaze_cli.read_build`)."""
+        command = ["blaze", "build", *blaze_cli.machine_format("build", ())] if self.name == "blaze" else ["cargo", "build"]
         ran = subprocess.run(command, cwd=self.ws, env=self.env, capture_output=True, text=True, timeout=STEP_SECS)
         if ran.returncode != 0:
             raise SystemExit(f"{self.name} {step}: {' '.join(command)} failed:\n{ran.stderr[-2000:]}")
-        return ran.stderr
+        return blaze_cli.read_build(ran) if self.name == "blaze" else ran
 
     def start(self):
         if self.name == "subsecond":
@@ -96,7 +97,7 @@ class Tool:
             self.build("first build")
             if self.name == "blaze":
                 for _ in range(240):
-                    if "[blaze]" in self.build("wait for the daemon"):
+                    if blaze_cli.how_built(self.build("wait for the daemon")) == "daemon":
                         break
                     time.sleep(0.5)
                 else:
@@ -112,11 +113,11 @@ class Tool:
         if self.name != "subsecond":
             # As `cargo watch -x run` does: the program is stopped, then built and started.
             self.stop()
-            stderr = self.build(f"edit {self.value}")
+            built = self.build(f"edit {self.value}")
             if counted:
                 self.build_times.append(round((time.time_ns() // 1000 - t0) / 1000, 2))
             if counted and self.name == "blaze":
-                how = blaze_cli.how_built(stderr)
+                how = blaze_cli.how_built(built)
                 self.built[how] = self.built.get(how, 0) + 1
             self.start()
         at, pid = self.wait_answer(self.value, f"edit {self.value}")

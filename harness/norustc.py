@@ -9,10 +9,13 @@ baseline fails: blaze is to run no rustc, and a change may only lower the counts
 The workspace, norustc/fixture, has a program with an `asm!` block, a library with unit tests,
 doctests and features, which the root package uses through another library, a proc macro, and a path dependency outside the workspace with a build script that
 `include!`s a file, `include_str!`s another, reads a variable with `option_env!` and expands the proc macro. It
-is built with a copy of the pinned toolchain whose rustc, rustdoc and cargo write a line for
-each run and then become the real tool, linked with rustup under a name of its own for the run.
-A scenario ends once no counted tool runs and the log has been still for a while, so what the
-daemon does after a command is counted with it.
+is built with a copy of blaze's own toolchain (the sysroot `blaze toolchain --json` names) whose
+rustc, rustdoc and cargo write a line for each run and then become the real tool, put where
+blaze looks for its toolchain in the run's BLAZE_HOME (`toolchains/<its name>`) and first on
+PATH, so a run of any of the three by blaze or by anything it starts is counted. No rustc is
+asked where the toolchain is, and rustup is not used. A scenario ends once no counted tool
+runs and the log has been still for a while, so what the daemon does after a command is
+counted with it.
 
 --record writes this platform's counts into the baseline (the fixture is built in the dev
 profile, which v2 compiles with Cranelift), after a change that
@@ -22,10 +25,11 @@ scripts.
 """
 import json, os, platform, shutil, subprocess, sys, tempfile, time
 
+import storelib
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine")
-TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 FIXTURE = os.path.join(HERE, "norustc", "fixture")
 BASELINE = os.path.join(HERE, "norustc", "baseline.json")
 SYSTEM = {"linux": "linux", "darwin": "macos"}[sys.platform]
@@ -44,35 +48,36 @@ exec {real} "$@"
 """
 
 MAIN, LIB = "src/main.rs", "word/src/lib.rs"
-# The scenarios, each a list of (step, blaze arguments, edits, whether to wait for the
-# daemon to be ready). An edit is (file, old, new), or (file, None, text to add).
+# The scenarios, each a list of (step, blaze arguments, edits). An edit is (file, old, new),
+# or (file, None, text to add). A step's command returns when its build is done; what the
+# daemon does after it is waited for by `settle`.
 SCENARIOS = [
-    ("cold build", [("cold", ["build"], [], True)]),
+    ("cold build", [("cold", ["build"], [])]),
     ("edits", [
-        ("nothing edited", ["build"], [], False),
-        ("a body", ["build"], [(MAIN, '"{} words', '"{} words!')], False),
-        ("a library's body", ["build"], [(LIB, ".count()", ".filter(|it| !it.is_empty()).count()")], False),
-        ("a new function", ["build"], [(MAIN, "fn main() {", "fn more() -> u32 {\n    3\n}\n\nfn main() {\n    more();")], False),
-        ("an error", ["build"], [(MAIN, "    more();", '    let _wrong: u32 = "no";\n    more();')], False),
-        ("the error mended", ["build"], [(MAIN, '    let _wrong: u32 = "no";\n', "")], False),
+        ("nothing edited", ["build"], []),
+        ("a body", ["build"], [(MAIN, '"{} words', '"{} words!')]),
+        ("a library's body", ["build"], [(LIB, ".count()", ".filter(|it| !it.is_empty()).count()")]),
+        ("a new function", ["build"], [(MAIN, "fn main() {", "fn more() -> u32 {\n    3\n}\n\nfn main() {\n    more();")]),
+        ("an error", ["build"], [(MAIN, "    more();", '    let _wrong: u32 = "no";\n    more();')]),
+        ("the error mended", ["build"], [(MAIN, '    let _wrong: u32 = "no";\n', "")]),
     ]),
     ("tests", [
-        ("first test --no-run", ["test", "--no-run", "--workspace"], [], True),
-        ("a body", ["test", "--no-run", "--workspace"], [(MAIN, '"{} words!', '"{} words!!')], False),
-        ("a test added", ["test", "--no-run", "--workspace"], [(LIB, None, "\n#[test]\nfn added() {}\n")], False),
+        ("first test --no-run", ["test", "--no-run", "--workspace"], []),
+        ("a body", ["test", "--no-run", "--workspace"], [(MAIN, '"{} words!', '"{} words!!')]),
+        ("a test added", ["test", "--no-run", "--workspace"], [(LIB, None, "\n#[test]\nfn added() {}\n")]),
     ]),
     ("doctests", [
-        ("first", ["test", "--doc", "-p", "word"], [], False),
-        ("again", ["test", "--doc", "-p", "word"], [], False),
+        ("first", ["test", "--doc", "-p", "word"], []),
+        ("again", ["test", "--doc", "-p", "word"], []),
     ]),
-    ("check", [("check", ["check"], [], False)]),
+    ("check", [("check", ["check"], [])]),
     # With no build of its flags loaded the daemon loads the workspace to check it.
     ("check unloaded", [
-        ("the daemon stopped", ["stop"], [], False),
-        ("check", ["check"], [], False),
-        ("an error", ["check"], [(MAIN, "fn main() {", 'fn wrong() -> u32 {\n    "no"\n}\n\nfn main() {')], False),
-        ("the error mended", ["check"], [(MAIN, 'fn wrong() -> u32 {\n    "no"\n}\n\n', "")], False),
-        ("another package", ["check", "-p", "word"], [], False),
+        ("the daemon stopped", ["stop"], []),
+        ("check", ["check"], []),
+        ("an error", ["check"], [(MAIN, "fn main() {", 'fn wrong() -> u32 {\n    "no"\n}\n\nfn main() {')]),
+        ("the error mended", ["check"], [(MAIN, 'fn wrong() -> u32 {\n    "no"\n}\n\n', "")]),
+        ("another package", ["check", "-p", "word"], []),
     ]),
 ]
 
@@ -81,11 +86,10 @@ def run(argv, **kwargs):
     return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, **kwargs)
 
 
-def counted_toolchain(work, log):
-    """A copy of the pinned toolchain whose rustc, rustdoc and cargo are stand-ins. rustc finds
-    its sysroot by where its library is, so the libraries are copied and the rest linked."""
-    sysroot = run(["rustc", f"+{TOOLCHAIN}", "--print", "sysroot"], check=True).stdout.strip()
-    toolchain = os.path.join(work, "toolchain")
+def counted_toolchain(sysroot, toolchain, log):
+    """A copy at `toolchain` of blaze's toolchain at `sysroot` whose rustc, rustdoc and cargo
+    are stand-ins. rustc finds its sysroot by where its library is, so the libraries are copied
+    and the rest linked."""
     os.makedirs(os.path.join(toolchain, "bin"))
     os.makedirs(os.path.join(toolchain, "lib"))
     for entry in os.listdir(sysroot):
@@ -164,13 +168,15 @@ def main():
     work = tempfile.mkdtemp(prefix="blaze-norustc-", dir="/tmp" if sys.platform == "darwin" else None)
     log = os.path.join(work, "runs.log")
     open(log, "w").close()
-    name = f"blaze-norustc-{os.getpid()}"
-    toolchain = counted_toolchain(work, log)
-    run(["rustup", "toolchain", "link", name, toolchain], check=True)
     ws = os.path.join(work, "ws")
     shutil.copytree(FIXTURE, ws)
     home = os.path.join(work, "home")
     os.makedirs(home, mode=0o700)
+    # Where blaze keeps its toolchain, as blaze says (downloaded once into the caller's home
+    # when it is not there); the counted copy goes where blaze looks in the run's home.
+    blaze = os.path.join(os.path.dirname(os.path.abspath(BLAZE)), "blaze")
+    sysroot = storelib.blaze_toolchain(blaze, {k: v for k, v in os.environ.items() if k != "BLAZE_BIN"}).sysroot
+    toolchain = counted_toolchain(sysroot, os.path.join(home, "toolchains", os.path.basename(sysroot)), log)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("BLAZE_", "RUSTC", "RUSTDOC"))}
     for unset in ("RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "CARGO"):
         env.pop(unset, None)
@@ -179,22 +185,16 @@ def main():
     # under them: six more runs that only ask in the cold build.
     for key in [k for k in env if k.endswith("RUSTFLAGS")]:
         del env[key]
-    env.update(RUSTUP_TOOLCHAIN=name, BLAZE_HOME=home,
-               PATH=os.path.dirname(os.path.abspath(BLAZE)) + os.pathsep + env["PATH"],
+    env.update(BLAZE_HOME=home,
+               PATH=os.pathsep.join((os.path.dirname(os.path.abspath(BLAZE)), os.path.join(toolchain, "bin"), env["PATH"])),
                CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", CARGO_NET_OFFLINE="true")
     found, failed = {}, []
     try:
         for scenario, steps in SCENARIOS:
             began = len(open(log).read().splitlines())
-            for step, args, edits, wait in steps:
+            for step, args, edits in steps:
                 apply(ws, edits)
                 ran = run(["blaze", *args], cwd=ws, env=env, timeout=1200)
-                if wait and ran.returncode == 0:
-                    for _ in range(600):
-                        status = run(["blaze", "status"], cwd=ws, env=env).stdout
-                        if ": ready" in status:
-                            break
-                        time.sleep(1)
                 settle(log)
                 said = (ran.stderr.strip().splitlines() or [""])[-1][:100]
                 print(f"  {scenario}: {step}: exit {ran.returncode}  {said}", flush=True)
@@ -209,7 +209,6 @@ def main():
                   f"cargo {runs['cargo']}", flush=True)
     finally:
         run(["blaze", "stop"], cwd=ws, env=env)
-        run(["rustup", "toolchain", "uninstall", name])
     baseline = json.load(open(BASELINE)) if os.path.exists(BASELINE) else {}
     recorded = baseline.get(PLACE)
     if record:

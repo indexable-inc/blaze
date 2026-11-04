@@ -35,8 +35,11 @@ the standard library is part of a compiler.
 ## What it is today
 
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
-  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`). v2's blaze
-  has no command that prints it or where it is (v1's `blaze toolchain` did).
+  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`).
+  `blaze toolchain` prints it and where it is, downloading it first when it is not there;
+  `blaze toolchain --json` prints one object (`name`, `nightly`, `rustc`, `release`, `commit`,
+  the host's tuple as `host`, and `sysroot`), which a harness reads instead of running
+  `rustc -vV` (harness/storelib.py, `blaze_toolchain`).
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, the host's `rust-std` and
   wasm32-wasip1's (for wasi-libc, which blaze's linker links every proc macro's module with), unchanged,
   from static.rust-lang.org, each checked against the sha256 compiled into blaze
@@ -47,9 +50,8 @@ the standard library is part of a compiler.
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/toolchain-c.md),
   which also plans the end of this download). The installer downloads it by running
-  `blaze toolchain`, which v2's blaze does not have, and no v2 build downloads it
-  (`toolchain::own::fetch` has no caller): today it must already be there, or a build stops
-  with "blaze's toolchain is not installed".
+  `blaze toolchain`, and every build checks it is there first (`toolchain::ensure`, which
+  fetches it with `toolchain::own::fetch` when it is not).
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,

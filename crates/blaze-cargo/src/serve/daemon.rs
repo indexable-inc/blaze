@@ -272,6 +272,8 @@ macro_rules! cx {
             settings: &$daemon.settings,
             memory_bytes: arena::own(),
             budget_bytes: $daemon.plane.budget().map_or(0, |it| it.bytes),
+            // The driver's clock starts as the daemon does.
+            uptime_ms: u64::try_from($daemon.driver.now().as_millis()).unwrap_or(u64::MAX),
             memory: blaze_mem::tag::snapshot,
             profile: blaze_profile::flight::dump,
             hot: crate::serve::observe::hot,

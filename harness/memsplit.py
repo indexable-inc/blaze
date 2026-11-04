@@ -117,7 +117,7 @@ def main():
                     sampler.add(daemon.pid())
                     took, ran = ours.cargo("build", *build)
                 split(daemon, kind + (" back" if back else ""), steps, wall_s=round(took, 3), peak_mb=sampler.peak_mb,
-                      built=bench.how_built(ran.stderr)[:40])
+                      built=bench.how_built(ran)[:40])
     finally:
         ours.cargo("stop")
     print(json.dumps(dict(project=name, env=extra_env, steps=steps)))
