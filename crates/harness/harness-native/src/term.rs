@@ -1,4 +1,4 @@
-//! The terminal: a vt100 screen drawn as panels (cell backgrounds, selection, cursor), lines (underlines) and atlas glyphs,
+//! The terminal: a libghostty screen (harness-vt) drawn as panels (cell backgrounds, selection, cursor), lines (underlines) and atlas glyphs,
 //! on the same pipeline and glyph cache as the rest of the UI; and the keyboard encoded the way xterm sends it.
 //!
 //! Each distinct cell (its grapheme, bold, italic) is shaped once by den's typesetter in the code face, so a character
@@ -65,11 +65,11 @@ fn idx(theme: &Theme, i: u8) -> Rgba {
     }
 }
 
-fn colour(theme: &Theme, c: vt100::Color, fg: bool) -> Option<Rgba> {
+fn colour(theme: &Theme, c: harness_vt::Color, fg: bool) -> Option<Rgba> {
     match c {
-        vt100::Color::Default => fg.then_some(theme.fg),
-        vt100::Color::Idx(i) => Some(idx(theme, i)),
-        vt100::Color::Rgb(r, g, b) => Some([f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0]),
+        harness_vt::Color::Default => fg.then_some(theme.fg),
+        harness_vt::Color::Idx(i) => Some(idx(theme, i)),
+        harness_vt::Color::Rgb(r, g, b) => Some([f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0, 1.0]),
     }
 }
 
@@ -79,10 +79,12 @@ struct Shape {
     glyphs: Vec<(u64, u16, f32, f32)>,
 }
 
-/// The cell grid's metrics at a font size, and the cells shaped so far.
+/// The cell grid's metrics at a font size and display scale, and the cells shaped so far. A cell is a whole number of
+/// device pixels each way, so rows and columns tile with no seams (block elements and box lines meet exactly).
 pub struct Grid {
     pub size: f32,
-    /// A cell's width and height and the baseline below its top, points.
+    pub scale: f32,
+    /// A cell's width and height and the baseline below its top, points (each a whole number of device pixels).
     pub cw: f32,
     pub ch: f32,
     pub base: f32,
@@ -110,11 +112,13 @@ impl Sel {
 }
 
 impl Grid {
-    pub fn new(fonts: &mut Fonts, size: f32) -> Self {
-        let (cw, ascent, descent) = crate::text::mono_cell(fonts, size);
-        let ch = ((ascent + descent) * 1.18).round().max(size);
-        let base = ((ch - (ascent + descent)) * 0.5 + ascent).round();
-        Self { size, cw, ch, base, shapes: HashMap::new() }
+    pub fn new(fonts: &mut Fonts, size: f32, scale: f32) -> Self {
+        let (adv, ascent, descent) = crate::text::mono_cell(fonts, size);
+        let px = |v: f32| (v * scale).round().max(1.0) / scale;
+        let cw = px(adv);
+        let ch = px(((ascent + descent) * 1.18).max(size));
+        let base = px((ch - (ascent + descent)) * 0.5 + ascent);
+        Self { size, scale, cw, ch, base, shapes: HashMap::new() }
     }
 
     /// Columns and rows that fit in `w` x `h` points.
@@ -151,87 +155,148 @@ pub struct Paint<'a> {
     pub time: f32,
 }
 
-/// Draw the screen of `parser` at `p.origin`.
-pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphCache, parser: &vt100::Parser, p: &Paint<'_>, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let (rows, cols) = (rows.get(), cols.get());
-    let (ox, oy) = p.origin;
+/// One cell as the drawing reads it, colours resolved (inverse applied): the only thing drawing knows of the parser.
+#[derive(Clone, Debug, Default)]
+pub struct Cell {
+    /// Its grapheme cluster ("" for a blank).
+    pub text: String,
+    pub fg: Rgba,
+    /// None: the terminal's own ground shows.
+    pub bg: Option<Rgba>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub dim: bool,
+    pub wide: bool,
+    /// The right half of a wide cell.
+    pub cont: bool,
+}
+
+/// What drawing reads of a screen: its rows of cells, the cursor and whether it shows.
+pub struct Snapshot {
+    pub rows: Vec<Vec<Cell>>,
+    pub cursor: (u16, u16),
+    pub cursor_shown: bool,
+    /// The cursor's look: DECSCUSR shape and blink, and whether the program set it (`explicit`) or the default applies.
+    pub cursor_look: harness_vt::Cursor,
+}
+
+/// Read `term`'s viewport (at its current scrollback offset) into a [`Snapshot`]. The one place drawing touches the
+/// terminal: swapping it is swapping this function.
+#[must_use]
+pub fn snapshot(term: &mut harness_vt::Term, theme: &Theme) -> Snapshot {
+    let (rows, cursor) = term.rows();
+    let out = rows
+        .into_iter()
+        .map(|row| {
+            row.cells
+                .into_iter()
+                .map(|cell| {
+                    let fg = colour(theme, cell.fg, true).unwrap_or(theme.fg);
+                    let bg = colour(theme, cell.bg, false);
+                    let (fg, bg) = if cell.inverse { (bg.unwrap_or(theme.bg), Some(fg)) } else { (fg, bg) };
+                    Cell {
+                        text: if cell.invisible { String::new() } else { cell.text },
+                        fg,
+                        bg,
+                        bold: cell.bold,
+                        italic: cell.italic,
+                        underline: cell.underline != harness_vt::UnderlineStyle::None,
+                        dim: cell.faint,
+                        wide: cell.wide,
+                        cont: cell.spacer,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let look = cursor.unwrap_or_default();
+    Snapshot { rows: out, cursor: (look.y, look.x), cursor_shown: cursor.is_some_and(|c| c.visible), cursor_look: look }
+}
+
+/// Draw `snap` at `p.origin`: cell grounds, the selection, the cursor, procedural block and box glyphs, underlines, then
+/// the font's glyphs.
+pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphCache, snap: &Snapshot, p: &Paint<'_>, upload: &mut dyn FnMut(u32, u32, u32, u32, &[u8])) {
+    let sc = p.scale;
+    let px = |v: f32| (v * sc).round() / sc;
+    let (ox, oy) = (px(p.origin.0), px(p.origin.1));
     let (cw, ch) = (grid.cw, grid.ch);
     let theme = p.theme;
-    let snap = |v: f32| (v * p.scale).round() / p.scale;
-    let cursor = screen.cursor_position();
-    let show_cursor = !screen.hide_cursor() && p.scroll == 0;
+    let cursor = snap.cursor;
+    let show_cursor = snap.cursor_shown && p.scroll == 0;
     let mut glyph_runs: Vec<(f32, f32, String, bool, bool, Rgba)> = Vec::new();
+    let mut boxes: Vec<(char, [f32; 4], Rgba)> = Vec::new();
     let mut lines: Vec<LineInst> = Vec::new();
-    for r in 0..rows {
-        let y = snap(oy + f32::from(r) * ch);
+    for (r, row) in snap.rows.iter().enumerate() {
+        let r = r as u16;
+        let y = oy + f32::from(r) * ch;
         let srow = i64::from(r) - p.scroll as i64;
         // Backgrounds: runs of one colour along the row, one panel each.
         let mut run: Option<(u16, Rgba)> = None;
-        let mut flush = |d: &mut Draw, run: &mut Option<(u16, Rgba)>, end: u16| {
+        let flush = |d: &mut Draw, run: &mut Option<(u16, Rgba)>, end: u16| {
             if let Some((start, c)) = run.take() {
-                let x0 = snap(ox + f32::from(start) * cw);
-                let x1 = snap(ox + f32::from(end) * cw);
-                d.panel(rect_panel([x0, y, x1 - x0, snap(y + ch) - y], c));
+                let x0 = ox + f32::from(start) * cw;
+                d.panel(rect_panel([x0, y, f32::from(end - start) * cw, ch], c));
             }
         };
-        for c in 0..cols {
-            let Some(cell) = screen.cell(r, c) else { continue };
-            let inverse = cell.inverse();
-            let (fg, bg) = (colour(theme, cell.fgcolor(), true).unwrap_or(theme.fg), colour(theme, cell.bgcolor(), false));
-            let bg = if inverse { Some(fg) } else { bg };
-            let bg = if p.sel.is_some_and(|s| s.holds(srow, c)) { Some(blend(bg.unwrap_or(theme.bg), theme.select)) } else { bg };
+        for (c, cell) in row.iter().enumerate() {
+            let c = c as u16;
+            let bg = if p.sel.is_some_and(|s| s.holds(srow, c)) { Some(blend(cell.bg.unwrap_or(theme.bg), theme.select)) } else { cell.bg };
             if run.map(|r| r.1) != bg {
                 flush(d, &mut run, c);
                 if let Some(bg) = bg {
                     run = Some((c, bg));
                 }
             }
-            if cell.is_wide_continuation() || !cell.has_contents() {
+            if cell.cont || cell.text.is_empty() || cell.text == " " {
                 continue;
             }
-            let mut ink = if inverse { colour(theme, cell.bgcolor(), false).unwrap_or(theme.bg) } else { fg };
-            if cell.dim() {
+            let mut ink = cell.fg;
+            if cell.dim {
                 ink[3] *= 0.6;
             }
-            let at_cursor = show_cursor && p.focused && (r, c) == cursor;
-            if at_cursor {
+            if show_cursor && p.focused && (r, c) == cursor {
                 ink = theme.bg;
             }
             let x = ox + f32::from(c) * cw;
-            glyph_runs.push((x, y, cell.contents().to_owned(), cell.bold(), cell.italic(), ink));
-            if cell.underline() {
-                let uy = y + grid.base + (grid.size * 0.12).max(1.0);
-                let w = if cell.is_wide() { 2.0 } else { 1.0 };
-                lines.extend(LineInst::stroke(&[[x, uy], [x + cw * w, uy]], 1.0, (fg, fg), 1.0));
+            let w = if cell.wide { 2.0 * cw } else { cw };
+            let mut chars = cell.text.chars();
+            match (chars.next(), chars.next()) {
+                (Some(k), None) if crate::boxdraw::drawn(k) => boxes.push((k, [x, y, w, ch], ink)),
+                _ => glyph_runs.push((x, y, cell.text.clone(), cell.bold, cell.italic, ink)),
+            }
+            if cell.underline {
+                let t = px(grid.size / 13.0).max(1.0 / sc);
+                let uy = px(y + grid.base + grid.size * 0.12);
+                d.panel(rect_panel([x, uy, w, t], cell.fg));
             }
         }
-        flush(d, &mut run, cols);
+        flush(d, &mut run, row.len() as u16);
     }
     if show_cursor {
         let (r, c) = cursor;
-        let wide = screen.cell(r, c).is_some_and(vt100::Cell::is_wide);
-        let x = snap(ox + f32::from(c) * cw);
-        let y = snap(oy + f32::from(r) * ch);
-        let w = snap(cw * if wide { 2.0 } else { 1.0 });
-        let mut panel = rect_panel([x, y, w, snap(ch)], theme.cursor);
-        if p.focused {
-            panel.shape[0] = 1.5;
-        } else {
+        let wide = snap.rows.get(usize::from(r)).and_then(|row| row.get(usize::from(c))).is_some_and(|cell| cell.wide);
+        let x = ox + f32::from(c) * cw;
+        let y = oy + f32::from(r) * ch;
+        let w = cw * if wide { 2.0 } else { 1.0 };
+        let mut panel = rect_panel([x, y, w, ch], theme.cursor);
+        if !p.focused {
             // Unfocused: a hollow box.
             panel.fill_d[3] = 0.0;
             panel.fill_l[3] = 0.0;
             panel.edge_d = theme.cursor;
             panel.edge_l = theme.cursor;
-            panel.shape = [1.5, 4.0, 1.0, 0.0];
+            panel.shape = [0.0, 4.0, 1.0, 0.0];
         }
         d.panel(panel);
     }
-    for l in lines {
+    let thin = (sc * grid.size / 13.0).round().max(1.0) / sc;
+    for (k, rect, ink) in boxes {
+        crate::boxdraw::draw(d, k, rect, ink, sc, thin);
+    }
+    for l in lines.drain(..) {
         d.line(l);
     }
-    let sc = p.scale;
     let asz = cache.size as f32;
     for (x, y, s, bold, italic, ink) in glyph_runs {
         let base = y + grid.base;

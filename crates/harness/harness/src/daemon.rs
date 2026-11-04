@@ -1,4 +1,4 @@
-//! harnessd: owns every agent PTY, mirrors each into a vt100 emulator (so a re-attaching client or
+//! harnessd: owns every agent PTY, mirrors each into a libghostty terminal (harness-vt) (so a re-attaching client or
 //! the web view can redraw the current screen), records the parent/child tree, and serves the
 //! socket API plus the web UI. Survives client exit like a tmux server.
 use crate::{archive, db, messages, paths, profiles, proto, queries, runs};
@@ -9,7 +9,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,16 +19,6 @@ use tokio::sync::broadcast;
 pub enum Ev {
     Data(Bytes),
     Exit(i32),
-}
-
-#[derive(Default)]
-pub struct TitleCb {
-    pub title: String,
-}
-impl vt100::Callbacks for TitleCb {
-    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        self.title = String::from_utf8_lossy(title).into_owned();
-    }
 }
 
 pub struct Session {
@@ -43,7 +32,7 @@ pub struct Session {
     pub created_ms: u64,
     /// The agent process (for `signal`).
     pub pid: Option<u32>,
-    pub term: Mutex<vt100::Parser<TitleCb>>,
+    pub term: Mutex<harness_vt::Term>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -61,35 +50,33 @@ impl Session {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let (Some(c), Some(r)) = (NonZeroU16::new(cols), NonZeroU16::new(rows)) else { return Ok(()) };
+        if cols == 0 || rows == 0 {
+            return Ok(());
+        }
         self.master.lock().unwrap().resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("{e}"))?;
-        self.term.lock().unwrap().set_size(r, c);
+        self.term.lock().unwrap().resize(cols, rows);
         Ok(())
     }
 
     /// Escape codes that redraw the current screen on a fresh terminal, plus a receiver for
     /// everything after it. Taken under the emulator lock so nothing is lost or doubled.
     pub fn snapshot_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Ev>) {
-        let term = self.term.lock().unwrap();
+        let mut term = self.term.lock().unwrap();
         let rx = self.tx.subscribe();
-        let mut snap = b"\x1b[0m\x1b[H\x1b[2J".to_vec();
-        snap.extend(term.screen().state_formatted().into_bytes());
-        (snap, rx)
+        (term.vt_snapshot(), rx)
     }
 
     pub fn screen_text(&self) -> String {
-        self.term.lock().unwrap().screen().contents()
+        self.term.lock().unwrap().text()
     }
 
     pub fn size(&self) -> (u16, u16) {
-        let t = self.term.lock().unwrap();
-        let (r, c) = t.screen().size();
-        (c.get(), r.get())
+        self.term.lock().unwrap().size()
     }
 
     pub fn info(&self) -> Value {
         let (cols, rows) = self.size();
-        let title = self.term.lock().unwrap().callbacks().title.clone();
+        let title = self.term.lock().unwrap().title();
         json!({
             "id": self.id, "object": format!("s{}", self.id), "kind": self.kind, "name": self.name, "parent": self.parent, "title": title, "cwd": self.cwd,
             "argv": self.argv, "created_ms": self.created_ms, "exit": *self.exit.lock().unwrap(),
@@ -245,11 +232,7 @@ impl Daemon {
         });
         let session = Arc::new(Session {
             id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid,
-            term: Mutex::new(vt100::Parser::new_with_callbacks(
-                NonZeroU16::new(rows).unwrap_or(NonZeroU16::new(24).unwrap()),
-                NonZeroU16::new(cols).unwrap_or(NonZeroU16::new(80).unwrap()),
-                10_000, TitleCb::default(),
-            )),
+            term: Mutex::new(harness_vt::Term::new(if cols == 0 { 80 } else { cols }, if rows == 0 { 24 } else { rows }, 10_000)),
             writer: Mutex::new(writer), master: Mutex::new(pair.master), killer: Mutex::new(killer),
             tx, exit: Mutex::new(None), attached: AtomicUsize::new(0),
         });

@@ -12,6 +12,9 @@ pub fn run(path: &str) -> Result<(), String> {
     if std::env::var_os("HARNESS_NATIVE_SHOT_PALETTE").is_some() {
         app.open_palette();
     }
+    if let Some(sid) = std::env::var("HARNESS_NATIVE_SHOT_SELECT").ok().and_then(|s| s.parse().ok()) {
+        app.select_session(sid);
+    }
     let secs = std::env::var("HARNESS_NATIVE_SHOT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2.5);
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);

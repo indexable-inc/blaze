@@ -192,7 +192,7 @@ impl App {
         let term = main.part("term").map_or(0, View::id);
         let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), term, palette: None };
         let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
-        let grid = Grid::new(&mut fonts, TERM_SIZE);
+        let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
         Ok(Self {
             world,
             fonts,
@@ -299,7 +299,8 @@ impl App {
             let first = rows.iter().find(|(e, _)| self.status_of(*e) == "running").or(rows.first()).map(|(e, _)| *e);
             model::select(w, first);
         }
-        if let Some(sid) = *self.spawned.lock().unwrap() {
+        let pending = *self.spawned.lock().unwrap();
+        if let Some(sid) = pending {
             if let Some(e) = self.entity_of(sid) {
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
@@ -488,6 +489,10 @@ impl App {
         let z = self.zoom();
         let view = (points.0 / z, points.1 / z);
         let scale = backing * z;
+        if self.grid.scale != scale {
+            // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
+            self.grid = Grid::new(&mut self.fonts, TERM_SIZE, scale);
+        }
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
             self.world.set(Viewport { w: view.0, h: view.1 });
@@ -632,13 +637,13 @@ impl App {
             t.rows = rows;
             o.set(t);
             if let Some(p) = self.terms.borrow_mut().get_mut(&sid) {
-                p.screen_mut().set_size(model::nz(rows), model::nz(cols));
+                p.resize(cols, rows);
             }
             self.link.resize(sid, cols, rows);
         }
     }
 
-    fn with_parser<R>(&self, f: impl FnOnce(&mut vt100::Parser, u64) -> R) -> Option<R> {
+    fn with_parser<R>(&self, f: impl FnOnce(&mut harness_vt::Term, u64) -> R) -> Option<R> {
         let sid = self.selected().and_then(|e| self.session_of(e))?;
         let mut map = self.terms.borrow_mut();
         map.get_mut(&sid).map(|p| f(p, sid))
@@ -732,10 +737,13 @@ impl App {
         let scroll = self.scroll();
         let mut map = self.terms.borrow_mut();
         let Some(parser) = map.get_mut(&sid) else { return };
-        parser.screen_mut().set_scrollback(scroll);
-        let scroll = parser.screen().scrollback();
+        parser.set_scrollback(scroll);
+        let scroll = parser.scrollback();
+        let snap = term::snapshot(parser, &term::DARK);
+        parser.set_scrollback(0);
+        drop(map);
         let paint = term::Paint { origin: (rect[0], rect[1]), scale: sc, focused: self.focused && self.palette.is_none(), sel: self.sel, scroll, theme: &term::DARK, time: self.time };
-        term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, parser, &paint, upload);
+        term::draw(d, &mut self.grid, &mut self.fonts, &mut self.cache, &snap, &paint, upload);
     }
 
     // ---- input ----
@@ -789,7 +797,7 @@ impl App {
             return;
         }
         self.wheel -= n;
-        let alt = self.with_parser(|p, _| (p.screen().alternate_screen(), p.screen().application_cursor())).unwrap_or((false, false));
+        let alt = self.with_parser(|p, _| (p.alternate_screen(), p.application_cursor())).unwrap_or((false, false));
         if alt.0 {
             // A full-screen program: the wheel is its arrow keys, as Terminal's alternate scroll does.
             let key = if n > 0.0 { 126 } else { 125 };
@@ -797,13 +805,7 @@ impl App {
             self.send(&bytes);
             return;
         }
-        let max = self.with_parser(|p, _| {
-            let s = p.screen_mut();
-            s.set_scrollback(usize::MAX);
-            let m = s.scrollback();
-            s.set_scrollback(0);
-            m
-        });
+        let max = self.with_parser(|p, _| p.history());
         let next = (self.scroll() as f32 + n).clamp(0.0, max.unwrap_or(0) as f32) as usize;
         self.set_scroll(next);
     }
@@ -823,7 +825,7 @@ impl App {
         if chars.chars().next().is_some_and(|c| ('\u{F700}'..='\u{F8FF}').contains(&c)) && !matches!(code, 96..=126) {
             return;
         }
-        let app_cursor = self.with_parser(|p, _| p.screen().application_cursor()).unwrap_or(false);
+        let app_cursor = self.with_parser(|p, _| p.application_cursor()).unwrap_or(false);
         let bytes = term::encode_key(code, chars, bare, Mods { shift: m.shift, ctrl: m.ctrl, alt: m.alt }, app_cursor);
         if bytes.is_empty() {
             return;
@@ -871,6 +873,7 @@ impl App {
             ("t", false) => self.spawn("claude"),
             ("t", true) => self.spawn("codex"),
             ("w", false) => self.kill(),
+            ("s", false) => self.toggle_sidebar(),
             ("k", false) => {
                 self.palette = if self.palette.is_some() { None } else { Some(Palette { query: String::new(), at: 0 }) };
             }
@@ -889,6 +892,30 @@ impl App {
             }
         }
         true
+    }
+
+    /// Command-S: fold the sidebar away (zero wide, clipped, so its rows neither draw nor take clicks; the main card
+    /// takes the window) or bring it back at the scene's size.
+    fn toggle_sidebar(&mut self) {
+        use harness_native_ui_layout_api::Padding;
+        use harness_native_ui_node_api::Clip;
+        let w = self.world.world_ref();
+        let Some(side) = w.entity_from_id(self.ids.device).parent() else { return };
+        let Some(proto) = view::prefab(w, "hn.Sidebar") else { return };
+        let (Some(mut size), Some(full), Some(pad)) = (side.try_cloned::<&Size>(), proto.try_cloned::<&Size>(), proto.try_cloned::<&Padding>()) else { return };
+        let show = size.w.value == 0.0;
+        size.w = if show { full.w } else { Sizing { kind: SizeKind::Fixed, value: 0.0, min: 0.0, max: 0.0 } };
+        side.set(size);
+        side.set(if show { pad } else { Padding::default() });
+        if show {
+            side.remove(Clip::id());
+        } else {
+            side.add(Clip::id());
+        }
+        // The window keeps no left margin beside the sidebar; without it the main card gets the same margin as its other sides.
+        if let (Some(root), Some(win)) = (side.parent(), view::prefab(w, "hn.Window").and_then(|p| p.try_cloned::<&Padding>())) {
+            root.set(Padding { l: if show { win.l } else { win.r }, ..win });
+        }
     }
 
     fn step_object(&mut self, by: i64) {
@@ -932,12 +959,12 @@ impl App {
         let sel = self.sel?;
         let scroll = self.scroll() as i64;
         self.with_parser(|p, _| {
-            let rows = i64::from(p.screen().size().0.get());
+            let rows = i64::from(p.size().1);
             let ((r0, c0), (r1, c1)) = sel.ordered();
             let (r0, r1) = ((r0 + scroll).clamp(0, rows - 1) as u16, (r1 + scroll).clamp(0, rows - 1) as u16);
-            p.screen_mut().set_scrollback(scroll as usize);
-            let text = p.screen().contents_between(r0, c0, r1, c1.saturating_add(1));
-            p.screen_mut().set_scrollback(0);
+            p.set_scrollback(scroll as usize);
+            let text = p.contents_between(r0, c0, r1, c1.saturating_add(1));
+            p.set_scrollback(0);
             text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
         })
         .filter(|s| !s.is_empty())
@@ -951,9 +978,14 @@ impl App {
             self.poke();
             return;
         }
-        let bracketed = self.with_parser(|p, _| p.screen().bracketed_paste()).unwrap_or(false);
+        let bracketed = self.with_parser(|p, _| p.bracketed_paste()).unwrap_or(false);
         self.set_scroll(0);
         self.send(&term::paste(text, bracketed));
+    }
+
+    /// Select the object of daemon session `sid` once the list has it (the shot's `HARNESS_NATIVE_SHOT_SELECT`).
+    pub fn select_session(&mut self, sid: u64) {
+        *self.spawned.lock().unwrap() = Some(sid);
     }
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).

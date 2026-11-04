@@ -9,5 +9,5 @@ publish = false
 [dependencies]
 harness-native-flecs = { path = "../harness-native-flecs" }
 harness-native-api = { path = "../harness-native-api" }
-vt100 = "0.18.1"
+harness-vt = { path = "../harness-vt" }
 serde_json = "1"

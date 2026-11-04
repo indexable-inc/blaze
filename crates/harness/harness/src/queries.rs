@@ -9,9 +9,10 @@ pub struct Filtered {
     pub replies: Vec<u8>,
 }
 
-/// Feed `chunk` through the emulator, splitting at each recognised query so replies see the
-/// cursor exactly where the app asked.
-pub fn filter<CB: vt100::Callbacks>(chunk: &[u8], parser: &mut vt100::Parser<CB>) -> Filtered {
+/// Feed `chunk` through the emulator, splitting at each recognised query so it is answered with the cursor exactly
+/// where the app asked. libghostty answers each query itself (configured in harness-vt to give the replies the daemon
+/// always gave); anything it would answer that is not stripped here is left to the attached client, as before.
+pub fn filter(chunk: &[u8], term: &mut harness_vt::Term) -> Filtered {
     let mut out = Vec::with_capacity(chunk.len());
     let mut replies = Vec::new();
     let mut start = 0;
@@ -20,9 +21,14 @@ pub fn filter<CB: vt100::Callbacks>(chunk: &[u8], parser: &mut vt100::Parser<CB>
         if chunk[i] == 0x1b {
             if let Some(len) = query_len(&chunk[i..]) {
                 let seg = &chunk[start..i];
-                parser.process(seg);
+                term.feed(seg);
                 out.extend_from_slice(seg);
-                replies.extend(reply(&chunk[i..i + len], parser.screen()));
+                let q = &chunk[i..i + len];
+                let r = term.query(q);
+                // No kitty keyboard protocol: clients send legacy keys, so apps must fall back (after the DA1 reply).
+                if q != b"\x1b[?u" {
+                    replies.extend(r);
+                }
                 i += len;
                 start = i;
                 continue;
@@ -31,7 +37,7 @@ pub fn filter<CB: vt100::Callbacks>(chunk: &[u8], parser: &mut vt100::Parser<CB>
         i += 1;
     }
     let seg = &chunk[start..];
-    parser.process(seg);
+    term.feed(seg);
     out.extend_from_slice(seg);
     Filtered { out, replies }
 }
@@ -54,30 +60,4 @@ fn query_len(s: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-fn reply(q: &[u8], screen: &vt100::Screen) -> Vec<u8> {
-    let (row, col) = screen.cursor_position();
-    let (rows, cols) = screen.size();
-    let s = match q {
-        b"\x1b[6n" => format!("\x1b[{};{}R", row + 1, col + 1),
-        b"\x1b[?6n" => format!("\x1b[?{};{}R", row + 1, col + 1),
-        b"\x1b[5n" => "\x1b[0n".into(),
-        b"\x1b[c" | b"\x1b[0c" => "\x1b[?62;22c".into(),
-        b"\x1b[>c" | b"\x1b[>0c" => "\x1b[>0;10;1c".into(),
-        b"\x1b[?u" => String::new(), // no kitty keyboard protocol; apps fall back after the DA1 reply
-        b"\x1b[18t" => format!("\x1b[8;{rows};{cols}t"),
-        b"\x1b[14t" => format!("\x1b[4;{};{}t", rows.get() as u32 * 16, cols.get() as u32 * 8),
-        b"\x1b[16t" => "\x1b[6;16;8t".into(),
-        b"\x1b[>q" | b"\x1b[>0q" => "\x1bP>|harness\x1b\\".into(),
-        q if q.starts_with(b"\x1b]10;") => "\x1b]10;rgb:d8d8/d8d8/d8d8\x1b\\".into(),
-        q if q.starts_with(b"\x1b]11;") => "\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\".into(),
-        q => {
-            // DECRQM: report synchronized output (2026) as supported-but-reset, everything else unknown.
-            let mode = std::str::from_utf8(&q[3..q.len() - 2]).unwrap_or("0");
-            let state = if mode == "2026" || mode == "2004" { 2 } else { 0 };
-            format!("\x1b[?{mode};{state}$y")
-        }
-    };
-    s.into_bytes()
 }

@@ -5,7 +5,7 @@
 //! - An [`Object`] is one of its sessions: `(Kind, Claude | Codex | ...)`, `(Status, Running | Exited | Lost)`, [`Name`],
 //!   [`Title`], [`Cwd`], [`ExitCode`] once it ended, and flecs's own `ChildOf` to its parent object or its device.
 //! - `(Viewing, object)` on the app entity is what the main pane shows (exclusive).
-//! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the vt100 parser itself is the
+//! - An attached object has [`Term`]: its grid's size and how far it is scrolled back; the terminal (harness-vt) itself is the
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
 //!
 //! The daemon link (a thread in the app) sends [`Msg`]s; the `DaemonInbox` system applies them to the world each frame.
@@ -113,8 +113,8 @@ pub struct Inbox {
     pub applied: u32,
 }
 
-/// The vt100 parsers of attached objects, by session id.
-pub type Terms = Rc<RefCell<HashMap<u64, vt100::Parser>>>;
+/// The terminals of attached objects, by session id.
+pub type Terms = Rc<RefCell<HashMap<u64, harness_vt::Term>>>;
 
 /// Rows of scrollback a terminal keeps.
 pub const SCROLLBACK: usize = 10_000;
@@ -227,8 +227,8 @@ fn apply(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, terms: &Terms
             let Some(e) = by_id.get(&id).map(|&e| w.entity_from_id(e)).filter(|e| e.is_alive()) else { return };
             let mut t = e.try_cloned::<&Term>().unwrap_or(Term { cols: 80, rows: 24, scroll: 0, seq: 0 });
             let mut map = terms.borrow_mut();
-            let p = map.entry(id).or_insert_with(|| vt100::Parser::new(nz(t.rows), nz(t.cols), SCROLLBACK));
-            p.process(&bytes);
+            let p = map.entry(id).or_insert_with(|| harness_vt::Term::new(t.cols, t.rows, SCROLLBACK));
+            p.feed(&bytes);
             t.seq = t.seq.wrapping_add(1);
             e.set(t);
         }
