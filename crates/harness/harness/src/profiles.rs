@@ -122,10 +122,16 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         "-c".into(), format!("mcp_servers.harness.env={{{env_table}}}"),
         "-c".into(), "mcp_servers.harness.default_tools_approval_mode=\"approve\"".into(), // ts runs without prompts
         "-c".into(), "web_search=\"disabled\"".into(),
-        "-c".into(), "include_apply_patch_tool=false".into(),
+        "-c".into(), "tools.experimental_request_user_input={enabled=false}".into(),
+        "-c".into(), "skills.include_instructions=false".into(),
+        "-c".into(), "skills.bundled={enabled=false}".into(),
         "-c".into(), format!("developer_instructions={}", toml_str(SYSTEM_NOTE)),
         "-a".into(), "never".into(),
     ];
+    if let Some(catalog) = codex_catalog(&home)? {
+        args.push("-c".into());
+        args.push(format!("model_catalog_json={}", toml_str(&catalog.display().to_string())));
+    }
     for f in CODEX_DISABLE {
         args.push("--disable".into());
         args.push((*f).into());
@@ -138,6 +144,26 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
     };
     pre.extend(args);
     Ok(Launch { program, args: pre, env })
+}
+
+/// Codex's model catalog decides most built-in tools per model (`tool_mode: code_mode_only` adds
+/// `functions.exec`/`wait`, `multi_agent_version` adds `collaboration.*`, plus apply_patch, clock and
+/// web search). Rewrite the cached catalog so every model runs tools directly and gets none of those,
+/// leaving only MCP tools. Returns None until Codex has fetched its catalog once.
+fn codex_catalog(home: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
+    let Ok(raw) = std::fs::read_to_string(home.join("models_cache.json")) else { return Ok(None) };
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(models) = doc.get_mut("models").and_then(|m| m.as_array_mut()) else { return Ok(None) };
+    for m in models.iter_mut().filter_map(|m| m.as_object_mut()) {
+        m.insert("tool_mode".into(), "direct_model_only".into());
+        m.remove("multi_agent_version");
+        m.insert("apply_patch_tool_type".into(), serde_json::Value::Null);
+        m.insert("experimental_supported_tools".into(), serde_json::json!([]));
+        m.insert("supports_search_tool".into(), false.into());
+    }
+    let out = home.join("catalog.locked.json");
+    std::fs::write(&out, serde_json::to_vec(&serde_json::json!({ "models": models }))?)?;
+    Ok(Some(out))
 }
 
 fn which(bin: &str) -> Option<String> {
