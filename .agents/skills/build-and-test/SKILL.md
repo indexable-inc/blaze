@@ -13,10 +13,14 @@ Build, check and test blaze with blaze (`blaze build`, `blaze check`, `blaze tes
 `rustc` or sccache, in any place: an agent's loop, a harness, a CI workflow, a benchmark, the
 release build or a doc's instructions. Stage 0 is a blaze binary (the release
 `.github/blaze-version` names, or a blaze built earlier), never cargo, until the wasm seed replaces
-it (docs/future/bootstrap.md). Every build, check, test and verdict comes from blaze. When blaze
-fails on blaze (a compile error, a link error, a panic, a hang, a wrong result, too slow, too much
-memory), that failure is the work: fix blaze, never route around it through cargo. A crate blaze
-can't check or test yet is a ranked, owned blocker, not a reason to keep using cargo for it.
+it (docs/future/bootstrap.md). Stage 0 is never overwritten: a build of the tree (stage 1) becomes
+stage 0 only after it rebuilds the tree (stage 2) byte for byte and the tests pass, and moving
+`.github/blaze-version` forward is that promotion. When stage 0 can't build the tree, that is a
+named error: write the source around it for one release or pin an older release, never cargo. Every
+build, check, test and verdict comes from blaze. When blaze fails on blaze (a compile error, a link
+error, a panic, a hang, a wrong result, too slow, too much memory), that failure is the work: fix
+blaze, never route around it through cargo. A crate blaze can't check or test yet is a ranked, owned
+blocker, not a reason to keep using cargo for it.
 
 See [docs/contributing.md](../../../docs/contributing.md).
 
