@@ -106,7 +106,7 @@ jobs:
           BLAZE_WANTED: ${{ inputs.blaze }}
         run: |
           case "$BLAZE_WANTED" in canary|stable) how=--channel;; *) how=--version;; esac
-          sh blaze/install.sh "$how" "$BLAZE_WANTED" --verbose
+          sh blaze/site/install.sh "$how" "$BLAZE_WANTED" --verbose
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: blaze (a run's build)
         if: inputs.build-run != ''

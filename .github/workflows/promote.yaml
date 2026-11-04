@@ -118,7 +118,7 @@ jobs:
           fi
       # As a user installs it: the toolchain blaze downloads included.
       - name: install ${{ env.TAG }}
-        run: sh install.sh --version "$TAG"
+        run: sh site/install.sh --version "$TAG"
       - name: what it installed runs
         run: |
           export PATH="$CARGO_HOME/bin:$PATH"
@@ -189,7 +189,7 @@ jobs:
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           mkdir -p "$OUT" "$WORK"
       - name: install ${{ env.TAG }}
-        run: sh install.sh --version "$TAG"
+        run: sh site/install.sh --version "$TAG"
       - name: what ${{ matrix.app }} builds with
         run: |
           jq -n --arg app "$APP" '{groups: ["apps"], only: [$app]}' > "$RUNNER_TEMP/app.json"

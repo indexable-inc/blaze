@@ -437,6 +437,7 @@ Designs not (fully) built, newest first.
 
 Research, reports and measurements, true on their date and not brought up to date. Newest first.
 
+- [CHANGELOG.md](CHANGELOG.md) (2026-11-03): Changelog: every user-visible change, by release, with [Unreleased] on top.
 - [v2/plan/lanes/concurrency/shared-structures.md](v2/plan/lanes/concurrency/shared-structures.md) (2026-11-01): Step 2 of the locks brief (2026-11-01) - each shared map, locked collector and locked queue either moved to papaya (blaze_hash::SharedMap), crossbeam's SegQueue/ArrayQueue or par's ordered results, or kept as a lock, with the reason.
 - [v2/plan/lanes/concurrency/flights.md](v2/plan/lanes/concurrency/flights.md) (2026-11-01): Flights under contention (crates/blaze-graph/benches/flights.rs, 2026-11-01, busy Mac). parking_lot's sharded map is 1.5x std's uncontended and 3-5x on one lock; the current lock-free table matches parking_lot on one thread and is 3x it at 18 threads; the first open-addressed table was flat at 13 Mops/s (shared counter, rebuilds).
 - [v2/requests/frontend.md](v2/requests/frontend.md) (2026-10-31): The v2 lanes' requests filed under `frontend` (what one lane asked of the code another owns), each with its answer.

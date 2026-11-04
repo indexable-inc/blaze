@@ -96,7 +96,7 @@ It is reached three ways, all declared in `wrangler.jsonc` `routes`, so `wrangle
 
 `/blaze` itself is a 301 to `/blaze/`. The origin and base are `Served` on `site` in `content/site.flecs`: the
 renderer prefixes every link, asset and form action with the base and writes the canonical and `og:` tags from the
-origin; the build writes `.gen/site.json` (for the worker) and `dist/sitemap.xml`, and copies the repo's `install.sh`
+origin; the build writes `.gen/site.json` (for the worker) and `dist/sitemap.xml`, and copies `site/install.sh`
 to `dist/install.sh` (https://ix.dev/blaze/install.sh, and https://ix.dev/blaze/ itself for a client that doesn't
 ask for HTML, so `curl -fsSL https://ix.dev/blaze | sh` installs). To move the site again, change `Served` and the routes.
 

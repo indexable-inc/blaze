@@ -15,7 +15,7 @@ name: bench-readme
 on:
   push:
     branches: ["main"]
-    paths-ignore: ["README.md", "CHANGELOG.md", "docs/**", "site/**"]
+    paths-ignore: ["README.md", "docs/**", "site/**"]
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:

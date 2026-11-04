@@ -18,7 +18,7 @@ where v1 had a setting or command v2 lacks, the section says so. v2's design is
 
 ## Install
 
-`blaze` is one program, also installed as `blaze-engine`. The [installer](../install.sh) and
+`blaze` is one program, also installed as `blaze-engine`. The [installer](../site/install.sh) and
 `cargo install` both install it:
 
     curl -fsSL https://ix.dev/blaze | sh

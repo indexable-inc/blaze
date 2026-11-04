@@ -263,9 +263,9 @@ async function build() {
 	}
 	writeFileSync(path.join(dist, 'site.css'), STYLES.map((s) => readFileSync(path.join(root, 'styles', s), 'utf8')).join('\n'));
 	cpSync(path.join(root, 'static'), dist, { recursive: true });
-	// The installer, at <base>/install.sh, from the repo root; the worker also answers <base>/ with it for curl
+	// The installer, at <base>/install.sh, from site/; the worker also answers <base>/ with it for curl
 	// (`curl -fsSL https://ix.dev/blaze | sh`).
-	cpSync(path.join(root, '..', 'install.sh'), path.join(dist, 'install.sh'));
+	cpSync(path.join(root, 'install.sh'), path.join(dist, 'install.sh'));
 
 	write(path.join(gen, 'site.cbor'), snap);
 	cpSync(path.join(modules, 'site.wasm'), path.join(gen, 'site.wasm'));

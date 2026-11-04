@@ -428,7 +428,7 @@ those files, and why each: the crates (`crates/`, with their test data and the L
 (`vendor/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`, the
 pinned nightly (`harness/toolchain`), `harness/unittests.py`, `.github/scripts/llvm.py`
 (which fetches the pinned LLVM), the release of blaze that builds blaze (`.github/blaze-version`,
-`install.sh`), `blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`,
+`site/install.sh`), `blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`,
 `blaze`, `blaze-remote`); on a push to main, the smoke corpus too (`harness/smoke.py`,
 `harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
 so a new directory of documents, benches or harnesses runs no build; a list of files that

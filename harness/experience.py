@@ -507,7 +507,7 @@ def install(home, archive, readme, rustup):
         script = subprocess.run(["curl", "-fsSL", "https://ix.dev/blaze"], capture_output=True, text=True, check=True).stdout
     else:
         env["BLAZE_ARCHIVE"] = os.path.abspath(archive)
-        with open(os.path.join(HERE, "..", "install.sh")) as f:
+        with open(os.path.join(HERE, "..", "site", "install.sh")) as f:
             script = f.read()
     done = subprocess.run(["sh"], input=script, env=env, capture_output=True, text=True)
     env.pop("BLAZE_ARCHIVE", None)
