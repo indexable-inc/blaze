@@ -272,7 +272,7 @@ struct Finished {
 
 /// A front end's run log, as `build`'s `provenance` rows: each memo that ran again and its
 /// cause, each untracked read by name. Taken on the loop as the build ends, with its database
-/// ([`super::work::Writer::ran`]); sorted by the engine, so the rows are the same each time.
+/// ([`super::work::Writer::run_log`]); sorted by the engine, so the rows are the same each time.
 pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<ProvenanceRow> {
     let blaze_query::db::Taken { rows, dropped } = taken;
     if dropped > 0 {
