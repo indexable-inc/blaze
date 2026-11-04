@@ -207,26 +207,7 @@ prefab hn.Main : ui.Column, Plate {
   Shape: {radius: 10, n: 4, border: 0, feather: 0}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-  head : ui.Row {
-    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 40, min: 0, max: 0}}
-    Padding: {l: 16, r: 16, t: 0, b: 0}
-    glyph : ui.Words, Muted {
-      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
-    }
-    title : ui.Words, Strong {
-      TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
-    }
-    sub : ui.Words, Muted {
-      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
-    }
-    spacer : ui.Spacer {}
-    state : ui.Words, Faint {
-      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-    }
-    dot : hn.Dot {}
-  }
-  rule : ui.Divider {}
+  // No header: the title bar names the object.
   // The terminal: drawn by the host into this node's rect (src/term.rs), where its clear plate comes in paint order.
   term : ui.Node {
     Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
