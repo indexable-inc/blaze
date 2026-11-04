@@ -1830,6 +1830,10 @@ impl Opened {
 const OWNERS_KEPT: usize = 64;
 /// Bytes of a [`Store`] before its rows.
 const STORE_HEAD: usize = 4096;
+/// The slots of the history's marks a [`Store`] keeps ([`Store::marks`]): one the last commit
+/// marked, one a flush may be marking as the process dies, and the one the next flush marks,
+/// so a crash in the middle of marking never leaves a slot a postmortem reads half written.
+pub(crate) const MARK_SLOTS: usize = 3;
 
 /// A ring's rows and what a reader needs to read them: its head, the rows, and the threads
 /// that wrote them. On the heap until the process's history persists the recorder; then in a
@@ -1840,18 +1844,21 @@ const STORE_HEAD: usize = 4096;
 pub(crate) struct Store {
     /// Rows ever written.
     head: AtomicU64,
-    /// The rows the history has written to its files: what a postmortem leaves out
-    /// ([`flushed`]).
-    flushed: AtomicU64,
     /// The ring's number.
     number: AtomicU64,
     /// Of `owners`, how many are said.
     owners_len: AtomicU64,
+    /// The history's marks in this ring, a pair a slot of the mapping's ([`MARK_SLOTS`],
+    /// [`flush_pending`]): the index of the first row the flush did not take (every row before
+    /// it is in its files, but the DEBUG rows it held), and the index of the first DEBUG row it
+    /// held (`logs::Hold`), at most the first. A postmortem reads from the marks of the slot
+    /// the manifest says committed. Each only grows, slot by slot.
+    marks: [[AtomicU64; 2]; MARK_SLOTS],
     /// The last [`OWNERS_KEPT`] of the ring's owners ([`Owner`]): the row each wrote from, and
     /// its tid << 32 | its name. Written by [`claim`] beside the ring's `owners`, for a
     /// postmortem, which has no other way to say whose rows they are.
     owners: [[AtomicU64; 2]; OWNERS_KEPT],
-    _pad: [u64; (STORE_HEAD - 32 - OWNERS_KEPT * 16) / 8],
+    _pad: [u64; (STORE_HEAD - 24 - MARK_SLOTS * 16 - OWNERS_KEPT * 16) / 8],
     /// [`WORDS`] words a row.
     words: [AtomicU64; WORDS * CAP],
 }
@@ -1900,7 +1907,7 @@ impl Store {
         head
     }
 
-    /// Copies `self` into `to`, which no one reads yet: rows, owners and the flushed mark,
+    /// Copies `self` into `to`, which no one reads yet: rows, owners and the history's marks,
     /// then the head last, with release.
     fn copy_to(&self, to: &Store) {
         let head = self.head.load(Ordering::Acquire);
@@ -1914,8 +1921,22 @@ impl Store {
         }
         to.owners_len.store(self.owners_len.load(Ordering::Relaxed), Ordering::Relaxed);
         to.number.store(self.number.load(Ordering::Relaxed), Ordering::Relaxed);
-        to.flushed.store(self.flushed.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.marks_to(to);
         to.head.store(head, Ordering::Release);
+    }
+
+    /// Raises each of `to`'s marks to `self`'s: what a mark written to `self` after a copy
+    /// carries over ([`Ring::move_store`]).
+    fn marks_to(&self, to: &Store) {
+        for (from, into) in self.marks.iter().flatten().zip(to.marks.iter().flatten()) {
+            into.fetch_max(from.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
+    /// Raises the marks of slot `slot` to `from` and `held_from`.
+    fn mark(&self, slot: usize, from: u64, held_from: u64) {
+        self.marks[slot][0].fetch_max(from, Ordering::SeqCst);
+        self.marks[slot][1].fetch_max(held_from, Ordering::SeqCst);
     }
 
     /// Writes the last [`OWNERS_KEPT`] of `owners` for a postmortem.
@@ -2034,6 +2055,13 @@ impl Ring {
         }
     }
 
+    /// Its store, loaded sequentially consistent: as the history marks it ([`flush_pending`]),
+    /// against a move ([`Ring::move_store`]).
+    fn store_seq(&self) -> &'static Store {
+        // SAFETY: as in `Ring::store`.
+        unsafe { &*self.store.load(Ordering::SeqCst) }
+    }
+
     /// Its store, as a reader loads it.
     #[inline]
     fn store(&self) -> &'static Store {
@@ -2084,8 +2112,15 @@ impl Ring {
         // SAFETY: `to` is a mapped store `persist` made for this ring alone and published
         // with release (the acquire swap above pairs with it); it is never unmapped.
         let to: &'static Store = unsafe { &*to };
-        self.store_mine().copy_to(to);
-        self.store.store(std::ptr::from_ref(to).cast_mut(), Ordering::Release);
+        let from = self.store_mine();
+        from.copy_to(to);
+        self.store.store(std::ptr::from_ref(to).cast_mut(), Ordering::SeqCst);
+        // A flush that loaded the old store before the swap may have marked it after the copy:
+        // its marks are raised here once more. Both sides are sequentially consistent, a store
+        // then a load each ([`mark`]): the flush sees the new store and marks it too, or this
+        // sees its mark, or both. Until 2026-11-04 the mark was copied once, and a flush racing
+        // the move left it in the abandoned store, so a postmortem wrote its rows again.
+        from.marks_to(to);
     }
 
     /// The rows from index `from` that are whole now, each with its index, into `into`; the
@@ -3439,19 +3474,57 @@ enum Taking<'a> {
     Window,
 }
 
-/// Notes that the rows before `cursor` are written to the history's files, `at_ns` the read
-/// that took them: what a postmortem of this process leaves out, so no row is written twice.
-/// Nothing until the recorder is persisted ([`persist`]).
-pub fn flushed(cursor: &Cursor, at_ns: i64) {
+/// Marks in the recorder's mapping, before the history commits flush `seq`, what that flush
+/// took: the rows before `cursor` in each ring, but the DEBUG rows the history still holds
+/// (`held`, their event ids, of the builds `held_builds`). A postmortem of this process reads
+/// past these marks once the manifest says flush `seq` committed, past the last committed
+/// flush's until then ([`flush_committed`]), so no row is written twice and none held is lost,
+/// whether the process dies before the commit or after. Nothing until the recorder is
+/// persisted ([`persist`]).
+pub fn flush_pending(
+    cursor: &Cursor,
+    held: impl IntoIterator<Item = u64>,
+    held_builds: &[u32],
+    seq: u64,
+) {
     if !postmortem::persisted() {
         return;
     }
-    for ring in lock(&RINGS).iter() {
-        if let Some(&next) = cursor.next.get(usize::from(ring.number) - 1) {
-            ring.store().flushed.store(next, Ordering::Release);
+    // The first held row of each ring, by its number less one.
+    // alloc: once a flush of a persisted recorder, a word a ring
+    let mut lowest = vec![u64::MAX; cursor.next.len()];
+    for id in held {
+        let (ring, index) = event_place(id);
+        if let Some(it) = usize::from(ring).checked_sub(1).and_then(|at| lowest.get_mut(at)) {
+            *it = (*it).min(index);
         }
     }
-    postmortem::flushed_at(at_ns);
+    postmortem::mark_flush(seq, held_builds, |slot| {
+        for ring in lock(&RINGS).iter() {
+            let at = usize::from(ring.number) - 1;
+            let Some(&next) = cursor.next.get(at) else { continue };
+            let held_from = lowest.get(at).copied().unwrap_or(u64::MAX).min(next);
+            let store = ring.store_seq();
+            store.mark(slot, next, held_from);
+            // The ring moved to the mapping meanwhile ([`Ring::move_store`]): its new store is
+            // marked too, so the mark is in the store a postmortem reads.
+            let now = ring.store_seq();
+            if !std::ptr::eq(now, store) {
+                now.mark(slot, next, held_from);
+            }
+        }
+    });
+}
+
+/// Notes that flush `seq`, marked by [`flush_pending`], committed, `at_ns` the read that took
+/// its rows: a postmortem reads past its marks even with no manifest saying so.
+pub fn flush_committed(seq: u64, at_ns: i64) {
+    postmortem::flush_committed(seq, at_ns);
+}
+
+/// The ring and the index in it of the row the event `id` names ([`event_id`]).
+const fn event_place(id: u64) -> (u16, u64) {
+    ((id >> EVENT_INDEX_BITS) as u16, id & ((1 << EVENT_INDEX_BITS) - 1))
 }
 
 /// Backs the rings, and all a reader needs to decode them (callsites, names, threads' names,

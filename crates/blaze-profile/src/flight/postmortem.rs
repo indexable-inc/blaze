@@ -7,7 +7,8 @@
 //!   a row's decoding rests on), the pid, the ring sizes, the stores mapped, whether frame
 //!   copies were counted, the clock's base ([`clock::Scale::line`], in two slots so a torn
 //!   write leaves the last whole one), the time of the last flush, the head of each name log,
-//!   blaze's hash and the process's name;
+//!   blaze's hash and the process's name, the mapping's nonce, and the history's flush marks
+//!   (below);
 //! - the callsites: a record a site, its name, target and level, written as the site
 //!   registers ([`super::register`]);
 //! - the builds running: a record a build, written as the history notes it started and freed
@@ -39,12 +40,25 @@
 //! The writer holds an exclusive lock on its file for its life. A reader ([`dead`]) takes the
 //! files no one holds, which are of processes that died: their header must be of this layout,
 //! or the reader refuses the file with an error naming it ([`PostmortemError::Refused`]), never
-//! skipping it. It decodes each store's rows past the history's last flush (the store's
-//! `flushed`, [`super::flushed`]) with the decoder this process's reads use
+//! skipping it. It decodes each store's rows past the history's last flush with the decoder
+//! this process's reads use
 //! ([`super::decode`]), gives their names and sites numbers of this process (names for the
 //! length of one [`Recovered`], sites for the process's life, [`super::foreign_site`]), and
 //! hands them to the history, which writes them as rows of the dead process and marks its
 //! running builds `crashed`; then the file is deleted ([`Found::remove`]).
+//!
+//! The history's flush marks are two-phase, so a crash between a flush's commit and its mark
+//! never has its rows written twice (2026-11-04: they were). Before it commits flush `seq`, the
+//! history marks in each store, in a slot neither the last commit's nor the last flush's
+//! ([`MARK_SLOTS`]), the first row the flush did not take and the first DEBUG row it still holds
+//! for a build not ended (`logs::Hold`); then the builds those held rows are of; then, last,
+//! that slot as pending for `seq` ([`mark_flush`]). Its commit names `seq` in the manifest beside
+//! the mapping's pid and nonce (`manifest::Recorder`); after the commit the slot is marked
+//! committed ([`flush_committed`]). A postmortem reads from the pending slot when the manifest
+//! says `seq` committed, from the committed slot otherwise: every row past its marks, and before
+//! them the DEBUG rows of the held builds. A postmortem that wrote a mapping's rows names its
+//! nonce in the commit that lists them, so a crash before the mapping is deleted never has it
+//! read again ([`Found::nonce`]).
 //!
 //! blaze's binary hash is kept, not checked: the file describes itself (layout, fingerprint,
 //! its own callsite and name tables), so a blaze rebuilt after the crash, the common case, reads
@@ -68,9 +82,10 @@ use std::alloc::Global;
 use stdx::file_lock::Locked;
 
 use super::{
-    CAP, KEPT, NAMES, Owner, RINGS, Read, SHARDS, SITES, SLOTS, Store, Sym, TAKEN, WORDS, clock,
-    decode, lock, span,
+    CAP, KEPT, MARK_SLOTS, NAMES, Owner, RINGS, Read, SHARDS, SITES, SLOTS, Store, Sym, TAKEN,
+    WORDS, clock, decode, lock, span,
 };
+use crate::logs::HOLD_BUILDS;
 
 // --- Layout -----------------------------------------------------------------------------
 
@@ -83,7 +98,7 @@ const MAGIC: u64 = u64::from_le_bytes(*b"BLZFLGHT");
 const ENDIAN: u64 = 0x0102_0304_0506_0708;
 /// The layout of the file. Bump it with any change to the parts below, the header's words or
 /// a [`Store`]'s.
-pub(crate) const LAYOUT: u64 = 2;
+pub(crate) const LAYOUT: u64 = 3;
 
 const SITE_RECORD: usize = 512;
 const SITES_AT: usize = PAGE;
@@ -152,7 +167,25 @@ const H_BLAZE_LEN: usize = 46;
 const H_PROCESS_LEN: usize = 47;
 const H_BLAZE: usize = 48;
 const H_PROCESS: usize = H_BLAZE + BLAZE_MAX / 8;
-const _: () = assert!(H_LOG_HEADS + LOGS <= H_BLAZE_LEN && (H_PROCESS * 8 + PROCESS_MAX) <= PAGE);
+/// The mapping's nonce: told from a mapping of a later process given the same pid.
+const H_NONCE: usize = 256;
+/// The slot the last flush marked, pending its commit, and the slot the last commit marked:
+/// each `seq << 2 | slot`, `seq` 0 for none.
+const H_PENDING: usize = 257;
+const H_COMMITTED: usize = 258;
+/// A slot's builds whose DEBUG rows the flush held: their count, then each build.
+const H_HELD: usize = 260;
+const HELD_WORDS: usize = 1 + HOLD_BUILDS;
+const _: () = assert!(H_LOG_HEADS + LOGS <= H_BLAZE_LEN && (H_PROCESS * 8 + PROCESS_MAX) <= H_NONCE * 8);
+const _: () = assert!((H_HELD + MARK_SLOTS * HELD_WORDS) * 8 <= PAGE && MARK_SLOTS <= 4);
+
+/// A pending or committed slot's word: its flush and its slot.
+const fn marked(word: u64) -> Option<(u64, usize)> {
+    match word >> 2 {
+        0 => None,
+        seq => Some((seq, (word & 3) as usize)),
+    }
+}
 
 /// The levels a site record names, by their index.
 const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
@@ -307,7 +340,7 @@ pub(crate) const ROWS_FINGERPRINT: u64 = {
 };
 
 /// The file of process `pid` in a history's directory.
-fn file_name(pid: u32) -> String {
+pub(crate) fn file_name(pid: u32) -> String {
     // alloc: a file's name, once a mapping made or found
     format!("flight-{pid}.map")
 }
@@ -436,6 +469,10 @@ pub(crate) struct Mapping {
     stores: std::ptr::NonNull<u8>,
     /// Stores handed to rings.
     given: Mutex<usize>,
+    /// Its nonce ([`H_NONCE`]).
+    nonce: u64,
+    /// One flush marks at a time ([`mark_flush`]).
+    marking: Mutex<()>,
 }
 
 // SAFETY: `fixed` and `stores` point into shared mappings that are never unmapped; a store is
@@ -512,6 +549,8 @@ impl Mapping {
                 builds: Mutex::new([0; BUILD_SLOTS]),
                 stores,
                 given: Mutex::new(0),
+                nonce: nonce(pid),
+                marking: Mutex::new(()),
             };
             mapping.header(pid, blaze, process, counting_copies);
             Ok(mapping)
@@ -528,6 +567,7 @@ impl Mapping {
             (H_WORDS, WORDS as u64),
             (H_STORE_BYTES, STORE_BYTES as u64),
             (H_COPIES, u64::from(counting_copies)),
+            (H_NONCE, self.nonce),
         ];
         for (at, value) in words {
             self.word(at).store(value, Ordering::Relaxed);
@@ -689,11 +729,51 @@ impl Mapping {
         }
     }
 
+    /// Marks flush `seq` pending: `marks` writes each store's marks in the slot given, then
+    /// the builds whose DEBUG rows it held are noted in that slot, then the slot is published
+    /// as pending. The slot is neither the last commit's nor the last flush's.
+    pub(crate) fn mark_flush(&self, seq: u64, held_builds: &[u32], marks: impl FnOnce(usize)) {
+        let _one = self.marking.lock();
+        let taken = [H_PENDING, H_COMMITTED]
+            .map(|at| marked(self.word(at).load(Ordering::Acquire)).map(|it| it.1));
+        let slot = (0..MARK_SLOTS).find(|it| !taken.contains(&Some(*it))).unwrap_or(0);
+        marks(slot);
+        let held = &held_builds[..held_builds.len().min(HOLD_BUILDS)];
+        let base = H_HELD + slot * HELD_WORDS;
+        for (at, build) in held.iter().enumerate() {
+            self.word(base + 1 + at).store(u64::from(*build), Ordering::Relaxed);
+        }
+        self.word(base).store(held.len() as u64, Ordering::Relaxed);
+        self.word(H_PENDING).store(seq << 2 | slot as u64, Ordering::SeqCst);
+    }
+
+    /// Marks flush `seq`, pending, committed; `at_ns` the read that took its rows.
+    pub(crate) fn flush_committed(&self, seq: u64, at_ns: i64) {
+        {
+            let _one = self.marking.lock();
+            let pending = self.word(H_PENDING).load(Ordering::Acquire);
+            if marked(pending).is_some_and(|it| it.0 == seq) {
+                self.word(H_COMMITTED).store(pending, Ordering::SeqCst);
+            }
+        }
+        self.flushed_at(at_ns);
+    }
+
     /// Notes the read time of the flush that just wrote, with the clock's base now.
     pub(crate) fn flushed_at(&self, at_ns: i64) {
         self.set_clock(&clock::Scale::now());
         self.word(H_FLUSHED_NS).store(at_ns as u64, Ordering::Release);
     }
+}
+
+/// A mapping's nonce: never 0, and another for each mapping a process of `pid` makes.
+fn nonce(pid: u32) -> u64 {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |it| it.as_nanos() as u64);
+    let words = [unix, clock::ticks(), u64::from(pid)];
+    let hash = words.iter().fold(0xcbf2_9ce4_8422_2325, |hash, word| fnv_word(hash, *word));
+    hash | 1
 }
 
 /// `text` cut to at most `max` bytes at a character's boundary, and whether it was cut.
@@ -944,11 +1024,24 @@ pub(super) fn site_registered(site: u16, meta: &'static super::Meta) {
     }
 }
 
-/// See [`Mapping::flushed_at`].
-pub(super) fn flushed_at(at_ns: i64) {
+/// See [`Mapping::mark_flush`]. Nothing until the recorder is persisted.
+pub(super) fn mark_flush(seq: u64, held_builds: &[u32], marks: impl FnOnce(usize)) {
     if let Some(mapping) = MAPPING.get() {
-        mapping.flushed_at(at_ns);
+        mapping.mark_flush(seq, held_builds, marks);
     }
+}
+
+/// See [`Mapping::flush_committed`].
+pub(super) fn flush_committed(seq: u64, at_ns: i64) {
+    if let Some(mapping) = MAPPING.get() {
+        mapping.flush_committed(seq, at_ns);
+    }
+}
+
+/// This process's pid and its mapping's nonce, once [`persist`] made it: what the history's
+/// commits name the flushes of (`manifest::Recorder`).
+pub fn recorder() -> Option<(u32, u64)> {
+    MAPPING.get().map(|it| (std::process::id(), it.nonce))
 }
 
 /// Notes a build running, so a postmortem marks it `crashed` if the process dies first.
@@ -1038,6 +1131,9 @@ pub struct DeadBuild {
 pub struct Recovered {
     pub path: PathBuf,
     pub pid: u32,
+    /// Its mapping's nonce ([`H_NONCE`]); 0 for a mapping with no header (its process died
+    /// making it), which holds no rows.
+    pub nonce: u64,
     /// Its name, as its rows name their process.
     pub process: String,
     /// The hash of the blaze it ran (`builds.blaze`).
@@ -1110,33 +1206,17 @@ impl Found {
         PostmortemError::Torn { path: self.path.clone(), what }
     }
 
-    /// Reads back the dead process's rows past its last flush, its running builds, and what
-    /// names them. A file of another layout is refused, naming it.
-    pub fn read(&self) -> Result<Recovered, PostmortemError> {
+    /// The header, checked to be of this layout; `None` for a file whose process died making
+    /// it (no magic yet), which holds no rows. A file of another layout is refused, naming it.
+    fn header(&self) -> Result<Option<Vec<u8>>, PostmortemError> {
         let len = self.file.metadata().map_err(io_error(&self.path, "reading the size of"))?.len();
-        let session = Session::begin();
-        let mut recovered = Recovered {
-            // alloc: a path, once a dead process
-            path: self.path.clone(),
-            pid: self.pid,
-            process: String::new(),
-            blaze: String::new(),
-            read: Read::default(),
-            builds: Vec::new(),
-            last_ns: 0,
-            unowned: 0,
-            names_lost: 0,
-            sites_lost: 0,
-            _session: session,
-        };
-        // A process that died making its file wrote no magic: nothing of it to read.
         if len < PAGE as u64 {
-            return Ok(recovered);
+            return Ok(None);
         }
         let header = self.bytes(0, PAGE, "reading the header of")?;
         let h = |at: usize| word(&header, at * 8);
         if h(H_MAGIC) == 0 {
-            return Ok(recovered);
+            return Ok(None);
         }
         for (what, at, expected) in [
             ("magic", H_MAGIC, MAGIC),
@@ -1151,10 +1231,68 @@ impl Found {
                 return Err(self.refuse(what, h(at), expected));
             }
         }
-        let rings = h(H_RINGS);
-        let needed = RINGS_AT as u64 + rings * STORE_BYTES as u64;
+        let needed = RINGS_AT as u64 + h(H_RINGS) * STORE_BYTES as u64;
         if len < needed {
             return Err(self.refuse("length", len, needed));
+        }
+        Ok(Some(header))
+    }
+
+    /// The mapping's nonce, which the manifest names it by (`manifest::Recorder`); `None` for
+    /// a file with no header, which holds no rows. A file of another layout is refused.
+    pub fn nonce(&self) -> Result<Option<u64>, PostmortemError> {
+        Ok(self.header()?.map(|header| word(&header, H_NONCE * 8)))
+    }
+
+    /// Reads back the dead process's rows past its last committed flush, its running builds,
+    /// and what names them. `committed` is the last flush of the process the manifest says
+    /// committed (`manifest::Recorder::flushed`), `None` when it names none of this mapping:
+    /// the rows are read past the marks of that flush when the mapping marked it pending,
+    /// past the marks of the last flush the mapping saw committed otherwise, and from the
+    /// first row a ring holds when it saw none. Before those marks, the DEBUG rows of the
+    /// builds that flush held are read too: the history had not written them. A file of
+    /// another layout is refused, naming it.
+    pub fn read(&self, committed: Option<u64>) -> Result<Recovered, PostmortemError> {
+        let session = Session::begin();
+        let mut recovered = Recovered {
+            // alloc: a path, once a dead process
+            path: self.path.clone(),
+            pid: self.pid,
+            nonce: 0,
+            process: String::new(),
+            blaze: String::new(),
+            read: Read::default(),
+            builds: Vec::new(),
+            last_ns: 0,
+            unowned: 0,
+            names_lost: 0,
+            sites_lost: 0,
+            _session: session,
+        };
+        // A process that died making its file wrote no magic: nothing of it to read.
+        let Some(header) = self.header()? else { return Ok(recovered) };
+        let h = |at: usize| word(&header, at * 8);
+        recovered.nonce = h(H_NONCE);
+        let rings = h(H_RINGS);
+        // The slot whose marks it reads from: the pending flush's once the manifest says it
+        // committed, else the last the mapping saw committed, else none (every row).
+        let pending = marked(h(H_PENDING));
+        let slot = match pending {
+            Some((seq, slot)) if committed.is_some_and(|it| it >= seq) => Some(slot),
+            _ => marked(h(H_COMMITTED)).map(|it| it.1),
+        };
+        if slot.is_some_and(|it| it >= MARK_SLOTS) {
+            return Err(self.torn("the slot of the history's flush marks"));
+        }
+        // alloc: once a postmortem, at most HOLD_BUILDS
+        let mut held_builds: Vec<u32> = Vec::new();
+        if let Some(slot) = slot {
+            let base = H_HELD + slot * HELD_WORDS;
+            let count = usize::try_from(h(base)).unwrap_or(usize::MAX);
+            if count > HOLD_BUILDS {
+                return Err(self.torn("the builds a flush held DEBUG rows of"));
+            }
+            held_builds.extend((0..count).map(|at| h(base + 1 + at) as u32));
         }
         let text = |at: usize, len_at: usize, max: usize| -> Result<String, PostmortemError> {
             let len = usize::try_from(h(len_at))
@@ -1183,6 +1321,8 @@ impl Found {
         let sites = self.sites()?;
         recovered.builds = self.builds()?;
         let mut read = Read::default();
+        // The rows before the marks, of which only the held DEBUG rows are kept.
+        let mut held = Read::default();
         for ring in 0..rings as usize {
             let store = self.bytes(
                 RINGS_AT + ring * STORE_BYTES,
@@ -1191,7 +1331,6 @@ impl Found {
             )?;
             let field = |offset: usize| word(&store, offset);
             let head = field(std::mem::offset_of!(Store, head));
-            let flushed = field(std::mem::offset_of!(Store, flushed));
             let number = u16::try_from(field(std::mem::offset_of!(Store, number)))
                 .map_err(|_| self.torn("a ring's number"))?;
             let owners_at = std::mem::offset_of!(Store, owners);
@@ -1207,30 +1346,53 @@ impl Found {
                     Owner { from, tid: (who >> 32) as u32, name: who as Sym }
                 })
                 .collect();
+            let (mark, held_mark) = match slot {
+                Some(slot) => {
+                    let at = std::mem::offset_of!(Store, marks) + slot * 16;
+                    (field(at), field(at + 8))
+                }
+                None => (0, 0),
+            };
             // The row the head would be next is half written, perhaps over the oldest: both
             // left out, as a live read leaves them.
-            let from = flushed.min(head).max((head + 1).saturating_sub(CAP as u64));
-            read.ring_begins();
-            for i in from..head {
-                let at = super::STORE_HEAD + (i as usize & (CAP - 1)) * WORDS * 8;
-                let row: [u64; WORDS] = std::array::from_fn(|it| field(at + it * 8));
-                let Some(by) = super::Ring::owner(&owners, i) else {
-                    recovered.unowned += 1;
-                    continue;
-                };
-                decode(
-                    &mut read,
-                    (by.tid, by.name),
-                    super::event_id(number, i),
-                    &row,
-                    &scale,
-                    counting_copies,
-                );
+            let oldest = (head + 1).saturating_sub(CAP as u64);
+            let from = mark.min(head).max(oldest);
+            let held_from = held_mark.min(from).max(oldest);
+            for (into, range) in [(&mut held, held_from..from), (&mut read, from..head)] {
+                into.ring_begins();
+                for i in range {
+                    let at = super::STORE_HEAD + (i as usize & (CAP - 1)) * WORDS * 8;
+                    let row: [u64; WORDS] = std::array::from_fn(|it| field(at + it * 8));
+                    let Some(by) = super::Ring::owner(&owners, i) else {
+                        recovered.unowned += 1;
+                        continue;
+                    };
+                    decode(
+                        into,
+                        (by.tid, by.name),
+                        super::event_id(number, i),
+                        &row,
+                        &scale,
+                        counting_copies,
+                    );
+                }
+                // A span whose CPU waited on a boundary row the process died before writing
+                // reads as not counted, as a live read's at the end of a ring.
+                into.ring_ends();
             }
-            // A span whose CPU waited on a boundary row the process died before writing reads
-            // as not counted, as a live read's at the end of a ring.
-            read.ring_ends();
         }
+        // Of the rows before the marks, the DEBUG events and their fields of the builds the
+        // flush held them for: in no file. Those of other builds were written or dropped.
+        let debug_held = |site: u16, build: u32| {
+            held_builds.contains(&build)
+                && usize::from(site)
+                    .checked_sub(1)
+                    .and_then(|at| sites.get(at))
+                    .and_then(Option::as_ref)
+                    .is_some_and(|(_, _, level)| *level == "DEBUG")
+        };
+        read.events.extend(held.events.iter().filter(|it| debug_held(it.site, it.build)));
+        read.fields.extend(held.fields.iter().filter(|it| debug_held(it.site, it.build)));
         self.renumber(&mut read, &names, &sites, &mut recovered)?;
         let last = [
             read.spans.iter().map(|it| it.start_ns + it.dur_ns).max(),
@@ -1553,10 +1715,10 @@ mod tests {
         for row in &rows {
             ring.put(*row);
         }
-        // The history wrote the first 25 rows to its files.
-        store.flushed.store(25, Ordering::Release);
-        // Its last flush read the rings a millisecond before the first row.
-        mapping.flushed_at(scale.mono(t0) - 1_000_000);
+        // The history wrote the first 25 rows to its files, in a flush that committed; its last
+        // flush read the rings a millisecond before the first row.
+        mapping.mark_flush(1, &[], |slot| store.mark(slot, 25, 25));
+        mapping.flush_committed(1, scale.mono(t0) - 1_000_000);
         drop(mapping);
 
         // What the dead process would have decoded of the rows past its flush.
@@ -1586,7 +1748,7 @@ mod tests {
         let found = dead(&dir).unwrap();
         assert_eq!(found.len(), 1, "the one file of a dead process");
         assert_eq!(found[0].pid(), DEAD);
-        let recovered = found[0].read().unwrap();
+        let recovered = found[0].read(None).unwrap();
         assert_eq!(
             (recovered.process.as_str(), recovered.blaze.as_str()),
             ("blaze serve", "c0ffee")
@@ -1650,7 +1812,7 @@ mod tests {
             (&file).flush().unwrap();
         }
         let found = dead(&dir).unwrap();
-        let refused = found[0].read().err().expect("refused");
+        let refused = found[0].read(None).err().expect("refused");
         match &refused {
             PostmortemError::Refused { path: named, what, found, expected } => {
                 assert_eq!(
@@ -1666,6 +1828,37 @@ mod tests {
         );
         drop(found);
         assert!(path.exists(), "a refused file stays");
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A flush marked pending is read past only once the manifest says it committed: a crash
+    /// between its commit and its mark never writes its rows twice, and one before its commit
+    /// never loses them.
+    #[test]
+    fn a_pending_flush_is_read_past_only_once_the_manifest_says_it_committed() {
+        let dir = scratch("pending");
+        let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
+        mapping.set_clock(&clock::Scale::now());
+        mapping.site(9, "compile", "blaze::unit", "INFO");
+        let store = mapping.store(1).unwrap();
+        let ring = Ring::with_store(1, store);
+        store.mirror(&[Owner { from: 0, tid: 42, name: 0 }]);
+        let t0 = clock::ticks();
+        for i in 0..30 {
+            ring.put(plot_row(t0, i));
+        }
+        // Flush 4 took 10 rows and committed; flush 5 took 20, and the process died before
+        // its commit was marked (or before it committed).
+        mapping.mark_flush(4, &[], |slot| store.mark(slot, 10, 10));
+        mapping.flush_committed(4, 0);
+        mapping.mark_flush(5, &[], |slot| store.mark(slot, 20, 20));
+        drop(mapping);
+        let found = dead(&dir).unwrap();
+        assert!(found[0].nonce().unwrap().is_some_and(|it| it != 0), "a mapping has a nonce");
+        let rows = |committed| found[0].read(committed).unwrap().read.counters.len();
+        assert_eq!(rows(None), 20, "no manifest names it: past the last commit the mapping saw");
+        assert_eq!(rows(Some(4)), 20, "the manifest has flush 4: flush 5 did not commit");
+        assert_eq!(rows(Some(5)), 10, "the manifest has flush 5: its rows are in files");
         _ = fs::remove_dir_all(&dir);
     }
 
