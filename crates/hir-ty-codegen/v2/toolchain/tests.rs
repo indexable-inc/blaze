@@ -198,6 +198,8 @@ fn a_flag_that_changes_code_and_is_not_read_is_an_error_naming_it() {
         (&["-C", "relocation-model=ropi"][..], "ropi"),
         (&["-C", "passes=gvn"][..], "gvn"),
         (&["-C", "llvm-args=-x86-asm-syntax=intel"][..], "-x86-asm-syntax"),
+        (&["-C", "save-temps"][..], "save-temps"),
+        (&["-C", "remark=all"][..], "remark"),
         (&["-C"][..], "-C"),
     ] {
         let error = of(LINUX, flags).unwrap_err();

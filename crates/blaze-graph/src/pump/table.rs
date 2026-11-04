@@ -469,7 +469,9 @@ impl<V> Runs<V> {
         let waiting = {
             let latched = self.latch(&claim.key);
             let (bucket, at) = latched.find(&claim.key).expect("a run's entry stays until it ends");
-            debug_assert_eq!(
+            // Checked in every build: a word not its own means a waiter claimed this run's
+            // flight for another task, whose end would end it under these waiters.
+            assert_eq!(
                 bucket.runs[at].load(Ordering::Relaxed) & !WAITED,
                 claim.word,
                 "a run's word is its own until it ends"

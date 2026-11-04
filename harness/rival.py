@@ -54,7 +54,7 @@ from dataclasses import MISSING, dataclass, field, fields
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import bench, blaze_cli
+import bench, blaze_cli, storelib
 from blaze_cli import Side, difference, program_output, test_results, test_verdict, wait_warm
 
 LET = bench.LET
@@ -260,7 +260,8 @@ def shipped_std(arm, runner, work):
         return remote
     engine = next(os.path.join(arm.bin, n) for n in ("blaze-engine", "ra-jit") if os.path.isfile(os.path.join(arm.bin, n)))
     env = dict(runner.env, **{runner.prefix + "HOME": os.path.join(work, f"home-std-{arm.name}")})
-    sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True, env=env, check=True).stdout.strip()
+    # The arm's own blaze says where its Rust is (`blaze toolchain --json`), never rustc.
+    sysroot = storelib.blaze_toolchain(os.path.join(arm.bin, "blaze"), env).sysroot
     runner.log.ran(arm.name, work, env, [engine, "std", remote, sysroot])
     made = subprocess.run([engine, "std", remote, sysroot], capture_output=True, text=True, env=env)
     if made.returncode != 0:

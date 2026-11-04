@@ -20,10 +20,12 @@ use blaze_codegen::settings::{Coverage, Sanitize, Toolchain};
 use blaze_codegen::{CompiledFunction, InstanceKey, Settings, Target};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
-use blaze_link::{Debug, DevRun, Format, NativeKind, Output, OutputKind, Platform};
+use blaze_link::{
+    Debug, DevRun, Format, LinkArgs, NativeKind, Output, OutputKind, Platform, Undefined,
+};
 use blaze_mem::{Tag, frame, frame::Frame};
 
-pub const GRAPH_DOMAIN: &str = "blaze v2 premap graph 2";
+pub const GRAPH_DOMAIN: &str = "blaze v2 premap graph 3";
 pub const IMAGE_DOMAIN: &str = "blaze v2 premap image 3";
 pub const INLINED_DOMAIN: &str = "blaze v2 premap inlined 1";
 
@@ -332,6 +334,7 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
         exec_log,
         sanitize,
         rpaths,
+        link,
     } = output;
     hasher.update(&[format_tag(*format), arch_tag(*arch)]);
     match kind {
@@ -387,6 +390,21 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
     for rpath in rpaths {
         hasher.part(rpath.as_bytes());
     }
+    let LinkArgs { rpaths, headerpad, headerpad_max_install_names, undefined, nodelete } = link;
+    count(hasher, rpaths.len());
+    for rpath in rpaths {
+        hasher.part(rpath.as_bytes());
+    }
+    let undefined = match undefined {
+        Undefined::Default => 0,
+        Undefined::Error => 1,
+        Undefined::DynamicLookup => 2,
+    };
+    hasher.update(&headerpad.to_le_bytes()).update(&[
+        *headerpad_max_install_names as u8,
+        undefined,
+        *nodelete as u8,
+    ]);
 }
 
 pub(crate) fn format_tag(format: Format) -> u8 {

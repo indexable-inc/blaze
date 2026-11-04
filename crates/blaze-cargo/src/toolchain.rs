@@ -49,6 +49,43 @@ pub fn host() -> Option<&'static str> {
     own::host()
 }
 
+/// `blaze toolchain --json`'s object: blaze's toolchain as blaze and rustup name it, the rustc
+/// it is, the host's tuple and where its files are. What a harness asks instead of running
+/// `rustc -vV` (docs/toolchain.md).
+#[derive(serde::Serialize)]
+struct ToolchainJson<'a> {
+    /// `blaze-2026-10-27` ([`name`]).
+    name: String,
+    /// `nightly-2026-10-27` ([`OURS`]).
+    nightly: &'a str,
+    /// `1.101.0-nightly (12433c307 2026-10-24)` ([`ours_says`]).
+    rustc: &'a str,
+    /// `1.101.0-nightly` ([`ours_release`]).
+    release: &'a str,
+    commit: &'a str,
+    /// The host's tuple ([`host`]): `null` on a host blaze ships no toolchain for.
+    host: Option<&'a str>,
+    sysroot: &'a Path,
+}
+
+/// [`ToolchainJson`] of `chosen`, one line, newline ended.
+pub fn json(chosen: &Chosen) -> Result<String, String> {
+    let json = ToolchainJson {
+        name: name(),
+        nightly: OURS.trim(),
+        rustc: ours_says(),
+        release: ours_release(),
+        commit: ours_commit(),
+        host: host(),
+        sysroot: chosen.dir(),
+    };
+    // alloc: the CLI's answer, once
+    let mut line = serde_json::to_string(&json)
+        .map_err(|error| format!("`blaze toolchain --json`'s answer as JSON: {error}"))?;
+    line.push('\n');
+    Ok(line)
+}
+
 /// Where the files of blaze's release are: blaze's own copy, never rustup's.
 pub struct Chosen(PathBuf);
 

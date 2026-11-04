@@ -200,6 +200,9 @@ pub struct Printer<'a, O: Write, E: Write> {
     /// The hash of every diagnostic printed, as cargo's `DiagDedupe` keeps them.
     printed: HashedSet<Global>,
     built: Option<Built>,
+    /// What the request's units came to, once its work report came ([`ResponseRef::Work`]):
+    /// for `build-finished`.
+    work: Option<json::Work>,
     /// The test units the build left unbuilt ([`blaze_api::Unchecked::tests`]), for the end of
     /// `test`'s run.
     unbuilt: Vec<blaze_api::Unbuilt>,
@@ -235,6 +238,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             names: String::with_capacity(NAMES),
             printed: HashedSet::with_capacity_in(DIAGNOSTICS, Global),
             built: None,
+            work: None,
             unbuilt: Vec::new(), // alloc: none until a test unit did not build
             refused: false,
             root: root.to_string_lossy().into_owned(), // alloc: once a printer
@@ -505,6 +509,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             // How each image was linked goes to stderr in every format: a link that was not
             // spliced is never silent.
             ResponseRef::Work(worked) => {
+                self.work = Some(json::Work::of(&worked));
                 if self.shown.format.json() {
                     self.to(true)?;
                     // alloc: two texts a request, at its end.
@@ -678,7 +683,14 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         }
         if self.shown.format.json() {
             self.to(true)?;
-            json::build_finished(&mut self.line, ok);
+            let finished = json::Finished {
+                success: ok,
+                profile: self.built.as_ref().and_then(|it| json::profile_name(&it.profile)),
+                served: json::Served::HERE,
+                took_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+                work: self.work,
+            };
+            json::build_finished(&mut self.line, &finished);
             self.line.push('\n');
         }
         self.flush()?;

@@ -9,7 +9,7 @@ then compares `blaze run` (or `test`) with blaze's build of the same tree from n
 (`blaze_cli.Scratch`), and the program with what the edit says it prints. A row is right
 when the two agree at every comparison, the program says what it should, and the daemon's log
 (`<home>/v2/serve.log`) has no panic in it; whether each build finished is in the table. The
-daemon is found by its lock (`storelib.daemon_pid`), never by what `blaze status` prints. v1's
+daemon is found by its lock (`storelib.daemon_pid`), its budget by `blaze status --json`. v1's
 rows of its workers (which one a memory ceiling stopped, how many a ceiling left) are gone with
 its workers.
 
@@ -17,7 +17,8 @@ Writes SOAKROWS.md next to this file.
 """
 import argparse, glob, os, re, shutil, signal, subprocess, sys, tempfile, time
 
-from blaze_cli import HERE, BLAZE, TOOLCHAIN, Scratch, Side, base_env, difference, how_built, program_output, test_results
+import storelib
+from blaze_cli import HERE, BLAZE, TOOLCHAIN, Scratch, Side, base_env, difference, how_built, machine_format, program_output, read_build, test_results
 from storelib import daemon_pid, state_of
 
 GIT = ["git", "-c", "user.name=blaze", "-c", "user.email=blaze@localhost", "-c", "advice.detachedHead=false"]
@@ -92,7 +93,7 @@ class Row:
         shutil.rmtree(self.path("target-scratch", ws=ws), ignore_errors=True)
         read = test_results if command == "test" else program_output
         differs = difference(read(ours), read(fresh))
-        how = how_built(ours.stderr)
+        how = how_built(ours)
         self.built.append(f"{label}: {how}")
         if differs:
             raise Wrong(f"{label} ({how}): {differs}")
@@ -376,10 +377,10 @@ def non_utf8_root(row):
     shutil.copytree(row.ws.encode(), ws, ignore=lambda _, names: [it for it in names if it.startswith(b"target")])
     run = lambda argv, env: subprocess.run(argv, cwd=ws, env=env, capture_output=True, text=True, errors="replace", timeout=1800)
     for label in ("cold", "edited"):
-        ours = run(["blaze", "run"], row.env)
+        ours = read_build(run(["blaze", "run", *machine_format("run", ())], row.env))
         _, fresh = Scratch(os.fsdecode(ws), row.env).cargo("run", timeout=1800)
         shutil.rmtree(os.path.join(ws, b"target-scratch"), ignore_errors=True)
-        how = how_built(ours.stderr)
+        how = how_built(ours)
         row.built.append(f"{label}: {how}")
         if (ours.returncode, ours.stdout) != (fresh.returncode, fresh.stdout):
             raise Wrong(f"{label} ({how}): {ours.returncode} {ours.stdout[-200:]!r} {ours.stderr[-300:]!r}, and from nothing {fresh.returncode} {fresh.stdout[-200:]!r}")
@@ -549,10 +550,8 @@ def binary_replaced(row):
 
 def in_a_control_group(row, allowed=6 << 30):
     """A daemon started in a control group that allows 6 GB, as a container, a CI job or a
-    systemd unit is, builds, and its edit is its own. v1 also read from `blaze status` that its
-    workers held at most half of that; v2 says its budget (`Status::budget_bytes`) only in
-    `blaze status`'s lines for people, which a harness does not read, so that is not checked
-    until blaze says it in a machine format."""
+    systemd unit is, budgets at most half of that (`blaze status --json`'s `budget_bytes`), not
+    half of the machine's memory, and builds."""
     scope = ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={allowed}"]
     if not sys.platform.startswith("linux") or not shutil.which("systemd-run"):
         raise NotRun("it starts a control group with systemd-run, on Linux")
@@ -564,6 +563,11 @@ def in_a_control_group(row, allowed=6 << 30):
     ran = subprocess.run([*scope, *side.argv("build")], cwd=row.ws, env=side.env, capture_output=True, text=True, timeout=1800)
     if ran.returncode:
         raise Wrong(f"the first build failed: {ran.stderr[-300:]}")
+    row.notes.append(side.cargo("status")[1].stdout)
+    daemon = storelib.blaze_status("blaze", side.env, row.ws).daemon
+    if daemon is None or daemon.budget_bytes > allowed // 2:
+        raise Wrong(f"the daemon may hold more than half of the {allowed >> 20} MB the control group allows: "
+                    f"{'no daemon runs' if daemon is None else f'its budget is {daemon.budget_bytes >> 20} MB'}")
     row.edit()
     how, _ = row.both("a body edited", want=f"mark {row.mark}")
     if how != "daemon":

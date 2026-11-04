@@ -18,6 +18,7 @@
 #![feature(allocator_api, allocator_ext, variant_count)]
 #![deny(unsafe_code)]
 
+pub mod args;
 mod arena;
 mod commit;
 mod counter;
@@ -73,7 +74,10 @@ use std::alloc::Global;
 pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};
-pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
+pub use output::{
+    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
+    Undefined,
+};
 pub use position::{
     COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
 };
@@ -997,6 +1001,7 @@ pub fn fuzz_read(
         sanitize: blaze_codegen::settings::Sanitize::default(),
         // alloc: a fuzz target's setup, once per input
         rpaths: Vec::new(),
+        link: crate::LinkArgs::default(),
         triple: match (format, arch) {
             (Format::Elf, blaze_codegen::Arch::Aarch64) => "aarch64-unknown-linux-gnu",
             (Format::Elf, _) => "x86_64-unknown-linux-gnu",

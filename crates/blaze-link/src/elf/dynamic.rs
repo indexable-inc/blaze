@@ -499,7 +499,10 @@ impl Tables {
             | if shared { elf::DF_SYMBOLIC } else { elf::DynamicFlags(0) }
             | if static_tls { elf::DF_STATIC_TLS } else { elf::DynamicFlags(0) };
         entry(elf::DT_FLAGS, flags.0);
-        let flags_1 = elf::DF_1_NOW | if shared { elf::DynamicFlags1(0) } else { elf::DF_1_PIE };
+        let flags_1 = elf::DF_1_NOW
+            | if shared { elf::DynamicFlags1(0) } else { elf::DF_1_PIE }
+            // `-z nodelete`: never unloaded ([`crate::LinkArgs::nodelete`]).
+            | if shared && output.link.nodelete { elf::DF_1_NODELETE } else { elf::DynamicFlags1(0) };
         entry(elf::DT_FLAGS_1, flags_1.0);
         if let Some(init) = placed.init {
             entry(elf::DT_INIT, init);

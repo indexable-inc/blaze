@@ -88,7 +88,8 @@ a build first needs it.
     blaze fmt   [RUSTFMT_ARGS] FILE.rs...
     blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
     blaze stop
-    blaze status
+    blaze status [--json]
+    blaze toolchain [--json]
     blaze daemon install | uninstall
     blaze codegen-inputs --format=json
     blaze trace --out PATH
@@ -157,7 +158,31 @@ rustc's diagnostic, `build-finished`), written as cargo and rustc write them
 (`crates/blaze-cargo/src/cli/json.rs`), which is what rust-analyzer's check-on-save and other
 editors read. The wording of a diagnostic is blaze's (`crates/blaze-diagnostics`), not always
 rustc's. `status` prints the daemon's process, the requests it has served, the checkouts it
-watches and the memory it holds of its budget. `stop` has the daemon write its state and end.
+watches and the memory it holds of its budget (`--json`: one object, [The daemon](#the-daemon)).
+`stop` has the daemon write its state and end.
+
+Under a JSON `--message-format` every `build`, `check`, `run`, `test` and `bench` ends its build
+with one `build-finished` line on stdout, the last of its JSON messages and before anything the
+program or the tests print. cargo's has only `success`; blaze's carries what a tool would
+otherwise read from the human `Finished` line and the daemon's log, each field always present,
+`null` where there is nothing to say:
+
+    {"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}
+
+- `success`: as cargo's.
+- `profile`: the profile's name, `null` when the build placed nothing (it failed first).
+- `served`: `daemon`, or `in-process` for the seed's one-shot engine (docs/future/bootstrap.md).
+- `took_ms`: from the command's start to the build's end.
+- `build_id`: the daemon's id of the build, which the profile history's rows carry
+  (`blaze slow --build N`, `blaze debug sql`); `null` with no work report.
+- `units`: the units made again (`built`) and replayed from the store as they were
+  (`replayed`); `null` for a request that sent no work report (a load that failed).
+- `links`: each image linked, by how: its first link, spliced into the last one, unchanged, or
+  laid out whole again (`full`, which the `link:` line on stderr says why of).
+
+`--message-format=json-render-diagnostics` keeps the diagnostics rendered on stderr as the
+human format has them and puts only the JSON messages on stdout: what harness/storelib.py's
+`split_build_output` reads (`crates/blaze-cargo/src/cli/json.rs`, `build_finished`).
 
 `doc` takes `cargo doc`'s flags (`--open`, `--no-deps`, `--document-private-items`, `--lib`,
 `--bins`, `--bin`, `--examples`, `--example`, and the package, feature, profile and target
@@ -338,6 +363,71 @@ errors naming the file. Why a second file and not `Cargo.lock`'s `[metadata]`: t
 flat map of strings cargo copies through `cargo update` untouched, so a pin there would go stale
 without a word, and anything blaze adds to `Cargo.lock` stops it being what cargo writes. One
 file holds every pin that is not a crate (docs/v2/plan/lock-policy.md).
+
+### Link arguments
+
+blaze links every program with its own linker, so a link argument reaches no `cc`, ld64, GNU
+ld or lld. `-C link-arg=ARG` and `-C link-args=ARGS` in the rustflags (`RUSTFLAGS`,
+`CARGO_ENCODED_RUSTFLAGS`, `build.rustflags` and `target.<triple>.rustflags` in
+`.cargo/config.toml`, a profile's `rustflags`) and a build script's `cargo:rustc-link-arg*`
+(and `rustc-cdylib-link-arg`) are read by `crates/blaze-link/src/args.rs`: the C driver's layer
+comes off (`-Wl,a,b` is the linker's `a` and `b`, `-Xlinker a` its `a`), and each word is read in
+the spelling of the linker the target's rustc would run, ld64's on macOS and GNU ld's (and
+lld's) on Linux. What blaze's linker implements:
+
+| Option | ld64 (macOS) | GNU ld, lld (Linux) |
+|---|---|---|
+| a library | `-lNAME`, `-framework NAME`, `-needed_framework NAME`, `-needed-lNAME`, `-pthread` | `-lNAME`, `-l NAME`, `-l:FILE`, `--library=NAME`, `-pthread` |
+| where to look | `-L DIR`, `-F DIR` | `-L DIR`, `--library-path=DIR` |
+| rpath | `-rpath DIR` (`LC_RPATH`) | `-rpath DIR`, `-rpath=DIR`, `--rpath`, `-R DIR` for a directory (`DT_RUNPATH`) |
+| header room | `-headerpad SIZE` (hex), `-headerpad_max_install_names` | |
+| undefined symbols | `-undefined dynamic_lookup` (flat lookup, executables too), `-undefined error` | `-z defs` |
+| a shared library's name | `-install_name NAME` | `-soname NAME`, `-h NAME`, `-soname=NAME` |
+| a shared library's exports | `-exported_symbol _NAME` (added to the crate's) | |
+| the main thread's stack | `-stack_size SIZE` (hex, whole 4 KiB pages) | |
+| never unloaded | | `-z nodelete` |
+
+Taken because blaze's linker always does it: ld64's `-dead_strip`, `-pie`, `-search_paths_first`,
+`-adhoc_codesign`, `-undefined error` for an executable; GNU's `--gc-sections`, `--as-needed`,
+`--eh-frame-hdr`, `-Bsymbolic`, `--hash-style=gnu`, `-pie`, `-z now`, `-z relro`,
+`-z noexecstack`, `-z defs` for an executable. Taken because it asks nothing of the image:
+`-fuse-ld=...` and `--ld-path=...` (which system linker, and blaze runs none), GNU's `-O1`, ld64's
+`-w`, `-z nodelete` for an executable, and `--no-as-needed` with no library after it.
+
+Every other argument fails the link with one error naming each refused argument, the word of it
+refused, where it came from (the rustflags, or the build script of which package) and the target.
+Among those refused today: weak and re-exported libraries (`-weak_framework`, `-weak-l`), exports
+of an executable and export lists (`-rdynamic`, `--export-dynamic`, `-export_dynamic`,
+`-exported_symbols_list`, `--version-script`, `--dynamic-list`), layout scripts (`-T`), static and
+start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `-ObjC`,
+`-no_compact_unwind`, `-sectcreate`, `--wrap`, an object or archive given by path (give it as
+`cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
+wasm target, which rustc gives `link.exe` or `wasm-ld` directly.
+
+The rest of the rustflags that are the link's, rather than the code's, are read by
+`crates/blaze-link/src/args/rustflags.rs`, and none is dropped:
+
+| Flag | What blaze does |
+|---|---|
+| `-l [KIND[:MODIFIERS]=]NAME` | linked as a build script's `cargo:rustc-link-lib` is, in the place of the crate whose rustflags give it |
+| `-L [KIND=]DIR` | searched as a build script's `cargo:rustc-link-search` is, before the build scripts' directories; `crate=` and `dependency=` find crates, which blaze finds by the unit graph |
+| `-C rpath` | a macOS shared library is named `@rpath/FILE`, as rustc names it; rustc's other rpaths are to Rust dylibs, and blaze links every Rust crate into the image |
+| `-C relro-level` | `full` is what blaze's linker always does on ELF; `partial`, `off` and `none` are refused there, and on macOS every value but `none` |
+| `-C link-dead-code` | off is taken; on is refused: blaze's linker always drops unreferenced sections |
+| `-C strip` | `none` is taken, `debuginfo` links the image without debug info, `symbols` is refused: blaze always writes the functions' local symbols |
+| `-C linker` | taken when it names a C driver or a system linker (`cc`, `gcc`, `clang`, `ld`, `ld.lld`, `mold`, ..., with a version or a cross prefix): blaze's linker writes what it would; any other program (a wrapper script, `zig cc`) is refused, since it can change the link in ways blaze cannot see |
+| `-C linker-flavor` | taken when it is the spelling blaze reads the target's link arguments in (`gcc`, `gnu-cc` on Linux, `darwin-cc` on macOS, `msvc` on Windows, `wasm-ld`); refused otherwise |
+| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic`, `-C target-feature=+crt-static` | off is taken; on is refused |
+
+A refused option fails the link with an error naming the flag as written, that it came from the
+rustflags, the target and why. A unit that links nothing (a library) is not refused for one, as
+rustc does not use it there either. The rustflags of a proc macro, which blaze builds for wasm,
+are the host's, meant for the native library rustc would make of it: none of them is applied to
+its wasm module, which is no output of the build.
+
+A unit's record key covers all of these: its own rustflags through its plan, the `-l`s of the
+rustflags of the crates it links in as a part of their own, and its build scripts' link
+arguments as a part of theirs.
 
 ### Sandboxed tests (an experiment, opt-in)
 
@@ -931,7 +1021,22 @@ error. `blaze status` prints:
     memory: 1.3 GiB of 30.1 GiB
 
 the requests it is answering, how many views (a workspace at a checkout) it holds, and what it
-holds of its budget.
+holds of its budget. `blaze status --json` prints one object instead, for a script or an agent,
+and starts no daemon:
+
+    {"format":1,"version":"blaze 0.1.0 (...)","api_schema":40,"home":"/Users/me/.cache/blaze","state":"/Users/me/.cache/blaze/v2","socket":"/Users/me/.cache/blaze/v2.sock","daemon":{"pid":10969,"build":"<64 hex>","exe":"/usr/local/bin/blaze","uptime_ms":5230000,"memory_bytes":1395864371,"budget_bytes":32319628083,"bugs":0,"requests":[7],"views":2,"history":null,"settings":{"BLAZE_DAEMON_MEMORY_GB":null}}}
+
+`format` is the object's own shape (a new number when a field changes meaning or goes);
+`version` and `api_schema` are this blaze's (`blaze --version`, the daemon API's schema);
+`home` is blaze's root (`BLAZE_HOME`, else `blaze` in the user's cache directory), `state` the
+daemon's directory under it and `socket` where the CLI connects. `daemon` is `null` when none
+answers; else its pid, the hash of its executable as it started (`build`) and that file, how
+long it has run, its memory and budget in bytes, the bugs it went on past (every site's summed;
+the human `blaze status` lists each), the requests under way, its views, the profile history's
+last error and the settings it was started with. `blaze toolchain --json` is the same for the
+Rust blaze builds with: `{"name","nightly","rustc","release","commit","host","sysroot"}`, the
+host's tuple among them, what a script asks instead of `rustc -vV`
+([toolchain.md](toolchain.md)).
 
 A build whose tasks run while no span closes, no query completes and no task or step ends for
 the stall bound fails with an error naming what each thread is inside, and the daemon stops

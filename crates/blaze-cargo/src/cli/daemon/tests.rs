@@ -52,6 +52,57 @@ fn a_start_that_never_listens_names_the_socket() {
 }
 
 #[test]
+fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
+    let place = StatusPlace {
+        home: PathBuf::from("/h"),
+        state: PathBuf::from("/h/v2"),
+        socket: PathBuf::from("/h/v2.sock"),
+    };
+    let none: serde_json::Value = serde_json::from_str(&status_json(&place, None).unwrap()).unwrap();
+    assert_eq!(none["daemon"], serde_json::Value::Null);
+    assert_eq!(none["api_schema"], blaze_api::SCHEMA);
+    assert_eq!(none["format"], 1);
+    assert_eq!((none["home"].as_str(), none["socket"].as_str()), (Some("/h"), Some("/h/v2.sock")));
+    let bug = |count| blaze_api::Bug {
+        kind: "AdtDef".to_owned(),
+        what: "formatted with no database attached".to_owned(),
+        at: "a.rs:1:1".to_owned(),
+        count,
+        thread: None,
+    };
+    let status = Status {
+        pid: 41,
+        requests: vec![3, 7],
+        views: 2,
+        history: None,
+        memory_bytes: 3 << 29,
+        budget_bytes: 8 << 30,
+        uptime_ms: 9000,
+        build: blaze_api::Build::default(),
+        bugs: vec![bug(2), bug(1)],
+        settings: vec![
+            blaze_api::Setting { name: "BLAZE_OPT".to_owned(), value: None },
+            blaze_api::Setting {
+                name: "BLAZE_DAEMON_MEMORY_GB".to_owned(),
+                value: Some("80".to_owned()),
+            },
+        ],
+    };
+    let line = status_json(&place, Some(&status)).unwrap();
+    assert!(line.ends_with("}\n") && line.matches('\n').count() == 1, "{line}");
+    let some: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let daemon = &some["daemon"];
+    assert_eq!((daemon["pid"].as_u64(), daemon["uptime_ms"].as_u64()), (Some(41), Some(9000)));
+    assert_eq!(daemon["bugs"], 3, "the bugs of every site, summed");
+    assert_eq!(daemon["requests"], serde_json::json!([3, 7]));
+    assert_eq!(
+        daemon["settings"],
+        serde_json::json!({"BLAZE_DAEMON_MEMORY_GB": "80", "BLAZE_OPT": null})
+    );
+    assert_eq!(daemon["build"].as_str().map(str::len), Some(64), "the build's hash in hex");
+}
+
+#[test]
 fn the_status_for_people() {
     let status = Status {
         pid: 41,
@@ -60,6 +111,7 @@ fn the_status_for_people() {
         history: None,
         memory_bytes: 3 << 29,
         budget_bytes: 8 << 30,
+        uptime_ms: 40,
         build: blaze_api::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
@@ -75,6 +127,7 @@ fn the_status_for_people() {
         history: None,
         memory_bytes: 512,
         budget_bytes: 1536,
+        uptime_ms: 40,
         build: blaze_api::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
@@ -151,6 +204,7 @@ impl Api for OfBuild {
                     history: None,
                     memory_bytes: 0,
                     budget_bytes: 0,
+                    uptime_ms: 40,
                     build: self.build.clone(),
                     bugs: Vec::new(),
                 }),

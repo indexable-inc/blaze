@@ -625,33 +625,58 @@ const TAKES_VALUE: &[&str] = &[
     "--remap-path-scope",
 ];
 
-/// The `-C` options that change only the link, the output's names or what is reported:
-/// the link's and cargo's, not the code's.
-const NOT_CODE: &[&str] = &[
-    "ar",
-    "codegen-units",
+/// The `-C` options that are the link's: `blaze_link::args::rustflags` reads each and the link
+/// takes or refuses it for the image it makes (docs/cargo.md, "Link arguments"), so a unit that
+/// links nothing (a library) is not refused for one, as rustc does not use it there either.
+/// `-l` and `-L` are the link's too ([`TAKES_VALUE`]).
+const LINK: &[&str] = &[
     "default-linker-libraries",
-    "dlltool",
-    "embed-bitcode",
-    "extra-filename",
-    "incremental",
-    "inline-threshold",
     "link-arg",
     "link-args",
     "link-dead-code",
     "link-self-contained",
     "linker",
     "linker-flavor",
-    "metadata",
-    "no-stack-check",
     "prefer-dynamic",
     "relro-level",
-    "remark",
     "rpath",
-    "save-temps",
-    "split-debuginfo",
     "strip",
+];
+
+/// The `-C` options that change nothing blaze makes, each with why.
+const NOT_CODE: &[&str] = &[
+    // rustc's own: deprecated, and does nothing.
+    "ar",
+    // How many pieces rustc splits a crate into: blaze partitions code its own way, and the
+    // program is the same.
+    "codegen-units",
+    // The program run to make a Windows import library: blaze runs none.
+    "dlltool",
+    // Whether an rlib carries LLVM bitcode: blaze's rlibs carry no code.
+    "embed-bitcode",
+    // cargo's file names: blaze names its outputs as cargo's plan says.
+    "extra-filename",
+    // rustc's incremental directory: blaze keeps its own store.
+    "incremental",
+    // rustc's own: deprecated, and does nothing.
+    "inline-threshold",
+    // cargo's crate disambiguator: blaze tells crates apart by their unit.
+    "metadata",
+    // rustc's own: deprecated, and does nothing.
+    "no-stack-check",
+    // How debug info is split into files: the profile's `split-debuginfo`, which cargo gives
+    // as this flag.
+    "split-debuginfo",
+    // Lifts rustc's check that crates agree on flags that change the ABI: blaze compiles
+    // every crate of a program with one toolchain, so they always agree.
     "unsafe-allow-abi-mismatch",
+];
+
+/// The `-C` options that ask for something blaze does not make and are off unless asked:
+/// only an off value is taken, and an on one is refused with why.
+const OFF_REPORTS: &[(&str, &str)] = &[
+    ("remark", "blaze reports no LLVM optimization remarks"),
+    ("save-temps", "blaze keeps none of rustc's intermediate files; its own are in its store"),
 ];
 
 /// The `-C` options the profile says: blaze compiles with the profile's.
@@ -749,7 +774,8 @@ impl Flags {
                             ));
                         }
                     };
-                    // The C runtime linked statically: the link's, not the code's.
+                    // The C runtime linked statically: the link's, not the code's
+                    // (`blaze_link::args::rustflags`, which takes or refuses it).
                     if feature_name != "crt-static" {
                         // alloc: per toolchain made, a few names
                         self.features.push((enable, feature_name.to_owned()));
@@ -799,8 +825,17 @@ impl Flags {
                 }
             }
             "jump-tables" if is_yes(value) => {}
+            _ if LINK.contains(&name.as_str()) => {}
             _ if NOT_CODE.contains(&name.as_str()) => {}
             _ if OFF.contains(&name.as_str()) && is_no(value) => {}
+            // `-C remark=` with no pass named asks for none.
+            "remark" if value.is_none_or(str::is_empty) => {}
+            "save-temps" if is_no(value) => {}
+            "remark" | "save-temps" => {
+                let why = OFF_REPORTS.iter().find(|(it, _)| *it == name).map_or("", |it| it.1);
+                // alloc: an error
+                return Err(format!("{}: {why}", shown()));
+            }
             _ => {
                 if let Some((_, key)) = PROFILE.iter().find(|(it, _)| *it == name) {
                     return Err(profile_error(&shown(), key));

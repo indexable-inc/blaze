@@ -33,6 +33,13 @@
 //! of 6,000 files, 17 CPU-seconds, for a query of one build. A reader refuses a file of a
 //! version it can't read as this one ([`schema::readable`]), naming it.
 //!
+//! What the history consumed of the files beside it that hold rows it writes is part of the
+//! same commit ([`Consumed`]): the flush that writes a flight recorder's rows says so in the
+//! commit that lists them, as does the postmortem that writes a dead daemon's, and the flush
+//! that writes a crash record's row. So a crash between a commit and the mark or delete that
+//! follows it never has the next open read those rows again (2026-11-04: it did, and wrote them
+//! twice).
+//!
 //! A directory with no manifest is a history written before manifests (2026-11-04): its
 //! manifest is made once from the files there, each classified by its name ([`listable`])
 //! and its entry read from its footer ([`Entry::of_footer`]); a file it can't classify is
@@ -44,7 +51,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs, io,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use arrow_array::{
@@ -68,8 +75,13 @@ pub const FILE: &str = "manifest.json";
 /// The file whose exclusive lock a writer holds around each change to the manifest.
 pub const LOCK: &str = "manifest.lock";
 
-/// The manifest's format: a reader refuses another, naming it.
-pub const FORMAT: u32 = 1;
+/// The manifest's format: a reader refuses another, naming it. Format 2 (2026-11-04) added
+/// [`Consumed`]; a manifest of format 1 reads as one that consumed nothing, and is written
+/// as format 2 at its next commit.
+pub const FORMAT: u32 = 2;
+
+/// The oldest format this blaze reads.
+const FORMAT_OLDEST: u32 = 1;
 
 /// How long a writer waits for the manifest's lock before failing, naming it. A holder holds
 /// it for one read and one rewrite of the manifest (and the renames of the files it lists),
@@ -94,6 +106,47 @@ pub struct Manifest {
     /// that never merged nor capped reads as it did before retirement.
     #[serde(default, skip_serializing_if = "Retired::never")]
     retired: Retired,
+    /// What the history consumed of the flight recorders' mappings and the crash records, as
+    /// of this manifest's files. Left out while empty.
+    #[serde(default, skip_serializing_if = "Consumed::is_empty")]
+    consumed: Consumed,
+}
+
+/// What a commit consumed of the files beside the history that hold rows it writes, so the
+/// rows a listed file holds are never read from them again: a mark that follows the commit
+/// (a mapping's flushed mark, a delete) is lost in a crash between the two, and this is not.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Consumed {
+    /// Each flight recorder mapping (`flight-<pid>.map`) a commit wrote rows of, by its
+    /// process. Forgotten once its mapping is gone ([`Held::prune_consumed`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recorders: BTreeMap<u32, Recorder>,
+    /// The crash records (`crash.<pid>`) whose `panics` rows a listed file holds, each by its
+    /// process and the instant of its signal: the next open deletes such a record unread.
+    /// Forgotten once the record is gone.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub crashes: BTreeSet<(u32, i64)>,
+}
+
+impl Consumed {
+    pub fn is_empty(&self) -> bool {
+        self.recorders.is_empty() && self.crashes.is_empty()
+    }
+}
+
+/// What the history wrote of one flight recorder mapping ([`crate::flight::postmortem`]).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Recorder {
+    /// The mapping's nonce, from its header: a mapping of a later process given the same pid
+    /// has another.
+    pub nonce: u64,
+    /// The last flush of its process this manifest committed, 0 for none: a postmortem reads
+    /// the rows past the marks of that flush when the mapping holds them.
+    pub flushed: u64,
+    /// A postmortem wrote its rows, listed by this manifest: the mapping is deleted unread.
+    pub recovered: bool,
 }
 
 /// What a file listed holds, so a reader picks the files it reads without opening any.
@@ -316,9 +369,16 @@ pub enum ManifestError {
 impl fmt::Display for ManifestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ManifestError::Json(error) => write!(f, "it is not a manifest's JSON: {error}"),
+            ManifestError::Json(error) => write!(
+                f,
+                "it is not a manifest's JSON (torn, or not written by blaze): refused, never read as an empty \
+                 history (persisted-state-round-trips): {error}"
+            ),
             ManifestError::Format(format) => {
-                write!(f, "it is of format {format}, and this blaze reads format {FORMAT}")
+                write!(
+                    f,
+                    "it is of format {format}, and this blaze reads formats {FORMAT_OLDEST} to {FORMAT}"
+                )
             }
             ManifestError::Entry { table, file } => write!(
                 f,
@@ -360,6 +420,7 @@ impl Manifest {
             flushed: 0,
             tables: BTreeMap::new(),
             retired: Retired::default(),
+            consumed: Consumed::default(),
         }
     }
 
@@ -371,6 +432,17 @@ impl Manifest {
     /// The history's generation and the files it unlisted and has not yet deleted.
     pub fn retired(&self) -> &Retired {
         &self.retired
+    }
+
+    /// What the history consumed of the flight recorders' mappings and the crash records.
+    pub fn consumed(&self) -> &Consumed {
+        &self.consumed
+    }
+
+    /// What this manifest says the history wrote of the mapping of process `pid` with
+    /// `nonce`; `None` for a mapping it wrote nothing of (or of another process given that pid).
+    pub fn recorder(&self, pid: u32, nonce: u64) -> Option<Recorder> {
+        self.consumed.recorders.get(&pid).copied().filter(|it| it.nonce == nonce)
     }
 
     /// The files of `table`, in name order.
@@ -503,14 +575,21 @@ impl Manifest {
 
     /// The manifest `bytes` hold, each entry checked.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Manifest, ManifestError> {
-        let manifest: Manifest = serde_json::from_slice(bytes).map_err(ManifestError::Json)?;
-        if manifest.format != FORMAT {
+        let mut manifest: Manifest =
+            serde_json::from_slice(bytes).map_err(ManifestError::Json)?;
+        if !(FORMAT_OLDEST..=FORMAT).contains(&manifest.format) {
             return Err(ManifestError::Format(manifest.format));
         }
+        // Read as this format: it is written so at its next commit.
+        manifest.format = FORMAT;
         manifest.retired.check().map_err(ManifestError::Retired)?;
-        if manifest.retired.files.iter().any(|(it, _)| listable(it).is_none()) {
-            // Never a name of the manifest's own files, nor of a reader's pins: a reap deletes it.
-            return Err(ManifestError::Retired("a retired file is of no form blaze lists"));
+        // By shape alone, as listed files of a table this blaze does not know are taken: a
+        // newer blaze's file it merged or capped is retired as any other. Never a schema
+        // file, a hidden file or anything not Parquet, nor a reader's pin: a reap deletes it.
+        if manifest.retired.files.iter().any(|(it, _)| !retirable(it)) {
+            return Err(ManifestError::Retired(
+                "a retired file is named as no Parquet file of a table (`<stem>.<table>.parquet`)",
+            ));
         }
         if let Some((name, _)) = manifest.retired.files.iter().find(|(it, _)| manifest.contains(it))
         {
@@ -548,6 +627,14 @@ fn holds(entry: &Entry, build: u64, window: &[(Option<&str>, [i64; 2])]) -> bool
         let same_boot = entry.boot.is_none() || boot.is_none() || entry.boot.as_deref() == *boot;
         same_boot && low <= *to && *from <= high
     })
+}
+
+/// Whether `name` is shaped as a file a manifest may retire: `<stem>.<table>.parquet` of any
+/// table, known or not, and neither hidden nor a schema file ([`kind`]).
+fn retirable(name: &str) -> bool {
+    table_of(name).is_some()
+        && !name.contains(['/', '\\'])
+        && matches!(kind(name), Kind::Listable | Kind::Unclassified)
 }
 
 /// The table a file's name `<stem>.<table>.parquet` says, whether or not this blaze knows it.
@@ -831,6 +918,38 @@ impl Held {
         self.manifest.flush_committed(seq);
     }
 
+    /// Notes that this commit holds the rows of flush `seq` of the process `pid` whose
+    /// flight recorder mapping has `nonce`: a postmortem of it reads past that flush's marks.
+    pub(crate) fn recorder_flushed(&mut self, pid: u32, nonce: u64, seq: u64) {
+        let recorders = &mut self.manifest.consumed.recorders;
+        match recorders.get_mut(&pid) {
+            Some(it) if it.nonce == nonce => it.flushed = it.flushed.max(seq),
+            _ => _ = recorders.insert(pid, Recorder { nonce, flushed: seq, recovered: false }),
+        }
+    }
+
+    /// Notes that this commit holds the rows a postmortem read back of the mapping of `pid`
+    /// with `nonce`: the next to find it deletes it unread.
+    pub(crate) fn recorder_recovered(&mut self, pid: u32, nonce: u64) {
+        let flushed = self.manifest.recorder(pid, nonce).map_or(0, |it| it.flushed);
+        self.manifest.consumed.recorders.insert(pid, Recorder { nonce, flushed, recovered: true });
+    }
+
+    /// Notes that this commit holds the `panics` rows of the crash records `ids` (each its
+    /// process and the instant of its signal).
+    pub(crate) fn crashes_written(&mut self, ids: impl IntoIterator<Item = (u32, i64)>) {
+        self.manifest.consumed.crashes.extend(ids);
+    }
+
+    /// Forgets what was consumed of a mapping or crash record no longer in `dir`: nothing can
+    /// read it again. One whose presence can't be told is kept, which costs nothing.
+    pub(crate) fn prune_consumed(&mut self, dir: &Path) {
+        let gone = |name: String| matches!(dir.join(name).try_exists(), Ok(false));
+        let consumed = &mut self.manifest.consumed;
+        consumed.recorders.retain(|&pid, _| !gone(crate::flight::postmortem::file_name(pid)));
+        consumed.crashes.retain(|&(pid, _)| !gone(crate::crash::file_name(pid)));
+    }
+
     /// Writes the manifest when it changed: to a hidden name, then renamed over the last.
     pub(crate) fn commit(&mut self) -> Result<(), HistoryError> {
         if self.manifest == self.written {
@@ -849,11 +968,7 @@ impl Held {
 }
 
 /// The exclusive lock of `dir`'s manifest, waiting at most [`LOCK_WAIT`] for another process
-/// to let go of it.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "a bounded wait on another process's lock, which has no wake to park on"
-)]
+/// to let go of it ([`super::lock_within`]).
 fn lock(dir: &Path) -> Result<Locked, HistoryError> {
     let path = dir.join(LOCK);
     let file = fs::OpenOptions::new()
@@ -863,27 +978,17 @@ fn lock(dir: &Path) -> Result<Locked, HistoryError> {
         .truncate(false)
         .open(&path)
         .map_err(io_error(&path, "opening the manifest's lock"))?;
-    let mut file = match Locked::try_lock(file) {
+    let file = match Locked::try_lock(file) {
         Ok(Ok(locked)) => return Ok(locked),
         Ok(Err(back)) => back,
         Err(error) => return Err(io_error(&path, "locking the manifest's lock")(error)),
     };
     let _span = tracing::info_span!(target: "blaze", "waits on the profile history's manifest lock", dir = %dir.display())
         .entered();
-    let until = Instant::now() + LOCK_WAIT;
-    let mut spin = blaze_graph::spin::SpinWait::new();
-    loop {
-        if Instant::now() >= until {
-            return Err(HistoryError::Manifest { path, why: ManifestError::Locked });
-        }
-        if !spin.spin() {
-            spin = blaze_graph::spin::SpinWait::new();
-        }
-        match Locked::try_lock(file) {
-            Ok(Ok(locked)) => return Ok(locked),
-            Ok(Err(back)) => file = back,
-            Err(error) => return Err(io_error(&path, "locking the manifest's lock")(error)),
-        }
+    match super::lock_within(file, LOCK_WAIT) {
+        Ok(Ok(locked)) => Ok(locked),
+        Ok(Err(_held)) => Err(HistoryError::Manifest { path, why: ManifestError::Locked }),
+        Err(error) => Err(io_error(&path, "locking the manifest's lock")(error)),
     }
 }
 
@@ -900,4 +1005,31 @@ pub(crate) fn list_written(dir: &Path) {
         }
     }
     held.commit().unwrap();
+}
+
+#[cfg(test)]
+mod consumed {
+    use super::*;
+
+    /// persisted-state-round-trips: what a commit consumed reads back as written, byte for
+    /// byte, and a manifest of the format before it reads as one that consumed nothing.
+    #[test]
+    fn a_manifest_reads_back_what_it_consumed_byte_for_byte() {
+        let mut manifest = Manifest::new();
+        manifest.flushed = 12;
+        manifest.consumed.recorders.insert(7, Recorder { nonce: 3, flushed: 12, recovered: false });
+        manifest.consumed.recorders.insert(9, Recorder { nonce: 5, flushed: 0, recovered: true });
+        manifest.consumed.crashes.insert((11, -4));
+        let bytes = manifest.encode().unwrap();
+        let read = Manifest::decode(&bytes).unwrap();
+        assert_eq!(read, manifest);
+        assert_eq!(read.encode().unwrap(), bytes, "the encoding is deterministic");
+        assert_eq!(read.recorder(7, 3).map(|it| it.flushed), Some(12));
+        assert!(read.recorder(7, 4).is_none(), "another mapping of the same pid is not this one");
+        assert!(read.recorder(9, 5).is_some_and(|it| it.recovered));
+
+        let old = Manifest::decode(br#"{"format":1,"flushed":4,"tables":{}}"#).unwrap();
+        assert_eq!(old.format, FORMAT, "read as this format, written so at its next commit");
+        assert!(old.consumed().is_empty());
+    }
 }

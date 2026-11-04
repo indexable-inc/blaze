@@ -700,7 +700,8 @@ fn run(sql: &str) -> Result<Vec<RecordBatch>, Refusal> {
 /// and answers with the flush's number once the flush committed; the manifest read after says
 /// that flush or a later one ([`history::Manifest::flushed`]), so the reader reads every row
 /// recorded before it asked, each once: a flush moves rows from the recorder to a file, and
-/// nothing is in both. With no daemon writing it, every row is in a file already. A daemon
+/// nothing is in both. With no daemon writing it, the rows a dead daemon had not flushed are
+/// written to files first ([`history::recover_dead`]), so every row is in a file. A daemon
 /// that writes the history and can't be asked, or whose flush the manifest does not show, is
 /// an error naming it: never a read that quietly misses rows.
 fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
@@ -737,6 +738,12 @@ pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
                 manifest.flushed()
             ));
         }
+    } else {
+        // A daemon that died left its last rows in its flight recorder's mapping: written to
+        // files and listed before the read, never a read that quietly misses them.
+        history::recover_dead(&dir).map_err(|error| {
+            format!("writing the rows a dead daemon left in the profile history {}: {error}", dir.display())
+        })?;
     }
     Ok((duckdb, dir))
 }

@@ -1626,6 +1626,7 @@ mod tests {
             exec_log: true,
             sanitize: blaze_codegen::settings::Sanitize::default(),
             rpaths: Vec::new(),
+            link: crate::LinkArgs::default(),
         };
         assert!(exec_log(&ok).is_ok());
         assert!(writer(&ok).is_ok());

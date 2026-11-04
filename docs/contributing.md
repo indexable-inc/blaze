@@ -177,15 +177,16 @@ What it leaves to a person, and prints at the end:
    the target specs depend on the host rustc was built for; then
    `uv run --frozen python tools/cpus.py '{"write": true}'` for the CPU table
    (`crates/target-features/src/cpus/table.rs`); commit both.
-2. `cargo build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
+2. `blaze build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
    ask for, and mirroring by hand what changed in rustc: the Rust ABI, vtables, `TypeId`,
    symbol names, new intrinsics and lang items. The move to `nightly-2026-10-25` needed
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM (in `nix develop`,
-   with a blaze built there, which has LLVM as every native blaze does: the profile picks the
-   backend, and the harnesses that cover LLVM build the release profile). It builds blaze and runs, in parallel,
+3. `uv run --frozen python harness/toolchain_bump.py checks '{"stage0": "/path/to/blaze"}'` in an
+   ix VM, with a blaze that builds the tree as stage 0, which has LLVM as every native blaze
+   does: the profile picks the backend, and the harnesses that cover LLVM build the release
+   profile. It builds blaze with that blaze (never cargo) and runs, in parallel,
    `toolchain_pins.py` and the gate's quick parts.
 4. The full tier re-measured at the new commit: the train and the crates' own test suites.
 5. One commit for the bump, landed like any other change.

@@ -245,6 +245,9 @@ pub fn output(dev: &Output, key_name: &str) -> Output {
         exec_log: false,
         sanitize: dev.sanitize,
         rpaths: dev.rpaths.clone(), // clone: setup, once per image made: the output owns them
+        // A dependency image takes none of the dev run's link arguments: its headers,
+        // undefined symbols and exports are its own.
+        link: blaze_link::LinkArgs::default(),
     }
 }
 
