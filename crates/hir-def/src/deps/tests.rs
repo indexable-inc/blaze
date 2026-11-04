@@ -940,6 +940,46 @@ fn keys_hold_no_path_of_the_checkout() {
     assert_ne!(key_of(&alice, "lib", BUILD), key_of(&unset, "lib", BUILD));
 }
 
+/// An outside source file is named from the crate when its image is restored (#1637).
+#[test]
+fn moving_a_crate_without_its_outside_source_file_moves_its_image_key() {
+    let _turn = TURN.lock();
+    let checkout = |dir: &str, outside: &str| {
+        // alloc: test fixture
+        format!(
+            "//- {dir}/src/lib.rs crate:lib new_source_root:library env:CARGO_MANIFEST_DIR={dir}\n\
+             #[path = \"{outside}\"] pub mod shared;\n\
+             //- {outside}\npub struct Shared;\n"
+        )
+    };
+    let original = checkout("/checkout/pkg", "/shared/code.rs");
+    let moved = checkout("/elsewhere/checkout/pkg", "/shared/code.rs");
+    assert_ne!(key_of(&original, "lib", BUILD), key_of(&moved, "lib", BUILD));
+
+    // Moving the whole layout keeps both the image's relative name and its key.
+    let together = checkout("/elsewhere/checkout/pkg", "/elsewhere/shared/code.rs");
+    let together_original = checkout("/checkout/pkg", "/shared/code.rs");
+    // The source text contains an absolute include path, which is an input of its own.
+    // Use a relative path so only the checkout's placement differs.
+    let original = together_original.replace("/shared/code.rs\"]", "../../../shared/code.rs\"]");
+    let together = together.replace("/elsewhere/shared/code.rs\"]", "../../../shared/code.rs\"]");
+    assert_eq!(key_of(&original, "lib", BUILD), key_of(&together, "lib", BUILD));
+
+    let (memory, _) = stored(&original);
+    let mut db = fixture::db(&together).into_db();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["lib"]);
+    let fresh = fixture::db(&together).into_db();
+    let live = crate_named(&fresh, "lib");
+    let restored = crate_named(&db, "lib");
+    assert_eq!(frozen::encode(&db, restored), frozen::encode(&fresh, live));
+    assert_eq!(
+        signatures::encode(&db, restored, &mut Vec::new()),
+        signatures::encode(&fresh, live, &mut Vec::new())
+    );
+}
+
 /// A part that holds a path its key writes as a marker refuses the image.
 #[test]
 fn an_image_holding_a_path_of_the_checkout_is_refused() {

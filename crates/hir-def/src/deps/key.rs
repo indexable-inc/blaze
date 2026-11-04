@@ -64,7 +64,7 @@ use crate::{
 };
 
 /// The domain of an image key.
-pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 4";
+pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 5";
 
 /// What makes the images: the version of each encoding in them, so an image of another
 /// encoding is never found.
@@ -280,15 +280,33 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
 /// that of the bytes the view loader gave it, which `include_str!` and `include_bytes!` read.
 /// Reading them writes nothing, so a key made before or after any other query is the same.
 fn files(db: &Db, krate: Crate, base: &Base, hasher: &mut Hasher) {
-    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+    let file = krate.data(db).root_file_id;
+    let root = db.file_source_root(file).source_root_id(db);
     let root = db.source_root(root).source_root_ref(db);
+    // alloc: setup: the directory frozen images name this crate's files from
+    let root_path = root.path_for_file(&file).map(|it| it.to_string());
+    let dir = root_path.as_deref().and_then(|it| it.rsplit_once('/')).map(|it| it.0);
     // alloc: setup: the root's files, once per crate per session
     let mut files: Vec<(Vec<u8>, ContentId)> = root
         .iter()
         .map(|file| {
             // alloc: setup: one path a file, once per crate per session
-            let path = root.path_for_file(&file).map(|it| it.to_string()).unwrap_or_default();
-            (base.portable(&path), db.file_content(file))
+            let path = root.path_for_file(&file)
+                .unwrap_or_else(|| panic!("source-root file {file:?} has no path"))
+                .to_string();
+            // An unmarked absolute path alone misses how frozen images restore it: from
+            // the crate root's directory. Moving that directory while keeping the outside
+            // file in place must move the key too (#1637).
+            let generated = base.out.as_deref().is_some_and(|out| {
+                path.strip_prefix(out).is_some_and(|rest| rest.starts_with('/'))
+            });
+            let path = match dir {
+                Some(dir) if !generated => {
+                    crate::nameres::frozen::relative(dir, &path).into_bytes()
+                }
+                _ => base.portable(&path),
+            };
+            (path, db.file_content(file))
         })
         // alloc: setup, as above
         .collect();
