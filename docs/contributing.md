@@ -38,9 +38,8 @@ one level down:
                               requests
     demo/                     small projects the harnesses build, and the live-reload demo
     fuzz/                     the fuzz targets and their corpora (docs/fuzzing.md)
-    site/                     the website
+    site/                     the website, and install.sh, the installer `curl | sh` and CI run
     licenses/                 NOTICE and the license texts of code blaze includes
-    install.sh                the installer `curl | sh` and CI run
     hegel.toml                Hegel's settings for the property tests (read from the root)
     Cargo.toml, pyproject.toml, flake.nix
                               the Rust, Python (uv) and Nix workspaces, each with its lock
@@ -152,7 +151,7 @@ one file; everything else reads it or is written from it:
   questions (`crates/blaze-units/src/stdlib/rustc.json`), and the code written by hand to agree with rustc:
   the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
   `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
-- `install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the
+- `site/install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the
   bench nightly alike) and `Cargo.toml`'s `rust-version`.
 
 ### Moving to a newer nightly
@@ -168,7 +167,7 @@ picks the nightly (the newest of the last two weeks whose manifest has every com
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
 `pins.txt`, re-vendors `crates/rustc_abi` from rust-lang/rust at the new commit, merges that
 nightly's standard library into `library/` (`harness/library.py merge`: upstream's changes applied three-way, so blaze's own changes to it
-are kept; a conflict stops it and names the files), moves the pin where else it is written (`install.sh`, the
+are kept; a conflict stops it and names the files), moves the pin where else it is written (`site/install.sh`, the
 server's version string, `Cargo.toml`, the flake's rust-overlay input) and
 installs the nightly with rustup. Each step names itself when it fails.
 

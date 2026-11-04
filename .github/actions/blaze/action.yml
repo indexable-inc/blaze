@@ -1,5 +1,5 @@
 # blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the release
-# .github/blaze-version names, installed by install.sh into ~/.cargo/bin with the Rust it builds
+# .github/blaze-version names, installed by site/install.sh into ~/.cargo/bin with the Rust it builds
 # with (its own toolchain, ~/.blaze/toolchains, docs/self-contained.md: no rustup), and blaze's
 # store, the one cache, pulled from the shared remote (.github/actions/blaze-remote) that main's
 # runs push to after their tests. With `llvm: true`, also the LLVM blaze pins
@@ -56,7 +56,7 @@ runs:
       run: |
         # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
         # as a user's install does, rather than at the first build.
-        sh install.sh --version "$(cat .github/blaze-version)" --verbose
+        sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
         [ -n "$version" ] || { echo "::error::blaze-engine --version said no version: $said"; exit 1; }

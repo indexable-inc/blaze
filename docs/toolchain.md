@@ -102,7 +102,7 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
    `crates/rustc_abi` from rust-lang/rust at the new commit, merges
    the new nightly's standard library into `library/` ([The standard
-   library](#the-standard-library-library)), and moves the pin in `install.sh`, `Cargo.toml`
+   library](#the-standard-library-library)), and moves the pin in `site/install.sh`, `Cargo.toml`
    and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into

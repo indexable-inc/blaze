@@ -1,3 +1,8 @@
+---
+status: record
+summary: Changelog: every user-visible change, by release, with [Unreleased] on top.
+date: 2026-11-03
+---
 # Changelog
 
 All notable changes to blaze are written here. The format follows
@@ -300,7 +305,7 @@ since the release before and the title of each change merged since.
   and `cargo-ra-jit` before it, are no longer built or shipped; install.sh removes the one it
   finds and says so in one line.
 
-- ra-jit is blaze everywhere (#270, [docs/rename.md](docs/rename.md)). The engine `blaze` runs
+- ra-jit is blaze everywhere (#270, [docs/rename.md](rename.md)). The engine `blaze` runs
   is `blaze-engine` (was `ra-jit`), and cargo's rustc wrapper is `blaze-rustc` (was
   `ra-jit-rustc`; `ra-jit-rustc-first` is gone). The crates are `blaze-engine` and
   `blaze-<name>`, and crates.io gets `blaze-engine` (was `cargo-blaze`): `cargo install
@@ -396,7 +401,7 @@ since the release before and the title of each change merged since.
   workspace loads once and the pages are written in parallel. `harness/docdiff.py` compares
   it with the pinned nightly's `cargo doc`: on fd and its dependencies blaze writes 100% of
   rustdoc's pages, 99.9% of the members and impls on them and 99.4% of the resolved links
-  ([docs/doc.md](docs/doc.md)).
+  ([docs/doc.md](doc.md)).
 
 - `nonstandard_macro_braces` no longer lints a call inside another macro's arguments
   (`vec!(..)` in `assert!(..)`), which stock clippy leaves alone; `new_without_default`
@@ -490,7 +495,7 @@ since the release before and the title of each change merged since.
 - `RA_JIT_WHOLE_BUILD=1` (or `BLAZE_WHOLE_BUILD=1`): `cargo blaze build` and `run` from nothing
   build each program whole with blaze, every crate compiled by blaze over the shipped standard
   library and linked by blaze, and put it where cargo does, with no `cargo build`
-  ([no-rustc.md](docs/no-rustc.md), step K, #91). A function the program can reach that blaze
+  ([no-rustc.md](no-rustc.md), step K, #91). A function the program can reach that blaze
   cannot compile fails the build with which and why, and nothing goes to cargo.
   `harness/coldbuild.py` holds the programs of a fixture equal to cargo's, and with `bench`
   does bench.py's projects.
@@ -522,7 +527,7 @@ since the release before and the title of each change merged since.
   place, as on Unix, instead of being linked again; the daemon wakes the program through a
   named event; and `ra_jit_live::edit` reaches the daemon, so `demo/life`'s editor builds as you
   type. life's edit to running is 26.6 ms at p50 (`socket`) on a Windows 11 desktop
-  ([live.md](docs/live.md#latency-under-typing)). A static with another value still asks for a
+  ([live.md](live.md#latency-under-typing)). A static with another value still asks for a
   restart.
 
 - `crates/blaze-build-script`: the environment cargo 1.99.0 gives a build script, computed
@@ -592,7 +597,7 @@ since the release before and the title of each change merged since.
 - `crates/blaze-manifest`, `Cargo.toml` and `.cargo/config.toml` read as cargo 1.99.0 reads
   them, without running cargo: `cargo metadata --no-deps` computed by blaze (its `metadata`
   example prints the same JSON, warnings and errors), on cargo's own manifest schema
-  (`cargo-util-schemas` 0.14.3) ([resolve.md](docs/resolve.md)). `harness/resolve.py` compares
+  (`cargo-util-schemas` 0.14.3) ([resolve.md](resolve.md)). `harness/resolve.py` compares
   it with cargo on the bench projects, 300 crates.io crates and 72 workspace repositories at
   pinned commits: all 385 equal, key order included. Nothing in blaze uses it yet.
 - blaze-manifest reads `.cargo/config.toml` into cargo's own config types through a port of
@@ -601,7 +606,7 @@ since the release before and the title of each change merged since.
   replacement, `[resolver]` and `[profile]`, each field from its file or its `CARGO_*`
   variable, with cargo's errors and unused-key warnings. Its `config` example is
   `cargo config get`, and `harness/resolve.py config` compares the two on config trees and
-  every corpus repository: 103 of 103 equal over 767 runs ([resolve.md](docs/resolve.md)).
+  every corpus repository: 103 of 103 equal over 767 runs ([resolve.md](resolve.md)).
 - blaze-manifest computes profiles as cargo 1.99 gives them to units (`blaze_manifest::profiles`,
   a port of cargo's): `dev`, `release`, `test`, `bench` and custom profiles through `inherits`,
   package overrides, `build-override`, profiles from config files, `--config` and
@@ -609,7 +614,7 @@ since the release before and the title of each change merged since.
   each manifest's profiles as cargo does reading it. `harness/resolve.py profiles` compares
   every unit's profile with cargo's `--unit-graph`: 86 of 89 trees and repositories equal over
   546 runs and 235,924 units, none with a different profile, the other three refused by
-  cargo or nightly-only ([resolve.md](docs/resolve.md)).
+  cargo or nightly-only ([resolve.md](resolve.md)).
 - `cargo ra-jit test` with `RA_JIT_TESTS=affected` runs, on Linux, each test that reaches a
   file, the environment, a process or the network in a sandbox of its own (#257): a process
   in new user, mount, network, IPC and PID namespaces, the machine's files read-only, the
@@ -628,7 +633,7 @@ since the release before and the title of each change merged since.
   rustc's. `RA_JIT_PROC_MACRO_COMPARE` and `RA_JIT_PROC_MACRO_LIBS` expand each call again
   with it and ra-jit's library of the crate and compare the output with the toolchain's;
   `harness/macroserver.py` holds serde_derive's, thiserror's, tokio's and clap's equal
-  ([no-rustc.md](docs/no-rustc.md), step J1). A proc-macro crate's `fn main` is no longer
+  ([no-rustc.md](no-rustc.md), step J1). A proc-macro crate's `fn main` is no longer
   taken for an entry point.
 - `RA_JIT_PROC_MACRO_SERVER` naming that server has a load into ra-jit's own target directory
   link its proc macros with ra-jit and expand them with the server, the toolchain's server
@@ -664,7 +669,7 @@ since the release before and the title of each change merged since.
   the program's as a compile of it alone is. It is not the default: on 16 cores helix builds
   in 71.1 s against 69.7 s and runs 1.28x of cargo's release build against 1.21x, and LLVM
   takes four times rustc's time for code of the same size either way
-  ([codegen-units.md](docs/research/codegen-units.md)). Imports are linked into a compile's
+  ([codegen-units.md](research/codegen-units.md)). Imports are linked into a compile's
   module once, after being linked to each other two at a time, which took the lowering of a
   module of many functions from 23.7 s to 8.1 s summed over ripgrep's cores.
 
@@ -722,7 +727,7 @@ since the release before and the title of each change merged since.
   name the stacks on macOS, and `harness/heap.py` gives the bytes to the salsa query whose
   value or record holds them. What they found
   ([#39](https://github.com/indexable-inc/ra-jit/issues/39),
-  [docs/research/daemon-memory.md](docs/research/daemon-memory.md)): nushell's worker holds
+  [docs/research/daemon-memory.md](research/daemon-memory.md)): nushell's worker holds
   10.0 GB live once ready, 2.7 GB of it what a debugger is told of types; ripgrep's 1.6 GB;
   and the spare worker the daemon starts after the first build holds 940 MB more on ripgrep.
   salsa's `lru` cannot evict `infer` or MIR (they have cycle handling), and on `described`
@@ -734,7 +739,7 @@ since the release before and the title of each change merged since.
   An expansion that asked the compiler anything, or failed, is not kept. Function-like macros
   are kept with `RA_JIT_PROC_MACRO_CACHE=all`, a macro is left out by name with
   `RA_JIT_PROC_MACRO_CACHE_SKIP`, and `RA_JIT_PROC_MACRO_CACHE=check` expands anyway and
-  reports any that differ ([docs/cache.md](docs/cache.md), `harness/expansions.py`). On a
+  reports any that differ ([docs/cache.md](cache.md), `harness/expansions.py`). On a
   warm start helix's 1455 kept expansions take resolve from 6.0 to 4.3 s and the time to
   ready from 9.6 to 8.0 s, nushell's 1588 from 5.8 to 4.5 s and from 10.1 to 8.8 s (Linux
   x86-64, 16 cores of an otherwise idle host, medians of four runs each); cold starts
@@ -746,7 +751,7 @@ since the release before and the title of each change merged since.
   edit to anything it reaches drops them, live edits too. Functions that read statics that
   change, thread-locals or the system (I/O, time, randomness) are refused with where that is
   written. Under plain cargo it does nothing. `cargo ra-jit cache clear` forgets what was kept
-  ([docs/fn-cache.md](docs/fn-cache.md), `harness/fncache.py`).
+  ([docs/fn-cache.md](fn-cache.md), `harness/fncache.py`).
 - `harness/abbench.py` runs builds of ra-jit against each other on `bench.py`'s edits, in
   interleaved rounds: edit and cold-start times, the workers' cycles on macOS and their peak
   memory. With `--train` it is the training of the release build's PGO.
@@ -755,7 +760,7 @@ since the release before and the title of each change merged since.
   needs none, folding constant branches, simplifying the control flow and instructions),
   `RA_JIT_MIR_OPT=2` what it runs above `-Copt-level=0` that is ported (also dead stores and
   unreachable blocks). Off by default. The interpreter's tests run every program at all three
-  levels and require the same result ([docs/research/mir-gap.md](docs/research/mir-gap.md)).
+  levels and require the same result ([docs/research/mir-gap.md](research/mir-gap.md)).
 - `ra-jit mir <dir> --crate <name> [--level N]` prints a crate's MIR as ra-jit compiles it,
   in rustc's `-Zunpretty=mir` format, and `harness/mirparity.py` compares it with rustc's
   function by function: at level 1, 21.5% of functions are identical to rustc's, against 4.0%
@@ -766,9 +771,9 @@ since the release before and the title of each change merged since.
   output differs from cargo's is never published. The first, on Linux x86-64, has every
   program's output the same as cargo's; on macOS arm64, ripgrep, fd, bat and jsonrt do not
   build whole yet (NEON intrinsics ra-jit does not have).
-- [docs/research/](docs/research/README.md): what 2026's Rust compiler work means for ra-jit,
+- [docs/research/](research/): what 2026's Rust compiler work means for ra-jit,
   and the MIR gap with rustc with the production gaps ranked; rustc's pass sources in
-  [docs/upstream/rustc-mir-transform/](docs/upstream/rustc-mir-transform/SOURCE.md).
+  [docs/upstream/rustc-mir-transform/](upstream/rustc-mir-transform/SOURCE.md).
 
 - Tiers ([#6](https://github.com/indexable-inc/ra-jit/issues/6)): a program that takes
   edits with `ra-jit-live` is sampled while it runs, and the functions it spends its time in
@@ -777,14 +782,14 @@ since the release before and the title of each change merged since.
   restart. An edit sends an edited function back to Cranelift in the same build.
   `RA_JIT_TIER=off` turns it off. The Game of Life window shows each hot function's level
   and the promotions as they happen; `demo/lifebench` and `harness/tiers.py` measure and
-  check it ([docs/tiers.md](docs/tiers.md)).
+  check it ([docs/tiers.md](tiers.md)).
 - `ra_jit_live::tiers()`, and the sampler that the daemon turns on in a running program.
   It stops once the worker that reads it is gone.
 - Benchmarks on real projects that keep the README current: `harness/bench.py` measures
   ripgrep, fd, bat, hyperfine, just, axum and nushell at pinned commits (cold build, no-op,
   four kinds of edit, and how fast ripgrep's program runs) against incremental cargo, on both
   tiers, keeping every sample; `harness/benchreport.py` writes the README table and
-  [docs/benchmarks.md](docs/benchmarks.md) from the result; the `bench-readme` workflow runs
+  [docs/benchmarks.md](benchmarks.md) from the result; the `bench-readme` workflow runs
   them on a dedicated Linux x86-64 machine after pushes to main and nightly, and commits the
   numbers to main when they moved beyond noise.
 - `harness/bench.py` measures what [#7](https://github.com/indexable-inc/ra-jit/issues/7)
@@ -832,7 +837,7 @@ since the release before and the title of each change merged since.
   of the callees it keeps calling and of what those call. Level 3 of `demo/lifebench` runs
   at 88% of a release build and 94 to 96% of one that checks overflow as the dev profile
   does, from 71 to 74% and 77 to 81%, measured side by side on a loaded machine
-  ([docs/tiers.md](docs/tiers.md)).
+  ([docs/tiers.md](tiers.md)).
 - `harness/tierbench.py`, the benchmark table of docs/tiers.md; `--together` runs the builds
   of a round at once, so that a loaded machine slows them alike.
 - `RA_JIT_DUMP_LLVM=after` prints the LLVM IR as the passes left it.
@@ -846,14 +851,14 @@ since the release before and the title of each change merged since.
   battery, the commit and the run, which `benchhistory.py live` reads. `harness/live-bevy`
   (bevy 0.20, generic systems) and `harness/live-egui` (egui 0.37, generic widgets) are real
   programs that take edits. Measured on a MacBook Pro in
-  [docs/live.md](docs/live.md#latency-under-typing).
+  [docs/live.md](live.md#latency-under-typing).
 - A borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree, written to give
   rustc's verdict: Polonius alpha by default as nightly rustc does, NLL with
   `RA_JIT_BORROWCK=nll`. It gives rustc's errors on
   1541 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
   rustc accepts, scored by `harness/borrowck_ui.py`, and finds nothing in ripgrep, fd, bat,
   hyperfine, just, axum, nushell, delta, eza, tokei, starship and cargo. Its errors, and rustc's
-  `unused_mut` warning, are rust-analyzer diagnostics and `ra-jit borrowck` prints them ([docs/borrowck.md](docs/borrowck.md)).
+  `unused_mut` warning, are rust-analyzer diagnostics and `ra-jit borrowck` prints them ([docs/borrowck.md](borrowck.md)).
 - Item well-formedness, the crate `hir-ty-wfcheck` next to the borrow checker: rustc's E0309
   and E0310 outside function bodies, for struct, enum and union fields (`&'static T` without
   `T: 'static`), a trait impl's associated types, an impl of a trait bounded by `'static`,
@@ -872,7 +877,7 @@ since the release before and the title of each change merged since.
   at `-O2`, against 3.89x with each crate alone; the programs other than the kernels took
   2.3 to 3.7 times as long to build as with each crate alone (ripgrep 30.1 s against 8.5 s).
   The README's table, measured at the merge into main, has 1.21x over 15 benchmarks
-  ([README](README.md#how-fast)): numeric's ra-jit build took 57 ms in three of its five
+  ([README](../README.md#how-fast)): numeric's ra-jit build took 57 ms in three of its five
   runs and 32 ms in the other two, where release's took 31 ms in all. A whole program's
   build from cold against `cargo build --release`'s from cold: ripgrep 31.7 s against
   8.4 s, tokei 50.7 s against 13.2 s, bat 125 s against 53.3 s, eza 38.9 s against 34.6 s.
@@ -1025,7 +1030,7 @@ since the release before and the title of each change merged since.
   `harness/coldbuild.py bench`: the store's entries are made in 0.84 s where they took 1.6 to
   1.8 s (the threads' wall in them 48 s where 310 s), the frozen parts written in 1.3 s; the
   cold build is 47.9 s (cargo 24.0 s), still waiting on single long jobs and on roots found one
-  after another, which [no-rustc.md](docs/no-rustc.md) (K) records.
+  after another, which [no-rustc.md](no-rustc.md) (K) records.
 - blaze builds with one Rust, the latest nightly: `nightly-2026-10-25` (rust-lang/rust
   12433c307), pinned in `harness/toolchain` and moved with `harness/toolchain_bump.py`, in
   place of stable 1.99.0. `vendor/rustc_abi` and the proc-macro server are taken from that
@@ -1047,7 +1052,7 @@ since the release before and the title of each change merged since.
   18 where 156 and takes as long, 0.53 to 0.70 s: what is left on both is the code that
   changed, compiled on a cold database (main before #360 compiled everything at the start and
   took 0.09 s and 0.37 s, its start 4.8 s longer on nushell)
-  ([warm-start.md](docs/research/warm-start.md)). A stored mark no longer hashes where the
+  ([warm-start.md](research/warm-start.md)). A stored mark no longer hashes where the
   named locals are kept for a debugger, which a full build and a later compile of the same
   code can tell apart, and which had every edit after a restart compile such code again.
   Entries are kept under new keys. `storetracked.py` has the edits of one body take some
@@ -1169,7 +1174,7 @@ since the release before and the title of each change merged since.
   restarted daemon's build on a store that has everything takes 38.3 s instead of 106.5, its
   "store read" 130.8 s of thread time instead of 561.1, the first edit's rebuild 12.2 s instead
   of 45.5, and a second checkout is ready 59.0 s after its build instead of 113.0; nushell's
-  takes 35.4 s instead of 37.8 ([research/warm-start.md](docs/research/warm-start.md)).
+  takes 35.4 s instead of 37.8 ([research/warm-start.md](research/warm-start.md)).
 - `unused_mut` a source denies fails the build, with the seven deny lints before it (#84).
   `harness/lints_ui.py --deny unused_mut` scores it on every rustc UI test: 51 right, 0 wrong,
   5 missed against the nightly, 49, 0, 5 against 1.99.0. `RA_JIT_BORROWCK_REFUSE=0` turns it
@@ -1309,7 +1314,7 @@ since the release before and the title of each change merged since.
   snmalloc start colder and edit no faster (an edit spends 1.8% of its time allocating, 73%
   revalidating salsa's memos). `release` itself is unchanged and stays the build to work with,
   so rebuilding ra-jit after a change takes as long as before
-  ([docs/reports/RELEASE-BUILD.md](docs/reports/RELEASE-BUILD.md)).
+  ([docs/reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md)).
 - Under `RA_JIT_BACKEND=llvm`, a body of more than 10 000 Cranelift instructions is compiled
   by Cranelift. Since LLVM lowers a handler that takes more than the exception (tiers), it
   compiled every function, and an edit of nushell's `main` (35 778 instructions) waited
@@ -2225,7 +2230,7 @@ since the release before and the title of each change merged since.
   calls `bcmp`, a `pthread_` function only rustc's inlined code reached) no longer has the
   program linked in full and started over at level 1, after which every later patch of it
   was linked in full too: that function stays where it was, and says why
-  ([docs/tiers.md](docs/tiers.md), "Code no patch can hold").
+  ([docs/tiers.md](tiers.md), "Code no patch can hold").
 - The thread that compiles at a higher level has a stack of 64 MiB, and the bodies a body
   built in shows are ten deep at most: a deep chain of them overflowed the 2 MiB default and
   took the worker down.
@@ -2233,7 +2238,7 @@ since the release before and the title of each change merged since.
   calls `bcmp`, a `pthread_` function only rustc's inlined code reached) no longer has the
   program linked in full and started over at level 1, after which every later patch of it
   was linked in full too: that function stays where it was, and says why
-  ([docs/tiers.md](docs/tiers.md), "Code no patch can hold").
+  ([docs/tiers.md](tiers.md), "Code no patch can hold").
 - The thread that compiles at a higher level has a stack of 64 MiB, and the bodies a body
   built in shows are ten deep at most: a deep chain of them overflowed the 2 MiB default and
   took the worker down.

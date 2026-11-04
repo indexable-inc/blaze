@@ -40,7 +40,7 @@ SPAN = re.compile(r"(`+)(.+?)\1")
 HTML_ID = re.compile(r"<a\s+(?:name|id)=\"([^\"]+)\"")
 # Not checked for the docs they name: docs/ itself (its links are), the history, others' code
 # (the standard library's own docs/, vendored crates) and the flecs skill, about another project.
-NOT_OURS = ("docs/", "CHANGELOG.md", "library/", "vendor/", ".agents/skills/flecs/")
+NOT_OURS = ("docs/", "library/", "vendor/", ".agents/skills/flecs/")
 
 
 @dataclass(frozen=True)

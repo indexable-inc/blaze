@@ -36,7 +36,7 @@ An old name that still worked would be one more name to document, test and keep.
 - blaze starts its state afresh under the new directories and doesn't move the old ones. The
   first command that finds one says, once, where it is, how big it is, and that it can be
   deleted. `target/ra-jit` goes with `cargo clean`.
-- [install.sh](../install.sh), over a blaze from before, disables the old one if it was
+- [site/install.sh](../site/install.sh), over a blaze from before, disables the old one if it was
   enabled, and removes the old programs (saying so in one line when it removes `cargo-blaze`).
 - `blaze` takes away the links to `cargo-blaze` an earlier `enable` made for `cargo fmt` and
   `cargo clippy`, with the rest of what `enable` wrote
@@ -52,6 +52,6 @@ neither finds what was stored under the old ones.
 
 The script rewrites every tracked text file and `git mv`s every path whose name says ra-jit.
 Running it a second time changes nothing. `--check` lists what still says ra-jit or
-`cargo blaze`, `--env` renames only the settings, and `--dry-run` changes nothing. CHANGELOG.md,
+`cargo blaze`, `--env` renames only the settings, and `--dry-run` changes nothing. docs/CHANGELOG.md,
 this file, the script and `renamed.rs` (what blaze says of the old names) are left as they are,
 and so is a line with `rename: old name` in a comment.
