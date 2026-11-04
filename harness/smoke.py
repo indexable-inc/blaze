@@ -11,7 +11,8 @@ optional:
 
     {"groups": ["std", "crates", "projects", "apps"], "only": [NAME, ...], "profiles": ["dev", "release"],
      "blaze": "path of the `blaze` to run (default: the one on PATH)", "work": DIR,
-     "results": "a JSON file of every result", "blaze_rev": "the commit of the project `blaze`"}
+     "results": "a JSON file of every result", "blaze_rev": "the commit of the project `blaze`",
+     "corpus_rev": "the commit whose corpus the blaze is held to"}
 
 smoke/smoke.json names the cases and projects. A case is a directory smoke/<name>: a cargo
 project whose `blaze run` prints exactly smoke/<name>/expected.txt (given `args` and `env`) and
@@ -36,6 +37,15 @@ Groups: `std` (no dependencies: the merge gate's, every pull request), `crates` 
 crates.io), `projects` (a project's default), and `apps` (the large applications, each in a job
 of its own in promote.yaml, with bench.py's times beside cargo's); all four are the gate a canary
 passes to become stable. Without `groups`, every group but `apps` runs.
+
+With `corpus_rev` (promote.yaml: the release's commit), a case this checkout has and that
+commit's harness/smoke/ does not is newer than the blaze under test and is skipped, said so in
+the results: a release is held to the corpus of its own commit, while the gate's own code is
+this checkout's. The commit has to be in this checkout (a clone with its history).
+
+A command that gives no answer in its time is followed by `blaze slow` in its directory, which
+names what the build it was in spent the time on (AGENTS.md rule 16), and `blaze stop`, so a
+daemon still at it holds neither the machine's memory nor its cores through what runs next.
 
 A case or project with `open` (an issue) is run and reported, and its failure does not fail the
 run. Each failure is printed with the command that repeats it. `results` is every result, for
@@ -68,6 +78,7 @@ class Input:
     work: str = ""
     results: str = ""
     blaze_rev: str = ""
+    corpus_rev: str = ""
 
 
 def typed(text):
@@ -179,14 +190,36 @@ class Smoke:
         self.work = os.path.abspath(args.work or tempfile.mkdtemp(prefix="blaze-smoke-"))
         self.profiles = args.profiles
         self.blaze_rev = args.blaze_rev
+        self.corpus_rev = args.corpus_rev
         self.results = []
+
+    def stalled(self, cwd, env):
+        """What blaze says after a command gave no answer in its time: `blaze slow` (the span
+        that names the slow thing), then `blaze stop`. Each is bounded, and each one's exit and
+        output are kept with the result."""
+        said = []
+        for words, secs in ((["slow"], 300), (["stop"], 120)):
+            code, out, err, _ = run([self.blaze, *words], cwd, env, secs)
+            said.append(f"--- blaze {' '.join(words)}: exit {code}\n{out}{err}")
+        return "\n".join(said)
+
+    def newer_than_corpus(self, name):
+        """Whether the case `name` is not in `corpus_rev`'s corpus (always False without one)."""
+        if not self.corpus_rev:
+            return False
+        done = subprocess.run(["git", "-C", ROOT, "cat-file", "-e", f"{self.corpus_rev}:harness/smoke/{name}/Cargo.toml"],
+                              capture_output=True, text=True)
+        return done.returncode != 0
 
     def check(self, what, argv, cwd, env, timeout, judge, repro, open_issue):
         code, out, err, secs = run(argv, cwd, env, timeout)
+        if code is None:
+            err += "\n" + self.stalled(cwd, env)
+        lines = 25 if code is not None else 80
         not_ours = [line for line in err.splitlines() if any(it in line for it in NOT_BLAZES)]
         why = f"the build was not blaze's: {not_ours[0].strip()}" if code == 0 and not_ours else judge(code, out)
         result = dict(what=what, ok=why is None, open=open_issue, seconds=round(secs, 1), why=why,
-                      repro=repro, stdout=tail(out), stderr=tail(err))
+                      repro=repro, stdout=tail(out, lines), stderr=tail(err, lines))
         self.results.append(result)
         if why is None:
             mark = "ok, OPEN passes now (remove its mark)" if open_issue else "ok"
@@ -197,12 +230,18 @@ class Smoke:
             print(f"    {why}\n    repeat: {repro}", flush=True)
             for label, text in (("stdout", out), ("stderr", err)):
                 if text.strip():
-                    print(f"    --- {label}\n" + "\n".join("    " + line for line in tail(text).splitlines()), flush=True)
+                    print(f"    --- {label}\n" + "\n".join("    " + line for line in tail(text, lines).splitlines()), flush=True)
 
     def profile_args(self, profile):
         return ["--release"] if profile == "release" else []
 
     def case(self, name, spec):
+        if self.newer_than_corpus(name):
+            why = f"not in the corpus at {self.corpus_rev[:10]}: newer than the blaze under test"
+            self.results.append(dict(what=name, ok=True, skipped=why, open=spec.get("open"), seconds=0, why=None,
+                                     repro="", stdout="", stderr=""))
+            print(f"skipped  {name}: {why}", flush=True)
+            return
         source = os.path.join(CORPUS, name)
         cwd = os.path.join(self.work, "cases", name)
         shutil.rmtree(cwd, ignore_errors=True)
@@ -351,7 +390,7 @@ def summary(results, out):
     failed = [r for r in results if not r["ok"] and not r["open"]]
     lines = ["| | what | s |", "|---|---|---|"]
     for r in results:
-        mark = "ok" if r["ok"] else (f"open {r['open']}" if r["open"] else "**FAILED**")
+        mark = ("skipped" if r.get("skipped") else "ok") if r["ok"] else (f"open {r['open']}" if r["open"] else "**FAILED**")
         lines.append(f"| {mark} | {r['what']} | {r['seconds']} |")
     for r in failed:
         lines += ["", f"**{r['what']}**: {r['why']}", "", "```sh", r["repro"], "```"]
@@ -382,6 +421,11 @@ def main():
     if not args.blaze_rev:
         rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
         args = Input(**{**args.__dict__, "blaze_rev": rev})
+    if args.corpus_rev:
+        done = subprocess.run(["git", "-C", ROOT, "cat-file", "-e", f"{args.corpus_rev}^{{commit}}"], capture_output=True, text=True)
+        if done.returncode != 0:
+            sys.exit(f"smoke.py: INPUT field corpus_rev: {args.corpus_rev} is no commit of {ROOT} "
+                     f"(a shallow clone has no history: fetch it): {done.stderr.strip()}")
     smoke = Smoke(args)
     version = (subprocess.run([smoke.blaze, "--version"], capture_output=True, text=True).stdout.strip().splitlines() or [""])[0]
     print(f"{version or smoke.blaze}: {len(cases)} cases, {len(projects)} projects, {', '.join(args.profiles)}; work {smoke.work}", flush=True)

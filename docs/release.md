@@ -7,8 +7,9 @@ summary: Releases: the canary and stable channels, how a release is cut and what
 blaze has two release channels, made of the same releases:
 
 - **canary** (opt-in): every release, as soon as it is built. A release is cut from a commit of
-  main as soon as main's merge gate has built it on Linux x86-64 (the job `linux x64 / build`),
-  without waiting for the unit tests or the other platforms. It is published as a GitHub
+  main as soon as main's merge gate has built it on Linux (the job `linux x64 / build`, or
+  `linux arm64 / build`, which runs on an ix runner with room for the build when the repository
+  variable `BLAZE_IX_RUNNERS` is on; #1654), without waiting for the unit tests or the other platforms. It is published as a GitHub
   *prerelease*.
 - **stable** (the default): a canary that then passed the heavy tests, unchanged, and whose
   commit passed main's whole merge gate: its whole run green, with the unit tests on Linux
@@ -64,9 +65,9 @@ published as a full release and counts as stable.
 
 Every built main is a canary, cheaply. `canary.yaml` runs on each push to main (and hourly, and
 by hand): `.github/scripts/canary.py cut` waits for main's build of the push (the job `linux x64
-/ build` of the merge gate's run on it; when the push changed nothing the build reads, the
+/ build` or `linux arm64 / build` of the merge gate's run on it, whichever passes first; when the push changed nothing the build reads, the
 newest commit of main that has a build), at most 90 minutes, and then tags the newest commit of
-main whose `linux x64 / build` passed (main moves faster than its build, so that is seldom HEAD
+main where one of them passed (main moves faster than its build, so that is seldom HEAD
 itself; it looks through main's first parents since the newest release) `v0.YYYYMMDD.N` through
 the API and dispatches `release.yaml` on the tag. It does not wait for the unit tests, the other
 platforms (macOS often queues half an hour) or the rest of the run: stable does (below). The
