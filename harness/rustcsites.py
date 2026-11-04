@@ -26,6 +26,9 @@ PLACE = re.compile(
 def places():
     found = {}
     for dirpath, dirnames, filenames in os.walk(os.path.join(ROOT, "crates")):
+        # crates/harness is its own cargo workspace, not blaze's code (crates/harness/README.md).
+        if os.path.relpath(dirpath, ROOT) == "crates":
+            dirnames[:] = [it for it in dirnames if it != "harness"]
         dirnames[:] = sorted(it for it in dirnames if it != "target")
         for filename in sorted(filenames):
             if not filename.endswith(".rs"):

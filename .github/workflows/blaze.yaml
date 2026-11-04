@@ -174,7 +174,7 @@ jobs:
       - run: blaze build -p astlog
       - run: >-
           PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py
-          '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"]}'
+          '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"], "exclude": ["crates/harness"]}'
 
   # AGENTS.md rule fix-through-blaze-lints: each clippy and blaze lint's findings, counted by
   # crate, may only shrink. crates/blaze-lints/baselines holds the counts, one file per lint;
