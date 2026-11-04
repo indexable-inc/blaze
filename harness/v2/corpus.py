@@ -86,7 +86,8 @@ from typing import Any, Literal, cast, get_args
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
 from typed_input import fail, parse
-import engine, report
+import engine, pins, report
+from pins import Corpus, Crate
 
 blaze_cli: Any = importlib.import_module("blaze_cli")
 
@@ -104,20 +105,6 @@ EXEC_SECS = 600
 # version in it) and libtest's name of the test, each with why: OPEN of unittests.py. One that
 # passes or no longer runs fails its step until it is taken out.
 OPEN: dict[str, dict[str, str]] = {}
-
-
-@dataclass(frozen=True)
-class Crate:
-    name: str
-    version: str
-
-
-@dataclass(frozen=True)
-class Corpus:
-    """corpus.json."""
-
-    about: str
-    crates: tuple[Crate, ...]
 
 
 @dataclass(frozen=True)
@@ -188,8 +175,8 @@ class Tested:
     kept: list[str]
 
 
-def load_corpus(path: Path = HERE / "corpus.json") -> Corpus:
-    return parse(Corpus, str(path), SCRIPT)
+def load_corpus() -> Corpus:
+    return pins.load_corpus(script=SCRIPT)
 
 
 def git(*args: str) -> str:
