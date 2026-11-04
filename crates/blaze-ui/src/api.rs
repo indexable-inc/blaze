@@ -192,13 +192,8 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         }
         Response::Done { ok: true } => {}
         Response::Done { ok: false } => put!(out, "{}\n", paint(RED, "failed")),
-        Response::Error(error) => {
-            put!(out, "{}: {}", paint(RED, "error"), error.what);
-            if let Some(at) = &error.at {
-                put!(out, " (at {at})");
-            }
-            out.push('\n');
-        }
+        Response::Error(error) => report_into(out, error.report(), color),
+        Response::Report { report, .. } => report_into(out, report, color),
         Response::Opened { root } => put!(out, "{} {root}\n", paint(GREEN, "opened")),
         Response::Reached(reach) => {
             put!(
@@ -288,6 +283,14 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         Response::Stored { path: Some(path), blake3 } => put!(out, "{} blake3:{blake3} at {path}\n", status("Stored")),
         Response::Stored { path: None, blake3 } => put!(out, "{} blake3:{blake3} in the store\n", status("Stored")),
     }
+}
+
+/// A report as the one renderer writes it ([`blaze_report::render_into`]): no links, no
+/// wrapping, paths as the report has them; a client with a terminal and a workspace renders
+/// it with those itself.
+fn report_into(out: &mut String, report: &blaze_api::Report, color: bool) {
+    let caps = blaze_report::Caps { color, links: false, width: None };
+    blaze_report::render_into(out, report, caps, &blaze_report::Roots::NONE);
 }
 
 /// `blaze debug hot`'s table: the keys that took most, each with the bracket the sketches
@@ -1008,11 +1011,11 @@ mod tests {
     fn a_candidates_lines_are_marked_with_it() {
         let inner = Response::Error(ApiError::new("no such file", Some("src/a.rs".to_owned())));
         let of = Response::Of { candidate: 2, response: Box::new(inner) };
-        assert_eq!(lines(&of, false), "[2] error: no such file (at src/a.rs)\n");
+        assert_eq!(lines(&of, false), "[2] error: no such file\n[2]   ─ src/a.rs\n");
         // After what `out` had, which stays as it was.
         let mut out = "before\n".to_owned();
         lines_into(&mut out, &of, false);
-        assert_eq!(out, "before\n[2] error: no such file (at src/a.rs)\n");
+        assert_eq!(out, "before\n[2] error: no such file\n[2]   ─ src/a.rs\n");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Documented, Edited, FactRead, FetchVerb, Hot, Level, Rebuilt, LiveFrame, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
+    Documented, Edited, FactRead, FetchVerb, Hot, Level, Rebuilt, LiveFrame, Memory, Mismatch, Ranked, Reach, Report, Response, Span, Status,
     Table, TargetKind, TestOutcome, TestResult, Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb,
     Worked,
 };
@@ -46,7 +46,7 @@ pub enum ResponseRef<'a> {
     Why(Why),
     Status(Status),
     Done { ok: bool },
-    Error(#[serde(borrow)] ApiErrorRef<'a>),
+    Error(ApiError),
     Opened { root: ContentId },
     Reached(Reach),
     Of {
@@ -91,6 +91,12 @@ pub enum ResponseRef<'a> {
         #[serde(borrow)]
         path: Option<&'a str>,
         blake3: &'a str,
+    },
+    /// Rare (a failure's): its report is read owned.
+    Report {
+        #[serde(borrow)]
+        unit: Option<UnitOfRef<'a>>,
+        report: Report,
     },
 }
 
@@ -259,14 +265,6 @@ pub enum BasisRef<'a> {
     Reached { why: &'a str },
 }
 
-/// [`ApiError`], read where it lies.
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ApiErrorRef<'a> {
-    #[serde(borrow)]
-    pub at: Option<&'a str>,
-    pub what: &'a str,
-}
-
 /// `text`, owned: every `into_owned` below allocates only through these four, for a response
 /// kept past its frame (another request's, a result held to the end); the path that prints
 /// reads in place.
@@ -307,7 +305,7 @@ impl ResponseRef<'_> {
             ResponseRef::Why(it) => Response::Why(it),
             ResponseRef::Status(it) => Response::Status(it),
             ResponseRef::Done { ok } => Response::Done { ok },
-            ResponseRef::Error(it) => Response::Error(it.into_owned()),
+            ResponseRef::Error(it) => Response::Error(it),
             ResponseRef::Opened { root } => Response::Opened { root },
             ResponseRef::Reached(it) => Response::Reached(it),
             ResponseRef::Of { response, candidate } => {
@@ -338,6 +336,7 @@ impl ResponseRef<'_> {
             ResponseRef::Launched { live, env } => Response::Launched { live, env },
             ResponseRef::Stopping { doing } => Response::Stopping { doing: owned(doing) },
             ResponseRef::Stored { path, blake3 } => Response::Stored { path: maybe(path), blake3: owned(blake3) },
+            ResponseRef::Report { unit, report } => Response::Report { unit: unit.map(UnitOfRef::into_owned), report },
         }
     }
 }
@@ -458,12 +457,6 @@ impl CachedRef<'_> {
             BasisRef::Reached { why } => Basis::Reached { why: owned(why) },
         };
         Cached { basis, millis: self.millis, outcome: self.outcome }
-    }
-}
-
-impl ApiErrorRef<'_> {
-    pub fn into_owned(self) -> ApiError {
-        ApiError { at: maybe(self.at), what: owned(self.what) }
     }
 }
 

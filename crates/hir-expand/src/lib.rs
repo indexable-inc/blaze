@@ -665,6 +665,8 @@ impl MacroCallId {
             rev_token_map.dropped_semicolon = semicolon;
             // alloc: only for an expansion whose `${concat(..)}`s made identifiers
             rev_token_map.made_idents = made.into_iter().collect();
+            // Kept as this query's value: counted in `span::kept_maps` until it is dropped.
+            rev_token_map.count_kept();
             let err = err.or_else(|| ignored_semicolon(db, loc, semicolon));
 
             ExpandResult { value: (parse, rev_token_map), err }

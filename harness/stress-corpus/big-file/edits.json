@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "edits": [
+    {
+      "name": "shift-top",
+      "what": "insert one comment line at the top of the big file; every span shifts",
+      "path": "src/items.rs",
+      "insert_before_line": 1,
+      "text": "// shifted by one line\n"
+    }
+  ]
+}

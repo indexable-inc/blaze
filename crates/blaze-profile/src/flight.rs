@@ -489,6 +489,12 @@ pub enum Plot {
     /// `never!` that failed. Written by the history with each build's flush and whenever it
     /// grew; each site that reported is also a row of `errors` of kind `blaze-bug`.
     BlazeBugs,
+    /// Heap bytes of every span map kept as a query's value (a macro expansion's, from
+    /// `parse_macro_expansion`) and still alive (`span::kept_maps`): what a packed layout of
+    /// the maps would shrink. Plotted with the memory's plots.
+    SpanMapBytes,
+    /// Pieces (a text range and its span each) of the maps of [`Plot::SpanMapBytes`].
+    SpanMapPieces,
     /// Nanoseconds the recorder spent on its own threads' spans so far ([`cost`]): making,
     /// entering, leaving and closing them (sampled 1 call in [`COST_SAMPLE`]) and reading the
     /// CPU clock at boundaries (every one). Written by the history with each build's flush,
@@ -503,7 +509,7 @@ pub enum Plot {
 }
 
 impl Plot {
-    pub const ALL: [Plot; 24] = [
+    pub const ALL: [Plot; 26] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -525,6 +531,8 @@ impl Plot {
         Plot::ReservedBytes,
         Plot::ProfileRowsBehind,
         Plot::BlazeBugs,
+        Plot::SpanMapBytes,
+        Plot::SpanMapPieces,
         Plot::ProfileCostNs,
         Plot::ProfileSpansMade,
         Plot::ProfileCpuReads,
@@ -553,6 +561,8 @@ impl Plot {
             Plot::ReservedBytes => "reserved bytes",
             Plot::ProfileRowsBehind => "profile rows skipped behind",
             Plot::BlazeBugs => "blaze bugs",
+            Plot::SpanMapBytes => "span map bytes",
+            Plot::SpanMapPieces => "span map pieces",
             Plot::ProfileCostNs => "profile cost ns",
             Plot::ProfileSpansMade => "profile spans made",
             Plot::ProfileCpuReads => "profile cpu reads",

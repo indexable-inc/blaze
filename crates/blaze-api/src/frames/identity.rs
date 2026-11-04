@@ -22,7 +22,7 @@ use crate::{
 };
 
 const REQUESTS: usize = 35;
-const RESPONSES: usize = 43;
+const RESPONSES: usize = 44;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -601,7 +601,7 @@ impl Gen {
                 }),
             }),
             13 => Response::Done { ok: self.yes() },
-            14 => Response::Error(ApiError { at: self.maybe(Gen::text), what: self.text() }),
+            14 => Response::Error(ApiError::from(self.report(depth))),
             15 => Response::Opened { root: self.id() },
             16 => Response::Reached(Reach {
                 items: self.many(depth, |g| ReachedItem {
@@ -717,14 +717,56 @@ impl Gen {
             41 => Response::Stored { path: self.maybe_text(), blake3: self.text() },
             40 => Response::Unchecked(Unchecked {
                 open: self.many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
-                behind: self.many(depth, |g| Behind { why: g.text(), unit: g.text(), units: g.texts(depth + 1) }),
+                behind: self.many(depth, |g| Behind { id: g.maybe(Gen::u32), why: g.text(), unit: g.text(), units: g.texts(depth + 1) }),
                 tests: self.many(depth, |g| Unbuilt { unit: g.text(), behind: g.text(), why: g.text() }),
                 stopped: self.yes(),
             }),
+            42 => Response::Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
         }
+    }
+
+    /// A report: its causes only near the top.
+    fn report(&mut self, depth: u32) -> crate::Report {
+        crate::Report {
+            at: self.maybe(Gen::report_text),
+            log: self.maybe_text(),
+            rule: self.maybe_text(),
+            facts: self.many(depth + 1, |g| crate::Fact { key: g.text(), text: g.report_text() }),
+            fixes: self.many(depth + 1, |g| crate::Fix { note: g.maybe(Gen::report_text), lines: g.texts(depth + 2) }),
+            blocks: self.maybe(|g| crate::Blocks {
+                all: g.texts(depth + 1),
+                what: g.text(),
+                count: g.wide(),
+                notable: g.texts(depth + 1),
+            }),
+            causes: match depth {
+                0 | 1 => self.many(depth + 1, |g| g.report(depth + 1)),
+                _ => Vec::new(),
+            },
+            headline: self.report_text(),
+            severity: match self.below(3) {
+                0 => crate::Severity::Error,
+                1 => crate::Severity::Warning,
+                _ => crate::Severity::Note,
+            },
+        }
+    }
+
+    fn report_text(&mut self) -> crate::Text {
+        crate::Text(self.many(1, |g| match g.below(9) {
+            0 => crate::ReportSpan::Plain(g.text()),
+            1 => crate::ReportSpan::Code(g.text()),
+            2 => crate::ReportSpan::Path(g.text()),
+            3 => crate::ReportSpan::Package { name: g.text(), version: g.maybe(Gen::text) },
+            4 => crate::ReportSpan::Version(g.text()),
+            5 => crate::ReportSpan::Hash(g.text()),
+            6 => crate::ReportSpan::Var(g.text()),
+            7 => crate::ReportSpan::Count(g.wide()),
+            _ => crate::ReportSpan::Took(g.wide()),
+        }))
     }
 
     fn maybe_id(&mut self) -> Option<ContentId> {
@@ -904,7 +946,8 @@ fn response_index(response: &Response) -> usize {
         Response::Stopping { .. } => 39,
         Response::Unchecked(_) => 40,
         Response::Stored { .. } => 41,
-        Response::Of { .. } => 42,
+        Response::Report { .. } => 42,
+        Response::Of { .. } => 43,
     }
 }
 

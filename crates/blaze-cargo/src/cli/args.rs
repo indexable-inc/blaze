@@ -333,7 +333,7 @@ pub enum Asked {
     Explore(Vec<OsString>),
     /// `blaze debug profile|live|sql`, with the words after `debug` ([`super::observe::debug`]).
     Debug(Vec<OsString>),
-    /// `blaze explain VIEW ...`, with the words after it ([`super::observe::explain`]).
+    /// `blaze explain RULE|PACKAGE|VIEW ...`, with the words after it ([`super::observe::explain`]).
     Explain(Vec<OsString>),
     /// `blaze why [ITEM]`, with the words after it ([`super::observe::why`]).
     Why(Vec<OsString>),

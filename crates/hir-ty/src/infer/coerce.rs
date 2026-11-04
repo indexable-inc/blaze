@@ -241,10 +241,12 @@ where
     /// fall back to subtyping (`unify_and`).
     fn coerce_from_inference_variable(&mut self, a: Ty<'db>, b: Ty<'db>) -> CoerceResult<'db, 'f> {
         debug!("coerce_from_inference_variable(a={:?}, b={:?})", a, b);
-        debug_assert!(a.is_infer() && self.infcx().shallow_resolve(a) == a);
+        debug_assert!(a.is_ty_var() && self.infcx().shallow_resolve(a) == a);
         debug_assert!(self.infcx().shallow_resolve(b) == b);
 
-        if b.is_infer() {
+        // Only a type variable target defers, as in rustc: an integer or float variable target
+        // is unified with at once.
+        if b.is_ty_var() {
             // Two unresolved type variables: create a `Coerce` predicate.
             let target_ty =
                 if self.use_lub { self.infcx().next_ty_var(self.cause.span()) } else { b };

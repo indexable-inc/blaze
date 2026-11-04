@@ -57,11 +57,13 @@ let
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that
   # editing anything else in the repo does not change the unit.
   # crates/blaze-cargo include_str!s harness/toolchain and library/{DIGEST,UPSTREAM}.
+  # crates/blaze-inproc-rt's root mounts library/blaze_inproc_rt/src with `#[path]`.
   pathSource = p:
     let
       d = p.source.dir;
       library = lib.optionals (d == "crates/blaze-cargo")
-        (map (f: repo + "/library/${f}") [ "DIGEST" "UPSTREAM" ]);
+        (map (f: repo + "/library/${f}") [ "DIGEST" "UPSTREAM" ])
+      ++ lib.optional (d == "crates/blaze-inproc-rt") (repo + "/library/blaze_inproc_rt/src");
     in
     "${lib.fileset.toSource {
       root = repo;

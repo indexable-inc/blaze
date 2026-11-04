@@ -15,6 +15,7 @@ mod config;
 mod files;
 mod invocation;
 mod manifest;
+mod native;
 mod plan;
 mod resolve;
 mod sandbox;
@@ -354,6 +355,7 @@ impl Query for Plan {
                 finished: built.finished,
                 link_dirs: built.link_dirs,
                 sandboxed_tests: built.sandboxed_tests,
+                native: built.native,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),
             Staged::Failed(error) => Planned::Failed(error),

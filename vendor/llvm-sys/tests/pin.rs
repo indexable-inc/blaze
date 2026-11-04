@@ -59,7 +59,7 @@ mod tests {
             pin.version.as_str(),
             pin.commit.as_str(),
             "something else",
-            "nix develop",
+            "[workspace.metadata.blaze.native.llvm]",
             PIN_PREFIX,
             ".github/workflows/llvm.yaml",
         ] {

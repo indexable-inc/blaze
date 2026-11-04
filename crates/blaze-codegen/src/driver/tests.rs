@@ -1220,7 +1220,7 @@ fn another_summary_under_a_summarys_flight_key_fails_the_build() {
     let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     let other: Vec<(InstanceKey, Summary)> = (cold.puts.iter())
         .filter(|it| it.kind == Kind::Query)
-        .filter_map(|it| Some((InstanceKey(it.key.0), serde_json::from_slice::<Summary>(&it.bytes).ok()?)))
+        .filter_map(|it| Some((InstanceKey(it.key.0), Summary::decode(&it.bytes).ok()?)))
         .map(|(flight, summary)| (flight, Summary { size: summary.size + 1, ..summary }))
         .collect();
     assert!(!other.is_empty(), "an O3 build keeps its summaries");

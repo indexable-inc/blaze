@@ -40,7 +40,20 @@ of blaze's own invariants.
 
 See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
 
-## one-concept-one-home (rule 28)
+## spec-then-build (rule 28)
+
+Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a
+hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the
+losing alternative in a line, the cost budget, the migration, how it is proven). Have a fresh
+reviewer check it against the code when it is large. Then start building it in the same lane, in the
+same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same
+pull request as the first code that implements it, and is marked `current` (or rewritten to describe
+what was built) once the work lands. A spec with no code behind it is unfinished work, not a result;
+a lane that cannot build what it specified says what blocks it and who it handed the work to.
+
+See [docs/contributing.md#rules-for-code](../../../docs/contributing.md#rules-for-code).
+
+## one-concept-one-home (rule 29)
 
 Each concept has one type, one rule and one place it is computed: two types for the same thing (a
 `BuiltFor` in two crates), two copies of a rule (where code runs, what a key covers), two paths that

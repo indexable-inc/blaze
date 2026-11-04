@@ -3,7 +3,8 @@
 //! `rustc-link-search` into the home directory, a `rustc-link-arg` that loads a plugin into
 //! the linker, or a `rustc-env` that overrides `CARGO_PKG_VERSION` reaches past the sandbox it
 //! ran in. So the directives of a sandboxed run are checked before cargo reads them
-//! ([`refused`]), and one that breaks a rule fails the build, naming the script and the line:
+//! ([`refused`]), and one that breaks a rule fails the build, naming the script, the line and
+//! the rule (`blaze explain sandbox:link-dir`, [`blaze_report::rules`]):
 //!
 //! - `rustc-link-search` and `rustc-flags`' `-L`: a directory inside the script's `OUT_DIR`,
 //!   its package, the target directory's build directory (the `OUT_DIR`s of its dependencies,
@@ -249,8 +250,20 @@ fn search_dir(value: &str) -> &str {
     }
 }
 
+/// One line a sandboxed script printed that a rule refuses.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Refused {
+    /// The rule's id ([`blaze_report::rules`]): `sandbox:link-dir`, `sandbox:link-arg` or
+    /// `sandbox:rustc-env`.
+    pub rule: &'static str,
+    /// The line, whole.
+    pub line: String,
+    /// Why, with code in backticks.
+    pub why: String,
+}
+
 /// Each line of `stdout` a run `ran` printed that its rules refuse, with why.
-pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
+pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<Refused> {
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(stdout).lines() {
         let line = line.trim();
@@ -261,9 +274,9 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
         };
         let Some((key, value)) = data.split_once('=') else { continue };
         let value = value.trim_end();
-        let why = match key {
-            "rustc-link-search" => (!ran.may_search(search_dir(value)))
-                .then(|| format!("a library directory that is none of {}", ran.places())),
+        let (rule, why) = match key {
+            "rustc-link-search" => ("sandbox:link-dir", (!ran.may_search(search_dir(value)))
+                .then(|| format!("a library directory that is none of {}", ran.places()))),
             "rustc-flags" => {
                 let mut flags = value.split_whitespace();
                 let mut why = None;
@@ -277,10 +290,10 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
                         why = Some(format!("`-L {dir}`, which is none of {}", ran.places()));
                     }
                 }
-                why
+                ("sandbox:link-dir", why)
             }
             "rustc-link-arg-bin" => {
-                value.split_once('=').and_then(|(_, arg)| ran.link_arg_refused(arg))
+                ("sandbox:link-arg", value.split_once('=').and_then(|(_, arg)| ran.link_arg_refused(arg)))
             }
             "rustc-link-arg"
             | "rustc-link-arg-bins"
@@ -288,37 +301,56 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
             | "rustc-link-arg-benches"
             | "rustc-link-arg-examples"
             | "rustc-link-arg-cdylib"
-            | "rustc-cdylib-link-arg" => ran.link_arg_refused(value),
-            "rustc-env" => value
+            | "rustc-cdylib-link-arg" => ("sandbox:link-arg", ran.link_arg_refused(value)),
+            "rustc-env" => ("sandbox:rustc-env", value
                 .split_once('=')
                 .filter(|(name, _)| given_by_cargo(name))
                 .map(|(name, _)| {
                     format!("`{name}`, which cargo gives the crate or the toolchain acts on itself")
-                }),
-            _ => None,
+                })),
+            _ => continue,
         };
         if let Some(why) = why {
-            out.push((line.to_owned(), why));
+            out.push(Refused { rule, line: line.to_owned(), why }); // alloc: a refusal's, once
         }
     }
     out
 }
 
-/// What a build that a script of `package` broke the rules of is told.
-pub fn refused_error(package: &str, refused: &[(String, String)]) -> String {
-    let lines: Vec<String> =
-        refused.iter().map(|(line, why)| format!("  `{line}`: {why}")).collect();
-    format!(
-        "the build script of `{package}` printed {} a build script in the sandbox may not:\n{}\n\
-         a directory of the system it links from goes in `build-script-link-dirs = [...]` \
-         under `[workspace.metadata.blaze.sandbox]` in the workspace's root manifest; a script \
-         that needs more runs outside, by name in `unsandboxed-build-scripts` there",
-        match refused.len() {
-            1 => "a directive",
-            _ => "directives",
-        },
-        lines.join("\n"),
-    )
+/// The report of a build a script of `package` broke the rules of, `at` naming the script:
+/// each line refused and why, under the first's rule, and the ways out.
+pub fn refused_report(package: &str, at: blaze_report::Text, refused: &[Refused]) -> blaze_report::Report {
+    use blaze_report::{Fix, Report, Text};
+    let what = match refused.len() {
+        1 => "a directive",
+        _ => "directives",
+    };
+    let headline = Text::new().words("a build script printed ").words(what).words(" its sandbox refuses");
+    let mut report = Report::error(headline).at(at);
+    if let Some(first) = refused.first() {
+        report = report.rule(first.rule);
+    }
+    for it in refused {
+        let mut text = Text::new().code(&it.line).words(": ");
+        text.0.extend(Text::marked(&it.why).0);
+        report = report.fact("refused", text);
+    }
+    if refused.iter().any(|it| it.rule == "sandbox:link-dir") {
+        report = report.fix(Fix::note(
+            Text::new()
+                .words("a directory of the system it links from goes in ")
+                .code("build-script-link-dirs = [...]")
+                .words(" under ")
+                .code("[workspace.metadata.blaze.sandbox]")
+                .words(" in the workspace's root manifest"),
+        ));
+    }
+    report.fix(Fix::note(
+        Text::new()
+            .words("a script that needs more runs outside the sandbox: ")
+            .code(&format!("unsandboxed-build-scripts = [\"{package}\"]")) // alloc: a refusal's, once
+            .words(" there"),
+    ))
 }
 
 /// The workspace's `build-script-link-dirs` as a script started in `env` may name them: an
@@ -362,7 +394,7 @@ mod tests {
     }
 
     fn refused_lines(stdout: &str) -> Vec<String> {
-        refused(stdout.as_bytes(), &ran()).into_iter().map(|it| it.0).collect()
+        refused(stdout.as_bytes(), &ran()).into_iter().map(|it| it.line).collect()
     }
 
     #[test]
@@ -469,13 +501,17 @@ mod tests {
     }
 
     #[test]
-    fn the_error_names_the_package_and_each_line() {
-        let refused = refused(b"cargo:rustc-link-search=/root/x\n", &ran());
-        let error = refused_error("evil-sys", &refused);
-        assert!(
-            error.contains("`evil-sys`") && error.contains("`cargo:rustc-link-search=/root/x`")
-        );
-        assert!(error.contains("build-script-link-dirs"), "{error}");
+    fn the_report_names_the_script_each_line_and_the_rule() {
+        let refused = refused(b"cargo:rustc-link-search=/root/x\ncargo:rustc-env=RUSTFLAGS=-Cx\n", &ran());
+        assert_eq!(refused.iter().map(|it| it.rule).collect::<Vec<_>>(), ["sandbox:link-dir", "sandbox:rustc-env"]);
+        let at = blaze_report::Text::new().words("build script of ").package("evil-sys", Some("0.1.0"));
+        let report = refused_report("evil-sys", at, &refused);
+        assert_eq!(report.rule.as_deref(), Some("sandbox:link-dir"));
+        assert_eq!(report.subject(), Some("evil-sys"));
+        let flat = report.flat();
+        assert!(flat.contains("`cargo:rustc-link-search=/root/x`") && flat.contains("`RUSTFLAGS`"), "{flat}");
+        assert!(flat.contains("build-script-link-dirs") && flat.contains("unsandboxed-build-scripts = [\"evil-sys\"]"), "{flat}");
+        assert!(blaze_report::rules::find("sandbox:link-dir").is_some() && blaze_report::rules::find("sandbox:rustc-env").is_some());
     }
 
     /// A link dir under a variable is where the script's environment puts it, and the search it

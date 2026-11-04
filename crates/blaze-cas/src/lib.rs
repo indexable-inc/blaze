@@ -60,7 +60,7 @@ use std::{collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
-use blaze_hash::{ByHash, HashMap, HashSet};
+use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_reclaim::{Grace, Limbo};
@@ -96,7 +96,9 @@ const PACK_MOST: u64 = 1 << 30;
 #[cfg(test)]
 const PACK_MOST: u64 = 256 << 10;
 
-/// A value shorter than this stays as it is: compressing it saves less than its index slot costs.
+/// A value shorter than this stays as it is: compressing it saves less than its index slot
+/// costs. A cold kind's value is the exception once its kind has a dictionary: values of one
+/// kind share most of their bytes, which the dictionary takes out of even a short one.
 const DEMOTE_FROM: u64 = 4 << 10;
 
 /// One [`Store::settle`] moves or copies at most this many bytes, so it stays a short step.
@@ -104,6 +106,10 @@ const DEMOTE_FROM: u64 = 4 << 10;
 const SETTLE_MOST: u64 = 256 << 20;
 #[cfg(test)]
 const SETTLE_MOST: u64 = 1 << 20;
+
+/// Of a [`Store::settle`]'s [`SETTLE_MOST`], at most this much goes to short cold records
+/// (each counted as [`DEMOTE_FROM`]), so a backlog of them does not take whole settles.
+const SHORT_MOST: u64 = SETTLE_MOST / 4;
 
 /// Outputs from this long on are kept as content-defined chunks.
 const CHUNK_FROM: usize = 256 << 10;
@@ -1039,10 +1045,41 @@ struct Dictionary {
 /// The raw values of a cold kind kept so far, to train its dictionary on.
 #[derive(Default)]
 struct Training {
+    /// Distinct values: a value is sampled once however often it is put or a settle meets its
+    /// record, so what a dictionary is trained on does not depend on how many settles ran.
     samples: Vec<Vec<u8>>,
+    /// The content of each sample.
+    sampled: ByHashSet<ContentId, Global>, // alloc: at most `SAMPLES_MOST` a kind, freed once it trains or gives up
     bytes: u64,
     /// No training before this many samples: doubled after one fails.
     after: usize,
+    /// No training can be had while the store is open: the samples are full and did not train
+    /// ([`Store::give_up_training`], in the problems). Nothing more is sampled.
+    given_up: bool,
+}
+
+impl Training {
+    /// Whether to train on the samples kept: [`cold::TRAIN_VALUES`] distinct values (or twice
+    /// as many as a training that failed had) and [`cold::TRAIN_BYTES`] of them, or as many
+    /// samples as are ever kept ([`cold::SAMPLES_MOST`]). Without the last, a kind whose
+    /// values are shorter than `TRAIN_BYTES / SAMPLES_MOST` on average (debug info, a few
+    /// hundred bytes a function) never reaches `TRAIN_BYTES`, as no sample is kept past
+    /// `SAMPLES_MOST`, and is never trained nor compressed.
+    fn ready(&self) -> bool {
+        self.samples.len() >= cold::TRAIN_VALUES.max(self.after)
+            && (self.bytes >= cold::TRAIN_BYTES || self.full())
+    }
+
+    /// Whether no more samples are kept: [`cold::SAMPLES_MOST`] of them, or
+    /// [`cold::SAMPLE_BYTES_MOST`] bytes.
+    fn full(&self) -> bool {
+        self.samples.len() >= cold::SAMPLES_MOST || self.bytes >= cold::SAMPLE_BYTES_MOST
+    }
+
+    /// Whether a new value would be kept as a sample.
+    fn wants_samples(&self) -> bool {
+        !self.given_up && !self.full()
+    }
 }
 
 /// One group commit: each pack cut to what is committed, appended to, synced; new externals
@@ -1376,7 +1413,7 @@ impl Store {
             && look.dictionary_of(kind).is_none()
             && look.columns_of(bytes).is_none();
         if sample {
-            self.sample(kind, bytes);
+            self.sample(kind, content, bytes);
         }
         let look = Look::new(&self.shared, Held::writer(&*self.shared));
         let put = self.own.put(look, unit, key, kind, content, bytes);
@@ -1425,6 +1462,8 @@ impl Store {
             return settled;
         }
         let mut spent: u64 = 0;
+        // What short cold records took of `spent`, and whether some were left for the next.
+        let (mut spent_short, mut more_short) = (0u64, false);
         let encodings = Arc::clone(&self.columns);
         let (mut demote, mut promote) = self.tier_moves();
         radix::sort_by_key(&mut demote, |(_, loc, _)| {
@@ -1436,14 +1475,29 @@ impl Store {
         'kinds: for group in demote.chunk_by(|a, b| a.1.kind == b.1.kind) {
             let kind = group[0].1.kind;
             if self.dictionary_of(kind).is_none() {
-                for &(_, loc, _) in group.iter().filter(|(_, loc, _)| loc.form == Form::Raw) {
+                // Long records are not sampled, as `put` does not sample them: a few would fill the
+                // samples with too few values and give the kind up.
+                let long = cold::LONG_FROM as u64;
+                for &(_, loc, _) in
+                    group.iter().filter(|(_, loc, _)| loc.form == Form::Raw && loc.raw < long)
+                {
+                    // The samples are full (and trained, or gave up) or the kind gave up: a
+                    // copy would be kept as no sample.
+                    if !self.training[kind.code() as usize].wants_samples() {
+                        break;
+                    }
                     let pack = &self.tiers[0].packs[loc.pack as usize];
                     let payload = loc.offset.checked_add(RECORD_HEADER);
-                    // alloc: a settle (idle), until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
-                    let Some(bytes) = payload.and_then(|at| pack.bytes(at, loc.raw)).map(<[u8]>::to_vec) else {
+                    let Some(raw) = payload.and_then(|at| pack.bytes(at, loc.raw)) else { continue };
+                    // A record met by an earlier settle, or put while the store is open, is
+                    // sampled already: a settle that meets it again adds nothing.
+                    let content = content_of(raw);
+                    if self.training[kind.code() as usize].sampled.contains(&content) {
                         continue;
-                    };
-                    self.sample(kind, &bytes);
+                    }
+                    // alloc: a settle (idle), a value not sampled yet, until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
+                    let bytes = raw.to_vec();
+                    self.sample(kind, content, &bytes);
                     if self.dictionary_of(kind).is_some() {
                         break;
                     }
@@ -1465,12 +1519,31 @@ impl Store {
                 }
             };
             for &(key, loc, row) in group {
-                if spent > 0 && spent.saturating_add(loc.raw) > SETTLE_MOST {
+                let short = loc.raw < DEMOTE_FROM;
+                // A short cold record is listed while its kind has no dictionary only to be
+                // sampled (`tier_moves`). It is not moved yet: without the dictionary it saves
+                // too little, and would be marked tried and never moved once one is trained.
+                if short && number.is_none() {
+                    continue;
+                }
+                // A short record costs a record's work: counted as `DEMOTE_FROM` bytes, so a
+                // settle of many short records stays a short step too. They have at most
+                // `SHORT_MOST` of a settle, so a backlog of them leaves the rest of the step to
+                // longer records, promotion and retiring.
+                let cost = loc.raw.max(DEMOTE_FROM);
+                if short && spent_short.saturating_add(cost) > SHORT_MOST {
+                    more_short = true;
+                    continue;
+                }
+                if spent > 0 && spent.saturating_add(cost) > SETTLE_MOST {
                     settled.more = true;
                     break 'kinds;
                 }
                 let Some((content, bytes)) = self.movable(key, loc) else { continue };
-                spent += loc.raw;
+                spent += cost;
+                if short {
+                    spent_short += cost;
+                }
                 if let Some(columns) = encodings_of(&encodings, &bytes) {
                     match colder_columns(columns, loc, &bytes) {
                         Ok(Some((form, payload))) => {
@@ -1535,6 +1608,9 @@ impl Store {
             self.tiers[0].packs[at].retiring = true;
             settled.retired += 1;
         }
+        // Short records left by their share are more to do, said only now: `settled.more` set
+        // earlier would stop promotion and retiring in this settle.
+        settled.more |= more_short;
         let own = &self.tiers[0];
         if let Some(index) = &own.index {
             index.bits.rotate();
@@ -1555,10 +1631,21 @@ impl Store {
         let rows = self.look().rows(0, &mut bad);
         // alloc: once a settle (idle), the records it moves, sorted after
         let (mut demote, mut promote) = (Vec::new(), Vec::new());
+        // By kind code: whether a short record of the kind is listed. A cold kind's is, to be
+        // moved colder once the kind has a dictionary and, before, to be sampled while its
+        // training wants samples (after a reopen, the only way its records already kept are).
+        let short_listed: [bool; Kind::ALL.len()] = std::array::from_fn(|code| {
+            Kind::from_code(code as u8).is_some_and(|kind| {
+                kind.cold()
+                    && (self.dictionary_of(kind).is_some() || self.training[code].wants_samples())
+            })
+        });
         for (key, found) in rows {
             let Place::Pack(loc) = found.place else { continue };
             let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
-            if pack.removed || pack.retiring || loc.raw < DEMOTE_FROM {
+            // A short record goes colder only as `short_listed` says, and never comes back hot.
+            let short = loc.raw < DEMOTE_FROM;
+            if pack.removed || pack.retiring || (short && !short_listed[loc.kind.code() as usize]) {
                 continue;
             }
             let flag = |flag| found.at.get(flag);
@@ -1574,7 +1661,7 @@ impl Store {
                 {
                     demote.push((key, loc, found.at.row()));
                 }
-                Form::Zstd | Form::Warm | Form::ColdColumns if read && before => {
+                Form::Zstd | Form::Warm | Form::ColdColumns if read && before && !short => {
                     promote.push((key, loc, found.at.row()));
                 }
                 _ => {}
@@ -2732,7 +2819,7 @@ impl Store {
             }
             if number != 0 && header.kind.cold() && header.form == Form::Raw {
                 // The store's own puts were sampled as they were put.
-                self.sample(header.kind, payload);
+                self.sample(header.kind, header.content, payload);
             }
         }
         batch.moves.push(Move { key: header.key, from, to: loc });
@@ -3101,18 +3188,41 @@ impl Store {
             .map(|at| at as u32)
     }
 
-    fn sample(&mut self, kind: Kind, bytes: &[u8]) {
+    /// Keeps `bytes`, whose hash is `content`, as a sample of `kind` unless it is one already,
+    /// and trains the kind's dictionary once the samples are [`Training::ready`]: or, when they
+    /// are full and not ready, gives up training until the store is opened again.
+    fn sample(&mut self, kind: Kind, content: ContentId, bytes: &[u8]) {
         let training = &mut self.training[kind.code() as usize];
-        if training.samples.len() < cold::SAMPLES_MOST && training.bytes < cold::SAMPLE_BYTES_MOST {
-            // alloc: a training sample, at most `SAMPLES_MOST` a kind and only before its dictionary is trained
-            training.samples.push(bytes.to_vec());
-            training.bytes += bytes.len() as u64;
+        if !training.wants_samples() || !training.sampled.insert(content) {
+            return;
         }
-        if training.samples.len() >= cold::TRAIN_VALUES.max(training.after)
-            && training.bytes >= cold::TRAIN_BYTES
-        {
+        // alloc: a training sample, at most `SAMPLES_MOST` a kind and only before its dictionary is trained
+        training.samples.push(bytes.to_vec());
+        training.bytes += bytes.len() as u64;
+        if training.ready() {
             self.train(kind);
+        } else if training.full() {
+            // alloc: a problem reported, once a kind while the store is open
+            let why = format!(
+                "its samples are full ({} values, {} bytes) with fewer than the {} values a training needs",
+                training.samples.len(),
+                training.bytes,
+                cold::TRAIN_VALUES.max(training.after),
+            );
+            self.give_up_training(kind, &why);
         }
+    }
+
+    /// No dictionary of `kind` is trained while the store is open: its samples are freed and
+    /// no more are kept, and the problems say so, naming the kind. Its values are put raw and
+    /// its records shorter than [`DEMOTE_FROM`] stay raw, until a store opened again trains.
+    fn give_up_training(&mut self, kind: Kind, why: &str) {
+        self.training[kind.code() as usize] = Training { given_up: true, ..Training::default() };
+        // alloc: a problem reported
+        self.problems.push(format!(
+            "the {} values under {DEMOTE_FROM} bytes stay raw until the store is opened again: no dictionary is trained: {why}",
+            kind.name()
+        ));
     }
 
     fn train(&mut self, kind: Kind) {
@@ -3150,6 +3260,8 @@ impl Store {
                 });
                 self.publish();
             }
+            // Full samples get no more to train on twice as many: it cannot be tried again.
+            Err(why) if training.full() => self.give_up_training(kind, &why),
             Err(why) => {
                 training.after = training.samples.len() * 2;
                 // alloc: a problem reported

@@ -6,7 +6,7 @@
 //!
 //! Where each is called is part of its contract:
 //!
-//! - **On an IO thread of the plane**: [`Steps::fetch`], [`Steps::library`]. They may block on
+//! - **On an IO thread of the plane**: [`Steps::fetch`], [`Steps::library`], [`Steps::native`]. They may block on
 //!   the network or the disk; they touch no state of the loop.
 //! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
 //!   [`Front::ub_tests`], [`Front::evaluate`], [`Front::codegen_inputs`], [`Front::tables`],
@@ -140,6 +140,10 @@ pub struct JobInput {
     /// environment, held in memory for the job only and never logged or kept.
     pub config: Arc<BuildConfig>,
     pub units: Arc<Units>,
+    /// Each of `units.native` laid out ([`Steps::native`]), in its order: what a build script
+    /// of its packages is given. Empty until the job's native stage settles, and for a build
+    /// whose units name none.
+    pub native: Arc<[super::native::NativeDir]>,
     /// The store, read by tasks with no lock (a read is valid while its
     /// [`blaze_cas::enter`] guard is held); written only by the loop.
     pub store: blaze_cas::Reader,
@@ -517,6 +521,18 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// fingerprint, and where that library is mounted) has it there, read before by this
     /// daemon or one before it.
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError>;
+    /// On an IO thread, before a job's lowering when its units name any, once a digest for
+    /// every job asking it: `input`'s archive fetched by its digest and laid out read-only,
+    /// its directory ([`super::native::ensure`]). One that can't be is the error of each job
+    /// asking it, naming it; there is no other place a build script is pointed at. A wait for
+    /// another process laying it out stops once `cancelled` is set: once no job waits on it.
+    fn native(&self, input: &blaze_units::query::NativeInput, cancelled: &AtomicBool) -> Result<std::path::PathBuf, ApiError> {
+        let _ = cancelled;
+        Err(ApiError::new(
+            format!("pinned native input `{}`: these steps lay out none", input.name),
+            Some(input.pin.clone()), // clone: an error's place, once
+        ))
+    }
     /// On a worker, before a job's lowering builds anything: the leases of `units`' build dirs
     /// (`target_dir`, `build_dir`) for `checkout`, `builds` the dir of every workspace's build
     /// dir, each dir made and marked on disk as docs/gc.md says (the daemon's is
@@ -720,8 +736,10 @@ impl std::fmt::Display for Broken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Broken::Panicked(panic) => write!(f, "the daemon {panic}"),
-            Broken::Failed(ApiError { at: Some(at), what }) => write!(f, "it failed at {at}: {what}"),
-            Broken::Failed(ApiError { at: None, what }) => write!(f, "it failed: {what}"),
+            Broken::Failed(error) => match &error.at {
+                Some(at) => write!(f, "it failed at {at}: {}", error.what),
+                None => write!(f, "it failed: {}", error.what),
+            },
         }
     }
 }

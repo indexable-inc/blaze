@@ -46,6 +46,7 @@ pub mod reach;
 pub mod replace;
 pub mod run;
 pub mod say;
+pub mod terminal;
 pub mod test;
 
 use std::{
@@ -101,7 +102,7 @@ Commands:
     debug profile [--seconds N]    The daemon's flight recorder as a Chrome trace
     debug live                     The daemon's threads as they run
     debug sql QUERY                SQL over the profile history, flushed first (every row recorded so far)
-    explain VIEW [NAME=VALUE ...]  One of the history's named views
+    explain RULE|PACKAGE|VIEW      A rule's long text, the last failure of PACKAGE with all it blocks, or a history view
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
     reach [ROOT] [--json]          What the edits since ROOT reach (items, functions, tests), and the root now
     slow [--build N] [--top N] [--json]   What made the last build slow, ranked by the time each fix saves
@@ -376,7 +377,12 @@ fn cargo(asked: &Invocation) -> i32 {
         return refused("cannot set both --verbose and --quiet", auto_color());
     }
     let var = |name: &str| std::env::var(name).ok();
-    let color = match place::color(asked.flags.color.as_deref(), var, io::stderr().is_terminal()) {
+    let config = match terminal::config() {
+        Ok(config) => config,
+        Err(what) => return refused(&what, auto_color()),
+    };
+    let flag = terminal::color_flag(asked.flags.color.as_deref(), &config, var);
+    let color = match place::color(flag, var, io::stderr().is_terminal()) {
         Ok(color) => color,
         Err(what) => return refused(&what, auto_color()),
     };
@@ -412,7 +418,8 @@ fn cargo(asked: &Invocation) -> i32 {
     };
     let stats = std::env::var_os("BLAZE_STATS").is_some();
     let fixing = pinned.is_some();
-    let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color, stats, fixing };
+    let terminal = terminal::stderr(&config, color);
+    let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color, stats, fixing, terminal };
     // On a terminal, `test` draws its live view, whose screen thread writes stderr: the locks
     // below are taken only off that path.
     if live::wanted(asked, shown) {
@@ -514,6 +521,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     programs: &mut P,
 ) -> io::Result<Then> {
     let mut printer = Printer::new(shown, &place.root, out, err);
+    printer.place(std::env::var("HOME").ok(), observe::last_failure());
     // alloc: once a request, for `--reached` and `--ub`; it grows by doubling, not by a result.
     let mut results: Vec<TestResult> = Vec::new();
     let mut unwritten = None;

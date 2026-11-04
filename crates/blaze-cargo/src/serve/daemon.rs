@@ -1878,6 +1878,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
         blaze_profile::plot(Plot::ReservedBytes, memory.reserved);
+        let (span_map_bytes, span_map_pieces) = ::span::kept_maps();
+        blaze_profile::plot(Plot::SpanMapBytes, span_map_bytes);
+        blaze_profile::plot(Plot::SpanMapPieces, span_map_pieces);
         if now.saturating_sub(self.memory_logged) >= MEMORY_LOG_EVERY {
             self.memory_logged = now;
             log_memory(&memory);
@@ -2208,11 +2211,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             };
             let (_, mut it) = self.held.swap_remove(at);
             if let Said::Finish(_, _, Some(error), _) = &mut it {
-                // alloc: the error's text, once a held build
-                match &why {
-                    Some(why) => error.what = format!("{}; {why}", error.what),
-                    None => error.what = format!("{}; the daemon stopped while the build waited for gc to free space", error.what),
-                }
+                // alloc: the error and its words, once a held build
+                let more = match &why {
+                    Some(why) => why.to_string(),
+                    None => "the daemon stopped while the build waited for gc to free space".to_owned(),
+                };
+                *error = error.clone().and(&more);
             }
             said.push(it);
         }

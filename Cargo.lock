@@ -500,6 +500,7 @@ dependencies = [
  "blaze-mem",
  "blaze-protocol",
  "blaze-query",
+ "blaze-report",
  "blaze-serde",
  "blaze-vfs",
  "libc",
@@ -591,6 +592,7 @@ dependencies = [
  "blaze-protocol",
  "blaze-query",
  "blaze-registry",
+ "blaze-report",
  "blaze-serde",
  "blaze-sha256",
  "blaze-source",
@@ -625,6 +627,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "span",
  "stdx",
  "syntax",
  "tar",
@@ -865,10 +868,12 @@ dependencies = [
  "ix-prof",
  "libmimalloc-sys",
  "parking_lot",
+ "serde_json",
  "stdx",
  "tar",
  "toml",
  "toml_edit",
+ "tracing",
  "url",
 ]
 
@@ -904,10 +909,12 @@ dependencies = [
  "blaze-ids",
  "blaze-sha256",
  "crossbeam-channel",
+ "filetime",
  "papaya",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tar",
  "tempfile",
  "tracing",
  "unicode-normalization",
@@ -1672,6 +1679,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-report"
+version = "0.0.0"
+dependencies = [
+ "blaze-protocol",
+ "serde",
+ "sonic-rs",
+ "toml",
+ "unicode-width 0.2.3",
+]
+
+[[package]]
 name = "blaze-resolve"
 version = "0.0.0"
 dependencies = [
@@ -1857,6 +1875,7 @@ dependencies = [
  "blaze-ids",
  "blaze-protocol",
  "blaze-query",
+ "blaze-report",
  "blaze-v2-proof",
  "blaze-vfs",
  "hashbrown 0.17.1",
@@ -2354,10 +2373,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "corosensei"
 version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6886a0c0f263965933c438626e7179139a62b978a33aa18281cbf0cd5a975f34"
 dependencies = [
  "autocfg",
+ "cc",
  "cfg-if",
  "libc",
  "scopeguard",

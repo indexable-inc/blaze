@@ -1,15 +1,21 @@
 //! blaze's looks at itself (docs/profiling.md): `blaze explore`, the explorer's link to the
 //! daemon (docs/v2/plan/lanes/observe/explore.md); `blaze debug profile`, `blaze debug live`
 //! and `blaze debug sql`, the daemon's flight recorder and its profile history; `blaze
-//! explain`, a named view of that history; and `blaze why`, what the last build computed
-//! again and why.
+//! explain`, a rule's long text, the last build's failure of a package with all it blocks, or a
+//! named view of that history; and `blaze why`, what the last build computed again and why.
 //!
 //! `blaze debug sql` and `blaze explain` run the DuckDB [`observe::DUCKDB`] names, here in
 //! the CLI over the history's files, after asking the daemon that writes the history to flush
 //! ([`history_source`]), so they read every row it recorded before they asked, each once.
 //! Unset, they fail naming `nix run .#duckdb`: nothing looks for a DuckDB on `PATH`.
 
-use std::{ffi::OsString, fmt::Write as _, io::Write as _, path::PathBuf, time::Duration};
+use std::{
+    ffi::OsString,
+    fmt::Write as _,
+    io::Write as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
@@ -33,7 +39,7 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]";
-const EXPLAIN_USAGE: &str = "blaze explain VIEW [NAME=VALUE ...] [--json]";
+const EXPLAIN_USAGE: &str = "blaze explain RULE | PACKAGE [--json] | VIEW [NAME=VALUE ...] [--json]";
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
 
@@ -165,8 +171,10 @@ fn time(words: Vec<OsString>) -> Result<(), Refusal> {
     out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
-/// `blaze explain VIEW [NAME=VALUE ...] [--json]`: the view's SQL with its arguments bound,
-/// run over the history.
+/// `blaze explain RULE`: the long text of a rule a report names (`sandbox:link-dir`,
+/// [`blaze_report::rules`]). `blaze explain PACKAGE [--json]`: the last build's failure of the
+/// package, with every package it blocks ([`last_failure`]). `blaze explain VIEW [NAME=VALUE
+/// ...] [--json]`: the view's SQL with its arguments bound, run over the history.
 pub fn explain(words: Vec<OsString>, color: bool) -> i32 {
     said(explained(words), color)
 }
@@ -440,11 +448,24 @@ fn query(words: Vec<OsString>) -> Result<(), Refusal> {
 }
 
 fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
-    let mut words = texts(words)?.into_iter();
+    let words = texts(words)?;
+    let json_asked = words.iter().skip(1).any(|it| it == "--json");
+    let mut words = words.into_iter();
     let name = words.next().ok_or_else(|| {
         let names: Vec<_> = views::VIEWS.iter().map(|it| it.name).collect();
-        Refusal::Usage(format!("{EXPLAIN_USAGE}; the views are {}", names.join(", ")))
+        let rules: Vec<_> = blaze_report::rules::RULES.iter().map(|it| it.id).collect();
+        Refusal::Usage(format!("{EXPLAIN_USAGE}; the rules are {}; the views are {}", rules.join(", "), names.join(", ")))
     })?;
+    if let Some(rule) = blaze_report::rules::find(&name) {
+        let mut text = String::new();
+        blaze_report::rules::explain_into(&mut text, rule);
+        return stdout(&text);
+    }
+    if !views::VIEWS.iter().any(|it| it.name == name)
+        && let Some(report) = failure_of(&name)?
+    {
+        return stdout(&failure_text(&report, json_asked));
+    }
     let view = views::find(&name).map_err(|error| error.to_string())?;
     let mut shape = Shape::Table;
     let mut args = Map::new();
@@ -460,6 +481,62 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
     }
     let sql = views::render(view, &args).map_err(|error| error.to_string())?;
     print(&run(&sql)?, shape)
+}
+
+/// The file the CLI keeps the last build's failures in, for `blaze explain PACKAGE`: a JSON
+/// array of reports (`blaze_report::Report`), in the daemon's state directory.
+pub fn last_failure() -> Result<PathBuf, String> {
+    crate::serve::state().map(|it| it.join("last-failure.json")).map_err(|error| format!("{error:#}"))
+}
+
+/// `failures` kept in `file` whole: written beside it, then moved over it.
+pub fn remember(file: &Path, failures: &[blaze_api::Report]) -> Result<(), String> {
+    let failed = |error: &dyn std::fmt::Display| format!("{}: {error}", file.display());
+    let text = serde_json::to_string(failures).map_err(|error| failed(&error))?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| failed(&error))?;
+    }
+    let part = file.with_extension("json.part");
+    std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, file)).map_err(|error| failed(&error))
+}
+
+/// The last build's failure of package `name` (the package its report is of,
+/// [`blaze_api::Report::subject`]); `None` when it had none, or no build failed yet.
+fn failure_of(name: &str) -> Result<Option<blaze_api::Report>, Refusal> {
+    let file = last_failure()?;
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Refusal::Failed(format!("{}: {error}", file.display()))),
+    };
+    let reports: Vec<blaze_api::Report> =
+        serde_json::from_str(&text).map_err(|error| format!("{}: not the reports blaze keeps: {error}", file.display()))?;
+    Ok(reports.into_iter().find(|it| it.subject() == Some(name)))
+}
+
+/// A failure as `blaze explain PACKAGE` prints it: the report, then every package it blocks;
+/// with `--json`, the report whole.
+fn failure_text(report: &blaze_api::Report, json: bool) -> String {
+    if json {
+        let mut text = blaze_report::json(report);
+        text.push('\n');
+        return text;
+    }
+    let mut text = blaze_report::render(report, blaze_report::Caps::PLAIN, &blaze_report::Roots::NONE);
+    if let Some(blocks) = &report.blocks {
+        // Writing to a String cannot fail.
+        let _ = writeln!(text, "\nblocks {} {}:", blocks.count, blocks.what);
+        for name in &blocks.all {
+            let _ = writeln!(text, "  {name}");
+        }
+    }
+    text
+}
+
+/// `text` on stdout.
+fn stdout(text: &str) -> Result<(), Refusal> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))
 }
 
 /// `value` as the JSON of argument `key`'s type; a key the view does not take is passed as

@@ -151,7 +151,11 @@ where
         if a.is_never() {
             return Head::Never;
         }
-        if a.is_infer() {
+        // Only a type variable, as in rustc: an integer or float variable source is not "no
+        // information" (no coercion has an integer or float source), so it takes R3's up-front
+        // rejection and then R9's plain unification, binding the target at once instead of
+        // deferring a `Coerce` goal (and, under LUB, a fresh variable) per coercion.
+        if a.is_ty_var() {
             return Head::FromInfer;
         }
         if !shortcuts() {

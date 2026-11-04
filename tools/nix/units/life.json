@@ -10656,7 +10656,7 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "src": "src/lib.rs",
      "target": "blaze_inproc_rt"
     },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
@@ -18922,7 +18922,7 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "src": "src/lib.rs",
      "target": "blaze_inproc_rt"
     },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
@@ -28111,7 +28111,7 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "src": "src/lib.rs",
      "target": "blaze_inproc_rt"
     },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
@@ -36397,7 +36397,7 @@
       "overflow_checks": false,
       "panic": "unwind"
      },
-     "src": "../../library/blaze_inproc_rt/src/lib.rs",
+     "src": "src/lib.rs",
      "target": "blaze_inproc_rt"
     },
     "blaze-inproc@0.0.0 lib blaze_inproc build": {
