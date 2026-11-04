@@ -143,8 +143,10 @@ SPANS_QUERY = (
     "WHERE name IN ('macro expand', 'macro module') GROUP BY ALL ORDER BY ALL"
 )
 BUILDS_QUERY = "SELECT build_id, workspace, command, tree, blaze, outcome FROM builds ORDER BY build_id"
+# The message is the message alone (schema version 4); `events_wide.fields` has its unit and crate.
 EVENTS_QUERY = (
-    "SELECT build_id, message FROM events WHERE message LIKE 'unit record not kept:%' ORDER BY ALL"
+    "SELECT build_id, message || coalesce(' ' || fields, '') AS message FROM events_wide "
+    "WHERE message LIKE 'unit record not kept:%' ORDER BY ALL"
 )
 
 type Daemon = Literal["same", "restarted"]

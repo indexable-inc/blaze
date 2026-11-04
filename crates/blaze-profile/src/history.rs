@@ -76,6 +76,7 @@ use crate::{
     facts::{self, CrateDepRow, LinkRow, MissRow, QueryCountRow},
     flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
     identity,
+    logs,
     sampler::{self, Sample},
     schema::{self, Column, Table, Type},
     symbols,
@@ -231,6 +232,13 @@ pub struct Flushed {
     pub samples: usize,
     pub switches: usize,
     pub events: usize,
+    /// Rows of `event_fields`: the fields of the events written.
+    pub event_fields: usize,
+    /// DEBUG rows of events held for builds not yet ended, after the flush ([`logs::Hold`]).
+    pub events_held: usize,
+    /// DEBUG rows of events dropped since the history opened: of builds that ended well, or
+    /// past what is held ([`logs::Hold`]).
+    pub events_dropped: u64,
     pub errors: usize,
     pub links: usize,
     pub crate_deps: usize,
@@ -349,7 +357,7 @@ fn dictionary(column: &Column) -> bool {
     match column.ty {
         Type::Dict | Type::Stack | Type::Utf8 | Type::U16 | Type::U32 => true,
         Type::U64 => column.name == "build_id",
-        Type::I64 | Type::F64 => false,
+        Type::I64 | Type::F64 | Type::Bool => false,
     }
 }
 
@@ -681,6 +689,8 @@ pub struct History {
     unidentified: Option<HistoryError>,
     /// The threads' open spans the last flush wrote, their times left out ([`same_open`]).
     open_written: Vec<flight::ThreadNow>,
+    /// What a flush writes of DEBUG events ([`History::events_policy`]).
+    hold: logs::Hold,
 }
 
 impl History {
@@ -786,6 +796,7 @@ impl History {
             unidentified: None,
             // alloc: once a history
             open_written: Vec::new(),
+            hold: logs::Hold::new(logs::Policy::default()),
         };
         history.trim()?;
         Ok(history)
@@ -837,7 +848,28 @@ impl History {
                 }
             }
         }
+        if let Ok(build) = u32::try_from(row.build_id) {
+            match row.outcome {
+                Outcome::Failed | Outcome::Stalled => self.hold.ended(build, true),
+                Outcome::Ok | Outcome::Cancelled => self.hold.ended(build, false),
+                Outcome::Running => {}
+            }
+        }
         self.ended.push(row);
+    }
+
+    /// Sets what the flushes write of DEBUG events from now on ([`logs::Policy`]): the daemon's
+    /// [`logs::POLICY_VAR`]. A history opens under [`logs::Policy::Info`].
+    pub fn events_policy(&mut self, policy: logs::Policy) {
+        if self.hold.policy() != policy {
+            self.hold = logs::Hold::new(policy);
+        }
+    }
+
+    /// Has the next flush write the DEBUG events held for builds that have not ended: the
+    /// history is closing under them (the daemon stops, or its builds' requests are gone).
+    pub fn release_held(&mut self) {
+        self.hold.release_all();
     }
 
     /// Notes errors a build said ([`errors::rows`]), for the next flush to write.
@@ -879,6 +911,8 @@ impl History {
         // span, so a slow flush read as uncovered time on the history's thread.
         let _span = tracing::info_span!(target: "blaze", "profile flush").entered();
         let (late, behind) = self.drained.take(&mut self.read);
+        // DEBUG events are held for their build's end, written if it was in trouble.
+        self.hold.sort(&mut self.read);
         // The flight recorder's own losses, as counters: a query sees whether a stretch with
         // no span is one the recorder dropped. Written with each build's flush and whenever
         // they grew, so an idle daemon's timer writes no file for them.
@@ -1000,6 +1034,8 @@ impl History {
         let switches =
             [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
         let events = [batches::events(&self.read.events, self.process).map_err(arrow_error(&schema::EVENTS))?];
+        let event_fields =
+            [batches::event_fields(&self.read.fields, self.process).map_err(arrow_error(&schema::EVENT_FIELDS))?];
         let folded = [batches::folded(&self.read.folds, self.process).map_err(arrow_error(&schema::FOLDED))?];
         self.samples.clear();
         let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
@@ -1026,6 +1062,9 @@ impl History {
             samples: rows(&samples),
             switches: rows(&switches),
             events: rows(&events),
+            event_fields: rows(&event_fields),
+            events_held: self.hold.held(),
+            events_dropped: self.hold.dropped(),
             errors: rows(&errors),
             links: rows(&links),
             crate_deps: rows(&crate_deps),
@@ -1039,7 +1078,7 @@ impl History {
         let build = named;
         flushed.build = build;
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 13] = [
+        let tables: [(&'static Table, &[RecordBatch]); 14] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -1053,6 +1092,7 @@ impl History {
             (&schema::MISSES, &misses),
             (&schema::OPEN, &open),
             (&schema::FOLDED, &folded),
+            (&schema::EVENT_FIELDS, &event_fields),
         ];
         for (table, parts) in tables {
             if rows(parts) == 0 {
@@ -1302,6 +1342,7 @@ pub fn write_live(window: Duration, dir: &Path) -> Result<Flushed, HistoryError>
     let counters = batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?;
     let switches = batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?;
     let events = batches::events(&read.events, process).map_err(arrow_error(&schema::EVENTS))?;
+    let event_fields = batches::event_fields(&read.fields, process).map_err(arrow_error(&schema::EVENT_FIELDS))?;
     let mut writer = Writer::new();
     writer.schemas(dir)?;
     let mut flushed = Flushed {
@@ -1309,13 +1350,15 @@ pub fn write_live(window: Duration, dir: &Path) -> Result<Flushed, HistoryError>
         counters: counters.num_rows(),
         switches: switches.num_rows(),
         events: events.num_rows(),
+        event_fields: event_fields.num_rows(),
         ..Flushed::default()
     };
-    let tables: [(&'static Table, RecordBatch); 4] = [
+    let tables: [(&'static Table, RecordBatch); 5] = [
         (&schema::SPANS, spans),
         (&schema::COUNTERS, counters),
         (&schema::SWITCHES, switches),
         (&schema::EVENTS, events),
+        (&schema::EVENT_FIELDS, event_fields),
     ];
     for (table, batch) in tables {
         // alloc: a file's name, once a file

@@ -297,9 +297,14 @@ impl Keeper {
     }
 }
 
-/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on;
-/// a history that does not open is the error, which fails `blaze serve`.
-pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling, Keeper), String> {
+/// Opens the history in `state` on the thread `blaze-history`, which keeps it from then on,
+/// writing DEBUG events by `events` ([`blaze_profile::logs::Policy`]); a history that does not
+/// open is the error, which fails `blaze serve`.
+pub fn keep_history(
+    state: &Path,
+    duckdb: Option<PathBuf>,
+    events: blaze_profile::logs::Policy,
+) -> Result<(Profiling, Keeper), String> {
     let dir = history::dir_in(state);
     let owner = claim(&dir).map_err(|it| it.to_string())?;
     let (ended, rows) = crossbeam_channel::unbounded();
@@ -316,7 +321,8 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
             // from what this one wrote.
             let _owner = owner;
             match History::open(&at, history::CAP_BYTES, blaze_profile::sampler::process()) {
-                Ok(history) => {
+                Ok(mut history) => {
+                    history.events_policy(events);
                     _ = opened_to.send(Ok(history.next_build()));
                     // Off the daemon's start path: builds that end meanwhile wait in `rows`.
                     now.set(Step::Restoring, 0);
@@ -470,6 +476,8 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                     tracing::error!("{error}");
                     _ = failed.send(error);
                 }
+                // Builds still under way as the daemon stops write the DEBUG events held for them.
+                history.release_held();
                 (history.flush(None), true)
             }
         });

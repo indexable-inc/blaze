@@ -249,20 +249,44 @@ impl SpanIn {
     }
 }
 
-/// An event as the model takes it: the columns of `events` it reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An event as the model takes it: the columns of `events` it reads, and its rows of
+/// `event_fields`. A profiled process's part keeps its events so too.
+#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct EventIn {
     pub process: u32,
     pub thread: u32,
     pub t_ns: i64,
+    /// The build it was part of.
+    #[serde(default)]
+    pub build: Option<u64>,
     /// The job running on the thread, as a switch's `job` names it.
     pub job: Option<u64>,
     pub level: String,
     pub target: String,
     pub name: String,
+    /// Its message alone.
     pub message: Option<String>,
     /// The span it happened in, as a span's `span_id`.
     pub span: Option<u64>,
+    /// Its id in its process, as `events.event_id`.
+    #[serde(default)]
+    pub event_id: u64,
+    /// Its fields other than its message, in the order it recorded them: each key and value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, crate::logs::Value)>,
+}
+
+impl EventIn {
+    /// Its message, then each field as `key=value`: a label.
+    pub fn said(&self) -> String {
+        let message = self.message.as_deref().unwrap_or("(its text was let go)");
+        match self.fields.is_empty() {
+            // alloc: a label, once an event a report
+            true => message.to_owned(),
+            // alloc: a label, once an event a report
+            false => format!("{message} {}", crate::logs::fields_text(&self.fields)),
+        }
+    }
 }
 
 /// A build's rows.
@@ -327,6 +351,13 @@ impl Input {
                 folded_ns: it.folded_ns,
             });
         }
+        // alloc: the dump's fields by event, once a dump
+        let mut fields: HashMap<u64, Vec<(String, crate::logs::Value)>, Global> = HashMap::new_in(Global);
+        for it in &read.fields {
+            let key = flight::meta(it.site).and_then(|meta| meta.fields().iter().nth(usize::from(it.index))).map_or("?", |it| it.name());
+            // alloc: a field, once a field a dump
+            fields.entry(it.event_id).or_default().push((key.to_owned(), crate::logs::Value::of(it.value)));
+        }
         let events = read
             .events
             .iter()
@@ -336,6 +367,7 @@ impl Input {
                     process,
                     thread: it.thread,
                     t_ns: it.t_ns,
+                    build: (it.build != 0).then_some(u64::from(it.build)),
                     job: (it.job != 0).then_some(it.job),
                     // alloc: an event's labels, once an event a dump
                     level: meta.map_or("?", |it| it.level().as_str()).to_owned(),
@@ -343,6 +375,8 @@ impl Input {
                     name: meta.map_or("?", |it| it.name()).to_owned(),
                     message: text(it.message),
                     span: (it.span != 0).then_some(it.span),
+                    event_id: it.event_id,
+                    fields: fields.remove(&it.event_id).unwrap_or_default(),
                 }
             })
             // alloc: the dump's events, once a dump

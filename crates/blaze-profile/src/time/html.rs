@@ -81,7 +81,7 @@ pub fn page(model: &Model, path: &Path, top: usize) -> String {
 fn events(model: &Model, out: &mut String) {
     const EVENTS_SHOWN: usize = 500;
     let shown = model.events.len().min(EVENTS_SHOWN);
-    _ = writeln!(out, "<h2>Events</h2><p>The first {shown} of the build's {} warn, error and info events.</p>", model.events.len());
+    _ = writeln!(out, "<h2>Events</h2><p>The first {shown} of the build's {} kept events (error, warn, info, and debug when written), each with its fields.</p>", model.events.len());
     if shown == 0 {
         return;
     }
@@ -98,7 +98,7 @@ fn events(model: &Model, out: &mut String) {
             escape(text, out);
             out.push_str("</td><td>");
         }
-        escape(it.message.as_deref().unwrap_or("(its text was let go)"), out);
+        escape(&it.said(), out);
         out.push_str("</td></tr>\n");
     }
     out.push_str("</table>\n");

@@ -895,14 +895,204 @@ pub fn switched(switch: Switch) {
 
 /// The low byte of word 4 of an event's row ([`evented`]).
 const EVENT_ROW: u64 = 0xfc;
+/// The low byte of word 4 of the rows that follow an event's row when it has fields other than
+/// its message: up to [`COL_WORDS`] values a row, at the words `COL_WORDS` names, the event's
+/// id at word 3, and in word 4 above its low byte one [`FIELD_SLOT_BITS`] slot a value: the
+/// field's index in its callsite << 3 | its [`FieldValue`] kind (0: no value in that word).
+const EVENT_FIELDS_ROW: u64 = 0xf8;
+const FIELD_SLOT_SHIFT: u32 = 8;
+const FIELD_SLOT_BITS: u32 = 9;
+const _: () = assert!(
+    FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * COL_WORDS.len() as u32 <= 62,
+    "a fields row's slots sit below its kind"
+);
+/// Fields of an event kept: `tracing`'s macros write at most 32 a callsite. A field's index
+/// is 6 bits of its slot.
+pub const EVENT_FIELDS: usize = 32;
+const _: () = assert!(EVENT_FIELDS <= 1 << (FIELD_SLOT_BITS - 3), "a field's index fits its slot");
+/// The bits of an event's id that are its row's place in its ring; above them, the ring's number.
+const EVENT_INDEX_BITS: u32 = 48;
+
+/// An event's id: the ring it was written in and its row's place there, which never repeat in
+/// a process (a ring's rows are numbered from its making, whichever thread holds it).
+const fn event_id(ring: u16, index: u64) -> u64 {
+    (ring as u64) << EVENT_INDEX_BITS | index & ((1 << EVENT_INDEX_BITS) - 1)
+}
+
+/// Fields of events past [`EVENT_FIELDS`] or recorded while their text could not be written
+/// (a field's `Debug` that itself logs), since the process began: not kept.
+static FIELDS_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// A field's value as an event recorded it: a number as itself, text interned ([`intern`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FieldValue {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Bool(bool),
+    Str(Sym),
+}
+
+impl FieldValue {
+    /// Its kind as a fields row's slot says it, from 1; 0 is no value.
+    pub(crate) const fn kind(self) -> u64 {
+        match self {
+            FieldValue::I64(_) => 1,
+            FieldValue::U64(_) => 2,
+            FieldValue::F64(_) => 3,
+            FieldValue::Bool(_) => 4,
+            FieldValue::Str(_) => 5,
+        }
+    }
+
+    const fn word(self) -> u64 {
+        match self {
+            FieldValue::I64(it) => it as u64,
+            FieldValue::U64(it) => it,
+            FieldValue::F64(it) => it.to_bits(),
+            FieldValue::Bool(it) => it as u64,
+            FieldValue::Str(it) => it as u64,
+        }
+    }
+
+    fn of(kind: u64, word: u64) -> Option<FieldValue> {
+        Some(match kind {
+            1 => FieldValue::I64(word as i64),
+            2 => FieldValue::U64(word),
+            3 => FieldValue::F64(f64::from_bits(word)),
+            4 => FieldValue::Bool(word != 0),
+            5 => FieldValue::Str(word as Sym),
+            _ => return None,
+        })
+    }
+
+    /// Its kind as `event_fields.kind` names it.
+    pub const fn kind_name(self) -> &'static str {
+        match self {
+            FieldValue::I64(_) => "i64",
+            FieldValue::U64(_) => "u64",
+            FieldValue::F64(_) => "f64",
+            FieldValue::Bool(_) => "bool",
+            FieldValue::Str(_) => "str",
+        }
+    }
+}
+
+/// What an event said: its message and its other fields, each by its index in its callsite,
+/// as [`evented`] writes them. A fixed buffer, so a number is kept with no allocation; text is
+/// interned.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Logged {
+    /// Its `message` field, interned; 0 for none.
+    pub(crate) message: Sym,
+    fields: [(u8, FieldValue); EVENT_FIELDS],
+    len: usize,
+}
+
+impl Logged {
+    const EMPTY: Logged = Logged { message: 0, fields: [(0, FieldValue::Bool(false)); EVENT_FIELDS], len: 0 };
+
+    /// Its fields other than its message, in the order it recorded them: each one's index in
+    /// its callsite's fields and its value.
+    pub(crate) fn fields(&self) -> &[(u8, FieldValue)] {
+        &self.fields[..self.len]
+    }
+
+    fn put(&mut self, field: &tracing::field::Field, value: FieldValue) {
+        let index = field.index();
+        if self.len == EVENT_FIELDS || index >= EVENT_FIELDS {
+            FIELDS_LOST.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.fields[self.len] = (index as u8, value);
+        self.len += 1;
+    }
+
+    fn text(&mut self, field: &tracing::field::Field, sym: Sym) {
+        if field.name() == "message" {
+            self.message = sym;
+        } else {
+            self.put(field, FieldValue::Str(sym));
+        }
+    }
+}
+
+impl tracing::field::Visit for Logged {
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.put(field, FieldValue::I64(value));
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.put(field, FieldValue::U64(value));
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.put(field, FieldValue::F64(value));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.put(field, FieldValue::Bool(value));
+    }
+
+    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+        match i64::try_from(value) {
+            Ok(it) => self.put(field, FieldValue::I64(it)),
+            Err(_) => self.record_debug(field, &value),
+        }
+    }
+
+    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+        match u64::try_from(value) {
+            Ok(it) => self.put(field, FieldValue::U64(it)),
+            Err(_) => self.record_debug(field, &value),
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.text(field, intern(value));
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let sym = TEXT
+            .try_with(|text| {
+                // A field's `Debug` that itself logs finds the text taken: that field is lost.
+                let mut text = text.try_borrow_mut().ok()?;
+                text.clear();
+                // Writing to a `String` does not fail.
+                _ = write!(text, "{value:?}");
+                Some(intern(&text))
+            })
+            .ok()
+            .flatten();
+        match sym {
+            Some(sym) => self.text(field, sym),
+            None => _ = FIELDS_LOST.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+/// What [`evented`] wrote of an event: what a profile's part keeps of it beside the ring
+/// (`crate::Recorder`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Evented {
+    /// Its [`EventRow::event_id`].
+    pub(crate) event_id: u64,
+    pub(crate) job: u64,
+    pub(crate) span: u64,
+    pub(crate) build: u32,
+    pub(crate) logged: Logged,
+}
 
 /// Notes the `tracing` event `event` of `site` now, in this thread's ring: one row, the `events`
-/// table's. Words: when, the job running here ([`running_job`]), the span it happened in, its
-/// site (level, target and name), its message and fields as one interned text, and its build.
-pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
+/// table's, then a row each [`COL_WORDS`] of its fields other than its message, the
+/// `event_fields` table's. The event's words: when, the job running here ([`running_job`]), the
+/// span it happened in, its site (level, target and name), its message interned, and its
+/// build; its id is its ring and its row's place there ([`event_id`]). A field's number is kept
+/// as itself, with no allocation, and its text interned. `None` when the thread has no ring.
+pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) -> Option<Evented> {
     let Some(ring) = ring() else {
         RINGLESS.fetch_add(1, Ordering::Relaxed);
-        return;
+        return None;
     };
     let span = if event.is_root() {
         0
@@ -914,48 +1104,35 @@ pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
     };
     let span = if span == UNRECORDED { 0 } else { span };
     keep(span);
-    let message = TEXT
-        .try_with(|text| {
-            // A field's `Debug` that itself logs finds the text taken: that event has none.
-            let Ok(mut text) = text.try_borrow_mut() else { return 0 };
-            text.clear();
-            event.record(&mut Message(&mut *text));
-            intern(&text)
-        })
-        .unwrap_or(0);
+    // Every field is read before a row is written: a field's `Debug` that logs writes its own
+    // event's rows first, never between this one's.
+    let mut logged = Logged::EMPTY;
+    event.record(&mut logged);
     let running = RUNNING.with(Cell::get);
     let build = match BUILD.with(Cell::get) {
         0 => running.build,
         build => build,
     };
+    let now = clock::ticks();
     let what = KIND_PLOT << 62 | u64::from(site) << 8 | EVENT_ROW;
-    ring.put([clock::ticks(), running.job, span, 0, what, u64::from(message), u64::from(build), 0]);
+    let index = ring.put([now, running.job, span, 0, what, u64::from(logged.message), u64::from(build), 0]);
+    let id = event_id(ring.number, index);
+    for chunk in logged.fields().chunks(COL_WORDS.len()) {
+        let mut row = [now, 0, 0, id, 0, 0, 0, 0];
+        let mut slots = 0;
+        for (place, &(index, value)) in chunk.iter().enumerate() {
+            row[COL_WORDS[place]] = value.word();
+            slots |= (u64::from(index) << 3 | value.kind()) << (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32);
+        }
+        row[4] = KIND_PLOT << 62 | slots | EVENT_FIELDS_ROW;
+        ring.put(row);
+    }
+    Some(Evented { event_id: id, job: running.job, span, build, logged })
 }
 
-/// An event's fields as one text: its message, then each other field as `name=value`.
-struct Message<'a>(&'a mut String);
-
-impl Message<'_> {
-    fn put(&mut self, name: &str, value: std::fmt::Arguments<'_>) {
-        if !self.0.is_empty() {
-            self.0.push(' ');
-        }
-        // Writing to a `String` does not fail.
-        if name != "message" {
-            _ = write!(self.0, "{name}=");
-        }
-        _ = self.0.write_fmt(value);
-    }
-}
-
-impl tracing::field::Visit for Message<'_> {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.put(field.name(), format_args!("{value}"));
-    }
-
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.put(field.name(), format_args!("{value:?}"));
-    }
+/// Fields of events not kept since the process began ([`FIELDS_LOST`]).
+pub fn fields_lost() -> u64 {
+    FIELDS_LOST.load(Ordering::Relaxed)
 }
 
 // --- Allocations --------------------------------------------------------------------------
@@ -1073,7 +1250,7 @@ const _: () = assert!(TYPED < FOLDED_TICKS_COL as usize, "a typed column's index
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
-    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, EVENT_ROW, SPAN_COLS_ROW, FOLD_ROW];
+    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, EVENT_ROW, EVENT_FIELDS_ROW, SPAN_COLS_ROW, FOLD_ROW];
     let mut i = 0;
     while i < bytes.len() {
         assert!(bytes[i] as usize >= Plot::ALL.len(), "a row's plot byte is no plot's");
@@ -1268,8 +1445,9 @@ impl Ring {
         }
     }
 
+    /// Writes `row` as the ring's next: its place in the ring, counted from the ring's making.
     #[inline]
-    fn put(&self, row: [u64; WORDS]) {
+    fn put(&self, row: [u64; WORDS]) -> u64 {
         let i = self.head.load(Ordering::Relaxed);
         let at = (i as usize & (CAP - 1)) * WORDS;
         fence(Ordering::Release);
@@ -1277,6 +1455,7 @@ impl Ring {
             word.store(value, Ordering::Relaxed);
         }
         self.head.store(i + 1, Ordering::Release);
+        i
     }
 
     /// The rows from index `from` that are whole now, each with its index, into `into`; the
@@ -2302,8 +2481,28 @@ pub struct EventRow {
     /// The span it happened in: 0 for none.
     pub span: u64,
     pub site: u16,
-    /// Its message and fields ([`name`]).
+    /// Its message alone ([`name`]): its other fields are its [`FieldRow`]s.
     pub message: Sym,
+    /// Its id, which no other event of the process has ([`event_id`]): what its fields name.
+    pub event_id: u64,
+}
+
+/// A row of the schema's `event_fields` table: one field, other than its message, of an event
+/// ([`evented`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FieldRow {
+    pub build: u32,
+    /// When its event was, as [`EventRow::t_ns`].
+    pub t_ns: i64,
+    /// Its event's [`EventRow::event_id`].
+    pub event_id: u64,
+    /// Its event's site: with `index`, its key.
+    pub site: u16,
+    /// Its place in its callsite's fields ([`tracing::field::Field::index`]).
+    pub index: u8,
+    /// Its place among its event's fields as the event recorded them.
+    pub ordinal: u16,
+    pub value: FieldValue,
 }
 
 /// A row of the schema's `folded` table: the spans of a site shorter than [`fold_below`]'s
@@ -2347,6 +2546,8 @@ pub struct Read {
     pub counters: Vec<CounterRow>,
     pub switches: Vec<SwitchRow>,
     pub events: Vec<EventRow>,
+    /// The fields of `events`, after them in the order they were read.
+    pub fields: Vec<FieldRow>,
     pub folds: Vec<FoldRow>,
     pub ends: Vec<BuildEnd>,
     /// Rows written over before this reader read them: it fell behind by that many.
@@ -2368,6 +2569,7 @@ impl Read {
         self.counters.clear();
         self.switches.clear();
         self.events.clear();
+        self.fields.clear();
         self.folds.clear();
         self.ends.clear();
         self.skipped = 0;
@@ -2375,7 +2577,13 @@ impl Read {
 
     /// The rows it holds, of every table.
     pub fn rows(&self) -> usize {
-        self.spans.len() + self.counters.len() + self.switches.len() + self.events.len() + self.folds.len() + self.ends.len()
+        self.spans.len()
+            + self.counters.len()
+            + self.switches.len()
+            + self.events.len()
+            + self.fields.len()
+            + self.folds.len()
+            + self.ends.len()
     }
 
     /// The highest build any of its rows is of; 0 when none is of a build.
@@ -2426,6 +2634,7 @@ pub fn window(window: Duration, into: &mut Read) {
     into.counters.retain(|it| it.t_ns >= since);
     into.switches.retain(|it| it.t_ns >= since);
     into.events.retain(|it| it.t_ns >= since);
+    into.fields.retain(|it| it.t_ns >= since);
     into.folds.retain(|it| it.to_ns >= since);
     into.ends.retain(|it| it.t_ns >= since);
 }
@@ -2499,7 +2708,21 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                     span: row[2],
                     site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
                     message: row[5] as Sym,
+                    event_id: event_id(ring.number, i),
                 }),
+                KIND_PLOT if row[4] & 0xff == EVENT_FIELDS_ROW => {
+                    // Written right after its event's row, by the same thread: the event read
+                    // last, unless the ring wrote over that row first.
+                    let Some(event) = into.events.last().filter(|it| it.event_id == row[3]) else { continue };
+                    let (build, t_ns, site) = (event.build, event.t_ns, event.site);
+                    let mut ordinal = into.fields.iter().rev().take_while(|it| it.event_id == row[3]).count() as u16;
+                    for (place, &word) in COL_WORDS.iter().enumerate() {
+                        let slot = row[4] >> (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32) & ((1 << FIELD_SLOT_BITS) - 1);
+                        let Some(value) = FieldValue::of(slot & 0b111, row[word]) else { continue };
+                        into.fields.push(FieldRow { build, t_ns, event_id: row[3], site, index: (slot >> 3) as u8, ordinal, value });
+                        ordinal += 1;
+                    }
+                }
                 KIND_PLOT if row[4] & 0xff == SPAN_COPIED_ROW => {
                     // Written right after its span's row, by the same thread: the span read
                     // last, unless the ring wrote over that row first.

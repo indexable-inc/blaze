@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use crate::schema;
 
 /// The DuckDB views every query runs after: one a table, and `queries`, `passes`,
-/// `fiber_stacks`, `job_waits`, `job_spans` and `span_sums`. Each
+/// `fiber_stacks`, `job_waits`, `job_spans`, `span_sums`, `event_values` and `events_wide`. Each
 /// `@<table>` in it is a list of globs, filled in by [`prelude`].
 pub const PRELUDE: &str = include_str!("../sql/views.sql");
 
@@ -567,6 +567,7 @@ mod tests {
         "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
         "then", "union", "union_by_name", "using", "view", "when", "where", "with", "true",
         "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar",
+        "hugeint",
     ];
     /// DuckDB's functions the SQL files call.
     const FUNCTIONS: &[&str] = &[

@@ -17,6 +17,7 @@ pub fn data_type(ty: Type) -> DataType {
         Type::U64 => DataType::UInt64,
         Type::I64 => DataType::Int64,
         Type::F64 => DataType::Float64,
+        Type::Bool => DataType::Boolean,
         Type::Utf8 => DataType::Utf8,
         Type::Dict => dict(),
         // alloc: a schema, made once a table per process
