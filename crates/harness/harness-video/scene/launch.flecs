@@ -8,7 +8,7 @@
 //   1.7           the fire catches from the b to the e, on A major; the frame starts a slow push in
 //   3.8 to 6.8    the letters glow white hot, burn down the fire's colours and crumble into embers
 //   5.6           the theme comes home, E A then a low A (burn + 1.8 in the exit's sound): on that A, where the letters
-//                 stood, where to find it, arriving hot and cooling; it holds under the exit's pad and fades out with it,
+//                 stood, where to find it (its https:// quiet), arriving hot and cooling; it holds under the exit's pad and fades out with it,
 //                 to the dark ground the video started on
 //
 // Motion is data: a `Cue` child moves one member of its node (`Pose.fade`, `Pose.shrink`...) between two values over a
@@ -18,6 +18,12 @@
 // ---- the moves ----
 @tree ChildOf
 cue {
+  // Fade in over `dur` from `at`, slowly at both ends.
+  template FadeIn {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    Cue: {member: "Pose.fade", from: 1, to: 0, at: $at, dur: $dur, ease: InOut}
+  }
   // Fade out over `dur` from `at`, slowly at both ends.
   template FadeOut {
     prop at: f32 = 0
@@ -68,11 +74,20 @@ launch : ui.ZStack {
     }
   }
 
-  // Where to find it, where the mark stood: each glyph arrives hot and cools.
+  // Where to find it, where the mark stood: the scheme fades in quietly, then the address arrives a glyph at a time,
+  // each hot and cooling.
   outro : launch_part.Layer {
-    url : launch_part.Lead {
-      Text: {s: "ix.dev/blaze"}
-      GlyphsIn: {at: $home, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
+    url : ui.Row {
+      Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+      scheme : launch_part.Lead {
+        Text: {s: "https://"}
+        Fill: $tone_ink_3
+        cue.FadeIn arrive(at: $home - 0.3, dur: 0.6)
+      }
+      name : launch_part.Lead {
+        Text: {s: "ix.dev/blaze"}
+        GlyphsIn: {at: $home, per: 0.045, dur: 0.5, by: 0, ease: Out, cool: 1.1, hot: $fire_3}
+      }
       cue.FadeOut leave(at: 8.5, dur: 1.4)
     }
   }
