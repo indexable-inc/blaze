@@ -4,6 +4,7 @@ mod db;
 mod messages;
 mod object;
 mod daemon;
+mod inject;
 mod paths;
 mod profiles;
 mod proto;
@@ -17,9 +18,9 @@ use serde_json::json;
 
 const USAGE: &str = "\
 harness                       start the daemon if needed, open the web UI, return
-harness claude|codex|shell [args...]
+harness claude|codex|cursor|shell [args...]
                               start a locked-down agent in this directory, open it in the web UI
-harness tui [claude|codex|shell [args...]]
+harness tui [claude|codex|cursor|shell [args...]]
                               terminal UI instead of the browser (ctrl-] returns to the tree)
 harness ls [--all]            print the session tree (--all: past sessions too, from the index)
 harness send <id> <text...>   type a message into a session and press Enter
@@ -40,7 +41,7 @@ async fn main() -> Result<()> {
     let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
     match args.first().map(String::as_str) {
         None => open_web(None).await,
-        Some(kind @ ("claude" | "codex" | "shell")) => {
+        Some(kind @ ("claude" | "codex" | "cursor" | "shell")) => {
             let (cols, rows) = crossterm::terminal::size().unwrap_or((140, 45));
             let cwd = std::env::current_dir()?.display().to_string();
             let v = client::Ctl::connect()
@@ -50,7 +51,7 @@ async fn main() -> Result<()> {
             open_web(v["id"].as_u64()).await
         }
         Some("tui") => match args.get(1).map(String::as_str) {
-            Some(kind @ ("claude" | "codex" | "shell")) => client::run(Some((kind.to_string(), args[2..].to_vec()))).await,
+            Some(kind @ ("claude" | "codex" | "cursor" | "shell")) => client::run(Some((kind.to_string(), args[2..].to_vec()))).await,
             _ => client::run(None).await,
         },
         Some("daemon") => {

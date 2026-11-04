@@ -3,7 +3,7 @@
 import { table, type Table } from "./table.ts";
 import { req } from "./daemon.ts";
 
-export type Kind = "claude" | "codex" | "shell";
+export type Kind = "claude" | "codex" | "cursor" | "shell";
 export type AgentInfo = {
   id: number; kind: Kind; parent: number | null; title: string; cwd: string;
   exit: number | null; attached: number; cols: number; rows: number; created_ms: number;

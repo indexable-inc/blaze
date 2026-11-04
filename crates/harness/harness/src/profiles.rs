@@ -20,7 +20,7 @@ pub struct Ctx<'a> {
     pub prompt: Option<&'a str>,
 }
 
-pub const KINDS: &[&str] = &["claude", "codex", "shell"];
+pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 
 const SYSTEM_NOTE: &str = "You are running inside harness. Your only tool is `ts`, a persistent TypeScript REPL whose \
 description lists the functions in scope (web search, agents.spawn/send/screen/tree to run and talk to other agents, \
@@ -51,6 +51,7 @@ pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut l = match kind {
         "claude" => claude(ctx),
         "codex" => codex(ctx)?,
+        "cursor" => cursor(ctx)?,
         "shell" => Launch {
             program: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()),
             args: vec!["-l".into()],
@@ -74,6 +75,8 @@ fn claude(ctx: &Ctx) -> Launch {
         "--setting-sources", "",                // ignore user/project/local settings: no hooks, plugins, permissions
         "--disable-slash-commands",             // no skills or custom commands
         "--no-chrome",
+        "--dangerously-skip-permissions",       // yolo: nothing ever prompts
+        "--settings", r#"{"skipDangerousModePermissionPrompt":true}"#, // flag settings apply despite --setting-sources ""
         "--append-system-prompt", SYSTEM_NOTE,
     ];
     let mut env = common_env(ctx);
@@ -82,6 +85,9 @@ fn claude(ctx: &Ctx) -> Launch {
         ("DISABLE_TELEMETRY", "1"),
         ("DISABLE_ERROR_REPORTING", "1"),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),  // no CLAUDE.md / AGENTS.md from any level
+        ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+        ("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1"),
     ] {
         env.insert(k.into(), v.into());
     }
@@ -123,10 +129,11 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         "-c".into(), "mcp_servers.harness.default_tools_approval_mode=\"approve\"".into(), // ts runs without prompts
         "-c".into(), "web_search=\"disabled\"".into(),
         "-c".into(), "tools.experimental_request_user_input={enabled=false}".into(),
+        "-c".into(), "project_doc_max_bytes=0".into(), // no AGENTS.md from the repo (global one is out via CODEX_HOME)
         "-c".into(), "skills.include_instructions=false".into(),
         "-c".into(), "skills.bundled={enabled=false}".into(),
         "-c".into(), format!("developer_instructions={}", toml_str(SYSTEM_NOTE)),
-        "-a".into(), "never".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(), // yolo: no approvals, no sandbox
     ];
     if let Some(catalog) = codex_catalog(&home)? {
         args.push("-c".into());
@@ -164,6 +171,141 @@ fn codex_catalog(home: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
     let out = home.join("catalog.locked.json");
     std::fs::write(&out, serde_json::to_vec(&serde_json::json!({ "models": models }))?)?;
     Ok(Some(out))
+}
+
+/// Built-in Cursor tools are chosen by the server; the `x-cursor-agent-allowed-tools` request header
+/// (what the hidden `--allowed-tools` flag sets) keeps only the MCP gateway, whose `get_mcp_tools`
+/// the server requires alongside `mcp`.
+const CURSOR_TOOLS: &str = "mcp_tool_call,get_mcp_tools_tool_call";
+
+fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
+    // cursor-agent reads mcp.json, plugins, skills and cli-config.json from `homedir()/.cursor`, so it
+    // runs with a private HOME. Auth lives in the macOS login keychain, found via $HOME/Library/Keychains.
+    let real_home = PathBuf::from(std::env::var("HOME")?);
+    let home = paths::home().join("cursor-home");
+    let dot = home.join(".cursor");
+    std::fs::create_dir_all(&dot)?;
+    std::fs::create_dir_all(home.join("Library"))?;
+    for (src, dst) in [("Library/Keychains", "Library/Keychains"), (".gitconfig", ".gitconfig")] {
+        let (src, dst) = (real_home.join(src), home.join(dst));
+        if src.exists() && std::fs::symlink_metadata(&dst).is_err() {
+            std::os::unix::fs::symlink(&src, &dst)?;
+        }
+    }
+
+    // Only the harness MCP server. The note goes in as MCP server instructions: cursor has no
+    // user-settable system prompt, and user rules come from the account, not disk.
+    // The file is shared by every cursor session, so per-session values are `${env:...}` references that
+    // cursor fills from its own environment (MCP servers don't inherit it otherwise).
+    let env = json!({
+        "HOME": real_home.display().to_string(),
+        "PATH": std::env::var("PATH").unwrap_or_default(),
+        "HARNESS_SESSION": "${env:HARNESS_SESSION}",
+        "HARNESS_SOCK": "${env:HARNESS_SOCK}",
+        "HARNESS_CWD": "${env:HARNESS_CWD}",
+        "HARNESS_MCP_INSTRUCTIONS": SYSTEM_NOTE,
+    });
+    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args(), "env": env } } });
+    let mcp = serde_json::to_vec_pretty(&mcp)?;
+    if std::fs::read(dot.join("mcp.json")).ok().as_deref() != Some(&mcp[..]) {
+        std::fs::write(dot.join("mcp.json"), mcp)?;
+    }
+
+    // Permissions: ts runs without prompts, every built-in that could still slip through is denied.
+    // The first launch inherits the user's model choice from their real config.
+    let cfg_path = dot.join("cli-config.json");
+    let mut cfg: serde_json::Value = std::fs::read(&cfg_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| {
+            let user: serde_json::Value = std::fs::read(real_home.join(".cursor/cli-config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            let mut c = json!({ "version": 1 });
+            for k in ["model", "selectedModel", "modelParameters", "hasChangedDefaultModel", "privacyCache"] {
+                if let Some(v) = user.get(k) {
+                    c[k] = v.clone();
+                }
+            }
+            c
+        });
+    cfg["permissions"] = json!({
+        "allow": ["Mcp(harness:*)"],
+        "deny": ["Shell(*)", "Read(**)", "Write(**)", "WebFetch(*)"],
+    });
+    cfg["approvalMode"] = "allowlist".into();
+    cfg["autoAcceptWebSearch"] = false.into();
+    std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg)?)?;
+
+    // Cursor loads AGENTS.md, CLAUDE.md and .cursor/rules from its workspace (and the server refuses
+    // --exclude-workspace-context), so its workspace is an empty private dir; ts still runs in the
+    // session's real cwd via HARNESS_CWD.
+    let workspace = home.join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    // The disabled list is keyed by project: the TUI uses its process cwd, other paths the workspace.
+    // Paths are used as given or resolved depending on the caller, so cover both.
+    for dir in [workspace.clone(), PathBuf::from(ctx.cwd)] {
+        let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        cursor_disable_plugin_mcps(&dot, &dir)?;
+        cursor_disable_plugin_mcps(&dot, &real)?;
+    }
+    let mut args: Vec<String> = [
+        "--force", "--sandbox", "disabled", // no prompts, no sandbox (the one tool is ts)
+        "--approve-mcps", "--trust", "--disable-auto-update",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.push("--workspace".into());
+    args.push(workspace.display().to_string());
+    // `--allowed-tools` only reaches the request in print mode; the interactive TUI sends -H headers.
+    args.push("-H".into());
+    args.push(format!("x-cursor-agent-allowed-tools: {CURSOR_TOOLS}"));
+    let mut env = common_env(ctx);
+    env.insert("HOME".into(), home.display().to_string());
+    env.insert("HARNESS_CWD".into(), ctx.cwd.into());
+    let program = which("cursor-agent").unwrap_or_else(|| real_home.join(".local/bin/cursor-agent").display().to_string());
+    Ok(Launch { program, args, env })
+}
+
+/// Account-installed marketplace plugins (synced into the private home) bring their own MCP servers,
+/// named `plugin-<plugin>-<server>`. Cursor has no global switch, so list them in the per-project
+/// disabled file (`~/.cursor/projects/<slug of git root>/mcp-disabled.json`) for `cwd`.
+fn cursor_disable_plugin_mcps(dot: &std::path::Path, cwd: &std::path::Path) -> anyhow::Result<()> {
+    let mut names = std::collections::BTreeSet::new();
+    // The private cache fills on cursor's first start, so also read the user's real one.
+    let caches = [dot.join("plugins/cache"), PathBuf::from(std::env::var("HOME")?).join(".cursor/plugins/cache")];
+    for market in caches.iter().flat_map(|c| std::fs::read_dir(c).into_iter().flatten().flatten()) {
+        for plugin in std::fs::read_dir(market.path()).into_iter().flatten().flatten() {
+            for version in std::fs::read_dir(plugin.path()).into_iter().flatten().flatten() {
+                let read = |p: &str| -> Option<serde_json::Value> {
+                    serde_json::from_slice(&std::fs::read(version.path().join(p)).ok()?).ok()
+                };
+                let Some(servers) = read("mcp.json").and_then(|m| m.get("mcpServers").and_then(|s| s.as_object().cloned())) else { continue };
+                let name = read(".cursor-plugin/plugin.json")
+                    .and_then(|p| p.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .unwrap_or_else(|| plugin.file_name().to_string_lossy().into_owned());
+                names.extend(servers.keys().map(|k| format!("plugin-{name}-{k}")));
+            }
+        }
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    let root = cwd.ancestors().find(|d| d.join(".git").exists()).unwrap_or(cwd);
+    let slug = root.display().to_string().split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+    let dir = dot.join("projects").join(slug);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("mcp-disabled.json");
+    let mut have: Vec<String> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    for n in names {
+        if !have.contains(&n) {
+            have.push(n);
+        }
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&have)?)?;
+    Ok(())
 }
 
 fn which(bin: &str) -> Option<String> {

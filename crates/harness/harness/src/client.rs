@@ -265,7 +265,7 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
                 head,
             );
             let items: Vec<ListItem> = if rows.is_empty() {
-                vec![ListItem::new("no sessions yet: press c for claude, x for codex, s for a shell").dim()]
+                vec![ListItem::new("no sessions yet: press c for claude, x for codex, u for cursor, s for a shell").dim()]
             } else {
                 rows.iter().map(|(_, l, dead)| if *dead { ListItem::new(l.clone()).dim() } else { ListItem::new(l.clone()) }).collect()
             };
@@ -273,7 +273,7 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(status.clone()).yellow(),
-                    Line::from("enter attach · c claude · x codex · s shell · d kill · D remove · q quit (sessions keep running)").dim(),
+                    Line::from("enter attach · c claude · x codex · u cursor · s shell · d kill · D remove · q quit (sessions keep running)").dim(),
                     Line::from("inside a session: ctrl-] back to this tree").dim(),
                 ]),
                 foot,
@@ -297,8 +297,8 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
                     return Ok(Some(id));
                 }
             }
-            b"c" | b"x" | b"s" => {
-                let kind = match key[0] { b'c' => "claude", b'x' => "codex", _ => "shell" };
+            b"c" | b"x" | b"u" | b"s" => {
+                let kind = match key[0] { b'c' => "claude", b'x' => "codex", b'u' => "cursor", _ => "shell" };
                 match ui.ctl.req(spawn(kind)).await {
                     Ok(v) => return Ok(v["id"].as_u64()),
                     Err(e) => *status = format!("spawn {kind}: {e:#}"),

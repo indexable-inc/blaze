@@ -10,8 +10,15 @@ import { setConfirm } from "./host.ts";
 // stdout is the MCP channel; anything logged outside a cell must go to stderr.
 console.log = console.error;
 
+// cursor runs in an empty private workspace (so it loads no repo rules) and passes the real one here.
+if (process.env.HARNESS_CWD) process.chdir(process.env.HARNESS_CWD);
+
 const repl = new Repl(functions);
-const server = new McpServer({ name: "harness", version: "0.1.0" });
+// Agents with no system-prompt flag (cursor) get the harness note as MCP server instructions.
+const instructions = process.env.HARNESS_MCP_INSTRUCTIONS
+  ? `${process.env.HARNESS_MCP_INSTRUCTIONS} The working directory is ${process.cwd()} (ts cells run there).`
+  : undefined;
+const server = new McpServer({ name: "harness", version: "0.1.0" }, { instructions });
 
 server.registerTool(
   "ts",

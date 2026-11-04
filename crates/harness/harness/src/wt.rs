@@ -467,13 +467,9 @@ fn rpc(d: &Arc<Daemon>, id: &str, method: &str, args: &Value) -> Result<Value> {
         "kill" => s.kill(),
         "interrupt" => s.write(b"\x03")?,
         "prompt" => {
-            // As the socket API's send: a bracketed paste, then Enter once the TUI has taken it.
+            // As the socket API's send (per-kind submit strategy in inject.rs).
             let text = args["text"].as_str().context("prompt needs args.text")?;
-            s.write(format!("\x1b[200~{text}\x1b[201~").as_bytes())?;
-            if args["submit"].as_bool().unwrap_or(true) {
-                std::thread::sleep(Duration::from_millis(150));
-                s.write(b"\r")?;
-            }
+            crate::inject::send(&s, text, args["submit"].as_bool().unwrap_or(true))?;
         }
         _ => bail!("{id} has no method {method:?}"),
     }

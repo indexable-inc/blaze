@@ -28,7 +28,7 @@
 <body>
 <div id="side">
   <header><b>harness</b>
-    <button onclick="spawn('claude')">+ claude</button><button onclick="spawn('codex')">+ codex</button><button onclick="spawn('shell')">+ sh</button>
+    <button onclick="spawn('claude')">+ claude</button><button onclick="spawn('codex')">+ codex</button><button onclick="spawn('cursor')">+ cursor</button><button onclick="spawn('shell')">+ sh</button>
   </header>
   <div id="tree"></div>
 </div>
@@ -122,7 +122,7 @@ async function spawn(kind) {
   if (r.error) return alert(r.error);
   await refresh(); open_(r.id);
 }
-async function kill() { if (current !== null && confirm(`kill #${current}?`)) await fetch(`/api/sessions/${current}/kill`, { method: 'POST' }); refresh(); }
+async function kill() { if (current !== null) await fetch(`/api/sessions/${current}/kill`, { method: 'POST' }); refresh(); }
 refresh().then(() => { const id = Number(location.hash.slice(1)); if (location.hash && sessions.some((s) => s.id === id)) open_(id); });
 setInterval(refresh, 1500);
 Object.assign(window, { open_, spawn, kill });

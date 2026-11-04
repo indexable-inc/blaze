@@ -326,12 +326,7 @@ impl Daemon {
                 if raw {
                     s.write(text.as_bytes())?;
                 } else {
-                    s.write(format!("\x1b[200~{text}\x1b[201~").as_bytes())?;
-                    if submit.unwrap_or(true) {
-                        // Let the TUI finish handling the paste before Enter, or it may land inside it.
-                        std::thread::sleep(std::time::Duration::from_millis(150));
-                        s.write(b"\r")?;
-                    }
+                    crate::inject::send(&s, &text, submit.unwrap_or(true))?;
                 }
                 json!({ "ok": true })
             }
