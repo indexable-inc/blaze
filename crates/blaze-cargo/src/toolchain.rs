@@ -56,7 +56,7 @@ pub fn host() -> Option<&'static str> {
 struct ToolchainJson<'a> {
     /// `blaze-2026-10-27` ([`name`]).
     name: String,
-    /// `nightly-2026-10-27` ([`OURS`]).
+    /// `nightly-2026-10-27` ([`blaze_units::lock::toolchain`]).
     nightly: &'a str,
     /// `1.101.0-nightly (12433c307 2026-10-24)` ([`ours_says`]).
     rustc: &'a str,
@@ -72,7 +72,7 @@ struct ToolchainJson<'a> {
 pub fn json(chosen: &Chosen) -> Result<String, String> {
     let json = ToolchainJson {
         name: name(),
-        nightly: OURS.trim(),
+        nightly: blaze_units::lock::toolchain(),
         rustc: ours_says(),
         release: ours_release(),
         commit: ours_commit(),
