@@ -319,6 +319,56 @@ fn units_apart_only_in_what_the_front_end_does_not_read_are_one_crate() {
 }
 
 #[test]
+fn release_build_overrides_keep_build_script_readers_keys_apart() {
+    let mut units = units();
+    for unit in &mut units.graph.units {
+        unit.profile.name = "release".to_owned(); // alloc: release graph under test
+        unit.profile.opt_level = "3".to_owned(); // alloc: release profile
+        unit.profile.debug_assertions = false;
+        unit.profile.overflow_checks = false;
+    }
+    units.plans[RUN].unit_id = "release-run".to_owned(); // alloc: test input
+    let run = units.graph.units.len();
+    let mut other_run = units.graph.units[RUN].clone(); // clone: the build-override's run
+    other_run.profile.opt_level = "0".to_owned(); // alloc: test profile
+    units.graph.units.push(other_run);
+    let mut run_plan = units.plans[RUN].clone(); // clone: the run has its own output directory
+    run_plan.unit_id = "build-override-run".to_owned(); // alloc: stable run identity under test
+    run_plan.out_dir = Some("/w/target/release/build/a-override/out".to_owned()); // alloc: test input
+    units.plans.push(run_plan);
+
+    let lib = units.graph.units.len();
+    let mut other_lib = units.graph.units[LIB].clone(); // clone: a library used by a build script
+    other_lib.profile.opt_level = "0".to_owned(); // alloc: test profile
+    other_lib.dependencies.iter_mut().find(|dep| dep.index == RUN).unwrap().index = run;
+    units.graph.units.push(other_lib);
+    let mut lib_plan = units.plans[LIB].clone(); // clone: the second crate reads the second run
+    for (name, value) in &mut lib_plan.env {
+        if name == "OUT_DIR" {
+            *value = "/w/target/release/build/a-override/out".to_owned(); // alloc: test input
+        }
+    }
+    units.plans.push(lib_plan);
+    units.graph.roots.push(lib);
+    let mut built = lowered(&units).unwrap();
+    let first = krate(&built, LIB);
+    let second = krate(&built, lib);
+    let db = built.lowered.db();
+    assert_ne!(first, second);
+    assert_ne!(blaze_items::key::crate_key(db, first), blaze_items::key::crate_key(db, second));
+    blaze_items::key::check_crate_keys(db).unwrap_or_else(|clash| panic!("{clash}"));
+    assert_eq!(&*first.extra_data(db).build_script_runs, ["release-run"]);
+    assert_eq!(&*second.extra_data(db).build_script_runs, ["build-override-run"]);
+
+    // Taking away the run identity brings back the clash and its diagnostic names the runs.
+    let mut same = second.extra_data(db).clone(); // clone: remove the key's distinguishing input
+    same.build_script_runs = first.extra_data(db).build_script_runs.clone(); // clone: test control
+    second.set_extra_data(built.lowered.served_db(), same);
+    let clash = blaze_items::key::check_crate_keys(built.lowered.db()).unwrap_err().to_string();
+    assert!(clash.contains("build-script runs") && clash.contains("release-run"), "{clash}");
+}
+
+#[test]
 fn deps_are_by_extern_name_in_the_units_order() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();

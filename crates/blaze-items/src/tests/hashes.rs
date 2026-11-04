@@ -712,6 +712,7 @@ fn an_example_and_a_test_with_one_name_are_two_crates() {
                 display_name: Some(base_db::CrateDisplayName::from_canonical_name("fetch")),
                 potential_cfg_options: None,
                 built_for: base_db::BuiltFor::default(),
+                build_script_runs: Box::new([]),
             };
             let cfg = cfg::CfgOptions::default();
             let env = base_db::Env::default();
@@ -777,6 +778,7 @@ fn one_package_built_for_the_host_a_target_and_wasm_proc_macros_has_a_key_for_ea
                 display_name: Some(base_db::CrateDisplayName::from_canonical_name("proc_macro")),
                 potential_cfg_options: None,
                 built_for: built_for.clone(),
+                build_script_runs: Box::new([]),
             };
             let (cfg, env) = (cfg::CfgOptions::default(), base_db::Env::default());
             krates.push(base_db::Crate::create(&mut db, data, extra, workspace.clone(), cfg, env, Durability::LOW));

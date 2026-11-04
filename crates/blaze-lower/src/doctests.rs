@@ -111,6 +111,7 @@ impl Lowered {
             display_name: Some(CrateDisplayName::from_canonical_name("rust_out")),
             potential_cfg_options: None,
             built_for: library.extra_data(db).built_for.clone(),
+            build_script_runs: library.extra_data(db).build_script_runs.clone(), // clone: the example reads the library's runs
         };
 
         let at = match self.doctests.iter().position(|it| it.unit == unit) {

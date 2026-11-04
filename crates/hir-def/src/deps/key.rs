@@ -211,7 +211,7 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
         crate_types,
         proc_macro_cwd,
     } = krate.data(db);
-    let ExtraCrateData { version, display_name, potential_cfg_options, built_for } = krate.extra_data(db);
+    let ExtraCrateData { version, display_name, potential_cfg_options, built_for, build_script_runs } = krate.extra_data(db);
 
     let root = db.file_source_root(*root_file_id).source_root_id(db);
     let root_path = db.source_root(root).source_root_ref(db).path_for_file(root_file_id);
@@ -254,6 +254,10 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Ha
         Some(cfg) => hasher.update(&[1]).id(&base_db::cfg_options_content(cfg)),
     };
     built_for.hash_into(hasher);
+    hasher.update(&(build_script_runs.len() as u64).to_le_bytes());
+    for run in build_script_runs {
+        hasher.part(run.as_bytes());
+    }
     hasher
         .id(&krate.workspace_data(db).content())
         .id(&base_db::cfg_options_content(krate.cfg_options(db)));

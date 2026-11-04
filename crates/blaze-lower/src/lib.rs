@@ -740,6 +740,7 @@ fn lower_writes<T: blaze_query::Tree>(db: &mut Db, lower: Lower<'_, T>) -> Resul
             display_name: Some(base_db::CrateDisplayName::from_canonical_name(&unit.target.name)),
             potential_cfg_options: None,
             built_for: crates::built_for(unit.built_for()),
+            build_script_runs: crates::build_script_runs(units, unit),
         };
         let env: Env = plan.env.iter().cloned().collect();
         let runs: Vec<usize> = unit
