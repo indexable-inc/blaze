@@ -30,28 +30,28 @@ prefab hn.Sidebar : ui.Column {
 }
 
 // The sidebar's tree: one hn.ObjRow per object, kept by key (src/view.rs). It takes the sidebar's height left over by
-// the device row and the Trash pinned under it, and clips what does not fit.
+// the device row and the Archive pinned under it, and clips what does not fit.
 prefab hn.Tree : ui.Column {
   Clip
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
 }
 
-// The hairline over the Trash, pinned to the sidebar's bottom.
-prefab hn.TrashRule : ui.Divider {}
+// The hairline over the Archive, pinned to the sidebar's bottom.
+prefab hn.ArchiveRule : ui.Divider {}
 
-// The Trash's objects (cmd+W'd), shown over the trash row while it is unfolded: hn.ObjRow each, by key.
-prefab hn.TrashList : ui.Column {
+// The Archive's objects (cmd+W'd), shown over the archive row while it is unfolded: hn.ObjRow each, by key.
+prefab hn.ArchiveList : ui.Column {
   Clip
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 280}}
   Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
 }
 
-// The trash row at the sidebar's bottom: a trash can (ui.Symbol, a Nerd Font glyph), "Trash", how many objects it holds and a chevron; pressed to fold or
+// The archive row at the sidebar's bottom: an archive box (ui.Symbol, a Nerd Font glyph), "Archive", how many objects it holds and a chevron; pressed to fold or
 // unfold the list over it.
-prefab hn.TrashRow : ui.Row {
+prefab hn.ArchiveRow : ui.Row {
   Pressable
-  Action: {name: "trash:toggle"}
+  Action: {name: "archive:toggle"}
   Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
@@ -59,15 +59,20 @@ prefab hn.TrashRow : ui.Row {
   Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
   Padding: {l: 8, r: 8, t: 0, b: 0}
+  // On the row's hover the box rises 1.5pt and grows to 1.08 (on the row's HoverAmt spring); when an object is archived
+  // it bounces (a spring kicked 3pt up, 0.12 bigger, ringing at omega 22, zeta 0.3).
   icon : ui.Symbol {
-    Size: {w: {kind: Fixed, value: 14, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+    Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+    HoverLift: {lift: 1.5, scale: 1.08, kick_lift: 3, kick_scale: 0.12, omega: 22, zeta: 0.3}
   }
   name : ui.Words, Muted {
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
+  // The count pulses (0.35 bigger at the kick) when an object is archived.
   count : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: 0.35, omega: 26, zeta: 0.35}
   }
   chevron : ui.Words, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}

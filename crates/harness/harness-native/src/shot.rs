@@ -38,12 +38,23 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut clicks: Vec<(f32, f32, f32)> = std::env::var("HARNESS_NATIVE_SHOT_CLICK").unwrap_or_default().split(';').map(nums).filter(|v| v.len() == 2).enumerate().map(|(i, v)| (1.0 + 0.4 * i as f32, v[0], v[1])).collect();
     let mut drag = std::env::var("HARNESS_NATIVE_SHOT_DRAG").ok().map(|s| nums(&s)).filter(|v| v.len() == 4);
     let mut up_next = false;
+    // HARNESS_NATIVE_SHOT_HOVER `x,y,t`: the pointer moves to (x, y) at t seconds (a hover mid-spring for a shot just after).
+    let mut hover = std::env::var("HARNESS_NATIVE_SHOT_HOVER").ok().map(|s| nums(&s)).filter(|v| v.len() == 3);
+    // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
+    // object, which kills its session).
+    let mut key = std::env::var("HARNESS_NATIVE_SHOT_KEY").ok().and_then(|s| s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
     let mut at = (0.0f32, 0.0f32);
     let (left, none) = (crate::term::Button::Left, crate::app::KeyMods::default());
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
         let t = start.elapsed().as_secs_f32();
+        if let Some(h) = hover.take_if(|h| t >= h[2]) {
+            app.pointer_move(h[0], h[1], crate::app::KeyMods::default());
+        }
+        if let Some((k, _)) = key.take_if(|k| t >= k.1) {
+            app.shortcut(&k, 0, crate::app::KeyMods { cmd: true, ..Default::default() });
+        }
         if up_next {
             app.pointer_up(at.0, at.1, left, none);
             up_next = false;

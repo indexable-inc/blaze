@@ -11,7 +11,7 @@ use crate::pack::{Frame, GlyphInst, PanelInst};
 use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
 use harness_vt::MouseTracking;
 use crate::text::{Face, Fonts, GlyphCache, Layout, SUBPX, Style, TypeLook};
-use harness_native_api::spring::Tune;
+use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{APP, Clock, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_model::{self as model, Msg};
@@ -72,9 +72,9 @@ struct Ids {
     device: u64,
     main: u64,
     term: u64,
-    /// The Trash pinned to the sidebar's bottom: its list of objects and its row.
-    trash_list: u64,
-    trash_row: u64,
+    /// The Archive pinned to the sidebar's bottom: its list of objects and its row.
+    archive_list: u64,
+    archive_row: u64,
     palette: Option<u64>,
     /// The title-bar strip's root (`hn.TitleBar`) and its label.
     bar: u64,
@@ -89,8 +89,27 @@ pub struct Chrome {
     pub title_x: f32,
 }
 
-/// The trash can (Symbols Nerd Font Mono, nf-fa-trash).
-const TRASH_GLYPH: &str = "\u{F1F8}";
+/// A node's motion, set in the scene (hn.ArchiveRow's icon and count): on its row's hover (the row's `HoverAmt`
+/// spring) it rises `lift` points and grows to `scale`; kicked (an object archived) its [`Bump`] spring, pushed at
+/// `omega` and ringing out at `omega` / `zeta`, adds up to `kick_lift` points of rise and `kick_scale` of size.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct HoverLift {
+    pub lift: f32,
+    pub scale: f32,
+    pub kick_lift: f32,
+    pub kick_scale: f32,
+    pub omega: f32,
+    pub zeta: f32,
+}
+
+/// The spring a [`HoverLift`] node bounces on: at rest at 0, kicked by a push of velocity.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Bump {
+    pub spring: Spring,
+}
+
+/// The archive box (Symbols Nerd Font Mono, nf-md-archive).
+const ARCHIVE_GLYPH: &str = "\u{F003C}";
 
 pub struct App {
     pub world: World,
@@ -150,12 +169,10 @@ pub struct App {
     restore: Option<Option<u64>>,
     /// What was last written to native.json.
     saved: Option<Option<u64>>,
-    /// Session ids in the Trash (native.json `trashed`) and emptied from it (`hidden`); the world's `Trashed` and
-    /// `Hidden` tags follow them.
-    trash: BTreeSet<u64>,
-    hidden: BTreeSet<u64>,
-    /// Whether the Trash's list shows.
-    trash_open: bool,
+    /// Session ids in the Archive (native.json `archived`); the world's `Archived` tags follow them.
+    archive: BTreeSet<u64>,
+    /// Whether the Archive's list shows.
+    archive_open: bool,
     /// The ids the daemon no longer lists were dropped (once, on its first list).
     pruned: bool,
     /// Remember the selected object in native.json (not for the offscreen shot).
@@ -221,6 +238,8 @@ impl App {
         harness_native_ui_prims::register(&world);
         harness_native_api::register(&world);
         model::register(&world);
+        world.component::<HoverLift>().writable();
+        world.component::<Bump>();
         let app = world.entity_named(APP);
         world.set(Clock::default());
         world.set(PointerState::default());
@@ -241,6 +260,12 @@ impl App {
         harness_native_ui_draw::install(w);
         // den-native-hover: each hoverable's hover spring toward whether the pointer is on it.
         let app_id = *app.id();
+        // Each kicked Bump rings back to rest on its HoverLift's spring.
+        world.system_named::<(&mut Bump, &HoverLift)>("Bump").each_iter(|it, _, (b, m)| {
+            if settle(&mut b.spring, 0.0, Tune { omega: m.omega.max(1.0), zeta: m.zeta.max(0.05) }, it.delta_time()) {
+                moving(&it.world());
+            }
+        });
         world.system_named::<&mut HoverAmt>("Hover").each_iter(move |it, row, h| {
             let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
             let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| t.id() == e.id());
@@ -261,15 +286,20 @@ impl App {
             set_side_width(side.entity(), w);
         }
         let tree = side.child("hn.Tree");
-        side.child("hn.TrashRule");
-        let trash_list = side.child("hn.TrashList");
-        let trash_row = side.child("hn.TrashRow");
-        trash_row.set(HoverAmt::default());
+        side.child("hn.ArchiveRule");
+        let archive_list = side.child("hn.ArchiveList");
+        let archive_row = side.child("hn.ArchiveRow");
+        archive_row.set(HoverAmt::default());
+        for name in ["icon", "count"] {
+            if let Some(p) = archive_row.part(name) {
+                p.set(Bump::default());
+            }
+        }
         let main = root.child("hn.Main");
         let term = main.part("term").map_or(0, View::id);
         let bar = View::root(w, "hn.TitleBar");
         let bar_title = bar.part("title").map_or(0, View::id);
-        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), term, trash_list: trash_list.id(), trash_row: trash_row.id(), palette: None, bar: bar.id(), bar_title };
+        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), term, archive_list: archive_list.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title };
         let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
         Ok(Self {
@@ -310,9 +340,9 @@ impl App {
             spawned: Arc::default(),
             restore: Some(crate::prefs::get("selected").and_then(|v| v.as_u64())),
             saved: None,
-            trash: crate::prefs::ids("trashed"),
-            hidden: crate::prefs::ids("hidden"),
-            trash_open: false,
+            // The older `trashed` key, read once (the next save writes `archived` and drops it).
+            archive: crate::prefs::ids("archived").or_else(|| crate::prefs::ids("trashed")).unwrap_or_default(),
+            archive_open: false,
             pruned: false,
             persist: true,
             focused: true,
@@ -445,7 +475,7 @@ impl App {
     fn sync_view(&mut self) {
         let w = self.world.world_ref();
         let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
-        self.sync_trash_tags(up);
+        self.sync_archive_tags(up);
         let w = self.world.world_ref();
         let rows = model::tree(w);
         // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
@@ -682,7 +712,7 @@ impl App {
             let t = if sel.is_some() { clip_text(&title, 80) } else { "harness".to_owned() };
             View::of(w.entity_from_id(self.ids.bar_title)).text(&t);
         }
-        self.sync_trash();
+        self.sync_archive();
         self.sync_palette();
         self.save_selected();
     }
@@ -699,9 +729,9 @@ impl App {
         }
     }
 
-    /// Keep the objects' `Trashed` and `Hidden` tags in step with the persisted ids; on the daemon's first list, drop the
+    /// Keep the objects' `Archived` tags in step with the persisted ids; on the daemon's first list, drop the
     /// ids it no longer lists.
-    fn sync_trash_tags(&mut self, up: bool) {
+    fn sync_archive_tags(&mut self, up: bool) {
         let w = self.world.world_ref();
         let mut listed = BTreeSet::new();
         let mut objs = Vec::new();
@@ -711,60 +741,58 @@ impl App {
         });
         for (e, sid) in objs {
             let e = w.entity_from_id(e);
-            for (tag, on) in [(*w.component_id::<model::Trashed>(), self.trash.contains(&sid)), (*w.component_id::<model::Hidden>(), self.hidden.contains(&sid))] {
-                if e.has(tag) != on {
-                    if on {
-                        e.add(tag);
-                    } else {
-                        e.remove(tag);
-                    }
+            let on = self.archive.contains(&sid);
+            if e.has(model::Archived::id()) != on {
+                if on {
+                    e.add(model::Archived::id());
+                } else {
+                    e.remove(model::Archived::id());
                 }
             }
         }
         // The link reports Up only after the list it got is in the world.
         if up && !self.pruned {
             self.pruned = true;
-            let (t, h) = (self.trash.len(), self.hidden.len());
-            self.trash.retain(|s| listed.contains(s));
-            self.hidden.retain(|s| listed.contains(s));
-            if (t, h) != (self.trash.len(), self.hidden.len()) {
-                self.save_trash();
+            let n = self.archive.len();
+            self.archive.retain(|s| listed.contains(s));
+            if n != self.archive.len() {
+                self.save_archive();
             }
         }
     }
 
-    /// Write the Trash's ids to native.json.
-    fn save_trash(&self) {
+    /// Write the Archive's ids to native.json (dropping the older Trash's keys).
+    fn save_archive(&self) {
         if self.persist {
-            crate::prefs::set("trashed", serde_json::json!(self.trash));
-            crate::prefs::set("hidden", serde_json::json!(self.hidden));
+            crate::prefs::set("archived", serde_json::json!(self.archive));
+            crate::prefs::remove(&["trashed", "hidden"]);
         }
     }
 
-    /// The Trash at the sidebar's bottom: its row (glyph, count, chevron) and, unfolded, one row per trashed object.
-    fn sync_trash(&mut self) {
+    /// The Archive at the sidebar's bottom: its row (icon, count, chevron) and, unfolded, one row per archived object.
+    fn sync_archive(&mut self) {
         let w = self.world.world_ref();
-        let items = model::trashed(w);
+        let items = model::archived(w);
         let sel = self.selected();
-        let row = View::of(w.entity_from_id(self.ids.trash_row));
-        if let Some(p) = row.part("icon").filter(|p| p.entity().try_cloned::<&Icon>().is_none_or(|i| i.glyph.as_str() != TRASH_GLYPH)) {
-            p.set(Icon { glyph: TRASH_GLYPH.into() });
+        let row = View::of(w.entity_from_id(self.ids.archive_row));
+        if let Some(p) = row.part("icon").filter(|p| p.entity().try_cloned::<&Icon>().is_none_or(|i| i.glyph.as_str() != ARCHIVE_GLYPH)) {
+            p.set(Icon { glyph: ARCHIVE_GLYPH.into() });
         }
         if let Some(p) = row.part("name") {
-            p.text("Trash");
+            p.text("Archive");
         }
         if let Some(p) = row.part("count") {
             p.text(&if items.is_empty() { String::new() } else { items.len().to_string() });
         }
         if let Some(p) = row.part("chevron") {
-            p.text(if self.trash_open { "\u{25BE}" } else { "\u{25B8}" });
+            p.text(if self.archive_open { "\u{25BE}" } else { "\u{25B8}" });
         }
         let (clear, chosen) = (tone(w, "hn.ToneClear"), tone(w, "hn.ToneSelected"));
-        // A trashed object that is selected while the list is folded lights the trash row.
-        set_if(row, if !self.trash_open && sel.is_some_and(|s| items.contains(&s)) { chosen } else { clear });
-        let list = View::of(w.entity_from_id(self.ids.trash_list));
-        // Newest first, nearest the trash row.
-        let shown: Vec<(String, u64)> = if self.trash_open { items.iter().rev().map(|&e| (format!("t{e}"), e)).collect() } else { Vec::new() };
+        // An archived object that is selected while the list is folded lights the archive row.
+        set_if(row, if !self.archive_open && sel.is_some_and(|s| items.contains(&s)) { chosen } else { clear });
+        let list = View::of(w.entity_from_id(self.ids.archive_list));
+        // Newest first, nearest the archive row.
+        let shown: Vec<(String, u64)> = if self.archive_open { items.iter().rev().map(|&e| (format!("t{e}"), e)).collect() } else { Vec::new() };
         let me = &*self;
         for_each(list, "hn.ObjRow", shown, |row, e, new| {
             if new {
@@ -794,58 +822,53 @@ impl App {
         });
     }
 
-    /// Put object `e` in the Trash (it was killed with cmd+W or a Kill).
-    fn trash_object(&mut self, e: u64) {
+    /// Put object `e` in the Archive (it was killed with cmd+W or a Kill): the archive row's icon bounces and its count
+    /// pulses.
+    fn archive_object(&mut self, e: u64) {
         let Some(sid) = self.session_of(e) else { return };
-        if self.trash.insert(sid) {
-            self.world.entity_from_id(e).add(model::Trashed::id());
-            self.save_trash();
+        if self.archive.insert(sid) {
+            self.world.entity_from_id(e).add(model::Archived::id());
+            self.save_archive();
+            self.kick_archive();
         }
     }
 
-    /// Take object `e` back out of the Trash into the tree.
-    pub fn put_back(&mut self, e: u64) {
-        let Some(sid) = self.session_of(e) else { return };
-        if self.trash.remove(&sid) {
-            self.world.entity_from_id(e).remove(model::Trashed::id());
-            self.save_trash();
-        }
-        self.poke();
-    }
-
-    /// Empty the Trash: its objects are hidden for good.
-    pub fn empty_trash(&mut self) {
-        let items = model::trashed(self.world.world_ref());
-        let sel = self.selected();
-        for e in items {
-            self.world.entity_from_id(e).add(model::Hidden::id());
-            if sel == Some(e) {
-                model::select(self.world.world_ref(), None);
+    /// Kick the archive row's springs (its parts with `HoverLift` and `Bump`): each rings out from a push of its omega.
+    fn kick_archive(&mut self) {
+        let row = View::of(self.world.entity_from_id(self.ids.archive_row));
+        for name in ["icon", "count"] {
+            let Some(p) = row.part(name) else { continue };
+            let e = p.entity();
+            if let (Some(m), Some(mut b)) = (e.try_cloned::<&HoverLift>(), e.try_cloned::<&Bump>()) {
+                b.spring.v = m.omega;
+                e.set(b);
             }
         }
-        self.hidden.extend(std::mem::take(&mut self.trash));
-        self.save_trash();
         self.poke();
     }
 
-    /// Whether `e` is in the Trash.
-    pub fn is_trashed(&self, e: u64) -> bool {
-        self.world.entity_from_id(e).has(model::Trashed::id())
+    /// Take object `e` back out of the Archive into the tree.
+    pub fn unarchive(&mut self, e: u64) {
+        let Some(sid) = self.session_of(e) else { return };
+        if self.archive.remove(&sid) {
+            self.world.entity_from_id(e).remove(model::Archived::id());
+            self.save_archive();
+        }
+        self.poke();
     }
 
-    /// Whether `(x, y)` (window points) is on the trash row.
-    pub fn trash_at(&self, x: f32, y: f32) -> bool {
-        let (x, y) = (x / self.zoom(), y / self.zoom());
-        self.world.entity_from_id(self.ids.trash_row).try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y))
+    /// Whether `e` is in the Archive.
+    pub fn is_archived(&self, e: u64) -> bool {
+        self.world.entity_from_id(e).has(model::Archived::id())
     }
 
-    /// The tree's (or the Trash's) row under `(x, y)` (window points): its object.
+    /// The tree's (or the Archive's) row under `(x, y)` (window points): its object.
     pub fn object_at(&self, x: f32, y: f32) -> Option<u64> {
         let (x, y) = (x / self.zoom(), y / self.zoom());
         let w = self.world.world_ref();
         let mut hit = None;
-        // The Trash first: the tree clips its rows that run under it.
-        for list in [self.ids.trash_list, self.ids.tree] {
+        // The Archive first: the tree clips its rows that run under it.
+        for list in [self.ids.archive_list, self.ids.tree] {
             let l = w.entity_from_id(list);
             if !l.try_cloned::<&Laid>().is_some_and(|r| r.contains(x, y)) {
                 continue;
@@ -859,7 +882,7 @@ impl App {
         hit.filter(|&e| w.entity_from_id(e).is_alive())
     }
 
-    /// The context menu's Kill on object `e` (no asking): as cmd+W, it goes to the Trash.
+    /// The context menu's Kill on object `e` (no asking): as cmd+W, it goes to the Archive.
     pub fn kill_object(&mut self, e: u64) {
         if !self.world.entity_from_id(e).is_alive() {
             return;
@@ -868,7 +891,7 @@ impl App {
             self.kill();
         } else if let Some(sid) = self.session_of(e) {
             self.link.kill(sid);
-            self.trash_object(e);
+            self.archive_object(e);
         }
         self.poke();
     }
@@ -1108,8 +1131,8 @@ impl App {
                 model::toggle_collapse(self.world.world_ref(), g);
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
                 model::toggle_fold(self.world.world_ref(), p);
-            } else if a == "trash:toggle" {
-                self.trash_open = !self.trash_open;
+            } else if a == "archive:toggle" {
+                self.archive_open = !self.archive_open;
             } else if a == "pal:close" {
                 self.palette = None;
             } else if let Some(i) = a.strip_prefix("pal:").and_then(|s| s.parse::<usize>().ok()) {
@@ -1243,6 +1266,12 @@ impl App {
             }
             let rect = [laid.x, laid.y, laid.w, laid.h];
             let (np, ng) = (d.panels.len(), d.glyphs.len());
+            // A HoverLift node: how far its row's hover and its bump have moved it (read before the drawing borrows self).
+            let motion = e.try_cloned::<&HoverLift>().map(|m| {
+                let hover = e.parent().and_then(|r| r.try_cloned::<&HoverAmt>()).map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
+                let bump = e.try_cloned::<&Bump>().map_or(0.0, |b| b.spring.x);
+                (-(m.lift * hover + m.kick_lift * bump), (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1))
+            });
             match p.kind {
                 PaintKind::Plate => {
                     let fill = e.try_cloned::<&Fill>().unwrap_or_default();
@@ -1289,6 +1318,13 @@ impl App {
                     emit_layout(d, &self.fonts, &mut self.cache, &lay, (laid.x + (laid.w - gw) * 0.5, laid.y), ink, p.alpha, sc, upload);
                 }
                 PaintKind::Picture | PaintKind::Ribbon => {}
+            }
+            // A HoverLift node: its glyphs risen and scaled about its centre by its row's hover and its bump.
+            if let Some((dy, k)) = motion {
+                let (cx, cy) = (laid.x + laid.w * 0.5, laid.y + laid.h * 0.5);
+                for g in &mut d.glyphs[ng..] {
+                    g.rect = [cx + (g.rect[0] - cx) * k, cy + (g.rect[1] - cy) * k + dy, g.rect[2] * k, g.rect[3] * k];
+                }
             }
             if p.clipped {
                 let band = [p.clip_y, p.clip_y + p.clip_h];
@@ -1787,7 +1823,7 @@ impl App {
             return;
         }
         let n = objs.len() as i64;
-        // From a trashed (or no) object: the first or the last of the tree.
+        // From an archived (or no) object: the first or the last of the tree.
         let at = self.selected().and_then(|s| objs.iter().position(|&e| e == s)).map_or(if by > 0 { -1 } else { n }, |i| i as i64);
         self.select(Some(objs[(at + by).rem_euclid(n) as usize]));
     }
@@ -1815,7 +1851,7 @@ impl App {
         let objs = self.objects();
         let next = objs.iter().position(|&o| o == e).and_then(|i| objs.get(i + 1).or_else(|| i.checked_sub(1).and_then(|j| objs.get(j)))).copied();
         self.link.kill(sid);
-        self.trash_object(e);
+        self.archive_object(e);
         self.select(next);
     }
 
