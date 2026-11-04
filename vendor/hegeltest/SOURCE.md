@@ -44,3 +44,8 @@ Changes, each marked `blaze:`:
 5. `hegeltest-c` asks for `miniz_oxide` 0.9.1 (upstream 0.8), the one `flate2` uses in blaze's
    lock; `compress_to_vec_zlib` and `decompress_to_vec_zlib_with_limit` are the same in 0.9.
    Blobs it compressed before still decode (zlib), though the bytes it writes may differ.
+6. The `Generator` impl of `BoxedGenerator` and the `PrintableGenerator` impl of
+   `BoxedPrintableGenerator` name the outer lifetime explicitly. Stage-0 blaze 0.20261030.1
+   rejects their `boxed` methods' `Self: 'b` bound when that lifetime is anonymous (#1678),
+   blocking the test dependencies. This keeps the same lifetime-generic impls and gives the
+   bootstrap compiler names it can check; the general compiler bug remains open.
