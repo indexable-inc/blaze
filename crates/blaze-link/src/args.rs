@@ -15,7 +15,12 @@
 //! (blaze's linker always does it: `--gc-sections`, `-z now`) and [`LinkOption::NoEffect`]
 //! (it asks nothing of the image: `-fuse-ld=mold`, which only picks the system linker blaze
 //! does not run). docs/cargo.md, "Link arguments", lists every spelling.
+//!
+//! The rest of the rustflags that are the link's (`-l`, `-L`, `-C strip`, `-C rpath`,
+//! `-C linker`, ...) are read by [`rustflags`], and [`apply`] takes or refuses their `-C`
+//! options alike.
 
+pub mod rustflags;
 #[cfg(test)]
 mod tests;
 
@@ -35,6 +40,9 @@ pub enum ArgFrom {
     /// A `cargo:rustc-link-arg*` (or `rustc-cdylib-link-arg`) of the build script of
     /// `package` (its package id).
     BuildScript { package: String },
+    /// A `-C` option in the unit's rustflags that rustc turns into link arguments of its own
+    /// (`-C strip`, `-C relro-level`, ...: [`rustflags::CodegenOption`]).
+    RustflagOption,
 }
 
 impl std::fmt::Display for ArgFrom {
@@ -48,6 +56,10 @@ impl std::fmt::Display for ArgFrom {
             ArgFrom::BuildScript { package } => {
                 write!(f, "from `cargo:rustc-link-arg*` of the build script of `{package}`")
             }
+            ArgFrom::RustflagOption => f.write_str(
+                "in the rustflags (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `build.rustflags`, \
+                 `target.<triple>.rustflags` or a profile's `rustflags`)",
+            ),
         }
     }
 }
@@ -135,7 +147,12 @@ pub struct ArgError {
 
 impl std::fmt::Display for ArgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the link argument `{}`", self.arg)?;
+        match self.from {
+            ArgFrom::RustflagOption => write!(f, "`{}`", self.arg)?,
+            ArgFrom::Rustflags | ArgFrom::BuildScript { .. } => {
+                write!(f, "the link argument `{}`", self.arg)?;
+            }
+        }
         if self.word != self.arg {
             write!(f, " (its `{}`)", self.word)?;
         }
@@ -613,16 +630,50 @@ pub struct Applied {
     pub search: Vec<PathBuf>,
 }
 
-/// Sets what `args` ask on `output`, whose kind is set ([`Output::link`], its stack, a shared
-/// library's name and exports), and hands back the libraries and search directories they add.
-/// Every argument refused is named in the one error.
-pub fn apply(output: &mut Output, args: &[GivenArg]) -> Result<Applied, LinkError> {
+/// Sets what the rustflags' `-C` options (`options`, [`rustflags::Rustflags::options`]) and the
+/// link arguments (`args`) ask on `output`, whose kind is set ([`Output::link`], its stack, a
+/// shared library's name and exports, its debug info), and hands back the libraries and search
+/// directories the arguments add. The options come first, as rustc gives its own link
+/// arguments before the ones it is given: a later `-install_name` wins over `-C rpath`'s.
+/// Every option and argument refused is named in the one error.
+pub fn apply(
+    output: &mut Output,
+    options: &[rustflags::GivenOption],
+    args: &[GivenArg],
+) -> Result<Applied, LinkError> {
     let mut applied = Applied::default();
-    if args.is_empty() {
-        return Ok(applied);
+    // alloc: none unless an option or argument is refused
+    let mut errors: Vec<ArgError> = Vec::new();
+    for given in options {
+        if let Err(why) = rustflags::set(output, &given.option) {
+            errors.push(ArgError {
+                // clone: an error owns what it names
+                arg: given.flag.clone(),
+                // clone: as above
+                word: given.flag.clone(),
+                from: ArgFrom::RustflagOption,
+                // clone: as above
+                triple: output.triple.clone(),
+                // alloc: as above
+                why: why.to_owned(),
+            });
+        }
     }
-    let options = parse(Spelling::of(output.format), Kind::of(output), &output.triple, args)
-        .map_err(|errors| refused(&errors))?;
+    if args.is_empty() {
+        return match errors.is_empty() {
+            true => Ok(applied),
+            false => Err(refused(&errors)),
+        };
+    }
+    let options = match parse(Spelling::of(output.format), Kind::of(output), &output.triple, args)
+    {
+        Ok(options) if errors.is_empty() => options,
+        Ok(_) => return Err(refused(&errors)),
+        Err(more) => {
+            errors.extend(more);
+            return Err(refused(&errors));
+        }
+    };
     for option in options {
         match option {
             LinkOption::Lib(lib) => applied.libs.push(lib),
@@ -652,11 +703,11 @@ pub fn apply(output: &mut Output, args: &[GivenArg]) -> Result<Applied, LinkErro
     Ok(applied)
 }
 
-/// The one error naming every argument refused.
+/// The one error naming every option and argument refused.
 fn refused(errors: &[ArgError]) -> LinkError {
     let mut what = String::from(
-        "blaze's linker drops no link argument, and refuses each it does not implement \
-         (docs/cargo.md, \"Link arguments\"):",
+        "blaze's linker drops no link argument or link option of the rustflags, and refuses \
+         each it does not implement (docs/cargo.md, \"Link arguments\"):",
     );
     for error in errors {
         what.push_str("\n  ");

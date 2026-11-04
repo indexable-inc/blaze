@@ -688,15 +688,6 @@ fn a_link_library_is_read_as_rustc_reads_l() {
     assert_eq!(codegen::link_lib("ssl").unwrap().kind, NativeLibKind::Dylib);
     assert_eq!(codegen::link_lib("framework=Security").unwrap().kind, NativeLibKind::Framework);
     assert!(codegen::link_lib("weird=x").is_err());
-    let args = codegen::rustflag_link_args(&[
-        "-C".into(),
-        "link-arg=-Wl,-rpath,$ORIGIN".into(),
-        "-Clink-args=-lz  -pthread".into(),
-        "--codegen=link_arg=-Wl,-z,now".into(),
-        "-Copt-level=3".into(),
-    ]);
-    let args: Vec<&str> = args.iter().map(|it| it.arg.as_str()).collect();
-    assert_eq!(args, ["-Wl,-rpath,$ORIGIN", "-lz", "-pthread", "-Wl,-z,now"]);
 }
 
 #[test]
@@ -1646,6 +1637,7 @@ fn script_front_for(
         run_env: &[],
         script_check_cfgs: Vec::new(),
         script_link_args: Vec::new(),
+        linked_rustflag_libs: Vec::new(),
         makers: one_maker(),
         goal: compile::keyed_goal(crate::serve::work::Goal::Build, script),
         color: false,
@@ -2358,6 +2350,7 @@ fn each_maker_of_a_record_moves_its_key() {
             run_env: &[],
             script_check_cfgs: Vec::new(),
             script_link_args: Vec::new(),
+            linked_rustflag_libs: Vec::new(),
             makers,
             goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
             color: false,
@@ -2405,6 +2398,7 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             run_env: &[],
             script_check_cfgs: Vec::new(),
             script_link_args: Vec::new(),
+            linked_rustflag_libs: Vec::new(),
             makers: one_maker(),
             goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
             color: false,

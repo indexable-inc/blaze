@@ -162,3 +162,61 @@ fn refusals_name_the_argument_the_word_where_and_why() {
     assert!(errors[0].to_string().contains("the build script of `x 1.0.0`"), "{}", errors[0]);
     assert_eq!(errors[1].word, "--wrap=b");
 }
+
+/// `Rustflags::read`: what of the rustflags is the link's, as rustc reads each spelling; every
+/// other flag is left to who reads it.
+#[test]
+fn rustflags_read_as_rustc_reads_them() {
+    use super::rustflags::{CodegenOption as C, RelroLevel, Rustflags, Strip};
+    let read = |flags: &[&str]| {
+        let flags: Vec<String> = flags.iter().map(|it| (*it).to_owned()).collect();
+        Rustflags::read(&flags)
+    };
+    let table: &[(&[&str], &[&str], &[&str], &[&str], &[(&str, C)])] = &[
+        // (flags, link args, -l values, -L values, options as written and typed)
+        (&["-C", "link-arg=-Wl,-rpath,$ORIGIN"], &["-Wl,-rpath,$ORIGIN"], &[], &[], &[]),
+        (&["-Clink-args=-lz  -pthread"], &["-lz", "-pthread"], &[], &[], &[]),
+        (&["--codegen=link_arg=-Wl,-z,now"], &["-Wl,-z,now"], &[], &[], &[]),
+        (&["-l", "z", "-lstatic=foo", "-l", "framework=Metal"], &[], &["z", "static=foo", "framework=Metal"], &[], &[]),
+        (&["-L", "native=/opt/lib", "-L/usr/local/lib"], &[], &[], &["native=/opt/lib", "/usr/local/lib"], &[]),
+        (&["-C", "rpath"], &[], &[], &[], &[("-C rpath", C::Rpath(true))]),
+        (&["-Crpath=no"], &[], &[], &[], &[("-C rpath=no", C::Rpath(false))]),
+        (&["-C", "relro_level=full"], &[], &[], &[], &[("-C relro-level=full", C::RelroLevel(RelroLevel::Full))]),
+        (&["-Clink-dead-code"], &[], &[], &[], &[("-C link-dead-code", C::LinkDeadCode(true))]),
+        (&["-C", "strip=debuginfo"], &[], &[], &[], &[("-C strip=debuginfo", C::Strip(Strip::Debuginfo))]),
+        (&["-C", "linker=clang"], &[], &[], &[], &[("-C linker=clang", C::Linker("clang".into()))]),
+        (&["-Clinker-flavor=gnu-cc"], &[], &[], &[], &[("-C linker-flavor=gnu-cc", C::LinkerFlavor("gnu-cc".into()))]),
+        (&["-C", "prefer-dynamic=off"], &[], &[], &[], &[("-C prefer-dynamic=off", C::PreferDynamic(false))]),
+        (&["-C", "default-linker-libraries"], &[], &[], &[], &[("-C default-linker-libraries", C::DefaultLinkerLibraries(true))]),
+        (&["-C", "link-self-contained=n"], &[], &[], &[], &[("-C link-self-contained=n", C::LinkSelfContained(false))]),
+        (&["-C", "target-feature=+crt-static,+avx2"], &[], &[], &[], &[("-C target-feature=+crt-static,+avx2", C::CrtStatic(true))]),
+        // Not the link's: the code generator's, cargo's, the front end's.
+        (&["-C", "target-cpu=native", "-Copt-level=3", "--cfg", "x", "-Zthreads=8", "--check-cfg=cfg(y)"], &[], &[], &[], &[]),
+    ];
+    for (flags, args, libs, search, options) in table {
+        let got = read(flags).unwrap_or_else(|why| panic!("{flags:?}: {why}"));
+        let got_args: Vec<&str> = got.args.iter().map(|it| it.arg.as_str()).collect();
+        assert_eq!(got_args, *args, "{flags:?}");
+        assert!(got.args.iter().all(|it| it.from == ArgFrom::Rustflags), "{flags:?}");
+        assert_eq!(got.libs, *libs, "{flags:?}");
+        let got_search: Vec<&str> = got.search.iter().map(|it| it.to_str().unwrap()).collect();
+        assert_eq!(got_search, *search, "{flags:?}");
+        let got_options: Vec<(&str, C)> =
+            got.options.iter().map(|it| (it.flag.as_str(), it.option.clone())).collect();
+        assert_eq!(got_options, *options, "{flags:?}");
+    }
+
+    // A value rustc would not take is an error naming the flag.
+    let refused: &[(&[&str], &str)] = &[
+        (&["-C", "strip=everything"], "`-C strip=everything`"),
+        (&["-C", "relro-level=most"], "`-C relro-level=most`"),
+        (&["-C", "rpath=maybe"], "`-C rpath=maybe`"),
+        (&["-C", "linker="], "no program named"),
+        (&["-C", "link-self-contained=+linker"], "unstable components"),
+        (&["-l"], "`-l` ends the rustflags"),
+    ];
+    for (flags, want) in refused {
+        let why = read(flags).expect_err("refused");
+        assert!(why.contains(want), "{flags:?}: {why}");
+    }
+}

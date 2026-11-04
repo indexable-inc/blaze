@@ -305,8 +305,32 @@ of an executable and export lists (`-rdynamic`, `--export-dynamic`, `-export_dyn
 start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `-ObjC`,
 `-no_compact_unwind`, `-sectcreate`, `--wrap`, an object or archive given by path (give it as
 `cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
-wasm target, which rustc gives `link.exe` or `wasm-ld` directly. A unit's record key covers the
-link arguments: the rustflags' through its plan, its build scripts' as a part of their own.
+wasm target, which rustc gives `link.exe` or `wasm-ld` directly.
+
+The rest of the rustflags that are the link's, rather than the code's, are read by
+`crates/blaze-link/src/args/rustflags.rs`, and none is dropped:
+
+| Flag | What blaze does |
+|---|---|
+| `-l [KIND[:MODIFIERS]=]NAME` | linked as a build script's `cargo:rustc-link-lib` is, in the place of the crate whose rustflags give it |
+| `-L [KIND=]DIR` | searched as a build script's `cargo:rustc-link-search` is, before the build scripts' directories; `crate=` and `dependency=` find crates, which blaze finds by the unit graph |
+| `-C rpath` | a macOS shared library is named `@rpath/FILE`, as rustc names it; rustc's other rpaths are to Rust dylibs, and blaze links every Rust crate into the image |
+| `-C relro-level` | `full` is what blaze's linker always does on ELF; `partial`, `off` and `none` are refused there, and on macOS every value but `none` |
+| `-C link-dead-code` | off is taken; on is refused: blaze's linker always drops unreferenced sections |
+| `-C strip` | `none` is taken, `debuginfo` links the image without debug info, `symbols` is refused: blaze always writes the functions' local symbols |
+| `-C linker` | taken when it names a C driver or a system linker (`cc`, `gcc`, `clang`, `ld`, `ld.lld`, `mold`, ..., with a version or a cross prefix): blaze's linker writes what it would; any other program (a wrapper script, `zig cc`) is refused, since it can change the link in ways blaze cannot see |
+| `-C linker-flavor` | taken when it is the spelling blaze reads the target's link arguments in (`gcc`, `gnu-cc` on Linux, `darwin-cc` on macOS, `msvc` on Windows, `wasm-ld`); refused otherwise |
+| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic`, `-C target-feature=+crt-static` | off is taken; on is refused |
+
+A refused option fails the link with an error naming the flag as written, that it came from the
+rustflags, the target and why. A unit that links nothing (a library) is not refused for one, as
+rustc does not use it there either. The rustflags of a proc macro, which blaze builds for wasm,
+are the host's, meant for the native library rustc would make of it: none of them is applied to
+its wasm module, which is no output of the build.
+
+A unit's record key covers all of these: its own rustflags through its plan, the `-l`s of the
+rustflags of the crates it links in as a part of their own, and its build scripts' link
+arguments as a part of theirs.
 
 ### Sandboxed tests (an experiment, opt-in)
 

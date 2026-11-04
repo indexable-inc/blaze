@@ -1362,12 +1362,14 @@ pub(crate) fn given(job: &Job, unit: u32) -> Result<Compile, String> {
 }
 
 /// What native inputs `unit` links: the native libraries, in rustc's order: each crate linked
-/// in, what depends first ([`Graph::linked_in`]), the `-l`s its rustc is given (its build
-/// script's `rustc-link-lib`s) then its `#[link]`s; where to look for them, the unit's `-L`s;
-/// the object each crate's `global_asm!`s assemble to for `triple`, in the same order, which
-/// go on the link line before every library, as rustc puts a crate's code before the
-/// libraries; and the unit's link arguments ([`link_args`]), which [`blaze_link::args::apply`]
-/// reads into the output and the libraries and directories after these.
+/// in, what depends first ([`Graph::linked_in`]), the `-l`s its rustc is given (those of its
+/// rustflags, then its build script's `rustc-link-lib`s) then its `#[link]`s; where to look
+/// for them, the unit's `-L`s (its rustflags', then its build scripts'); the object each
+/// crate's `global_asm!`s assemble to for `triple`, in the same order, which go on the link
+/// line before every library, as rustc puts a crate's code before the libraries; and the
+/// unit's link arguments and its rustflags' link options (`-C strip`, ...), which
+/// [`blaze_link::args::apply`] reads into the output and the libraries and directories after
+/// these.
 ///
 /// [`Graph::linked_in`]: super::graph::Graph::linked_in
 fn natives(
@@ -1379,18 +1381,27 @@ fn natives(
 ) -> Result<Natives, String> {
     let unit = unit as u32;
     let mine = given(job, unit)?;
+    let own = link_rustflags(job, unit)?;
     let mut libs = Vec::new();
     let mut assembled = Vec::new();
     for at in job.graph.linked_in(unit) {
         let theirs;
-        let compile = match at == unit {
-            true => &mine,
+        let theirs_flags;
+        let (compile, flags) = match at == unit {
+            true => (&mine, &own),
             false => {
                 theirs = given(job, at)?;
-                &theirs
+                theirs_flags = link_rustflags(job, at)?;
+                (&theirs, &theirs_flags)
             }
         };
-        libs.reserve(compile.libs.len());
+        libs.reserve(flags.libs.len() + compile.libs.len());
+        for lib in &flags.libs {
+            libs.push(link_lib(lib).map_err(|why| {
+                // alloc: error path
+                format!("{why}, in the rustflags of `{}`", job.units().graph.units[at as usize].pkg_id)
+            })?);
+        }
         for lib in &compile.libs {
             libs.push(link_lib(lib)?);
         }
@@ -1405,23 +1416,44 @@ fn natives(
             assembled.extend(frontend.global_asm(krate, triple).map_err(|it| it.what)?);
         }
     }
-    let args = link_args(job, unit, &mine)?;
-    Ok(Natives { libs, search: search_dirs(&mine.search), assembled, args })
+    let mut search = search_dirs(&own.search);
+    search.extend(search_dirs(&mine.search));
+    let mut args = own.args;
+    args.extend(script_args(job, unit, &mine)?);
+    Ok(Natives { libs, search, assembled, args, options: own.options })
 }
 
-/// The link arguments of `unit`, in the order cargo gives rustc them: the `-C link-arg`s and
-/// `-C link-args` of its rustflags ([`rustflag_link_args`]), then the `rustc-link-arg*`s of
-/// the build scripts it is linked with (`mine`, its [`given`]), each naming its script's
-/// package.
-pub(crate) fn link_args(
+/// What `unit`'s rustflags ask of a link ([`blaze_link::args::rustflags::Rustflags`]): its
+/// `-l`s, `-L`s, `-C link-arg`s and link options. None for a proc macro built for wasm: its
+/// rustflags are the host's, for the native shared library rustc would make of it, and blaze
+/// links it as a WASI reactor that is no output of the build, which nothing of them can apply
+/// to.
+pub(crate) fn link_rustflags(
+    job: &Job,
+    unit: u32,
+) -> Result<blaze_link::args::rustflags::Rustflags, String> {
+    if wasm_macro(job, unit as usize) {
+        return Ok(blaze_link::args::rustflags::Rustflags::default());
+    }
+    let plan = job.plan(unit as usize).map_err(|it| it.what)?;
+    blaze_link::args::rustflags::Rustflags::read(&plan.rustflags).map_err(|why| {
+        // alloc: error path
+        format!("{why} (of `{}`)", job.units().graph.units[unit as usize].pkg_id)
+    })
+}
+
+/// The `rustc-link-arg*`s of the build scripts `unit` is linked with (`mine`, its [`given`]),
+/// in the order cargo gives rustc them, each naming its script's package. They follow the
+/// `-C link-arg`s of its rustflags ([`link_rustflags`]) on the link line.
+pub(crate) fn script_args(
     job: &Job,
     unit: u32,
     mine: &Compile,
 ) -> Result<Vec<blaze_link::args::GivenArg>, String> {
-    let mut args = rustflag_link_args(&job.plan(unit as usize).map_err(|it| it.what)?.rustflags);
     let units = job.units();
     let runs = job.graph.links(unit);
-    args.reserve(mine.link_args.len());
+    // alloc: once per link, its build scripts' arguments
+    let mut args = Vec::with_capacity(mine.link_args.len());
     for blaze_build_script::apply::LinkArg { from, arg } in &mine.link_args {
         let run = runs.get(*from).ok_or_else(|| {
             // alloc: error path
@@ -1444,37 +1476,25 @@ pub(crate) fn link_args(
     Ok(args)
 }
 
-/// The link arguments of `rustflags`, in order, as rustc reads them: each `-C link-arg=ARG`,
-/// and each word of a `-C link-args=ARGS`, split on whitespace (`-C`, `-C...`, `--codegen` and
-/// `--codegen=` alike, `_` in the option's name read as `-`).
-pub(crate) fn rustflag_link_args(rustflags: &[String]) -> Vec<blaze_link::args::GivenArg> {
-    let given = |arg: &str| blaze_link::args::GivenArg {
-        // alloc: the link owns its arguments, once per argument per link
-        arg: arg.to_owned(),
-        from: blaze_link::args::ArgFrom::Rustflags,
-    };
-    // alloc: none until a link argument is found
+/// The `-l`s of the rustflags of the crates linked into `unit` other than its own, each with
+/// its crate's package, in link order: its link reads them ([`natives`]), and its plan holds
+/// only its own rustflags. Empty for a unit that links nothing.
+pub(crate) fn linked_rustflag_libs(job: &Job, unit: u32) -> Result<Vec<(String, String)>, String> {
+    // alloc: none unless a crate linked in has a `-l` in its rustflags
     let mut out = Vec::new();
-    let mut flags = rustflags.iter().map(String::as_str);
-    while let Some(flag) = flags.next() {
-        let option = match flag {
-            "-C" | "--codegen" => match flags.next() {
-                Some(it) => it,
-                None => break,
-            },
-            _ => match flag.strip_prefix("--codegen=").or_else(|| flag.strip_prefix("-C")) {
-                Some(it) => it,
-                None => continue,
-            },
-        };
-        let Some((name, value)) = option.split_once('=') else { continue };
-        match name {
-            "link-arg" | "link_arg" => out.push(given(value)),
-            "link-args" | "link_args" => out.extend(value.split_whitespace().map(given)),
-            _ => {}
-        }
+    if wasm_macro(job, unit as usize) {
+        return Ok(out);
     }
-    out
+    for at in job.graph.linked_in(unit) {
+        if at == unit {
+            continue;
+        }
+        let flags = link_rustflags(job, at)?;
+        let package = &job.units().graph.units[at as usize].pkg_id;
+        // alloc: once per `-l` per unit's key
+        out.extend(flags.libs.into_iter().map(|lib| (package.to_string(), lib)));
+    }
+    Ok(out)
 }
 
 /// The directories a link searches for native libraries, from the unit's `-L`s: each one's
@@ -1489,13 +1509,14 @@ pub(crate) fn search_dirs(search: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// [`natives`]: the libraries, where to look for them, the crates' `global_asm!` objects, and
-/// the link arguments.
+/// [`natives`]: the libraries, where to look for them, the crates' `global_asm!` objects, the
+/// link arguments, and the rustflags' link options.
 struct Natives {
     libs: Vec<NativeLib>,
     search: Vec<PathBuf>,
     assembled: Vec<GlobalAsmObject>,
     args: Vec<blaze_link::args::GivenArg>,
+    options: Vec<blaze_link::args::rustflags::GivenOption>,
 }
 
 /// The place on the link line of the first library: the `global_asm!` objects take the places
@@ -1676,13 +1697,13 @@ fn link_at(
     output.sanitize = generated.policy.sanitize;
     let (assembled, located) = {
         let _span = tracing::info_span!(target: "blaze", "link natives", unit = %path).entered();
-        let Natives { mut libs, mut search, assembled, args } =
+        let Natives { mut libs, mut search, assembled, args, options } =
             natives(job, unit, krate, &generated.frontend, triple(job, u))?;
-        // What the link arguments ask: set on the output, and their libraries and directories
-        // after the rest, as rustc appends them to the link line. One it does not implement
-        // stops the link, named.
-        let applied =
-            blaze_link::args::apply(&mut output, &args).map_err(linker(LinkStep::Output))?;
+        // What the rustflags' link options and the link arguments ask: set on the output, and
+        // the arguments' libraries and directories after the rest, as rustc appends them to
+        // the link line. One it does not implement stops the link, named.
+        let applied = blaze_link::args::apply(&mut output, &options, &args)
+            .map_err(linker(LinkStep::Output))?;
         libs.extend(applied.libs);
         search.extend(applied.search);
         let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
