@@ -59,6 +59,22 @@ fn entry(call: &str, next: &str, descr: &'static str) -> (String, String, &'stat
 const NONE: [(String, String, &str); 0] = [];
 
 #[test]
+fn a_never_to_any_coercion_has_no_return_path() {
+    let fx = fixture::db("//- minicore: sized\n#![feature(never_type)]\nfn coerce(value: !) -> u32 { value }\n");
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let body = db.mir_body(function(&db, "coerce").into()).expect("the MIR of `coerce`");
+        assert!(body.basic_blocks.iter().any(|(_, block)| {
+            matches!(block.terminator.as_ref().map(|it| &it.kind), Some(TerminatorKind::Unreachable))
+        }));
+        assert!(!body.basic_blocks.iter().any(|(_, block)| {
+            matches!(block.terminator.as_ref().map(|it| &it.kind), Some(TerminatorKind::Return))
+        }), "evaluating a never value cannot return an uninitialized destination");
+    });
+}
+
+#[test]
 fn a_let_of_a_call_is_an_unreachable_definition() {
     let src = "fn main() {\n    let x = f();\n    let _ = x;\n}\n";
     assert_eq!(entries(src, "main"), [entry("f()", "x", "definition")]);
