@@ -16,6 +16,23 @@
 //! to a hidden name, then renamed, so DuckDB never reads half a file. Past [`CAP_BYTES`] (or the
 //! cap the history is opened with), the oldest files are deleted first.
 //!
+//! A flush every [`EVERY`] would leave thousands of files a long build (a 52-minute self-build
+//! left 3,250), and every reader's glob reads each one's footer. So after each flush the
+//! history merges files of one build name and one table into one,
+//! `<build>-<first:08>-<last:08>-<level>.<table>.parquet`: the rows of that build's files of the
+//! table whose seqs lie in `first..=last`, at `level` 1 or more (a flush's file is level 0).
+//! Rows are copied as their column chunks, with no decode and no re-encode, so row groups stay
+//! the size their flush wrote. While a build runs, each `FAN_IN` (16) files of a level
+//! become one a level up, so a table holds at most `FAN_IN - 1` files a level and its levels
+//! grow as log16 of its flushes; as the build ends (the flush of `Some(build)`), each of its
+//! tables becomes one file. Only files this history wrote since it opened are merged: those
+//! there before may be of another blaze's schema. The views' globs read both name forms.
+//!
+//! A merge is written to a hidden name and renamed into place, then its inputs are deleted.
+//! Between the two (milliseconds) a reader's glob can see the merged file and its inputs both,
+//! and count those rows twice; that race is not solved. A crash between the two leaves both,
+//! and the next open deletes the inputs a merged file holds.
+//!
 //! What a daemon that dies leaves readable: a build's `builds` row as it starts (outcome
 //! `running`, [`History::build_started`]), and with each flush that wrote rows the spans every
 //! thread was inside then (the `open` table). A build whose last row is its start, of a process
@@ -42,8 +59,13 @@ use arrow_schema::ArrowError;
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
+    column::writer::ColumnCloseResult,
     errors::ParquetError,
-    file::properties::{WriterProperties, WriterVersion},
+    file::{
+        metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
+        properties::{WriterProperties, WriterVersion},
+        writer::SerializedFileWriter,
+    },
     schema::types::ColumnPath,
 };
 
@@ -58,6 +80,10 @@ use crate::{
     schema::{self, Column, Table, Type},
     symbols,
 };
+
+mod compact;
+
+use compact::Name;
 
 /// What the history keeps by default: 4 GiB, about 400 million rows at the ~10 bytes a row
 /// takes compressed. A self-build's `check` and `build` wrote about 1 GiB together with every
@@ -219,6 +245,10 @@ pub struct Flushed {
     pub skipped: u64,
     /// Old files deleted to stay under the cap.
     pub deleted: u32,
+    /// Files merged into others, and deleted, after the flush.
+    pub merged: u32,
+    /// Files those merges made.
+    pub compacted: u32,
 }
 
 #[derive(Debug)]
@@ -231,6 +261,29 @@ pub enum HistoryError {
     /// The history `dir` has no schema file of `tables` (it was written before they existed),
     /// and writing them there failed: no view over it can be opened.
     SchemasMissing { dir: PathBuf, tables: Vec<&'static str>, error: Box<HistoryError> },
+    /// Merging files into `output` failed at the step `doing`, on `file`: an input, or the
+    /// hidden file the output is written to. Every input stays in place.
+    Compact { output: PathBuf, file: PathBuf, doing: &'static str, error: CompactError },
+}
+
+/// Why a merge of history files failed.
+#[derive(Debug)]
+pub enum CompactError {
+    Io(io::Error),
+    Parquet(ParquetError),
+    /// An input's Parquet schema is not the first input's. Every input is a file this process
+    /// wrote, so this is a bug.
+    SchemaDiffers,
+}
+
+impl fmt::Display for CompactError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompactError::Io(error) => write!(f, "{error}"),
+            CompactError::Parquet(error) => write!(f, "{error}"),
+            CompactError::SchemaDiffers => write!(f, "its Parquet schema is not the first input's"),
+        }
+    }
 }
 
 impl fmt::Display for HistoryError {
@@ -255,6 +308,12 @@ impl fmt::Display for HistoryError {
                 dir.display(),
                 tables.join(", ")
             ),
+            HistoryError::Compact { output, file, doing, error } => write!(
+                f,
+                "the profile history: merging files into {}: {doing} {}: {error}",
+                output.display(),
+                file.display()
+            ),
         }
     }
 }
@@ -267,6 +326,9 @@ impl std::error::Error for HistoryError {
             HistoryError::Arrow { error, .. } => Some(error),
             HistoryError::Identity { error, .. } => Some(error),
             HistoryError::SchemasMissing { error, .. } => Some(error.as_ref()),
+            HistoryError::Compact { error: CompactError::Io(error), .. } => Some(error),
+            HistoryError::Compact { error: CompactError::Parquet(error), .. } => Some(error),
+            HistoryError::Compact { error: CompactError::SchemaDiffers, .. } => None,
         }
     }
 }
@@ -446,20 +508,126 @@ pub fn builds(rows: &[BuildRow], pid: u32) -> Result<RecordBatch, ArrowError> {
     RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
 }
 
-/// A file of the history the cap counts: written by a flush, deleted oldest first.
+/// A file of the history the cap counts: written by a flush or a merge, deleted oldest first
+/// (by the last flush it holds rows of, `name.last`).
 struct Kept {
-    seq: u64,
+    name: Name,
     bytes: u64,
     path: PathBuf,
+    /// Written by this history since it opened, so it may be merged: a file there before may be
+    /// of another blaze's schema.
+    ours: bool,
 }
 
-/// The `seq` of a history file's name, `<build>-<seq>.<table>.parquet`.
-/// The build and the flush's number a history file is named for.
-fn named(name: &str) -> Option<(u64, u64)> {
-    let (stem, table) = name.strip_suffix(".parquet")?.split_once('.')?;
-    schema::TABLES.iter().find(|it| it.name == table)?;
-    let (build, seq) = stem.split_once('-')?;
-    Some((build.parse().ok()?, seq.parse().ok()?))
+/// A merge as its driver runs it: the paths of the files merged, in seq order, and the name of
+/// the file they become.
+struct Job {
+    inputs: Vec<PathBuf>,
+    output: Name,
+}
+
+/// Writes the rows of the Parquet files `inputs`, all of one schema, as the file `output`,
+/// copying their column chunks as they are, with `properties` (the table's); its size. It is
+/// streamed to a hidden name and renamed into place, so a reader never sees half of it; on a
+/// failure the hidden file is deleted and `output` is not made.
+fn concat(output: &Path, inputs: &[PathBuf], properties: &WriterProperties) -> Result<u64, HistoryError> {
+    let name = output.file_name().and_then(|it| it.to_str()).unwrap_or("history");
+    // alloc: a file's name, once a merge
+    let hidden = output.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let written = concat_into(output, &hidden, inputs, properties).and_then(|()| {
+        fs::rename(&hidden, output).map_err(|error| HistoryError::Compact {
+            // alloc: an error
+            output: output.to_owned(),
+            // alloc: an error
+            file: hidden.clone(),
+            doing: "renaming into place",
+            error: CompactError::Io(error),
+        })
+    });
+    if let Err(error) = written {
+        // The open of the next history deletes a hidden file this leaves.
+        _ = fs::remove_file(&hidden);
+        return Err(error);
+    }
+    let bytes = fs::metadata(output).map_err(|error| HistoryError::Compact {
+        // alloc: an error
+        output: output.to_owned(),
+        // alloc: an error
+        file: output.to_owned(),
+        doing: "reading the size of",
+        error: CompactError::Io(error),
+    })?;
+    Ok(bytes.len())
+}
+
+/// [`concat`] into the hidden file `hidden`.
+fn concat_into(
+    output: &Path,
+    hidden: &Path,
+    inputs: &[PathBuf],
+    properties: &WriterProperties,
+) -> Result<(), HistoryError> {
+    let fail = |file: &Path, doing: &'static str, error: CompactError| HistoryError::Compact {
+        // alloc: an error
+        output: output.to_owned(),
+        // alloc: an error
+        file: file.to_owned(),
+        doing,
+        error,
+    };
+    let footer = |path: &Path| -> Result<(fs::File, ParquetMetaData), HistoryError> {
+        let file = fs::File::open(path).map_err(|error| fail(path, "opening the input", CompactError::Io(error)))?;
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Optional)
+            .parse_and_finish(&file)
+            .map_err(|error| fail(path, "reading the footer of the input", CompactError::Parquet(error)))?;
+        Ok((file, metadata))
+    };
+    let Some(first) = inputs.first() else { return Ok(()) };
+    let (first_file, first_metadata) = footer(first)?;
+    let schema = first_metadata.file_metadata().schema_descr().root_schema_ptr();
+    let out = fs::File::create(hidden).map_err(|error| fail(hidden, "making", CompactError::Io(error)))?;
+    // alloc: writer properties, once a merge
+    let properties = Arc::new(properties.clone());
+    let mut writer = SerializedFileWriter::new(out, Arc::clone(&schema), properties)
+        .map_err(|error| fail(hidden, "starting to write", CompactError::Parquet(error)))?;
+    // The Arrow schema and blaze's own keys (`blaze.schema`, `blaze.table`, `blaze.clock`).
+    for kv in first_metadata.file_metadata().key_value_metadata().into_iter().flatten() {
+        // clone: a key and its value, a few a merge
+        writer.append_key_value_metadata(kv.clone());
+    }
+    let mut next = Some((first_file, first_metadata));
+    for path in inputs {
+        let (file, metadata) = match next.take() {
+            Some(it) => it,
+            None => footer(path)?,
+        };
+        if metadata.file_metadata().schema() != &*schema {
+            return Err(fail(path, "checking the schema of the input", CompactError::SchemaDiffers));
+        }
+        for (rg_at, row_group) in metadata.row_groups().iter().enumerate() {
+            let index = metadata.page_index_for_row_group(rg_at);
+            let mut group = writer
+                .next_row_group()
+                .map_err(|error| fail(hidden, "starting a row group of", CompactError::Parquet(error)))?;
+            for (column_at, column) in row_group.columns().iter().enumerate() {
+                let close = ColumnCloseResult {
+                    bytes_written: column.compressed_size().cast_unsigned(),
+                    rows_written: row_group.num_rows().cast_unsigned(),
+                    // clone: a column chunk's metadata, once a chunk copied
+                    metadata: column.clone(),
+                    bloom_filter: None,
+                    column_index: index.column_index(column_at).cloned(),
+                    offset_index: index.offset_index(column_at).cloned(),
+                };
+                group.append_column(&file, close)
+                    .map_err(|error| fail(path, "copying a column chunk of the input", CompactError::Parquet(error)))?;
+            }
+            group.close().map_err(|error| fail(hidden, "ending a row group of", CompactError::Parquet(error)))?;
+        }
+    }
+    writer.close().map_err(|error| fail(hidden, "ending", CompactError::Parquet(error)))?;
+    Ok(())
 }
 
 /// The Parquet history of this process's flight recorder, in one directory.
@@ -537,13 +705,32 @@ impl History {
                 fs::remove_file(&path).map_err(io_error(&path, "deleting a half-written file"))?;
                 continue;
             }
-            let Some((build, seq)) = named(name) else { continue };
-            last_build = last_build.max(build);
+            let Some(named) = Name::parse(name) else { continue };
+            last_build = last_build.max(named.build);
             let bytes = entry.metadata().map_err(io_error(&path, "reading the size of"))?.len();
-            kept.push(Kept { seq, bytes, path });
+            kept.push(Kept { name: named, bytes, path, ours: false });
         }
-        kept.sort_unstable_by_key(|it| it.seq);
-        let seq = kept.last().map_or(1, |it| it.seq + 1);
+        // A crash between a merge's rename and its deletes left files whose rows a merged file
+        // holds: deleted, so no reader counts them twice.
+        // alloc: once a history
+        let names: Vec<Name> = kept.iter().map(|it| it.name).collect();
+        let gone = compact::superseded(&names);
+        for &at in &gone {
+            let path = &kept[at].path;
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(path, "deleting a file a merged file holds the rows of")(error)),
+            }
+        }
+        let mut at = 0;
+        kept.retain(|_| {
+            let keep = gone.binary_search(&at).is_err();
+            at += 1;
+            keep
+        });
+        kept.sort_unstable_by_key(|it| it.name.last);
+        let seq = kept.last().map_or(1, |it| it.name.last + 1);
         let total = kept.iter().map(|it| it.bytes).sum();
         let mut writer = Writer::new();
         writer.schemas(dir)?;
@@ -683,9 +870,14 @@ impl History {
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
     /// since, one file a table with rows, named for the highest build any of its rows is of and
     /// never below `build` (`None`: the timer's flush, named 0 when it holds no build's rows).
-    /// Then deletes the oldest files past the cap. A failed write is an error naming the
-    /// file; the rows it held are not written again.
+    /// Then merges files this history wrote ([`Flushed::merged`]; each table of `build` into one
+    /// file when `build` is given, as its build ends) and deletes the oldest files past the cap.
+    /// A failed write is an error naming the file; the rows it held are not written again. A
+    /// failed merge is an error after the flush's own files are written.
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
+        // The record cost of the history itself: encoding and writing a flush's Parquet had no
+        // span, so a slow flush read as uncovered time on the history's thread.
+        let _span = tracing::info_span!(target: "blaze", "profile flush").entered();
         let (late, behind) = self.drained.take(&mut self.read);
         // The flight recorder's own losses, as counters: a query sees whether a stretch with
         // no span is one the recorder dropped. Written with each build's flush and whenever
@@ -771,6 +963,8 @@ impl History {
 
     /// [`History::flush`] of the rows drained.
     fn write(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
+        // The flush of a build's end merges each of its tables into one file.
+        let ended = build;
         let seq = self.seq;
         self.seq += 1;
         let named = self.named_for(build);
@@ -864,10 +1058,10 @@ impl History {
             if rows(parts) == 0 {
                 continue;
             }
-            // alloc: a file's name, once a file
-            let path = self.dir.join(format!("{build}-{seq:08}.{}.parquet", table.name));
+            let name = Name { build, table: table_at(table), first: seq, last: seq, level: 0 };
+            let path = self.dir.join(name.file_name());
             let bytes = self.writer.write(&path, table, parts)?;
-            self.kept.push_back(Kept { seq, bytes, path });
+            self.kept.push_back(Kept { name, bytes, path, ours: true });
             self.total += bytes;
             flushed.files += 1;
             flushed.bytes += bytes;
@@ -878,11 +1072,76 @@ impl History {
         self.crate_deps.clear();
         self.query_counts.clear();
         self.misses.clear();
+        let compacted = self.compact(ended, &mut flushed);
         flushed.deleted = self.trim()?;
+        compacted?;
         match self.unidentified.take() {
             Some(error) => Err(error),
             None => Ok(flushed),
         }
+    }
+
+    /// Merges the files this history wrote since it opened as [`compact::plan`] says, `ended`
+    /// the build whose end this flush is for, counting the files merged and made in `flushed`.
+    /// Each merge's output is renamed into place before its inputs are deleted; a merge that
+    /// fails leaves every input in place and ends the compaction.
+    fn compact(&mut self, ended: Option<u64>, flushed: &mut Flushed) -> Result<(), HistoryError> {
+        // alloc: once a flush
+        let ours: Vec<usize> = (0..self.kept.len()).filter(|&at| self.kept[at].ours).collect();
+        // alloc: once a flush
+        let names: Vec<Name> = ours.iter().map(|&at| self.kept[at].name).collect();
+        let merges = compact::plan(&names, ended);
+        if merges.is_empty() {
+            return Ok(());
+        }
+        // The paths first: `kept` changes as each merge is done.
+        let jobs: Vec<Job> = merges
+            .into_iter()
+            .map(|merge| Job {
+                // clone: a merge's paths, once a merge
+                inputs: merge.inputs.iter().map(|&at| self.kept[ours[at]].path.clone()).collect(),
+                output: merge.output,
+            })
+            // alloc: once a flush that compacts
+            .collect();
+        for job in jobs {
+            let _span = tracing::info_span!(target: "blaze", "profile merge").entered();
+            let path = self.dir.join(job.output.file_name());
+            let properties = &self.writer.properties[job.output.table];
+            let bytes = concat(&path, &job.inputs, properties)?;
+            let mut gone = 0;
+            self.kept.retain(|it| {
+                let merged = job.inputs.contains(&it.path);
+                if merged {
+                    gone += it.bytes;
+                }
+                !merged
+            });
+            self.total -= gone;
+            let at = self.kept.partition_point(|it| it.name.last <= job.output.last);
+            // clone: a file's path, once a merge
+            self.kept.insert(at, Kept { name: job.output, bytes, path: path.clone(), ours: true });
+            self.total += bytes;
+            flushed.compacted += 1;
+            for input in &job.inputs {
+                match fs::remove_file(input) {
+                    Ok(()) => {}
+                    // Gone already, as the merge wants it.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(HistoryError::Compact {
+                            output: path,
+                            // clone: an error
+                            file: input.clone(),
+                            doing: "deleting a merged input",
+                            error: CompactError::Io(error),
+                        });
+                    }
+                }
+                flushed.merged += 1;
+            }
+        }
+        Ok(())
     }
 
     /// The build a flush's files are named for: the highest build any of its rows is of, and
@@ -921,8 +1180,8 @@ impl History {
     /// flush's files, every table of it.
     fn trim(&mut self) -> Result<u32, HistoryError> {
         let mut deleted = 0;
-        let newest = self.kept.back().map_or(0, |it| it.seq);
-        while self.total > self.cap && self.kept.front().is_some_and(|it| it.seq != newest) {
+        let newest = self.kept.back().map_or(0, |it| it.name.last);
+        while self.total > self.cap && self.kept.front().is_some_and(|it| it.name.last != newest) {
             let oldest = &self.kept[0];
             match fs::remove_file(&oldest.path) {
                 Ok(()) => {}
@@ -1142,6 +1401,8 @@ mod tests {
                 said.set(col::PeakBytes::AT, (i % 5 == 0).then_some(4096 * i).word());
                 said.typed
             },
+            folded_spans: 0,
+            folded_ns: 0,
         };
         let spans: Vec<SpanRow> = (0..40).map(span).collect();
         let process = Process { pid: 9, name: "blaze test", commit: Some("abc") };
@@ -1520,7 +1781,7 @@ mod tests {
         assert!(!name(&flushes[0]).exists() && !name(&flushes[1]).exists(), "the older builds' files are deleted");
         assert!(name(&flushes[2]).exists(), "the newest flush's files stay, though they are past the cap alone");
         assert!(dir.join("schema.spans.parquet").exists(), "the schema files are not the cap's");
-        assert!(history.kept.iter().all(|it| it.seq == flushes[2].seq), "only the newest flush is kept");
+        assert!(history.kept.iter().all(|it| it.name.last == flushes[2].seq), "only the newest flush is kept");
     }
 
     /// The flush's cost a span, in release: what docs/v2/plan/lanes/observe/history.md bounds.
@@ -1546,6 +1807,8 @@ mod tests {
                 unit: 0,
                 self_cpu_ns: Some(i % 50_000),
                 typed: crate::span::Said::EMPTY.typed,
+                folded_spans: 0,
+                folded_ns: 0,
             })
             .collect();
         let dir = scratch("cost");
@@ -1568,8 +1831,12 @@ mod tests {
 
     #[test]
     fn a_file_name_gives_its_seq() {
-        assert_eq!(named("41-00000007.spans.parquet"), Some((41, 7)));
-        assert_eq!(named("0-00000012.counters.parquet"), Some((0, 12)));
+        let named = |name: &str| Name::parse(name).map(|it| (it.build, it.first, it.last, it.level));
+        assert_eq!(named("41-00000007.spans.parquet"), Some((41, 7, 7, 0)));
+        assert_eq!(named("0-00000012.counters.parquet"), Some((0, 12, 12, 0)));
+        assert_eq!(named("3-00000001-00000016-1.spans.parquet"), Some((3, 1, 16, 1)), "a merged file");
+        assert_eq!(named("3-00000001-00000016-0.spans.parquet"), None, "a merged file is of level 1 or more");
+        assert_eq!(named("3-00000009-00000002-1.spans.parquet"), None);
         assert_eq!(named("schema.spans.parquet"), None);
         assert_eq!(named("live.spans.parquet"), None);
         assert_eq!(named("1-2.tiles.parquet"), None, "tiles are not kept");

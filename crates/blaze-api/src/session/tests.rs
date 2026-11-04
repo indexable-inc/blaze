@@ -74,6 +74,7 @@ impl World {
             builder: &mut self.builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
@@ -465,7 +466,7 @@ fn status_lists_every_connections_requests_sorted() {
     world.request(1, 5, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 1, Request::Open { view: head("main") });
     let status =
-        Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20, build: BUILD.clone(), bugs: Vec::new() };
+        Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20, build: BUILD.clone(), bugs: Vec::new(), settings: Vec::new() };
     assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
 }
 
@@ -486,6 +487,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
@@ -508,6 +510,7 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             budget_bytes: 20,
             build: BUILD.clone(),
             bugs: Vec::new(),
+            settings: Vec::new(),
         };
         assert_eq!(out, [reply(2, id, Response::Status(status)), done(2, id, true)]);
     }
@@ -895,6 +898,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             builder: &mut *builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
@@ -914,6 +918,7 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             builder: &mut *builder,
             pid: 30,
             build: &BUILD,
+            settings: &[],
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,

@@ -17,11 +17,12 @@ name does not start with `blaze` (hir-ty-codegen) is published as `blaze-<name>`
 Dev-dependencies, tests and benches are left out. One file outside a crate is copied into it:
 blaze's pinned toolchain (harness/toolchain).
 
-blaze-engine's build script works out the code identities of the code generator and the front
-end, the trait solver among it (`blaze_codegen_code::CODEGEN` and `FRONT_END`), from the
-checkout, which a published crate has none of. So their tree parts are worked out here, from the checkout, and shipped in the
-staged crate (`shipped-codegen-code.txt`, `shipped-front-end-code.txt`, by blaze-codegen-code's
-`ship-code-identity`); the build script finishes them with what it is built with, the same
+blaze-engine's build script works out the code identities of the code generator, the front
+end, the trait solver among it, and what makes a unit's record (`blaze_codegen_code::CODEGEN`,
+`FRONT_END` and `RECORD`), from the checkout, which a published crate has none of. So their tree
+parts are worked out here, from the checkout, and shipped in the staged crate
+(`shipped-codegen-code.txt`, `shipped-front-end-code.txt`, `shipped-record-code.txt`, by
+blaze-codegen-code's `ship-code-identity`); the build script finishes them with what it is built with, the same
 identity a build of the checkout in that environment has.
 
 Idempotent: a version already on crates.io is skipped, so a run that stopped can be run again.
@@ -661,7 +662,7 @@ def ship_code_identities(staged: Path) -> None:
             f"shipping blaze-engine's code identities: `{' '.join(cmd)}` in {ROOT} exited "
             f"{r.returncode}; tail:\n{r.stderr[-3000:]}"
         )
-    for name in ("shipped-codegen-code.txt", "shipped-front-end-code.txt"):
+    for name in ("shipped-codegen-code.txt", "shipped-front-end-code.txt", "shipped-record-code.txt"):
         if not (staged / name).is_file():
             fail(f"ship-code-identity exited 0 and wrote no {staged / name}")
 

@@ -59,7 +59,7 @@ fn config(io: usize, work: usize) -> PlaneConfig {
 }
 
 fn budget(bytes: u64) -> Option<Budget> {
-    Some(Budget { bytes, from: "the test's budget".to_owned() })
+    Some(Budget { bytes, from: "the test's budget".to_owned(), kept_back: 0 })
 }
 
 fn open(plane: &mut Plane<impl Memo>, request: u32, weight: u32, keep_going: bool) {
@@ -815,15 +815,29 @@ fn a_task_bigger_than_the_budget_fails_naming_itself() {
     assert!(why.starts_with("<1> needs"), "{why}");
     assert!(why.contains("more than blaze may use here"), "{why}");
     assert!(why.contains("the test's budget"), "{why}");
-    // One that fits the budget but not what the process holds, with nothing running, fails too.
-    built(&mut plane, 2);
+}
+
+/// One that fits the budget but not beside what the process holds outside its grants starts
+/// once nothing granted memory runs (waiting could never make room: memadmit), says how far
+/// the process is over while it waits, and holds back every other task with memory while it
+/// runs but what fits beside it.
+#[test]
+fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 2)])), [1]);
+    // 2 granted, 8 held: 2 free, under the 7 asked. It waits for the grant, not the rest.
     plane.step(PlaneInput::Held { at_ns: 0, bytes: 8 }).unwrap();
-    add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 3)]);
-    let Some(NodeState::Failed { why }) = plane.state(NodeId(3)) else {
-        panic!("{:?}", plane.state(NodeId(3)))
-    };
-    assert!(why.starts_with("<3> needs"), "{why}");
-    assert!(why.contains("with nothing of blaze's running"), "{why}");
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 7)])), Vec::<u32>::new());
+    assert_eq!(plane.short(), 5, "8 held less 2 granted is 6 besides; 7 wants 5 of them let go");
+    let out = built(&mut plane, 1);
+    assert_eq!(runs(&out), [2], "nothing granted memory runs: it starts though 8 are held");
+    assert_eq!(plane.short(), 0);
+    assert!(matches!(plane.state(NodeId(2)), Some(NodeState::Running)));
+    // 7 granted, 8 held: 2 free. 3 waits for the grant of 7, then starts alone in turn.
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 3)])), Vec::<u32>::new());
+    assert_eq!(runs(&built(&mut plane, 2)), [3]);
 }
 
 /// A task passed over for memory `starve_after` times holds back every task with memory, of
@@ -1072,13 +1086,11 @@ impl Model {
                         {
                             let spec = &self.specs[id];
                             assert!(why.starts_with(&spec.name), "seed {seed}: {why}");
+                            // The one failure for memory: a prediction over the budget. One under
+                            // it starts alone, never fails (memadmit).
                             let budget = self.budget.expect("a failure of memory has a budget");
-                            if why.contains("more than blaze may use here") {
-                                assert!(spec.memory > budget, "seed {seed}: {why}");
-                            } else {
-                                assert!(why.contains("with nothing of blaze's running"));
-                                assert!(self.running.is_empty(), "seed {seed}: {why}");
-                            }
+                            assert!(why.contains("more than blaze may use here"), "seed {seed}: {why}");
+                            assert!(spec.memory > budget, "seed {seed}: {why}");
                         }
                         if state.settled() && holding == Some(NodeId(*id)) {
                             held_settled = true;

@@ -61,6 +61,9 @@ mod implicit_allocator;
 mod jagged_vec;
 mod intern_candidate;
 mod key_ignores_field;
+mod lenient_deserialize;
+#[cfg(test)]
+mod lenient_deserialize_tests;
 mod large_move;
 mod lock_across_query;
 mod loops;
@@ -224,6 +227,7 @@ pub enum Lint {
     NllWorkaround,
     NativeContracts,
     ThreadLocalInWaitingFn,
+    LenientDeserialize,
 }
 
 /// Which workspaces a lint is for.
@@ -383,6 +387,7 @@ impl Lint {
         Lint::NllWorkaround,
         Lint::NativeContracts,
         Lint::ThreadLocalInWaitingFn,
+        Lint::LenientDeserialize,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -482,7 +487,10 @@ impl Lint {
             // Its fix passes only blaze's (and nightly Rust's) borrow checker: on in workspaces
             // that turn on `internal`, allowed in the rest, so a published crate keeps building
             // with stable Rust.
-            | Lint::NllWorkaround => Kind::Internal,
+            | Lint::NllWorkaround
+            // AGENTS.md rule 3 (no fallback) for input: what a workspace reads must say what it
+            // holds. Another crate may read a format that grows on purpose, so it opts in.
+            | Lint::LenientDeserialize => Kind::Internal,
         }
     }
 
@@ -576,6 +584,7 @@ impl Lint {
             Lint::NllWorkaround => "nll_workaround",
             Lint::NativeContracts => "native_contracts",
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
+            Lint::LenientDeserialize => "lenient_deserialize",
         }
     }
 
@@ -667,6 +676,7 @@ impl Lint {
             Lint::NllWorkaround => concat!(general_docs!(), "#nll_workaround"),
             Lint::NativeContracts => concat!(general_docs!(), "#native_contracts"),
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
+            Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/may-suspend/fiber-boundary.md"
             }
@@ -858,6 +868,9 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => {
                 "read the thread-local in a small `#[inline(never)]` function that does not wait, and call that here (as `blaze_graph`'s `pool::with_caches` and `pool::local` do)"
             }
+            Lint::LenientDeserialize => {
+                "add `#[serde(deny_unknown_fields)]` under the derive (`blaze check --fix` does), so an unknown field is an error naming it; or say why the format must accept fields it doesn't know with `#[expect(blaze::lenient_deserialize, reason = \"..\")]`"
+            }
             Lint::NativeContracts => {
                 "write the contract as `requires`/`ensures` clauses between the signature and the body (`blaze check --fix` does), naming the return `-> (r: T)` for the `ensures`"
             }
@@ -916,6 +929,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     if let Some(adt) = ast::Adt::cast(node) {
         error_debug::check_attrs(cx, adt);
+        lenient_deserialize::check(cx, adt);
         intern_candidate::check(cx, adt);
         boxed_recursive_node::check(cx, adt);
     }

@@ -456,6 +456,8 @@ const GATING: AttrFlags = AttrFlags::HAS_EXPORT_NAME
     .union(AttrFlags::RUSTC_NEVER_RETURNS_NULL_PTR)
     .union(AttrFlags::RUSTC_CANONICAL_SYMBOL)
     .union(AttrFlags::MARKER)
+    .union(AttrFlags::RUSTC_SPECIALIZATION_TRAIT)
+    .union(AttrFlags::RUSTC_UNSAFE_SPECIALIZATION_MARKER)
     .union(AttrFlags::AUTOMATICALLY_DERIVED)
     .union(AttrFlags::RUSTC_MAIN)
     .union(AttrFlags::DEFAULT)

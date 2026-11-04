@@ -2589,19 +2589,22 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         // target.
         let word = self.word()?;
         let fat = |len: usize| -> Box<[u8]> { [word_bytes(0, word), word_bytes(len, word)].concat().into() };
-        let bytes: Box<[_]> = match l {
+        // A scalar's bytes are borrowed from the stack: a literal already interned allocates
+        // nothing.
+        let scalar = |bytes: &[u8]| -> Result<'db, Operand> { Ok(Operand::from_scalar_bytes(bytes, ty)) };
+        match l {
             hir_def::hir::Literal::String(b) => {
                 let b = b.as_str();
                 let data = fat(b.len());
                 let mm = MemoryMap::simple(b.as_bytes().into());
-                return Ok(Operand::from_concrete_const(data, mm, ty));
+                Ok(Operand::from_concrete_const(data, mm, ty))
             }
             hir_def::hir::Literal::CString(b) => {
                 let bytes = b.iter().copied().chain(iter::once(0)).collect::<Box<_>>();
 
                 let data = fat(bytes.len());
                 let mm = MemoryMap::simple(bytes);
-                return Ok(Operand::from_concrete_const(data, mm, ty));
+                Ok(Operand::from_concrete_const(data, mm, ty))
             }
             hir_def::hir::Literal::ByteString(b) => {
                 // A reference to an array is the address alone.
@@ -2610,25 +2613,20 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 let data = data.into_boxed_slice();
                 // clone: the constant's bytes; borrowed once D1 lands
                 let mm = MemoryMap::simple(b.clone());
-                return Ok(Operand::from_concrete_const(data, mm, ty));
+                Ok(Operand::from_concrete_const(data, mm, ty))
             }
-            hir_def::hir::Literal::Char(c) => const_bytes(u32::from(*c).to_le_bytes()),
-            hir_def::hir::Literal::Bool(b) => const_bytes([*b as u8]),
-            hir_def::hir::Literal::Int(it, _) => Box::from(&it.to_le_bytes()[0..size()?]),
-            hir_def::hir::Literal::Uint(it, _) => Box::from(&it.to_le_bytes()[0..size()?]),
+            hir_def::hir::Literal::Char(c) => scalar(&u32::from(*c).to_le_bytes()),
+            hir_def::hir::Literal::Bool(b) => scalar(&[*b as u8]),
+            hir_def::hir::Literal::Int(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
+            hir_def::hir::Literal::Uint(it, _) => scalar(&it.to_le_bytes()[0..size()?]),
             hir_def::hir::Literal::Float(f, _) => match size()? {
-                16 => const_bytes(f.to_f128().to_bits().to_le_bytes()),
-                8 => const_bytes(f.to_f64().to_bits().to_le_bytes()),
-                4 => const_bytes(f.to_f32().to_bits().to_le_bytes()),
-                2 => const_bytes(u16::try_from(f.to_f16().to_bits()).unwrap().to_le_bytes()),
-                _ => {
-                    return Err(MirLowerError::TypeError(
-                        "float with size other than 2, 4, 8 or 16 bytes",
-                    ));
-                }
+                16 => scalar(&f.to_f128().to_bits().to_le_bytes()),
+                8 => scalar(&f.to_f64().to_bits().to_le_bytes()),
+                4 => scalar(&f.to_f32().to_bits().to_le_bytes()),
+                2 => scalar(&u16::try_from(f.to_f16().to_bits()).unwrap().to_le_bytes()),
+                _ => Err(MirLowerError::TypeError("float with size other than 2, 4, 8 or 16 bytes")),
             },
-        };
-        Ok(Operand::from_concrete_const(bytes, MemoryMap::default(), ty))
+        }
     }
 
     fn new_basic_block(&mut self) -> BasicBlockId {

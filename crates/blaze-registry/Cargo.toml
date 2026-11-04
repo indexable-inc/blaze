@@ -35,9 +35,9 @@ blaze-sha256.workspace = true
 flate2 = { workspace = true, features = ["default"] }
 tar.workspace = true
 filetime.workspace = true
-# Where `.crate` files are kept, by their sha256.
+# Where `.crate` files are kept: blaze-fetch's objects in the store, found by their sha256.
 blaze-cas.workspace = true
-blaze-ids.workspace = true
+blaze-fetch.workspace = true
 # The configuration credentials are read from, as cargo's `GlobalContext` holds it.
 blaze-manifest.workspace = true
 toml.workspace = true

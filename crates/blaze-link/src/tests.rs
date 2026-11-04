@@ -1927,7 +1927,7 @@ mod columns {
         let target = symbols.sym_name("target");
         let mut state = State::new();
         let lines = [Line { at: 4, span: SpanRef { anchor: id(9), index: 2 } }];
-        let function = state.add_function(key(1), symbols.id(&id(1)), None, None, &lines);
+        let function = state.add_function(key(1), symbols.id(&id(1)), None, None, &lines, crate::state::NO_MADE);
         let body = symbols.sym_name("body");
         let kept = add(&mut state, body, &[fixup(0, target)], What::Function(function));
         let mut gone = Vec::new();

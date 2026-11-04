@@ -62,9 +62,12 @@ pub struct Opts {
 
 fn help() -> String {
     format!(
-        "This utility formats all bin and lib files of the current crate using rustfmt.
+        "Formats every target of the current package (or, at a workspace's root, of every member)
+with blaze's formatter: no rustfmt or cargo-fmt is started. Each target is formatted with its
+edition, under the nearest rustfmt.toml or .rustfmt.toml.
 
-Usage: cargo fmt [OPTIONS] [-- <rustfmt_options>...]
+Usage: blaze fmt [OPTIONS] [-- <rustfmt_options>...]
+       blaze fmt [rustfmt_options] <FILE.rs>...
 
 Arguments:
   [rustfmt_options]...  Options passed to rustfmt
@@ -170,7 +173,7 @@ fn execute(args: Vec<String>) -> i32 {
         }
         Parsed::Error(msg) => {
             eprintln!(
-                "error: {msg}\n\nUsage: cargo fmt [OPTIONS] [-- <rustfmt_options>...]\n\n\
+                "error: {msg}\n\nUsage: blaze fmt [OPTIONS] [-- <rustfmt_options>...]\n\n\
                  For more information, try '--help'."
             );
             return USAGE;

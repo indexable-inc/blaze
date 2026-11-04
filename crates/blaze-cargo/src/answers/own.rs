@@ -649,10 +649,9 @@ mod tests {
         assert_eq!(Vars::Only(&only).get("PATH"), None);
     }
 
-    /// This test binary's code identity: `-vV` names it.
+    /// This test binary's code identity, the one every blaze-cargo test hands over: `-vV` names it.
     fn hand_over_code() {
-        let code = hir_ty_codegen::v2::CodegenCode::from_hex(&"5a".repeat(32)).unwrap();
-        hir_ty_codegen::v2::set_code(code).unwrap();
+        hir_ty_codegen::v2::set_code(crate::serve::TEST_CODEGEN_CODE).unwrap();
     }
 
     /// blaze as `rustc` says which blaze it is in its `-vV`, after what rustc says, and only
@@ -663,7 +662,7 @@ mod tests {
         let said = answered(&[OsString::from("-vV")], &[], Vars::Only(&[])).expect("an answer");
         let said = String::from_utf8(said.stdout).unwrap();
         let rustc = target::rustc_verbose_version(Toolchain::ours().unwrap().host);
-        assert_eq!(said, format!("{rustc}blaze-identity: {}\n", "5a".repeat(32)));
+        assert_eq!(said, format!("{rustc}blaze-identity: {:x}\n", crate::serve::TEST_CODEGEN_CODE.0));
     }
 
     /// servo's `[env]` has `RUSTC_BOOTSTRAP` a list of its crates, which every build script

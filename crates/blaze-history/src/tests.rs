@@ -448,7 +448,7 @@ fn admission_takes_each_key_peak_not_its_kind() {
     history.observe(KIND, Some(&d), 1000, 30);
     assert_eq!(history.estimates().predict(KIND), 80);
     let plane = || {
-        let budget = Some(Budget { bytes: 100, from: "the test".to_owned() });
+        let budget = Some(Budget { bytes: 100, from: "the test".to_owned(), kept_back: 0 });
         Plane::new(PlaneConfig { io: 1, work: 2, budget, starve_after: 8 }).unwrap()
     };
     // Two of 80 do not fit 100 at once; two of 30 do, which the kind's 80 would not let.

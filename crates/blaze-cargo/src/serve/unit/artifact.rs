@@ -171,25 +171,34 @@ fn dir_of(path: &str) -> &str {
 }
 
 /// Whether `path` is a file rustc writes, named with the unit's `extra_filename`
-/// (`deps/foo-0123`, `build/foo-0123/build_script_build-0123`), not a copy cargo makes.
+/// (`deps/foo-0123`, `build/foo-0123/build_script_build-0123`) in the unit's output directory
+/// (where its first output is), not a copy cargo makes: a test's program placed to run from
+/// `target/debug/deps` keeps its name, and is a copy by where it is.
 fn rustc_writes(path: &str, plan: &UnitPlan) -> bool {
-    plan.extra_filename.is_empty() || file_name(path).contains(plan.extra_filename.as_str())
+    if plan.extra_filename.is_empty() {
+        return true;
+    }
+    let output_dir = plan.outputs.first().map(|it| dir_of(it));
+    file_name(path).contains(plan.extra_filename.as_str()) && output_dir.is_none_or(|it| it == dir_of(path))
 }
 
 /// The copy cargo makes of `path`, if it makes one: the output of the same name but the
-/// `extra_filename` (`target/debug/foo` of `deps/foo-0123`), or a build script's
-/// `build-script-build` beside it.
+/// `extra_filename` (`target/debug/foo` of `deps/foo-0123`), a build script's
+/// `build-script-build` beside it, or a test's program of the same name in the profile's
+/// `deps` (`target/debug/deps/it-0123` of `build/app/0123/out/it-0123`), which it runs from.
 pub(crate) fn uplifted<'a>(path: &str, plan: &'a UnitPlan) -> Option<&'a str> {
     if plan.extra_filename.is_empty() {
         return None;
     }
-    let name = file_name(path).replacen(&plan.extra_filename, "", 1);
+    let own = file_name(path);
+    let name = own.replacen(&plan.extra_filename, "", 1);
     let script = name.starts_with("build_script_");
     plan.outputs
         .iter()
         .filter(|it| it.as_str() != path && listed(it) && !rustc_writes(it, plan))
         .find(|it| {
             file_name(it) == name
+                || (file_name(it) == own && dir_of(it) != dir_of(path))
                 || (script && dir_of(it) == dir_of(path) && file_name(it) == name.replace('_', "-"))
         })
         .map(String::as_str)
@@ -208,7 +217,8 @@ pub(crate) fn filenames(_unit: &Unit, plan: &UnitPlan) -> Vec<String> {
 }
 
 /// cargo's `executable`: the program a unit that makes one makes (a binary, an example, a test
-/// of any target), at its uplifted path when cargo uplifts it; none for a build script.
+/// of any target), at its uplifted path when there is one (a test's is `target/debug/deps`',
+/// where it is run from, so its `current_exe()` is there); none for a build script.
 pub(crate) fn executable(unit: &Unit, plan: &UnitPlan) -> Option<String> {
     let runs = match unit.mode {
         // A doctest unit's program is its runner (docs/v2/plan/doctests.md).

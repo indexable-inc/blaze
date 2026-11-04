@@ -264,6 +264,7 @@ pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, Load
     for file in &types {
         let path = out_dir.join(file.output_filename(it.crate_name, it.extra));
         let hardlink = uplift_to(it, file, &path);
+        let run_from = run_from(it, file, &path);
         outputs.push(path.display().to_string());
         if let Some(link) = hardlink {
             if it.is_root && !matches!(file.flavor, Flavor::DebugInfo | Flavor::Auxiliary) {
@@ -271,6 +272,7 @@ pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, Load
             }
             outputs.push(link.display().to_string());
         }
+        outputs.extend(run_from.map(|it| it.display().to_string()));
     }
     let stem = match it.extra {
         Some(extra) => format!("{}-{extra}.d", it.crate_name),
@@ -309,6 +311,25 @@ fn uplift_to(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<Path
         }
         it.layout.dest.join(filename)
     };
+    (path != from).then_some(path)
+}
+
+/// Where a test's or bench's program is placed to be run from: `deps/<crate>-<hash>` in the
+/// profile's directory of the target dir (`target/debug/deps/it-0123`), beside the package's
+/// binaries (`target/debug/app`) and examples (`target/debug/examples/`), as cargo lays them
+/// out. Not cargo's new layout, which leaves a test in its unit's `build/<pkg>/<hash>/out`:
+/// real tests find the package's binaries from their own path (`current_exe()/../app`, as
+/// ripgrep's `tests/util.rs`, assert_cmd's `cargo_bin` and escargot do), so blaze keeps the
+/// one layout they work in. Its file name keeps the unit's hash, so it is the unit's own;
+/// rustc's file is still the one written, this a place of the same bytes
+/// (`artifact::uplifted`). None of a doctest (its examples run beside their runner), of a
+/// build that writes no artifact directory, or where rustc's file is there already (the old
+/// layout with the build dir the target dir).
+fn run_from(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<PathBuf> {
+    if it.mode != CompileMode::Test || !it.artifact_dir || file.flavor != Flavor::Normal {
+        return None;
+    }
+    let path = it.layout.dest.join("deps").join(from.file_name()?);
     (path != from).then_some(path)
 }
 

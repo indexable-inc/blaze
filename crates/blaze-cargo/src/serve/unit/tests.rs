@@ -358,6 +358,28 @@ fn a_tests_artifact_is_cargos() {
     assert!(it.profile.test);
 }
 
+/// A test built in its unit's own directory (cargo's new layout) is run from the profile's
+/// `deps`, where its name keeps the hash: `current_exe()/../p` is the package's binary.
+#[test]
+fn a_test_runs_from_deps_beside_the_packages_binaries() {
+    let test = unit(P, target("it", "test", "/w/p/tests/it.rs"), Mode::Test, &[]);
+    let out = "/w/target/debug/build/p/4567/out";
+    let plan = plan(
+        "-4567",
+        &[
+            format!("{out}/it-4567").as_str(),
+            "/w/target/debug/deps/it-4567",
+            format!("{out}/it-4567.dwp").as_str(),
+            format!("{out}/it-4567.d").as_str(),
+        ],
+    );
+    let it = artifact_of(&test, &plan);
+    assert_eq!(it.filenames, ["/w/target/debug/deps/it-4567"]);
+    assert_eq!(it.executable.as_deref(), Some("/w/target/debug/deps/it-4567"));
+    assert_eq!(artifact::made(&plan), [format!("{out}/it-4567")]);
+    assert_eq!(artifact::uplifted(&format!("{out}/it-4567"), &plan), Some("/w/target/debug/deps/it-4567"));
+}
+
 #[test]
 fn a_build_scripts_artifact_is_cargos() {
     let script = unit(P, target("build-script-build", "custom-build", "/w/p/build.rs"), Mode::Build, &[]);
@@ -1227,7 +1249,7 @@ fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], pr
         plan: &units.plans[1],
         run_env: &[],
         script_check_cfgs: Vec::new(),
-        blaze: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
+        makers: one_maker(),
         goal: compile::keyed_goal(crate::serve::work::Goal::Build, script),
         color: false,
         short: false,
@@ -1242,6 +1264,13 @@ fn script_front_for(text: &'static [u8], on_core: bool, env: &[(&str, &str)], pr
     .key(1)
     .unwrap();
     ScriptFront { lowered, base, units, config, tree, view }
+}
+
+/// One made-up maker of records ([`crate::serve::RecordMakers`]), for the keys these tests
+/// compare.
+fn one_maker() -> crate::serve::RecordMakers {
+    let id = |what: &[u8]| ContentId::of("blaze v2 cargo test record makers", what);
+    crate::serve::RecordMakers { front_end: id(b"front end"), codegen: id(b"code generator"), record: id(b"record") }
 }
 
 /// The key of the record of `base` that `store` has for the variables `env`, as
@@ -1784,6 +1813,50 @@ fn a_reached_only_crate_that_seals_keeps_its_relaxed_impl_in_its_sealed_graph() 
     assert!(!l.iter().any(|it| matches!(it.code.as_ref().and_then(|it| it.error()), Some("E0210" | "E0117"))), "{l:#?}");
 }
 
+/// Rule 18 for what makes a record: the front end's, the code generator's and the record's code
+/// identities ([`crate::serve::RecordMakers`]) are each in a unit's record key, so a record made
+/// by other code of any one of them is never found, and one made by the same code is.
+#[test]
+fn each_maker_of_a_record_moves_its_key() {
+    let key = |front: &mut MemFront, makers: crate::serve::RecordMakers| {
+        let identity = front.lowered.identity(0).unwrap();
+        let u = &front.units.graph.units[0];
+        compile::RecordInputs {
+            identity,
+            unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
+            plan: &front.units.plans[0],
+            run_env: &[],
+            script_check_cfgs: Vec::new(),
+            makers,
+            goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
+            color: false,
+            short: false,
+            verified: false,
+            reached: false,
+            pgo: None,
+            lint_profile: None,
+            layout: None,
+            width: None,
+            refused: None,
+        }
+        .key(0)
+        .unwrap()
+    };
+    let mut front = orphan_front(false);
+    let one = one_maker();
+    let base = key(&mut front, one);
+    assert_eq!(key(&mut front, one), base, "the same makers, the same key");
+    let other = ContentId::of("blaze v2 cargo test record makers", b"another");
+    let moved = [
+        ("the front end's", crate::serve::RecordMakers { front_end: other, ..one }),
+        ("the code generator's", crate::serve::RecordMakers { codegen: other, ..one }),
+        ("the record's", crate::serve::RecordMakers { record: other, ..one }),
+    ];
+    for (what, makers) in moved {
+        assert_ne!(key(&mut front, makers), base, "{what} code identity is in the record key");
+    }
+}
+
 /// Rule 18 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
 /// `d`'s record key moves, so a record of `d` built while its graph had no sealed trait (no check
 /// of its own, so no refusal) is never served for the sealed graph, and `d` is checked again and
@@ -1800,7 +1873,7 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             plan: &front.units.plans[unit],
             run_env: &[],
             script_check_cfgs: Vec::new(),
-            blaze: ContentId::of("blaze v2 cargo test toolchain", b"one blaze"),
+            makers: one_maker(),
             goal: compile::keyed_goal(crate::serve::work::Goal::Build, u),
             color: false,
             short: false,

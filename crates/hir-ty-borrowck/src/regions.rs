@@ -369,40 +369,8 @@ pub(super) fn rv_of(region: Region<'_>) -> Option<Rv> {
     }
 }
 
-/// `ty` with every alias in it marked not rigid. Whether the solver has found an alias rigid
-/// (it could not normalize it further) says nothing of which type it is, and the bounds a type
-/// test is checked against come from both sides: `&Self::Output` of
-/// `impl<I: SliceIndex<[Value]>> Index<I> for Array` normalizes, for its implied bound, to a
-/// rigid `<I as SliceIndex<[Value]>>::Output`, while the callee's signature it is tested
-/// against names the same projection as lowered, not rigid (sonic-rs's `Array::index`, E0311).
-/// Type bounds and type tests hold their types in this form so that equality is the type's.
-pub(super) fn unrigid<'db>(interner: hir_ty::next_solver::DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
-    struct Unrigid<'db>(hir_ty::next_solver::DbInterner<'db>);
-    impl<'db> rustc_type_ir::TypeFolder<hir_ty::next_solver::DbInterner<'db>> for Unrigid<'db> {
-        fn cx(&self) -> hir_ty::next_solver::DbInterner<'db> {
-            self.0
-        }
-
-        fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
-            use rustc_type_ir::{TypeSuperFoldable as _, TypeVisitableExt as _, inherent::Ty as _};
-            if !ty.has_aliases() {
-                return ty;
-            }
-            let ty = ty.super_fold_with(self);
-            match ty.kind() {
-                TyKind::Alias(rustc_type_ir::IsRigid::Yes, alias) => {
-                    Ty::new_alias(self.0, rustc_type_ir::IsRigid::No, alias)
-                }
-                _ => ty,
-            }
-        }
-    }
-    use rustc_type_ir::TypeVisitableExt as _;
-    if !ty.has_aliases() {
-        return ty;
-    }
-    rustc_type_ir::TypeFoldable::fold_with(ty, &mut Unrigid(interner))
-}
+/// `ty` with every alias in it marked not rigid: [`hir_ty_wfcheck::unrigid`].
+pub(super) use hir_ty_wfcheck::unrigid;
 
 /// Each region in `ty`, in order, those under a binder aside.
 /// The associated types `ty` names, with their arguments.

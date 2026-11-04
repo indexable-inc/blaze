@@ -633,10 +633,14 @@ pub(crate) fn vecreport(rustflags: &[String]) -> bool {
     on
 }
 
-/// How `unit`'s build compiles every function: its own profile, and for each package of its
-/// closure whose unit cargo gives another profile (`[profile.*.package.*]`), that one; the
-/// sanitizers of its rustflags, the same for every function, std's too, as cargo passes
-/// `RUSTFLAGS` to every crate.
+/// How `unit`'s build compiles every function: its own profile, and for each package linked
+/// into it ([`Graph::linked_in`](super::graph::Graph::linked_in)) whose unit cargo gives
+/// another profile (`[profile.*.package.*]`), that one; the sanitizers of its rustflags, the
+/// same for every function, std's too, as cargo passes `RUSTFLAGS` to every crate. Only what
+/// is linked in: a package that is also a build script's or proc macro's dependency (a
+/// release build's host package under `build-override`) shares its crate with the linked unit
+/// (`blaze_lower`'s run classes) and is compiled under that unit's own policy, so its other
+/// profile must not name this unit's functions of the package.
 pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Policy, String> {
     let root = job.unit(unit).map_err(|it| it.what)?;
     let plan = job.plan(unit).map_err(|it| it.what)?;
@@ -649,7 +653,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     let info = debuginfo(&base.debuginfo)?;
     // BTreeMap: it is `Profile::packages`, which is serialized and hashed.
     let mut packages = BTreeMap::new();
-    for dep in job.graph.closure(unit as u32).into_iter().skip(1) {
+    for dep in job.graph.linked_in(unit as u32).into_iter().skip(1) {
         if job.graph.has(dep, flag::STD) {
             continue;
         }
@@ -1868,6 +1872,8 @@ fn relink(
         heat,
         // clone: once per image linked, the functions codegen inferred cold
         cold: built.cold.clone(),
+        // How each function was made, sorted by key: what the image's code is summed by.
+        made: &built.made,
     };
     // What a dev executable's running code assumes, and what of it this link changes: a
     // program running the earlier link is told to start again, naming each change.

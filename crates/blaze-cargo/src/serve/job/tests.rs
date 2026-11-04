@@ -20,7 +20,7 @@ fn targets() -> Targets {
 }
 
 fn setup(runs: u64, runs_end: u64) -> Setup {
-    Setup { views: "/v".into(), std: "/s/std".into(), builds: "/s/build".into(), sources: "/s/sources".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
+    Setup { views: "/v".into(), std: "/s/std".into(), builds: "/s/build".into(), sources: "/s/sources".into(), store: "/s/v2/store".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
 }
 
 fn opened(root: u8) -> Opened {

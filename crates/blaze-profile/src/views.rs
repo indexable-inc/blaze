@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use crate::schema;
 
 /// The DuckDB views every query runs after: one a table, and `queries`, `passes`,
-/// `fiber_stacks`, `job_waits` and `job_spans`. Each
+/// `fiber_stacks`, `job_waits`, `job_spans` and `span_sums`. Each
 /// `@<table>` in it is a list of globs, filled in by [`prelude`].
 pub const PRELUDE: &str = include_str!("../sql/views.sql");
 
@@ -101,6 +101,8 @@ pub const VIEWS: &[View] = &[
     view("footprint_per_build", &[LIMIT]),
     view("derive_panics_per_build", &[LIMIT]),
     view("errors_by_kind", &[ENDED_BUILD]),
+    view("link_regions", &[BUILD]),
+    view("link_code", &[BUILD]),
 ];
 
 /// The view named `name`.
@@ -570,7 +572,7 @@ mod tests {
     const FUNCTIONS: &[&str] = &[
         "any_value", "arg_max", "array_to_string", "count", "lag", "lead", "max", "median", "min",
         "rank", "read_parquet", "round", "starts_with", "sum", "unnest", "range", "least", "greatest",
-        "coalesce", "string_agg", "regexp_matches", "row_number",
+        "coalesce", "string_agg", "regexp_matches", "row_number", "regexp_extract", "ends_with",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with

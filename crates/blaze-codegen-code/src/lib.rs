@@ -18,6 +18,18 @@
 //! build script works one out: no library of the front end has one, so an edit of the lock or of a
 //! vendored file reruns no build script but the program's, and recompiles the program alone.
 //!
+//! The same walk works out a third, [`RECORD`]: of what makes a unit's record (blaze-cargo, and
+//! every package it is built from but those [`RECORD_CUT`] names), which blaze-engine's build
+//! script sets as `BLAZE_RECORD_CODE`. A unit's record and the standard library's shared directory
+//! are keyed by it with the other two (blaze-cargo's `serve::RecordMakers`), never by the
+//! executable's bytes, so an edit of blaze-engine, the explorer, the plane's history or the CLI's
+//! rendering keeps every record. A closure leaves out a package its roots are built from only by
+//! an [`Identity::cut`], which says why no value keyed by the identity depends on its code and
+//! lists each file of a root that names it ([`Cut::named_in`], held both ways by `tests::cuts`);
+//! a cut that a package of the closure other than a root is built from is refused. What the
+//! executable's bytes covered and none of the three does: the C compiler, its flags and its SDK
+//! (below), and `--features` blaze is built with past what a build script is told.
+//!
 //! A package cut from the checkout (published, or a Nix unit's source) has no checkout to work an
 //! identity out of. The checkout ships what of it the checkout alone decides with the package
 //! ([`Tree`], [`Identity::shipped`], written by the `ship-code-identity` tool), and the program's
@@ -28,7 +40,8 @@
 //! It is of every input the code generator's code is built from ([`Worked::inputs`] lists each):
 //!
 //! 1. Every package the [`ROOTS`] the program links are built from: their normal and build
-//!    dependencies, transitively, read from `Cargo.lock` and the manifests of the checkout's
+//!    dependencies, transitively, never walking into a package the identity cuts
+//!    ([`Identity::cut`]), read from `Cargo.lock` and the manifests of the checkout's
 //!    packages, never by running cargo (a build script's `$CARGO` is blaze under blaze, AGENTS.md
 //!    rule 2). The lock lists every platform's and every feature's dependencies, a superset of
 //!    what the build compiles; a checkout package's dev-dependencies are left out by its
@@ -79,7 +92,8 @@
 //! (its dep-info) and to what each package's build script said it reads
 //! (`rerun-if-env-changed`, `rerun-if-changed`): hir-ty-codegen's test
 //! `the_code_identity_hashes_every_input_the_code_generator_read` for [`CODEGEN`], blaze-cargo's
-//! `the_front_end_identity_hashes_every_input_the_front_end_read` for [`FRONT_END`].
+//! `the_front_end_identity_hashes_every_input_the_front_end_read` for [`FRONT_END`] and
+//! `the_record_identity_hashes_every_input_what_makes_a_record_read` for [`RECORD`].
 //!
 //! Code outside the closure that the code generator or front end runs through hooks: what
 //! shapes the identity's values is a root ([`Identity::roots`]); the rest is listed in
@@ -166,6 +180,14 @@ pub struct Identity {
     pub env: &'static str,
     /// The packages whose closure it is of, when the program links them.
     pub roots: &'static [Root],
+    /// The packages the closure is not walked into: neither they nor what only they are built
+    /// from is an input. Each says why no value keyed by the identity depends on its code, and
+    /// lists the files of a root that name it ([`Cut::named_in`]). Their manifests stay inputs
+    /// where they can turn on a feature of the closure's (step 2). Refused
+    /// ([`Workspace::closure_names_of`]): a cut that is a root, one the program does not link,
+    /// and one a package of the closure other than a root is built from (a cut is only what the
+    /// roots call, through files a test holds to [`Cut::named_in`]).
+    pub cut: &'static [Cut],
     /// The root the program must link: without it there is nothing to identify.
     pub required: &'static str,
     /// Files outside every package that the closure reads: the package that reads it and the
@@ -196,6 +218,7 @@ pub const CODEGEN: Identity = Identity {
     domain: DOMAIN,
     env: ENV,
     roots: ROOTS,
+    cut: &[],
     required: CODE_GENERATOR,
     extra: EXTRA,
     how_built: true,
@@ -211,7 +234,7 @@ pub const CODEGEN: Identity = Identity {
 ///
 /// Not a root: blaze-lints, whose clippy lints run on a checked crate after its check outcome is
 /// kept (blaze-cargo's `compile::bodies` keeps it before `linted`), so what they find is in the
-/// unit's record alone, which is keyed by the whole executable; the code generator; and
+/// unit's record alone, which [`RECORD`] keys (blaze-lints is of its closure); the code generator; and
 /// blaze-cargo, which drives the front end and keeps what it made by the keys it made.
 pub const FRONT_END_ROOTS: &[Root] = &[
     Root {
@@ -255,7 +278,7 @@ pub const FRONT_END_ROOTS: &[Root] = &[
 
 /// Every identity a build script of the checkout works out: what the `ship-code-identity` tool
 /// ships with a package cut from it.
-pub const IDENTITIES: &[&Identity] = &[&CODEGEN, &FRONT_END];
+pub const IDENTITIES: &[&Identity] = &[&CODEGEN, &FRONT_END, &RECORD];
 
 /// The front end's code identity: what the values the front end computes once for everyone are
 /// stored by (blaze-cargo's `serve::unit::deps::front_end`): dependency crates' images, their
@@ -274,6 +297,7 @@ pub const FRONT_END: Identity = Identity {
     domain: "blaze v2 front end code 1",
     env: "BLAZE_FRONT_END_CODE",
     roots: FRONT_END_ROOTS,
+    cut: &[],
     required: "hir-def",
     extra: FRONT_END_EXTRA,
     how_built: true,
@@ -348,6 +372,185 @@ pub const FRONT_END_REVIEWED: &[Hook] = &[
               in the unit's record; no constant the front end stores is evaluated with it",
     },
 ];
+
+/// What makes a unit's record, when the program links it, and so every package it is built
+/// from but [`RECORD_CUT`]: the front end, the code generator and its backends, the lints, the
+/// linker, user code's runners, the store and the encodings among them.
+pub const RECORD_ROOTS: &[Root] = &[Root {
+    package: "blaze-cargo",
+    why: "makes a unit's record (`serve::unit::compile`): it plans the unit, drives the front end, the \
+          lints (blaze-lints), the code generator and the linker (blaze-link) over it, renders their \
+          diagnostics, writes the files cargo would and encodes the record (`Record`, its header)",
+}];
+
+/// The packages blaze-cargo is built from whose code shapes no record: each serves, orders or
+/// shows what was made, and nothing that makes a record calls it.
+pub const RECORD_CUT: &[Cut] = &[
+    Cut {
+        package: "blaze-explore",
+        why: "the explorer's server, started by `serve::observe` on the first request for it: it serves \
+              the history, spans and SQL of builds to a browser and hands blaze-cargo nothing back",
+        named_in: &[NamedIn {
+            package: "blaze-cargo",
+            file: "src/serve/observe.rs",
+            why: "starts the explorer for `blaze explore` and encodes `blaze debug sql`'s Arrow IPC: \
+                  answers to a client about finished builds, past every record",
+        }],
+    },
+    Cut {
+        package: "blaze-web",
+        why: "the build page blaze-explore serves: built into blaze-explore alone",
+        named_in: &[],
+    },
+    Cut {
+        package: "flecs-c",
+        why: "the ECS blaze-web's page is made with: built into blaze-web alone",
+        named_in: &[],
+    },
+    Cut {
+        package: "blaze-history",
+        why: "the plane's costs and peaks learned from past runs (`serve::plane`, kept in the daemon's \
+              image by `serve::image`): it orders and admits work, and what a unit makes does not \
+              depend on when or beside what it ran (AGENTS.md rule 22)",
+        named_in: &[
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/job.rs",
+                why: "names `History` as the plane's predictor type (`Plane<Step<S>, History>`): \
+                      admission and order, through the reviewed hook `Predict`",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/daemon.rs",
+                why: "makes the plane's `History` and reports its image section's faults: the \
+                      daemon's state, never a unit's",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/serve/image.rs",
+                why: "writes and restores the history's section of the daemon image: what the plane \
+                      learned, kept across restarts",
+            },
+        ],
+    },
+    Cut {
+        package: "blaze-ui",
+        why: "the client's rendering of what the daemon answered (`cli::live`, `cli::inspect`): it \
+              shows records and makes none; the daemon (`serve`) does not call it",
+        named_in: &[
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/print.rs",
+                why: "the client's `Printer`: renders a request's answers (unchecked tree, work, links, \
+                      timeline) to the terminal after the daemon sent them",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/live.rs",
+                why: "the client's live test view (`blaze test`): what it draws, never what ran",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/inspect.rs",
+                why: "`blaze inspect` writes what the daemon answered as JSON or CBOR, on the client",
+            },
+            NamedIn {
+                package: "blaze-cargo",
+                file: "src/cli/observe.rs",
+                why: "`blaze why` and the hot list, rendered on the client from the daemon's answer",
+            },
+        ],
+    },
+];
+
+/// Files outside every package that [`RECORD`]'s closure reads: the pinned nightly (blaze-cargo's
+/// `toolchain::OURS`, hir-ty's and the code generator's `NIGHTLY`), the digest and upstream of
+/// blaze's own standard library (blaze-cargo's `toolchain::library`), and the pinned nightly's
+/// proc-macro bridge, which blaze-macro-eval serves ([`FRONT_END_EXTRA`]).
+pub const RECORD_EXTRA: &[(&str, &str)] = &[
+    ("blaze-cargo", "../../harness/toolchain"),
+    ("blaze-cargo", "../../library/DIGEST"),
+    ("blaze-cargo", "../../library/UPSTREAM"),
+    ("blaze-macro-eval", "../../library/proc_macro/src/bridge"),
+];
+
+/// [`RECORD`]'s hooks past its closure besides every trait of the closure it names `dyn`: the
+/// generic ones blaze-engine and a cut package implement, the program's allocator's
+/// (blaze-graph's `arena::Holders`) and the plane's predictor (blaze-graph's
+/// `admission::Predict`).
+pub const RECORD_HOOKS: &[&str] = &["Holders", "Predict"];
+
+/// Implementations of [`RECORD`]'s hooks past its closure, reviewed: none changes a byte of a
+/// record.
+pub const RECORD_REVIEWED: &[Hook] = &[
+    Hook {
+        package: "blaze-engine",
+        hook: "Tree",
+        why: "`ProbeFiles` gives a `rustc` probe's files by their content, in the process of blaze run \
+              as a build script's `rustc`: a build script's run is kept by what it read \
+              (`blaze_usercode::run`), and what it printed reaches a unit by value, in its plan and \
+              its crate's identity, which the record key hashes",
+    },
+    Hook {
+        package: "blaze-engine",
+        hook: "Holders",
+        why: "`Heaps` is the program's global allocator: where a value lives, never its bytes (AGENTS.md \
+              rule 22: no output depends on addresses)",
+    },
+    Hook {
+        package: "blaze-history",
+        hook: "Predict",
+        why: "`History` predicts a node's time and peak for the plane's admission and critical path: \
+              when work runs, never what it makes (AGENTS.md rule 22)",
+    },
+];
+
+/// The code identity of what makes a unit's record (blaze-cargo's `serve::unit::compile`): what
+/// records and the standard library's shared directory are keyed by, beside [`FRONT_END`] and
+/// [`CODEGEN`] (blaze-cargo's `serve::RecordMakers`). Of every package [`RECORD_ROOTS`] are built
+/// from but [`RECORD_CUT`], and how blaze is built (`how_built`), so an edit of blaze-engine (the
+/// launcher, the pins, the as-`rustc` probes) or of a cut package keeps every record.
+///
+/// Its closure holds [`FRONT_END`]'s and [`CODEGEN`]'s packages too (blaze-cargo is built from
+/// both), so it moves whenever either does; the record key takes all three by name all the same,
+/// so `blaze why` says which moved, and a later narrowing of this one keeps them in the key.
+pub const RECORD: Identity = Identity {
+    what: "the code identity of what makes a unit's record",
+    domain: "blaze v2 unit record code 1",
+    env: "BLAZE_RECORD_CODE",
+    roots: RECORD_ROOTS,
+    cut: RECORD_CUT,
+    required: "blaze-cargo",
+    extra: RECORD_EXTRA,
+    how_built: true,
+    listing: "record-code-inputs.txt",
+    shipped: "shipped-record-code.txt",
+    hooks: RECORD_HOOKS,
+    reviewed: RECORD_REVIEWED,
+};
+
+/// A package an identity's closure is not walked into ([`Identity::cut`]).
+#[derive(Debug)]
+pub struct Cut {
+    pub package: &'static str,
+    /// Why no value keyed by the identity depends on its code.
+    pub why: &'static str,
+    /// Every file of a root that names the cut's crate, compiled into the program (tests
+    /// aside), each with why no keyed value depends on what it does with it. A test holds the
+    /// roots' files to this list both ways (blaze-codegen-code's `tests::cuts`), and refuses
+    /// one that makes a record (blaze-cargo's `src/serve/unit/`) whatever its reason.
+    pub named_in: &'static [NamedIn],
+}
+
+/// A file of a root that names a cut package's crate ([`Cut::named_in`]).
+#[derive(Debug)]
+pub struct NamedIn {
+    /// The root package the file is of.
+    pub package: &'static str,
+    /// The file, from the package's directory.
+    pub file: &'static str,
+    pub why: &'static str,
+}
 
 /// A `dyn` hook of the front end or code generator, implemented past the closure by code that
 /// can't change the bytes the code generator makes.
@@ -445,7 +648,8 @@ pub const EXTRA: &[(&str, &str)] = &[(CODE_GENERATOR, "../../harness/toolchain")
 /// its value: `CI` (stdx's `is_ci`), what llvm-sys's build script links LLVM's C++ runtime by
 /// and builds its wrappers with, where cranelift-codegen's build script reads its ISLE (refused
 /// when set: [`ISLE_SOURCE_DIR`]), and what libc's and zstd-sys's build scripts say they read
-/// (`rerun-if-env-changed`).
+/// (`rerun-if-env-changed`); and, for [`RECORD`]'s closure, what ring's and winapi's build scripts
+/// say they read (`RING_PREGENERATE_ASM` makes ring's assembly in place of the packaged one).
 pub const READ_ENV: &[&str] = &[
     "CI",
     "CXXSTDLIB",
@@ -459,6 +663,9 @@ pub const READ_ENV: &[&str] = &[
     "RUST_LIBC_UNSTABLE_FREEBSD_VERSION",
     "ZSTD_SYS_NO_HIDE_SYMBOLS",
     "ZSTD_SYS_USE_PKG_CONFIG",
+    "RING_PREGENERATE_ASM",
+    "WINAPI_NO_BUNDLED_LIBRARIES",
+    "WINAPI_STATIC_NOBUNDLE",
 ];
 /// Where cranelift-codegen's build script reads its ISLE from, when set, in place of its own
 /// files: a directory the identity does not hash, so a build with it set is refused.
@@ -1126,10 +1333,15 @@ impl Workspace {
 
     /// Every package reachable from `from` by [`Workspace::built_from`], `from` too.
     fn reach(&self, from: &[usize]) -> Result<BTreeSet<usize>, String> {
+        self.reach_past(from, &BTreeSet::new())
+    }
+
+    /// [`Workspace::reach`], never walking into a package of `cut`.
+    fn reach_past(&self, from: &[usize], cut: &BTreeSet<usize>) -> Result<BTreeSet<usize>, String> {
         let mut seen = BTreeSet::new();
         let mut stack = from.to_vec();
         while let Some(at) = stack.pop() {
-            if seen.insert(at) {
+            if !cut.contains(&at) && seen.insert(at) {
                 stack.extend(self.built_from(at)?);
             }
         }
@@ -1195,15 +1407,34 @@ impl Workspace {
         Ok(seen.difference(closure).copied().collect())
     }
 
-    /// Every package of the lock the roots of `identity` the program links are built from.
+    /// Every package of the lock the roots of `identity` the program links are built from, never
+    /// walking into one it cuts.
     fn closure(&self, identity: &Identity) -> Result<BTreeSet<usize>, String> {
         let linked = self.reach(&[self.program_at()?])?;
+        // `blaze-hir-ty-codegen` is the name .github/scripts/publish_crates.py publishes it under.
+        let named = |at: usize, package: &str| {
+            let name = self.lock[at].name.as_str();
+            name == package || name.strip_prefix("blaze-") == Some(package)
+        };
+        // Two names of one package: `ui` and `blaze-ui`, as `named` reads a lock's.
+        let same = |a: &str, b: &str| a == b || a.strip_prefix("blaze-") == Some(b) || b.strip_prefix("blaze-") == Some(a);
+        let mut cut = BTreeSet::new();
+        for it in identity.cut {
+            if identity.roots.iter().any(|root| same(root.package, it.package)) {
+                return Err(format!("{} both roots and cuts `{}`", identity.what, it.package));
+            }
+            let found: Vec<usize> = linked.iter().copied().filter(|at| named(*at, it.package)).collect();
+            if found.is_empty() {
+                return Err(format!(
+                    "{} cuts `{}` from its closure, and the program `{}` does not link it: drop the cut",
+                    identity.what, it.package, self.program
+                ));
+            }
+            cut.extend(found);
+        }
         let mut roots = Vec::new();
         for root in identity.roots {
-            // `blaze-hir-ty-codegen` is the name .github/scripts/publish_crates.py publishes it under.
-            let published = format!("blaze-{}", root.package);
-            let found: Vec<usize> =
-                linked.iter().copied().filter(|at| self.lock[*at].name == root.package || self.lock[*at].name == published).collect();
+            let found: Vec<usize> = linked.iter().copied().filter(|at| named(*at, root.package)).collect();
             match found[..] {
                 [] if root.package == identity.required => {
                     return Err(format!(
@@ -1216,7 +1447,28 @@ impl Workspace {
                 _ => return Err(format!("the program `{}` links {} packages named `{}`", self.program, found.len(), root.package)),
             }
         }
-        self.reach(&roots)
+        let closure = self.reach_past(&roots, &cut)?;
+        // A cut reached past the roots would be code the closure runs that no one reviewed: only a
+        // root may be built from a cut, and the roots' files that name it are held to
+        // `Cut::named_in` by a test.
+        let mut reached: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for &at in closure.iter().filter(|at| !roots.contains(at)) {
+            for dep in self.built_from(at)? {
+                if cut.contains(&dep) {
+                    reached.entry(self.lock[dep].name.as_str()).or_default().insert(self.lock[at].name.as_str());
+                }
+            }
+        }
+        if let Some((cut, by)) = reached.into_iter().next() {
+            let by: Vec<&str> = by.into_iter().collect();
+            return Err(format!(
+                "{} cuts `{cut}`, and `{}`, of its closure and no root, is built from it: what a cut \
+                 does could reach a keyed value unreviewed; drop the cut, or make the package a root",
+                identity.what,
+                by.join("`, `")
+            ));
+        }
+        Ok(closure)
     }
 }
 

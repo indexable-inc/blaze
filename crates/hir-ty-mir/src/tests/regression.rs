@@ -413,7 +413,7 @@ fn bug_1030() {
         }
         "#,
         &expect![[r#"
-            143..145 '{}': HashSet<T, H>
+            143..145 '{}': {unknown}
             168..197 '{     ...t(); }': ()
             174..192 'FxHash...efault': fn default<{unknown}, FxHasher>() -> HashSet<{unknown}, FxHasher>
             174..194 'FxHash...ault()': HashSet<{unknown}, FxHasher>
@@ -848,7 +848,7 @@ fn issue_4966() {
         "#,
         &expect![[r#"
             236..240 'iter': T
-            255..257 '{}': Vec<A>
+            255..257 '{}': {unknown}
             269..413 '{     ...r(); }': ()
             279..284 'inner': Map<impl Fn(&'?0.0 f64) -> f64>
             287..311 'Map { ... 0.0 }': Map<impl Fn(&'?0.0 f64) -> f64>
@@ -935,7 +935,7 @@ fn flush(&self) {
 "#,
         &expect![[r#"
             129..133 'self': &'? Mutex<T>
-            156..158 '{}': MutexGuard<'?, T>
+            156..158 '{}': {unknown}
             242..246 'self': &'? MutexGuard<'a, T>
             265..276 '{ loop {} }': &'? T
             267..274 'loop {}': !
@@ -1071,17 +1071,17 @@ fn cfg_tail() {
         "#,
         &expect![[r#"
             14..53 '{     ...)] 9 }': ()
-            20..31 '{ "first" }': ()
+            20..31 '{ "first" }': {unknown}
             22..29 '"first"': &'static str
             72..190 '{     ...] 13 }': ()
-            78..88 '{ "fake" }': ()
+            78..88 '{ "fake" }': {unknown}
             80..86 '"fake"': &'static str
-            93..103 '{ "fake" }': ()
+            93..103 '{ "fake" }': {unknown}
             95..101 '"fake"': &'static str
-            108..120 '{ "second" }': ()
+            108..120 '{ "second" }': {unknown}
             110..118 '"second"': &'static str
             210..273 '{     ... 15; }': ()
-            216..227 '{ "third" }': ()
+            216..227 '{ "third" }': {unknown}
             218..225 '"third"': &'static str
             293..357 '{     ...] 15 }': ()
             299..311 '{ "fourth" }': &'? str
@@ -2247,7 +2247,7 @@ extern "C" {
 fn f() -> Foo {}
 "#,
         &expect![[r#"
-            47..49 '{}': Foo
+            47..49 '{}': {unknown}
         "#]],
     );
 }
@@ -2451,11 +2451,11 @@ fn main() {
       //^ AtomicPtr<()>
 }
 
-//- /lib.rs crate:r#std deps:core
+//- /std.rs crate:r#std deps:core
 #![no_std]
 pub use core::*;
 
-//- /lib.rs crate:r#core
+//- /core.rs crate:r#core
 #![no_core]
 
 #[lang = "pointee_trait"]

@@ -710,6 +710,10 @@ impl Writer<Real> for UnitWriter {
         self.release.compiled(unit);
     }
 
+    fn short(&mut self) {
+        self.release.short_under(blaze_graph::admission::Pressure::now);
+    }
+
     /// The writes asked for since the last apply, as three changes, each one maintenance pass
     /// of the database ([`base_db::Trigger`] names each on its `maintain` span), not one per
     /// input set: every proc macro's load and build script's run in one batch; then, reading
@@ -1349,6 +1353,63 @@ pub(crate) fn cost_key(unit: &Unit, phase: Option<Phase>) -> blaze_graph::Key {
     }
     hasher.update(&[unit.mode as u8, u8::from(unit.macro_wasm), phase.map_or(u8::MAX, |it| it as u8)]);
     blaze_graph::Key(hasher.finish().0)
+}
+
+/// The most directory entries [`source_bytes`] reads for one unit (rule 15): a unit rooted
+/// in a directory of more (a package root holding a vendored tree) is sized by what it read.
+const SOURCE_ENTRIES: usize = 50_000;
+
+/// The bytes of Rust source of `unit`'s target, what its phases' memory is predicted from
+/// (`plane::Plane::push_sized`): every `.rs` file where its modules live by Rust's rule. A
+/// root named `lib.rs`, `main.rs` or `mod.rs` keeps its modules beside it, so its whole
+/// directory; any other (`build.rs`, `tests/it.rs`, `src/bin/tool.rs`) itself and the
+/// directory of its stem (`tests/it/`). Hidden directories and `target` are not read. A
+/// prediction only, never an input of what is built: a directory that can't be read counts
+/// 0, and 0 in all predicts the unit as [`plane::Plane::push_learned`] does. `seen` keeps each
+/// directory's count for the build, so a package's many units read it once.
+pub(crate) fn source_bytes(unit: &Unit, seen: &mut blaze_hash::HashMap<PathBuf, u64, std::alloc::Global>) -> u64 {
+    let root = unit.target.src_path.as_path();
+    let Some(dir) = root.parent() else { return 0 };
+    let modules_beside = matches!(root.file_name().and_then(|it| it.to_str()), Some("lib.rs" | "main.rs" | "mod.rs"));
+    if modules_beside {
+        return dir_source_bytes(dir, seen);
+    }
+    let own = std::fs::metadata(root).map_or(0, |it| it.len());
+    // alloc: the stem's directory's path, once a unit a build
+    let below = root.file_stem().map_or(0, |stem| dir_source_bytes(&dir.join(stem), seen));
+    own + below
+}
+
+/// The bytes of every `.rs` file under `dir`, at most [`SOURCE_ENTRIES`] entries read; once a
+/// build per directory, through `seen`.
+fn dir_source_bytes(dir: &std::path::Path, seen: &mut blaze_hash::HashMap<PathBuf, u64, std::alloc::Global>) -> u64 {
+    if let Some(&bytes) = seen.get(dir) {
+        return bytes;
+    }
+    let mut bytes = 0u64;
+    let mut entries = 0usize;
+    let mut stack = vec![dir.to_path_buf()]; // alloc: a walk's directories, once a directory a build
+    'walk: while let Some(at) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&at) else { continue };
+        for entry in read.flatten() {
+            entries += 1;
+            if entries > SOURCE_ENTRIES {
+                break 'walk;
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_dir() {
+                if !name.starts_with('.') && name != "target" {
+                    stack.push(entry.path()); // alloc: a directory to read, once a build
+                }
+            } else if kind.is_file() && name.ends_with(".rs") {
+                bytes += entry.metadata().map_or(0, |it| it.len());
+            }
+        }
+    }
+    seen.insert(dir.to_path_buf(), bytes); // alloc: the directory's count, kept for the build
+    bytes
 }
 
 /// A job's front as the loop holds it.

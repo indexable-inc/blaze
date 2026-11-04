@@ -40,6 +40,7 @@ pub mod premap;
 mod reloc;
 mod reset;
 mod sanitize;
+mod shape;
 mod stage;
 mod state;
 mod symbols;
@@ -61,7 +62,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 
-use blaze_codegen::{CompiledFunction, InstanceKey, Static, Target};
+use blaze_codegen::{CompiledFunction, InstanceKey, Made, Static, Target};
 use blaze_core::{Effect, FileName};
 use blaze_hash::HashMap;
 use std::alloc::Global;
@@ -76,6 +77,7 @@ pub use position::{
     COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
 };
 pub use premap::{NoOutside, Outside};
+pub use shape::RegionShape;
 
 use commit::{Pending, Undo, Writes};
 use model::{Formats, NativeFile, Plan, Writer};
@@ -116,6 +118,11 @@ pub struct Change<'a> {
     /// `#[track_caller]` function): a full link puts those the heat does not name after
     /// every other function. In any order, repeats allowed.
     pub cold: Vec<InstanceKey>,
+    /// How each function was made: its backend and the crate that asked for it, sorted by
+    /// key, each key once (codegen's `Built::made`, borrowed). Only what the image's shape
+    /// says of its code (`shape.rs`: `link code`); a function with none is summed as
+    /// `unsaid`.
+    pub made: &'a [(InstanceKey, Made)],
 }
 
 /// The output of a link, made visible only by a commit.
@@ -178,6 +185,43 @@ pub enum Refusal {
     TlsMoved,
     /// A native library on the link line is in none of the directories searched.
     NotFound(Box<NotFound>),
+    /// The image as laid out is past a limit of its format or of a field the linker writes
+    /// ([`OutOfReach`]), found on the addresses before anything was written. When an
+    /// incremental stage put it there ([`OutOfReach::scratch`]), a link from scratch lays the
+    /// image out anew and may keep it in reach; when a full link did, only a smaller image, or
+    /// a format change, takes it.
+    OutOfReach(Box<OutOfReach>),
+    /// A value written into the image did not fit its field: a relocation's (a 32-bit
+    /// PC-relative offset, a page offset), a branch past every thunk's reach, or a 32-bit
+    /// offset of the file's own (Mach-O's section offsets, past 4 GiB). A reach the placement
+    /// check ([`Refusal::OutOfReach`]) does not cover; its message shows the image's regions
+    /// (`shape.rs`). Final: a link from scratch lays the same out the same.
+    FieldRange,
+}
+
+/// What a laid-out image is past ([`Refusal::OutOfReach`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OutOfReach {
+    /// The section, as the format names it (`__TEXT,__eh_frame`, `.eh_frame`).
+    pub section: String,
+    /// What is past the limit: the record and the function or symbol it reaches, or the
+    /// section's room.
+    pub what: String,
+    /// How far it reaches: bytes from the image's base, or a field's distance to its target.
+    pub reach: u64,
+    /// The most the limit allows.
+    pub limit: u64,
+    /// The limit, as the format or the field sets it.
+    pub rule: &'static str,
+    /// Whether an incremental stage refused it: new code in the patch region, or a record in
+    /// a kept region, that a link from scratch places anew. A full link's is final.
+    pub scratch: bool,
+    /// The reach's two ends: the base and the room's end for a window, the field and its
+    /// target for a record's field.
+    pub from: u64,
+    pub to: u64,
+    /// The image's regions as laid out, by address: what sits between `from` and `to`.
+    pub layout: Vec<RegionShape>,
 }
 
 /// A native library the link line names that no directory searched has.
@@ -207,9 +251,22 @@ pub enum Searched {
 
 impl LinkError {
     /// The refusal, when the image refused the stage for want of room: [`Refusal::NoRoom`],
-    /// `NoRegion`, `TableFull` or `TlsMoved`.
+    /// `NoRegion`, `TableFull`, `TlsMoved`, or an incremental stage's `OutOfReach`, which a
+    /// link from scratch takes. Never `NotFound` or `FieldRange`, which one does not.
     pub fn no_room(&self) -> Option<&Refusal> {
-        self.refusal.as_ref().filter(|it| !matches!(it, Refusal::NotFound(_)))
+        self.refusal.as_ref().filter(|it| match it {
+            Refusal::NotFound(_) | Refusal::FieldRange => false,
+            Refusal::OutOfReach(reach) => reach.scratch,
+            _ => true,
+        })
+    }
+
+    /// The limit the laid-out image is past, when that refused it.
+    pub fn out_of_reach(&self) -> Option<&OutOfReach> {
+        match &self.refusal {
+            Some(Refusal::OutOfReach(it)) => Some(it),
+            _ => None,
+        }
     }
 
     /// The native library not found, and every directory it was searched in.
@@ -518,7 +575,7 @@ impl Image {
         const ROUNDS: usize = 8;
         let mut settled = false;
         for _ in 0..ROUNDS {
-            stage.place()?;
+            stage.place().map_err(|error| stage.explained(error))?;
             stage.referrers();
             let before = stage.fresh.len();
             stage.needs()?;
@@ -545,10 +602,15 @@ impl Image {
         if !self.state.laid_out {
             stage.new.lineage = lineage(&stage, &self.to);
         }
+        // The image's shape as laid out, said once a stage (`link region`, `link code`), and
+        // shown in any refusal about size or reach from here on ([`shape`]).
+        let layout = stage.record_shape();
+        stage.check_reach(&layout)?;
         stage.fill_descriptor()?;
-        stage.relocate_all()?;
+        stage.relocate_all().map_err(|error| shape::explained(error, &layout, stage.plan.base))?;
         let base = self.state.generation;
-        let finished = stage.finish()?;
+        let image_base = stage.plan.base;
+        let finished = stage.finish().map_err(|error| shape::explained(error, &layout, image_base))?;
         Ok(Staged {
             base,
             state: finished.state,

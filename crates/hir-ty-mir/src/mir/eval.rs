@@ -2592,15 +2592,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let value = self.eval_operand(it, locals)?;
                 let (val, shadow) = self.read_shadowed(value.addr, value.size)?;
-                let bytes = val.iter().copied().cycle().take(len * val.len()).collect(); // alloc: the repeated value, sized once from the exact `take` hint
+                // `[u8]::repeat` copies by doubling, not byte by byte: a `[0u8; 1 << 20]` is
+                // twenty copies, not a million steps of an iterator.
+                let bytes = OwnedBytes::from_vec(val.repeat(len)); // alloc: the repeated value, sized once
                 if !M::CHECKS {
                     return Ok(Owned(bytes));
                 }
-                let mut repeated = M::Shadow::default();
-                for i in 0..len {
-                    repeated.put(i * value.size, &shadow);
-                }
-                Shadowed(bytes, repeated)
+                Shadowed(bytes, shadow.repeat(value.size, len))
             }
             Rvalue::CopyForDeref(_) => not_supported!("copy for deref"),
             Rvalue::Aggregate(kind, values) => {

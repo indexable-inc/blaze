@@ -1556,8 +1556,10 @@ fn f(x: u32) -> Option<u32> {{
     for (cfg, checked) in [("", "false"), ("cfg:contract_checks", "true")] {
         let printed = body(cfg);
         let count = |it: &str| printed.matches(it).count();
+        // A lang path prints the name of the item it names (`print_path`), not its lang item:
+        // `contract_build_check_ensures` is the fixture's `build_check_ensures`, as in core.
         assert_eq!(count("builtin#lang(contract_check_requires)"), 1, "{printed}");
-        assert_eq!(count("builtin#lang(contract_build_check_ensures)"), 1, "{printed}");
+        assert_eq!(count("builtin#lang(build_check_ensures)"), 1, "{printed}");
         // The tail, `return None` and the `?`; not the closure's `return 1u32`.
         assert_eq!(count("builtin#lang(contract_check_ensures)"), 3, "{printed}");
         assert_eq!(count(&format!("if {checked}")), 4, "{printed}");
@@ -1617,7 +1619,9 @@ fn f(x: u32) -> (r: u32) requires x < 10 ensures r > x { x + 1 }
     function("f");
     let test = function("f_contract");
     let printed = Body::of(&db, test.into()).pretty_print(&db, test.into(), Edition::CURRENT);
-    assert!(printed.contains("assume(x < 10)"), "the requires is assumed: {printed}");
+    // A call prints each argument on a line of its own: `.assume(\n    x < 10,\n)`.
+    let assumed = printed.split_once(".assume(").map(|(_, rest)| rest.trim_start());
+    assert!(assumed.is_some_and(|it| it.starts_with("x < 10,")), "the requires is assumed: {printed}");
     assert!(printed.contains("r > x"), "the ensures is checked: {printed}");
     assert!(printed.contains("f("), "`f` is called: {printed}");
 }

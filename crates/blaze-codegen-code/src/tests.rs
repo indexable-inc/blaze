@@ -436,6 +436,46 @@ fn an_extra_whose_reader_is_outside_the_closure_is_an_error() {
     assert!(why.contains("`nowhere`") && why.contains("harness/toolchain"), "{why}");
 }
 
+/// A package an identity cuts is no input, nor what only it is built from, though a root is
+/// built from it: an edit of it keeps the identity, and an edit of a root still moves it. A cut
+/// that names no package the program links, or a root, is refused, naming it (rule 18: a cut
+/// names a package that is there, never one gone stale).
+#[test]
+fn a_cut_package_is_no_input_and_a_stale_cut_is_refused() {
+    let cut = Identity { cut: &[Cut { package: "front", why: "the test's", named_in: &[] }], ..CODEGEN };
+    let workspace = Workspace::new("cut", false);
+    let worked = work_out_of(&workspace.read().unwrap(), &cut, &env()).unwrap();
+    assert!(worked.packages.contains(CODE_GENERATOR), "{}", worked.listing());
+    for gone in ["front", "hir-def", "blaze-macro-eval"] {
+        assert!(!worked.packages.contains(gone), "{gone} is reached through the cut alone: {}", worked.listing());
+    }
+    assert_ne!(worked.code, workspace.code(), "a cut is another closure");
+    workspace.write("crates/front/src/lib.rs", "pub fn lower() { let _ = 1; }\n");
+    let edited = work_out_of(&workspace.read().unwrap(), &cut, &env()).unwrap();
+    assert_eq!(edited.code, worked.code, "an edit of a cut package keeps the identity");
+    workspace.write("crates/hir-ty-codegen/src/lib.rs", "pub fn compile() { let _ = 2; }\n");
+    let rooted = work_out_of(&workspace.read().unwrap(), &cut, &env()).unwrap();
+    assert_ne!(rooted.code, worked.code, "an edit of a root moves the identity");
+
+    let read = workspace.read().unwrap();
+    let stale = Identity { cut: &[Cut { package: "nowhere", why: "the test's", named_in: &[] }], ..CODEGEN };
+    let why = work_out_of(&read, &stale, &env()).unwrap_err();
+    assert!(why.contains("`nowhere`") && why.contains("does not link"), "{why}");
+    let both = Identity { cut: &[Cut { package: CODE_GENERATOR, why: "the test's", named_in: &[] }], ..CODEGEN };
+    let why = work_out_of(&read, &both, &env()).unwrap_err();
+    assert!(why.contains("both roots and cuts"), "{why}");
+    // M2 of the overkey review: a root and a cut are one package by either of its names.
+    let short = Identity { cut: &[Cut { package: "item-hash", why: "the test's", named_in: &[] }], ..CODEGEN };
+    let why = work_out_of(&read, &short, &env()).unwrap_err();
+    assert!(why.contains("both roots and cuts"), "{why}");
+
+    // C1 of the overkey review: `hir-def` is built from by `front` and `hir-ty`, which are of the
+    // closure and no root, so code the closure runs would be past it unreviewed.
+    let reached = Identity { cut: &[Cut { package: "hir-def", why: "the test's", named_in: &[] }], ..CODEGEN };
+    let why = work_out_of(&read, &reached, &env()).unwrap_err();
+    assert!(why.contains("`hir-def`") && why.contains("`front`") && why.contains("`hir-ty`") && why.contains("no root"), "{why}");
+}
+
 /// M2 of the fekey review: a link to a directory under a directory an identity reads outside
 /// every package is refused, naming it; followed, a link to a directory above it never ends.
 #[cfg(unix)]
@@ -542,4 +582,5 @@ fn the_vendored_solver_is_of_the_front_ends_identity() {
     assert!(worked.files.contains(&workspace.root().join(source).canonicalize().unwrap()), "{:?}", worked.files);
 }
 
+mod cuts;
 mod hooks;

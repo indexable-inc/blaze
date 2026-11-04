@@ -1,6 +1,6 @@
 //! blaze's collector of what it keeps on disk (docs/gc.md): the per-workspace build dirs
 //! (`<home>/build/<workspace id>/`, a profile each below), the machine's shared standard-library
-//! stores (`<machine>/std/<build id>/`), temporaries left behind, and its own trash.
+//! stores (`<machine>/std/<makers>/`), temporaries left behind, and its own trash.
 //!
 //! - [`plan::Collector`] is the core: a synchronous state machine that reads time only from
 //!   [`plan::Collector::advance_clock`], owns no file, thread or timer, and hands back

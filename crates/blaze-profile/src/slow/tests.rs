@@ -32,6 +32,7 @@ fn span(thread: u32, span_id: u64, parent: Option<u64>, name: &str, start: i64, 
         start_ns: start * U,
         dur_ns: dur * U,
         self_cpu_ns: None,
+        folded_ns: 0,
     }
 }
 
@@ -328,7 +329,8 @@ fn two_daemons_builds_numbered_alike_in_one_history_stay_apart() {
     );
     let source = crate::time::load::Source { duckdb: &duckdb, history: &apart };
     let pick = crate::time::load::pick(&source, Some(1)).unwrap_or_else(|error| panic!("{error}"));
-    let (input, process) = crate::time::load::rows(&source, pick).unwrap_or_else(|error| panic!("{error}"));
+    let crate::time::load::Rows { input, process, cut } = crate::time::load::rows(&source, pick).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!((cut.floor_ns, cut.read), (0, 1), "a build within the budget is read whole");
     assert_eq!(process, Some(8));
     let processes: Vec<u32> = input.spans.iter().map(|it| it.process).collect();
     assert_eq!(processes, [8], "another process's row of no build in the window is not the build's");

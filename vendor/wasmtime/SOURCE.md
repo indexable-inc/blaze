@@ -8,7 +8,7 @@
   Cargo.toml with the tests/ they name, unused: the root manifest excludes this directory from
   the workspace, so its own tests are not built.
 
-Why: the wasm seed (docs/future/bootstrap.md) builds blaze for `wasm32-wasip1`, where proc macros
+Why: the wasm seed (todo/bootstrap/plan.md) builds blaze for `wasm32-wasip1`, where proc macros
 run on Wasmtime's Pulley interpreter inside the seed. That target is neither Unix nor Windows, so
 Wasmtime uses its `sys::custom` platform layer with `std` but no virtual memory, and upstream
 does not build there: `vm.rs` imports `sys::mmap::open_file_for_mmap` under `std`, and
@@ -33,7 +33,7 @@ enables:
    component tasks. The fiber calls the function through `TypedFunc::call_raw` (its `ty` and
    `func` now `pub(crate)`), since `TypedFunc::call` refuses a call from an async context, a
    check against a future polled on another thread that a guest fiber never has. This is the
-   bootstrap seed's fiber switch (docs/future/bootstrap.md, "Fibers in the seed").
+   bootstrap seed's fiber switch (todo/bootstrap/plan.md, "Fibers in the seed").
 
 Report upstream: `std` without virtual memory is a configuration Wasmtime's build script makes
 (`has_virtual_memory` is false for any `std` target that is neither Unix nor Windows).

@@ -260,14 +260,22 @@ fn installed_is_read_from_the_main_file() {
 
 #[test]
 fn captured_variables_and_unit_dirs() {
-    let env = captured(|name| match name {
+    let env = captured(&["BLAZE_DAEMON_MEMORY_GB", "BLAZE_OPT"], |name| match name {
         "PATH" => Some("/bin".to_owned()),
         "HOME" => Some("/h".to_owned()),
         "BLAZE_HOME" => Some(String::new()),
         "BLAZE_SANDBOX" => Some("off".to_owned()),
+        "BLAZE_DAEMON_MEMORY_GB" => Some("80".to_owned()),
         _ => None,
     });
-    assert_eq!(env, vec![("HOME".to_owned(), "/h".to_owned()), ("PATH".to_owned(), "/bin".to_owned())]);
+    assert_eq!(
+        env,
+        vec![
+            ("HOME".to_owned(), "/h".to_owned()),
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("BLAZE_DAEMON_MEMORY_GB".to_owned(), "80".to_owned())
+        ]
+    );
 
     let home = Path::new("/h");
     assert_eq!(unit_dir(Manager::Launchd, home, None), Path::new("/h/Library/LaunchAgents"));

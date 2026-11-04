@@ -308,17 +308,12 @@ impl Backends<'_> {
 }
 
 /// A request the walk did not list, `what`, with the settings the unit built its IR under and
-/// the walks its references came from: a unit whose settings neither walk has is where the
-/// two disagree.
-fn unwalked(what: &str, build: Build, inlined: bool) -> String {
-    let [first, second] = Build::WALKS_INLINED;
-    let all = [Build::WALK, first, second];
-    let walks = match inlined {
-        true => &all[..],
-        false => &all[..1],
-    };
+/// the walks its references came from, as the walk takes them ([`refs::Walking::builds`]): a
+/// unit whose settings no walk has is where the two disagree.
+fn unwalked(what: &str, build: Build, walking: refs::Walking) -> String {
+    let walks = walking.builds();
     // alloc: an error
-    format!("{what}; the unit is built as {build:?}, its references walked as {walks:?}")
+    format!("{what}; the unit is built as {build:?}, its references walked as {:?}", &walks[..])
 }
 
 /// `instance`'s IR as `spec` builds it, against `refs`, with what each of its requests is in
@@ -383,12 +378,12 @@ pub(super) fn built_function(
         Built::Ir(pending) => {
             let requests = &mut pending.wants.requests;
             let places = place_requests(db, hashes, krate, &mut placer, requests)
-                .map_err(|what| fail(unwalked(&what, build, inlined)))?;
+                .map_err(|what| fail(unwalked(&what, build, walking)))?;
             (places, pending.source.take(), pending.variables.take())
         }
         Built::Assembled(_, requests) => {
             let places = place_requests(db, hashes, krate, &mut placer, requests)
-                .map_err(|what| fail(unwalked(&what, build, inlined)))?;
+                .map_err(|what| fail(unwalked(&what, build, walking)))?;
             (places, None, None)
         }
     };

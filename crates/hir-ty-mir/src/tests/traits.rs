@@ -1518,24 +1518,24 @@ fn test(x: Box<dyn Trait<u64>>, y: &dyn Trait<u64>) {
     z.foo2();
 }"#,
         &expect![[r#"
-            206..208 '{}': Box<dyn Trait<u64> + '?>
+            206..208 '{}': {unknown}
             218..219 'x': Box<dyn Trait<u64> + 'static>
-            242..243 'y': &'? (dyn Trait<u64> + 'static)
+            242..243 'y': &'? (dyn Trait<u64> + '?)
             262..379 '{     ...2(); }': ()
             268..269 'x': Box<dyn Trait<u64> + 'static>
-            275..276 'y': &'? (dyn Trait<u64> + 'static)
+            275..276 'y': &'? (dyn Trait<u64> + '?)
             286..287 'z': Box<dyn Trait<u64> + '?>
             290..293 'bar': fn bar() -> Box<dyn Trait<u64> + 'static>
             290..295 'bar()': Box<dyn Trait<u64> + 'static>
             301..302 'x': Box<dyn Trait<u64> + 'static>
             301..308 'x.foo()': u64
-            314..315 'y': &'? (dyn Trait<u64> + 'static)
+            314..315 'y': &'? (dyn Trait<u64> + '?)
             314..321 'y.foo()': u64
             327..328 'z': Box<dyn Trait<u64> + '?>
             327..334 'z.foo()': u64
             340..341 'x': Box<dyn Trait<u64> + 'static>
             340..348 'x.foo2()': i64
-            354..355 'y': &'? (dyn Trait<u64> + 'static)
+            354..355 'y': &'? (dyn Trait<u64> + '?)
             354..362 'y.foo2()': i64
             368..369 'z': Box<dyn Trait<u64> + '?>
             368..376 'z.foo2()': i64
@@ -1565,13 +1565,13 @@ fn test(s: S<u32, i32>) {
 }"#,
         &expect![[r#"
             106..110 'self': &'? S<T, U>
-            132..143 '{ loop {} }': &'? (dyn Trait<T, U> + 'static)
+            132..143 '{ loop {} }': &'? (dyn Trait<T, U> + '?)
             134..141 'loop {}': !
             139..141 '{}': ()
             255..256 's': S<u32, i32>
             271..293 '{     ...z(); }': ()
             277..278 's': S<u32, i32>
-            277..284 's.bar()': &'? (dyn Trait<u32, i32> + 'static)
+            277..284 's.bar()': &'? (dyn Trait<u32, i32> + '?)
             277..290 's.bar().baz()': (u32, i32)
         "#]],
     );
@@ -1596,10 +1596,10 @@ fn test(x: Trait, y: &Trait) -> u64 {
     z.foo();
 }"#,
         &expect![[r#"
-            60..62 '{}': dyn Trait + '?
+            60..62 '{}': {unknown}
             72..73 'x': dyn Trait + 'static
             82..83 'y': &'? (dyn Trait + 'static)
-            100..175 '{     ...o(); }': u64
+            100..175 '{     ...o(); }': {unknown}
             106..107 'x': dyn Trait + 'static
             113..114 'y': &'? (dyn Trait + 'static)
             124..125 'z': dyn Trait + '?
@@ -1868,7 +1868,7 @@ fn test<T: Trait1, U: Trait2>(x: T, y: U) {
 }"#,
         &expect![[r#"
             53..57 'self': &'? Self
-            66..68 '{}': u32
+            66..68 '{}': {unknown}
             185..186 'x': T
             191..192 'y': U
             197..226 '{     ...o(); }': ()
@@ -1897,7 +1897,7 @@ fn test(x: &impl Trait1) {
 }"#,
         &expect![[r#"
             53..57 'self': &'? Self
-            66..68 '{}': u32
+            66..68 '{}': {unknown}
             119..120 'x': &'? impl Trait1
             136..152 '{     ...o(); }': ()
             142..143 'x': &'? impl Trait1
@@ -1949,7 +1949,7 @@ fn test() {
 }"#,
         &expect![[r#"
             134..135 't': T
-            145..147 '{}': U
+            145..147 '{}': {unknown}
             177..178 't': T
             188..191 '{t}': T
             189..190 't': T
@@ -2070,9 +2070,9 @@ fn make_foo_fn() -> Foo {}
 }"#,
         &expect![[r#"
             36..40 'self': &'? Foo
-            51..53 '{}': usize
+            51..53 '{}': {unknown}
             134..135 'f': F
-            154..156 '{}': Lazy<T, F>
+            154..156 '{}': {unknown}
             254..496 '{     ...o(); }': ()
             264..269 'lazy1': Lazy<Foo, impl Fn() -> Foo>
             286..295 'Lazy::new': fn new<Foo, impl Fn() -> Foo>(impl Fn() -> Foo) -> Lazy<Foo, impl Fn() -> Foo>
@@ -2091,7 +2091,7 @@ fn make_foo_fn() -> Foo {}
             477..479 'r2': usize
             482..487 'lazy2': Lazy<Foo, fn() -> Foo>
             482..493 'lazy2.foo()': usize
-            356..358 '{}': Foo
+            356..358 '{}': {unknown}
         "#]],
     );
 }
@@ -3093,13 +3093,13 @@ fn test(x: &dyn Foo) {
     foo(x);
 }"#,
         &expect![[r#"
-            21..22 'x': &'? (dyn Foo + 'static)
+            21..22 'x': &'? (dyn Foo + '?)
             34..36 '{}': ()
-            46..47 'x': &'? (dyn Foo + 'static)
+            46..47 'x': &'? (dyn Foo + '?)
             59..74 '{     foo(x); }': ()
-            65..68 'foo': fn foo(&'? (dyn Foo + 'static))
+            65..68 'foo': fn foo(&'? (dyn Foo + '?))
             65..71 'foo(x)': ()
-            69..70 'x': &'? (dyn Foo + 'static)
+            69..70 'x': &'? (dyn Foo + '?)
         "#]],
     );
 }
@@ -3162,7 +3162,7 @@ fn test() {
         &expect![[r#"
             9..11 '{}': ()
             28..29 'T': {unknown}
-            36..38 '{}': T
+            36..38 '{}': {unknown}
             36..38: expected T, got ()
             169..249 '{     ...t(); }': ()
             175..178 'foo': fn foo()
@@ -3559,7 +3559,7 @@ fn f() {
 }"#,
         &expect![[r#"
             17..73 '{     ...   } }': ()
-            39..71 '{     ...     }': S
+            39..71 '{     ...     }': {unknown}
             53..54 's': S
             57..62 'inner': fn inner() -> S
             57..64 'inner()': S
@@ -4284,7 +4284,7 @@ trait Trait {
 }
 
 fn f(t: &dyn Trait<T = (), T = ()>) {}
-   //^&'? (dyn Trait<T = ()> + 'static)
+   //^&'? (dyn Trait<T = ()> + '?)
         "#,
     );
 }
@@ -4400,9 +4400,9 @@ fn f<'a>(v: &dyn Trait<Assoc<i32> = &'a i32>) {
 }
     "#,
         &expect![[r#"
-            127..128 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + 'static)
+            127..128 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + '?)
             164..195 '{     ...f(); }': ()
-            170..171 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + 'static)
+            170..171 'v': &'? (dyn Trait<Assoc<i32> = &'_ i32> + '?)
             170..184 'v.get::<i32>()': {unknown}
             170..192 'v.get:...eref()': {unknown}
         "#]],
@@ -5455,7 +5455,7 @@ impl<'a, 'b> Trait<'a, 'b> for Foo {}
 fn run_dyn<'b>(val: &dyn for<'a> Trait<'a, 'b>) {}
 "#,
         &expect![[r#"
-            91..94 'val': &'? (dyn Trait<'?0.0, '_> + 'static)
+            91..94 'val': &'? (dyn Trait<'?0.0, '_> + '?)
             124..126 '{}': ()
         "#]],
     );

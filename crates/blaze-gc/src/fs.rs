@@ -9,7 +9,7 @@
 //!   it a [`Class::Profile`], and each file in it ending `.tmp` a [`Class::Temp`]. A workspace
 //!   with no lease file, no record that reads, or a checkout whose state cannot be told is
 //!   refused, and so are its profiles and temporaries.
-//! - In the last area, the machine's shared directory: `std/<build id>`, a [`Class::Std`];
+//! - In the last area, the machine's shared directory: `std/<makers>` (one per code identity of what makes std's records), a [`Class::Std`];
 //!   refused without a lease file.
 //! - In each area, `.blaze-trash/<entry>` ([`Class::Trash`]), only when the trash holds blaze's
 //!   marker ([`trash_dir`]), and only entries named as blaze names them ([`is_trash_name`]).

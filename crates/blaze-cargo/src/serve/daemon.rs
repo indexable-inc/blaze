@@ -265,6 +265,7 @@ macro_rules! cx {
             builder: &mut $daemon.jobs,
             pid: $daemon.pid,
             build: &$daemon.build,
+            settings: &$daemon.settings,
             memory_bytes: arena::own(),
             budget_bytes: $daemon.plane.budget().map_or(0, |it| it.bytes),
             memory: blaze_mem::tag::snapshot,
@@ -301,9 +302,9 @@ macro_rules! world {
 pub struct Options {
     /// Its state directory ([`super::state`]), under the driver's root.
     pub state: FileName,
-    /// The directory this blaze build's daemons share the standard library in, whatever
-    /// their `BLAZE_HOME` (`<machine>/std/<build id>`, [`super::machine`] and
-    /// [`super::build_id`]), under the driver's root: each std key's outputs in a directory of
+    /// The directory the daemons of every blaze with this one's record makers share the
+    /// standard library in, whatever their `BLAZE_HOME` (`<machine>/std/<makers>`,
+    /// [`super::machine`] and [`super::RecordMakers::id`]), under the driver's root: each std key's outputs in a directory of
     /// its own, their records and outputs in the shared store `store` beside them.
     pub std: FileName,
     /// Where workspaces' build directories are when nothing names one ([`super::builds`]),
@@ -335,6 +336,9 @@ pub struct Options {
     /// Which blaze the daemon is: its executable's hash and that file as it started
     /// ([`super::build_of`]), which a client compares with its own before it sends a request.
     pub build: blaze_api::Build,
+    /// What it was started with and keeps for its life ([`super::settings`]), which a client
+    /// compares with its own environment before it sends a request.
+    pub settings: Vec<blaze_api::Setting>,
     /// The table of directories outside views that user code's checks read
     /// ([`blaze_vfs::outside::dirs`]); the daemon drives its watches for its whole life.
     pub outside: &'static blaze_vfs::outside::Dirs,
@@ -444,6 +448,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     pid: u32,
     /// Which blaze it is ([`Options::build`]), for [`blaze_api::Status::build`].
     build: blaze_api::Build,
+    /// What it was started with ([`Options::settings`]), for [`blaze_api::Status::settings`].
+    settings: Vec<blaze_api::Setting>,
     started: Started,
     /// Its state directory, in whose `stalls/` a stall's trace is written.
     state: FileName,
@@ -488,6 +494,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// The collector of what blaze keeps on disk ([`super::gc`]): `blaze serve`'s daemon's
     /// alone ([`Daemon::collect`]), as a test's daemons share no disk of their own.
     gc: Option<super::gc::Gc>,
+    /// `blaze fetch-url`'s requests, each fetched on a thread of its own.
+    fetch_urls: super::fetch_url::FetchUrls,
     /// Builds that failed for want of space, their finish held under the collector's hold id
     /// until the urgent run they asked for ends and the volumes are measured after it
     /// ([`super::gc::Gc::hold`]); then told, their error saying what the run found.
@@ -1271,6 +1279,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             std: format!("/{}", options.std),
             builds: format!("/{}", options.builds),
             sources: format!("/{}", options.sources),
+            store: format!("/{state}/store"),
             host: options.host,
             env: options.env,
             color: options.color,
@@ -1309,6 +1318,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             failed: None,
             pid: std::process::id(),
             build: options.build,
+            settings: options.settings,
             started,
             state,
             observe,
@@ -1326,6 +1336,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
             gc: None,
+            fetch_urls: super::fetch_url::FetchUrls::new(),
             held: Vec::new(), // alloc: none until a build runs out of space
         })
     }
@@ -1607,6 +1618,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.between();
         // A stalled job's leases end once its tasks let go of it.
         self.jobs.release_leases();
+        let fetched = self.fetch_urls.take_answers();
+        if !fetched.is_empty() {
+            self.send(fetched);
+        }
         if self.stopping.is_none()
             && let Some(gc) = &mut self.gc
         {
@@ -2035,6 +2050,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     };
                     self.server.reply(&Reply { to: from, response }, &mut self.effects);
                     self.server.reply(&Reply { to: from, response: blaze_api::Response::Done { ok } }, &mut self.effects);
+                }
+                // `blaze fetch-url`: fetched on a thread of its own, answered as it ends
+                // ([`super::fetch_url::FetchUrls::take_answers`]).
+                Out::Pass(Arrived::Request {
+                    from,
+                    request: Request::FetchUrl { url, repo, rev, digest, most_bytes, out },
+                }) => {
+                    let asked = super::fetch_url::Asked { url, repo, rev, digest, most_bytes, out };
+                    self.fetch_urls.ask(from, asked);
                 }
                 Out::Pass(Arrived::Request { from, request: Request::Sql { sql, last_s } }) => {
                     let mut replies = std::mem::take(&mut self.replies);

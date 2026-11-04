@@ -268,7 +268,9 @@ fn once(g: &Goal) -> u64 {{
 }}
 "
     );
-    let f = fx(&source, "");
+    // `g.a[0]` types through the `Index` lang item, as in rustc: without it `once` is
+    // `CannotIndexInto` and its MIR does not build.
+    let f = fx(&source, "//- minicore: slice, index\n");
     let db = &f.db;
     let ranked = blaze_query::db::attach(db, || {
         let mut heat = Heat::new();

@@ -57,6 +57,7 @@ mod attr;
 pub mod cargo_fmt;
 mod chains;
 pub mod cli;
+pub mod command;
 mod closures;
 mod comment;
 pub(crate) mod config;

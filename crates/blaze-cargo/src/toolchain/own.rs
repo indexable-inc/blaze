@@ -18,7 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_sha256::Sha256;
 use tokio::sync::mpsc;
 
 use blaze_registry::http::HyperHttp;
@@ -484,8 +483,11 @@ async fn download(
         Some(to) => to.send(piece).await.map_err(|_| anyhow::Error::new(Unpacking)),
         None => Ok(()),
     };
+    // alloc: once a file
+    let pinned = blaze_fetch::Digest::parse(&format!("sha256:{}", pin.sha256)).map_err(anyhow::Error::new)?;
     let mut written = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
-    let mut hasher = Sha256::new();
+    // The pin's algorithm and BLAKE3 in one pass, as blaze-fetch checks every download.
+    let mut hasher = blaze_fetch::Hashing::new(pinned.algo());
     let mut have = written.metadata()?.len();
     if have > pin.bytes {
         written.set_len(0)?;
@@ -532,8 +534,7 @@ async fn download(
         }
         tokio::time::sleep(Duration::from_secs(tries.into())).await;
     }
-    let got = crate::content::hex(&hasher.finish());
-    if got != pin.sha256 {
+    if hasher.finish().digest != pinned {
         drop(written);
         _ = std::fs::remove_file(part);
         return Err(NotPublished { file: file.to_owned(), version: "" }.into());

@@ -104,6 +104,16 @@ pub trait Shadow<P>: Clone + Default + std::fmt::Debug {
     /// `other` put over these at `at`, growing them when it ends past them; bytes between
     /// their old end and `at` are uninitialized.
     fn put(&mut self, at: usize, other: &Self);
+    /// These, of `size` bytes, `count` times end to end, as `[x; count]` lays out its
+    /// elements. A shadow that records only its pointers overrides it to cost their number,
+    /// not `count` puts.
+    fn repeat(&self, size: usize, count: usize) -> Self {
+        let mut repeated = Self::default();
+        for i in 0..count {
+            repeated.put(i * size, self);
+        }
+        repeated
+    }
     /// The provenance of the pointer that starts at `at`, if a whole one does.
     fn prov_at(&self, at: usize, size: usize) -> Option<P>;
     /// Calls `f` with the start of each whole pointer of `size` bytes with provenance in the
@@ -300,6 +310,8 @@ impl<P> Shadow<P> for () {
     fn slice(&self, _: Range<usize>) -> Self {}
     #[inline(always)]
     fn put(&mut self, _: usize, _: &Self) {}
+    #[inline(always)]
+    fn repeat(&self, _: usize, _: usize) -> Self {}
     #[inline(always)]
     fn prov_at(&self, _: usize, _: usize) -> Option<P> {
         None

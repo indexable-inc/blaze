@@ -69,7 +69,7 @@ mod utils;
 mod vec_box;
 
 #[cfg(test)]
-mod disallowed_tests;
+pub(crate) mod disallowed_tests;
 #[cfg(test)]
 pub(crate) mod drops_tests;
 #[cfg(test)]

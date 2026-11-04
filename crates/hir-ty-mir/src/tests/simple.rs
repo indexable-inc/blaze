@@ -977,7 +977,7 @@ fn main(foo: Foo) {
             58..66 '{      }': ()
             72..106 'if fal...     }': ()
             75..80 'false': bool
-            81..106 '{     ...     }': ()
+            81..106 '{     ...     }': {unknown}
             91..94 'foo': Foo
             91..100 'foo.field': i32
         "#]],
@@ -1073,10 +1073,10 @@ fn infer_inherent_method() {
         &expect![[r#"
             31..35 'self': A
             37..38 'x': u32
-            52..54 '{}': i32
+            52..54 '{}': {unknown}
             106..110 'self': &'? A
             112..113 'x': u64
-            127..129 '{}': i64
+            127..129 '{}': {unknown}
             147..148 'a': A
             153..201 '{     ...(1); }': ()
             159..160 'a': A
@@ -1110,7 +1110,7 @@ fn test() {
 "#,
         &expect![[r#"
             67..71 'self': &'? str
-            80..82 '{}': i32
+            80..82 '{}': {unknown}
             96..116 '{     ...o(); }': ()
             102..107 '"foo"': &'static str
             102..113 '"foo".foo()': i32
@@ -1403,7 +1403,7 @@ fn infer_impl_generics_basic() {
             206..210 'self': A<X, Y>
             206..212 'self.y': Y
             214..215 't': T
-            244..341 '{     ...(1); }': i128
+            244..341 '{     ...(1); }': {unknown}
             254..255 'a': A<u64, i64>
             258..280 'A { x:...1i64 }': A<u64, i64>
             265..269 '1u64': u64
@@ -1440,7 +1440,7 @@ fn infer_impl_generics_with_autoderef() {
         "#,
         &expect![[r#"
             77..81 'self': &'? Option<T>
-            97..99 '{}': Option<&'? T>
+            97..99 '{}': {unknown}
             110..111 'o': Option<u32>
             126..164 '{     ...f(); }': ()
             132..136 '(&o)': &'? Option<u32>
@@ -1936,7 +1936,7 @@ fn closure_return() {
         }
         "#,
         &expect![[r#"
-            16..58 '{     ...; }; }': u32
+            16..58 '{     ...; }; }': {unknown}
             26..27 'x': impl Fn() -> usize
             30..55 '|| -> ...n 1; }': impl Fn() -> usize
             42..55 '{ return 1; }': !
@@ -1955,7 +1955,7 @@ fn closure_return_unit() {
         }
         "#,
         &expect![[r#"
-            16..47 '{     ...; }; }': u32
+            16..47 '{     ...; }; }': {unknown}
             26..27 'x': impl Fn()
             30..44 '|| { return; }': impl Fn()
             33..44 '{ return; }': !
@@ -1973,7 +1973,7 @@ fn closure_return_inferred() {
         }
         "#,
         &expect![[r#"
-            16..46 '{     ..." }; }': u32
+            16..46 '{     ..." }; }': {unknown}
             26..27 'x': impl Fn() -> &'? str
             30..43 '|| { "test" }': impl Fn() -> &'? str
             33..43 '{ "test" }': &'? str
@@ -3261,11 +3261,11 @@ fn main() {
         "#,
         &expect![[r#"
             188..192 'self': &'_ Box<Foo<T>>
-            218..220 '{}': &'? T
+            218..220 '{}': {unknown}
             242..246 'self': &'_ Box<Foo<T>>
-            275..277 '{}': &'? Foo<T>
+            275..277 '{}': {unknown}
             297..301 'self': Box<Foo<T>>
-            322..324 '{}': Foo<T>
+            322..324 '{}': {unknown}
             338..559 '{     ...r(); }': ()
             348..353 'boxed': Box<Foo<i32>>
             356..359 'Box': fn Box<Foo<i32>>(Foo<i32>) -> Box<Foo<i32>>

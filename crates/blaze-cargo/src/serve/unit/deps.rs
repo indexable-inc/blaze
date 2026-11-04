@@ -683,27 +683,17 @@ pub(crate) fn front_end() -> Result<ContentId, ApiError> {
     crate::serve::front_end_code().map(|it| it.0).map_err(|why| ApiError::new(why, None))
 }
 
-/// The identity of the blaze writing unit records: the hash of its whole executable
-/// ([`crate::serve::build_id`]). A record is made by blaze-cargo itself (its plan, its flags,
-/// the code generator's and the front end's outputs), and blaze-cargo's closure is every
-/// package of the program but blaze-engine, which installs hooks into it; so a content identity
-/// of the code making a record would move on the same edits as the bytes do, past those to
-/// blaze-engine alone. A record miss reruns the unit's check or compile against the images and
-/// stores, which [`front_end`] keeps. The standard library's shared directory is keyed by it
-/// too, as it holds std units' records and outputs alone.
-pub(crate) fn build() -> Result<ContentId, ApiError> {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the identity of the running blaze executable, hashed once per process"
-    )]
-    static BUILD: std::sync::OnceLock<Result<ContentId, String>> = std::sync::OnceLock::new();
-    let worked_out = BUILD.get_or_init(|| {
-        // alloc: an error, once a process
-        let exe = std::env::current_exe().map_err(|why| format!("the path of blaze itself: {why}"))?;
-        // alloc: an error, once a process
-        crate::serve::build_id(&exe).map_err(|why| format!("{why:#}"))
-    });
-    worked_out.clone().map_err(|why| ApiError::new(format!("the identity of the blaze executable: {why}"), None))
+/// What makes unit records, by the code identity of each part ([`crate::serve::RecordMakers`]):
+/// the front end's ([`front_end`]), the code generator's and that of blaze-cargo's closure past
+/// the packages `blaze_codegen_code::RECORD` cuts. A record is made by blaze-cargo itself (its
+/// plan, its flags, the lints', the code generator's, the linker's and the front end's outputs),
+/// so its key takes all three; never the executable's bytes, so that an edit of blaze-engine or
+/// of a cut package (the explorer, the plane's history, the client's rendering) keeps every
+/// record. A record miss reruns the unit's check or compile against the images and stores, which
+/// [`front_end`] keeps. The standard library's shared directory is keyed by them too, as it holds
+/// std units' records and outputs alone.
+pub(crate) fn record_makers() -> Result<crate::serve::RecordMakers, ApiError> {
+    crate::serve::record_makers().map_err(|why| ApiError::new(why, None))
 }
 
 /// The store as [`hir_def::deps`] and the goal store read and write it.

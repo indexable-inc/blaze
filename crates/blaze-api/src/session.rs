@@ -50,6 +50,8 @@ pub struct Daemon<'a> {
     /// For [`Response::Status`].
     pub pid: u32,
     pub build: &'a crate::Build,
+    /// What the daemon was started with, for [`Status::settings`].
+    pub settings: &'a [crate::Setting],
     pub memory_bytes: u64,
     pub budget_bytes: u64,
     /// blaze-mem's counters as they are now, for [`Response::Memory`]:
@@ -734,6 +736,8 @@ impl Session {
                     // clone: the reply's own copy, once per Status.
                     build: cx.build.clone(),
                     requests,
+                    // clone: the reply's own copy, once per Status.
+                    settings: cx.settings.to_vec(),
                     views: self.views(),
                     // alloc: the reply's own copy of an error, once per Status.
                     history: cx.history.map(str::to_owned),
@@ -760,12 +764,13 @@ impl Session {
             | Request::Sql { .. }
             | Request::Gc { .. }
             | Request::Rebuilt { .. }
-            | Request::Launch { .. } => {
+            | Request::Launch { .. }
+            | Request::FetchUrl { .. } => {
                 return Err(ApiError::new(
                     "the explorer, the live feed, live SQL, the collector, the last build's \
-                     reasons and the dev runs' launches are answered by the daemon's loop, which \
-                     holds their servers, feeds, collector, reasons and programs; this one handed \
-                     the request on instead",
+                     reasons, the dev runs' launches and fetches by digest are answered by the \
+                     daemon's loop, which holds their servers, feeds, collector, reasons, programs \
+                     and store; this one handed the request on instead",
                     Some(request_name(&request).to_owned()),
                 ));
             }
@@ -1106,6 +1111,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Gc { .. } => "blaze cache gc",
         Request::Rebuilt { .. } => "blaze why",
         Request::Launch { .. } => "blaze run",
+        Request::FetchUrl { .. } => "blaze fetch-url",
         _ => "a request",
     }
 }

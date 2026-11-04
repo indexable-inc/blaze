@@ -412,7 +412,12 @@ fn outputs_on_linux() {
     );
     assert_eq!(
         files(HOST, hash::CompileMode::Test, &TargetKind::Test, "it", Some(H), true),
-        [format!("{out}/it-{H}"), format!("{out}/it-{H}.dwp"), format!("{out}/it-{H}.d")]
+        [format!("{out}/it-{H}"), format!("/w/target/debug/deps/it-{H}"), format!("{out}/it-{H}.dwp"), format!("{out}/it-{H}.d")]
+    );
+    // A library's unit tests are run from `deps` too, beside its package's binaries.
+    assert_eq!(
+        files(TARGET, hash::CompileMode::Test, &lib, "app", Some(H), true)[1],
+        format!("/w/target/{TARGET}/debug/deps/app-{H}")
     );
     // A library's doctests: one program, placed as a test's (blaze builds them, no rustdoc).
     assert_eq!(
@@ -867,6 +872,8 @@ fn plans_of_a_workspace() {
         test.outputs,
         [
             format!("{build}/app/{hex}/out/it-{hex}"),
+            // Where it is run from: `current_exe()/../app` is the package's binary.
+            format!("{t}/debug/deps/it-{hex}"),
             format!("{build}/app/{hex}/out/it-{hex}.dwp"),
             format!("{build}/app/{hex}/out/it-{hex}.d"),
         ]

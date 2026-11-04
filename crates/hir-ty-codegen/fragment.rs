@@ -975,6 +975,18 @@ pub(super) struct Wants {
     pub(super) pointees: Vec<(u32, Pointee)>,
     /// The bodies of functions it calls that LLVM is shown, in its names.
     pub(super) seen: Vec<Seen>,
+    /// Every function and data object asked for, in the order asked, one asked for before
+    /// included: kept only where it is `Some`, which the reference walk sets
+    /// (`v2::refs::pass`), as which earlier ask an ask is one with is what its
+    /// `v2::refs::placement` reads (rule 18). `None` in a compile.
+    pub(super) asks: Option<Vec<Asked>>,
+}
+
+/// One ask of [`Wants`], by the place of what it gave among the [`Requests`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Asked {
+    Func(u32),
+    Data(u32),
 }
 
 /// An entry of a table of places: the hash is kept so that growing the table hashes nothing
@@ -1096,6 +1108,14 @@ impl Wants {
             // alloc: empty, allocates nothing
             pointees: Vec::new(),
             seen: Vec::new(), // alloc: empty, allocates nothing
+            asks: None,
+        }
+    }
+
+    /// Logs `ask` where [`Self::asks`] is kept.
+    fn asked(&mut self, ask: Asked) {
+        if let Some(asks) = &mut self.asks {
+            asks.push(ask);
         }
     }
 
@@ -1309,7 +1329,7 @@ impl Wants {
             |it| it.hash == hash && same(&key, &funcs[it.at as usize]),
             |it| it.hash,
         );
-        match entry {
+        let id = match entry {
             Entry::Occupied(it) => FuncId::from_u32(it.get().at),
             Entry::Vacant(it) => {
                 let at = funcs.len() as u32;
@@ -1317,12 +1337,15 @@ impl Wants {
                 funcs.push(make(key));
                 FuncId::from_u32(at)
             }
-        }
+        };
+        self.asked(Asked::Func(id.as_u32()));
+        id
     }
 
     fn data(&mut self, request: DataRequest) -> DataId {
         let id = DataId::from_u32(self.requests.datas.len() as u32);
         self.requests.datas.push(request);
+        self.asked(Asked::Data(id.as_u32()));
         id
     }
 
@@ -1393,7 +1416,7 @@ impl Wants {
             },
             |it| it.hash,
         );
-        match entry {
+        let id = match entry {
             Entry::Occupied(it) => DataId::from_u32(it.get().at),
             Entry::Vacant(it) => {
                 let at = datas.len() as u32;
@@ -1401,7 +1424,9 @@ impl Wants {
                 datas.push(DataRequest::Blob { blob: make(key), identity: DataIdentity::Shared });
                 DataId::from_u32(at)
             }
-        }
+        };
+        self.asked(Asked::Data(id.as_u32()));
+        id
     }
 
     pub(super) fn make_signature(&self) -> Signature {
@@ -1574,11 +1599,16 @@ impl<'db> Recorder<'db> {
         Ok(self.func(FuncTarget::Instance(instance, env.store()), sig))
     }
 
+    /// The vtable of `key` asked for before, logged as asked again ([`Wants::asks`]).
     pub(super) fn vtable(
-        &self,
+        &mut self,
         key: &(StoredTy, Option<(TraitId, StoredGenericArgs)>),
     ) -> Option<DataId> {
-        self.vtable_of(vtable_hash(&key.0, &key.1), &key.0, &key.1)
+        let found = self.vtable_of(vtable_hash(&key.0, &key.1), &key.0, &key.1);
+        if let Some(id) = found {
+            self.wants.asked(Asked::Data(id.as_u32()));
+        }
+        found
     }
 
     fn vtable_of(
@@ -1623,10 +1653,12 @@ impl<'db> Recorder<'db> {
 
     pub(super) fn static_data(&mut self, id: StaticId) -> DataId {
         let datas = &mut self.wants.requests.datas;
-        *self.statics.entry(id).or_insert_with(|| {
+        let data = *self.statics.entry(id).or_insert_with(|| {
             datas.push(DataRequest::Static(id));
             DataId::from_u32(datas.len() as u32 - 1)
-        })
+        });
+        self.wants.asked(Asked::Data(data.as_u32()));
+        data
     }
 
     pub(super) fn location(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> DataId {
@@ -1735,7 +1767,10 @@ impl<'db> Recorder<'db> {
                 DataRequest::Vtable { ty, trait_ref, blob } => {
                     let hash = vtable_hash(ty, trait_ref);
                     match self.vtable_of(hash, ty, trait_ref) {
-                        Some(id) => id,
+                        Some(id) => {
+                            self.wants.asked(Asked::Data(id.as_u32()));
+                            id
+                        }
                         None => {
                             let view =
                                 BlobView { blob, datas: Some(&datas[..]), funcs: Some(&funcs[..]) };

@@ -562,6 +562,8 @@ dependencies = [
  "blaze-diagnostics",
  "blaze-doc",
  "blaze-explore",
+ "blaze-fetch",
+ "blaze-fmt",
  "blaze-format",
  "blaze-gc",
  "blaze-global",
@@ -889,6 +891,24 @@ dependencies = [
  "serde_json",
  "tokio",
  "wtransport",
+]
+
+[[package]]
+name = "blaze-fetch"
+version = "0.0.0"
+dependencies = [
+ "blaze-cas",
+ "blaze-format",
+ "blaze-ids",
+ "blaze-sha256",
+ "crossbeam-channel",
+ "papaya",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1617,9 +1637,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-cas",
+ "blaze-fetch",
  "blaze-format",
  "blaze-hash",
- "blaze-ids",
  "blaze-manifest",
  "blaze-resolve",
  "blaze-serde",

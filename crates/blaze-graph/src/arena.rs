@@ -847,7 +847,7 @@ fn least(
     match bytes.checked_sub(others).and_then(|it| it.checked_sub(margin)) {
         Some(left) if left > 0 => {
             // alloc: the budget's name, once per daemon start
-            Ok(Budget { bytes: left, from: format!("{from}, {}, less {taken}", gb(bytes)) })
+            Ok(Budget { bytes: left, from: format!("{from}, {}, less {taken}", gb(bytes)), kept_back: bytes - left })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1231,6 +1231,12 @@ mod tests {
         );
         let budget = least(linux_limits(&tree.0).unwrap(), in_use.as_ref(), GB / 2).unwrap();
         assert_eq!(budget.bytes, 4 * GB - GB - GB / 2);
+        // The limit that fits a task of 3.25 GB is that and what the cgroup's limit loses to
+        // others (1 GB) and the margin (0.5 GB), rounded up to whole GiB: under a told limit of
+        // 5 the budget is 3.5 GB, under 4 it is 2.5 GB (earlyfail).
+        assert_eq!(budget.kept_back, GB + GB / 2);
+        assert_eq!(budget.to_fit(3 * GB + GB / 4), 5);
+        assert_eq!(budget.to_fit(budget.bytes), 4);
         assert_eq!(
             budget.from,
             "memory.max of cgroup /lane.scope, 4.00 GB, less 1.00 GB others use in cgroup \

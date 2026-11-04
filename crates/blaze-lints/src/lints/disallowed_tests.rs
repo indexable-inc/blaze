@@ -516,7 +516,7 @@ impl ProcMacroExpander for Nothing {
 }
 
 /// Gives each derive crate its `Serialize` and `Deserialize`, both [`Nothing`].
-fn give_derives(built: &mut Fixture) {
+pub(crate) fn give_derives(built: &mut Fixture) {
     for name in ["serde_derive", "blaze_serde_derive"] {
         let db = built.db();
         let krate = *all_crates(db)

@@ -7,7 +7,9 @@ use blaze_units::query::{Fetch, FetchKind};
 use blaze_vfs::Mode;
 use parking_lot::Mutex;
 
-use super::{Fetcher, redact};
+use blaze_fetch::scrub as redact;
+
+use super::Fetcher;
 use crate::serve::work::{Source, SourceFile};
 
 /// What the fake server answers, in order.
@@ -44,12 +46,32 @@ impl Http for Fake {
     }
 }
 
-fn fetcher(fake: &Arc<Fake>) -> Fetcher<Fake> {
-    Fetcher::with_http(fake.clone(), std::env::temp_dir().join("blaze-fetch-tests")).retrying(Retry {
-        retries: 3,
-        quiet: true,
-        fixed_sleep_ms: Some(0),
-    })
+/// A fetcher over `fake` keeping `.crate` files in a store of its own: the tests serve the
+/// same tarballs, and one test's kept `.crate` must not answer another's fetch. The store's
+/// handle is leaked (blaze-fetch takes a `'static` one, as the daemon's is); its directory is
+/// removed when the fetcher drops.
+fn fetcher(fake: &Arc<Fake>) -> Kept {
+    let dir = tempfile::tempdir().unwrap();
+    let driven = Box::leak(Box::new(blaze_cas::Driven::open(dir.path()).unwrap()));
+    let store = Box::leak(Box::new(driven.handle()));
+    let fetcher = Fetcher::with_http(fake.clone(), dir.path().join("scratch"))
+        .retrying(Retry { retries: 3, quiet: true, fixed_sleep_ms: Some(0) })
+        .keeping_in(blaze_fetch::StoreOf::Given(store));
+    Kept { fetcher, _dir: dir }
+}
+
+/// A test's fetcher with the directory of its store, removed as it drops.
+struct Kept {
+    fetcher: Fetcher<Fake>,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Kept {
+    type Target = Fetcher<Fake>;
+
+    fn deref(&self) -> &Fetcher<Fake> {
+        &self.fetcher
+    }
 }
 
 enum Entry<'a> {
@@ -361,6 +383,19 @@ fn a_transient_failure_is_tried_again_and_a_permanent_one_is_not() {
     let error = fetcher(&fake).fetch(&index_fetch()).unwrap_err();
     assert_eq!(fake.asked().len(), 4);
     assert!(error.what.contains("got 500"), "{}", error.what);
+}
+
+/// A `.crate` once fetched is kept in the store under its sha256, and a second fetch of it,
+/// by any package that pins the same bytes, asks the server nothing.
+#[test]
+fn a_kept_crate_is_not_asked_for_again() {
+    let bytes = tarball(&[Entry::File("serde-1.0.219/Cargo.toml", b"", 0o644)]);
+    let sha256 = blaze_registry::download::checksum(&bytes);
+    let fake = Fake::new(vec![Answer::Status(200, bytes)]);
+    let fetcher = fetcher(&fake);
+    let first = fetcher.fetch(&crate_fetch(&sha256)).unwrap();
+    assert_eq!(fetcher.fetch(&crate_fetch(&sha256)).unwrap(), first);
+    assert_eq!(fake.asked().len(), 1);
 }
 
 #[test]

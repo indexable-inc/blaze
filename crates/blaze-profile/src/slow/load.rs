@@ -7,19 +7,20 @@ use arrow_array::RecordBatch;
 use super::{BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, QueryCount, Recorder, Report, SpanKind, ThreadName, analyse};
 use crate::time::{
     Model, TimeError,
-    load::{Source, get, ints, query, texts, uints},
+    load::{Source, get, ints, query, query_many, texts, uints},
     path,
 };
 
 /// The report of `build`, or of the last build that ended or whose daemon died.
 pub fn run(source: &Source<'_>, build: Option<u64>) -> Result<Report, TimeError> {
     let pick = crate::time::load::pick(source, build)?;
-    let (input, process) = crate::time::load::rows(source, pick)?;
+    let crate::time::load::Rows { input, process, cut } = crate::time::load::rows(source, pick)?;
     let build = input.build;
     let window = input.build_row.map(|(start, dur)| (start, start + dur));
     let model = Model::build(input)?;
     let path = path::critical(&model);
     let mut facts = facts(source, build, window, process)?;
+    facts.spans = cut;
     if let (Some(process), Some((t0, t1))) = (pick.died, window) {
         facts.build.died = Some(died(source, process, t0, t1)?);
     }
@@ -74,14 +75,34 @@ pub fn facts(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, proces
         // alloc: a query, once a report
         None => format!("(SELECT * FROM spans WHERE build_id = {build})"),
     };
+    // The sums of its spans too short for a row each, chosen alike by when the first began.
+    let folded = match window {
+        // alloc: a query, once a report
+        Some((t0, t1)) => format!("(SELECT * FROM folded WHERE build_id = {build} OR (build_id IS NULL AND from_ns >= {t0} AND from_ns < {t1}{of}))"),
+        // alloc: a query, once a report
+        None => format!("(SELECT * FROM folded WHERE build_id = {build})"),
+    };
+    // One DuckDB for them all: the views are made once ([`crate::sql::run_all`]).
+    let windowed = window.map(|(t0, t1)| (memory_sql(build, t0, t1, &of), recorder_sql(build, t0, t1, &of)));
+    // alloc: the queries, once a report
+    let mut sqls = vec![build_row_sql(build), threads_sql(&spans), span_kinds_sql(&spans, &folded), misses_sql(build), query_counts_sql(build)];
+    if let Some((memory, recorder)) = &windowed {
+        // clone: a query, once a report
+        sqls.extend([memory.clone(), recorder.clone()]);
+    }
+    // alloc: the queries' text, once a report
+    let asked: Vec<&str> = sqls.iter().map(String::as_str).collect();
+    let answers = query_many(source, &asked, "reading the build's row, threads, spans by name, misses, query counts, memory and recorder")?;
+    let answer = |i: usize| answers.get(i).map(Vec::as_slice).unwrap_or_default();
     Ok(Facts {
-        build: build_row(source, build)?,
-        threads: threads(source, &spans)?,
-        span_kinds: span_kinds(source, &spans)?,
-        misses: misses(source, build)?,
-        query_counts: query_counts(source, build)?,
-        memory: memory(source, build, window, &of)?,
-        recorder: recorder(source, build, window, &of)?,
+        build: build_row(answer(0), build)?,
+        threads: threads(answer(1))?,
+        span_kinds: span_kinds(answer(2))?,
+        misses: misses(answer(3))?,
+        query_counts: query_counts(answer(4))?,
+        memory: if windowed.is_some() { memory(answer(5))? } else { Memory::default() },
+        recorder: if windowed.is_some() { recorder(answer(6))? } else { Recorder::default() },
+        spans: crate::time::SpanCut::default(),
     })
 }
 
@@ -89,8 +110,7 @@ pub fn facts(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, proces
 /// after it) less its last before its start, in the same process: they count from its start.
 /// `of` keeps the rows to the build's process; the folded spans are the build's and its
 /// process's of no build.
-fn recorder(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, of: &str) -> Result<Recorder, TimeError> {
-    let Some((t0, t1)) = window else { return Ok(Recorder::default()) };
+fn recorder_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
     // The flush after the build's end has its rows; one flush is at most `history::EVERY` on.
     let after = t1 + crate::history::EVERY.as_nanos() as i64;
     let delta = |name: &str, column: &str| {
@@ -104,16 +124,19 @@ fn recorder(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, of: &st
     // alloc: a condition, once a report
     let folded = format!("(build_id = {build} OR build_id IS NULL{of}) AND to_ns BETWEEN {t0} AND {t1}");
     // alloc: a query, once a report
-    let sql = format!(
+    format!(
         "SELECT {}, {}, {}, \
          (SELECT CAST(coalesce(sum(spans), 0) AS BIGINT) FROM folded WHERE {folded}) AS folded_spans, \
          (SELECT CAST(coalesce(sum(dur_ns), 0) AS BIGINT) FROM folded WHERE {folded}) AS folded_ns",
         delta("profile spans lost", "spans_lost"),
         delta("profile rows skipped", "rows_skipped"),
         delta("profile rows skipped behind", "rows_behind"),
-    );
-    let batches = query(source, &sql, "reading what the flight recorder dropped in the build's window")?;
-    let Some((batch, row)) = rows(&batches).next() else { return Ok(Recorder::default()) };
+    )
+}
+
+/// What [`recorder_sql`]'s answer says.
+fn recorder(batches: &[RecordBatch]) -> Result<Recorder, TimeError> {
+    let Some((batch, row)) = rows(batches).next() else { return Ok(Recorder::default()) };
     const T: &str = "counters";
     Ok(Recorder {
         spans_lost: int(batch, T, "spans_lost", row)?,
@@ -141,17 +164,19 @@ fn int(batch: &RecordBatch, table: &'static str, column: &'static str, row: usiz
     Ok(get(ints(batch, table, column)?, row, |it, row| it.value(row)))
 }
 
-fn build_row(source: &Source<'_>, build: u64) -> Result<BuildFacts, TimeError> {
+fn build_row_sql(build: u64) -> String {
     // alloc: a query, once a report
-    let sql = format!(
+    format!(
         "SELECT CAST(workspace AS VARCHAR) AS workspace, CAST(command AS VARCHAR) AS command, \
          CAST(outcome AS VARCHAR) AS outcome, CAST(tree AS VARCHAR) AS tree, CAST(blaze AS VARCHAR) AS blaze, \
          CAST(hits AS UBIGINT) AS hits, CAST(misses AS UBIGINT) AS misses FROM builds \
          WHERE build_id = {build} ORDER BY dur_ns DESC NULLS LAST LIMIT 1"
-    );
-    let batches = query(source, &sql, "reading the build's builds row")?;
+    )
+}
+
+fn build_row(batches: &[RecordBatch], build: u64) -> Result<BuildFacts, TimeError> {
     let mut it = BuildFacts { id: build, ..BuildFacts::default() };
-    if let Some((batch, row)) = rows(&batches).next() {
+    if let Some((batch, row)) = rows(batches).next() {
         const T: &str = "builds";
         it.workspace = text(batch, T, "workspace", row)?;
         it.command = text(batch, T, "command", row)?;
@@ -164,16 +189,18 @@ fn build_row(source: &Source<'_>, build: u64) -> Result<BuildFacts, TimeError> {
     Ok(it)
 }
 
-fn threads(source: &Source<'_>, spans: &str) -> Result<Vec<ThreadName>, TimeError> {
+fn threads_sql(spans: &str) -> String {
     // alloc: a query, once a report
-    let sql = format!(
+    format!(
         "SELECT CAST(process AS BIGINT) AS process, CAST(thread AS BIGINT) AS thread, CAST(min(thread_name) AS VARCHAR) AS name \
          FROM {spans} WHERE thread_name IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 2"
-    );
-    let batches = query(source, &sql, "reading the build's threads' names")?;
+    )
+}
+
+fn threads(batches: &[RecordBatch]) -> Result<Vec<ThreadName>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
-    for (batch, row) in rows(&batches) {
+    for (batch, row) in rows(batches) {
         const T: &str = "spans";
         let (Some(process), Some(thread), Some(name)) = (int(batch, T, "process", row)?, int(batch, T, "thread", row)?, text(batch, T, "name", row)?)
         else {
@@ -184,18 +211,28 @@ fn threads(source: &Source<'_>, spans: &str) -> Result<Vec<ThreadName>, TimeErro
     Ok(out)
 }
 
-fn span_kinds(source: &Source<'_>, spans: &str) -> Result<Vec<SpanKind>, TimeError> {
+/// The spans by name and query kind: the rows of `spans` and the sums of `folded` (the spans
+/// too short for a row each, [`crate::flight::FOLD_BELOW`]) together, so a name whose spans
+/// were mostly folded keeps all its runs and time. A folded query's kind is its name, as
+/// `batches::spans` gives a row's.
+fn span_kinds_sql(spans: &str, folded: &str) -> String {
     // alloc: a query, once a report
-    let sql = format!(
-        "SELECT CAST(name AS VARCHAR) AS name, CAST(query_kind AS VARCHAR) AS query_kind, CAST(min(target) AS VARCHAR) AS target, \
-         CAST(count(*) AS UBIGINT) AS runs, CAST(sum(dur_ns) AS BIGINT) AS dur_ns, \
-         CAST(coalesce(sum(self_cpu_ns), 0) AS BIGINT) AS self_cpu_ns \
-         FROM {spans} GROUP BY 1, 2 ORDER BY 1, 2 NULLS FIRST"
-    );
-    let batches = query(source, &sql, "reading the build's spans by name")?;
+    format!(
+        "SELECT name, query_kind, CAST(min(target) AS VARCHAR) AS target, \
+         CAST(sum(runs) AS UBIGINT) AS runs, CAST(sum(dur_ns) AS BIGINT) AS dur_ns, \
+         CAST(coalesce(sum(self_cpu_ns), 0) AS BIGINT) AS self_cpu_ns FROM (\
+         SELECT CAST(name AS VARCHAR) AS name, CAST(query_kind AS VARCHAR) AS query_kind, CAST(target AS VARCHAR) AS target, \
+         CAST(1 AS UBIGINT) AS runs, dur_ns, self_cpu_ns FROM {spans} \
+         UNION ALL SELECT CAST(name AS VARCHAR), CASE WHEN ends_with(CAST(name AS VARCHAR), '_query') THEN CAST(name AS VARCHAR) END, \
+         CAST(target AS VARCHAR), CAST(spans AS UBIGINT), dur_ns, self_cpu_ns FROM {folded}) \
+         GROUP BY 1, 2 ORDER BY 1, 2 NULLS FIRST"
+    )
+}
+
+fn span_kinds(batches: &[RecordBatch]) -> Result<Vec<SpanKind>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
-    for (batch, row) in rows(&batches) {
+    for (batch, row) in rows(batches) {
         const T: &str = "spans";
         out.push(SpanKind {
             name: text(batch, T, "name", row)?.unwrap_or_default(),
@@ -209,17 +246,19 @@ fn span_kinds(source: &Source<'_>, spans: &str) -> Result<Vec<SpanKind>, TimeErr
     Ok(out)
 }
 
-fn misses(source: &Source<'_>, build: u64) -> Result<Vec<MissGroup>, TimeError> {
+fn misses_sql(build: u64) -> String {
     // alloc: a query, once a report
-    let sql = format!(
+    format!(
         "SELECT CAST(step AS VARCHAR) AS step, CAST(coalesce(cause, '') AS VARCHAR) AS cause, CAST(count(*) AS UBIGINT) AS count, \
          CAST(min(item) AS VARCHAR) AS example, CAST(mode(what) AS VARCHAR) AS what \
          FROM misses WHERE build_id = {build} GROUP BY 1, 2 ORDER BY 3 DESC, 1, 2"
-    );
-    let batches = query(source, &sql, "reading the build's misses")?;
+    )
+}
+
+fn misses(batches: &[RecordBatch]) -> Result<Vec<MissGroup>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
-    for (batch, row) in rows(&batches) {
+    for (batch, row) in rows(batches) {
         const T: &str = "misses";
         out.push(MissGroup {
             step: text(batch, T, "step", row)?.unwrap_or_default(),
@@ -232,21 +271,24 @@ fn misses(source: &Source<'_>, build: u64) -> Result<Vec<MissGroup>, TimeError> 
     Ok(out)
 }
 
-fn query_counts(source: &Source<'_>, build: u64) -> Result<Vec<QueryCount>, TimeError> {
-    const COLUMNS: [&str; 8] =
-        ["executed", "verified", "reran", "evicted_asked", "evicted", "dropped", "reads_recorded", "reads_kept"];
+const QUERY_COUNT_COLUMNS: [&str; 8] =
+    ["executed", "verified", "reran", "evicted_asked", "evicted", "dropped", "reads_recorded", "reads_kept"];
+
+fn query_counts_sql(build: u64) -> String {
     // alloc: a query, once a report
-    let sums = COLUMNS.map(|it| format!("CAST(sum({it}) AS UBIGINT) AS {it}")).join(", ");
+    let sums = QUERY_COUNT_COLUMNS.map(|it| format!("CAST(sum({it}) AS UBIGINT) AS {it}")).join(", ");
     // `reads_most` is a mark, not a sum: the build's most.
     // alloc: a query, once a report
-    let sql = format!(
+    format!(
         "SELECT CAST(query AS VARCHAR) AS query, {sums}, CAST(max(reads_most) AS UBIGINT) AS reads_most \
          FROM query_counts WHERE build_id = {build} GROUP BY 1 ORDER BY 1"
-    );
-    let batches = query(source, &sql, "reading the build's query counts")?;
+    )
+}
+
+fn query_counts(batches: &[RecordBatch]) -> Result<Vec<QueryCount>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
-    for (batch, row) in rows(&batches) {
+    for (batch, row) in rows(batches) {
         const T: &str = "query_counts";
         let n = |column| uint(batch, T, column, row).map(|it| it.unwrap_or(0));
         out.push(QueryCount {
@@ -265,10 +307,9 @@ fn query_counts(source: &Source<'_>, build: u64) -> Result<Vec<QueryCount>, Time
     Ok(out)
 }
 
-fn memory(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, of: &str) -> Result<Memory, TimeError> {
-    let Some((t0, t1)) = window else { return Ok(Memory::default()) };
+fn memory_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
     // alloc: a query, once a report
-    let sql = format!(
+    format!(
         "SELECT \
          CAST((SELECT arg_max(value, t_ns) FROM counters WHERE name = 'live bytes' AND t_ns <= coalesce( \
              (SELECT max(started_ns + dur_ns) FROM builds WHERE started_ns + dur_ns <= {t0}), {t0})) AS BIGINT) AS live_before, \
@@ -277,9 +318,11 @@ fn memory(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, of: &str)
          CAST(min(value) FILTER (WHERE name = 'live bytes') AS BIGINT) AS live_least, \
          CAST(max(value) FILTER (WHERE name = 'footprint bytes') AS BIGINT) AS footprint_peak \
          FROM counters WHERE (build_id = {build} OR build_id IS NULL){of} AND t_ns BETWEEN {t0} AND {t1}"
-    );
-    let batches = query(source, &sql, "reading the daemon's memory around the build")?;
-    let Some((batch, row)) = rows(&batches).next() else { return Ok(Memory::default()) };
+    )
+}
+
+fn memory(batches: &[RecordBatch]) -> Result<Memory, TimeError> {
+    let Some((batch, row)) = rows(batches).next() else { return Ok(Memory::default()) };
     const T: &str = "counters";
     Ok(Memory {
         live_before: int(batch, T, "live_before", row)?,

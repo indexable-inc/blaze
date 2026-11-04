@@ -1130,6 +1130,7 @@ fn options() -> Options {
         toolchain: Hasher::new("blaze v2 test toolchain").finish(),
         color: false,
         build: blaze_api::Build::default(),
+        settings: Vec::new(),
         // A table of its own: each daemon drives one, and tests run at once.
         outside: Box::leak(Box::new(blaze_vfs::outside::Dirs::new())),
         stall: blaze_profile::Watchdog::BOUND,
@@ -1425,6 +1426,17 @@ fn a_build_whose_fetches_all_fail_ends_with_the_fetch_error_rather_than_hanging(
         .collect();
     assert!(errors.iter().any(|it| it.contains("has no HTTP client")), "the build fails with the fetch's error: {errors:?}");
     assert!(!errors.iter().any(|it| it.starts_with("blaze stalled")), "the build ends, not stalls: {errors:?}");
+    // Lane earlyfail: every source that failed is named in one error, not the first a run
+    // (`hashbrown v0.16.1`, then `fnv v1.0.7` the next run), with where blaze looked.
+    let all: Vec<&&str> = errors.iter().filter(|it| it.starts_with("2 of the 2 sources this build needs")).collect();
+    assert_eq!(all.len(), 1, "one error names both failed fetches: {errors:?}");
+    for part in [
+        "crates.io index (index file) from https://index.crates.io/de/p/dep",
+        "dep v1.0.0 (package) from https://static.crates.io/crates/dep/1.0.0/download",
+        "blaze looked for each first in its store (/",
+    ] {
+        assert!(all[0].contains(part), "the error says `{part}`: {}", all[0]);
+    }
 }
 
 /// The 2026-11-02 self-build stall: a build script's run that the plane starts while its
@@ -3536,7 +3548,7 @@ fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_again
     // Far past what any test holds, so no other daemon's release in this process is made due,
     // and no budget it sets (32 TiB at least) weighs on another test's sweep.
     const LIMIT: u64 = (1 << 50) + (64 << 20);
-    let budget = blaze_graph::Budget { bytes: LIMIT, from: "a test's limit".to_owned() };
+    let budget = blaze_graph::Budget { bytes: LIMIT, from: "a test's limit".to_owned(), kept_back: 0 };
     let said = super::limit_said(&budget);
     assert!(said.starts_with("memory limit 1048576.06 GiB (a test's limit): "), "{said}");
     assert!(said.contains("holds 917504.05 GiB") && said.contains("mir "), "{said}");
@@ -3550,9 +3562,8 @@ fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_again
 }
 
 /// A test command line's environment: the test process's own `BLAZE_CORES`, as a real
-/// command's carries it, so the daemon this process runs (whose budget is the process's)
-/// finds the request agrees with it ([`blaze_core::cores::check_request`]) wherever the
-/// tests run, `BLAZE_CORES=all` in CI too.
+/// command's carries it (the daemon's budget is the process's, and the CLI compares the two
+/// before any request, `super::settings`), wherever the tests run, `BLAZE_CORES=all` in CI too.
 fn command_env() -> Vec<(String, String)> {
     let name = blaze_core::cores::VAR;
     // alloc: a test's request, once

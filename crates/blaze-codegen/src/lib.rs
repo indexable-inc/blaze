@@ -113,6 +113,16 @@ impl Backend {
     }
 }
 
+/// How a function of a build was made: the backend that compiled it, and whose code it is
+/// ([`plan::Origin`]: the crate that asked for it). What a linked image's code is summed by
+/// (blaze-link's `link code` events, `blaze explain link_code`); never part of a key, as the
+/// backend already is in the instance's settings.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Made {
+    pub backend: Backend,
+    pub origin: plan::Origin,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Arch {
     X86_64,

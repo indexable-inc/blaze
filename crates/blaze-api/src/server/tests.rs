@@ -24,7 +24,7 @@ fn config(unix: bool, http: bool) -> Config {
 }
 
 fn status() -> Status {
-    Status { pid: 6, requests: vec![1, 2], views: 3, history: None, memory_bytes: 4, budget_bytes: 5, build: crate::Build::default(), bugs: Vec::new() }
+    Status { pid: 6, requests: vec![1, 2], views: 3, history: None, memory_bytes: 4, budget_bytes: 5, build: crate::Build::default(), bugs: Vec::new(), settings: Vec::new() }
 }
 
 /// The server and a driver played by hand: what it asked for and has not been told of.

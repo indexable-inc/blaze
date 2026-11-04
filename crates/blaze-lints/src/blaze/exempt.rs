@@ -110,6 +110,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::BorrowWorkaround
         | Lint::NllWorkaround
         | Lint::NativeContracts
+        // Kept with `#[expect(..)]` on the item: what a format accepts is the type's choice.
+        | Lint::LenientDeserialize
         // A hasher is chosen in the type, or kept with `#[expect(blaze::default_hasher, reason = ..)]`:
         // an allocation's comment says nothing about it.
         | Lint::DefaultHasher => None,

@@ -26,16 +26,53 @@ use blaze_mem::align::align_up_u64;
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
 use crate::layout;
+use crate::shape::{self, RegionShape};
 use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved, zeroed};
-use crate::stage::{Stage, error, function_of, refused};
+use crate::reloc::GotKind;
+use crate::stage::{Stage, error, function_of, named_in, refused};
 use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What};
 use crate::symbols::{SymKey, Symbols};
-use crate::{DevRun, Format, LinkError, Refusal};
+use crate::{DevRun, Format, LinkError, OutOfReach, Refusal};
 
 /// The patch regions' least room: what an edit session's new code and data may take.
 const PATCH: u64 = 64 << 20;
+/// The patch regions' most room. Each is as large as the image's code (or data), so an edit
+/// that compiles most of it again still fits, but no larger than this: past it a stage is
+/// refused for want of room ([`Refusal::NoRoom`]) and the image is linked from scratch, which
+/// then costs about what placing that much new code does. The room is address space an image
+/// keeps from its format's limits ([`Writer::window`]: Mach-O's 4 GiB), so it is bounded
+/// rather than growing with the code: with 1 GiB, a Mach-O image keeps its whole window to
+/// about 3 GiB of code and data.
+const PATCH_MAX: u64 = 1 << 30;
 /// The least room of a growing region of an incremental image.
 const ROOM: u64 = 64 << 10;
+
+/// The room of a patch region of an image with `size` bytes of code (or data): as large, at
+/// least [`PATCH`], at most [`PATCH_MAX`], a whole number of pages.
+pub(crate) fn patch_room(size: u64, page: u64) -> u64 {
+    align_up_u64(size.clamp(PATCH, PATCH_MAX), page)
+}
+
+/// The first region, by address, whose room ends more than `window` bytes past `base`, and
+/// where it ends: none when all are within it. A dev run's reservations and zero-fill
+/// (`__bss`, `__thread_bss`) hold no file bytes and no code, so they are not counted: a
+/// large zero-initialized static past the window is a valid image.
+pub(crate) fn past_window<'r>(regions: impl Iterator<Item = &'r Region>, base: u64, window: u64) -> Option<(&'r Region, u64)> {
+    regions
+        .filter(|it| !zeroed(&it.class))
+        .map(|it| (it, it.addr.saturating_add(it.capacity.max(it.size))))
+        .filter(|(_, end)| end.saturating_sub(base) > window)
+        .min_by_key(|(it, _)| it.addr)
+}
+
+/// The bytes between the lowest region's start and the highest's room's end, reservations
+/// aside: no PC-relative field from one region to another reaches farther.
+pub(crate) fn span<'r>(regions: impl Iterator<Item = &'r Region>) -> u64 {
+    let (low, high) = regions
+        .filter(|it| !reserved(&it.class))
+        .fold((u64::MAX, 0u64), |(low, high), it| (low.min(it.addr), high.max(it.addr.saturating_add(it.capacity.max(it.size)))));
+    high.saturating_sub(low)
+}
 
 /// Whether a class grows in place in an incremental link (else its new pieces go to a
 /// patch region, or it never grows).
@@ -65,6 +102,43 @@ pub(crate) fn reservations(dev_run: Option<&DevRun>, page: u64) -> impl Iterator
         .zip(sizes)
         .filter(|it| it.1 != 0)
         .map(move |(reserve, size)| (reserve, align_up_u64(size, page)))
+}
+
+/// What [`Stage::check_reach`] says of a call frame record's 32-bit address field.
+const RECORD_RULE: &str = "a call frame record's 32-bit PC-relative address (`DW_EH_PE_pcrel|DW_EH_PE_sdata4`) reaches ±2 GiB";
+/// What [`Stage::check_reach`] says of a CIE's personality field.
+const PERSONALITY_RULE: &str =
+    "a CIE's personality (`DW_EH_PE_indirect|pcrel|sdata4`, as LLVM writes it) reaches its GOT cell within ±2 GiB";
+
+/// The two ends of a reach past its limit, and the limit: what [`out_of_reach`] says.
+struct Reach {
+    from: u64,
+    to: u64,
+    reach: u64,
+    limit: u64,
+    rule: &'static str,
+}
+
+/// A refusal of an image past a limit ([`crate::Refusal::OutOfReach`]), its message naming the
+/// section, what is past it, how far and the limit, then the image's regions by address with
+/// the reach's two ends marked ([`shape::render`]): one failed link shows what fills the gap.
+fn out_of_reach(
+    function: Option<blaze_codegen::InstanceKey>,
+    section: String,
+    what: String,
+    reach: Reach,
+    layout: &[RegionShape],
+    base: u64,
+    scratch: bool,
+) -> LinkError {
+    let Reach { from, to, reach, limit, rule } = reach;
+    let then = if scratch { "; an incremental link placed it, so the image is linked from scratch" } else { "" };
+    // alloc: error path
+    let mut message = format!("`{section}`: {what} is {reach:#x} bytes away, past {limit:#x}: {rule}{then}\n");
+    shape::render(layout, base, &[(from, "from"), (to, "to")], &mut message);
+    // alloc: error path, the refusal's one box and its copy of the layout
+    let reach = OutOfReach { section, what, reach, limit, rule, scratch, from, to, layout: layout.to_vec() };
+    refused(function, Refusal::OutOfReach(Box::new(reach)), message)
 }
 
 /// Whether the program observes the order of a class's pieces: it is laid out again whole.
@@ -498,6 +572,94 @@ impl<'a> Stage<'a> {
         entries.into_iter().map(|it| it.id)
     }
 
+    /// The bytes `ids` take placed in this order from 0, as [`Stage::put`] places them.
+    fn extent(&self, ids: &[PieceId]) -> u64 {
+        ids.iter().fold(0, |size, id| {
+            let piece = self.new.piece(*id).expect("live");
+            align_up_u64(size, piece.align()) + piece.size
+        })
+    }
+
+    /// The limits the placed image keeps, checked on addresses alone after the last placement
+    /// round and before any piece is written (`Stage::relocate_all`): a link past one stops
+    /// with an error naming the section, what is past the limit and the limit, never in a
+    /// relocation's field. They are
+    /// - the format's window ([`Writer::window`]): every region's room ends within it of the
+    ///   base;
+    /// - the 32-bit PC-relative fields of call frame records ([`Class::EhFrame`]): an FDE's
+    ///   first address and LSDA where its CIE's pointers are 4 bytes (ELF's
+    ///   [`crate::unwind::Pointers::Sdata4`], and native objects' records), and a CIE's
+    ///   personality (`indirect|pcrel|sdata4` to its GOT cell). Only an image whose regions
+    ///   span more than 2 GiB can be past one, and then only the records this stage writes
+    ///   are read.
+    ///
+    /// Branches and code's own fields are checked where they are written: thunks reach far
+    /// branches ([`crate::thunk`]), and the writer names any other field out of reach
+    /// ([`Refusal::FieldRange`]). `layout` is the image's shape ([`Stage::record_shape`]),
+    /// which a refusal shows.
+    pub fn check_reach(&self, layout: &[RegionShape]) -> Result<(), LinkError> {
+        let regions = || self.new.spaces.iter().map(|it| &it.region);
+        if let Some(window) = self.writer.window()
+            && let Some((region, end)) = past_window(regions(), self.plan.base, window.bytes)
+        {
+            let section = self.writer.section_name(&region.class);
+            let base = self.plan.base;
+            // alloc: error path
+            let what = format!(
+                "its room ({:#x} bytes at {:#x}, {:#x} of them used)",
+                region.capacity, region.addr, region.size
+            );
+            // `to` the room's last byte, so the mark lands in the region past the window.
+            let reach = Reach { from: base, to: end - 1, reach: end - base, limit: window.bytes, rule: window.why };
+            return Err(out_of_reach(None, section, what, reach, layout, base, !self.full));
+        }
+        if span(regions()) <= i32::MAX as u64 {
+            return Ok(());
+        }
+        for id in self.write.iter() {
+            let Some(piece) = self.new.piece(id) else { continue };
+            if !piece.placed() || *piece.class() != Class::EhFrame {
+                continue;
+            }
+            for fixup in piece.fixups() {
+                if fixup.minus.is_some() {
+                    continue;
+                }
+                let (target, rule) = match fixup.apply {
+                    Apply::Rel32 => (self.new.addr_of(fixup.target), RECORD_RULE),
+                    Apply::GotRel32 => (
+                        self.got_cell(GotKind::Address, fixup.target).and_then(|it| self.new.addr_of(it)),
+                        PERSONALITY_RULE,
+                    ),
+                    _ => continue,
+                };
+                // One with no address yet is the writer's to name.
+                let Some(target) = target else { continue };
+                let p = piece.addr + fixup.at;
+                let value = target.wrapping_add(fixup.addend as u64).wrapping_sub(p) as i64;
+                if i32::try_from(value).is_ok() {
+                    continue;
+                }
+                let function = match self.symbols.key(fixup.target) {
+                    SymKey::Body(it) | SymKey::Slot(it) => Some(self.symbols.instance(it)),
+                    _ => None,
+                };
+                let section = self.writer.section_name(&self.new.spaces[piece.region as usize].region.class);
+                // alloc: error path
+                let what = format!(
+                    "the record {} at {:#x}: its field at {:#x} reaches {} at {target:#x}",
+                    self.symbols.describe(piece.sym),
+                    piece.addr,
+                    fixup.at,
+                    named_in(self.symbols, &[&self.new], self.writer, fixup.target),
+                );
+                let reach = Reach { from: p, to: target, reach: value.unsigned_abs(), limit: i32::MAX as u64, rule };
+                return Err(out_of_reach(function, section, what, reach, layout, self.plan.base, !self.full));
+            }
+        }
+        Ok(())
+    }
+
     /// Places `ids` in this order from `start`: each piece's address, and the region's size.
     fn put(&mut self, start: u64, ids: &[PieceId], region: u32, zero: bool) -> u64 {
         let mut size = 0;
@@ -587,6 +749,13 @@ impl<'a> Stage<'a> {
                 ids.extend(order);
             }
         }
+        // The code's size, sized before any class is placed: the patch region's room is as
+        // large ([`patch_room`]), and a writer may put it before the code (Mach-O). The code
+        // starts at a page (the first of its protection, or after the room, a whole number of
+        // pages), so laid out from 0 it takes what it takes where it is placed.
+        let text_size = (self.new.find_class(&Class::Text))
+            .and_then(|it| groups.get(it.0 as usize))
+            .map_or(0, |ids| self.extent(ids));
         let mut sorted = groups;
         let mut classes: Vec<Class> = Vec::with_capacity(present.len());
         for (at, _) in present.iter().enumerate().filter(|it| *it.1) {
@@ -602,7 +771,6 @@ impl<'a> Stage<'a> {
         // (`Plan::headers`); any other starts a page of its own, so headers are never mapped
         // writable or executable.
         let mut prot = Some(Prot::R);
-        let mut text_size = 0;
         let mut data_size = 0;
         for class in classes {
             let id = self.new.find_class(&class).expect("a class of the image");
@@ -622,16 +790,14 @@ impl<'a> Stage<'a> {
             let start = if indexed { code_addr } else { align_up_u64(addr, align) };
             let zero = zeroed(&class);
             let size = self.put(start, &ids, spaces.len() as u32, zero);
-            match &class {
-                Class::Text => text_size += size,
-                Class::Rodata | Class::RelRo | Class::Data | Class::Bss => data_size += size,
-                _ => {}
+            if matches!(class, Class::Rodata | Class::RelRo | Class::Data | Class::Bss) {
+                data_size += size;
             }
             let bound = synthetic.iter().find(|it| it.0 == class).map(|it| it.1);
             let capacity = match (&class, incremental) {
                 (Class::Reserve(reserve), _) => self.reservation(*reserve),
-                (Class::Patch, true) => align_up_u64(text_size.max(PATCH), self.plan.page),
-                (Class::PatchData, true) => align_up_u64(data_size.max(PATCH), self.plan.page),
+                (Class::Patch, true) => patch_room(text_size, self.plan.page),
+                (Class::PatchData, true) => patch_room(data_size, self.plan.page),
                 (Class::Synthetic(_), true) => {
                     let bound = bound.unwrap_or(size);
                     align_up_u64((bound * 2).max(bound + ROOM), 16)

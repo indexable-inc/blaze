@@ -79,6 +79,8 @@ a build first needs it.
     blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
     blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
     blaze doc   [cargo's flags]                                       (d)
+    blaze fmt   [--check] [-p NAME]... [--all] [--manifest-path PATH] [-v|-q] [-- RUSTFMT_ARGS]
+    blaze fmt   [RUSTFMT_ARGS] FILE.rs...
     blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
     blaze stop
     blaze status
@@ -114,9 +116,20 @@ and commits the edits to the checkout's head, and the client writes them to its 
 to name `TO` without depending on its crate, or a name the front end can't place (a
 `macro_rules!` body, cfg'd out code), stops it with an error naming the file and line, before
 anything is written, and nothing is checked; `pin` is [below](#pinning-a-release-of-blaze). `check`'s lints, `--fix`
-and `--baselines` are [below](#lints). There is no `clippy` and no `fix` command: `check` is both. Any other command (v1's `fmt`, `tree`,
-`metadata`, `toolchain`, ...) fails with `error: no such command` and status 101; none is
+and `--baselines` are [below](#lints). There is no `clippy` and no `fix` command: `check` is both. Any other command (v1's `tree`,
+`metadata`, ...) fails with `error: no such command` and status 101; none is
 passed to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
+
+`fmt` is `cargo fmt` and rustfmt, run in the client's process with blaze's own formatter
+(`crates/blaze-fmt`, `blaze_fmt::command`); it asks nothing of the daemon and starts no rustfmt
+or cargo-fmt. With no `.rs` file named before `--` it formats the targets of the current
+package, or of every member at the workspace's root (`-p NAME` picks packages, `--all` adds
+their local path dependencies), each with its target's edition; `--check` writes the diff and
+exits 1 when a file would change; words after `--` go to the formatter (rustfmt's options, and
+more files). Given `.rs` files it formats those, each with the edition of the target or package
+that has it unless `--edition` says. Each file reads the nearest `rustfmt.toml` or
+`.rustfmt.toml`; one with an option blaze fmt does not run (a name rustfmt 1.11.0 does not
+know, or a non-empty `ignore`) stops it with an error naming the file and each option.
 
 `blaze check` checks the targets `cargo check` with the same flags does: a plain one
 the libraries and binaries of the packages selected, and `--lib`, `--bins`, `--tests`,
@@ -781,10 +794,12 @@ network IO and keeps the work on the efficiency cores. A priority blaze cannot l
 warning naming the call and errno, and the build goes on at the priority it started with.
 
 The client and the daemon each read it once, as they start (`blaze_core::cores`). A daemon's
-budget and priority are fixed for its life, so a command whose `BLAZE_CORES` asks for another
-budget or priority than the running daemon's is refused, naming both; `blaze stop` and run it
-again, and the daemon that command starts takes its setting. A daemon systemd or launchd
-starts (`blaze daemon install`) reads its unit's environment.
+budget and priority are fixed for its life, so a command that sets a `BLAZE_CORES` giving
+another budget or priority than the running daemon's is refused before any request, in one
+error with every other daemon setting it differs in; `blaze stop` and run it again, and the
+daemon that command starts takes its setting. A command that leaves it unset runs on the
+daemon's. A daemon systemd or launchd starts (`blaze daemon install`) reads its unit's
+environment, which captures the installing shell's `BLAZE_CORES`.
 
 ### Files
 
@@ -974,7 +989,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 | `BLAZE_RUST_DIST` | where the pinned nightly's components come from: a URL, or a directory of them ([Install](#install)) | rust-lang's dist server, at the pinned date |
 | `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | GitHub's |
 | `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |
-| `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command whose value differs from the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
+| `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |
 
 `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_INLINE` are not settings in v2. They change the code
@@ -1093,13 +1108,14 @@ plugin (`cargo-<name>` on the path).
 v2's client has only the commands of [Commands](#commands) (`crates/blaze-cargo/src/cli.rs`);
 any other fails with status 101 and does nothing:
 
-    error: no such command: `fmt`
+    error: no such command: `tree`
 
-    help: blaze's commands are build, check, run, test, bench, doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug and explain
+    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, explain, why, reach and slow
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back
-once the client asks the daemon for it. None of it runs in v2.
+once the client asks the daemon for it. None of it runs in v2, except `fmt`, which is back as
+[above](#commands).
 
 | Command | blaze's | What it is, and what it waits for |
 |---|---|---|

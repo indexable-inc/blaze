@@ -869,6 +869,43 @@ reading through `Deref` (a method or field of the value, `&*y`): `&` plus one `*
 of `x`'s type plus one. Inside a loop the note names epoch or hazard reclamation (arc-swap
 guards, crossbeam-epoch). No MIR: the HIR adjustments say what each use borrows.
 
+## `lenient_deserialize`
+
+In `blaze::internal`: allowed by default, so a workspace that doesn't turn it on is unchanged;
+blaze's own turns it on through `internal = "warn"` in its root `Cargo.toml`. AGENTS.md rule 3
+(no fallback) for input: a struct or enum that derives serde's `Deserialize` without
+`#[serde(deny_unknown_fields)]` skips a key it has no field for, so a misspelled or renamed field
+of a config, manifest or message reads as absent and what it said is silently dropped.
+
+A finding is a derive path that name resolution takes to the `Deserialize` derive of
+`serde_derive` (through `serde`) or `blaze_serde_derive` (through `blaze_serde`), bare, by path
+(`serde::Deserialize`), renamed or re-exported, on an item whose own `#[serde(..)]` attributes
+(those inside a `cfg_attr` included) have no `deny_unknown_fields`. The message names the item;
+the span is the derive's path. Nothing is found where the attribute means nothing or serde
+refuses it:
+
+- a tuple or unit struct, read as a sequence or a unit, with no field names;
+- a struct with a `#[serde(flatten)]` field: serde and blaze-serde-derive refuse
+  `deny_unknown_fields` beside `flatten`, whose field takes the keys left over;
+- `#[serde(transparent)]`, `from = ".."` and `try_from = ".."`: the input is read as another
+  type, whose own derive is where unknown fields are refused;
+- an enum with no struct variant (`V { .. }`): unit, newtype and tuple variants have no field
+  names, and an unknown variant is already an error. On an enum with a struct variant the
+  container attribute refuses unknown fields in every struct variant (externally, internally and
+  adjacently tagged alike), so the one finding is on the enum; an enum with a `flatten` field in
+  any variant is left alone, as such a struct is;
+- an `#[serde(untagged)]` enum: blaze-serde-derive tries each variant with unknown fields allowed
+  whatever the container says, so the attribute would promise nothing.
+
+Not checked: test code, an item a macro wrote, an item declared in a function body, and a derive
+inside a `cfg_attr`. `#[serde(default)]` is not this lint's: a missing field filled with a
+default is the type's stated choice.
+
+The fix, machine-applicable, writes `#[serde(deny_unknown_fields)]` on the line after the derive
+at its indentation; `blaze check --workspace --fix --lint blaze::lenient_deserialize` applies it
+everywhere. A type that must read input from a newer writer (a wire format that grows on
+purpose) keeps its leniency with `#[expect(blaze::lenient_deserialize, reason = "..")]`.
+
 ## The correctness lints of `blaze::general`
 
 Warn, general; shared helpers in `src/blaze/general_facts.rs` (std items found by crate and

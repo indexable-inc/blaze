@@ -1,4 +1,9 @@
-use std::{fmt, hash::Hash, marker::PhantomData, num::NonZeroU32};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+    num::NonZeroU32,
+};
 
 use macros::GenericTypeVisitable;
 use rustc_type_ir::GenericTypeVisitable;
@@ -25,6 +30,35 @@ const _: () = assert!(size_of::<Option<Allocation<'static>>>() == 4);
 impl<'db> Allocation<'db> {
     pub fn new(data: AllocationData<'db>) -> Self {
         Self::at(ALLOCATIONS.intern(data))
+    }
+
+    /// The allocation of `memory` with no memory map (a scalar constant), found without copying
+    /// `memory` when it is interned already, so lowering a literal it has met allocates nothing.
+    pub fn of_bytes(ty: Ty<'db>, memory: &[u8]) -> Self {
+        /// [`AllocationData`] with no memory map, borrowed: hashes as `AllocationData::hash`
+        /// does, which `find_by` needs to land on the same row.
+        struct Key<'a, 'db> {
+            ty: Ty<'db>,
+            memory: &'a [u8],
+        }
+        impl Hash for Key<'_, '_> {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.ty.hash(state);
+                self.memory.hash(state);
+                MemoryMap::Empty.hash(state);
+            }
+        }
+        let same = |data: &AllocationData<'db>| {
+            data.ty == ty && *data.memory == *memory && matches!(data.memory_map, MemoryMap::Empty)
+        };
+        match ALLOCATIONS.find_by(&Key { ty, memory }, same) {
+            Some(row) => Self::at(row),
+            None => Self::new(AllocationData {
+                ty,
+                memory: memory.into(), // alloc: a new constant's bytes, which the table keeps
+                memory_map: MemoryMap::Empty,
+            }),
+        }
     }
 
     #[inline]
@@ -70,6 +104,7 @@ pub struct AllocationData<'db> {
     pub memory_map: MemoryMap<'db>,
 }
 
+// `Allocation::of_bytes` hashes a borrowed key the same way: change both together.
 impl<'db> Hash for AllocationData<'db> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let Self { ty, memory, memory_map } = self;

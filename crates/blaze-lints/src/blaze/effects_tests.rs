@@ -68,6 +68,20 @@ pub mod sync {
         }
     }
 }
+pub mod env {
+    pub struct VarError;
+    pub fn var(_key: &str) -> Result<u32, VarError> {
+        loop {}
+    }
+}
+pub mod time {
+    pub struct SystemTime(u64);
+    impl SystemTime {
+        pub fn now() -> SystemTime {
+            loop {}
+        }
+    }
+}
 "#;
 
 /// What the three lints say of `main` (`src/lib.rs`, its crate's meta `meta` after `crate:main`).
@@ -388,6 +402,58 @@ impl Sink for Loud {
     let found = findings(&out, "noalloc");
     assert_eq!(found.len(), 1, "{out}");
     assert!(out.contains("lib.rs:13"), "`Loud`'s `put`:\n{out}");
+}
+
+/// blaze-fetch's `Transform` (crates/blaze-fetch/src/graph.rs) is `#[blaze::pure]` on a trait:
+/// an impl whose `run` reads the clock or the environment is refused at its `run`, naming the
+/// call; the impl that reads only its input passes. A fetch graph keys a step's output by its
+/// input and code alone, which holds only while this refuses.
+#[test]
+fn an_impure_transform_is_refused() {
+    let fixture = format!(
+        "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std\n{}",
+        r#"pub struct Tree(u32);
+pub struct StepError;
+#[blaze::pure]
+pub trait Transform {
+    type In;
+    fn run(input: Self::In) -> Result<Tree, StepError>;
+}
+pub struct Same;
+impl Transform for Same {
+    type In = u32;
+    fn run(input: u32) -> Result<Tree, StepError> {
+        Ok(Tree(input))
+    }
+}
+pub struct Stamped;
+impl Transform for Stamped {
+    type In = u32;
+    fn run(input: u32) -> Result<Tree, StepError> {
+        let _ = std::time::SystemTime::now();
+        Ok(Tree(input))
+    }
+}
+pub struct Configured;
+impl Transform for Configured {
+    type In = u32;
+    fn run(input: u32) -> Result<Tree, StepError> {
+        match std::env::var("STEP") {
+            Ok(it) => Ok(Tree(it + input)),
+            Err(_) => Err(StepError),
+        }
+    }
+}
+"#
+    );
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::pure");
+    let found = findings(&out, "pure");
+    assert_eq!(found.len(), 2, "{out}");
+    assert!(out.contains("lib.rs:18"), "`Stamped`'s `run`:\n{out}");
+    assert!(out.contains("reads the clock"), "{out}");
+    assert!(out.contains("lib.rs:26"), "`Configured`'s `run`:\n{out}");
+    assert!(out.contains("reads the environment"), "{out}");
+    assert!(!out.contains("lib.rs:11"), "`Same`'s `run` reads only its input:\n{out}");
 }
 
 /// An attribute with anything but `trusted = ".."` is a finding, never read as unmarked.
