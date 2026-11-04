@@ -68,8 +68,10 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
 - The 4.2 changes (explicit deferral, `Copy`, Parent storage) are in the `flecs` skill. Here: mutate from systems
   through the stage (`vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor) or collect, then write;
   never rely on implicit `defer_begin`.
-- v4.2.0 aborts at shutdown with the Parent storage script prefab/template children default to
-  (flecs_non_fragmenting_childof_move), so each top-level scene scope says `@tree ChildOf` until upstream fixes it.
+- Script prefab/template children default to Parent storage in 4.2. The shutdown abort it caused
+  (flecs_non_fragmenting_childof_move) is fixed in the fork (upstream flecs#2384), but the views still find children
+  through ChildOf tables (without `@tree ChildOf` the window draws empty), so each top-level scene scope keeps
+  `@tree ChildOf` until they read Parent children too.
 - Since 4.2, prefabs, constraint traits, cached queries and query plans are addons: features of `hyperion-flecs-c`.
 
 ## Target: reactive templates (4.2 has them; no view uses them yet)

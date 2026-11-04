@@ -11,13 +11,15 @@
   `hyperion-panic`, `hyperion-wyhash` and `hyperion-manifest-types` (the data-only module manifest den-native's modules
   export).
 - flecs: the fork github.com/indexable-inc/flecs, branch `indexable/v4.2`, commit
-  `cef19829fd147960a04b71fcc14f75b8166796f1`: upstream tag v4.2.0 (`6566d4b7bdc597d0b74d5e0a4104d4ae6ac49402`, also
+  `4086c73fd7da789822dc8d359263fefd6149383b`: upstream tag v4.2.0 (`6566d4b7bdc597d0b74d5e0a4104d4ae6ac49402`, also
   upstream master on 2026-11-04; tarball https://github.com/SanderMertens/flecs/archive/refs/tags/v4.2.0.tar.gz, sha256
-  4107b0a36aa25f80ddcd6f939451ccfe1bacafcccdd2695840a4a8c413d05b40) plus seven commits: the fork's per-component column
+  4107b0a36aa25f80ddcd6f939451ccfe1bacafcccdd2695840a4a8c413d05b40) plus nine commits: the fork's per-component column
   allocator, shortest round-trip JSON floats and query-cache notification while quitting; refusing pairs that break
   relationship constraints under FLECS_SOFT_ASSERT (was HYPERION-PATCHES #3); copying OrderedChildren to prefab instances
   (was #4); and two script fixes, world aliases winning over the script's own declarations and scoped declarations
-  resolving as children rather than aliases. Licence MIT (LICENSE in this dir).
+  resolving as children rather than aliases; and two commits for deleting a parent before its Parent-component children,
+  which aborted at shutdown with prefab scopes (upstream issue SanderMertens/flecs#2384, PR #2385). Licence MIT (LICENSE in
+  this dir).
 - Files: the fork's `distr/flecs.c` and `distr/flecs.h`, unmodified, built with upstream's own tool (`bake build .` in
   the fork; bake reproduces upstream's v4.2.0 distr byte for byte). Patch here by committing to the fork and re-vendoring.
 - Dropped from hyperion: its typed SDK crates and module macros, the dlopen loader and linker, phases, threads, hyperion-ecs's
