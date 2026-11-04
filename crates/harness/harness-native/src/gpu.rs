@@ -6,7 +6,7 @@
 //! slots gated by a semaphore; the tiny uniforms go by setBytes.
 pub use crate::draw::*;
 use objc2_quartz_core::CAMetalDrawable as _;
-use crate::pack::{GlyphInst, LineInst, PanelInst};
+use crate::pack::{GlyphInst, LineInst, PanelInst, SpriteInst};
 use bytemuck::Pod;
 use dispatch2::{DispatchData, DispatchRetained, DispatchSemaphore, DispatchTime};
 use block2::RcBlock;
@@ -50,9 +50,10 @@ pub struct Renderer {
     panel: Pso,
     glyph: Pso,
     line: Pso,
+    sprite: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     pub atlas: Tex,
-    rings: [Option<Ring>; 3],
+    rings: [Option<Ring>; 4],
     slot: usize,
     sem: DispatchRetained<DispatchSemaphore>,
 }
@@ -97,11 +98,12 @@ impl Renderer {
             panel: pipeline(&dev, &lib, "panel_vs", "panel_fs"),
             glyph: pipeline(&dev, &lib, "glyph_vs", "glyph_fs"),
             line: pipeline(&dev, &lib, "line_vs", "line_fs"),
+            sprite: pipeline(&dev, &lib, "sprite_vs", "sprite_fs"),
             dev,
             queue,
             sampler,
             atlas,
-            rings: [None, None, None],
+            rings: [None, None, None, None],
             slot: 0,
             sem: DispatchSemaphore::new(FRAMES as isize),
         }
@@ -149,6 +151,7 @@ impl Renderer {
         let pb = self.ring(0, ring_slot, &draw.panels);
         let gb = self.ring(1, ring_slot, &draw.glyphs);
         let lb = self.ring(2, ring_slot, &draw.lines);
+        let sb = self.ring(3, ring_slot, &draw.sprites);
         let Some(cmd) = self.queue.commandBuffer() else {
             self.sem.signal();
             return;
@@ -177,6 +180,7 @@ impl Renderer {
                     SegKind::Panel => (&self.panel, "panel_vs", "panel_fs", &pb, std::mem::size_of::<PanelInst>()),
                     SegKind::Glyph => (&self.glyph, "glyph_vs", "glyph_fs", &gb, std::mem::size_of::<GlyphInst>()),
                     SegKind::Line => (&self.line, "line_vs", "line_fs", &lb, std::mem::size_of::<LineInst>()),
+                    SegKind::Sprite => (&self.sprite, "sprite_vs", "sprite_fs", &sb, std::mem::size_of::<SpriteInst>()),
                 };
                 enc.setRenderPipelineState(pso);
                 // SAFETY: the pointers are valid for the lengths given; setBytes copies them. Buffers, textures and the
@@ -184,10 +188,12 @@ impl Renderer {
                 // bound offset, inside the ring buffer.
                 unsafe {
                     enc.setVertexBytes_length_atIndex(NonNull::new(fb.as_ptr().cast_mut().cast()).unwrap(), fb.len(), slot(vs, "frame"));
-                    enc.setFragmentBytes_length_atIndex(NonNull::new(fb.as_ptr().cast_mut().cast()).unwrap(), fb.len(), slot(fs, "frame"));
+                    if sg.kind != SegKind::Sprite {
+                        enc.setFragmentBytes_length_atIndex(NonNull::new(fb.as_ptr().cast_mut().cast()).unwrap(), fb.len(), slot(fs, "frame"));
+                    }
                     enc.setVertexBuffer_offset_atIndex(Some(buf), sg.first as usize * stride, slot(vs, "insts"));
                     match sg.kind {
-                        SegKind::Panel | SegKind::Line => enc.setFragmentBuffer_offset_atIndex(Some(buf), sg.first as usize * stride, slot(fs, "insts")),
+                        SegKind::Panel | SegKind::Line | SegKind::Sprite => enc.setFragmentBuffer_offset_atIndex(Some(buf), sg.first as usize * stride, slot(fs, "insts")),
                         SegKind::Glyph => {
                             enc.setFragmentTexture_atIndex(Some(&self.atlas), slot(fs, "atlas"));
                             enc.setFragmentSamplerState_atIndex(Some(&self.sampler), slot(fs, "smp"));

@@ -35,6 +35,8 @@ pub trait FontSource: Clone + Sized {
     fn descent(&self) -> f32;
     fn cap_height(&self) -> f32;
     fn x_height(&self) -> f32;
+    /// The underline's thickness, points (the `post` table's).
+    fn underline_thickness(&self) -> f32;
     /// The glyph `ch` maps to, 0 when it has none.
     fn glyph(&self, ch: char) -> u16;
     /// `glyph`'s advance as the platform sets it at this size (with its tracking), points.

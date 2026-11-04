@@ -4,7 +4,7 @@
 //! Each distinct cell (its grapheme, bold, italic) is shaped once by den's typesetter in the code face, so a character
 //! the monospace font lacks (CJK, emoji, symbols) comes from the shaper's fallback, and is placed on the cell grid.
 use crate::draw::Draw;
-use crate::pack::{GlyphInst, LineInst, PanelInst};
+use crate::pack::{GlyphInst, LineInst, PanelInst, SpriteInst};
 use crate::text::{Face, Fonts, GlyphCache, Layout, SUBPX, Style};
 use std::collections::HashMap;
 
@@ -225,7 +225,7 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
     let cursor = snap.cursor;
     let show_cursor = snap.cursor_shown && p.scroll == 0;
     let mut glyph_runs: Vec<(f32, f32, String, bool, bool, Rgba)> = Vec::new();
-    let mut boxes: Vec<(char, [f32; 4], Rgba)> = Vec::new();
+    let mut sprites: Vec<SpriteInst> = Vec::new();
     let mut lines: Vec<LineInst> = Vec::new();
     for (r, row) in snap.rows.iter().enumerate() {
         let r = r as u16;
@@ -261,8 +261,23 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
             let x = ox + f32::from(c) * cw;
             let w = if cell.wide { 2.0 * cw } else { cw };
             let mut chars = cell.text.chars();
-            match (chars.next(), chars.next()) {
-                (Some(k), None) if crate::boxdraw::drawn(k) => boxes.push((k, [x, y, w, ch], ink)),
+            let sprite = match (chars.next(), chars.next()) {
+                (Some(k), None) => crate::boxdraw::shape(k),
+                _ => None,
+            };
+            match sprite {
+                Some(sh) => {
+                    // A procedural cell: its rect in whole device pixels (the origin and cell are on the pixel grid), its
+                    // ground under it unless the cursor's plate is (drawn before the sprites).
+                    let ip = |v: f32| (v * sc).round() as i32;
+                    let under_cursor = show_cursor && (r, c) == cursor;
+                    sprites.push(SpriteInst {
+                        rect: [ip(x), ip(y), ip(x + w) - ip(x), ip(y + ch) - ip(y)],
+                        shape: [sh.kind, sh.a, sh.b, 0],
+                        fg: ink,
+                        bg: if under_cursor { [0.0; 4] } else { bg.unwrap_or([0.0; 4]) },
+                    });
+                }
                 _ => glyph_runs.push((x, y, cell.text.clone(), cell.bold, cell.italic, ink)),
             }
             if cell.underline {
@@ -290,9 +305,10 @@ pub fn draw(d: &mut Draw, grid: &mut Grid, fonts: &mut Fonts, cache: &mut GlyphC
         }
         d.panel(panel);
     }
-    let thin = (sc * grid.size / 13.0).round().max(1.0) / sc;
-    for (k, rect, ink) in boxes {
-        crate::boxdraw::draw(d, k, rect, ink, sc, thin);
+    let thick = crate::boxdraw::thickness(fonts, grid.size, sc);
+    for mut s in sprites {
+        s.shape[3] = thick;
+        d.sprite(s);
     }
     for l in lines.drain(..) {
         d.line(l);

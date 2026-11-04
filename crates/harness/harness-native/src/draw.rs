@@ -1,6 +1,6 @@
 //! What one frame draws, as plain data: the view flattens the world into a [`Draw`] and gpu.rs draws it. Nothing here touches
 //! a GPU. Copied from den-native's draw.rs (github.com/andrewgazelka/den) and stripped to panels, glyphs and lines.
-use crate::pack::{Frame, GlyphInst, LineInst, PanelInst};
+use crate::pack::{Frame, GlyphInst, LineInst, PanelInst, SpriteInst};
 
 pub const ATLAS_SIZE: u32 = 2048;
 
@@ -10,6 +10,8 @@ pub enum SegKind {
     Glyph,
     /// Indices into [`Draw::lines`]: stroked segments and dots, anti-aliased, blended in draw order with the rest.
     Line,
+    /// Indices into [`Draw::sprites`]: procedural cells (box drawing, blocks, braille, sextants, powerline).
+    Sprite,
 }
 
 /// A run of consecutive instances of one kind, drawn in order.
@@ -28,6 +30,7 @@ pub struct Draw {
     pub panels: Vec<PanelInst>,
     pub glyphs: Vec<GlyphInst>,
     pub lines: Vec<LineInst>,
+    pub sprites: Vec<SpriteInst>,
     /// Paint order: runs of instances by kind.
     pub segs: Vec<Seg>,
 }
@@ -57,5 +60,10 @@ impl Draw {
     pub fn line(&mut self, l: LineInst) {
         self.lines.push(l);
         self.push_seg(SegKind::Line, self.lines.len() - 1);
+    }
+
+    pub fn sprite(&mut self, s: SpriteInst) {
+        self.sprites.push(s);
+        self.push_seg(SegKind::Sprite, self.sprites.len() - 1);
     }
 }
