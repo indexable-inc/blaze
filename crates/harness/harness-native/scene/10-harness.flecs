@@ -72,6 +72,9 @@ prefab hn.ObjRow : ui.Row {
 
 // The main card: the selected object's header over its terminal.
 prefab hn.Main : ui.Column, Plate {
+  // One surface in the terminal's own ground: no hairline frame; the contrast with the black window separates it.
+  Edge: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
+  Shape: {radius: 10, n: 4, border: 0, feather: 0}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
   head : ui.Row {

@@ -33,7 +33,8 @@ const HARNESS: &str = include_str!("../scene/10-harness.flecs");
 
 /// The terminal's font size at zoom 1 (points), and its padding inside the main card.
 const TERM_SIZE: f32 = 13.0;
-const TERM_PAD: (f32, f32) = (14.0, 10.0);
+/// The terminal's padding inside its pane (Ghostty's window-padding), in points; the cell remainder is added on top.
+const TERM_PAD: (f32, f32) = (18.0, 16.0);
 const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
 
 /// The window's ground under the sidebar.
@@ -617,9 +618,13 @@ impl App {
         let Some(sid) = self.session_of(e) else { return };
         let laid = self.world.entity_from_id(self.ids.term).try_cloned::<&Laid>();
         let Some(l) = laid.filter(|l| l.w > 0.0 && l.h > 0.0) else { return };
-        let rect = [l.x + TERM_PAD.0, l.y + TERM_PAD.1, l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1];
+        // Fit the grid inside the padding, then split what is left of a cell evenly into the padding on both sides
+        // (Ghostty's window-padding-balance), snapped to whole device pixels so every cell starts on one.
+        let (cols, rows) = self.grid.fit(l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1);
+        let (gw, gh) = (f32::from(cols) * self.grid.cw, f32::from(rows) * self.grid.ch);
+        let snap = |v: f32| (v * self.grid.scale).floor() / self.grid.scale;
+        let rect = [snap(l.x + (l.w - gw) * 0.5), snap(l.y + (l.h - gh) * 0.5), gw, gh];
         self.term_rect = Some(rect);
-        let (cols, rows) = self.grid.fit(rect[2], rect[3]);
         let o = self.world.entity_from_id(e);
         let running = self.status_of(e) == "running";
         // Attach when it is not: a running object again a second after its last try, an ended one once (its last screen).
