@@ -23,8 +23,14 @@ export const more_h = 22
 export const indent_step = 16
 export const icon_box = 16
 export const chevron_box = 12
-// A tree row's disclosure slot: the chevron's hit target, left of the row's icon.
+// A tree row's disclosure slot: the chevron's hit target, left of the row's icon. In the sidebar it hangs in the gutter
+// left of the icon (never pushing the row's content right).
 export const disclose_w = 18
+// The sidebar's side margin: the tree pads itself by it (so a depth-0 chevron hangs in it, inside the tree's clip), and
+// the section label and the Archive row sit in from it. label_inset is side_inset + row_pad: the section label's left
+// edge, where depth-0 icons start.
+export const side_inset = 10
+export const label_inset = 18
 // The seam between the sidebar and the main card: a soft shadow off the card's left edge.
 export const seam_blur = 14
 export const seam_alpha = 0.28
@@ -49,6 +55,8 @@ export const turn_omega = 30
 export const turn_zeta = 0.78
 export const pill_omega = 32
 export const pill_zeta = 0.86
+// From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on).
+export const pill_jump_rows = 3
 export const sidebar_omega = 24
 // The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade, the knob's width.
 export const tree_glide_omega = 22

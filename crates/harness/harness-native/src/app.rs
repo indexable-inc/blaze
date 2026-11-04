@@ -297,7 +297,7 @@ impl App {
             set_side_width(side.entity(), w);
         }
         let tree = side.child("hn.Tree");
-        let archive_row = side.child("hn.ArchiveRow");
+        let archive_row = side.child("hn.SideFoot").child("hn.ArchiveRow");
         archive_row.set(HoverAmt::default());
         for name in ["icon", "count"] {
             if let Some(p) = archive_row.part(name) {
@@ -567,6 +567,7 @@ impl App {
         }
         let looks = RowLooks::of(w, clear);
         let step = crate::look::width(w, "indent");
+        let (inset, slot) = (crate::look::width(w, "row_inset"), crate::look::width(w, "disclose"));
         // One row per session, run and stage, with a fold row over each session's older runs.
         let tree = View::of(w.entity_from_id(self.ids.tree));
         let hint: HashMap<u64, usize> = rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
@@ -582,11 +583,19 @@ impl App {
         let info = self.fold.merge(info, w);
         let me = &*self;
         // Names to clip to their row's room once the loop is done (the typesetter needs `self` mutably).
+        // A row padded in by its depth (its icon at the section label's edge at depth 0), its disclosure's layer padded so
+        // the slot ends at the icon: the chevron hangs in the gutter and never pushes the row's content.
         let indent = |row: View<'_>, depth: usize| {
-            if let Some(p) = row.part("indent") {
-                let s = Size { w: Sizing { kind: SizeKind::Fixed, value: depth as f32 * step, min: 0.0, max: 0.0 }, h: Sizing { kind: SizeKind::Fixed, value: 1.0, min: 0.0, max: 0.0 } };
-                if p.entity().try_cloned::<&Size>() != Some(s) {
-                    p.set(s);
+            let l = inset + depth as f32 * step;
+            use harness_native_ui_layout_api::Padding;
+            let pad = row.entity().try_cloned::<&Padding>().unwrap_or_default();
+            if pad.l != l {
+                row.set(Padding { l, ..pad });
+            }
+            if let Some(h) = row.part("hang") {
+                let pad = Padding { l: l - slot, ..Padding::default() };
+                if h.entity().try_cloned::<&Padding>() != Some(pad) {
+                    h.set(pad);
                 }
             }
         };
@@ -1522,6 +1531,25 @@ impl App {
     fn toggle_sidebar(&mut self) {
         self.side_open = !self.side_open;
         self.poke();
+    }
+
+    /// One line of what a shot sequence measures (src/shot.rs `HARNESS_NATIVE_SHOT_SEQ`): the fold spring, the focused
+    /// terminal's grid origin and columns, the selection pill's drawn y and the tree's scroll.
+    pub fn probe(&self) -> String {
+        let w = self.world.world_ref();
+        let grid = self.focused_term().and_then(|t| w.entity_from_id(t).try_cloned::<&crate::pane::TermGrid>());
+        let pill = w.try_lookup("ui_matched::hn_selection").and_then(|h| h.try_cloned::<&harness_native_ui_motion_api::Matched>());
+        let drawn = pill.and_then(|m| w.entity_from_id(m.owner).try_cloned::<&harness_native_ui_motion_api::Drawn>());
+        format!(
+            "side={:.4} open={} grid_x={:.2} cols={} pill_y={:.2} pill_v={:.1} scroll={:.2}",
+            self.side_x.x,
+            self.side_open,
+            grid.map_or(-1.0, |g| g.x),
+            grid.map_or(0, |g| g.cols),
+            drawn.map_or(-1.0, |d| d.y),
+            pill.map_or(0.0, |m| m.y.v),
+            w.entity_from_id(self.ids.tree).try_cloned::<&harness_native_ui_layout_api::ScrollState>().map_or(0.0, |s| s.y)
+        )
     }
 
     /// Start with the sidebar folded away (`HARNESS_NATIVE_SIDEBAR=0`, for captures).

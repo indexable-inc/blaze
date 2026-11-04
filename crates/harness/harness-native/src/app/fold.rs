@@ -255,7 +255,8 @@ fn fold_key(e: EntityView<'_>) -> Option<String> {
 /// Set a row's disclosure: a chevron that folds `e` (turned open or not) when it has rows under it, shown while the row
 /// is hovered or while it is folded; nothing, and no hit target (the row takes the press), when it has none.
 pub fn disclosure(row: View<'_>, e: Option<EntityView<'_>>) {
-    let Some(p) = row.part("disclose") else { return };
+    // In the sidebar it hangs in the row's `hang` layer (left of the icon); in the Archive it is in the row's flow.
+    let Some(p) = row.part("disclose").or_else(|| row.part("hang").and_then(|h| h.part("disclose"))) else { return };
     let kids = e.filter(|e| has_kids(*e));
     let pe = p.entity();
     match kids {

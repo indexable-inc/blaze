@@ -263,12 +263,13 @@ impl App {
             }
             let laid = w.entity_from_id(t).try_cloned::<&Laid>();
             let Some(l) = laid.filter(|l| l.w > 0.0 && l.h > 0.0) else { continue };
-            // Fit the grid inside the padding, then split what is left of a cell evenly into the padding on both sides
-            // (Ghostty's window-padding-balance), snapped to whole device pixels so every cell starts on one.
+            // Fit the grid inside the padding, pinned to its top-left inset (snapped to a whole device pixel so every cell
+            // starts on one); what is left of a cell goes to the right and bottom. Balancing it on both sides would
+            // re-centre the text by half a cell each time the column count changes (a jolt at the end of a cmd+S fold).
             let (cols, rows) = self.grid.fit(l.w - 2.0 * TERM_PAD.0, l.h - 2.0 * TERM_PAD.1);
             let (gw, gh) = (f32::from(cols) * self.grid.cw, f32::from(rows) * self.grid.ch);
-            let snap = |v: f32| (v * self.grid.scale).floor() / self.grid.scale;
-            self.put(t, TermGrid { x: snap(l.x + (l.w - gw) * 0.5), y: snap(l.y + (l.h - gh) * 0.5), w: gw, h: gh, cols, rows });
+            let snap = |v: f32| (v * self.grid.scale).round() / self.grid.scale;
+            self.put(t, TermGrid { x: snap(l.x + TERM_PAD.0), y: snap(l.y + TERM_PAD.1), w: gw, h: gh, cols, rows });
             let o = w.entity_from_id(e);
             if let Some((n, stage)) = run {
                 // A run (or stage): its output, read-only, from the start into a fresh parser the pane's size.
