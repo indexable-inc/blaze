@@ -65,12 +65,11 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
 
 ## Flecs 4.2 traps (the vendored version)
 
-- Deferring is explicit in 4.2. In C (what hyperion-ecs wraps) `it->world` is now the real world and `it->stage` is
-  the deferred one (`vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor); mutate from systems
-  through the stage (or collect, then write), never rely on implicit `defer_begin`. `e.stage()` is the C++ spelling only.
-- 4.2 renames `(OnInstantiate, Override)` to `Copy`. Children of script prefab/template scopes default to the new
-  non-fragmenting Parent storage; v4.2.0 aborts at shutdown with it (flecs_non_fragmenting_childof_move), so each
-  top-level scene scope says `@tree ChildOf` until upstream fixes it.
+- The 4.2 changes (explicit deferral, `Copy`, Parent storage) are in the `flecs` skill. Here: mutate from systems
+  through the stage (`vendor/hyperion-ecs/src/system.rs`: `Iter::world` and the stage accessor) or collect, then write;
+  never rely on implicit `defer_begin`.
+- v4.2.0 aborts at shutdown with the Parent storage script prefab/template children default to
+  (flecs_non_fragmenting_childof_move), so each top-level scene scope says `@tree ChildOf` until upstream fixes it.
 - Since 4.2, prefabs, constraint traits, cached queries and query plans are addons: features of `hyperion-flecs-c`.
 
 ## Target: reactive templates (4.2 has them; no view uses them yet)
@@ -90,22 +89,22 @@ template hn.ObjRow {
   prop has_children = false
 
   ui.Row { Padding: {l: depth * $indent} }
-  if has_children { chevron : hn.Disclosure { Rotation: {deg: folded ? 0 : 90} } }
+  if has_children { chevron : hn.Disclosure { Rotation: {deg: match folded { true: 0; false: 90 }} } }
   icon : ui.Icon { Mark: {name: kind_mark(kind)} }   // fn kind_mark in script
   label : ui.Lead { Text: {s: name} }
   if code != 0 { badge : hn.Badge { Text: {s: "{code}"} } }
 
   async {                                             // small behaviour lives with the widget
-    while true { await on.double_click(this); folded = !folded }
+    while true { await on.activate(this); folded = !folded }   // flecs.script.input has no double-click
   }
 }
 ```
 
 - Rust sets the instance's props from the model (one `set` per changed row) and never pokes `part("...")`.
-- Use template interfaces for families (`template Row { prop name; prop icon }`, `template SessionRow : Row`), and
-  pass a template as a prop (`List(row: SessionRow)`) to share list code between sidebar and archive.
-- Also available: `for (i, v) in coll`, string formatting `"{x:.2}"`, `fn`, `include widgets/...`, `export mut`
-  tokens Rust may change, vector literals and maps.
+- Use template interfaces for families (an interface struct `Row`, `template SessionRow : Row`), and pass a
+  template as a prop (`prop row: template Row`) to share list code between sidebar and archive.
+- The language itself (props, muts, interfaces, `for`, `fn`, `include`, string formats, vectors, maps, `export mut`
+  tokens Rust may change, async and input events) is the `flecs` skill's `script.md`.
 - `async` + `flecs.script.input` must be bridged to our pointer/key system; if a behaviour needs the hot path
   (terminal input, key dispatch), keep it in Rust.
 
