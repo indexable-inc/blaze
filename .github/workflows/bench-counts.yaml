@@ -137,20 +137,14 @@ jobs:
           done
           echo "regressed=$regressed" >> "$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/regressions.md" >> "$GITHUB_STEP_SUMMARY"
+      # The README's and docs/benchmarks.md's trend charts, from the history just appended to.
+      - name: Trends
+        run: python3 harness/benchcharts.py '{}'
+      # Main may have moved during the run: bench_commit.py puts the commit on top, draws the
+      # trends again from the history as it is then, and tries again.
       - name: Commit to main
         run: |
-          git add docs/benchmarks/history/
-          git diff --cached --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -q -m "bench: instruction counts for ${GITHUB_SHA::10} [skip ci]"
-          for attempt in 1 2 3 4 5; do
-            git fetch -q origin main
-            git rebase -q origin/main || { git rebase --abort; echo "::error::the counts commit does not apply to main"; exit 1; }
-            git push -q origin HEAD:main && exit 0
-            sleep $((attempt * 5))
-          done
-          exit 1
+          python3 .github/scripts/bench_commit.py "$(printf '{"message": "bench: instruction counts for %s [skip ci]", "paths": ["docs/benchmarks/history/", "docs/benchmarks/charts/", "README.md", "docs/benchmarks.md"]}' "${GITHUB_SHA::10}")"
       - name: Fail on a regression
         if: steps.history.outputs.regressed == 'true'
         run: |

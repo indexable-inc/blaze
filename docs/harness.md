@@ -376,7 +376,11 @@ whose runner is registered. `benchreport.py` writes each table from the newest s
 every platform, so one that did not run keeps its last numbers. `benchcharts.py` draws the
 benchmark charts (SVG, a light and a dark version, a bar per platform) from the same results;
 `benchreport.py` regenerates them whenever it writes a table, `--charts` on its own, and
-`--render` every table and chart.
+`--render` every table and chart. With one typed JSON input (`'{}'` for the repository's own
+paths) `benchcharts.py` also draws the trends, blaze against its own past runs, from
+`docs/benchmarks/history` into the README and benchmarks.md
+([benchmarks.md](benchmarks.md#over-time)); every workflow that appends to the history runs it and
+commits through `.github/scripts/bench_commit.py`, which draws them again on top of main.
 `live_latency.py` times live edits on macOS on AArch64 one at a time through `blaze build`, with
 one typed JSON input (`{"blaze": PATH, "program": "probe" | "life" | "bevy" | "egui", "edits": 10,
 "json": PATH}`; the fields are in its docstring); its JSON goes to `benchhistory.py live`. The

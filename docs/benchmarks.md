@@ -24,6 +24,7 @@ and `harness/v2/budgets.py` is what measures them.
 - [How fast an edit builds](#how-fast-an-edit-builds)
 - [How much memory and disk it takes](#how-much-memory-and-disk-it-takes)
 - [How fast the built programs run](#how-fast-the-built-programs-run)
+- [Over time](#over-time): blaze against its own earlier runs
 - [What is measured](#what-is-measured), [the machines](#the-machines),
   [run it yourself](#run-it-yourself) and [every number](#results)
 
@@ -327,6 +328,23 @@ Release with dev checks: `cargo build --release` with `-C overflow-checks=on -C 
 Measured by v1's runbench.py on each platform's benchmark machine, the last results before v2, which has no runtime bench yet. Raw JSON: [macOS arm64](benchmarks/runtime-macos-arm64.json), [Linux aarch64](benchmarks/runtime-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-linux-x86-64.json); bun: [macOS arm64](benchmarks/runtime-bun-macos-arm64.json), [Linux aarch64](benchmarks/runtime-bun-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-bun-linux-x86-64.json).
 <!-- runbench:end -->
 
+## Over time
+
+`harness/benchcharts.py` draws these from `docs/benchmarks/history` (below) into the same section
+of the README and this page, each run of a workflow that appends to the history (bench-readme,
+bench-counts and live-latency) right after it appends, and the workflow commits them with the
+history. A platform's trend draws only the runs of the machine of its last run, as the check
+compares them; a chart with fewer than two such runs is a line saying so. Regressions are not
+marked on them yet: the history does not record what the check found.
+
+<!-- benchtrend:start -->
+How blaze's own numbers move from run to run, each platform on its own benchmark machine: the instructions each merge to main retires, how long an edit takes and how soon a live edit runs, from [the history](benchmarks/history) ([how it is kept](#history-and-regressions)). Every workflow that adds to the history draws these again and commits them with it.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/trend-macos-arm64-live-dark.svg"><img alt="From saving an edit to the program running it, macOS arm64: 11 runs from Oct 21 to Oct 30, the first to the latest: bevy 83 ms to 3.79 s; egui 15 ms to 219 ms; life 22 ms to 34 ms (Oct 26); probe 7.7 ms to 14 ms" src="benchmarks/charts/trend-macos-arm64-live-light.svg" width="760"></picture>
+
+Not drawn until there are two runs on one machine: macOS arm64 instructions per merge (none yet), macOS arm64 edit times (one run), Linux aarch64 instructions per merge (none yet), Linux aarch64 edit times (one run), Linux x86-64 instructions per merge (none yet), Linux x86-64 edit times (one run), Windows x86-64 live-edit latency (one run).
+<!-- benchtrend:end -->
+
 ## What is measured
 
 `harness/bench.py` copies each project's pinned checkout and builds it two ways side by side:
@@ -626,9 +644,14 @@ when:
 - the stored run is more than 24 hours old (so the commit the tables name stays within a day
   of main).
 
-It then commits those files to main as `github-actions[bot]` with `[skip ci]` in the message (so
-the commit starts no other workflow), once for every platform, rebasing onto main if main moved
-during the run. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
+It then draws [the trends](#over-time) again (`harness/benchcharts.py`, after the history below is
+appended) and commits those files to main as `github-actions[bot]` with `[skip ci]` in the
+message (so the commit starts no other workflow), once for every platform, rebasing onto main if
+main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml and
+live-latency.yaml commit through too). bench-readme, bench-counts and live-latency each draw
+every trend, so two of them running at once can conflict in the trend charts and sections: a
+conflict only there is settled by drawing them again from the merged history, and one anywhere
+else stops the commit with the files named. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
 the ruleset on main lets past its required check; the job's own `GITHUB_TOKEN` is refused
 ([harness.md](harness.md#ci)). `bench-bun.yaml` does the same for bun, nightly, on the same runners: bun takes
 hours, so it has a workflow and a stored result of its own (`docs/benchmarks/bun-<platform>.json`
@@ -684,8 +707,9 @@ manifest is not in the tree), and in a history line as `stress:<crate>/<backend>
 dedicated machines as bench-readme (one run at a time, a newer push replacing the waiting one):
 the stress corpus with fd and hyperfine, the dev profile, three runs. It appends a line per
 platform to `docs/benchmarks/history/<platform>-merge.jsonl` (`benchhistory.py build --suite
-merge`; the site does not chart those yet), checks it as below, writes the summary to the run's
-summary, commits the history to main with `[skip ci]` and fails on a regression.
+merge`; the site does not chart those yet, [the trends](#over-time) do), checks it as below, writes
+the summary to the run's summary, draws the trends again, commits the history and the trends to
+main with `[skip ci]` and fails on a regression.
 
 ## History and regressions
 
@@ -719,8 +743,8 @@ Live edits are checked the same way. `.github/workflows/live-latency.yaml` runs 
 main on a GitHub macOS arm64 runner (`macos-15`), times edits of the four live programs through
 `blaze build` (`harness/live_latency.py cargo`; its socket, burst and replay modes are refused
 until they are clients of `blaze_api::client`, [live.md](live.md#latency-under-typing)), appends
-one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl` and checks the p50
-and p90 of each program and mode (floor 1 ms). A shared runner is noisier than the benchmark
+one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl`, checks the p50
+and p90 of each program and mode (floor 1 ms), and draws the trends again before it commits. A shared runner is noisier than the benchmark
 machine; the band widens with the spread its own history shows.
 
 ## Run it yourself
