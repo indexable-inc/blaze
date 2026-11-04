@@ -48,7 +48,7 @@ fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 7] {
     let ground = t.bg;
     // The palette's card a touch off the ground: toward the ink in the dark, toward white in the light.
     let card = if dark { mix(t.bg, t.fg, 0.04) } else { mix(t.bg, [1.0; 4], 0.6) };
-    let side = alpha(t.bg, if dark { 0.75 } else { 0.6 });
+    let side = t.bg;
     let ink = alpha(t.fg, 0.92);
     let muted = alpha(t.fg, if dark { 0.5 } else { 0.55 });
     [ground, ground, card, side, ink, muted, muted]

@@ -36,6 +36,12 @@ prefab hn.TitleBar : ui.Row {
   }
 }
 
+// The hairline between the sidebar and the main card: the only seam (no shadow, same ground on both sides).
+prefab hn.Seam : ui.Node {
+  Fill: $tone_seam
+  Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+}
+
 // The sidebar's fold (cmd+S): a clip as wide as the fold's spring leaves the sidebar, over the sidebar laid out at its
 // full width and slid left by the part folded away (src/app.rs lay_chrome), so its rows never lay out at an in-between
 // width. The main card's left edge follows the clip's right edge.
@@ -258,7 +264,6 @@ prefab hn.Main : ui.Row, Plate {
   Fill: $tone_term_ground
   Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
   Shape: {radius: 0, n: 4, border: 0, feather: 0}
-  Lift: {blur: $seam_blur, alpha: $seam_alpha, dy: 0}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
   SafeAreaPadding: {l: false, r: false, t: true, b: false}

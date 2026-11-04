@@ -318,6 +318,7 @@ impl App {
             }
         }
         // The panes: sync_panes makes the first (and swaps each one's prefab by what it shows).
+        root.child("hn.Seam");
         let main = root.child("hn.Main");
         let bar = View::root(w, "hn.TitleBar");
         let bar_title = bar.part("title").map_or(0, View::id);

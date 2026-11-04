@@ -33,7 +33,7 @@ export const side_inset = 10
 export const label_inset = 18
 // The seam between the sidebar and the main card: a soft shadow off the card's left edge.
 export const seam_blur = 14
-export const seam_alpha = 0.28
+export const seam_alpha = 0
 export const row_gap = 8
 export const row_pad = 8
 
@@ -118,7 +118,9 @@ export const tone_wash_press = Fill: {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.
 export const tone_knob = Fill: {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_select = Fill: {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
-export const tone_side_tint = Fill: {dark: {0.071, 0.071, 0.078, 0.75}, light: {0.965, 0.965, 0.970, 0.6}}
+export const tone_side_tint = Fill: {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
+// The one hairline between the sidebar and the main card.
+export const tone_seam = Fill: {dark: {1, 1, 1, 0.07}, light: {0, 0, 0, 0.08}}
 // Nothing: a node that paints no fill.
 export const tone_clear = Fill: {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 // The palette's scrim over the window and its card.
