@@ -18,8 +18,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 4. **superset-of-rust**: Every program the pinned nightly builds builds and behaves the same under
    blaze; blaze refuses only rustc soundness holes, and its extensions are opt-in. Skill:
    `compiler-correctness`.
-5. **useful-not-parity**: rustc and cargo are references, not specs: judge output by usefulness and
-   match them only where real code or tools depend on it. Skill: `compiler-correctness`.
+5. **useful-not-parity**: rustc and cargo are references, not specs: design every output and interface
+   as if from scratch, the best way for people and agents, and match them only where real code or
+   tools depend on it. Skill: `compiler-correctness`.
 6. **blaze-uses-its-extensions**: blaze's own crates use blaze's language extensions (`#[blaze::pure]`,
    effects, contracts, ...) directly, enforced, with no rustc-compatible fallback or cfg guard.
    Skill: `compiler-correctness`.

@@ -36,10 +36,14 @@ person or agent using it, not by how closely it matches them: errors, warnings, 
 and flags, printed and JSON output, progress, the target directory's layout, file formats, caches,
 symbol names, debug info, what a build or test run does and in what order. Match them only where
 real code or tools depend on it (a program's behavior, a published crate's manifest, an editor
-reading the JSON); everywhere else pick the better design and delete the copy. Tests check what
-makes the result useful and correct, never that it equals rustc's or cargo's. `superset-of-rust` is
-unchanged: every program the pinned nightly builds still builds and runs as it does under rustc,
-except one that only builds through a rustc soundness bug.
+reading the JSON); everywhere else pick the better design and delete the copy. Their style is no
+constraint either: how cargo or rustc words, colours, lays out or orders a message, a progress line,
+a summary or a flag is not a reason for blaze to do the same; design it as blaze would from scratch
+(structured data first, rendered for a person on a terminal and as data for an agent) and change it
+freely when a better way is found. Tests check what makes the result useful and correct, never that
+it equals rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly
+builds still builds and runs as it does under rustc, except one that only builds through a rustc
+soundness bug.
 
 ## blaze-uses-its-extensions (rule 6)
 
