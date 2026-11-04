@@ -366,12 +366,10 @@ impl App {
         let run = self.run_of(e);
         if run.is_none() {
             if let Some(p) = row.part("glyph") {
-                let kind = model::kind_name(o);
-                p.icon(crate::look::kind_icon(kind));
-                set_if(p, crate::look::tone(w, crate::look::kind_tone(kind)));
+                crate::look::kind_mark(w, p.entity(), model::kind_name(o));
             }
         } else if let Some(p) = row.part("glyph") {
-            p.icon(crate::look::RUN_ICON);
+            crate::look::show_glyph(p.entity(), crate::look::RUN_ICON);
             set_if(p, self.dot_tone(e));
         }
         if let Some(p) = row.part("name") {

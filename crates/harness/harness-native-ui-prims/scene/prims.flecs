@@ -68,6 +68,13 @@ prefab ui.Symbol : ui.Node, Muted {
   Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
 }
 
+// A vector mark by name (a brand's: `Mark: {name: "claude"}`), 16 points, drawn from its outline so it is crisp at every
+// zoom, sized by its ink rather than its bounds, in its Fill (the ink unless set).
+prefab ui.Icon : ui.Node, Ink {
+  Mark: {name: ""}
+  Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+}
+
 // A picture from the media cache, square until an instance sets another Aspect or a Size.
 prefab ui.Image : ui.Node {
   Picture: {handle: ""}

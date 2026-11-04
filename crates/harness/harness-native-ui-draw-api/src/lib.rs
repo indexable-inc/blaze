@@ -18,6 +18,8 @@ pub enum PaintKind {
     Glyphs,
     /// Its `Icon` glyph, inked by its `Fill`.
     Icon,
+    /// Its `Mark`, a vector outline inked by its `Fill`.
+    Mark,
     /// Its `Picture`.
     Picture,
     /// A `Ribbon`: a band in its Fill between the nodes its `RibbonFrom` and `RibbonTo` name.

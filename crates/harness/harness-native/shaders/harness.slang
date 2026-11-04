@@ -1,9 +1,14 @@
 // harness-native: the panel, line and glyph passes. One slangc run, one metallib.
 // Copied from den-native's shaders/den.slang (github.com/andrewgazelka/den) and stripped to what harness draws: plates (base,
-// meter ring, caret, disclosure chevron), hairlines, and atlas glyphs. The structs are den's, unchanged, so pack.rs matches
-// byte for byte. den's outline text (the Slug algorithm, Eric Lengyel, JCGT 6(2) 2017; MIT OR Apache-2.0) is not used here.
+// meter ring, caret, disclosure chevron), hairlines, atlas glyphs and outline glyphs (the brand marks). The structs are den's,
+// unchanged, so pack.rs matches byte for byte.
 // Units: points in the instance buffers; Frame.view is the window size in points, Frame.scale the backing scale.
 // All per-pass buffers and textures are entry parameters (never globals) so each entry's Metal binding table is its own.
+// Outline glyphs (glyph_vs / glyph_fs, `slug_*`: the brand marks of icons.rs) are the Slug algorithm: Eric Lengyel,
+// "GPU-Centered Font Rendering Directly from Glyph Outlines", JCGT 6(2), 2017. The patent is dedicated to the public
+// domain; the reference shaders (https://github.com/EricLengyel/Slug) are MIT OR Apache-2.0, Copyright 2017 Eric
+// Lengyel, and `slug_dilate`, `slug_root_code`, `slug_solve_*` and `slug_render` are ports of them, copied from
+// den-native's den.slang (github.com/andrewgazelka/den).
 
 struct Frame
 {
@@ -743,7 +748,39 @@ struct GlyphV
     nointerpolation float4 clip : TEXCOORD4;
     float y : TEXCOORD5;
     nointerpolation float2 fade : TEXCOORD6;
+    nointerpolation float outline : TEXCOORD7;
+    nointerpolation float4 banding : TEXCOORD8;
+    nointerpolation uint4 gdata : TEXCOORD9;
 };
+
+// Dynamic dilation (SlugDilate): moves the vertex `pos.xy` along its outward normal `pos.zw` so every edge of the quad
+// is half a pixel further out than the glyph's, whatever the transform `m0 m1 m3` (rows of the object-to-clip matrix)
+// and the viewport `dim` (pixels). Returns the em-space sample coordinates for the moved vertex; `jac` is the inverse
+// Jacobian from object space to em space.
+float2 slug_dilate(float4 pos, float2 tex, float4 jac, float4 m0, float4 m1, float4 m3, float2 dim, out float2 vpos)
+{
+    float2 n = normalize(pos.zw);
+    float s = dot(m3.xy, pos.xy) + m3.w;
+    float t = dot(m3.xy, n);
+
+    float u = (s * dot(m0.xy, n) - t * (dot(m0.xy, pos.xy) + m0.w)) * dim.x;
+    float v = (s * dot(m1.xy, n) - t * (dot(m1.xy, pos.xy) + m1.w)) * dim.y;
+
+    float s2 = s * s;
+    float st = s * t;
+    float uv = u * u + v * v;
+    float2 d = pos.zw * (s2 * (st + sqrt(uv)) / (uv - st * st));
+
+    vpos = pos.xy + d;
+    return float2(tex.x + dot(d, jac.xy), tex.y + dot(d, jac.zw));
+}
+
+// Device pixels to a point for an outline glyph: the eased zoom's, so its edges are half a pixel out at every step.
+float live_px(Frame frame)
+{
+    return frame.live > 0.0 ? frame.live : frame.scale;
+}
+
 
 [shader("vertex")]
 GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer<Frame> frame, StructuredBuffer<GlyphInst> insts)
@@ -768,6 +805,29 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
     o.colour = g.kind.x;
     o.clip = g.clip;
     o.fade = g.fade.xy;
+    o.outline = g.kind.w;
+    o.banding = g.band;
+    o.gdata = g.gdata;
+    if (g.kind.w > 0.5)
+    {
+        // Outline glyph (a brand mark, icons.rs): the quad is its em box (uv, the top-left corner then the
+        // bottom-right) shown on rect. Object space is em space; the rows take it to clip space (points to ndc, y
+        // flipped), and each corner's normal points out of the box (`span` is negative in y: ems go up, points down).
+        float2 em = lerp(g.uv.xy, g.uv.zw, c);
+        float2 span = g.uv.zw - g.uv.xy;
+        float2 n = sign(span) * (c * 2.0 - 1.0);
+        float2 sc = g.rect.zw / (sign(span) * max(abs(span), float2(1e-6, 1e-6)));
+        float2 top = g.rect.xy + float2(0, rise) - g.uv.xy * sc;
+        float4 m0 = float4(2.0 * sc.x / frame.view.x, 0, 0, 2.0 * top.x / frame.view.x - 1.0);
+        float4 m1 = float4(0, -2.0 * sc.y / frame.view.y, 0, 1.0 - 2.0 * top.y / frame.view.y);
+        float4 m3 = float4(0, 0, 0, 1);
+        float2 dim = frame.view * live_px(frame) / (1.0 + 2.0 * frame.slug.w);
+        float2 vpos;
+        o.uv = slug_dilate(float4(em, n), em, float4(1, 0, 0, 1), m0, m1, m3, dim, vpos);
+        o.pos = float4(vpos.x * m0.x + m0.w, vpos.y * m1.y + m1.w, 0, 1);
+        o.y = top.y + vpos.y * sc.y;
+        return o;
+    }
     float2 pt = g.rect.xy + c * g.rect.zw + float2(0, rise);
     // A turned bitmap (a disclosure chevron): its corners turned about its middle, clockwise (y down).
     if (g.clip.z != 0.0)
@@ -784,9 +844,154 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
     return o;
 }
 
-[shader("fragment")]
-float4 glyph_fs(GlyphV v, ConstantBuffer<Frame> frame, Texture2D<float4> atlas, SamplerState smp)
+// The root eligibility code of a sample-relative quadratic Bézier from the signs of its three y (or x) coordinates:
+// bit 0 set: the first root counts, bit 8: the second does (SlugPixelShader.hlsl CalcRootCode).
+uint slug_root_code(float y1, float y2, float y3)
 {
+    uint i1 = asuint(y1) >> 31U;
+    uint i2 = asuint(y2) >> 30U;
+    uint i3 = asuint(y3) >> 29U;
+
+    uint shift = (i2 & 2U) | (i1 & ~2U);
+    shift = (i3 & 4U) | (shift & ~4U);
+
+    return (0x2E74U >> shift) & 0x0101U;
+}
+
+// Where the curve crosses y = 0 (SolveHorizPoly; its quadratic is a t^2 - 2 b t + c): the x coordinates at the two
+// roots. A nearly linear polynomial solves -2 b t + c = 0 instead; the divisions are guarded so no infinity is made.
+float2 slug_solve_horiz(float4 p12, float2 p3)
+{
+    float2 a = p12.xy - p12.zw * 2.0 + p3;
+    float2 b = p12.xy - p12.zw;
+    bool lin = abs(a.y) < 1.0 / 65536.0;
+    float ra = 1.0 / (lin ? 1.0 : a.y);
+    float rb = 0.5 / (b.y == 0.0 ? 1.0 : b.y);
+
+    float d = sqrt(max(b.y * b.y - a.y * p12.y, 0.0));
+    float t1 = lin ? p12.y * rb : (b.y - d) * ra;
+    float t2 = lin ? t1 : (b.y + d) * ra;
+
+    return float2((a.x * t1 - b.x * 2.0) * t1 + p12.x, (a.x * t2 - b.x * 2.0) * t2 + p12.x);
+}
+
+// Where the curve crosses x = 0 (SolveVertPoly): the y coordinates at the two roots.
+float2 slug_solve_vert(float4 p12, float2 p3)
+{
+    float2 a = p12.xy - p12.zw * 2.0 + p3;
+    float2 b = p12.xy - p12.zw;
+    bool lin = abs(a.x) < 1.0 / 65536.0;
+    float ra = 1.0 / (lin ? 1.0 : a.x);
+    float rb = 0.5 / (b.x == 0.0 ? 1.0 : b.x);
+
+    float d = sqrt(max(b.x * b.x - a.x * p12.x, 0.0));
+    float t1 = lin ? p12.x * rb : (b.x - d) * ra;
+    float t2 = lin ? t1 : (b.x + d) * ra;
+
+    return float2((a.y * t1 - b.y * 2.0) * t1 + p12.y, (a.y * t2 - b.y * 2.0) * t2 + p12.y);
+}
+
+// The coverage of the pixel centred at em-space `render` (SlugRender): casts a horizontal and a vertical ray through
+// the glyph's curves, reading only the curves of the band the pixel is in, and blends the two estimates by how near
+// each ray's nearest edge is. `ppem` is the pixels to the em on each axis; `gd` is the glyph's `gdata`. The band
+// buffer holds, from gd.x, a (count, list offset) pair per horizontal band then per vertical one, then the lists of
+// curve indices into `curves` (two float4s a curve: p1 p2, then p3), sorted so a ray can stop at the first curve left
+// of it. The outline winds counter-clockwise (ink on the left of every edge), so a root of the first kind is a
+// left edge going down (horizontal ray) or a top edge going left (vertical ray), the second kind the opposite sides:
+// `embolden` pixels moves each edge that far out, as the font smoothing of the system's bitmaps does at small sizes.
+float slug_render(StructuredBuffer<float4> curves, StructuredBuffer<uint> bands, float2 render, float4 band_tf, uint4 gd, float2 ppem, float embolden)
+{
+    float e = embolden;
+    int2 band_max = int2(int(gd.y), int(gd.z));
+    int2 band_ix = clamp(int2(render * band_tf.xy + band_tf.zw), int2(0, 0), band_max);
+    uint at = gd.x;
+
+    float xcov = 0.0;
+    float xwgt = 0.0;
+    uint hb = at + 2U * uint(band_ix.y);
+    uint hcount = bands[hb];
+    uint hlist = at + bands[hb + 1U];
+    for (uint i = 0U; i < hcount; i++)
+    {
+        uint slot = bands[hlist + i];
+        float4 p12 = curves[slot] - float4(render, render);
+        float2 p3 = curves[slot + 1U].xy - render;
+
+        if (max(max(p12.x, p12.z), p3.x) * ppem.x < -0.5 - e)
+            break;
+
+        uint code = slug_root_code(p12.y, p12.w, p3.y);
+        if (code != 0U)
+        {
+            float2 r = slug_solve_horiz(p12, p3) * ppem.x;
+            if ((code & 1U) != 0U)
+            {
+                float x = r.x - e;
+                xcov += saturate(x + 0.5);
+                xwgt = max(xwgt, saturate(1.0 - abs(x) * 2.0));
+            }
+            if (code > 1U)
+            {
+                float x = r.y + e;
+                xcov -= saturate(x + 0.5);
+                xwgt = max(xwgt, saturate(1.0 - abs(x) * 2.0));
+            }
+        }
+    }
+
+    float ycov = 0.0;
+    float ywgt = 0.0;
+    uint vb = at + 2U * (uint(band_max.y) + 1U + uint(band_ix.x));
+    uint vcount = bands[vb];
+    uint vlist = at + bands[vb + 1U];
+    for (uint j = 0U; j < vcount; j++)
+    {
+        uint slot = bands[vlist + j];
+        float4 p12 = curves[slot] - float4(render, render);
+        float2 p3 = curves[slot + 1U].xy - render;
+
+        if (max(max(p12.y, p12.w), p3.y) * ppem.y < -0.5 - e)
+            break;
+
+        uint code = slug_root_code(p12.x, p12.z, p3.x);
+        if (code != 0U)
+        {
+            float2 r = slug_solve_vert(p12, p3) * ppem.y;
+            if ((code & 1U) != 0U)
+            {
+                float y = r.x + e;
+                ycov -= saturate(y + 0.5);
+                ywgt = max(ywgt, saturate(1.0 - abs(y) * 2.0));
+            }
+            if (code > 1U)
+            {
+                float y = r.y - e;
+                ycov += saturate(y + 0.5);
+                ywgt = max(ywgt, saturate(1.0 - abs(y) * 2.0));
+            }
+        }
+    }
+
+    // Absolute values make either winding convention work (CalcCoverage; nonzero fill).
+    float coverage = max(abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0), min(abs(xcov), abs(ycov)));
+    return saturate(coverage);
+}
+
+[shader("fragment")]
+float4 glyph_fs(GlyphV v, ConstantBuffer<Frame> frame, Texture2D<float4> atlas, SamplerState smp, StructuredBuffer<float4> curves, StructuredBuffer<uint> bands)
+{
+    // The em box's size in pixels from the sample coordinates' derivatives (uniform control flow: before any branch).
+    float2 fw = abs(ddx(v.uv)) + abs(ddy(v.uv));
+    if (v.outline > 0.5)
+    {
+        float2 ppem = 1.0 / max(fw, float2(1e-9, 1e-9));
+        float embolden = min(0.5 * (ppem.x + ppem.y) * frame.slug.x, frame.slug.w);
+        float cov = slug_render(curves, bands, v.uv, v.banding, v.gdata, ppem, embolden);
+        // Gamma on the coverage per appearance, its own: this is exact geometric coverage, not the platform's smoothing.
+        float go = v.dark > 0.5 ? frame.slug.y : frame.slug.z;
+        float ao = pow(cov * in_band(v.y, v.clip, v.fade, live_px(frame)), go) * v.color.a;
+        return float4(v.color.rgb * ao, ao);
+    }
     // The atlas is premultiplied RGBA: a colour glyph's own pixels, or a plain glyph's coverage as white.
     float4 t = atlas.SampleLevel(smp, v.uv, 0) * in_band(v.y, v.clip, v.fade, frame.scale);
     if (v.colour > 0.5)

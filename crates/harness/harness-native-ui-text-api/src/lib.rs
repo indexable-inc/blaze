@@ -49,6 +49,13 @@ pub struct Icon {
     pub glyph: ScriptString,
 }
 
+/// The mark of a `ui.Icon`, by name among the host's vector marks (harness-native's icons.rs: `claude`, `openai`,
+/// `cursor`), drawn from its outline in its `Fill` at every zoom, sized optically in its box.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Mark {
+    pub name: ScriptString,
+}
+
 /// A picture of an `Image`, by handle in the host's media cache.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Picture {
@@ -85,6 +92,7 @@ hyperion_api_layouts::api_layouts! {
     "MarkdownText" => alias MarkdownText,
     "OneLine" => alias OneLine,
     "Icon" => alias Icon,
+    "Mark" => alias Mark,
     "Picture" => alias Picture,
     "Highlight" => alias Highlight,
     "LineNumbers" => alias LineNumbers,
@@ -99,6 +107,7 @@ pub fn register(world: &World) {
     world.component::<MarkdownText>().writable();
     world.component::<OneLine>().writable();
     world.component::<Icon>().writable();
+    world.component::<Mark>().writable();
     world.component::<Picture>().writable();
     world.component::<Highlight>().writable();
     world.component::<LineNumbers>().writable();
