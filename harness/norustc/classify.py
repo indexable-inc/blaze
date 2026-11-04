@@ -50,7 +50,7 @@ def who(pc):
     if "build-script" in first or "/build/" in first:
         return "build script"
     if " serve" in pc and (first.endswith(("/blaze", "/blaze-engine")) or first in ("blaze", "blaze-engine")):
-        return "worker"
+        return "daemon"
     if first.endswith("/blaze") or first == "blaze":
         return "client"
     if "/blaze-engine " in pc or pc.startswith("blaze-engine"):
@@ -105,7 +105,7 @@ def kind(r, cargos):
         return "rustc assembles asm!"
     if parent == "build script":
         return "rustc probe by a build script"
-    if "-" in a and parent in ("blaze", "client", "worker") or (parent == "blaze" and "--crate-type=bin" in a):
+    if "-" in a and parent in ("blaze", "client", "daemon") or (parent == "blaze" and "--crate-type=bin" in a):
         return "rustc compiles a doctest example" + (" (metadata only)" if "--emit=metadata" in a else "")
     if name.startswith("build_script_"):
         return f"rustc compiles a build script{via}"

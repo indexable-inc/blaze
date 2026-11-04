@@ -1,4 +1,4 @@
-# Live edits on macOS arm64 alone, with the daemon's and the workers' logs kept: for chasing a
+# Live edits on macOS arm64 alone, with the daemon's log kept: for chasing a
 # live-edit failure without the rest of nix-live.yaml. Runs on a push to a live-debug* branch.
 name: live edits (debug)
 on:
@@ -44,17 +44,16 @@ jobs:
           LIVE_EDITS: ${{ inputs.edits || '8' }}
           RUST_BACKTRACE: "1"
           BLAZE_IDLE_SECS: "0"
-        run: BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" python3 harness/live_e2e.py
-      - name: what the daemon and its workers said
+        # Its daemon's home is kept, `/tmp/rj-live-*` (live_e2e.py's `keep`), for the logs below.
+        run: |
+          python3 harness/live_e2e.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze-engine\", \"edits\": $LIVE_EDITS, \"keep\": true}"
+      # v2 has one daemon and one log, `<home>/v2/serve.log`: the harness's home and the stage 0's.
+      - name: what the daemon said
         if: always()
         run: |
-          home="$HOME/.cache/blaze"
-          echo "::group::daemon.log"; cat "$home/daemon.log" || true; echo "::endgroup::"
-          for log in "$home"/workers/*/log "$home"/spares/*/log; do
+          for log in /tmp/rj-live-*/v2/serve.log "$HOME/.cache/blaze/v2/serve.log"; do
             [ -f "$log" ] || continue
-            echo "::group::$log (filtered)"
-            grep -E "change:|edit|patch|link:|live:|panicked|Error|error|ended|not spliced|without a stable name|cold:" "$log" | cut -c1-300 || true
-            echo "::endgroup::"
+            echo "::group::$log"; tail -n 2000 "$log" | cut -c1-300; echo "::endgroup::"
           done
       - name: keep the logs
         if: always()
@@ -62,8 +61,6 @@ jobs:
         with:
           name: blaze-logs
           path: |
-            ~/.cache/blaze/daemon.log
-            ~/.cache/blaze/workers/*/log
-            ~/.cache/blaze/spares/*/log
-            ~/.cache/blaze/live
+            /tmp/rj-live-*/v2/serve.log
+            ~/.cache/blaze/v2/serve.log
           if-no-files-found: warn

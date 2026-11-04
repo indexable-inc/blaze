@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
-"""coldprof.py: where the time of a cold `blaze build` goes until the daemon is ready.
+"""coldprof.py: where the time of a cold `blaze build` goes.
 
-    coldprof.py PROJECT_DIR --work DIR [--store DIR] [--edit FILE:ANCHOR] [--after S] [--max-wait S]
+    coldprof.py PROJECT_DIR --work DIR [--store DIR] [--edit FILE:ANCHOR] [--after S] [--until TEXT] [--memory]
 
 Runs `blaze build` in PROJECT_DIR with an empty target directory and BLAZE_HOME, and
 the store DIR as it is (an empty one when it does not exist), and prints, by seconds since the
-command started: every line the daemon and its workers log, when the command returned, when
-the daemon said the checkout is ready, and twice a second the cores busy in blaze and in
-cargo's processes. `--edit` then adds a statement after ANCHOR in FILE and times the
-`blaze build` of that. The cores busy are read from /proc, on Linux alone.
-`--max-wait` makes it a check: it exits 1 when the daemon was ready more than S seconds
-after the command returned (a fraction of a second on just and ripgrep, some 3 s on nushell,
-where reading the program's symbols waits for cargo's last file).
-`--until TEXT` waits, once ready, until a line the daemon or a worker logs has TEXT in it (the
-build the daemon makes of its own after a cold start that patches what rustc linked:
-`memory after request-1` with `BLAZE_MEMORY` set), before `--after` and `--edit`.
+command started: every line the daemon logs (`<home>/v2/serve.log`, the daemon the build
+started), when the command returned, and twice a second the cores busy in blaze and in other
+processes. `--edit` then adds a statement after ANCHOR in FILE and times the `blaze build` of
+that. The cores busy are read from /proc, on Linux alone. It exits 1 when the build failed.
+v1's `--max-wait`, a check that its worker said the checkout was ready soon after the command
+returned, is gone: v2 has no workers, and the daemon has built everything when the command
+returns.
+`--until TEXT` waits, once the command returned, until a line the daemon logs has TEXT in it,
+before `--after` and `--edit`.
 `--memory` also follows what the command and the daemon it starts hold (harness/memory.py):
-the most they held at once until ready, the largest process's peak, and what the largest
-process (the worker of the project) holds once ready.
+the most they held at once until the command returned, the largest process's peak, and what
+the largest process (the daemon) holds then.
 """
-import os, re, shutil, subprocess, sys, threading, time
+import os, shutil, subprocess, sys, threading, time
 
 import memory
 
@@ -84,25 +83,23 @@ def main():
     def note(what):
         events.append((time.monotonic() - began, what))
 
+    # The daemon's own log, of the daemon the first `blaze build` starts (crates/blaze-cargo,
+    # `cli/daemon.rs`): v1's worker and spare logs are gone with its workers.
+    log = os.path.join(home, "v2", "serve.log")
+
     def follow():
-        offsets = {}
+        offset = 0
         while not done.is_set():
-            for root, _, names in os.walk(home):
-                for name in names:
-                    if name not in ("log", "daemon.log"):
-                        continue
-                    path = os.path.join(root, name)
-                    try:
-                        with open(path, errors="replace") as f:
-                            f.seek(offsets.get(path, 0))
-                            text = f.read()
-                    except OSError:
-                        continue
-                    end = text.rfind("\n") + 1
-                    offsets[path] = offsets.get(path, 0) + len(text[:end].encode())
-                    who = os.path.relpath(root, home).replace("workers/", "w:")[:14] if name == "log" else "daemon"
-                    for line in text[:end].splitlines():
-                        note(f"[{who}] {line[:220]}")
+            try:
+                with open(log, errors="replace") as f:
+                    f.seek(offset)
+                    text = f.read()
+            except OSError:
+                text = ""
+            end = text.rfind("\n") + 1
+            offset += len(text[:end].encode())
+            for line in text[:end].splitlines():
+                note(f"[daemon] {line[:220]}")
             time.sleep(0.02)
 
     others = []
@@ -127,14 +124,6 @@ def main():
     if run.returncode:
         print(run.stderr[-2000:])
     built = time.monotonic() - began
-    while run.returncode == 0:
-        out = subprocess.run(["blaze", "status"], cwd=project, env=env, capture_output=True, text=True).stdout
-        states = re.findall(rf"^    {re.escape(project)}: (.*)$", out, re.M)
-        if states and not any(s.startswith("loading") for s in states):
-            note(f"=== status: {states}")
-            break
-        time.sleep(0.05)
-    ready = time.monotonic() - began
     if opt("--until") and run.returncode == 0:
         while not done.is_set() and not any(opt("--until") in what for _, what in list(events)):
             time.sleep(0.1)
@@ -179,14 +168,10 @@ def main():
             quiet = what
         print(f"{at:8.2f}  {what}")
     busy = sum(others) / max(1, len(others))
-    print(f"\nbuild {built:.2f}s  ready {ready:.2f}s" + (f"  first edit {edit:.2f}s" if edit is not None else "")
+    print(f"\nbuild {built:.2f}s" + (f"  first edit {edit:.2f}s" if edit is not None else "")
           + f"  others {busy:.2f} cores"
-          + (f"  peak {sampler.peak_mb} MB  largest {sampler.largest_mb} MB  ready {held} MB" if sampler else ""))
-    most = opt("--max-wait")
-    if most is not None and run.returncode:
-        sys.exit(1)
-    if most is not None and ready - built > float(most):
-        print(f"READY {ready - built:.2f}s AFTER THE COMMAND RETURNED, MORE THAN {most}s")
+          + (f"  peak {sampler.peak_mb} MB  largest {sampler.largest_mb} MB  after {held} MB" if sampler else ""))
+    if run.returncode:
         sys.exit(1)
 
 

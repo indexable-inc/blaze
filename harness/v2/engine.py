@@ -2,12 +2,15 @@
 
 Every script under harness/v2 takes, in its typed input, an `engine`:
 
-    {"kind": "v1", "blaze": "target/release/blaze", "backend": "cranelift"}
+    {"kind": "v2", "blaze": "target/release/blaze"}
 
 (`backend` is v1's, given it as BLAZE_BACKEND; v2 takes only the default, as it picks each
 unit's backend from its profile and refuses every unit while BLAZE_BACKEND is set. v2 also takes
 `"dev_backend": "stencil"` or `"cranelift"`, forcing the dev tier's backend for every function,
-`"default"` leaving it to blaze), and does everything through `Engine`. Builds, runs and tests go through the `blaze` command
+`"default"` leaving it to blaze), and does everything through `Engine`. `Engine.of` refuses
+`"kind": "v1"`: v1 is gone, and its adapter (`V1`) read what its workers logged and the
+`loading`/`ready` states `blaze status` printed, which a v2 blaze has none of, so against one it
+would measure nothing without a word. Builds, runs and tests go through the `blaze` command
 line (`blaze build`, `run`, `test`, `check`, `status`, `stop`), which v1 and v2 both have, so a
 script is the same for both. What only an engine's insides can say (what an edit recompiled,
 the codegen inputs of a build, the critical path of a cold build) is a method here:
@@ -422,7 +425,11 @@ class Engine(ABC):
 
     @staticmethod
     def of(spec: EngineSpec) -> "Engine":
-        return V1(spec) if spec.kind == "v1" else V2(spec)
+        if spec.kind == "v1":
+            raise Failed(f"engine.kind 'v1' ({spec.blaze}): v1 is gone, and its adapter reads its workers' logs "
+                         "(`<home>/*/*/log`) and `blaze status`'s `loading`/`ready` lines, which v2 has none of; "
+                         "give `\"kind\": \"v2\"`")
+        return V2(spec)
 
     @property
     def kind(self) -> Kind:
@@ -502,8 +509,9 @@ class Engine(ABC):
 
 
 class V1(Engine):
-    """Today's blaze (`blaze` beside `blaze-engine`): a daemon of workers, each logging what it
-    built under `BLAZE_HOME`; a build it cannot do is cargo's, and says so."""
+    """v1's blaze (`blaze` beside `blaze-engine`): a daemon of workers, each logging what it
+    built under `BLAZE_HOME`; a build it cannot do is cargo's, and says so. `Engine.of` no
+    longer gives it (v1 is gone); only proof.py's check of its log reader still builds one."""
 
     def not_blazes(self, ran: Ran) -> str | None:
         import blaze_cli

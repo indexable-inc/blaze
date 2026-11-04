@@ -12,7 +12,9 @@ lowest and highest of the rounds:
   record of what it wrote and reached);
 - a generated library, opted into sandboxed tests, with `--tests` unit tests, `--io` of which
   read a file of the package and write one in the package and one in `std::env::temp_dir()`, under `blaze test`
-  once the daemon serves its build: with `BLAZE_SANDBOX=off`, in the sandbox under
+  once the daemon has built it (the first `blaze test`, whose `blaze-work` line says the daemon
+  served it and whose `compiler-artifact` names the program of the tests): with
+  `BLAZE_SANDBOX=off`, in the sandbox under
   `BLAZE_TESTS=all`, under `affected` with what passed forgotten before each run (so every
   test runs and records what it reads), and as one process per test (`--exact name`, 16 at a
   time), in a sandbox each and bare. The command's wall time is given whole and less that of
@@ -36,6 +38,10 @@ import statistics
 import sys
 import tempfile
 import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from storelib import artifact, worked  # noqa: E402
 
 STEP_TIMEOUT_S = 900
 
@@ -122,19 +128,6 @@ def forget_passed(root):
                     os.remove(os.path.join(dirpath, name))
 
 
-def test_executable(pkg):
-    """The program of the library's tests the daemon built: the newest `sbxbench-*` that runs."""
-    found = []
-    for dirpath, _, names in os.walk(os.path.join(pkg, "target")):
-        for name in names:
-            path = os.path.join(dirpath, name)
-            if name.startswith("sbxbench-") and "." not in name and os.access(path, os.X_OK):
-                found.append((os.path.getmtime(path), path))
-    if not found:
-        raise Failed(f"no program of tests under {pkg}/target")
-    return max(found)[1]
-
-
 def table(rows):
     width = max(len(name) for name in rows)
     print(f"{'':{width}}  median      lowest     highest   (seconds; {len(next(iter(rows.values())))} rounds)")
@@ -197,16 +190,15 @@ async def main():
         # The library of tests.
         library(pkg, args.tests, args.io)
         test = ["blaze", "test", "--lib"]
-        deadline = time.monotonic() + 600
-        while True:
-            _, said = await run(test, cwd=pkg, env=env)
-            if "[blaze]" in said:
-                break
-            if time.monotonic() > deadline:
-                raise Failed(f"the daemon did not serve the build in 600 s:\n{said[-2000:]}")
-            await asyncio.sleep(1)
+        # The first `blaze test` starts the daemon and is served by it: nothing to wait for.
+        _, said = await run([*test, "--message-format=json"], cwd=pkg, env=env)
+        if not worked(said):
+            raise Failed(f"`blaze test` printed no `blaze-work` line: not served by the daemon:\n{said[-2000:]}")
+        # The program of the library's tests the daemon built, as its `compiler-artifact` names it.
+        exe = artifact(said, "sbxbench")
+        if exe is None:
+            raise Failed(f"`blaze test` named no executable of sbxbench's tests:\n{said[-2000:]}")
         await run(test, cwd=pkg, env=dict(env, BLAZE_TESTS="affected"))
-        exe = test_executable(pkg)
         _, listed = await run([exe, "--list", "--format", "terse"], cwd=pkg, env=env)
         names = [line.removesuffix(": test") for line in listed.splitlines() if line.endswith(": test")]
         if len(names) != args.tests:

@@ -135,6 +135,7 @@ import bounds
 import blaze_cli
 import counters
 import memory
+import storelib
 
 SCRIPT = "budgets.py"
 Budget = Literal[
@@ -149,8 +150,6 @@ RUN_SECS = 600
 # docs/v2/plan/design/restore.md: Linux's one batched statx sweep, about 50 ms for 100k files.
 STATX_US_PER_FILE = 0.5
 GONE_SECS = 60.0
-# `blaze status`: v2's first line (blaze_cargo::cli::daemon::status_lines), v1's `daemon:` line.
-DAEMON_PID = re.compile(r"^(?:pid: |daemon: pid )(\d+)\b", re.M)
 
 PROJECTS: dict[str, dict[str, Any]] = getattr(bench, "PROJECTS")
 LET: str = getattr(bench, "LET")
@@ -852,8 +851,7 @@ class Lane:
     def count_daemon(self) -> None:
         """Counts the daemon serving this checkout, and what it starts, from now on."""
         try:
-            status = self.eng.command("the daemon's status", "status", [], self.ws, self.env, 300)
-            self.meter.follow(daemon_pid(status.stdout))
+            self.meter.follow(daemon_pid(self.home))
         except engine.Failed as e:
             # The budgets stand without counts; each count says why it is missing.
             self.meter.gap = f"no daemon to count: {e}"
@@ -1295,12 +1293,14 @@ def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], limit_s: 
     return timed(seconds, "s", tests_run=ran_tests, edited=edit.file)
 
 
-def daemon_pid(status: str) -> int:
-    """The daemon's process in what `blaze status` printed."""
-    found = DAEMON_PID.findall(status)
-    if len(found) != 1:
-        raise engine.Failed(f"`blaze status` names {len(found)} daemon processes, not one:\n{status[-1000:]}")
-    return int(found[0])
+def daemon_pid(home: Path) -> int:
+    """The daemon running on `home`, from its lock (`storelib.daemon_pid`): `blaze status` says
+    its pid for people only, with no machine format."""
+    pid = storelib.daemon_pid(str(home))
+    if pid is None:
+        raise engine.Failed(f"no daemon runs on {home}: {Path(storelib.state_of(str(home))) / 'serve.lock'} "
+                            "names none that runs")
+    return pid
 
 
 def restart_limit(warm_ms: float, files: int, slack_ms: float, sweeps: bool) -> float:
@@ -1382,8 +1382,7 @@ def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how:
                                       args):
             n = len(first)
             warm.append(check(f"warm no-op check {n + 1}"))
-            status = eng.command("the daemon's status", "status", [], ws, env, 300).checked("the daemon's status")
-            pid = daemon_pid(status.stdout)
+            pid = daemon_pid(Path(env["BLAZE_HOME"]))
             if how == "clean":
                 eng.stop(ws, env)
                 until_gone(f"the daemon {pid} after `blaze stop`", lambda: alive(pid))
@@ -1587,15 +1586,19 @@ def selftest() -> None:
     expect("median_low_ms" not in timed([1.0, 2, 3], "ms").numbers, "no interval is reported from 3 runs")
     expect(set(TABLES.values()) == {"token", "syntax-node", "hir-expr", "mir-statement", "memo", "memo-edge",
                                     "relocation"}, f"the tables of docs/v2/plan/design/data.md: {TABLES}")
-    v2_status = "pid: 41\nrequests: 2 (7, 9)\nviews: 1\nmemory: 1.5 GiB of 8.0 GiB\n"
-    v1_status = "daemon: pid 123, version 0.1, exits never, no limit\n  worker: pid 456, ready, log /h/w/1/log\n"
-    expect(daemon_pid(v2_status) == 41 and daemon_pid(v1_status) == 123, "the daemon's pid in v2's and v1's status")
-    for status in ("no daemon is running\n", "requests: 0\n  pid: 9\n", v2_status + "pid: 42\n"):
-        try:
-            daemon_pid(status)
-            expect(False, f"a status naming no one daemon is refused: {status!r}")
-        except engine.Failed:
-            pass
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        lock = Path(storelib.state_of(tmp)) / "serve.lock"
+        lock.parent.mkdir()
+        lock.write_text(str(os.getpid()))
+        expect(daemon_pid(home) == os.getpid(), "the daemon's pid from its lock")
+        for said in (f"{os.getpid()} stopped", "", "not a pid"):
+            lock.write_text(said)
+            try:
+                daemon_pid(home)
+                expect(False, f"a lock naming no daemon that runs is refused: {said!r}")
+            except engine.Failed:
+                pass
     expect(restart_limit(12.0, 100_000, 5.0, True) == 67.0, "the restart budget with Linux's statx sweep")
     expect(restart_limit(12.0, 100_000, 5.0, False) == 17.0, "the restart budget where a journal survives")
     restarts = {row.key: row for row in ROWS if row.budget == "restart"}
