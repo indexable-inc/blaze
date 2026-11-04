@@ -389,6 +389,17 @@ impl App {
         Ok(app)
     }
 
+    /// The tooltip of the node under the pointer (or the nearest ancestor that has one); empty for none.
+    pub fn tooltip(&self) -> String {
+        let w = self.world.world_ref();
+        let Some(t) = w.entity_named(APP).target(Hovered::id(), 0) else { return String::new() };
+        std::iter::successors(Some(t), |n| n.parent())
+            .take(6)
+            .find_map(|n| n.try_cloned::<&harness_native_ui_input_api::Tooltip>())
+            .map(|t| t.text.as_str().to_owned())
+            .unwrap_or_default()
+    }
+
     pub fn zoom(&self) -> f32 {
         ZOOMS[self.zoom]
     }

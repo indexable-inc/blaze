@@ -93,29 +93,18 @@ prefab hn.Selection : ui.Node {
 prefab hn.ArchiveRow : ui.Row {
   Pressable
   Action: {name: "archive:open"}
+  Tooltip: {text: "Archive"}
   Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
   PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
   Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
   // On the row's hover the box rises and grows (on the row's HoverAmt spring); when an object is archived it bounces.
   icon : ui.Symbol {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
     HoverLift: {lift: $archive_lift, scale: $archive_scale, kick_lift: $archive_kick_lift, kick_scale: $archive_kick_scale, omega: $archive_omega, zeta: $archive_zeta}
-  }
-  name : ui.Lead, Muted {
-    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0}
-  }
-  spacer : ui.Spacer {}
-  // The count pulses when an object is archived.
-  count : ui.Line, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-    HoverLift: {lift: 0, scale: 1, kick_lift: 0, kick_scale: $count_kick_scale, omega: $count_omega, zeta: $count_zeta}
-  }
-  chevron : ui.Symbol, Faint {
-    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
   }
 }
 
@@ -205,7 +194,6 @@ prefab hn.ObjRow : ui.Row {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   badge : hn.Badge { LayoutPriority: {value: 1} }
-  dot : hn.Dot {}
 }
 
 // A shell run (or one of its pipeline stages) under its session (padded in by depth): a small dot tinted by how it went, its command

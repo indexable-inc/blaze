@@ -67,6 +67,12 @@ pub struct Focused;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Draggable;
 
+/// Words shown in the system tooltip while the pointer rests on this node (or a node inside it).
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Tooltip {
+    pub text: ScriptString,
+}
+
 /// What a Pressable does when activated: feature systems observe nodes carrying [`Activated`] and read `name`.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct Action {
@@ -123,6 +129,7 @@ pub fn register(world: &World) {
     world.component::<Focused>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Draggable>().writable();
     world.component::<Action>().writable();
+    world.component::<Tooltip>().writable();
     world.component::<Activated>().writable();
     world.component::<Editable>().with(Focusable::id()).writable();
     world.component::<PointerState>().writable();

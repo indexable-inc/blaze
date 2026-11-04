@@ -43,6 +43,7 @@ struct State {
     title: String,
     /// The traffic lights' opacity as last set (they fade with the sidebar's fold).
     lights: f32,
+    tip: String,
     /// Drawing at the calm rate: only a running dot's breath moves.
     calm: bool,
     /// The keys' load the menu bar was made from (made again when the user's keys.flecs changes).
@@ -602,6 +603,11 @@ impl HarnessView {
                 st.title.clone_from(&st.app.title);
                 st.window.setTitle(&NSString::from_str(&st.title));
             }
+            let tip = st.app.tooltip();
+            if tip != st.tip {
+                st.tip = tip;
+                self.setToolTip((!st.tip.is_empty()).then(|| NSString::from_str(&st.tip)).as_deref());
+            }
             let lights = st.app.lights();
             if (lights - st.lights).abs() > 1e-3 || (lights == 0.0) != (st.lights == 0.0) {
                 st.lights = lights;
@@ -846,7 +852,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
     // The menu bar, from the keys' actions and bindings (rebuilt in `frame` when they are loaded again).
     NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu(mtm, &app.menu(), Some(&*view))));
     let menu_gen = app.keys_gen();
-    STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, calm: false, menu_gen }));
+    STATE.with(|s| *s.borrow_mut() = Some(State { app, renderer, layer, link, window: window.clone(), last: None, title: String::new(), lights: 1.0, tip: String::new(), calm: false, menu_gen }));
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.
     let effect = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), rect);
     // HARNESS_NATIVE_MATERIAL=sidebar|under|hud: the vibrancy material under the sidebar's tint plate.
