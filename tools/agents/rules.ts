@@ -281,6 +281,14 @@ export const rules = [
 		link: "docs/contributing.md#rules-for-code",
 	},
 	{
+		id: "spec-then-build",
+		skill: "changing-code",
+		line: "A change that needs a design gets a spec first, then the same lane builds it right away; a spec is never the deliverable.",
+		info: "Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the losing alternative in a line, the cost budget, the migration, how it is proven). Have a fresh reviewer check it against the code when it is large. Then start building it in the same lane, in the same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same pull request as the first code that implements it, and is marked `current` (or rewritten to describe what was built) once the work lands. A spec with no code behind it is unfinished work, not a result; a lane that cannot build what it specified says what blocks it and who it handed the work to.",
+		reason: "Andrew, 2026-11-04: \"by default write a spec but also do it right away (don't just write and not do)\". A plan written and left alone goes stale while the code moves, and the work it describes never happens.",
+		link: "docs/contributing.md#rules-for-code",
+	},
+	{
 		id: "one-concept-one-home",
 		skill: "changing-code",
 		line: "One type, one rule and one place per concept; merge duplicates and ban the removed name.",

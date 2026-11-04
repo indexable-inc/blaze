@@ -68,33 +68,35 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     guard, an `Rc`) across a wait. Skill: `runtime-code`.
 27. **best-long-term-design**: Pick the best long-term design, not the least work, and spend the effort
     proving it right. Skill: `changing-code`.
-28. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
+28. **spec-then-build**: A change that needs a design gets a spec first, then the same lane builds it
+    right away; a spec is never the deliverable. Skill: `changing-code`.
+29. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
     removed name. Skill: `changing-code`.
-29. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
+30. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
     (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the daemon and the
     runtime stay outside. Skill: `compiler-correctness`.
-30. **library-over-language**: Build a feature as a library on the language that exists; when no library
+31. **library-over-language**: Build a feature as a library on the language that exists; when no library
     can express it, add the smallest general primitive, never an ad hoc language feature. Skill:
     `compiler-correctness`.
-31. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
+32. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR. Skill: `docs-and-scripts`.
-32. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
+33. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
     on AWS. Skill: `build-and-test`.
-33. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
+34. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
     runs `blaze check` and `blaze test` once. Skill: `build-and-test`.
-34. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
+35. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
     `build-and-test`.
-35. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
+36. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
-36. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
+37. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
     lane what changed. Skill: `landing`.
-37. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
+38. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
     branch. Skill: `build-and-test`.
-38. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
+39. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
     `landing`.
-39. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
+40. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
     plan, record or superseded; keep current docs true. Skill: `docs-and-scripts`.
-40. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
+41. **scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not
     flags or environment variables. Skill: `docs-and-scripts`.
 
 ## Code Review Rules
