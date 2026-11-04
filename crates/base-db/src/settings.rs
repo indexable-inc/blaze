@@ -66,7 +66,12 @@ pub(crate) fn set_from_env(db: &mut Db) {
     let borrowck_debug = std::env::var("BLAZE_BORROWCK_DEBUG").ok().map(String::into_boxed_str);
     let trace_holders = std::env::var_os("BLAZE_TRACE_HOLDERS").is_some_and(|it| it == "1");
     let check_relative_bodies = std::env::var_os("RA_CHECK_RELATIVE_BODIES").is_some();
-    _ = FrontSettings::builder(borrowck, borrowck_debug, trace_holders, check_relative_bodies)
-        .durability(Durability::HIGH)
-        .new(db);
+    _ = FrontSettings::new(
+        db,
+        Durability::HIGH,
+        borrowck,
+        borrowck_debug,
+        trace_holders,
+        check_relative_bodies,
+    );
 }

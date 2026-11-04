@@ -4,17 +4,17 @@ use std::ops::Range;
 use std::{cmp, fmt, mem};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use rustc_index::IndexVec;
 use rustc_type_ir::solve::VisibleForLeakCheck;
 use rustc_type_ir::{IsRigid, RegionKind, RegionVid, TypeVisitableExt, UniverseIndex};
+use std::alloc::Global;
 use tracing::{debug, instrument};
 
 use self::CombineMapType::*;
 use super::MemberConstraint;
 use crate::Span;
-use crate::next_solver::infer::union_find::{UnionFind, UnionFindMark};
 use crate::next_solver::infer::unify_key::RegionVariableValue;
+use crate::next_solver::infer::union_find::{UnionFind, UnionFindMark};
 use crate::next_solver::{AliasTy, Binder, DbInterner, ParamTy, PlaceholderType, Region, Ty};
 
 mod leak_check;
@@ -750,10 +750,8 @@ impl<'db> RegionConstraintCollector<'db, '_> {
     pub(super) fn new_region_var(&mut self, universe: UniverseIndex, span: Span) -> RegionVid {
         let vid = self.storage.var_infos.push(RegionVariableInfo { universe, span });
 
-        let u_vid = self
-            .storage
-            .unification_table
-            .new_key(RegionVariableValue::Unknown { universe, span });
+        let u_vid =
+            self.storage.unification_table.new_key(RegionVariableValue::Unknown { universe, span });
         assert_eq!(vid, u_vid);
         debug!("created new region variable {:?} in {:?}", vid, universe);
         vid
@@ -833,7 +831,10 @@ impl<'db> RegionConstraintCollector<'db, '_> {
             }
             (RegionKind::ReVar(sub_id), RegionKind::ReVar(sup_id)) => {
                 if sub_id != sup_id {
-                    self.add_constraint(Constraint::VarSubVar(sub_id, sup_id), visible_for_leak_check);
+                    self.add_constraint(
+                        Constraint::VarSubVar(sub_id, sup_id),
+                        visible_for_leak_check,
+                    );
                 }
             }
             (_, RegionKind::ReVar(sup_id)) => {

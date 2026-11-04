@@ -43,8 +43,7 @@ const SEQ_CST: &str = "std::sync::atomic::Ordering::SeqCst";
 
 /// What the fix writes at the end of each line it puts a `SeqCst` on: the reason
 /// `blaze::seqcst_unexplained` asks for, so the fixed code lints clean.
-const SEQ_CST_WHY: &str =
-    " // seqcst: keeps the one total order of the `Mutex` this replaces; `Acquire`/`Release` do unless a thread relies on it";
+const SEQ_CST_WHY: &str = " // seqcst: keeps the one total order of the `Mutex` this replaces; `Acquire`/`Release` do unless a thread relies on it";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lock {
@@ -104,8 +103,12 @@ fn check<'t>(
     let shown = ty.display(db, target).to_string();
     let inner_shown = inner.display(db, target).to_string();
     let named = match ascription {
-        Ascription::Required(item, _) => item.name().map_or("this static".into(), |it| format!("static `{}`", it.text())),
-        Ascription::Optional(_) => binding.and_then(|it| it.name()).map_or("this value".into(), |it| format!("`{}`", it.text())),
+        Ascription::Required(item, _) => {
+            item.name().map_or("this static".into(), |it| format!("static `{}`", it.text()))
+        }
+        Ascription::Optional(_) => binding
+            .and_then(|it| it.name())
+            .map_or("this value".into(), |it| format!("`{}`", it.text())),
     };
     let mut edits = Vec::new(); // alloc: the edits of one finding
     let mut whole = matches!(ascription, Ascription::Optional(_))
@@ -113,7 +116,10 @@ fn check<'t>(
         && binding.is_some_and(|it| it.mut_token().is_none());
     let mut blocked = Vec::new(); // alloc: as `edits`
     if let Some(arg) = new_arg(init) {
-        edits.push((range, format!("std::sync::atomic::{atomic}::new({})", cx.source_of(arg.syntax()))));
+        edits.push((
+            range,
+            format!("std::sync::atomic::{atomic}::new({})", cx.source_of(arg.syntax())),
+        ));
         match ascription {
             Ascription::Required(_, ty) => {
                 if let Some(ty) = cx.range(ty.syntax()) {
@@ -124,7 +130,10 @@ fn check<'t>(
                 if let (Some(colon), Some(ty)) = (stmt.colon_token(), stmt.ty())
                     && let Some(ty) = cx.range(ty.syntax())
                 {
-                    let start = stmt.pat().and_then(|it| cx.range(it.syntax())).map_or(colon.text_range().start(), |it| it.end());
+                    let start = stmt
+                        .pat()
+                        .and_then(|it| cx.range(it.syntax()))
+                        .map_or(colon.text_range().start(), |it| it.end());
                     edits.push((TextRange::new(start, ty.end()), String::new()));
                 }
             }
@@ -146,16 +155,20 @@ fn check<'t>(
     if edits.is_empty() {
         diagnostic.help(format!("use a `std::sync::atomic::{atomic}`"));
     } else {
-        let applicability = if whole { Applicability::MachineApplicable } else { Applicability::MaybeIncorrect };
+        let applicability =
+            if whole { Applicability::MachineApplicable } else { Applicability::MaybeIncorrect };
         diagnostic.multipart_suggestion(format!("use a `{atomic}`"), edits, applicability);
     }
     for note in notes {
         diagnostic.span_note(note, "a use the fix can't rewrite to `load` or `store`");
     }
     if matches!(ascription, Ascription::Required(..)) {
-        diagnostic.note("the static's uses are not rewritten: each `lock()` becomes a `load` or `store`");
+        diagnostic
+            .note("the static's uses are not rewritten: each `lock()` becomes a `load` or `store`");
     }
-    diagnostic.help("if the lock orders a critical section rather than guarding the value, `Mutex<()>` says so");
+    diagnostic.help(
+        "if the lock orders a critical section rather than guarding the value, `Mutex<()>` says so",
+    );
 }
 
 /// The lock and the type it guards, when `ty` is std's or `lock_api`'s `Mutex`.
@@ -245,8 +258,14 @@ fn uses<'t>(
 
 /// Each line the rewrites from `edits[first..]` put a `SeqCst` on gets [`SEQ_CST_WHY`] at its
 /// end, once: appended to the rewrite that ends there, or inserted.
-fn explain_seq_cst(text: &str, root: ast::Node<'_>, edits: &mut Vec<(TextRange, String)>, first: usize) {
-    let mut ends: Vec<TextSize> = edits[first..].iter().filter_map(|(range, _)| line_end(text, root, range.end())).collect(); // alloc: a few lines, on a finding
+fn explain_seq_cst(
+    text: &str,
+    root: ast::Node<'_>,
+    edits: &mut Vec<(TextRange, String)>,
+    first: usize,
+) {
+    let mut ends: Vec<TextSize> =
+        edits[first..].iter().filter_map(|(range, _)| line_end(text, root, range.end())).collect(); // alloc: a few lines, on a finding
     ends.sort_unstable();
     ends.dedup();
     for end in ends {
@@ -270,7 +289,11 @@ fn line_end(text: &str, root: ast::Node<'_>, at: TextSize) -> Option<TextSize> {
 
 /// `*m.lock()` read, to `m.load(..)`, or assigned, to `m.store(e, ..)`: the range rewritten and
 /// its new text.
-fn rewrite<'t>(cx: &Cx<'_, 't>, path: ast::PathExpr<'t>, lock: Lock) -> Option<(TextRange, String)> {
+fn rewrite<'t>(
+    cx: &Cx<'_, 't>,
+    path: ast::PathExpr<'t>,
+    lock: Lock,
+) -> Option<(TextRange, String)> {
     let name = path.syntax().text();
     let call = ast::MethodCallExpr::cast(path.syntax().parent()?)?;
     if call.receiver()?.syntax() != path.syntax()
@@ -305,7 +328,8 @@ fn rewrite<'t>(cx: &Cx<'_, 't>, path: ast::PathExpr<'t>, lock: Lock) -> Option<(
         let value = cx.source_of(assign.rhs()?.syntax());
         return Some((assign.syntax().text_range(), format!("{name}.store({value}, {SEQ_CST})")));
     }
-    is_read(parent, deref.syntax()).then(|| (deref.syntax().text_range(), format!("{name}.load({SEQ_CST})")))
+    is_read(parent, deref.syntax())
+        .then(|| (deref.syntax().text_range(), format!("{name}.load({SEQ_CST})")))
 }
 
 /// Whether `expr`, a child of `parent`, is only read for its value there, the guard dropped at
@@ -313,12 +337,20 @@ fn rewrite<'t>(cx: &Cx<'_, 't>, path: ast::PathExpr<'t>, lock: Lock) -> Option<(
 fn is_read(parent: ast::Node<'_>, expr: ast::Node<'_>) -> bool {
     match parent.kind() {
         K::LET_STMT => ast::LetStmt::cast(parent).is_some_and(|it| it.let_else().is_none()),
-        K::ARG_LIST | K::RETURN_EXPR | K::PAREN_EXPR | K::ARRAY_EXPR | K::TUPLE_EXPR | K::RECORD_EXPR_FIELD | K::STMT_LIST => true,
+        K::ARG_LIST
+        | K::RETURN_EXPR
+        | K::PAREN_EXPR
+        | K::ARRAY_EXPR
+        | K::TUPLE_EXPR
+        | K::RECORD_EXPR_FIELD
+        | K::STMT_LIST => true,
         K::IF_EXPR | K::WHILE_EXPR => true,
         K::PREFIX_EXPR => ast::PrefixExpr::cast(parent)
             .is_some_and(|it| matches!(it.op_kind(), Some(ast::UnaryOp::Not | ast::UnaryOp::Neg))),
         K::BIN_EXPR => ast::BinExpr::cast(parent).is_some_and(|it| match it.op_kind() {
-            Some(ast::BinaryOp::Assignment { .. }) => it.rhs().is_some_and(|rhs| rhs.syntax() == expr),
+            Some(ast::BinaryOp::Assignment { .. }) => {
+                it.rhs().is_some_and(|rhs| rhs.syntax() == expr)
+            }
             Some(_) => true,
             None => false,
         }),
@@ -347,11 +379,17 @@ pub fn f() {
 "#;
         let atomic = lint_only("mutex_atomic", main);
         assert_eq!(atomic.matches(FOUND).count(), 2, "{atomic}");
-        assert!(atomic.contains("static `FLAG` is a `Mutex<bool>` around one `bool`: `AtomicBool`"), "{atomic}");
+        assert!(
+            atomic.contains("static `FLAG` is a `Mutex<bool>` around one `bool`: `AtomicBool`"),
+            "{atomic}"
+        );
         assert!(atomic.contains("`size` is a `Mutex<usize>`"), "{atomic}");
         let integer = lint_only("mutex_integer", main);
         assert_eq!(integer.matches(FOUND).count(), 1, "{integer}");
-        assert!(integer.contains("`count` is a `Mutex<u32>` around one `u32`: `AtomicU32`"), "{integer}");
+        assert!(
+            integer.contains("`count` is a `Mutex<u32>` around one `u32`: `AtomicU32`"),
+            "{integer}"
+        );
     }
 
     #[test]

@@ -35,11 +35,13 @@ pub mod properties {
     pub const SERVES_ONLY_WRITTEN: &str =
         "a restore never serves a value other than one some writer fully wrote under that key";
     pub const NEVER_SILENTLY_EMPTY: &str = "a restore never silently starts empty";
-    pub const REFUSED_NOT_OVERWRITTEN: &str = "two different values under one identity are refused, never overwritten";
+    pub const REFUSED_NOT_OVERWRITTEN: &str =
+        "two different values under one identity are refused, never overwritten";
     pub const ANSWERED_SURVIVES: &str = "after a build answers, its results survive any crash";
     pub const RESTORE_EQUALS_FRESH: &str = "the restore after any crash equals a fresh build";
     pub const EVERY_WAIT_ENDS: &str = "every wait ends";
-    pub const KERNEL_GETS_END: &str = "a kernel get ends in a value, or for an impure step a conflict";
+    pub const KERNEL_GETS_END: &str =
+        "a kernel get ends in a value, or for an impure step a conflict";
     pub const NO_PANIC: &str = "no step panics";
     pub const EXPLORED: &str = "the search covers every schedule within its bounds";
 }

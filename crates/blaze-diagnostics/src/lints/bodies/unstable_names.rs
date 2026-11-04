@@ -74,7 +74,11 @@ enum Node {
 }
 
 /// The lint of `node`, with the position of the span it is at, for the order of the body's.
-fn lint(b: &BodyCx<'_, '_, '_>, node: Node, candidates: &[(CandidateId, Symbol)]) -> Option<(u32, Found)> {
+fn lint(
+    b: &BodyCx<'_, '_, '_>,
+    node: Node,
+    candidates: &[(CandidateId, Symbol)],
+) -> Option<(u32, Found)> {
     let db = b.db();
     let (item, args, at) = match node {
         Node::MethodCall(expr) => {
@@ -95,23 +99,30 @@ fn lint(b: &BodyCx<'_, '_, '_>, node: Node, candidates: &[(CandidateId, Symbol)]
         Node::PathExpr(_) | Node::PathPat(_) => b.cx.span_of(at),
     };
     let (article, kind) = match item {
-        CandidateId::FunctionId(it) if hir::Function::from(it).has_self_param(db) => ("a", "method"),
+        CandidateId::FunctionId(it) if hir::Function::from(it).has_self_param(db) => {
+            ("a", "method")
+        }
         CandidateId::FunctionId(_) => ("an", "associated function"),
         CandidateId::ConstId(_) => ("an", "associated constant"),
     };
     // alloc: the lint's text, for a collision found
-    let message = format!("{article} {kind} with this name may be added to the standard library in the future");
+    let message = format!(
+        "{article} {kind} with this name may be added to the standard library in the future"
+    );
     // clone: the lint's span, for a collision found
     let mut diag = Diag::lint("unstable_name_collisions", message, span.clone());
     match item {
         CandidateId::FunctionId(it) => {
             let path = b.cx.def_path(ModuleDef::Function(it.into()));
             // alloc: the lint's text, for a collision found
-            diag.help(format!("call with fully qualified syntax `{path}(...)` to keep using the current method"));
+            diag.help(format!(
+                "call with fully qualified syntax `{path}(...)` to keep using the current method"
+            ));
         }
         CandidateId::ConstId(it) => {
             if let ItemContainerId::TraitId(trait_) = it.lookup(db).container {
-                let name = hir::Const::from(it).name(db).expect("a trait's associated constant is named");
+                let name =
+                    hir::Const::from(it).name(db).expect("a trait's associated constant is named");
                 let trait_path = b.cx.def_path(ModuleDef::Trait(trait_.into()));
                 let self_ty = b.ty(self_ty(args));
                 diag.suggestion(
@@ -136,7 +147,11 @@ fn self_ty<'db>(args: GenericArgs<'db>) -> hir_ty::next_solver::Ty<'db> {
 
 /// rustc's `disabled_nightly_features`: on a nightly, for each item passed over, the
 /// suggestion to enable its feature at the top of the crate.
-fn disabled_nightly_features(b: &BodyCx<'_, '_, '_>, diag: &mut Diag, candidates: &[(CandidateId, Symbol)]) {
+fn disabled_nightly_features(
+    b: &BodyCx<'_, '_, '_>,
+    diag: &mut Diag,
+    candidates: &[(CandidateId, Symbol)],
+) {
     // `UnstableFeatures::from_environment(None).is_nightly_build()` of blaze's nightly, as
     // `checks::features` reads it: `RUSTC_BOOTSTRAP=-1` makes it a stable compiler.
     let bootstrap = b.cx.krate.base().env(b.db()).get("RUSTC_BOOTSTRAP");
@@ -144,7 +159,8 @@ fn disabled_nightly_features(b: &BodyCx<'_, '_, '_>, diag: &mut Diag, candidates
         return;
     }
     let root = b.cx.krate.root_module(b.db());
-    let span = inject_use_span(b.cx, root).expect("the crate root is a file, whose items have a start");
+    let span =
+        inject_use_span(b.cx, root).expect("the crate root is a file, whose items have a start");
     for &(candidate, ref feature) in candidates {
         let def = match candidate {
             CandidateId::FunctionId(it) => ModuleDef::Function(it.into()),

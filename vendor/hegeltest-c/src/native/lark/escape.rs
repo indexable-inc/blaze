@@ -14,17 +14,12 @@ fn hex_escape(
 ) -> GrammarResult<(char, usize)> {
     let end = i + digits;
     if end > chars.len() || !chars[i..end].iter().all(char::is_ascii_hexdigit) {
-        return Err(GrammarError::new(format!(
-            "Truncated escape sequence in literal `{literal}`"
-        )));
+        return Err(GrammarError::new(format!("Truncated escape sequence in literal `{literal}`")));
     }
     let hex: String = chars[i..end].iter().collect();
-    let value = u32::from_str_radix(&hex, 16)
-        .ok()
-        .and_then(char::from_u32)
-        .ok_or_else(|| {
-            GrammarError::new(format!("Invalid escape sequence in literal `{literal}`"))
-        })?;
+    let value = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32).ok_or_else(|| {
+        GrammarError::new(format!("Invalid escape sequence in literal `{literal}`"))
+    })?;
     Ok((value, end))
 }
 
@@ -109,15 +104,11 @@ fn python_literal(body: &str, literal: &str) -> GrammarResult<String> {
 /// quotes and the flags after them.
 pub fn string_literal(body: &str, flags: &str) -> GrammarResult<Pattern> {
     if body.contains('\n') {
-        return Err(GrammarError::new(
-            "You cannot put newlines in string literals",
-        ));
+        return Err(GrammarError::new("You cannot put newlines in string literals"));
     }
     let value = eval_escaping(body)?.replace("\\\\", "\\");
     if value.is_empty() {
-        return Err(GrammarError::new(format!(
-            "Empty terminals are not allowed (\"{body}\")"
-        )));
+        return Err(GrammarError::new(format!("Empty terminals are not allowed (\"{body}\")")));
     }
     Ok(Pattern::str(value).with_flags(flags))
 }
@@ -131,9 +122,7 @@ pub fn regex_literal(body: &str, flags: &str) -> GrammarResult<Pattern> {
     }
     let value = eval_escaping(body)?;
     if value.is_empty() {
-        return Err(GrammarError::new(format!(
-            "Empty terminals are not allowed (/{body}/)"
-        )));
+        return Err(GrammarError::new(format!("Empty terminals are not allowed (/{body}/)")));
     }
     Ok(Pattern::re(value).with_flags(flags))
 }

@@ -362,8 +362,7 @@ pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
         for (_, module_data) in crate_def_map.modules(db) {
             for def in module_data.scope(db).declarations() {
                 if let ModuleDefId::TraitId(trait_) = def
-                    && AttrFlags::query(db, trait_.into())
-                        .contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
+                    && AttrFlags::query(db, trait_.into()).contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
                 {
                     traits.push(trait_);
                 }
@@ -912,9 +911,9 @@ language_item_table! { LangItems =>
 
 #[cfg(test)]
 mod tests {
-    use intern::{Symbol, sym};
     use blaze_query::db::FromId;
     use hir_expand::fixture;
+    use intern::{Symbol, sym};
 
     use super::{LangItemEnum, LangItemTarget, LangItems, crate_lang_items};
     use crate::{
@@ -936,7 +935,8 @@ mod tests {
             symbols.push(Symbol::intern(&text[..text.len() - 1]));
         }
         symbols.extend(
-            ["sized", "copy", "drop", "Default", "Debug", "", "not a lang item"].map(Symbol::intern),
+            ["sized", "copy", "drop", "Default", "Debug", "", "not a lang item"]
+                .map(Symbol::intern),
         );
         symbols.extend([sym::Default, sym::Output, sym::Item, sym::call, sym::fmt, sym::self_]);
         symbols.extend([sym::Integer::get(0), sym::Integer::get(300)]);
@@ -1107,10 +1107,11 @@ pub struct Global;
         .into_db();
         let krate = db.fetch_test_crate();
         let _ = super::lang_items(&db, krate);
-        let (sized, global) = blaze_alloc_count::assert_at_most(0, "a warm lang-item lookup", || {
-            let items = super::lang_items(&db, krate);
-            (items.Sized, LangItemEnum::GlobalAlloc.from_lang_items(items))
-        });
+        let (sized, global) =
+            blaze_alloc_count::assert_at_most(0, "a warm lang-item lookup", || {
+                let items = super::lang_items(&db, krate);
+                (items.Sized, LangItemEnum::GlobalAlloc.from_lang_items(items))
+            });
         assert!(sized.is_some() && global.is_some());
     }
 
@@ -1133,7 +1134,12 @@ pub trait Other {}
         let named = |name: &str| {
             *base_db::all_crates(&db)
                 .iter()
-                .find(|it| it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
+                .find(|it| {
+                    it.extra_data(&db)
+                        .display_name
+                        .as_ref()
+                        .is_some_and(|it| it.to_string() == name)
+                })
                 .unwrap_or_else(|| panic!("no crate {name}"))
         };
         let (krate, other) = (named("main"), named("other"));

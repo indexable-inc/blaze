@@ -12,7 +12,10 @@
 
 use serde::Deserialize;
 
-use crate::{digest::Digest, fetcher::{Source, is_commit}};
+use crate::{
+    digest::Digest,
+    fetcher::{Source, is_commit},
+};
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +45,8 @@ pub struct Asked {
 
 /// `json` as an [`Asked`], or why not: naming the field.
 pub fn parse(json: &str) -> Result<Asked, String> {
-    let ask: Json = serde_json::from_str(json).map_err(|e| format!("blaze fetch-url's request: {e}"))?; // alloc: error path
+    let ask: Json =
+        serde_json::from_str(json).map_err(|e| format!("blaze fetch-url's request: {e}"))?; // alloc: error path
     let (repo, rev) = ask.git.map(|it| (it.repo, it.rev)).unzip();
     from_fields(ask.url, repo, rev, &ask.digest, ask.most_bytes, ask.out)
 }
@@ -64,7 +68,9 @@ pub fn from_fields(
         (Some(url), None, None) => Source::Url { url, digest },
         (None, Some(repo), Some(rev)) => {
             if !is_commit(&rev) {
-                return Err(refused(&format!("`git.rev` is `{rev}`, and it must be a full commit id (40 or 64 hex digits): a branch or tag moves"))); // alloc: error path
+                return Err(refused(&format!(
+                    "`git.rev` is `{rev}`, and it must be a full commit id (40 or 64 hex digits): a branch or tag moves"
+                ))); // alloc: error path
             }
             Source::Git { repo, rev, digest }
         }

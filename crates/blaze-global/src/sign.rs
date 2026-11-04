@@ -59,7 +59,8 @@ impl Record {
 
     pub fn decode(bytes: &[u8; RECORD_LEN]) -> Result<Record, String> {
         // alloc: an error's message, made only when it fails.
-        let kind = Kind::from_code(bytes[32]).ok_or_else(|| format!("a record of an unknown kind code {}", bytes[32]))?;
+        let kind = Kind::from_code(bytes[32])
+            .ok_or_else(|| format!("a record of an unknown kind code {}", bytes[32]))?;
         Ok(Record {
             key: Key(ContentId(bytes[..32].try_into().expect("32 bytes"))),
             kind,
@@ -112,7 +113,9 @@ impl Signed {
     pub fn decode(bytes: &[u8; SIGNED_LEN]) -> Result<Signed, String> {
         Ok(Signed {
             record: Record::decode(bytes[..RECORD_LEN].try_into().expect("a record's bytes"))?,
-            publisher: PublisherKey(bytes[RECORD_LEN..RECORD_LEN + 32].try_into().expect("32 bytes")),
+            publisher: PublisherKey(
+                bytes[RECORD_LEN..RECORD_LEN + 32].try_into().expect("32 bytes"),
+            ),
             signature: bytes[RECORD_LEN + 32..].try_into().expect("64 bytes"),
         })
     }
@@ -138,7 +141,9 @@ impl Publisher {
         let pair = Ed25519KeyPair::from_seed_unchecked(seed)
             // alloc: an error's message, made only when it fails.
             .map_err(|error| format!("an Ed25519 seed refused: {error}"))?;
-        let key = PublisherKey(pair.public_key().as_ref().try_into().expect("an Ed25519 public key is 32 bytes"));
+        let key = PublisherKey(
+            pair.public_key().as_ref().try_into().expect("an Ed25519 public key is 32 bytes"),
+        );
         Ok(Publisher { pair, seed: *seed, key })
     }
 
@@ -191,7 +196,10 @@ impl Trust {
     /// Refuses no keys: a cache no one is trusted to publish to is not one to ask.
     pub fn new(mut pinned: Vec<PublisherKey>) -> Result<Trust, String> {
         if pinned.is_empty() {
-            return Err("no publisher of the global cache is pinned: this blaze takes nothing from it".into());
+            return Err(
+                "no publisher of the global cache is pinned: this blaze takes nothing from it"
+                    .into(),
+            );
         }
         pinned.sort_unstable();
         pinned.dedup();
@@ -207,7 +215,10 @@ impl Trust {
         let refused = |what: String| Refused { key: signed.record.key, what };
         if !self.trusts(&signed.publisher) {
             // alloc: an error's message, made only when it fails.
-            return Err(refused(format!("its record is signed by {}, which this blaze does not pin", signed.publisher)));
+            return Err(refused(format!(
+                "its record is signed by {}, which this blaze does not pin",
+                signed.publisher
+            )));
         }
         UnparsedPublicKey::new(&ED25519, &signed.publisher.0)
             .verify(&signed.record.message(), &signed.signature)
@@ -302,9 +313,16 @@ pub(crate) mod tests {
         let trust = Trust::new(vec![publisher(1).key()]).unwrap();
         let digest = ContentId([3; 32]);
         let signature = publisher(1).sign_digest(b"bundle", &digest);
-        assert_eq!(trust.verify_digest(b"bundle", &digest, &publisher(1).key(), &signature), Ok(()));
+        assert_eq!(
+            trust.verify_digest(b"bundle", &digest, &publisher(1).key(), &signature),
+            Ok(())
+        );
         assert!(trust.verify_digest(b"other", &digest, &publisher(1).key(), &signature).is_err());
-        assert!(trust.verify_digest(b"bundle", &ContentId([4; 32]), &publisher(1).key(), &signature).is_err());
+        assert!(
+            trust
+                .verify_digest(b"bundle", &ContentId([4; 32]), &publisher(1).key(), &signature)
+                .is_err()
+        );
     }
 
     #[test]

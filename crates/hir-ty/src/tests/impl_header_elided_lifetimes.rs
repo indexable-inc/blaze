@@ -167,10 +167,12 @@ fn an_elided_impl_header_lifetime_holds_for_every_lifetime() {
                 _ => None,
             }));
             for imp in scope.impls() {
-                funcs.extend(imp.impl_items(&db).items.iter().filter_map(|&(_, item)| match item {
-                    AssocItemId::FunctionId(it) => Some(it),
-                    _ => None,
-                }));
+                funcs.extend(imp.impl_items(&db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        AssocItemId::FunctionId(it) => Some(it),
+                        _ => None,
+                    },
+                ));
             }
         }
         let mut failed = String::new();
@@ -312,10 +314,12 @@ fn the_bridges_decode_impls_resolve_for_run_client() {
                 _ => None,
             }));
             for imp in scope.impls() {
-                funcs.extend(imp.impl_items(&db).items.iter().filter_map(|&(_, item)| match item {
-                    AssocItemId::FunctionId(it) => Some(it),
-                    _ => None,
-                }));
+                funcs.extend(imp.impl_items(&db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        AssocItemId::FunctionId(it) => Some(it),
+                        _ => None,
+                    },
+                ));
             }
         }
         // Inference leaves the regions of an expression's type as errors; a type error is what
@@ -338,7 +342,9 @@ fn the_bridges_decode_impls_resolve_for_run_client() {
             for (id, expr) in body.exprs() {
                 let ty = infer.expr_ty(id);
                 if crate::providers::erase_regions(interner, ty).references_error() {
-                    failed.push_str(&format!("`{name}`: expr {id:?} has an error type {ty:?}: {expr:?}\n"));
+                    failed.push_str(&format!(
+                        "`{name}`: expr {id:?} has an error type {ty:?}: {expr:?}\n"
+                    ));
                 }
             }
             checked.push(name);

@@ -157,22 +157,13 @@ impl Lowering {
 
     /// A production of the part `lhs`.
     fn part(&mut self, lhs: NtId, rhs: Vec<Symbol>) {
-        self.productions.push(Production {
-            lhs,
-            rhs,
-            provenance: Provenance::RepeatPart,
-        });
+        self.productions.push(Production { lhs, rhs, provenance: Provenance::RepeatPart });
     }
 }
 
 impl Parts {
     fn new(symbol: Symbol) -> Parts {
-        Parts {
-            symbol,
-            powers: alloc::vec![symbol],
-            optional: Vec::new(),
-            below: Vec::new(),
-        }
+        Parts { symbol, powers: alloc::vec![symbol], optional: Vec::new(), below: Vec::new() }
     }
 
     /// The part deriving exactly `2^i` items.
@@ -260,10 +251,7 @@ fn unrolled_symbols(min: u32, max: u32) -> u64 {
 
 /// Lower `grammar` to BNF.
 pub fn lower(grammar: &Grammar) -> Lowered {
-    let mut lowering = Lowering {
-        productions: Vec::new(),
-        nonterminals: grammar.rules.len(),
-    };
+    let mut lowering = Lowering { productions: Vec::new(), nonterminals: grammar.rules.len() };
     for (id, rule) in grammar.rules.iter().enumerate() {
         for (alt, seq) in rule.alternatives.iter().enumerate() {
             let rhs = lowering.sequence(seq);
@@ -279,10 +267,7 @@ pub fn lower(grammar: &Grammar) -> Lowered {
     for (id, production) in productions.iter().enumerate() {
         by_lhs[production.lhs].push(id);
     }
-    Lowered {
-        productions,
-        by_lhs,
-    }
+    Lowered { productions, by_lhs }
 }
 
 #[cfg(test)]

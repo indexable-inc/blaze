@@ -28,9 +28,9 @@
 use std::path::{Path, PathBuf};
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::radix;
 use blaze_protocol::events::{Event, How, Record};
+use std::alloc::Global;
 
 pub use crate::flecs::Answer;
 use crate::flecs::{Entity, Flecs, Tag};
@@ -603,7 +603,6 @@ impl World {
         self.scratch.ends = ends;
         at
     }
-
 }
 
 impl Program {
@@ -653,7 +652,10 @@ impl Program {
                 self.appended += 1;
             }
             Err(error) => {
-                eprintln!("build page: a record of {} does not encode: {error}", self.root.display())
+                eprintln!(
+                    "build page: a record of {} does not encode: {error}",
+                    self.root.display()
+                )
             }
         }
     }

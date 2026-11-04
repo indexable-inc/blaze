@@ -113,7 +113,10 @@ impl<'de: 'a, 'a, T: Deserialize<'a>> Deserialize<'de> for List<'a, T> {
     fn deserialize<D: Deserializer<'de>>(from: D) -> Result<List<'a, T>, D::Error> {
         let Raw(bytes) = Raw::deserialize(from)?;
         let Some((len, head)) = array_head(bytes) else {
-            return Err(de::Error::invalid_type(de::Unexpected::Other("an item that is no array"), &"an array"));
+            return Err(de::Error::invalid_type(
+                de::Unexpected::Other("an item that is no array"),
+                &"an array",
+            ));
         };
         // Fits: `Raw` passed every item, each at least a byte of `bytes`.
         let len = len as usize;
@@ -144,7 +147,8 @@ impl<'a, T: Deserialize<'a>> Iterator for Iter<'a, T> {
         self.left -= 1;
         // The list's read decoded this item as `T` from these same bytes, and a decode depends
         // on nothing else.
-        let (item, used) = from_front::<T>(self.rest).expect("an item its list's read decoded as `T`");
+        let (item, used) =
+            from_front::<T>(self.rest).expect("an item its list's read decoded as `T`");
         self.rest = &self.rest[used..];
         Some(item)
     }

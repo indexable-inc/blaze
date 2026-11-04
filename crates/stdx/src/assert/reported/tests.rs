@@ -56,20 +56,30 @@ fn keeps_its_exit_status_and_reports_a_bug() {
 #[test]
 fn a_process_that_reported_a_bug_exits_failing_naming_it() {
     let out = alone("assert::reported::tests::reports_a_bug_and_passes");
-    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("1 passed"), "the test itself passes\nstdout: {stdout}\nstderr: {stderr}");
+    let (stdout, stderr) =
+        (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout.contains("1 passed"),
+        "the test itself passes\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert_eq!(out.status.code(), Some(101), "stdout: {stdout}\nstderr: {stderr}");
     assert!(stderr.contains("this process reported 2 blaze bug(s)"), "{stderr}");
     let site = format!("a blaze bug: `planted` reported by a test at {}:", file!());
     assert!(stderr.contains(&site), "{site} in\n{stderr}");
-    assert!(stderr.contains(", 2 times, first on thread `assert::reported::tests::reports_a_bug_and_passes`"), "{stderr}");
+    assert!(
+        stderr.contains(
+            ", 2 times, first on thread `assert::reported::tests::reports_a_bug_and_passes`"
+        ),
+        "{stderr}"
+    );
 }
 
 /// The blaze binary keeps its exit status: its daemon says its bugs in `blaze status`.
 #[test]
 fn a_process_that_keeps_its_exit_status_exits_as_it_would() {
     let out = alone("assert::reported::tests::keeps_its_exit_status_and_reports_a_bug");
-    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let (stdout, stderr) =
+        (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("1 passed"), "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(out.status.code(), Some(0), "stdout: {stdout}\nstderr: {stderr}");
     assert!(!stderr.contains("blaze bug"), "{stderr}");

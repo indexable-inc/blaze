@@ -4,8 +4,8 @@
 //! storage states of its scopes are never seen by the coroutine transform there.
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_mem::{Frame, Tag, frame};
+use std::alloc::Global;
 
 use crate::mir::{
     BasicBlockId, MirBody, StatementKind, TerminatorKind,

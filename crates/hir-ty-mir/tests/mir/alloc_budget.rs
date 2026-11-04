@@ -5,6 +5,7 @@
 
 use blaze_alloc_count::{assert_at_most, measure};
 use hir_def::{HasModule, expr_store::Body, hir::Expr};
+use hir_expand::fixture;
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::HirDatabase,
@@ -17,7 +18,6 @@ use hir_ty_mir::mir::{
     monomorphized,
 };
 use hir_ty_print::rustc_type_name;
-use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 

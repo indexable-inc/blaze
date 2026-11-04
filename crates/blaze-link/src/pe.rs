@@ -33,7 +33,8 @@ use blaze_ids::radix;
 use parking_lot::Mutex;
 
 use crate::model::{
-    Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer, zeroed,
+    Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special,
+    Writer, zeroed,
 };
 use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
@@ -97,7 +98,9 @@ pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
         )));
     }
     if output.dev_run.is_some() && !matches!(output.kind, OutputKind::Executable { .. }) {
-        return Err(error("a dev run of a DLL: only an executable has a start hook and a code memory"));
+        return Err(error(
+            "a dev run of a DLL: only an executable has a start hook and a code memory",
+        ));
     }
     let last = output.incremental.then(Mutex::default);
     // alloc: once per link: the writer's own copy of the output it makes
@@ -336,7 +339,10 @@ impl Writer for Pe {
             "_tls_index" => Some(Special::Start(Class::Synthetic(TLS_INDEX))),
             "__blaze_live" => Some(Special::LiveDescriptor),
             _ if ABSENT.contains(&name) => Some(Special::Absolute(0)),
-            _ => name.strip_prefix(IMP).filter(|it| !it.is_empty()).map(|_| Special::Got { from: IMP.len() as u32 }),
+            _ => name
+                .strip_prefix(IMP)
+                .filter(|it| !it.is_empty())
+                .map(|_| Special::Got { from: IMP.len() as u32 }),
         }
     }
 
@@ -372,7 +378,10 @@ impl Writer for Pe {
         ))
     }
 
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, crate::cow::CowBytes)>, LinkError> {
+    fn synthesize(
+        &self,
+        placed: &Placed<'_>,
+    ) -> Result<Vec<(Class, crate::cow::CowBytes)>, LinkError> {
         image::synthesize(self, placed)
     }
 

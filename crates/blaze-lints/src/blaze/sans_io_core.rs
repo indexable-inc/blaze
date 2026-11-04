@@ -115,19 +115,26 @@ pub(crate) fn ambient(db: &Db, f: FunctionId) -> Ambient {
     let self_is = |names: &[&str]| self_adt.as_ref().is_some_and(|it| names.contains(&it.as_str()));
     if is("std") {
         // alloc: once per function of std the walk meets, its module path
-        let path: Vec<hir::Name> = module.path_to_root(db).into_iter().rev().filter_map(|it| it.name(db)).collect();
+        let path: Vec<hir::Name> =
+            module.path_to_root(db).into_iter().rev().filter_map(|it| it.name(db)).collect();
         let segment = |at: usize| path.get(at).map(hir::Name::as_str);
         return match segment(0) {
-            Some("time") if name == "now" && self_is(&["Instant", "SystemTime"]) => Ambient::Root(Effect::Clock),
+            Some("time") if name == "now" && self_is(&["Instant", "SystemTime"]) => {
+                Ambient::Root(Effect::Clock)
+            }
             Some("thread") => Ambient::Root(Effect::Thread),
             Some("fs") => Ambient::Root(Effect::Fs),
             Some("net") => Ambient::Root(Effect::Net),
             Some("process") => Ambient::Root(Effect::Process),
             Some("env") => Ambient::Root(Effect::Env),
-            Some("io") if segment(1) == Some("stdio") && matches!(name, "stdin" | "stdout" | "stderr") => {
+            Some("io")
+                if segment(1) == Some("stdio") && matches!(name, "stdin" | "stdout" | "stderr") =>
+            {
                 Ambient::Root(Effect::Stdio)
             }
-            Some("hash") if name == "new" && self_is(&["RandomState"]) => Ambient::Root(Effect::Random),
+            Some("hash") if name == "new" && self_is(&["RandomState"]) => {
+                Ambient::Root(Effect::Random)
+            }
             Some("sync") if matches!(name, "recv_timeout" | "recv_deadline" | "send_timeout") => {
                 Ambient::Root(Effect::ChannelTimeout)
             }
@@ -149,8 +156,15 @@ pub(crate) fn ambient(db: &Db, f: FunctionId) -> Ambient {
     if is("crossbeam_channel")
         && matches!(
             name,
-            "recv_timeout" | "recv_deadline" | "send_timeout" | "send_deadline" | "after" | "at" | "tick"
-                | "select_timeout" | "ready_timeout"
+            "recv_timeout"
+                | "recv_deadline"
+                | "send_timeout"
+                | "send_deadline"
+                | "after"
+                | "at"
+                | "tick"
+                | "select_timeout"
+                | "ready_timeout"
         )
     {
         return Ambient::Root(Effect::ChannelTimeout);
@@ -158,9 +172,17 @@ pub(crate) fn ambient(db: &Db, f: FunctionId) -> Ambient {
     if is("libc") || is("rustix") || is("nix") {
         return Ambient::Root(Effect::Syscall);
     }
-    if ["parking_lot", "parking_lot_core", "lock_api", "tracing", "tracing_core", "log", "blaze_mem"]
-        .into_iter()
-        .any(is)
+    if [
+        "parking_lot",
+        "parking_lot_core",
+        "lock_api",
+        "tracing",
+        "tracing_core",
+        "log",
+        "blaze_mem",
+    ]
+    .into_iter()
+    .any(is)
     {
         return Ambient::Stop;
     }
@@ -197,7 +219,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     if cx.is_in_test(cx.root()) {
         return found;
     }
-    let env = ParamEnvAndCrate { param_env: db.trait_environment(def.generic_def(db)), krate: def.krate(db) };
+    let env = ParamEnvAndCrate {
+        param_env: db.trait_environment(def.generic_def(db)),
+        krate: def.krate(db),
+    };
     let body = analysis.body();
     let infer = analysis.infer();
     let owner_name = fn_name(db, owner);
@@ -308,10 +333,18 @@ fn root_path(db: &Db, f: FunctionId) -> String {
 
 /// `module`'s path, its crate's name first.
 fn module_path(db: &Db, module: hir::Module) -> String {
-    let krate = module.krate(db).display_name(db).map(|it| it.crate_name().symbol().as_str().to_owned());
+    let krate =
+        module.krate(db).display_name(db).map(|it| it.crate_name().symbol().as_str().to_owned());
     // alloc: a finding's path, reported at the edge
     let mut path: Vec<String> = krate.into_iter().collect();
-    path.extend(module.path_to_root(db).into_iter().rev().filter_map(|it| it.name(db)).map(|it| it.as_str().to_owned()));
+    path.extend(
+        module
+            .path_to_root(db)
+            .into_iter()
+            .rev()
+            .filter_map(|it| it.name(db))
+            .map(|it| it.as_str().to_owned()),
+    );
     path.join("::")
 }
 
@@ -365,7 +398,10 @@ pub mod sync {
 "#;
 
     fn lint_main(main: &str) -> String {
-        lint(&format!("{STD}{}", main.trim_start_matches('\n')), "-A clippy::all --warn=blaze::sans_io_core")
+        lint(
+            &format!("{STD}{}", main.trim_start_matches('\n')),
+            "-A clippy::all --warn=blaze::sans_io_core",
+        )
     }
 
     /// A core's direct read of the clock and its read of a file through a helper outside the
@@ -417,17 +453,28 @@ pub fn driver() {
         );
         assert_eq!(found.matches("does no IO").count(), 3, "{found}");
         assert!(
-            found.contains("`Machine::direct` reaches the wall clock through `std::time::Instant::now`"),
+            found.contains(
+                "`Machine::direct` reaches the wall clock through `std::time::Instant::now`"
+            ),
             "{found}"
         );
         assert!(
             found.contains("`Machine::through_helper` → `helper` → `std::fs::read`"),
             "a chain through the workspace names each step:\n{found}"
         );
-        assert!(found.contains("`Machine::elapsed` → `Instant::elapsed` → `std::time::Instant::now`"), "{found}");
+        assert!(
+            found.contains("`Machine::elapsed` → `Instant::elapsed` → `std::time::Instant::now`"),
+            "{found}"
+        );
         assert!(found.contains("is in the sans-IO core `main::machine`"), "{found}");
-        assert!(!found.contains("`Machine::injected`"), "IO injected through a parameter is fine:\n{found}");
-        assert!(!found.contains("`Machine::calls_its_core`"), "a core callee is found in its own body:\n{found}");
+        assert!(
+            !found.contains("`Machine::injected`"),
+            "IO injected through a parameter is fine:\n{found}"
+        );
+        assert!(
+            !found.contains("`Machine::calls_its_core`"),
+            "a core callee is found in its own body:\n{found}"
+        );
         assert!(!found.contains("`Machine::locks`"), "std's locks end the walk:\n{found}");
         assert!(!found.contains("`driver`"), "a driver outside the core reads the clock:\n{found}");
     }
@@ -452,7 +499,10 @@ mod tests {
 "#,
         );
         assert_eq!(found.matches("does no IO").count(), 1, "{found}");
-        assert!(found.contains("`reads` reaches the file system through `std::fs::read`"), "{found}");
+        assert!(
+            found.contains("`reads` reaches the file system through `std::fs::read`"),
+            "{found}"
+        );
         assert!(found.contains("the sans-IO core `main`"), "{found}");
     }
 }

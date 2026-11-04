@@ -27,7 +27,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::BorrowckSkipped) -> Vec<Found> {
         None => cx.snippet(&span).unwrap_or_default(),
     };
     // alloc: the message, once per diagnostic (the edge).
-    let mut diag = Diag::error(None, format!("blaze cannot borrow-check `{path}`: {}", d.reason), span);
+    let mut diag =
+        Diag::error(None, format!("blaze cannot borrow-check `{path}`: {}", d.reason), span);
     if let Some((item, path)) = &item {
         let name = path.rsplit("::").next().unwrap_or(path);
         // alloc: the fact's text, once per diagnostic (the edge).

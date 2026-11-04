@@ -10,7 +10,10 @@
 //! `compiler/rustc_ast/src/ast.rs` (`join_path_idents`) (MIT or Apache-2.0).
 
 use hir::{AsAssocItem as _, AssocItemContainer, EditionLint, InFile, ReceiverAdjustment};
-use hir_def::{Lookup as _, item_scope::{ImportId, ImportOrExternCrate}};
+use hir_def::{
+    Lookup as _,
+    item_scope::{ImportId, ImportOrExternCrate},
+};
 use hir_ty::next_solver::Mutability;
 use intern::sym;
 use smallvec::SmallVec;
@@ -30,8 +33,12 @@ const BOXED_SLICE_INTO_ITER: LintId = LintId::named("boxed_slice_into_iter");
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::EditionDependentMethodCall) -> Vec<Found> {
     let (lint, name) = match d.lint {
-        EditionLint::Rust2021PreludeCollisions => (RUST_2021_PRELUDE_COLLISIONS, "rust_2021_prelude_collisions"),
-        EditionLint::Rust2024PreludeCollisions => (RUST_2024_PRELUDE_COLLISIONS, "rust_2024_prelude_collisions"),
+        EditionLint::Rust2021PreludeCollisions => {
+            (RUST_2021_PRELUDE_COLLISIONS, "rust_2021_prelude_collisions")
+        }
+        EditionLint::Rust2024PreludeCollisions => {
+            (RUST_2024_PRELUDE_COLLISIONS, "rust_2024_prelude_collisions")
+        }
         EditionLint::ArrayIntoIter => (ARRAY_INTO_ITER, "array_into_iter"),
         EditionLint::BoxedSliceIntoIter => (BOXED_SLICE_INTO_ITER, "boxed_slice_into_iter"),
     };
@@ -47,7 +54,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::EditionDependentMethodCall) -> Vec
     let db = cx.db;
     let method = d.method.name(db);
     // alloc: the lint's text, for a call hir found
-    let message = format!("trait method `{}` will become ambiguous in Rust {edition}", method.as_str());
+    let message =
+        format!("trait method `{}` will become ambiguous in Rust {edition}", method.as_str());
     let derefs = "*".repeat(d.autoderefs as usize);
     let autoref = match d.autoref {
         Some(ReceiverAdjustment::Autoref(Mutability::Mut)) => "&mut ",
@@ -71,7 +79,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::EditionDependentMethodCall) -> Vec
             Some(expr) => {
                 // alloc: the lint's text, for a call hir found
                 let code = format!("({})", adjusted(expr));
-                diag.suggestion(receiver, "disambiguate the method call", code, Applicability::MachineApplicable);
+                diag.suggestion(
+                    receiver,
+                    "disambiguate the method call",
+                    code,
+                    Applicability::MachineApplicable,
+                );
             }
             None => {
                 let placeholder = match to_const_ptr {
@@ -81,7 +94,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::EditionDependentMethodCall) -> Vec
                     false => format!("{autoref}{derefs}..."),
                 };
                 // alloc: the lint's text, for a call hir found
-                diag.span_help(receiver, format!("disambiguate the method call with `({placeholder})`"));
+                diag.span_help(
+                    receiver,
+                    format!("disambiguate the method call with `({placeholder})`"),
+                );
             }
         }
         code_fact(cx, &mut diag, receiver_at);
@@ -94,9 +110,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::EditionDependentMethodCall) -> Vec
     let sp = cx.span_of(call_at);
     let trait_ = match d.method.as_assoc_item(db).map(|it| it.container(db)) {
         Some(AssocItemContainer::Trait(it)) => it,
-        Some(AssocItemContainer::Impl(imp)) => {
-            imp.trait_(db).expect("a method call hir lints as not inherent is of a trait or a trait's impl")
-        }
+        Some(AssocItemContainer::Impl(imp)) => imp
+            .trait_(db)
+            .expect("a method call hir lints as not inherent is of a trait or a trait's impl"),
         None => unreachable!("a method call hir lints is of an associated function"),
     };
     let trait_name = trait_path_or_bare_name(cx, call.value.syntax(), trait_);
@@ -128,13 +144,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::EditionDependentMethodCall) -> Vec
                 })
                 .unwrap_or_default();
             // alloc: the lint's text, for a call hir found
-            let code = format!("{trait_name}::{}{turbofish}({}{args})", method.as_str(), adjusted(expr));
+            let code =
+                format!("{trait_name}::{}{turbofish}({}{args})", method.as_str(), adjusted(expr));
             // clone: the lint's span, for a call hir found
-            diag.suggestion(sp.clone(), "disambiguate the associated function", code, Applicability::MachineApplicable);
+            diag.suggestion(
+                sp.clone(),
+                "disambiguate the associated function",
+                code,
+                Applicability::MachineApplicable,
+            );
         }
         None => {
             // alloc: the lint's text, for a call hir found
-            let help = format!("disambiguate the associated function with `{trait_name}::{}(...)`", method.as_str());
+            let help = format!(
+                "disambiguate the associated function with `{trait_name}::{}(...)`",
+                method.as_str()
+            );
             // clone: the lint's span, for a call hir found
             diag.span_help(sp.clone(), help);
         }
@@ -159,7 +184,11 @@ pub(crate) fn ancestor_inside(span: &Span, outer: &Span) -> Option<Span> {
 
 /// rustc's `trait_path_or_bare_name`: how `trait_` is named where `at` is ([`trait_path`]),
 /// else its name.
-pub(crate) fn trait_path_or_bare_name<'db>(cx: &Cx<'_, 'db>, at: view::Node<'db>, trait_: hir::Trait) -> String {
+pub(crate) fn trait_path_or_bare_name<'db>(
+    cx: &Cx<'_, 'db>,
+    at: view::Node<'db>,
+    trait_: hir::Trait,
+) -> String {
     trait_path(cx, at, trait_).unwrap_or_else(|| {
         // alloc: the lint's text, for a call hir found
         trait_.name(cx.db).as_str().to_owned()
@@ -191,7 +220,9 @@ fn trait_path<'db>(cx: &Cx<'_, 'db>, at: view::Node<'db>, trait_: hir::Trait) ->
         module = if at.is_block_module(db) { def_map.containing_module(db, at) } else { None };
     };
     match import {
-        Some(ImportOrExternCrate::Import(import)) if *name.symbol() == sym::underscore => use_path(cx, import),
+        Some(ImportOrExternCrate::Import(import)) if *name.symbol() == sym::underscore => {
+            use_path(cx, import)
+        }
         // alloc: the lint's text, for a call hir found
         Some(ImportOrExternCrate::Import(_)) => Some(name.as_str().to_owned()),
         _ => None,

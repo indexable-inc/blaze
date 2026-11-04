@@ -34,7 +34,9 @@ pub(super) fn kind_of(macro_: hir::Macro, db: &Db) -> Kind {
     match macro_.kind(db) {
         hir::MacroKind::Attr | hir::MacroKind::AttrBuiltIn => Kind::Attr,
         hir::MacroKind::Derive | hir::MacroKind::DeriveBuiltIn => Kind::Derive,
-        hir::MacroKind::Declarative | hir::MacroKind::DeclarativeBuiltIn | hir::MacroKind::ProcMacro => Kind::Bang,
+        hir::MacroKind::Declarative
+        | hir::MacroKind::DeclarativeBuiltIn
+        | hir::MacroKind::ProcMacro => Kind::Bang,
     }
 }
 
@@ -52,7 +54,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMacroCall) -> Vec<Found>
     };
     let (node, segments) = match (kind, attr) {
         // alloc: the error's parts, for an error hir found
-        (Kind::Attr, Some(attr)) => (attr.syntax(), attr.path().map_or_else(Vec::new, path_segments)),
+        (Kind::Attr, Some(attr)) => {
+            (attr.syntax(), attr.path().map_or_else(Vec::new, path_segments))
+        }
         (Kind::Bang, _) => match find_node_at_range::<ast::MacroCall<'_>>(root, d.range.value) {
             // alloc: the error's parts, for an error hir found
             Some(call) => (call.syntax(), call.path().map_or_else(Vec::new, path_segments)),
@@ -71,14 +75,26 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMacroCall) -> Vec<Found>
     };
     if segments.len() > 1 {
         let range = TextRange::new(segments[0].range.start(), ident.range.end());
-        let diag = macro_path_error(cx, file, node, &segments, range, (kind.article(), kind.descr()), d.is_bang);
+        let diag = macro_path_error(
+            cx,
+            file,
+            node,
+            &segments,
+            range,
+            (kind.article(), kind.descr()),
+            d.is_bang,
+        );
         // alloc: the error's parts, for an error hir found
         return vec![Found::new(diag, Phase::Expand)];
     }
     let span = cx.span(InFile::new(file, ident.range));
     let name = ident.name.as_str();
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(None, format!("cannot find {} `{name}` in this scope", kind.expected()), span.clone());
+    let mut diag = Diag::error(
+        None,
+        format!("cannot find {} `{name}` in this scope", kind.expected()),
+        span.clone(),
+    );
     let names = names_in_scope(cx, node);
     if let Some(module) = cx.vsema.scope(node).map(|it| it.module()) {
         // alloc: the error's text, for an error hir found
@@ -108,27 +124,36 @@ fn suggestions<'db>(
     if kind == Kind::Bang && name == "macro_rules" {
         let at = span.shrink_to_hi();
         // alloc: the error's text, for an error hir found
-        let spans = MultiSpan { primary: vec![at.clone()], labels: vec![(at, "put a macro name here".to_owned())] };
+        let spans = MultiSpan {
+            primary: vec![at.clone()],
+            labels: vec![(at, "put a macro name here".to_owned())],
+        };
         diag.span_note(spans, "maybe you have forgotten to define a name for this `macro_rules!`");
         return;
     }
     if kind == Kind::Derive && matches!(name, "Send" | "Sync") {
         // alloc: the error's text, for an error hir found
-        diag.span_note(span, format!("unsafe traits like `{name}` should be implemented explicitly"));
+        diag.span_note(
+            span,
+            format!("unsafe traits like `{name}` should be implemented explicitly"),
+        );
         return;
     }
     let local = local_macro_rules(cx);
     let current = cx.vsema.scope(node).map(|it| it.module().nearest_non_block_module(db));
     let call_at = node.text_range().start();
     let unused = local.iter().find(|(it, _, _)| {
-        it.name(db).as_str() == name && (kind_of(*it, db) != kind || is_after(cx, *it, node, call_at))
+        it.name(db).as_str() == name
+            && (kind_of(*it, db) != kind || is_after(cx, *it, node, call_at))
     });
     if let Some(&(macro_, name_file, name_range)) = unused {
         let at = cx.span(InFile::new(name_file, name_range));
         if kind_of(macro_, db) != kind {
             let label = match kind {
                 // alloc: the error's text, for an error hir found
-                Kind::Bang => format!("`{name}` exists, but has no rules for function-like invocation"),
+                Kind::Bang => {
+                    format!("`{name}` exists, but has no rules for function-like invocation")
+                }
                 // alloc: the error's text, for an error hir found
                 Kind::Attr => format!("`{name}` exists, but has no `attr` rules"),
                 // alloc: the error's text, for an error hir found
@@ -140,7 +165,10 @@ fn suggestions<'db>(
         if Some(macro_.module(db)) == current {
             diag.span_note(at, "a macro with the same name exists, but it appears later");
             // alloc: the error's text, for an error hir found
-            diag.span_label(span, format!("consider moving the definition of `{name}` before this call"));
+            diag.span_label(
+                span,
+                format!("consider moving the definition of `{name}` before this call"),
+            );
             return;
         }
     }
@@ -170,12 +198,21 @@ fn suggestions<'db>(
 
 /// rustc's typo suggestion of a macro: one of the kind asked for in scope (or a built-in
 /// attribute, for an attribute) whose name is close, labelled where it is defined.
-fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, kind: Kind, name: &str, span: Span, names: &[(hir::Name, ScopeDef<'_>)]) {
+fn typo(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    kind: Kind,
+    name: &str,
+    span: Span,
+    names: &[(hir::Name, ScopeDef<'_>)],
+) {
     let db = cx.db;
     let mut candidates: Vec<(&str, Option<hir::Macro>)> = names
         .iter()
         .filter_map(|(it, def)| match def {
-            ScopeDef::ModuleDef(ModuleDef::Macro(m)) if kind_of(*m, db) == kind => Some((it.as_str(), Some(*m))),
+            ScopeDef::ModuleDef(ModuleDef::Macro(m)) if kind_of(*m, db) == kind => {
+                Some((it.as_str(), Some(*m)))
+            }
             _ => None,
         })
         // alloc: the error's parts, for an error hir found
@@ -195,7 +232,10 @@ fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, kind: Kind, name: &str, span: Span, na
             let kind = kind_of(m, db);
             if let Some(at) = head_span(cx, m) {
                 // alloc: the error's text, for an error hir found
-                diag.span_label(at, format!("similarly named {} `{best}` defined here", kind.descr()));
+                diag.span_label(
+                    at,
+                    format!("similarly named {} `{best}` defined here", kind.descr()),
+                );
             }
             (kind.article(), kind.descr())
         }
@@ -211,7 +251,12 @@ fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, kind: Kind, name: &str, span: Span, na
 }
 
 /// What `name` is in scope when it is not a macro of `kind`, as rustc's note says it.
-fn other_meaning(cx: &Cx<'_, '_>, kind: Kind, name: &str, names: &[(hir::Name, ScopeDef<'_>)]) -> Option<String> {
+fn other_meaning(
+    cx: &Cx<'_, '_>,
+    kind: Kind,
+    name: &str,
+    names: &[(hir::Name, ScopeDef<'_>)],
+) -> Option<String> {
     let db = cx.db;
     let defs: Vec<ModuleDef> = names
         .iter()
@@ -240,9 +285,24 @@ fn other_meaning(cx: &Cx<'_, '_>, kind: Kind, name: &str, names: &[(hir::Name, S
         return Some(as_kind(Kind::Attr));
     }
     let types = defs.iter().find(|it| {
-        matches!(it, ModuleDef::Module(_) | ModuleDef::Adt(_) | ModuleDef::Trait(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_))
+        matches!(
+            it,
+            ModuleDef::Module(_)
+                | ModuleDef::Adt(_)
+                | ModuleDef::Trait(_)
+                | ModuleDef::TypeAlias(_)
+                | ModuleDef::BuiltinType(_)
+        )
     });
-    let values = defs.iter().find(|it| matches!(it, ModuleDef::Function(_) | ModuleDef::Const(_) | ModuleDef::Static(_) | ModuleDef::EnumVariant(_)));
+    let values = defs.iter().find(|it| {
+        matches!(
+            it,
+            ModuleDef::Function(_)
+                | ModuleDef::Const(_)
+                | ModuleDef::Static(_)
+                | ModuleDef::EnumVariant(_)
+        )
+    });
     let def = types.or(values)?;
     if kind == Kind::Derive && matches!(def, ModuleDef::Trait(_)) {
         // alloc: the error's text, for an error hir found
@@ -292,7 +352,8 @@ fn local_macro_rules(cx: &Cx<'_, '_>) -> Vec<(hir::Macro, hir::HirFileId, TextRa
             _ => None,
         });
         for macro_ in module.legacy_macros_iter(db).chain(declared) {
-            if macro_.module(db).krate(db) != cx.krate || out.iter().any(|(it, _, _)| *it == macro_) {
+            if macro_.module(db).krate(db) != cx.krate || out.iter().any(|(it, _, _)| *it == macro_)
+            {
                 continue;
             }
             let Some(src) = cx.vsema.source(macro_) else { continue };
@@ -349,7 +410,9 @@ fn derive_segments(root: ast::Node<'_>, range: TextRange) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut push = |i: usize, token: ast::Token<'_>| match token.kind() {
         // alloc: the error's text, for an error hir found
-        SyntaxKind::COLON2 if i == 0 => segments.push(Segment { name: ROOT.to_owned(), range: token.text_range() }),
+        SyntaxKind::COLON2 if i == 0 => {
+            segments.push(Segment { name: ROOT.to_owned(), range: token.text_range() })
+        }
         kind if kind == SyntaxKind::IDENT || kind.is_keyword(span::Edition::LATEST) => {
             // alloc: the error's text, for an error hir found
             segments.push(Segment { name: token.text().to_owned(), range: token.text_range() });
@@ -385,7 +448,10 @@ mod tests {
         let root = parse.root();
         let at = |written: &str, skip: usize| {
             let start = text.find(written).expect("in the text") + skip;
-            TextRange::at(TextSize::from(u32::try_from(start).unwrap()), TextSize::of(&written[skip..]))
+            TextRange::at(
+                TextSize::from(u32::try_from(start).unwrap()),
+                TextSize::of(&written[skip..]),
+            )
         };
         let derive = "#[derive(Debug, ::serde::Serialize)]";
         let cfg_attr = "#[cfg_attr(x, derive(Clone))]";
@@ -403,7 +469,8 @@ mod tests {
             (at("fn f()", 0), None, None),
             (root.text_range(), None, None),
         ] {
-            let found_attr = find_node_at_range::<ast::Attr<'_>>(root, range).map(|it| &text[it.syntax().text_range()]);
+            let found_attr = find_node_at_range::<ast::Attr<'_>>(root, range)
+                .map(|it| &text[it.syntax().text_range()]);
             let found_call = find_node_at_range::<ast::MacroCall<'_>>(root, range)
                 .map(|it| text[it.syntax().text_range()].trim_end_matches(';'));
             assert_eq!((found_attr, found_call), (attr, call), "at {:?}", &text[range]);

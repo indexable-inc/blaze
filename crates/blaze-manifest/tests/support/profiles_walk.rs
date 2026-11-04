@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_manifest::config::CompileKind;
 use blaze_manifest::diagnostic::report;
 use blaze_manifest::files::Disk;
@@ -20,6 +19,7 @@ use blaze_manifest::{Config, Context, Workspace};
 use cargo_util_schemas::core::PackageIdSpec;
 use cargo_util_schemas::lockfile::TomlLockfile;
 use serde_json::Value;
+use std::alloc::Global;
 
 /// What the profiles of `cargo <args> --unit-graph` were made from.
 pub(crate) struct Output {
@@ -253,7 +253,11 @@ fn profiles_of(
     for unit in units {
         let pkg = package(unit["pkg_id"].as_str().unwrap_or_default())?;
         let is_member = pkg.source_id.is_path()
-            && pkg.source_id.url().to_file_path().is_ok_and(|p| ws.is_member(&p.join("Cargo.toml")));
+            && pkg
+                .source_id
+                .url()
+                .to_file_path()
+                .is_ok_and(|p| ws.is_member(&p.join("Cargo.toml")));
         let kinds: Vec<&str> = unit["target"]["kind"]
             .as_array()
             .map(|k| k.iter().filter_map(Value::as_str).collect())

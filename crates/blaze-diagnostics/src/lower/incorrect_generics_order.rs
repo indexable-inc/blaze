@@ -116,7 +116,9 @@ fn params(cx: &Cx<'_, '_>, def: GenericDef) -> Vec<Param> {
                 synthetic: false,
                 source: Some(Either::Right(param)),
             },
-            Either::Right(param) if param.is_implicit(db) && matches!(def, GenericDef::Trait(_)) => {
+            Either::Right(param)
+                if param.is_implicit(db) && matches!(def, GenericDef::Trait(_)) =>
+            {
                 return None;
             }
             Either::Right(param) => Param {
@@ -188,7 +190,10 @@ fn mismatch(args: &[Arg], params: &[Param]) -> Option<Mismatch> {
                     let help = format!(
                         "reorder the arguments: {}: `<{}>`",
                         // alloc: the error's help, for an error hir found
-                        ords.iter().map(|it| format!("{}s", ord_name(*it))).collect::<Vec<_>>().join(", then "),
+                        ords.iter()
+                            .map(|it| format!("{}s", ord_name(*it)))
+                            .collect::<Vec<_>>()
+                            .join(", then "),
                         present
                             .iter()
                             .filter(|(_, it)| it.name != "Self")
@@ -200,7 +205,12 @@ fn mismatch(args: &[Arg], params: &[Param]) -> Option<Mismatch> {
                     );
                     let rest = &args[a..];
                     let sorted = rest.windows(2).all(|it| it[0].ord() <= it[1].ord());
-                    return Some(Mismatch { arg: a, param: p, ordering: !sorted, help: Some(help) });
+                    return Some(Mismatch {
+                        arg: a,
+                        param: p,
+                        ordering: !sorted,
+                        help: Some(help),
+                    });
                 }
             },
             (Some(_), None) => {
@@ -248,7 +258,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
         let kinds: Vec<Arg> = list.generic_args().filter_map(Arg::of).collect();
         let params = params(cx, def);
         let m = mismatch(&kinds, &params)?;
-        let at = list.generic_args().filter(|it| Arg::of(*it).is_some()).nth(m.arg)?.syntax().text_range();
+        let at = list
+            .generic_args()
+            .filter(|it| Arg::of(*it).is_some())
+            .nth(m.arg)?
+            .syntax()
+            .text_range();
         (at == arg_range).then_some((m, params))
     });
 
@@ -286,17 +301,16 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
                     None => {
                         braces(&mut diag);
                         // alloc: the error's text, for an error hir found
-                        diag.message = "unresolved item provided when a constant was expected".to_owned();
+                        diag.message =
+                            "unresolved item provided when a constant was expected".to_owned();
                     }
                     Some(PathResolution::TypeParam(src)) => {
                         let target = param.and_then(|it| match it.source {
                             Some(Either::Right(it)) => Some(it),
                             _ => None,
                         });
-                        let src_range = cx
-                            .vsema
-                            .source(src.merge())
-                            .and_then(|it| match it.value {
+                        let src_range =
+                            cx.vsema.source(src.merge()).and_then(|it| match it.value {
                                 Either::Left(ast::TypeOrConstParam::Type(p)) => {
                                     Some(it.with_value(ast::type_param_span(p)?))
                                 }
@@ -318,9 +332,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
                 }
             }
             Some(ast::Type::ArrayType(array)) => {
-                let usize_param = param.is_some_and(|it| {
-                    matches!(it.source, Some(Either::Right(c)) if c.ty(db).is_usize())
-                });
+                let usize_param = param.is_some_and(
+                    |it| matches!(it.source, Some(Either::Right(c)) if c.ty(db).is_usize()),
+                );
                 if usize_param
                     && let Some(len) = array.const_arg()
                     && let Some(snippet) = cx.snippet(&span(len.syntax().text_range()))

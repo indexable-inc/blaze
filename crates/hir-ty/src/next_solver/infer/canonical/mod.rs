@@ -77,7 +77,9 @@ impl<'db> InferCtxt<'db> {
             self.interner,
             canonical.var_kinds,
             |var_values, info| {
-                self.instantiate_canonical_var(span, info, var_values, |ui| universes[ui.as_usize()])
+                self.instantiate_canonical_var(span, info, var_values, |ui| {
+                    universes[ui.as_usize()]
+                })
             },
         );
         let result = canonical.instantiate(self.interner, &var_values);

@@ -45,17 +45,13 @@ impl UllbcPass for Transform {
 
     fn transform_body(&self, _ctx: &mut TransformCtx, body: &mut ExprBody) {
         for block in &mut body.body {
-            if let TerminatorKind::Call {
-                call, on_unwind, ..
-            } = &block.terminator.kind
+            if let TerminatorKind::Call { call, on_unwind, .. } = &block.terminator.kind
                 && let FnOperand::Regular(fn_ptr) = &call.func
                 && let FnPtrKind::Fun(id) = fn_ptr.kind.as_ref()
                 && let Some(name) = self.panic_fns.get(id)
             {
-                block.terminator.kind = TerminatorKind::Panic {
-                    name: name.clone(),
-                    on_unwind: *on_unwind,
-                };
+                block.terminator.kind =
+                    TerminatorKind::Panic { name: name.clone(), on_unwind: *on_unwind };
             }
         }
     }

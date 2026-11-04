@@ -62,7 +62,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, lp: ast::LoopExpr<'t>) {
     }
     let Some(range) = cx.range(lp.syntax()) else { return };
     let name = match owner {
-        Owner::Fn(f) => f.name().map_or_else(|| "this function".into(), |it| format!("`{}`", it.text())),
+        Owner::Fn(f) => {
+            f.name().map_or_else(|| "this function".into(), |it| format!("`{}`", it.text()))
+        }
         Owner::Closure(_) => "this closure".into(),
     };
     let fix = match owner {
@@ -78,8 +80,14 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, lp: ast::LoopExpr<'t>) {
     );
     let diagnostic = cx.lint(LINT, lp.syntax(), span, message);
     match fix {
-        Some(at) => diagnostic.suggestion(at, "if it is meant to run forever, say so", " -> !", Applicability::MaybeIncorrect),
-        None => diagnostic.note("if it is meant to run forever, the function's return type says so: `-> !`"),
+        Some(at) => diagnostic.suggestion(
+            at,
+            "if it is meant to run forever, say so",
+            " -> !",
+            Applicability::MaybeIncorrect,
+        ),
+        None => diagnostic
+            .note("if it is meant to run forever, the function's return type says so: `-> !`"),
     };
     diagnostic.help(
         "a loop that waits for progress needs a bound (fuel, a deadline) and ends in a typed outcome (AGENTS.md rule 13)",
@@ -94,7 +102,11 @@ fn owner<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<Owner<'t>> {
     for it in written_ancestors(cx, node).skip(1) {
         match it.kind() {
             K::AWAIT_EXPR => awaited = true,
-            K::BLOCK_EXPR if ast::BlockExpr::cast(it).is_some_and(|it| it.async_token().is_some()) => in_async = true,
+            K::BLOCK_EXPR
+                if ast::BlockExpr::cast(it).is_some_and(|it| it.async_token().is_some()) =>
+            {
+                in_async = true
+            }
             K::CLOSURE_EXPR => {
                 let closure = ast::ClosureExpr::cast(it)?;
                 if closure.async_token().is_some() {
@@ -148,13 +160,16 @@ impl<'t> Leaves<'_, '_, 't> {
             let WalkEvent::Enter(it) = event else { continue };
             match it.kind() {
                 K::BREAK_EXPR => {
-                    let label = ast::BreakExpr::cast(it).and_then(|it| it.lifetime()).map(|it| it.text());
+                    let label =
+                        ast::BreakExpr::cast(it).and_then(|it| it.lifetime()).map(|it| it.text());
                     if self.depth == 0 || (label.is_some() && label == self.label) {
                         self.left = true;
                     }
                 }
                 K::CONTINUE_EXPR => {
-                    let label = ast::ContinueExpr::cast(it).and_then(|it| it.lifetime()).map(|it| it.text());
+                    let label = ast::ContinueExpr::cast(it)
+                        .and_then(|it| it.lifetime())
+                        .map(|it| it.text());
                     if label.is_some_and(|it| !self.inner.contains(&it)) {
                         self.left = true;
                     }
@@ -178,7 +193,9 @@ impl<'t> Leaves<'_, '_, 't> {
                     }
                 }
                 K::CALL_EXPR | K::METHOD_CALL_EXPR => {
-                    let never = ast::Expr::cast(it).and_then(|it| self.cx.ty(it)).is_some_and(|it| it.is_never());
+                    let never = ast::Expr::cast(it)
+                        .and_then(|it| self.cx.ty(it))
+                        .is_some_and(|it| it.is_never());
                     if never {
                         self.left = true;
                     }
@@ -187,7 +204,9 @@ impl<'t> Leaves<'_, '_, 't> {
                     events.skip_subtree();
                     let Some(call) = ast::MacroCall::cast(it) else { continue };
                     match self.cx.expand(call) {
-                        Some(expansion) if expansions < DEEPEST => self.walk(expansion, expansions + 1),
+                        Some(expansion) if expansions < DEEPEST => {
+                            self.walk(expansion, expansions + 1)
+                        }
                         // What it does can't be seen: not called infinite.
                         _ => self.left = true,
                     }
@@ -196,7 +215,9 @@ impl<'t> Leaves<'_, '_, 't> {
                     events.skip_subtree();
                 }
                 K::BLOCK_EXPR => {
-                    if ast::BlockExpr::cast(it).is_some_and(|it| it.async_token().is_some() || it.const_token().is_some()) {
+                    if ast::BlockExpr::cast(it)
+                        .is_some_and(|it| it.async_token().is_some() || it.const_token().is_some())
+                    {
                         events.skip_subtree();
                     }
                 }
@@ -291,8 +312,16 @@ pub fn after() {
 "#,
         );
         assert_eq!(found.matches(FOUND).count(), 2, "{found}");
-        assert_eq!(found.matches("if it is meant to run forever, say so: `-> !`").count(), 1, "{found}");
+        assert_eq!(
+            found.matches("if it is meant to run forever, say so: `-> !`").count(),
+            1,
+            "{found}"
+        );
         assert!(found.contains("in `serve` never ends"), "{found}");
-        assert_eq!(found.matches("the function's return type says so: `-> !`").count(), 1, "{found}");
+        assert_eq!(
+            found.matches("the function's return type says so: `-> !`").count(),
+            1,
+            "{found}"
+        );
     }
 }

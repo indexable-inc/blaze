@@ -270,7 +270,8 @@ pub mod wait {
 "#;
 
 /// Every lint of these tests, by name after `blaze::`.
-const LINTS: &[&str] = &["held_across_wait", "lock_across_query", "blocking_on_pool", "unnamed_wait"];
+const LINTS: &[&str] =
+    &["held_across_wait", "lock_across_query", "blocking_on_pool", "unnamed_wait"];
 
 /// The lint a message is of.
 fn lint_of(message: &str) -> Option<&'static str> {
@@ -280,7 +281,9 @@ fn lint_of(message: &str) -> Option<&'static str> {
         Some("lock_across_query")
     } else if message.contains("blocks the pool thread") {
         Some("blocking_on_pool")
-    } else if message.contains("names nothing it waits for") || message.contains("names what it waits for only as") {
+    } else if message.contains("names nothing it waits for")
+        || message.contains("names what it waits for only as")
+    {
         Some("unnamed_wait")
     } else {
         None
@@ -292,7 +295,9 @@ fn found(out: &str) -> Vec<(u32, &'static str)> {
     let mut found = Vec::new();
     let mut lint = None;
     for line in out.lines() {
-        if let Some(message) = line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: ")) {
+        if let Some(message) =
+            line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: "))
+        {
             lint = lint_of(message);
             continue;
         }
@@ -316,7 +321,10 @@ fn expected(source: &str) -> Vec<(u32, &'static str)> {
             None => (number, marks),
         };
         for mark in marks.split_whitespace() {
-            let lint = LINTS.iter().find(|&&it| it == mark).unwrap_or_else(|| panic!("`{mark}` is not a lint of these tests"));
+            let lint = LINTS
+                .iter()
+                .find(|&&it| it == mark)
+                .unwrap_or_else(|| panic!("`{mark}` is not a lint of these tests"));
             expected.push((number, *lint));
         }
     }
@@ -334,7 +342,11 @@ fn fixture(crates: &str, main: &str) -> (String, String) {
 /// Checks that the findings of `out` in `source` are what its markers say.
 #[track_caller]
 fn assert_marked(out: &str, source: &str, flags: &str) {
-    assert_eq!(found(out), expected(source), "with `{flags}`, the findings of:\n{source}\nwere:\n{out}");
+    assert_eq!(
+        found(out),
+        expected(source),
+        "with `{flags}`, the findings of:\n{source}\nwere:\n{out}"
+    );
 }
 
 /// Lints `main` with `flags`, `crates` beside the stand-ins, and checks the findings are what
@@ -370,13 +382,20 @@ pub fn waits(lock: &std::sync::Mutex<u32>, condvar: &std::sync::Condvar) {{
     );
     for lint in ["held_across_wait", "blocking_on_pool", "unnamed_wait"] {
         let flags = format!("-A clippy::all --deny=blaze::{lint}");
-        let refused = crate::tests::try_lint_once(&fixture, &flags, crate::conf::Conf::default(), |_| {});
+        let refused =
+            crate::tests::try_lint_once(&fixture, &flags, crate::conf::Conf::default(), |_| {});
         let Err(crate::diag::CheckError::SuspendUnchecked { file, why }) = refused else {
             panic!("`{lint}` refuses a graph without the root, not {refused:?}")
         };
         assert_eq!(file, "src/lib.rs", "{lint}");
-        assert!(why.contains("no `blaze_graph::sched::stack::Yielder::suspend` (no `stack` there)"), "{lint}: {why}");
-        assert!(why.contains("that `blaze_graph` is 0.3.0 at `/blaze_graph/lib.rs`"), "{lint} names which: {why}");
+        assert!(
+            why.contains("no `blaze_graph::sched::stack::Yielder::suspend` (no `stack` there)"),
+            "{lint}: {why}"
+        );
+        assert!(
+            why.contains("that `blaze_graph` is 0.3.0 at `/blaze_graph/lib.rs`"),
+            "{lint} names which: {why}"
+        );
         assert!(why.ends_with("the check of `main` stops"), "{lint}: {why}");
     }
 }

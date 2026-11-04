@@ -126,7 +126,10 @@ mod text {
         table().write(live, out);
     }
 
-    pub(super) fn restore<S: Stable>(image: &'static Image<S>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
+    pub(super) fn restore<S: Stable>(
+        image: &'static Image<S>,
+        jobs: Jobs<'_>,
+    ) -> Result<(), RestoreError> {
         Table::restore_into(&TABLE, shape(), image, SectionId::SYMBOLS, symbols_schema(), jobs)
     }
 }
@@ -156,7 +159,10 @@ pub fn symbols_schema() -> SchemaHash {
 /// be used: every one of them is recomputed from a cold start. The section is checked whole
 /// here, since every value depends on it, its CRCs and columns split across `jobs` (the
 /// daemon's pool: one core streams a tenth of what the machine's memory can).
-pub fn restore_symbols<S: Stable>(image: Arc<Image<S>>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
+pub fn restore_symbols<S: Stable>(
+    image: Arc<Image<S>>,
+    jobs: Jobs<'_>,
+) -> Result<(), RestoreError> {
     // alloc: once a restore, so the image outlives every symbol read from it
     let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
     text::restore(image, jobs)?;
@@ -222,7 +228,11 @@ impl Symbol {
     /// could pick thousands of names with one (`crate::table`'s doc).
     #[inline]
     pub fn intern_hashed(s: &str, hash: u64) -> Self {
-        debug_assert_eq!(hash, blaze_phf::name_hash(s.as_bytes()), "{s:?}: a hash not its name_hash");
+        debug_assert_eq!(
+            hash,
+            blaze_phf::name_hash(s.as_bytes()),
+            "{s:?}: a hash not its name_hash"
+        );
         match symbols::COMPILED.index_by_name_hash(hash, s.as_bytes()) {
             Some(index) => Symbol::from_index(index),
             None => Symbol::from_table(text::intern(s)),
@@ -239,7 +249,11 @@ impl Symbol {
     /// [`Symbol::intern_hashed`].
     #[inline]
     pub fn find_hashed(s: &str, hash: u64) -> Option<Symbol> {
-        debug_assert_eq!(hash, blaze_phf::name_hash(s.as_bytes()), "{s:?}: a hash not its name_hash");
+        debug_assert_eq!(
+            hash,
+            blaze_phf::name_hash(s.as_bytes()),
+            "{s:?}: a hash not its name_hash"
+        );
         match symbols::COMPILED.index_by_name_hash(hash, s.as_bytes()) {
             Some(index) => Some(Symbol::from_index(index)),
             None => text::find(s).map(Symbol::from_table),
@@ -464,11 +478,19 @@ mod tests {
         for (at, text) in symbols::TEXTS.iter().enumerate() {
             let bytes = text.str.as_bytes();
             assert_eq!(symbols::COMPILED.get(text.str), Some(at), "{:?}", text.str);
-            assert_eq!(symbols::COMPILED.index_by_name_hash(blaze_phf::name_hash(bytes), bytes), Some(at));
+            assert_eq!(
+                symbols::COMPILED.index_by_name_hash(blaze_phf::name_hash(bytes), bytes),
+                Some(at)
+            );
         }
-        for other in ["selff", "Self_", "a new symbol", "ünïcödé", "256", "<ra@gennew>", "c_int "] {
+        for other in ["selff", "Self_", "a new symbol", "ünïcödé", "256", "<ra@gennew>", "c_int "]
+        {
             let bytes = other.as_bytes();
-            assert_eq!(symbols::COMPILED.index_by_name_hash(blaze_phf::name_hash(bytes), bytes), None, "{other:?}");
+            assert_eq!(
+                symbols::COMPILED.index_by_name_hash(blaze_phf::name_hash(bytes), bytes),
+                None,
+                "{other:?}"
+            );
         }
     }
 
@@ -476,7 +498,9 @@ mod tests {
     /// are fixed symbols.
     #[test]
     fn common_names_are_compiled_in() {
-        for name in ["self", "Some", "Ok", "new", "iter", "std", "None", "Err", "a", "T", "unwrap", "len"] {
+        for name in
+            ["self", "Some", "Ok", "new", "iter", "std", "None", "Err", "a", "T", "unwrap", "len"]
+        {
             let symbol = Symbol::intern(name);
             assert!(symbol.static_index().is_some(), "{name} is not compiled in");
             assert!(symbol.declared_index().is_some(), "{name} is not declared");
@@ -487,7 +511,8 @@ mod tests {
 
     #[test]
     fn a_hash_handed_over_is_the_same_as_hashing() {
-        let mut names: Vec<String> = symbols::TEXTS.iter().map(|text| text.str.to_owned()).collect();
+        let mut names: Vec<String> =
+            symbols::TEXTS.iter().map(|text| text.str.to_owned()).collect();
         names.extend((0..500).map(|n| format!("hashed name {n}")));
         names.extend(["", "x_", "ünïcödé", "a much longer name than one word"].map(String::from));
         for name in &names {
@@ -496,7 +521,13 @@ mod tests {
             assert_eq!(Symbol::find_hashed(name, hash), Symbol::find(name), "{name:?}");
             assert_eq!(Symbol::find_hashed(name, hash), Some(Symbol::intern(name)), "{name:?}");
         }
-        assert_eq!(Symbol::find_hashed("never interned by any test", blaze_phf::name_hash(b"never interned by any test")), None);
+        assert_eq!(
+            Symbol::find_hashed(
+                "never interned by any test",
+                blaze_phf::name_hash(b"never interned by any test")
+            ),
+            None
+        );
     }
 
     #[test]
@@ -634,7 +665,10 @@ mod tests {
         let image = image_of(&Table::new(shape()), &Live::new());
         let cell = OnceLock::new();
         let _ = cell.get_or_init(|| Table::new(shape()));
-        assert_eq!(restore_into(&cell, image, &serial), Err(RestoreError::Started { section: SectionId::SYMBOLS }));
+        assert_eq!(
+            restore_into(&cell, image, &serial),
+            Err(RestoreError::Started { section: SectionId::SYMBOLS })
+        );
         let fresh = OnceLock::new();
         assert_eq!(restore_into(&fresh, image, &serial), Ok(()));
         assert_eq!(fresh.get().unwrap().find(b"self"), Some(sym::self_.id()));

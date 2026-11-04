@@ -39,7 +39,8 @@ pub(crate) fn of(key: u64) -> (u16, u32) {
 pub(crate) fn closed(cells: &[AtomicU64], key: u64, ticks: u64, waits_on: u64) {
     let mut cells = Shared(cells);
     cells.add(SPANS, 1);
-    let estimate = CountMin::add_to(&mut Part { cells: &mut cells, from: COUNT_MIN_AT }, key, ticks);
+    let estimate =
+        CountMin::add_to(&mut Part { cells: &mut cells, from: COUNT_MIN_AT }, key, ticks);
     TopKeys::offer_to(&mut Part { cells: &mut cells, from: TOP_AT }, key, estimate, ticks);
     if let Some(kind) = waits_on.checked_sub(1).map(|it| it as usize).filter(|it| *it < KINDS) {
         DdSketch::add_to(&mut Part { cells: &mut cells, from: wait_at(kind) }, ticks);

@@ -258,7 +258,8 @@ fn a64(form: Form, insn: u32, value: i64) -> Option<u32> {
     let movw = |chunk: u64| (insn & !(0xffff << 5)) | (((chunk & 0xffff) as u32) << 5);
     let imm12 = |field: u64| (insn & !(0xfff << 10)) | ((field as u32) << 10);
     let scaled = |size: i64| {
-        (value % size == 0 && (0..4096 * size).contains(&value)).then(|| imm12((value / size) as u64))
+        (value % size == 0 && (0..4096 * size).contains(&value))
+            .then(|| imm12((value / size) as u64))
     };
     let branch = |bits: u32, shift: u32| {
         let words = value >> 2;
@@ -419,7 +420,11 @@ mod tests {
 
     fn refused(form: Form, value: i64) {
         let mut code = [0x5a; 12];
-        assert_eq!(write(form, &mut code, 2, value), Err(Overflow { form, value }), "{form:?} {value:#x}");
+        assert_eq!(
+            write(form, &mut code, 2, value),
+            Err(Overflow { form, value }),
+            "{form:?} {value:#x}"
+        );
         assert_eq!(code, [0x5a; 12], "{form:?} wrote a value it refused");
         assert_eq!(check(form, value), Err(Overflow { form, value }));
     }
@@ -465,7 +470,8 @@ mod tests {
 
     #[test]
     fn an_aarch64_field_keeps_the_instruction_s_other_bits() {
-        for Bounds { form, .. } in BOUNDS.iter().filter(|it| it.form as u8 >= Form::A64MovwG0 as u8) {
+        for Bounds { form, .. } in BOUNDS.iter().filter(|it| it.form as u8 >= Form::A64MovwG0 as u8)
+        {
             let mut code = u32::MAX.to_le_bytes();
             write(*form, &mut code, 0, 0).unwrap();
             assert_eq!(u32::from_le_bytes(code), !mask(*form), "{form:?}");

@@ -18,8 +18,7 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{NoImplMethod, SelfTyKey, TraitImpls, loaded_crates},
     next_solver::{
-        DbInterner, GenericArgs, Mutability, ParamEnv, Ty, TypingMode,
-        infer::DbInternerInferExt,
+        DbInterner, GenericArgs, Mutability, ParamEnv, Ty, TypingMode, infer::DbInternerInferExt,
     },
     traits::ParamEnvAndCrate,
 };
@@ -73,15 +72,19 @@ fn check(origin: &str) {
     let db = fixture::db(&fixture_with(origin)).into_db();
     let (main, dep) = (crate_named(&db, "main"), crate_named(&db, "dep"));
     let ModuleDefId::TraitId(p) = root_def(&db, dep, "P") else { panic!("`P` is a trait") };
-    let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else { panic!("`S` is a struct") };
-    let distance = p.trait_items(&db).method_by_name(&Name::new_root("distance")).expect("`P::distance`");
+    let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else {
+        panic!("`S` is a struct")
+    };
+    let distance =
+        p.trait_items(&db).method_by_name(&Name::new_root("distance")).expect("`P::distance`");
     blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main };
         for mutability in [Mutability::Not, Mutability::Mut] {
             let ptr = Ty::new_ptr(interner, s, mutability);
-            let (found, _) = db.lookup_impl_method(env, distance, GenericArgs::new_from_slice(&[ptr.into()]));
+            let (found, _) =
+                db.lookup_impl_method(env, distance, GenericArgs::new_from_slice(&[ptr.into()]));
             let Either::Left(found) = found else { panic!("{ptr:?}: a builtin derive's method") };
             assert!(
                 matches!(found.loc(&db).container, ItemContainerId::ImplId(_)),
@@ -102,8 +105,12 @@ fn impls_of(db: &Db, dep: Crate, trait_: TraitId) -> String {
     for imp in root.def_map(db).module(db, root).scope(db).impls() {
         let self_ty = db.impl_self_ty(imp).skip_binder();
         let trait_ref = db.impl_trait(imp).map(|it| it.skip_binder());
-        let predicates: Vec<_> = GenericPredicates::query_all(db, imp.into()).skip_binder().collect();
-        _ = writeln!(out, "impl {imp:?}: self type {self_ty:?}, trait {trait_ref:?}, predicates {predicates:?}");
+        let predicates: Vec<_> =
+            GenericPredicates::query_all(db, imp.into()).skip_binder().collect();
+        _ = writeln!(
+            out,
+            "impl {imp:?}: self type {self_ty:?}, trait {trait_ref:?}, predicates {predicates:?}"
+        );
     }
     let table = TraitImpls::for_crate_and_trait(db, dep, trait_);
     table.for_trait(trait_, |it| _ = writeln!(out, "table: {it:?}"));
@@ -116,24 +123,39 @@ fn solving<'db>(db: &'db Db, krate: Crate, trait_: TraitId, ptr: Ty<'db>) -> Str
     let interner = DbInterner::new_with(db, krate);
     let simplified = simplify_type(interner, ptr, TreatParams::InstantiateWithInfer);
     let candidates = simplified.map(|it| {
-        TraitImpls::in_crate_and_deps_for_trait_and_self_ty(db, krate, trait_, SelfTyKey(it)).to_vec()
+        TraitImpls::in_crate_and_deps_for_trait_and_self_ty(db, krate, trait_, SelfTyKey(it))
+            .to_vec()
     });
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
     let holds = infcx.type_implements_trait(trait_, [ptr], ParamEnv::empty());
-    let mut out = format!("simplified {simplified:?}, candidates {candidates:?}, holds {holds:?}\n");
+    let mut out =
+        format!("simplified {simplified:?}, candidates {candidates:?}, holds {holds:?}\n");
     for dep in &krate.data(db).dependencies {
         let origin = &dep.crate_id.data(db).origin;
-        _ = writeln!(out, "dependency {:?}: sysroot {}, origin {origin:?}", dep.name, dep.is_sysroot());
+        _ = writeln!(
+            out,
+            "dependency {:?}: sysroot {}, origin {origin:?}",
+            dep.name,
+            dep.is_sysroot()
+        );
     }
     for (_, module) in crate_def_map(db, krate).modules(db) {
         let Some(file) = module.origin.file_id() else { continue };
         let text = db.file_text(file.file_id(db)).text(db);
-        _ = writeln!(out, "file {file:?}: names dep {}, {} bytes", text.contains("dep"), text.len());
+        _ = writeln!(
+            out,
+            "file {file:?}: names dep {}, {} bytes",
+            text.contains("dep"),
+            text.len()
+        );
     }
     for &loaded in loaded_crates(db, krate) {
         let name = loaded.extra_data(db).display_name.as_ref().map(|it| it.to_string());
         let own = simplified.map(|it| {
-            TraitImpls::for_crate_and_trait(db, loaded, trait_).for_trait_and_self_ty(trait_, &it).0.to_vec()
+            TraitImpls::for_crate_and_trait(db, loaded, trait_)
+                .for_trait_and_self_ty(trait_, &it)
+                .0
+                .to_vec()
         });
         _ = writeln!(out, "loaded {name:?}: its own impls of the pointer {own:?}");
     }
@@ -158,17 +180,22 @@ fn a_lookup_that_finds_no_impl_says_why() {
     let db = fixture::db(&fixture_with("")).into_db();
     let (main, dep) = (crate_named(&db, "main"), crate_named(&db, "dep"));
     let ModuleDefId::TraitId(p) = root_def(&db, dep, "P") else { panic!("`P` is a trait") };
-    let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else { panic!("`S` is a struct") };
-    let distance = p.trait_items(&db).method_by_name(&Name::new_root("distance")).expect("`P::distance`");
+    let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else {
+        panic!("`S` is a struct")
+    };
+    let distance =
+        p.trait_items(&db).method_by_name(&Name::new_root("distance")).expect("`P::distance`");
     let function = |krate: Crate, name: &str| -> FunctionId {
         let root = crate_def_map(&db, krate).root_module_id();
         let scope = root.def_map(&db).module(&db, root).scope(&db);
-        let Some(ModuleDefId::FunctionId(it)) = scope.get(&Name::new_root(name)).take_values() else {
+        let Some(ModuleDefId::FunctionId(it)) = scope.get(&Name::new_root(name)).take_values()
+        else {
             panic!("`{name}`, a function at the root")
         };
         it
     };
-    let (f, measure, bounded) = (function(main, "f"), function(dep, "measure"), function(dep, "bounded"));
+    let (f, measure, bounded) =
+        (function(main, "f"), function(dep, "measure"), function(dep, "bounded"));
     blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
@@ -177,7 +204,8 @@ fn a_lookup_that_finds_no_impl_says_why() {
             db.lookup_impl_method_or_why(env, distance, GenericArgs::new_from_slice(&[self_ty]))
                 .err()
         };
-        let param = |def: FunctionId| GenericArgs::identity_for_item(interner, def.into()).type_at(0);
+        let param =
+            |def: FunctionId| GenericArgs::identity_for_item(interner, def.into()).type_at(0);
         assert_eq!(why(f, Ty::new_ptr(interner, s, Mutability::Not).into()), None);
         assert_eq!(why(f, s.into()), Some(NoImplMethod::Unimplemented));
         assert_eq!(why(bounded, param(bounded).into()), Some(NoImplMethod::Param));
@@ -192,15 +220,20 @@ fn a_provided_method_the_impl_leaves_out_is_the_traits() {
     let db = fixture::db(&fixture_with("")).into_db();
     let (main, dep) = (crate_named(&db, "main"), crate_named(&db, "dep"));
     let ModuleDefId::TraitId(p) = root_def(&db, dep, "P") else { panic!("`P` is a trait") };
-    let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else { panic!("`S` is a struct") };
-    let provided = p.trait_items(&db).method_by_name(&Name::new_root("provided")).expect("`P::provided`");
+    let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else {
+        panic!("`S` is a struct")
+    };
+    let provided =
+        p.trait_items(&db).method_by_name(&Name::new_root("provided")).expect("`P::provided`");
     blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, main);
         let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
         let ptr = Ty::new_ptr(interner, s, Mutability::Not);
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main };
         let args = GenericArgs::new_from_slice(&[ptr.into()]);
-        let found = db.lookup_impl_method_or_why(env, provided, args).map(|(found, args)| (found, args.to_vec()));
+        let found = db
+            .lookup_impl_method_or_why(env, provided, args)
+            .map(|(found, args)| (found, args.to_vec()));
         assert_eq!(found, Ok((Either::Left(provided), args.to_vec())));
     });
 }

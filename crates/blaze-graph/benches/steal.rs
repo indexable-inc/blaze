@@ -56,9 +56,13 @@ fn round(pool: &Pool, iterations: u64) -> Duration {
                         || {
                             pool.scope(|inner| {
                                 for _ in 0..FAN {
-                                    inner.submit(None, || black_box(spin(iterations)), |it| {
-                                        assert!(it.is_ok(), "a leaf panicked");
-                                    });
+                                    inner.submit(
+                                        None,
+                                        || black_box(spin(iterations)),
+                                        |it| {
+                                            assert!(it.is_ok(), "a leaf panicked");
+                                        },
+                                    );
                                 }
                             });
                         },
@@ -85,8 +89,7 @@ fn main() {
     for victims in [Victims::Walk, Victims::TwoChoices] {
         let stealing = Stealing { victims, seed: Stealing::DEFAULT.seed };
         let pool = Pool::with_stealing(&topology, bind, stealing).expect("the pool");
-        let best =
-            (0..ROUNDS).map(|_| round(&pool, iterations)).min().expect("at least one round");
+        let best = (0..ROUNDS).map(|_| round(&pool, iterations)).min().expect("at least one round");
         let wave = best / WAVES as u32;
         println!(
             "{:<11} {:>10.1} {:>11.1} {:>18.1}",

@@ -195,7 +195,11 @@ impl Target {
     /// a node whose attributes are another's (the lists inner attributes are written in, a
     /// function's body) or that rustc gives no attributes. `crate_root` is the crate's root
     /// file.
-    pub(crate) fn of(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, crate_root: HirFileId) -> Option<Target> {
+    pub(crate) fn of(
+        cx: &Cx<'_, '_>,
+        node: InFile<ast::Node<'_>>,
+        crate_root: HirFileId,
+    ) -> Option<Target> {
         let syntax = node.value;
         let target = match syntax.kind() {
             SyntaxKind::SOURCE_FILE => match node.file_id == crate_root {
@@ -238,7 +242,9 @@ impl Target {
                 Some(_) => Target::TraitAlias,
                 None => Target::Trait,
             },
-            SyntaxKind::IMPL => Target::Impl { of_trait: ast::Impl::cast(syntax)?.trait_().is_some() },
+            SyntaxKind::IMPL => {
+                Target::Impl { of_trait: ast::Impl::cast(syntax)?.trait_().is_some() }
+            }
             SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => Target::MacroDef,
             SyntaxKind::MACRO_CALL => Target::MacroCall,
             SyntaxKind::TYPE_PARAM => Target::GenericParam {
@@ -270,7 +276,9 @@ impl Target {
 fn from_expr(expr: ast::Expr<'_>) -> Target {
     match expr {
         ast::Expr::ClosureExpr(_) => Target::Closure,
-        ast::Expr::BlockExpr(block) if block.async_token().is_some() || block.gen_token().is_some() => {
+        ast::Expr::BlockExpr(block)
+            if block.async_token().is_some() || block.gen_token().is_some() =>
+        {
             Target::Closure
         }
         ast::Expr::ParenExpr(paren) => paren.expr().map_or(Target::Expression, from_expr),
@@ -310,9 +318,7 @@ fn container(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> Container {
         },
         SyntaxKind::EXTERN_ITEM_LIST => Container::Extern,
         _ if parent.parent().is_none() => match node.file_id.macro_file() {
-            Some(call) => {
-                container(cx, call.loc(cx.db).to_node_view(cx.db))
-            }
+            Some(call) => container(cx, call.loc(cx.db).to_node_view(cx.db)),
             None => Container::Other,
         },
         _ => Container::Other,

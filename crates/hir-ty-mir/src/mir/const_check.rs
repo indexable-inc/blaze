@@ -44,8 +44,8 @@ use hir_ty::{
 };
 
 use super::{
-    AggregateKind, BasicBlockId, BinOp, CastKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
-    TerminatorKind,
+    AggregateKind, BasicBlockId, BinOp, CastKind, MirBody, MirSpan, Operand, OperandKind, Rvalue,
+    StatementKind, TerminatorKind,
     framed::{Bits, bits_in},
 };
 
@@ -93,11 +93,21 @@ pub enum ConstCheckKind {
     NonConstClosure { callee: FunctionId, note: ClosureNote, conditionally: bool },
     /// An overloaded operator: `NonConstOperator`. `derefs` is rustc's `ConsiderDereferencing`:
     /// the `*`s that make an `==` of references to a primitive compare the primitives.
-    NonConstOperator { callee: FunctionId, trait_: TraitId, derefs: Option<u32>, conditionally: bool },
+    NonConstOperator {
+        callee: FunctionId,
+        trait_: TraitId,
+        derefs: Option<u32>,
+        conditionally: bool,
+    },
     /// A constant pattern's comparison of `ty`s: `NonConstMatchEq`.
     NonConstMatchEq { ty: StoredTy, conditionally: bool },
     /// A deref the source does not write: `NonConstDerefCoercion` of `ty` into `target`.
-    NonConstDerefCoercion { callee: FunctionId, ty: StoredTy, target: StoredTy, conditionally: bool },
+    NonConstDerefCoercion {
+        callee: FunctionId,
+        ty: StoredTy,
+        target: StoredTy,
+        conditionally: bool,
+    },
     /// A desugaring's call on `ty`, the callee's `Self`.
     NonConstDesugaring {
         callee: FunctionId,
@@ -261,7 +271,9 @@ impl ConstCheckKind {
             NonConstFmtMacroCall { conditionally, .. } => {
                 write!(out, "cannot call {}-const formatting macro in {kind}", non(conditionally))
             }
-            CVariadicCall => write!(out, "calling const c-variadic functions is unstable in {kind}"),
+            CVariadicCall => {
+                write!(out, "calling const c-variadic functions is unstable in {kind}")
+            }
             PanicNonStr => {
                 out.write_str("argument to `panic!()` in a const context must have type `&str`")
             }
@@ -283,11 +295,9 @@ impl ConstCheckKind {
             UnmarkedIntrinsicExposed { path } => {
                 write!(out, "intrinsic `{path}` cannot be (indirectly) exposed to stable")
             }
-            LiveDrop { ty: dropped, .. } => write!(
-                out,
-                "destructor of `{}` cannot be evaluated at compile-time",
-                ty(dropped)
-            ),
+            LiveDrop { ty: dropped, .. } => {
+                write!(out, "destructor of `{}` cannot be evaluated at compile-time", ty(dropped))
+            }
             EscapingMutBorrow => out.write_str(
                 "mutable borrows of temporaries that have their lifetime extended until the end \
                  of the program are not allowed",
@@ -599,8 +609,7 @@ impl<'a, 'db> Checker<'a, 'db> {
 
     /// rustc's `check_op_spanned`.
     fn check_op(&mut self, kind: ConstCheckKind, status: Status, span: MirSpan) {
-        if let Status::Unstable { gate, already_checked, safe_to_expose, is_function_call } =
-            status
+        if let Status::Unstable { gate, already_checked, safe_to_expose, is_function_call } = status
             && (already_checked || self.features.is_enabled(&gate))
         {
             if !safe_to_expose
@@ -647,7 +656,9 @@ impl<'a, 'db> Checker<'a, 'db> {
     fn written(&self, span: MirSpan) -> bool {
         let source_map = || self.source_map();
         match span {
-            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map().expr_syntax(expr).is_ok(),
+            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {
+                source_map().expr_syntax(expr).is_ok()
+            }
             MirSpan::PatId(pat) => source_map().pat_syntax(pat).is_ok(),
             MirSpan::BindingId(_) | MirSpan::SelfParam => true,
             MirSpan::Unknown | MirSpan::Inlined(_) => false,
@@ -709,7 +720,12 @@ fn described<'db>(
     let (parent_args, own_args) = all.split_at(parent.min(all.len()));
     match func.lookup(db).container {
         ItemContainerId::ImplId(impl_) => {
-            let ty = impl_type_name(db, caller, impl_, (parent_args.len() == parent).then_some(parent_args));
+            let ty = impl_type_name(
+                db,
+                caller,
+                impl_,
+                (parent_args.len() == parent).then_some(parent_args),
+            );
             // alloc: the text of a diagnostic, made when it is reported
             (assoc_descr, format!("{ty}::{name}{}", turbofish(db, caller, own_args)))
         }
@@ -717,7 +733,10 @@ fn described<'db>(
             let self_ty = self_ty_name(db, args.type_at(0));
             let trait_name = TraitSignature::of(db, trait_).name.as_str();
             // alloc: the text of a diagnostic, made when it is reported
-            (assoc_descr, format!("<{self_ty} as {trait_name}>::{name}{}", turbofish(db, caller, own_args)))
+            (
+                assoc_descr,
+                format!("<{self_ty} as {trait_name}>::{name}{}", turbofish(db, caller, own_args)),
+            )
         }
         _ => {
             let path = def_path(db, caller, func.module(db), name);
@@ -764,8 +783,11 @@ fn impl_type_name<'db>(
 fn turbofish<'db>(db: &'db Db, caller: Crate, own: &[GenericArg<'db>]) -> String {
     let target = DisplayTarget::from_crate(db, caller);
     // alloc: the text of a diagnostic, made when it is reported
-    let shown: Vec<String> =
-        own.iter().filter(|it| it.region().is_none()).map(|it| it.display(db, target).to_string()).collect();
+    let shown: Vec<String> = own
+        .iter()
+        .filter(|it| it.region().is_none())
+        .map(|it| it.display(db, target).to_string())
+        .collect();
     match shown.is_empty() {
         // alloc: none, empty
         true => String::new(),
@@ -825,7 +847,8 @@ fn def_path<'db>(db: &'db Db, caller: Crate, mut module: ModuleIdLt<'db>, name: 
 /// name, then its `impl`'s type or its trait for an associated item.
 fn owner_segments(db: &Db, caller: Crate, owner: DefWithBodyId, segments: &mut Vec<String>) {
     // alloc: the text of a diagnostic, made when it is reported
-    let named = |name: Option<&hir_expand::name::Name>| name.map_or("_", |it| it.as_str()).to_owned();
+    let named =
+        |name: Option<&hir_expand::name::Name>| name.map_or("_", |it| it.as_str()).to_owned();
     let container = match owner {
         DefWithBodyId::FunctionId(it) => {
             segments.push(named(Some(&FunctionSignature::of(db, it).name)));
@@ -848,7 +871,9 @@ fn owner_segments(db: &Db, caller: Crate, owner: DefWithBodyId, segments: &mut V
     };
     match container {
         ItemContainerId::ImplId(impl_) => segments.push(impl_type_name(db, caller, impl_, None)),
-        ItemContainerId::TraitId(trait_) => segments.push(named(Some(&TraitSignature::of(db, trait_).name))),
+        ItemContainerId::TraitId(trait_) => {
+            segments.push(named(Some(&TraitSignature::of(db, trait_).name)))
+        }
         ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {}
     }
 }

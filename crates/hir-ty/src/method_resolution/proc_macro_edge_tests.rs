@@ -55,7 +55,11 @@ fn called_in(db: &Db, krate: Crate, name: &str) -> Vec<Option<Crate>> {
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .find_map(|it| match it {
-            ModuleDefId::FunctionId(func) if FunctionSignature::of(db, func).name.as_str() == name => Some(func),
+            ModuleDefId::FunctionId(func)
+                if FunctionSignature::of(db, func).name.as_str() == name =>
+            {
+                Some(func)
+            }
             _ => None,
         })
         .unwrap_or_else(|| panic!("no function `{name}`"));
@@ -87,14 +91,24 @@ fn a_proc_macros_sysroot_is_not_its_users() {
 #[test]
 fn a_proc_macros_impls_are_not_its_users() {
     let db = fixture::db(FIXTURE).into_db();
-    let (main, pm, syn) = (crate_named(&db, "main"), crate_named(&db, "pm"), crate_named(&db, "syn"));
+    let (main, pm, syn) =
+        (crate_named(&db, "main"), crate_named(&db, "pm"), crate_named(&db, "syn"));
     let loaded = loaded_crates(&db, main);
-    assert!(!loaded.iter().any(|it| [pm, syn, crate_named(&db, "std")].contains(it)), "main loads {loaded:?}");
+    assert!(
+        !loaded.iter().any(|it| [pm, syn, crate_named(&db, "std")].contains(it)),
+        "main loads {loaded:?}"
+    );
     assert!(loaded_crates(&db, pm).contains(&syn), "the macro's crate loads its own dependencies");
     let syn_impls = TraitImpls::for_crate(&db, syn);
     assert!(
-        !TraitImpls::for_crate_and_deps(&db, main).iter().any(|it| triomphe::Arc::ptr_eq(it, syn_impls)),
+        !TraitImpls::for_crate_and_deps(&db, main)
+            .iter()
+            .any(|it| triomphe::Arc::ptr_eq(it, syn_impls)),
         "`impl Parse for u8` of the macro's `syn` is among main's impls"
     );
-    assert!(TraitImpls::for_crate_and_deps(&db, pm).iter().any(|it| triomphe::Arc::ptr_eq(it, syn_impls)));
+    assert!(
+        TraitImpls::for_crate_and_deps(&db, pm)
+            .iter()
+            .any(|it| triomphe::Arc::ptr_eq(it, syn_impls))
+    );
 }

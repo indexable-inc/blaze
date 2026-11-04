@@ -67,7 +67,8 @@ impl<'t> Binder<'t> {
     fn of(node: ast::Node<'t>) -> Option<Binder<'t>> {
         let binder = |kind, for_binder: Option<ast::ForBinder<'t>>, at: TextRange| {
             let list = for_binder.and_then(|it| it.generic_param_list());
-            let span = for_binder.map_or(TextRange::empty(at.start()), |it| it.syntax().text_range());
+            let span =
+                for_binder.map_or(TextRange::empty(at.start()), |it| it.syntax().text_range());
             Some(Binder { kind, list, span, node })
         };
         if let Some(it) = cast::<ast::ForType>(node) {
@@ -99,9 +100,10 @@ impl<'t> Binder<'t> {
         }
         let kind = match cast::<ast::Item>(node)? {
             ast::Item::Fn(_) => Kind::Function,
-            ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_) | ast::Item::Trait(_) => {
-                Kind::Item
-            }
+            ast::Item::Struct(_)
+            | ast::Item::Enum(_)
+            | ast::Item::Union(_)
+            | ast::Item::Trait(_) => Kind::Item,
             ast::Item::TypeAlias(_) => {
                 let in_impl = node
                     .parent()
@@ -128,7 +130,13 @@ impl<'t> Binder<'t> {
         Some(Binder { kind, list, span, node })
     }
 
-    fn declares(&self, cx: &Cx<'_, '_>, file: HirFileId, name: &str, key: Key) -> Option<ast::Lifetime<'t>> {
+    fn declares(
+        &self,
+        cx: &Cx<'_, '_>,
+        file: HirFileId,
+        name: &str,
+        key: Key,
+    ) -> Option<ast::Lifetime<'t>> {
         declared(cx, file, self.list?, name, key)
     }
 }
@@ -166,7 +174,11 @@ fn declared<'t>(
 /// The impl or trait among whose items a macro call emitted `item`, through the calls of
 /// expansions emitted at the top of another: its generics are a rib of `item`'s, as in rustc,
 /// where a `macro_rules!` lifetime has no hygiene and resolves where the macro expands.
-fn around_call<'db>(cx: &Cx<'_, 'db>, mut file: HirFileId, item: ast::Node<'db>) -> Option<(HirFileId, ast::Node<'db>)> {
+fn around_call<'db>(
+    cx: &Cx<'_, 'db>,
+    mut file: HirFileId,
+    item: ast::Node<'db>,
+) -> Option<(HirFileId, ast::Node<'db>)> {
     if item.parent()?.parent().is_some() {
         return None;
     }
@@ -183,7 +195,11 @@ fn around_call<'db>(cx: &Cx<'_, 'db>, mut file: HirFileId, item: ast::Node<'db>)
     }
 }
 
-pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime: ast::Lifetime<'db>) -> Option<Found> {
+pub(super) fn check<'db>(
+    cx: &Cx<'_, 'db>,
+    signature: &Signature<'db>,
+    lifetime: ast::Lifetime<'db>,
+) -> Option<Found> {
     let name = lifetime.text();
     if name == "'static" || name == "'_" {
         return None;
@@ -235,7 +251,11 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime:
     let mut diag = match &outer {
         Some(outer) => {
             // clone: the error's span
-            let mut diag = Diag::error(Some("E0401"), "can't use generic parameters from outer item", span.clone());
+            let mut diag = Diag::error(
+                Some("E0401"),
+                "can't use generic parameters from outer item",
+                span.clone(),
+            );
             // clone: the error's span
             diag.span_label(span.clone(), "use of generic parameter from outer item");
             diag.span_label(at(outer.syntax().text_range()), "lifetime parameter from outer item");
@@ -243,21 +263,33 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime:
         }
         None => {
             // alloc: the error's message and span
-            let mut diag = Diag::error(Some("E0261"), format!("use of undeclared lifetime name `{name}`"), span.clone());
+            let mut diag = Diag::error(
+                Some("E0261"),
+                format!("use of undeclared lifetime name `{name}`"),
+                span.clone(),
+            );
             // clone: the error's span
             diag.span_label(span.clone(), "undeclared lifetime");
             diag
         }
     };
     if edit_distance(name, "'static", 2).is_some() {
-        diag.suggestion_verbose(span, "you may have misspelled the `'static` lifetime", "'static", Applicability::MachineApplicable);
+        diag.suggestion_verbose(
+            span,
+            "you may have misspelled the `'static` lifetime",
+            "'static",
+            Applicability::MachineApplicable,
+        );
     } else {
-        let generic_const_items = hir_def::unstable_features::UnstableFeatures::query(cx.db, cx.krate.base())
-            .iter()
-            .any(|it| it.as_str() == "generic_const_items");
+        let generic_const_items =
+            hir_def::unstable_features::UnstableFeatures::query(cx.db, cx.krate.base())
+                .iter()
+                .any(|it| it.as_str() == "generic_const_items");
         let mut noted = false;
         for binder in &binders {
-            if binder.kind == Kind::ImplAssocType || (binder.kind == Kind::ConstItem && !generic_const_items) {
+            if binder.kind == Kind::ImplAssocType
+                || (binder.kind == Kind::ConstItem && !generic_const_items)
+            {
                 continue;
             }
             let higher_ranked = binder.kind.is_higher_ranked();
@@ -271,12 +303,18 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime:
                     && let Some(bounds) = pred.type_bound_list()
                 {
                     for bound in bounds.bounds() {
-                        let (Some(for_binder), Some(ast::Type::PathType(ty))) = (bound.for_binder(), bound.ty()) else {
+                        let (Some(for_binder), Some(ast::Type::PathType(ty))) =
+                            (bound.for_binder(), bound.ty())
+                        else {
                             continue;
                         };
                         let start = bound.syntax().text_range().start();
                         removed.push(TextRange::new(start, ty.syntax().text_range().start()));
-                        for param in for_binder.generic_param_list().iter().flat_map(|it| it.lifetime_params()) {
+                        for param in for_binder
+                            .generic_param_list()
+                            .iter()
+                            .flat_map(|it| it.lifetime_params())
+                        {
                             if let Some(it) = param.lifetime()
                                 && !names.iter().any(|name| *name == it.text())
                             {
@@ -288,22 +326,30 @@ pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime:
                 }
                 let names = names.join(", ");
                 // alloc: the error's suggestion
-                let sugg = if higher_ranked { format!("for<{names}> ") } else { format!("<{names}>") };
+                let sugg =
+                    if higher_ranked { format!("for<{names}> ") } else { format!("<{names}>") };
                 (binder.span, sugg)
             } else {
-                let Some(angle) = binder.list.as_ref().and_then(|it| it.l_angle_token()) else { continue };
+                let Some(angle) = binder.list.as_ref().and_then(|it| it.l_angle_token()) else {
+                    continue;
+                };
                 // alloc: the error's suggestion
                 (TextRange::empty(angle.text_range().end()), format!("{name}, "))
             };
             let message = if higher_ranked {
                 // alloc: the error's suggestion
-                format!("consider making the {} lifetime-generic with a new `{name}` lifetime", binder.kind.descr())
+                format!(
+                    "consider making the {} lifetime-generic with a new `{name}` lifetime",
+                    binder.kind.descr()
+                )
             } else {
                 // alloc: the error's suggestion
                 format!("consider introducing lifetime `{name}` here")
             };
             // alloc: the error's suggestion
-            let parts = std::iter::once((at(insert), sugg)).chain(removed.into_iter().map(|it| (at(it), String::new()))).collect();
+            let parts = std::iter::once((at(insert), sugg))
+                .chain(removed.into_iter().map(|it| (at(it), String::new())))
+                .collect();
             diag.multipart_suggestion(message, parts, Applicability::MaybeIncorrect);
             if higher_ranked && !noted {
                 noted = true;

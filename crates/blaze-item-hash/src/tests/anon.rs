@@ -196,9 +196,8 @@ fn closure(db: &Db, def: DefWithBodyId) -> SolverDefId<'_> {
 #[test]
 fn a_record_of_a_renamed_body_names_the_same_definitions() {
     let before = db(&with_dep("pub fn f(a: u8) -> u8 { let c = |x: u8| x + a; c(dep::g()) }"));
-    let after = db(&with_dep(
-        "\n\npub fn renamed(b: u8) -> u8 { let k = |y: u8| y + b; k(dep::g()) }",
-    ));
+    let after =
+        db(&with_dep("\n\npub fn renamed(b: u8) -> u8 { let k = |y: u8| y + b; k(dep::g()) }"));
     let (old, new) = (body(&before, "f"), body(&after, "renamed"));
     assert_eq!(identity(&before, old), identity(&after, new));
 

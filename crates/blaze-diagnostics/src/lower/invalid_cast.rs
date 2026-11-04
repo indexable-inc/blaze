@@ -21,12 +21,12 @@ use syntax::{
 };
 
 use super::binary_operator_cannot_be_applied::{adt_def_span, code_fact};
-use stdx::list::Join;
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
+use stdx::list::Join;
 
 /// The parts of the cast rustc's spans name: the whole `x as T`, `x` and `T`.
 struct Spans {
@@ -57,7 +57,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
     let e = cx.ty(&d.expr_ty);
     let c = cx.ty(&d.cast_ty);
     // alloc: the error's text, for an error hir found
-    let invalid = || Diag::error(Some("E0606"), format!("casting `{e}` as `{c}` is invalid"), spans.span.clone());
+    let invalid = || {
+        Diag::error(Some("E0606"), format!("casting `{e}` as `{c}` is invalid"), spans.span.clone())
+    };
     let operand_is_borrow = matches!(operand, Some(ast::Expr::RefExpr(_)));
 
     let mut diag = match d.error {
@@ -134,7 +136,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
             let mut diag = invalid();
             use hir::CastPointerKind::*;
             let note = match (d.expr_pointer, d.cast_pointer) {
-                (Some(VTable(_)), Some(VTable(_))) => Some("the trait objects may have different vtables"),
+                (Some(VTable(_)), Some(VTable(_))) => {
+                    Some("the trait objects may have different vtables")
+                }
                 (Some(OfParam(_) | OfAlias), Some(OfParam(_) | OfAlias | VTable(_) | Length))
                 | (Some(VTable(_) | Length), Some(OfParam(_) | OfAlias)) => {
                     Some("the pointers may have different metadata")
@@ -151,7 +155,11 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
         }
         CastError::CastToBool => {
             // alloc: the error's text, for an error hir found
-            let mut diag = Diag::error(Some("E0054"), format!("cannot cast `{e}` as `bool`"), spans.span.clone());
+            let mut diag = Diag::error(
+                Some("E0054"),
+                format!("cannot cast `{e}` as `bool`"),
+                spans.span.clone(),
+            );
             if is_numeric(&d.expr_ty) {
                 diag.suggestion_verbose(
                     spans.expr.shrink_to_hi().with_hi(spans.span.hi),
@@ -243,7 +251,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
                 "consider casting this expression to `*const ()`, then using `core::ptr::from_raw_parts`",
             );
             if let Some(hir::CastPointerKind::OfParam(param)) = d.cast_pointer
-                && d.cast_ty.as_raw_ptr().is_some_and(|(pointee, _)| pointee.as_type_param(cx.db).is_some())
+                && d.cast_ty
+                    .as_raw_ptr()
+                    .is_some_and(|(pointee, _)| pointee.as_type_param(cx.db).is_some())
             {
                 // alloc: the error's text, for an error hir found
                 diag.note(format!(
@@ -283,7 +293,11 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
         }
         CastError::UnknownCastPtrKind => {
             // clone: on the error path, for an error hir found
-            let mut diag = Diag::error(Some("E0641"), "cannot cast to a pointer of an unknown kind", spans.cast.clone());
+            let mut diag = Diag::error(
+                Some("E0641"),
+                "cannot cast to a pointer of an unknown kind",
+                spans.cast.clone(),
+            );
             // clone: on the error path, for an error hir found
             diag.span_label(spans.cast.clone(), "needs more type information");
             diag.note("the type information given here is insufficient to check whether the pointer cast is valid");
@@ -291,7 +305,11 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
         }
         CastError::UnknownExprPtrKind => {
             // clone: on the error path, for an error hir found
-            let mut diag = Diag::error(Some("E0641"), "cannot cast from a pointer of an unknown kind", spans.cast.clone());
+            let mut diag = Diag::error(
+                Some("E0641"),
+                "cannot cast from a pointer of an unknown kind",
+                spans.cast.clone(),
+            );
             diag.span_label(
                 // clone: on the error path, for an error hir found
                 spans.span.clone(),
@@ -327,12 +345,18 @@ fn non_scalar<'db>(
     c: &str,
 ) -> Diag {
     // alloc: the error's text, for an error hir found
-    let mut diag = Diag::error(Some("E0605"), format!("non-primitive cast: `{e}` as `{c}`"), spans.span.clone());
+    let mut diag = Diag::error(
+        Some("E0605"),
+        format!("non-primitive cast: `{e}` as `{c}`"),
+        spans.span.clone(),
+    );
     if let Some(ast::Expr::RefExpr(_)) = operand
         && let Some(snippet) = cx.snippet(&spans.expr)
     {
         // alloc: the error's text, for an error hir found
-        diag.note(format!("casting reference expression `{snippet}` because `&` binds tighter than `as`"));
+        diag.note(format!(
+            "casting reference expression `{snippet}` because `&` binds tighter than `as`"
+        ));
     }
 
     let prefix = |it: hir::Mutability| match it {
@@ -349,7 +373,8 @@ fn non_scalar<'db>(
             && coerces(&pointee, mutability)
         {
             // alloc: the suggestion's text, for an error hir found
-            sugg = Some((format!("&{}*", prefix(mutability)), cx.ty(&cast_inner) == cx.ty(&pointee)));
+            sugg =
+                Some((format!("&{}*", prefix(mutability)), cx.ty(&cast_inner) == cx.ty(&pointee)));
         } else if let Some((expr_inner, hir::Mutability::Shared)) = d.expr_ty.as_reference()
             && mutability == hir::Mutability::Mut
             && coerces(&expr_inner, hir::Mutability::Mut)
@@ -390,7 +415,11 @@ fn non_scalar<'db>(
             // alloc: empty, allocates nothing
             parts.push((spans.expr.shrink_to_hi().to(&spans.cast), String::new()));
         }
-        diag.multipart_suggestion("consider borrowing the value", parts, Applicability::MachineApplicable);
+        diag.multipart_suggestion(
+            "consider borrowing the value",
+            parts,
+            Applicability::MachineApplicable,
+        );
     } else if !(d.cast_ty.is_fn() || d.cast_ty.is_closure()) {
         if let Some(from) = core_trait(cx, sym::convert, sym::From)
             && d.cast_ty.impls_trait(cx.db, from, std::slice::from_ref(&d.expr_ty))
@@ -398,7 +427,8 @@ fn non_scalar<'db>(
             let to = match d.cast_ty.as_adt() {
                 Some(adt) => {
                     // alloc: the suggestion's text, for an error hir found
-                    let args: Vec<String> = d.cast_ty.type_arguments().map(|it| cx.ty(&it)).collect();
+                    let args: Vec<String> =
+                        d.cast_ty.type_arguments().map(|it| cx.ty(&it)).collect();
                     let path = cx.def_path(hir::ModuleDef::Adt(adt));
                     // alloc: the suggestion's text, for an error hir found
                     if args.is_empty() { path } else { format!("{path}::<{}>", args.join(", ")) }
@@ -441,11 +471,18 @@ fn non_scalar<'db>(
 }
 
 /// rustc's `try_suggest_collection_to_bool`: `s as bool` of a string or a slice.
-fn collection_to_bool<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>, spans: &Spans, diag: &mut Diag) {
+fn collection_to_bool<'db>(
+    cx: &Cx<'_, 'db>,
+    d: &hir::InvalidCast<'db>,
+    spans: &Spans,
+    diag: &mut Diag,
+) {
     if !d.cast_ty.is_bool() {
         return;
     }
-    let Some(deref) = d.expr_ty.autoderef(cx.db).find(|it| it.is_str() || it.is_slice()) else { return };
+    let Some(deref) = d.expr_ty.autoderef(cx.db).find(|it| it.is_str() || it.is_slice()) else {
+        return;
+    };
     let deref_ty = cx.ty(&deref);
     if deref_ty != cx.ty(&d.expr_ty.strip_references()) {
         diag.span_note(

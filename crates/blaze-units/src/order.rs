@@ -6,7 +6,9 @@
 
 use std::cmp::Ordering;
 
-use blaze_manifest::profiles::{DebugInfo, Lto, PanicStrategy, Profile, ProfileRoot, Strip, StripInner};
+use blaze_manifest::profiles::{
+    DebugInfo, Lto, PanicStrategy, Profile, ProfileRoot, Strip, StripInner,
+};
 use blaze_manifest::targets::{CrateType, Target, TargetKind};
 use cargo_util_schemas::manifest::{TomlDebugInfo, TomlTrimPaths};
 

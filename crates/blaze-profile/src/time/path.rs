@@ -27,8 +27,14 @@ pub enum LinkKind {
 }
 
 impl LinkKind {
-    pub const ALL: [LinkKind; 6] =
-        [LinkKind::Ran, LinkKind::Waited, LinkKind::Wake, LinkKind::Queued, LinkKind::Spawned, LinkKind::Unrecorded];
+    pub const ALL: [LinkKind; 6] = [
+        LinkKind::Ran,
+        LinkKind::Waited,
+        LinkKind::Wake,
+        LinkKind::Queued,
+        LinkKind::Spawned,
+        LinkKind::Unrecorded,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -67,9 +73,13 @@ pub enum Reached {
     BuildStart,
     /// The start of a lane the record names no spawner of: a job given to the pool by a thread
     /// on no fiber inside no span the model has, or one whose spawner has no lane.
-    LaneStart { lane: usize },
+    LaneStart {
+        lane: usize,
+    },
     /// Its bound of steps, [`fuel`] of the model.
-    Fuel { steps: usize },
+    Fuel {
+        steps: usize,
+    },
     /// No lane ran at all.
     NoRun,
 }
@@ -162,17 +172,23 @@ pub fn critical(model: &Model) -> Path {
         let interval = &model.lanes[lane].intervals[i];
         let from = interval.from_ns.max(start);
         let mut link = |kind: LinkKind, from: i64, to: i64| {
-            links.push(Link { kind, lane, interval: i, from_ns: from, to_ns: to, wakes: wakes.take() });
+            links.push(Link {
+                kind,
+                lane,
+                interval: i,
+                from_ns: from,
+                to_ns: to,
+                wakes: wakes.take(),
+            });
         };
         let kind = match interval.state {
             State::Running { .. } => LinkKind::Ran,
             State::Queued { .. } => LinkKind::Queued,
             State::Unrecorded { .. } => LinkKind::Unrecorded,
             State::Parked { wait } | State::ParkedOrQueued { wait } => {
-                let waker = model.waits[wait]
-                    .waker
-                    .lane()
-                    .filter(|&it| model.lanes[it].begin_ns() < t && model.lanes[it].end_ns() > from);
+                let waker = model.waits[wait].waker.lane().filter(|&it| {
+                    model.lanes[it].begin_ns() < t && model.lanes[it].end_ns() > from
+                });
                 match waker {
                     Some(waker) if crossed_at != Some(t) => {
                         // The waker's work up to the wake stands on the path in place of the wait;
@@ -283,9 +299,12 @@ pub struct OnPath {
 /// tie), and the path's running time under none.
 pub fn by_query(model: &Model, path: &Path) -> Vec<OnPath> {
     // alloc: once a report
-    let mut sums: HashMap<(Option<&str>, Option<&str>), (i64, u64), Global> = HashMap::new_in(Global);
+    let mut sums: HashMap<(Option<&str>, Option<&str>), (i64, u64), Global> =
+        HashMap::new_in(Global);
     for (from, to, span, _) in segments(model, path) {
-        let key = span.map_or((None, None), |it| (Some(model.spans[it].name.as_str()), model.spans[it].subject()));
+        let key = span.map_or((None, None), |it| {
+            (Some(model.spans[it].name.as_str()), model.spans[it].subject())
+        });
         let sum = sums.entry(key).or_insert((0, 0));
         sum.0 += to - from;
         sum.1 += 1;
@@ -293,9 +312,16 @@ pub fn by_query(model: &Model, path: &Path) -> Vec<OnPath> {
     let mut out: Vec<OnPath> = sums
         .into_iter()
         // alloc: a row's labels, once a row a report
-        .map(|((name, subject), (ns, stretches))| OnPath { name: name.map(str::to_owned), subject: subject.map(str::to_owned), ns, stretches })
+        .map(|((name, subject), (ns, stretches))| OnPath {
+            name: name.map(str::to_owned),
+            subject: subject.map(str::to_owned),
+            ns,
+            stretches,
+        })
         // alloc: once a report
         .collect();
-    out.sort_by(|a, b| b.ns.cmp(&a.ns).then_with(|| (&a.name, &a.subject).cmp(&(&b.name, &b.subject))));
+    out.sort_by(|a, b| {
+        b.ns.cmp(&a.ns).then_with(|| (&a.name, &a.subject).cmp(&(&b.name, &b.subject)))
+    });
     out
 }

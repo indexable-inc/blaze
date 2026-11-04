@@ -133,7 +133,9 @@ fn sites_of<'db>(db: &'db Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'
         let Some(atomic) = atomic_of(db, def, analysis, receiver) else { continue };
         let role = match callee.name {
             "store" | "swap" => {
-                let relaxed = args.get(1).and_then(|&it| general_facts::ordering(db, def, analysis, it)) == Some("Relaxed");
+                let relaxed =
+                    args.get(1).and_then(|&it| general_facts::ordering(db, def, analysis, it))
+                        == Some("Relaxed");
                 if !relaxed {
                     continue;
                 }
@@ -154,7 +156,12 @@ fn sites_of<'db>(db: &'db Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'
 }
 
 /// The atomic the receiver `expr` is: a field, or a `static`, under references and derefs.
-fn atomic_of(db: &Db, def: DefWithBodyId, analysis: &hir::BodyAnalysis<'_>, expr: ExprId) -> Option<Atomic> {
+fn atomic_of(
+    db: &Db,
+    def: DefWithBodyId,
+    analysis: &hir::BodyAnalysis<'_>,
+    expr: ExprId,
+) -> Option<Atomic> {
     let body = analysis.body();
     let mut at = expr;
     for _ in 0..8 {
@@ -191,14 +198,17 @@ fn guards<'db>(
     let mut at = load;
     for parent in parents.up(load, 8) {
         match body.expr(parent) {
-            Expr::UnaryOp { op: UnaryOp::Not, .. } | Expr::BinaryOp { op: Some(BinaryOp::LogicOp(_)), .. } => at = parent,
+            Expr::UnaryOp { op: UnaryOp::Not, .. }
+            | Expr::BinaryOp { op: Some(BinaryOp::LogicOp(_)), .. } => at = parent,
             Expr::If { condition, then_branch, .. } if condition == at => {
                 return reads_data(db, analysis, parents, then_branch);
             }
             Expr::UnaryOp { op: UnaryOp::Deref, .. } if pointer && at == load => return true,
             Expr::Block { statements, .. } if pointer && at == load => {
                 let pat = statements.iter().find_map(|it| match it {
-                    Statement::Let { pat, initializer: Some(init), .. } if init == load => Some(pat),
+                    Statement::Let { pat, initializer: Some(init), .. } if init == load => {
+                        Some(pat)
+                    }
                     _ => None,
                 });
                 let Some(pat) = pat else { return false };
@@ -213,7 +223,12 @@ fn guards<'db>(
 
 /// Whether the branch `branch` reads data other than an atomic: a field that is not the
 /// receiver of an atomic's own method, a dereference or an index. A walk that runs out says no.
-fn reads_data<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, parents: &facts::Parents, branch: ExprId) -> bool {
+fn reads_data<'db>(
+    db: &'db Db,
+    analysis: &hir::BodyAnalysis<'db>,
+    parents: &facts::Parents,
+    branch: ExprId,
+) -> bool {
     let body = analysis.body();
     let mut reads = false;
     let walked = general_facts::walk(body, branch, |id| {
@@ -227,7 +242,12 @@ fn reads_data<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, parents: &fac
 }
 
 /// Whether the field expression `field` is the receiver of a method of one of core's atomics.
-fn atomic_receiver<'db>(db: &'db Db, analysis: &hir::BodyAnalysis<'db>, parents: &facts::Parents, field: ExprId) -> bool {
+fn atomic_receiver<'db>(
+    db: &'db Db,
+    analysis: &hir::BodyAnalysis<'db>,
+    parents: &facts::Parents,
+    field: ExprId,
+) -> bool {
     let Some(parent) = parents.of_expr(field) else { return false };
     let Expr::MethodCall { receiver, .. } = analysis.body().expr(parent) else { return false };
     receiver == field
@@ -304,7 +324,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             Role::Publish => &uses.guard,
             Role::Guard => &uses.publish,
         };
-        let Some(&other) = others.iter().find(|&&it| it != def).or(others.first()) else { continue };
+        let Some(&other) = others.iter().find(|&&it| it != def).or(others.first()) else {
+            continue;
+        };
         let Some(range) = analysis.expr_range(site.expr) else { continue };
         if exempt::commented(cx.text(), range, TAG) || documented(db, site.atomic) {
             continue;
@@ -317,12 +339,16 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         };
         let (message, note) = match site.role {
             Role::Publish => (
-                format!("this `Relaxed` store of {atomic} publishes it, and {other}{more} reads it with a load that guards other data"),
+                format!(
+                    "this `Relaxed` store of {atomic} publishes it, and {other}{more} reads it with a load that guards other data"
+                ),
                 "a thread whose load sees this value is not promised to see the writes made before the store; \
                  store with `Ordering::Release` (a `swap` with `AcqRel`) and load with `Ordering::Acquire`",
             ),
             Role::Guard => (
-                format!("this load of {atomic} guards other data, and {other}{more} sets it with a `Relaxed` store"),
+                format!(
+                    "this load of {atomic} guards other data, and {other}{more} sets it with a `Relaxed` store"
+                ),
                 "a `Relaxed` store orders nothing before it, so the data this branch reads may not be written yet \
                  when the load sees the value; load with `Ordering::Acquire` and store with `Ordering::Release`",
             ),

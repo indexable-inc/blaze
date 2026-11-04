@@ -15,7 +15,8 @@ use base_db::Db;
 use blaze_hash::HashSet;
 use blaze_mem::scratch::Lent;
 use hir_def::{
-    AdtId, ExpressionStoreOwnerId, ExternCrateId, FunctionId, GenericDefId, ItemContainerId, Lookup,
+    AdtId, ExpressionStoreOwnerId, ExternCrateId, FunctionId, GenericDefId, ItemContainerId,
+    Lookup,
     hir::{ClosureKind, CoroutineKind, CoroutineSource, ExprId, generics::GenericParams},
 };
 use hir_expand::name::Name;
@@ -64,8 +65,13 @@ pub struct Mode {
 }
 
 impl Mode {
-    pub const NORMAL: Mode =
-        Mode { spelling: Spelling::Diagnostic, forced: false, untrimmed: false, erase: false, type_limit: None };
+    pub const NORMAL: Mode = Mode {
+        spelling: Spelling::Diagnostic,
+        forced: false,
+        untrimmed: false,
+        erase: false,
+        type_limit: None,
+    };
     pub const UNTRIMMED: Mode = Mode { untrimmed: true, ..Mode::NORMAL };
     pub const ERASED: Mode = Mode { erase: true, ..Mode::NORMAL };
     pub const TYPE_NAME: Mode = Mode { spelling: Spelling::TypeName, ..Mode::NORMAL };
@@ -97,7 +103,14 @@ pub trait DiagnosticHost {
     fn extern_crate(&self, krate: base_db::Crate) -> Option<ExternCrateId>;
     /// `file:l:c: l:c` of rustc's `def_span` of the closure-like expression `expr` of `owner`
     /// (`file:l:c` of the start, the file's name only, when `short`), written to `out`.
-    fn closure_span(&self, owner: ExpressionStoreOwnerId, expr: ExprId, kind: ClosureKind, short: bool, out: &mut String);
+    fn closure_span(
+        &self,
+        owner: ExpressionStoreOwnerId,
+        expr: ExprId,
+        kind: ClosureKind,
+        short: bool,
+        out: &mut String,
+    );
     /// The source text of the anonymous constant `expr` of `owner`, written to `out`.
     fn anon_const_text(&self, owner: ExpressionStoreOwnerId, expr: ExprId, out: &mut String);
 }
@@ -118,12 +131,13 @@ struct Frame {
 
 /// rustc's names for anonymous regions, `'a` to `'z`.
 const LETTERS: [&str; 26] = [
-    "'a", "'b", "'c", "'d", "'e", "'f", "'g", "'h", "'i", "'j", "'k", "'l", "'m", "'n", "'o", "'p", "'q", "'r",
-    "'s", "'t", "'u", "'v", "'w", "'x", "'y", "'z",
+    "'a", "'b", "'c", "'d", "'e", "'f", "'g", "'h", "'i", "'j", "'k", "'l", "'m", "'n", "'o", "'p",
+    "'q", "'r", "'s", "'t", "'u", "'v", "'w", "'x", "'y", "'z",
 ];
 
 /// The rule not reproduced when no more specific one is named.
-pub(crate) const NOT_LOOKED_UP: &str = "a part of it whose path, constant or generic argument could not be looked up";
+pub(crate) const NOT_LOOKED_UP: &str =
+    "a part of it whose path, constant or generic argument could not be looked up";
 
 pub struct Printer<'h, 't> {
     pub db: &'t Db,
@@ -158,14 +172,23 @@ pub struct Generics {
 
 impl<'h, 't> Printer<'h, 't> {
     /// A printer for a diagnostic about `host`'s crate.
-    pub fn diagnostic(db: &'t Db, host: &'h dyn DiagnosticHost, mode: Mode, in_value: bool) -> Self {
+    pub fn diagnostic(
+        db: &'t Db,
+        host: &'h dyn DiagnosticHost,
+        mode: Mode,
+        in_value: bool,
+    ) -> Self {
         debug_assert_eq!(mode.spelling, Spelling::Diagnostic);
         Self::with(db, Some(host), mode, in_value)
     }
 
     /// A printer of `type_name`'s, a symbol's or debug info's spelling.
     pub fn spelled(db: &'t Db, spelling: Spelling) -> Self {
-        assert_ne!(spelling, Spelling::Diagnostic, "a diagnostic is printed for a crate, by `Printer::diagnostic`");
+        assert_ne!(
+            spelling,
+            Spelling::Diagnostic,
+            "a diagnostic is printed for a crate, by `Printer::diagnostic`"
+        );
         Self::with(db, None, Mode { spelling, ..Mode::NORMAL }, false)
     }
 
@@ -302,7 +325,9 @@ impl<'h, 't> Printer<'h, 't> {
     /// rustc's `pretty_print_region`; `'_` for every region outside a diagnostic.
     pub(crate) fn print_region(&mut self, r: Region<'t>) {
         let kind = r.kind();
-        if !self.diagnostic_spelling() || (self.mode.erase && !matches!(kind, RegionKind::ReBound(..))) {
+        if !self.diagnostic_spelling()
+            || (self.mode.erase && !matches!(kind, RegionKind::ReBound(..)))
+        {
             return self.write_str("'_");
         }
         match kind {
@@ -322,8 +347,12 @@ impl<'h, 't> Printer<'h, 't> {
     /// a name it has, else the next of `'a`, `'b`, … no region in sight is called), prints
     /// `for<..> ` unless paths are forced trimmed, then `f` of the bound value. Outside a
     /// diagnostic no region is named and no binder printed.
-    pub(crate) fn wrap_binder<T>(&mut self, binder: &Binder<'t, T>, kind: BinderKind, f: impl FnOnce(&mut Self, &T))
-    where
+    pub(crate) fn wrap_binder<T>(
+        &mut self,
+        binder: &Binder<'t, T>,
+        kind: BinderKind,
+        f: impl FnOnce(&mut Self, &T),
+    ) where
         T: TypeVisitable<DbInterner<'t>>,
     {
         let value = binder.as_ref().skip_binder();
@@ -349,29 +378,41 @@ impl<'h, 't> Printer<'h, 't> {
         let letters: SmallVec<[Symbol; 26]> = match bound.found.is_empty() {
             true => SmallVec::new(),
             // alloc: none, at most 26 inline in the `SmallVec`
-            false => LETTERS.iter().map(|it| Symbol::intern(it)).filter(|it| !self.used_names.contains(it)).collect(),
+            false => LETTERS
+                .iter()
+                .map(|it| Symbol::intern(it))
+                .filter(|it| !self.used_names.contains(it))
+                .collect(),
         };
         let mut taken = 0;
         let mut region_index = self.region_index;
         let mut names: SmallVec<[(u32, Symbol); 4]> = SmallVec::new();
         for br in bound.found {
             let own = match br.kind {
-                BoundRegionKind::Named(_) if kind == BinderKind::Signature && !self.mode.erase => late_name(self.db, br),
-                BoundRegionKind::NamedForPrinting(name) if !self.mode.erase && name.0.as_str() != "'_" => Some(name.0),
+                BoundRegionKind::Named(_) if kind == BinderKind::Signature && !self.mode.erase => {
+                    late_name(self.db, br)
+                }
+                BoundRegionKind::NamedForPrinting(name)
+                    if !self.mode.erase && name.0.as_str() != "'_" =>
+                {
+                    Some(name.0)
+                }
                 _ => None,
             };
-            let name = own.unwrap_or_else(|| loop {
-                let name = match letters.get(taken) {
-                    Some(it) => {
-                        taken += 1;
-                        *it
+            let name = own.unwrap_or_else(|| {
+                loop {
+                    let name = match letters.get(taken) {
+                        Some(it) => {
+                            taken += 1;
+                            *it
+                        }
+                        // alloc: a region past `'z` named, printing a type, the edge
+                        None => Symbol::intern(&format!("'z{}", region_index - letters.len())),
+                    };
+                    region_index += 1;
+                    if !self.used_names.contains(&name) {
+                        break name;
                     }
-                    // alloc: a region past `'z` named, printing a type, the edge
-                    None => Symbol::intern(&format!("'z{}", region_index - letters.len())),
-                };
-                region_index += 1;
-                if !self.used_names.contains(&name) {
-                    break name;
                 }
             });
             names.push((br.var.as_u32(), name));
@@ -483,9 +524,13 @@ impl<'h, 't> Printer<'h, 't> {
     pub(crate) fn closure_segments(&mut self, closures: &[(usize, ClosureKind)]) {
         for &(place, kind) in closures {
             match self.mode.spelling {
-                Spelling::Diagnostic | Spelling::Symbol => self.path_segment_fmt(format_args!("{{closure#{place}}}")),
+                Spelling::Diagnostic | Spelling::Symbol => {
+                    self.path_segment_fmt(format_args!("{{closure#{place}}}"))
+                }
                 Spelling::TypeName => self.path_segment_fmt(format_args!("{{{{closure}}}}")),
-                Spelling::Debug => self.path_segment_fmt(format_args!("{{{}#{place}}}", kind_label(kind))),
+                Spelling::Debug => {
+                    self.path_segment_fmt(format_args!("{{{}#{place}}}", kind_label(kind)))
+                }
             }
         }
     }
@@ -550,7 +595,10 @@ impl<'h, 't> Printer<'h, 't> {
         let Some(name) = def.name(db) else { return false };
         match def {
             Def::Function(_) | Def::Const(_) | Def::TypeAlias(_)
-                if matches!(def.container(db), Some(ItemContainerId::TraitId(_) | ItemContainerId::ImplId(_))) =>
+                if matches!(
+                    def.container(db),
+                    Some(ItemContainerId::TraitId(_) | ItemContainerId::ImplId(_))
+                ) =>
             {
                 let Some(ItemContainerId::TraitId(it)) = def.container(db) else {
                     return false;
@@ -569,7 +617,12 @@ impl<'h, 't> Printer<'h, 't> {
                 self.write_str("::");
             }
             Def::TypeAlias(_) if def.is_foreign(db) => return false,
-            Def::Adt(_) | Def::Trait(_) | Def::TypeAlias(_) | Def::Function(_) | Def::Const(_) | Def::Static(_) => {}
+            Def::Adt(_)
+            | Def::Trait(_)
+            | Def::TypeAlias(_)
+            | Def::Function(_)
+            | Def::Const(_)
+            | Def::Static(_) => {}
             _ => return false,
         }
         let name = self.local_name(name, def);
@@ -644,7 +697,9 @@ impl<'h, 't> Printer<'h, 't> {
                 let _ = write!(self.out, "{}", name.crate_name());
                 self.empty_path = false;
             }
-            None if self.diagnostic_spelling() => panic!("a dependency is named by the crate graph"),
+            None if self.diagnostic_spelling() => {
+                panic!("a dependency is named by the crate graph")
+            }
             None => self.refuse("a crate the crate graph gives no name"),
         }
     }
@@ -688,11 +743,17 @@ impl<'h, 't> Printer<'h, 't> {
         }
         match parent {
             // Debug info names no provided function of a trait by its type.
-            Parent::Def(Def::Trait(_)) if self.mode.spelling == Spelling::Debug && matches!(def, Def::Function(_)) => {
+            Parent::Def(Def::Trait(_))
+                if self.mode.spelling == Spelling::Debug && matches!(def, Def::Function(_)) =>
+            {
                 return self.refuse("a provided trait function in debug info");
             }
             Parent::Def(Def::Trait(it)) if qualify => {
-                let tr = TraitRef::new_from_args(self.interner, it.into(), GenericArgs::new_from_slice(parent_args));
+                let tr = TraitRef::new_from_args(
+                    self.interner,
+                    it.into(),
+                    GenericArgs::new_from_slice(parent_args),
+                );
                 self.print_path_with_qualified(tr.self_ty(), Some(tr));
             }
             parent => self.print_parent(&parent, parent_args),
@@ -736,7 +797,9 @@ impl<'h, 't> Printer<'h, 't> {
             return;
         };
         match module.containing_module(db) {
-            Some(outer) if module.is_block_module(db) => self.print_def_path(Def::Module(outer.to_static()), &[]),
+            Some(outer) if module.is_block_module(db) => {
+                self.print_def_path(Def::Module(outer.to_static()), &[])
+            }
             _ => self.print_crate_name(module.krate(db)),
         }
     }
@@ -767,7 +830,8 @@ impl<'h, 't> Printer<'h, 't> {
     fn print_debug_owner(&mut self, owner: Def) {
         let db = self.db;
         match (owner, owner.container(db)) {
-            (Def::Function(_) | Def::Const(_), Some(ItemContainerId::ModuleId(_))) | (Def::Static(_), _) => {
+            (Def::Function(_) | Def::Const(_), Some(ItemContainerId::ModuleId(_)))
+            | (Def::Static(_), _) => {
                 self.print_def_path(owner, &[]);
             }
             (Def::Function(func), _) => {
@@ -782,27 +846,44 @@ impl<'h, 't> Printer<'h, 't> {
     /// What a function is written in, as a debugger is told of it: its module; the type of an
     /// inherent impl of a type with a path when `inherent_as_type`, else `{impl#N}` by the
     /// impl's place in its module; or the trait.
-    pub(crate) fn print_debug_container(&mut self, func: FunctionId, args: &[GenericArg<'t>], inherent_as_type: bool) {
+    pub(crate) fn print_debug_container(
+        &mut self,
+        func: FunctionId,
+        args: &[GenericArg<'t>],
+        inherent_as_type: bool,
+    ) {
         let db = self.db;
         match func.lookup(db).container {
             ItemContainerId::ModuleId(module) => self.print_def_path(Def::Module(module), &[]),
             ItemContainerId::ImplId(impl_) => {
                 let parent_count = hir_ty::generics::generics(db, func.into()).len_parent();
-                let Some(parent_args) = args.get(..parent_count) else { return self.refuse(NOT_LOOKED_UP) };
-                let self_ty = db.impl_self_ty(impl_).instantiate(self.interner, parent_args).skip_normalization();
-                if inherent_as_type && db.impl_trait(impl_).is_none() && matches!(self_ty.kind(), TyKind::Adt(..)) {
+                let Some(parent_args) = args.get(..parent_count) else {
+                    return self.refuse(NOT_LOOKED_UP);
+                };
+                let self_ty = db
+                    .impl_self_ty(impl_)
+                    .instantiate(self.interner, parent_args)
+                    .skip_normalization();
+                if inherent_as_type
+                    && db.impl_trait(impl_).is_none()
+                    && matches!(self_ty.kind(), TyKind::Adt(..))
+                {
                     self.print_type(self_ty);
                     self.empty_path = false;
                     return;
                 }
                 let module = impl_.lookup(db).container;
                 let scope = module.def_map(db).module(db, module).scope(db);
-                let Some(place) = scope.impls().position(|it| it == impl_) else { return self.refuse(NOT_LOOKED_UP) };
+                let Some(place) = scope.impls().position(|it| it == impl_) else {
+                    return self.refuse(NOT_LOOKED_UP);
+                };
                 self.print_def_path(Def::Module(module), &[]);
                 self.path_segment_fmt(format_args!("{{impl#{place}}}"));
             }
             ItemContainerId::TraitId(trait_) => self.print_def_path(Def::Trait(trait_), &[]),
-            ItemContainerId::ExternBlockId(_) => self.refuse("a function of an `extern` block in debug info"),
+            ItemContainerId::ExternBlockId(_) => {
+                self.refuse("a function of an `extern` block in debug info")
+            }
         }
     }
 
@@ -842,7 +923,8 @@ impl<'h, 't> Printer<'h, 't> {
         self.params_as_holes = was || (holes && !self.diagnostic_spelling());
         let parent = def::parent(db, Def::Impl(it));
         let in_self_mod = matches!(self.characteristic_parent(self_ty), Some(Some(p)) if Some(&p) == parent.as_ref());
-        let in_trait_mod = trait_ref.is_some_and(|tr| def::parent(db, Def::Trait(tr.def_id.0)) == parent);
+        let in_trait_mod =
+            trait_ref.is_some_and(|tr| def::parent(db, Def::Trait(tr.def_id.0)) == parent);
         if !in_self_mod && !in_trait_mod {
             match &parent {
                 Some(parent) => self.print_parent(parent, &[]),
@@ -877,10 +959,14 @@ impl<'h, 't> Printer<'h, 't> {
                 let principal = preds.principal()?;
                 Some(def::parent(db, Def::Trait(principal.skip_binder().def_id.0)))
             }
-            TyKind::Pat(ty, _) | TyKind::Array(ty, _) | TyKind::Slice(ty) | TyKind::RawPtr(ty, _) | TyKind::Ref(_, ty, _) => {
-                self.characteristic_parent(ty)
+            TyKind::Pat(ty, _)
+            | TyKind::Array(ty, _)
+            | TyKind::Slice(ty)
+            | TyKind::RawPtr(ty, _)
+            | TyKind::Ref(_, ty, _) => self.characteristic_parent(ty),
+            TyKind::Tuple(tys) => {
+                tys.as_slice().iter().find_map(|it| self.characteristic_parent(*it))
             }
-            TyKind::Tuple(tys) => tys.as_slice().iter().find_map(|it| self.characteristic_parent(*it)),
             TyKind::FnDef(def, _) => match def.0 {
                 hir_def::CallableDefId::FunctionId(it) => Some(def::parent(db, Def::Function(it))),
                 _ => Some(None),
@@ -896,7 +982,11 @@ impl<'h, 't> Printer<'h, 't> {
 
     /// rustc's `pretty_print_path_with_qualified`: `S` for an inherent impl of a type with a
     /// path, `<S as Trait>` or `<&S>` else.
-    pub(crate) fn print_path_with_qualified(&mut self, self_ty: Ty<'t>, trait_ref: Option<TraitRef<'t>>) {
+    pub(crate) fn print_path_with_qualified(
+        &mut self,
+        self_ty: Ty<'t>,
+        trait_ref: Option<TraitRef<'t>>,
+    ) {
         if trait_ref.is_none()
             && matches!(
                 self_ty.kind(),
@@ -971,10 +1061,22 @@ impl<'h, 't> Printer<'h, 't> {
             Def::Impl(it) => it.into(),
             Def::Variant(it) => {
                 let enum_ = Def::Adt(AdtId::EnumId(it.lookup(self.db).parent));
-                return Generics { id: None, parent: Some(enum_), parent_count: args, count: args, has_self: false };
+                return Generics {
+                    id: None,
+                    parent: Some(enum_),
+                    parent_count: args,
+                    count: args,
+                    has_self: false,
+                };
             }
             Def::Module(_) | Def::Macro(_) | Def::ExternCrate(_) => {
-                return Generics { id: None, parent: None, parent_count: 0, count: 0, has_self: false };
+                return Generics {
+                    id: None,
+                    parent: None,
+                    parent_count: 0,
+                    count: 0,
+                    has_self: false,
+                };
             }
         };
         let generics = hir_ty::generics::generics(self.db, id);
@@ -992,8 +1094,13 @@ impl<'h, 't> Printer<'h, 't> {
     /// rustc's `own_args_no_defaults`: the definition's own arguments, a trait's `Self` left
     /// out, without the trailing ones that are their parameter's default. Debug info keeps
     /// the defaults.
-    pub fn own_args_no_defaults<'x>(&self, generics: &Generics, args: &'x [GenericArg<'t>]) -> &'x [GenericArg<'t>] {
-        let start = if generics.has_self && generics.parent.is_none() { 1 } else { generics.parent_count };
+    pub fn own_args_no_defaults<'x>(
+        &self,
+        generics: &Generics,
+        args: &'x [GenericArg<'t>],
+    ) -> &'x [GenericArg<'t>] {
+        let start =
+            if generics.has_self && generics.parent.is_none() { 1 } else { generics.parent_count };
         let mut end = generics.count.min(args.len());
         if let Some(id) = generics.id
             && self.mode.spelling != Spelling::Debug
@@ -1002,7 +1109,12 @@ impl<'h, 't> Printer<'h, 't> {
             while end > generics.parent_count {
                 let i = end - 1;
                 match defaults.get(i) {
-                    Some(default) if default.instantiate(self.interner, args).skip_normalization() == args[i] => end -= 1,
+                    Some(default)
+                        if default.instantiate(self.interner, args).skip_normalization()
+                            == args[i] =>
+                    {
+                        end -= 1
+                    }
                     _ => break,
                 }
             }
@@ -1100,7 +1212,9 @@ impl<'t> TypeVisitor<DbInterner<'t>> for UsedNames<'t, '_> {
         let name = match r.kind() {
             RegionKind::ReEarlyParam(p) => early_name(self.db, p).filter(|it| it.as_str() != "'_"),
             RegionKind::ReLateParam(p) => late_name(self.db, p.kind),
-            RegionKind::ReBound(BoundVarIndexKind::Bound(d), br) if self.signature && d == self.depth => {
+            RegionKind::ReBound(BoundVarIndexKind::Bound(d), br)
+                if self.signature && d == self.depth =>
+            {
                 late_name(self.db, br)
             }
             RegionKind::RePlaceholder(p) => late_name(self.db, p.bound),

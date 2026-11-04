@@ -64,7 +64,13 @@ impl Git {
             argument("a ref to fetch", reference)?;
         }
         // alloc: once per fetch, its argv
-        let mut args = vec!["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head"];
+        let mut args = vec![
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+        ];
         args.push(&self.remote);
         args.extend(refs.iter().map(String::as_str));
         let mut command = self.git(&args);
@@ -95,7 +101,9 @@ impl Git {
             .git(&args)
             .output()
             // alloc: error path
-            .map_err(|error| CheckoutError::new(format!("git did not start: {error}"), Some(shown(&args))))?;
+            .map_err(|error| {
+                CheckoutError::new(format!("git did not start: {error}"), Some(shown(&args)))
+            })?;
         match output.status.code() {
             Some(0) => Ok(true),
             // `--verify` ends 1 for a name that is no commit: none there, or an object of
@@ -121,8 +129,15 @@ impl Git {
                 // alloc: once per checkout, the diff's range
                 let from = format!("{from}^{{commit}}");
                 let to = format!("{to}^{{commit}}"); // alloc: once per checkout, the diff's range
-                let args =
-                    ["diff-tree", "-r", "-z", "--no-renames", "--no-abbrev", from.as_str(), to.as_str()];
+                let args = [
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-renames",
+                    "--no-abbrev",
+                    from.as_str(),
+                    to.as_str(),
+                ];
                 self.run(self.git(&args), &args)?.stdout
             }
             None => {
@@ -133,7 +148,8 @@ impl Git {
         };
         let changes = if from.is_some() { diff(&listed)? } else { listing(&listed)? };
         // alloc: once per checkout, a borrow per changed file
-        let blobs: Vec<&str> = changes.iter().filter_map(|it| it.blob.map(|(blob, _)| blob)).collect();
+        let blobs: Vec<&str> =
+            changes.iter().filter_map(|it| it.blob.map(|(blob, _)| blob)).collect();
         let mut contents = self.blobs(&blobs)?.into_iter();
         let mut ops: Vec<Op> = changes
             .into_iter()
@@ -198,11 +214,16 @@ impl Git {
             Err(misread) if status.success() || errors.trim_ascii().is_empty() => Err(misread),
             _ if !status.success() => {
                 // alloc: error path
-                Err(CheckoutError::new(format!("git failed ({status}): {}", last_line(&errors)), at()))
+                Err(CheckoutError::new(
+                    format!("git failed ({status}): {}", last_line(&errors)),
+                    at(),
+                ))
             }
             read => {
                 // alloc: error path
-                written.map_err(|error| CheckoutError::new(format!("writing to git: {error}"), at()))?;
+                written.map_err(|error| {
+                    CheckoutError::new(format!("writing to git: {error}"), at())
+                })?;
                 read
             }
         }
@@ -349,10 +370,15 @@ fn batch(from: &mut impl BufRead, blobs: &[&str]) -> Result<Vec<Vec<u8>>, Checko
         let mut bytes = vec![0; size + 1];
         from.read_exact(&mut bytes)
             // alloc: error path
-            .map_err(|error| CheckoutError::new(format!("reading blob {blob} from git: {error}"), at()))?;
+            .map_err(|error| {
+                CheckoutError::new(format!("reading blob {blob} from git: {error}"), at())
+            })?;
         if bytes.pop() != Some(b'\n') {
             // alloc: error path
-            return Err(CheckoutError::new(format!("git cat-file's blob {blob} did not end its record"), at()));
+            return Err(CheckoutError::new(
+                format!("git cat-file's blob {blob} did not end its record"),
+                at(),
+            ));
         }
         contents.push(bytes);
     }
@@ -396,7 +422,9 @@ fn shown(args: &[&str]) -> String {
     for arg in args {
         shown.push(' ');
         match arg.split_once("://") {
-            Some((scheme, rest)) if rest.split('/').next().is_some_and(|host| host.contains('@')) => {
+            Some((scheme, rest))
+                if rest.split('/').next().is_some_and(|host| host.contains('@')) =>
+            {
                 let after = &rest[rest.find('@').expect("an @ in the host part") + 1..];
                 shown.push_str(scheme);
                 shown.push_str("://***@");

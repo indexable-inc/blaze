@@ -20,8 +20,7 @@ use crate::utils::serialize_map_to_array::SeqHashMapToArray;
 ///
 /// A type can only be an ADT (structure or enumeration), as type aliases are
 /// inlined in MIR.
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[serde_state(state_implements = DedupSerializerState)]
 pub struct TypeDecl {
     pub def_id: TypeDeclId,
@@ -46,9 +45,9 @@ pub struct TypeDecl {
 generate_index_type!(VariantId, "Variant");
 generate_index_type!(FieldId, "Field");
 
-#[derive(Debug, Clone)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, EnumAsInner, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 pub enum TypeDeclKind {
     Struct(IndexVec<FieldId, Field>),
     Enum(IndexVec<VariantId, Variant>),
@@ -66,8 +65,7 @@ pub enum TypeDeclKind {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[serde_state(stateless)]
 pub struct Variant {
     pub id: VariantId,
@@ -83,8 +81,7 @@ pub struct Variant {
     pub discriminant: IntegerValue,
 }
 
-#[derive(Debug, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Debug, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[serde_state(stateless)]
 pub struct Field {
     pub span: Span,
@@ -102,9 +99,21 @@ pub struct Field {
 /// The metadata stored in a pointer. That's the information stored in pointers alongside
 /// their address. It's empty for `Sized` types, and interesting for unsized
 /// aka dynamically-sized types.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    EnumAsInner,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 #[serde_state(default_state = ())]
 pub enum PtrMetadata {
     /// Types that need no metadata, namely `T: Sized` types.
@@ -125,9 +134,9 @@ pub enum PtrMetadata {
 }
 
 /// Where a given type came from.
-#[derive(Debug, Clone)]
-#[derive(EnumAsInner)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, EnumAsInner, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Type"))]
 pub enum TypeSource {
     /// A normal type declaration.
@@ -149,8 +158,9 @@ pub enum TypeSource {
 }
 
 /// Which marker traits this type implements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 #[serde_state(stateless)]
 pub struct ImplementsMarkerTraits {
     pub is_sized: bool,
@@ -160,8 +170,9 @@ pub struct ImplementsMarkerTraits {
     pub is_unpin: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo,
+)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_prefix("VTable"))]
 pub enum VTableField {
     Size,
@@ -172,8 +183,19 @@ pub enum VTableField {
 }
 
 /// Additional information for closures.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    SerializeState,
+    DeserializeState,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub struct ClosureInfo {
     #[serde_state(stateless)]
     pub kind: ClosureKind,
@@ -189,8 +211,21 @@ pub struct ClosureInfo {
     pub signature: RegionBinder<FunSig>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Drive,
+    DriveMut,
+    DriveTwo,
+)]
 pub enum ClosureKind {
     Fn,
     FnMut,
@@ -220,9 +255,7 @@ impl TypeDecl {
             TypeDeclKind::Enum(variants) => &variants[variant.unwrap()].fields,
             _ => return None,
         };
-        fields
-            .iter_enumerated()
-            .find(|(_, field)| field.name == field_name)
+        fields.iter_enumerated().find(|(_, field)| field.name == field_name)
     }
 
     /// Returns a `TypeDeclRef` that refers to this type declaration, with identity generic arguments.
@@ -239,18 +272,12 @@ impl Variant {
     /// The new name for this variant, as suggested by the `#[charon::rename]` and
     /// `#[charon::variants_prefix]` attributes.
     pub fn renamed_name(&self) -> &str {
-        self.attr_info
-            .rename
-            .as_deref()
-            .unwrap_or(self.name.as_ref())
+        self.attr_info.rename.as_deref().unwrap_or(self.name.as_ref())
     }
 
     /// Whether this variant has a `#[charon::opaque]` annotation.
     pub fn is_opaque(&self) -> bool {
-        self.attr_info
-            .attributes
-            .iter()
-            .any(|attr| attr.is_opaque())
+        self.attr_info.attributes.iter().any(|attr| attr.is_opaque())
     }
 }
 
@@ -262,10 +289,7 @@ impl Field {
 
     /// Whether this field has a `#[charon::opaque]` annotation.
     pub fn is_opaque(&self) -> bool {
-        self.attr_info
-            .attributes
-            .iter()
-            .any(|attr| attr.is_opaque())
+        self.attr_info.attributes.iter().any(|attr| attr.is_opaque())
     }
 }
 

@@ -19,7 +19,11 @@ fn target_of(n: u32) -> u64 {
     0x30_0000 + u64::from(n) * 0x40
 }
 
-fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runner<C, Addresses, Mail>, Arc<Mailbox>) {
+fn start<C: Compiler>(
+    count: u32,
+    compiler: C,
+    workers: u32,
+) -> (Runner<C, Addresses, Mail>, Arc<Mailbox>) {
     let functions: Vec<Function> = (0..count).map(function).collect();
     let mail = Arc::new(Mailbox::default());
     let runner = Runner::start(
@@ -37,14 +41,19 @@ fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runner<C, Addre
 
 /// Waits until all `workers` of `runner` sleep.
 fn asleep<C: Compiler>(runner: &Runner<C, Addresses, Mail>, workers: u32) {
-    blaze_spin::SpinWait::within("every worker to sleep", Duration::from_secs(60), || runner.parked() == workers);
+    blaze_spin::SpinWait::within("every worker to sleep", Duration::from_secs(60), || {
+        runner.parked() == workers
+    });
 }
 
 fn ready<C: Compiler>(runner: &Runner<C, Addresses, Mail>, mail: &Mailbox, seq: u32, lazy: u32) {
     runner.frame(0, ASK_KIND, seq, &wire::ask(u64::from(seq), lazy)).unwrap();
     let (kind, body) = mail.wait(0, seq);
     assert_eq!(kind, READY_KIND, "ask {seq} of function {lazy}");
-    assert_eq!(Frame::decode(&body).unwrap(), Frame::Ready { request: u64::from(seq), lazy, target: target_of(lazy) });
+    assert_eq!(
+        Frame::decode(&body).unwrap(),
+        Frame::Ready { request: u64::from(seq), lazy, target: target_of(lazy) }
+    );
 }
 
 #[test]
@@ -82,7 +91,11 @@ fn a_burst_of_asks_is_compiled_once_each_across_the_workers() {
     assert_eq!(closed.compiles, u64::from(FUNCTIONS));
     let seen = compiler.seen.lock();
     let distinct: std::collections::HashSet<_> = seen.iter().collect();
-    assert_eq!((seen.len(), distinct.len()), (FUNCTIONS as usize, FUNCTIONS as usize), "each compiled once");
+    assert_eq!(
+        (seen.len(), distinct.len()),
+        (FUNCTIONS as usize, FUNCTIONS as usize),
+        "each compiled once"
+    );
 }
 
 #[test]
@@ -90,15 +103,25 @@ fn prefetched_callees_are_taken_by_sleeping_workers() {
     #[derive(Clone)]
     struct Calls;
     impl Compiler for Calls {
-        fn compile(&self, at: blaze_codegen::InstanceKey) -> Result<blaze_codegen::CompiledFunction, String> {
+        fn compile(
+            &self,
+            at: blaze_codegen::InstanceKey,
+        ) -> Result<blaze_codegen::CompiledFunction, String> {
             let n = (0..8).find(|n| key(*n) == at).ok_or("not a function of the test")?;
             let callees: Vec<u32> = if n == 0 { (1..8).collect() } else { Vec::new() };
             Ok(compiled(n, &callees, &[]))
         }
-        fn hit(&self, _: blaze_codegen::InstanceKey) -> Option<Result<blaze_codegen::CompiledFunction, String>> {
+        fn hit(
+            &self,
+            _: blaze_codegen::InstanceKey,
+        ) -> Option<Result<blaze_codegen::CompiledFunction, String>> {
             None
         }
-        fn tier_up(&self, at: blaze_codegen::InstanceKey, _: blaze_stencil::tier::Tier) -> Result<blaze_codegen::CompiledFunction, String> {
+        fn tier_up(
+            &self,
+            at: blaze_codegen::InstanceKey,
+            _: blaze_stencil::tier::Tier,
+        ) -> Result<blaze_codegen::CompiledFunction, String> {
             Err(format!("{at:?}: not tiered"))
         }
     }

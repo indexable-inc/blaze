@@ -25,8 +25,8 @@ use crate::{
 };
 
 use super::check_pointers::{
-    Consts, Lowered, Setup, Site, append, assign, copy_of, project, site_span, sites,
-    split_block, split_index, temp,
+    Consts, Lowered, Setup, Site, append, assign, copy_of, project, site_span, sites, split_block,
+    split_index, temp,
 };
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
@@ -45,7 +45,14 @@ enum Check<'f, 'db> {
     /// An enum with a tag and no niche: the tag is one of the variants' discriminants.
     Direct { source: Operand, discr: Discr<'db>, op_size: Size, valid: Vec<u128, &'f Frame> },
     /// An enum with a niche: the tag at `offset` is in `start..=end`, wrapping.
-    WithNiche { source: Operand, discr: Discr<'db>, op_size: Size, offset: Size, start: u128, end: u128 },
+    WithNiche {
+        source: Operand,
+        discr: Discr<'db>,
+        op_size: Size,
+        offset: Size,
+        start: u128,
+        end: u128,
+    },
 }
 
 pub(super) fn check_enums<'db>(
@@ -203,7 +210,9 @@ fn discr_of<'db>(ctx: &Ctx<'_, 'db>, value: rustc_abi::Primitive) -> Result<'db,
         },
         Primitive::Pointer(_) => Ty::new_uint(interner, UintTy::Usize),
         Primitive::Float(_) => {
-            return Err(MirLowerError::NotSupported("UB checks: an enum tag that is a float".into()));
+            return Err(MirLowerError::NotSupported(
+                "UB checks: an enum tag that is a float".into(),
+            ));
         }
     };
     let Some(size) = ctx.size_of(ty) else {
@@ -254,18 +263,23 @@ fn discr_to_u128<'db>(
             ));
         };
         let u8_ty = Ty::new_uint(interner, rustc_type_ir::UintTy::U8);
-        let byte =
-            Ty::new_adt(interner, AdtId::UnionId(maybe_uninit), GenericArgs::new_from_slice(&[u8_ty.into()]));
+        let byte = Ty::new_adt(
+            interner,
+            AdtId::UnionId(maybe_uninit),
+            GenericArgs::new_from_slice(&[u8_ty.into()]),
+        );
         let array_ty = Ty::new_array(interner, byte, op_size.bytes());
         let array = temp(body, array_ty);
-        setup.push(assign(array, Rvalue::Cast(CastKind::Transmute, source, array_ty.store()), span));
+        setup.push(assign(
+            array,
+            Rvalue::Cast(CastKind::Transmute, source, array_ty.store()),
+            span,
+        ));
         let from = offset.unwrap_or(Size::ZERO).bytes();
         // `to` of this MIR's `Subslice` counts from the end.
         let to = op_size.bytes() - (from + discr.size.bytes());
-        let bytes = project(
-            &crate::mir::Place::from(array).store(),
-            ProjectionElem::Subslice { from, to },
-        );
+        let bytes =
+            project(&crate::mir::Place::from(array).store(), ProjectionElem::Subslice { from, to });
         (CastKind::Transmute, Operand { kind: OperandKind::Copy(bytes), span: None })
     } else {
         let int_ty = uint_of_size(ctx, op_size)?;
@@ -376,7 +390,6 @@ fn niche_check<'db>(
     setup.push(assign(diff, below, span));
     setup.push(assign(is_ok, within, span));
     append(body, block, setup);
-    body.basic_blocks[block].terminator =
-        Some(assert(copy_of(is_ok), copy_of(wide), span, next));
+    body.basic_blocks[block].terminator = Some(assert(copy_of(is_ok), copy_of(wide), span, next));
     Ok(())
 }

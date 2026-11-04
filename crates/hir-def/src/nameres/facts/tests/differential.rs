@@ -179,7 +179,10 @@ fn every_test_file_is_compared() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|it| it == "rs") {
                 let file = format!("{dir}/{}", path.file_name().unwrap().to_str().unwrap());
-                assert!(listed.contains(&file.as_str()), "{file} is not in the differential's lists");
+                assert!(
+                    listed.contains(&file.as_str()),
+                    "{file} is not in the differential's lists"
+                );
             }
         }
     }
@@ -496,10 +499,15 @@ pub mod fmt {{
     };
     let variants = [
         ("own_prelude_derive", crate_("    #[derive(Clone)] pub struct S;")),
-        ("own_prelude_derive_beside_a_derive_module", crate_("    pub(crate) mod derive {}\n    #[derive(Clone)] pub struct S;")),
+        (
+            "own_prelude_derive_beside_a_derive_module",
+            crate_("    pub(crate) mod derive {}\n    #[derive(Clone)] pub struct S;"),
+        ),
         (
             "own_prelude_derive_through_a_glob_of_a_derive_module",
-            crate_("    pub(crate) mod derive {}\n    mod rt { use super::*; #[derive(Clone)] pub struct R; }"),
+            crate_(
+                "    pub(crate) mod derive {}\n    mod rt { use super::*; #[derive(Clone)] pub struct R; }",
+            ),
         ),
     ];
     let mut failures = String::new();
@@ -522,8 +530,14 @@ fn a_wider_glob_of_the_same_item_binds_it() {
         )
     };
     let variants = [
-        ("wider_glob_first", crate_("pub(in crate::a::b) use super::*;\n#[cfg(on)]\nuse crate::*;")),
-        ("wider_glob_second", crate_("#[cfg(on)]\nuse crate::*;\npub(in crate::a::b) use super::*;")),
+        (
+            "wider_glob_first",
+            crate_("pub(in crate::a::b) use super::*;\n#[cfg(on)]\nuse crate::*;"),
+        ),
+        (
+            "wider_glob_second",
+            crate_("#[cfg(on)]\nuse crate::*;\npub(in crate::a::b) use super::*;"),
+        ),
     ];
     let name = |it: &str| hir_expand::name::Name::new_symbol_root(intern::Symbol::intern(it));
     let mut failures = String::new();
@@ -534,26 +548,39 @@ fn a_wider_glob_of_the_same_item_binds_it() {
                 let db = fixture_db(fixture);
                 let krate = db.fetch_test_crate();
                 let map = facts_crate_local_def_map(&db, krate).def_map(&db);
-                let child = |module, it: &str| match map.module(&db, module).scope(&db).type_(&name(it)) {
-                    Some((ModuleDefId::ModuleId(it), _)) => it,
-                    other => panic!("{variant}: `{it}` is {other:?}"),
-                };
+                let child =
+                    |module, it: &str| match map.module(&db, module).scope(&db).type_(&name(it)) {
+                        Some((ModuleDefId::ModuleId(it), _)) => it,
+                        other => panic!("{variant}: `{it}` is {other:?}"),
+                    };
                 let inner = child(child(child(map.root, "a"), "b"), "a");
                 let scope = map.module(&db, inner).scope(&db);
-                assert!(!scope.unresolved.contains(&name("T")), "{variant}, fast path {on}: `T` is also unresolved");
+                assert!(
+                    !scope.unresolved.contains(&name("T")),
+                    "{variant}, fast path {on}: `T` is also unresolved"
+                );
                 let t = scope.get(&name("T"));
-                let types = t.types.and_then(|it| it.import).and_then(crate::item_scope::ImportOrExternCrate::glob);
+                let types = t
+                    .types
+                    .and_then(|it| it.import)
+                    .and_then(crate::item_scope::ImportOrExternCrate::glob);
                 let values = t.values.and_then(|it| it.import).and_then(|it| match it {
                     crate::item_scope::ImportOrGlob::Glob(glob) => Some(glob),
                     crate::item_scope::ImportOrGlob::Import(_) => None,
                 });
                 for import in [types, values] {
-                    let Some(glob) = import else { panic!("{variant}, fast path {on}: `T` is {t:?}, not through a glob") };
+                    let Some(glob) = import else {
+                        panic!("{variant}, fast path {on}: `T` is {t:?}, not through a glob")
+                    };
                     let use_ = crate::Lookup::lookup(&glob.use_, &db).id;
-                    let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db)).original_node_file_range_rooted(&db);
+                    let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db))
+                        .original_node_file_range_rooted(&db);
                     let text = db.file_text(range.file_id.file_id(&db)).text(&db);
                     let text = &text[range.range];
-                    assert!(text.contains("use super::*"), "{variant}, fast path {on}: `T` is bound through `{text}`");
+                    assert!(
+                        text.contains("use super::*"),
+                        "{variant}, fast path {on}: `T` is bound through `{text}`"
+                    );
                 }
             });
         }
@@ -570,7 +597,12 @@ fn a_name_reaching_two_globs_of_one_module_later_is_credited_to_the_wider() {
     let fixture = "//- /lib.rs crate:main\npub mod libs {\n    pub struct Placeholder;\n}\npub mod reexport_2 {\n    use reexport_1::*;\n    pub use reexport_1::*;\n    pub mod reexport_1 {\n        pub use crate::libs::*;\n    }\n}\nuse reexport_2::*;\n";
     let name = |it: &str| hir_expand::name::Name::new_symbol_root(intern::Symbol::intern(it));
     let mut failures = String::new();
-    compare_fixture("a_name_reaching_two_globs_of_one_module_later", fixture, &Exempt::NONE, &mut failures);
+    compare_fixture(
+        "a_name_reaching_two_globs_of_one_module_later",
+        fixture,
+        &Exempt::NONE,
+        &mut failures,
+    );
     for on in [true, false] {
         with_fast_path(on, || {
             let db = fixture_db(fixture);
@@ -581,13 +613,22 @@ fn a_name_reaching_two_globs_of_one_module_later_is_credited_to_the_wider() {
                 other => panic!("`reexport_2` is {other:?}"),
             };
             let t = map.module(&db, reexport_2).scope(&db).get(&name("Placeholder"));
-            let glob = t.types.and_then(|it| it.import).and_then(crate::item_scope::ImportOrExternCrate::glob);
-            let Some(glob) = glob else { panic!("fast path {on}: `Placeholder` is {t:?}, not through a glob") };
+            let glob = t
+                .types
+                .and_then(|it| it.import)
+                .and_then(crate::item_scope::ImportOrExternCrate::glob);
+            let Some(glob) = glob else {
+                panic!("fast path {on}: `Placeholder` is {t:?}, not through a glob")
+            };
             let use_ = crate::Lookup::lookup(&glob.use_, &db).id;
-            let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db)).original_node_file_range_rooted(&db);
+            let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db))
+                .original_node_file_range_rooted(&db);
             let text = db.file_text(range.file_id.file_id(&db)).text(&db);
             let text = &text[range.range];
-            assert!(text.starts_with("pub use"), "fast path {on}: `Placeholder` is credited to `{text}`");
+            assert!(
+                text.starts_with("pub use"),
+                "fast path {on}: `Placeholder` is credited to `{text}`"
+            );
         });
     }
     assert!(failures.is_empty(), "the def maps differ:\n{failures}");
@@ -605,8 +646,16 @@ fn of_two_globs_as_wide_giving_one_item_the_first_in_the_source_binds_it() {
         )
     };
     let variants = [
-        ("a_first", crate_("    pub use crate::a::*;\n    pub use crate::b::*;"), "pub use crate::a::*"),
-        ("b_first", crate_("    pub use crate::b::*;\n    pub use crate::a::*;"), "pub use crate::b::*"),
+        (
+            "a_first",
+            crate_("    pub use crate::a::*;\n    pub use crate::b::*;"),
+            "pub use crate::a::*",
+        ),
+        (
+            "b_first",
+            crate_("    pub use crate::b::*;\n    pub use crate::a::*;"),
+            "pub use crate::b::*",
+        ),
     ];
     let name = |it: &str| hir_expand::name::Name::new_symbol_root(intern::Symbol::intern(it));
     let mut failures = String::new();
@@ -622,13 +671,22 @@ fn of_two_globs_as_wide_giving_one_item_the_first_in_the_source_binds_it() {
                     other => panic!("{variant}: `m` is {other:?}"),
                 };
                 let x = map.module(&db, m).scope(&db).get(&name("X"));
-                let glob = x.types.and_then(|it| it.import).and_then(crate::item_scope::ImportOrExternCrate::glob);
-                let Some(glob) = glob else { panic!("{variant}, fast path {on}: `X` is {x:?}, not through a glob") };
+                let glob = x
+                    .types
+                    .and_then(|it| it.import)
+                    .and_then(crate::item_scope::ImportOrExternCrate::glob);
+                let Some(glob) = glob else {
+                    panic!("{variant}, fast path {on}: `X` is {x:?}, not through a glob")
+                };
                 let use_ = crate::Lookup::lookup(&glob.use_, &db).id;
-                let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db)).original_node_file_range_rooted(&db);
+                let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db))
+                    .original_node_file_range_rooted(&db);
                 let text = db.file_text(range.file_id.file_id(&db)).text(&db);
                 let text = &text[range.range];
-                assert!(text.starts_with(first), "{variant}, fast path {on}: `X` is credited to `{text}`");
+                assert!(
+                    text.starts_with(first),
+                    "{variant}, fast path {on}: `X` is credited to `{text}`"
+                );
             });
         }
     }
@@ -644,7 +702,12 @@ fn a_glob_passes_on_no_name_its_importer_cannot_see() {
     let fixture = "//- /lib.rs crate:main\npub(crate) use crate::a::e::a::*;\npub mod a {\npub mod e {\nstruct T;\npub mod a {\npub use super::*;\n}\n}\npub struct T;\n}\nuse crate::a::*;\n";
     let name = |it: &str| hir_expand::name::Name::new_symbol_root(intern::Symbol::intern(it));
     let mut failures = String::new();
-    compare_fixture("a_glob_passes_on_no_name_its_importer_cannot_see", fixture, &Exempt::NONE, &mut failures);
+    compare_fixture(
+        "a_glob_passes_on_no_name_its_importer_cannot_see",
+        fixture,
+        &Exempt::NONE,
+        &mut failures,
+    );
     for on in [true, false] {
         with_fast_path(on, || {
             let db = fixture_db(fixture);
@@ -657,12 +720,22 @@ fn a_glob_passes_on_no_name_its_importer_cannot_see() {
             };
             match root.type_(&name("T")) {
                 Some((ModuleDefId::AdtId(crate::AdtId::StructId(it)), _)) => {
-                    assert_eq!(crate::Lookup::lookup(&it, &db).container, a, "fast path {on}: the root's `T` is not `a::T`");
+                    assert_eq!(
+                        crate::Lookup::lookup(&it, &db).container,
+                        a,
+                        "fast path {on}: the root's `T` is not `a::T`"
+                    );
                 }
                 other => panic!("fast path {on}: the root's `T` is {other:?}"),
             }
-            let ambiguous = root.glob_ambiguities().iter().filter(|it| it.name == name("T")).count();
-            assert_eq!(ambiguous, 0, "fast path {on}: the root's `T` is ambiguous: {:?}", root.glob_ambiguities());
+            let ambiguous =
+                root.glob_ambiguities().iter().filter(|it| it.name == name("T")).count();
+            assert_eq!(
+                ambiguous,
+                0,
+                "fast path {on}: the root's `T` is ambiguous: {:?}",
+                root.glob_ambiguities()
+            );
         });
     }
     assert!(failures.is_empty(), "the def maps differ:\n{failures}");

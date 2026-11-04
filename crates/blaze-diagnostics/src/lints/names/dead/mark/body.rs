@@ -23,9 +23,12 @@ use either::Either;
 use hir::{InFile, Name};
 use hir_def::{
     AdtId, DefWithBodyId, FieldId, VariantId,
-    expr_store::{Body, BodySourceMap, ExpressionStore, HygieneId, StoreVisitor, StoreVisitorExt, path::Path},
+    expr_store::{
+        Body, BodySourceMap, ExpressionStore, HygieneId, StoreVisitor, StoreVisitorExt, path::Path,
+    },
     hir::{
-        AsmOperand, BindingId, ClosureKind, CoroutineSource, Expr, ExprId, ExprOrPatId, Pat, PatId, RecordLitField,
+        AsmOperand, BindingId, ClosureKind, CoroutineSource, Expr, ExprId, ExprOrPatId, Pat, PatId,
+        RecordLitField,
         type_ref::{TypeRef, TypeRefId},
     },
     resolver::{HasResolver, Resolver, TypeNs, ValueNs},
@@ -138,7 +141,12 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         let defs = self.m.k.defs;
         match store.expr(expr) {
             Expr::Path(path) => {
-                let r = self.resolve(Some(ExprOrPatId::ExprId(expr)), path, Site::Value, store.expr_path_hygiene(expr));
+                let r = self.resolve(
+                    Some(ExprOrPatId::ExprId(expr)),
+                    path,
+                    Site::Value,
+                    store.expr_path_hygiene(expr),
+                );
                 self.handle(r);
             }
             Expr::MethodCall { .. } => {
@@ -154,7 +162,12 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
                 }
             }
             Expr::RecordLit { path, fields, .. } => {
-                let r = self.resolve(Some(ExprOrPatId::ExprId(expr)), path, Site::RecordExpr, HygieneId::ROOT);
+                let r = self.resolve(
+                    Some(ExprOrPatId::ExprId(expr)),
+                    path,
+                    Site::RecordExpr,
+                    HygieneId::ROOT,
+                );
                 self.handle(r);
                 self.union_fields(expr, fields);
             }
@@ -162,7 +175,8 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             Expr::InlineAsm(asm) => {
                 for (_, operand) in asm.operands.iter() {
                     if let AsmOperand::Sym(path) = operand {
-                        let r = self.resolve(None, store.path_at(*path), Site::Value, HygieneId::ROOT);
+                        let r =
+                            self.resolve(None, store.path_at(*path), Site::Value, HygieneId::ROOT);
                         self.handle(r);
                     }
                 }
@@ -186,7 +200,10 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
                 return;
             }
             Expr::Closure { closure_kind, .. } => {
-                if !matches!(closure_kind, ClosureKind::Coroutine { source: CoroutineSource::Fn, .. }) {
+                if !matches!(
+                    closure_kind,
+                    ClosureKind::Coroutine { source: CoroutineSource::Fn, .. }
+                ) {
                     self.anon(expr, true, |this| store.visit_expr_children(expr, &mut *this));
                     return;
                 }
@@ -233,7 +250,12 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             _ => (None, Site::PathPat),
         };
         if let Some(path) = path {
-            let r = self.resolve(Some(ExprOrPatId::PatId(pat)), path, site, store.pat_path_hygiene(pat));
+            let r = self.resolve(
+                Some(ExprOrPatId::PatId(pat)),
+                path,
+                site,
+                store.pat_path_hygiene(pat),
+            );
             self.arm_paths.push((pat, r));
             if r.resolved
                 && let Res::Variant(variant) = r.res
@@ -258,8 +280,11 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
                 if let Some(variant) = self.infer.variant_resolution_for_pat(pat) {
                     for arg in args {
                         if !matches!(store.pat(arg.pat), Pat::Wild)
-                            && let Some(field) =
-                                self.field(variant, &arg.name, self.store.record_field_hygiene(arg.pat))
+                            && let Some(field) = self.field(
+                                variant,
+                                &arg.name,
+                                self.store.record_field_hygiene(arg.pat),
+                            )
                         {
                             self.m.insert_def_id(field);
                         }
@@ -276,7 +301,12 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
                 StoreVisitorExt::on_path(self, path);
                 if let Some(variant) = self.m.variant_of(r.res, adt) {
                     let wildcard = args.iter().map(|&it| matches!(store.pat(it), Pat::Wild));
-                    self.m.tuple_fields(variant, wildcard, args.len(), ellipsis.map(|it| it as usize));
+                    self.m.tuple_fields(
+                        variant,
+                        wildcard,
+                        args.len(),
+                        ellipsis.map(|it| it as usize),
+                    );
                 }
                 for &arg in args {
                     self.on_pat(arg);
@@ -340,7 +370,13 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
     }
 
     /// `path` at `at`, resolved as `hir::view::Semantics` resolves the node it was lowered from.
-    fn resolve(&mut self, at: Option<ExprOrPatId>, path: Path<'_>, site: Site, hygiene: HygieneId) -> Resolved {
+    fn resolve(
+        &mut self,
+        at: Option<ExprOrPatId>,
+        path: Path<'_>,
+        site: Site,
+        hygiene: HygieneId,
+    ) -> Resolved {
         let Some(mod_path) = path.mod_path() else { return Resolved::NONE };
         let defs = self.m.k.defs;
         let db = self.m.k.cx.db;
@@ -384,13 +420,18 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
                 let mut ty = None;
                 if site == Site::Value {
                     if need {
-                        value = recorded_value.or_else(|| r.resolve_path_in_value_ns_fully(db, path, hygiene));
+                        value = recorded_value
+                            .or_else(|| r.resolve_path_in_value_ns_fully(db, path, hygiene));
                     }
                     if qualified || (need && value.is_none()) {
-                        ty = r.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
+                        ty = r
+                            .resolve_path_in_type_ns(db, path)
+                            .map(|(it, remaining, _)| (it, remaining));
                     }
                 } else {
-                    ty = r.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
+                    ty = r
+                        .resolve_path_in_type_ns(db, path)
+                        .map(|(it, remaining, _)| (it, remaining));
                     if need && !matches!(ty, Some((_, None))) {
                         value = r.resolve_path_in_value_ns_fully(db, path, hygiene);
                     }
@@ -404,9 +445,10 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         };
         let (qualifier, resolved) = match ty {
             _ if !qualified => (Res::None, true),
-            Some((ty, Some(_))) => {
-                (Res::ty(defs, ty, false), matches!(ty, TypeNs::ModuleId(_) | TypeNs::AdtId(AdtId::EnumId(_))))
-            }
+            Some((ty, Some(_))) => (
+                Res::ty(defs, ty, false),
+                matches!(ty, TypeNs::ModuleId(_) | TypeNs::AdtId(AdtId::EnumId(_))),
+            ),
             Some((TypeNs::EnumVariantId(it), None)) => (self.enum_of(it), true),
             _ => (Res::None, true),
         };
@@ -457,7 +499,10 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             TypeNs::AdtId(it) | TypeNs::AdtSelfType(it) => defs.get(Id::Adt(it)).and_then(|adt| {
                 defs.impls()
                     .iter()
-                    .filter(|it| it.self_adt == Some(adt) && defs[it.def].kind == (Kind::Impl { of_trait: false }))
+                    .filter(|it| {
+                        it.self_adt == Some(adt)
+                            && defs[it.def].kind == (Kind::Impl { of_trait: false })
+                    })
                     .find_map(|it| named(it.def))
             }),
             _ => None,
@@ -530,7 +575,9 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
     }
 
     fn derefs(&self, expr: ExprId) -> bool {
-        self.infer.expr_adjustment(expr).is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_))))
+        self.infer
+            .expr_adjustment(expr)
+            .is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_))))
     }
 
     /// rustc's `check_for_self_assign`: `x = x` or `a.b = a.b`, not from a macro's expansion.
@@ -553,7 +600,8 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             _ => "variable",
         };
         // alloc: the edge, a lint that fires
-        let message = format!("useless assignment of {what} of type `{}` to itself", self.print(ty));
+        let message =
+            format!("useless assignment of {what} of type `{}` to itself", self.print(ty));
         let mut diag = Diag::lint("dead_code", message, cx.span_of(at));
         crate::lints::code_fact(cx, &mut diag, at);
         self.m.found.push(Found::lint(diag, Phase::Late, at));
@@ -566,9 +614,12 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         match (store.expr(lhs), store.expr(rhs)) {
             (Expr::Path(l), Expr::Path(r)) => {
                 let same_name = matches!((ident(l), ident(r)), (Some(a), Some(b)) if a == b);
-                same_name && matches!((self.local(lhs, l), self.local(rhs, r)), (Some(a), Some(b)) if a == b)
+                same_name
+                    && matches!((self.local(lhs, l), self.local(rhs, r)), (Some(a), Some(b)) if a == b)
             }
-            (Expr::Field { expr: l, name: a }, Expr::Field { expr: r, name: b }) => a == b && self.same_place(l, r),
+            (Expr::Field { expr: l, name: a }, Expr::Field { expr: r, name: b }) => {
+                a == b && self.same_place(l, r)
+            }
             _ => false,
         }
     }
@@ -605,7 +656,9 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         if k.defs.in_anon
             && let Some(ptr) = self.node(expr)
         {
-            let own = closure && self.m.propagated && k.levels.at(k.cx, k.cx.syntax_view(ptr)).is_allow_or_expect();
+            let own = closure
+                && self.m.propagated
+                && k.levels.at(k.cx, k.cx.syntax_view(ptr)).is_allow_or_expect();
             if !own {
                 self.m.live.anon.insert(ptr);
             }
@@ -716,12 +769,22 @@ pub fn g<T: Tr, const N: usize>(x: u8) -> u8 {
                     if let Some(value) = infer.value_resolution(at)
                         && qualifier.is_none()
                     {
-                        assert_eq!(Some(value), resolver.resolve_path_in_value_ns_fully(db, path, hygiene), "{expr:?}");
+                        assert_eq!(
+                            Some(value),
+                            resolver.resolve_path_in_value_ns_fully(db, path, hygiene),
+                            "{expr:?}"
+                        );
                         values += 1;
                     }
                     if let Some((ty, segments)) = qualifier {
-                        assert_eq!(resolver.resolve_path_in_value_ns_fully(db, path, hygiene), None, "{expr:?}");
-                        let found = resolver.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
+                        assert_eq!(
+                            resolver.resolve_path_in_value_ns_fully(db, path, hygiene),
+                            None,
+                            "{expr:?}"
+                        );
+                        let found = resolver
+                            .resolve_path_in_type_ns(db, path)
+                            .map(|(it, remaining, _)| (it, remaining));
                         assert_eq!(found, Some((ty, Some(segments as usize))), "{expr:?}");
                         qualifiers += 1;
                     }

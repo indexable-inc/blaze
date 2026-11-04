@@ -45,10 +45,7 @@ fn offer_resumes_only_after_the_driver_polls_again() {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     assert!(!resumed.get());
-    exchange
-        .take()
-        .unwrap()
-        .mark_complete(&TestCaseResult::Valid);
+    exchange.take().unwrap().mark_complete(&TestCaseResult::Valid);
     assert!(fut.as_mut().poll(&mut cx).is_ready());
     assert!(resumed.get());
 }
@@ -57,10 +54,7 @@ fn offer_resumes_only_after_the_driver_polls_again() {
 fn take_errors_when_nothing_was_offered() {
     let err = CaseExchange::new().take().err().unwrap();
     let msg = err.to_string();
-    assert!(
-        msg.contains("suspended without offering a test case"),
-        "{msg}"
-    );
+    assert!(msg.contains("suspended without offering a test case"), "{msg}");
     assert!(msg.contains("bug in hegel"), "{msg}");
 }
 
@@ -83,11 +77,7 @@ fn drive_no_yield_returns_the_value_of_a_non_offering_future() {
 }
 
 fn proposal(id: u64) -> Next {
-    Next::Run(Proposal {
-        id,
-        prefix: Vec::new(),
-        tail: Tail::Simplest,
-    })
+    Next::Run(Proposal { id, prefix: Vec::new(), tail: Tail::Simplest })
 }
 
 #[test]
@@ -122,11 +112,9 @@ fn request_proposal_errors_when_resumed_without_one() {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(fut.as_mut().poll(&mut cx).is_pending());
     match fut.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(Err(err)) => assert!(
-            err.to_string()
-                .contains("without the proposal it requested"),
-            "{err}"
-        ),
+        std::task::Poll::Ready(Err(err)) => {
+            assert!(err.to_string().contains("without the proposal it requested"), "{err}")
+        }
         _ => panic!("expected an internal error"),
     }
 }
@@ -147,11 +135,7 @@ fn take_handoff_prefers_an_offered_case() {
 #[test]
 fn take_handoff_errors_when_nothing_is_pending() {
     let err = CaseExchange::new().take_handoff().err().unwrap();
-    assert!(
-        err.to_string()
-            .contains("suspended without offering a test case"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("suspended without offering a test case"), "{err}");
 }
 
 #[test]

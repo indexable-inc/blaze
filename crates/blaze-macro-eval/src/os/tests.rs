@@ -21,7 +21,8 @@ struct Scratch {
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        let top = std::env::temp_dir().join(format!("blaze-macro-eval-os-{name}-{}", std::process::id()));
+        let top =
+            std::env::temp_dir().join(format!("blaze-macro-eval-os-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&top);
         fs::create_dir_all(top.join("pkg/src")).unwrap();
         fs::create_dir_all(top.join("pkg/data")).unwrap();
@@ -76,13 +77,21 @@ impl<'e> Run<'e> {
     /// `None` on a host whose target the shims don't model, where there is nothing to test.
     fn new(env: &'e Env) -> Option<Run<'e>> {
         let t = Target::host()?;
-        Some(Run { os: Os::in_dir(env, manifest_dir(env)), g: Buffer { base: 0x1000, bytes: vec![0; 64], errno: None }, t })
+        Some(Run {
+            os: Os::in_dir(env, manifest_dir(env)),
+            g: Buffer { base: 0x1000, bytes: vec![0; 64], errno: None },
+            t,
+        })
     }
 
     /// [`Run::new`]'s, in the working directory `cwd`, the call's directory.
     fn in_dir(env: &'e Env, cwd: &'e str) -> Option<Run<'e>> {
         let t = Target::host()?;
-        Some(Run { os: Os::in_dir(env, cwd), g: Buffer { base: 0x1000, bytes: vec![0; 64], errno: None }, t })
+        Some(Run {
+            os: Os::in_dir(env, cwd),
+            g: Buffer { base: 0x1000, bytes: vec![0; 64], errno: None },
+            t,
+        })
     }
 
     /// Calls `call` with a return place of `ret` bytes: what it returned, sign-extended.
@@ -112,7 +121,12 @@ impl<'e> Run<'e> {
     }
 
     fn read(&mut self, fd: i64, buf: u64, len: u64) -> i64 {
-        self.call(Call::Read, &[&(fd as i32).to_le_bytes(), &buf.to_le_bytes(), &len.to_le_bytes()], 8).unwrap()
+        self.call(
+            Call::Read,
+            &[&(fd as i32).to_le_bytes(), &buf.to_le_bytes(), &len.to_le_bytes()],
+            8,
+        )
+        .unwrap()
     }
 
     fn errno(&self, errno: Errno) -> Option<i32> {
@@ -163,7 +177,11 @@ fn a_relative_path_starts_at_the_calls_directory_and_only_the_roots_are_read() {
     let buf = run.room(64);
     assert_eq!(run.read(fd, buf, 64), 12);
     assert_eq!(run.g.read(buf, 12).unwrap(), b"hello, macro");
-    assert!(run.seen().contains(&(Seen::Read, format!("{}/data/a.txt", scratch.pkg))), "{:?}", run.seen());
+    assert!(
+        run.seen().contains(&(Seen::Read, format!("{}/data/a.txt", scratch.pkg))),
+        "{:?}",
+        run.seen()
+    );
 
     let dot = run.c_str(".");
     let stat = run.room(STAT_MAX);
@@ -171,13 +189,26 @@ fn a_relative_path_starts_at_the_calls_directory_and_only_the_roots_are_read() {
     let Field(at, width) = run.t.stat_layout().mode;
     let mut word = [0; 8];
     word[..width].copy_from_slice(run.g.read(stat + at as u64, width).unwrap());
-    assert_eq!(u64::from_le_bytes(word) & 0o170000, 0o040000, "the working directory is a directory");
-    assert!(!run.seen().iter().any(|it| it.1 == top || it.1 == format!("{top}/.")), "{:?}", run.seen());
+    assert_eq!(
+        u64::from_le_bytes(word) & 0o170000,
+        0o040000,
+        "the working directory is a directory"
+    );
+    assert!(
+        !run.seen().iter().any(|it| it.1 == top || it.1 == format!("{top}/.")),
+        "{:?}",
+        run.seen()
+    );
 
-    let cwd = run.call(Call::Getcwd, &[&0u64.to_le_bytes(), &0u64.to_le_bytes()], 8).unwrap() as u64;
+    let cwd =
+        run.call(Call::Getcwd, &[&0u64.to_le_bytes(), &0u64.to_le_bytes()], 8).unwrap() as u64;
     assert_eq!(run.g.read_c_str(cwd, 4096).unwrap(), top.as_bytes());
 
-    assert_eq!(run.open("secret.txt", 0).unwrap(), -1, "a file of the workspace's root outside the package");
+    assert_eq!(
+        run.open("secret.txt", 0).unwrap(),
+        -1,
+        "a file of the workspace's root outside the package"
+    );
     assert_eq!(run.g.errno, run.errno(Errno::Acces));
     let listed = run.call(Call::Opendir, &[&dot.to_le_bytes()], 8).unwrap();
     assert_eq!(listed, 0, "the working directory outside the package is not listed");
@@ -232,7 +263,11 @@ fn a_link_out_of_the_package_is_refused_and_one_in_it_is_followed() {
     assert!(seen.contains(&(Seen::Read, format!("{}/inner", scratch.pkg))), "{seen:?}");
     let buf = run.room(64);
     let path = run.c_str("inner");
-    let len = run.call(Call::Readlink, &[&path.to_le_bytes(), &buf.to_le_bytes(), &64u64.to_le_bytes()], 8);
+    let len = run.call(
+        Call::Readlink,
+        &[&path.to_le_bytes(), &buf.to_le_bytes(), &64u64.to_le_bytes()],
+        8,
+    );
     assert_eq!(len.unwrap(), 10);
     assert_eq!(run.g.read(buf, 10).unwrap(), b"data/a.txt");
 }
@@ -303,7 +338,8 @@ fn getenv_answers_from_the_env_given_and_notes_each_name() {
         }
         vars.push(String::from_utf8(run.g.read_c_str(var, 4096).unwrap().to_vec()).unwrap());
     }
-    let mut expected: Vec<String> = env.iter().map(|(name, value)| format!("{name}={value}")).collect();
+    let mut expected: Vec<String> =
+        env.iter().map(|(name, value)| format!("{name}={value}")).collect();
     expected.sort();
     assert_eq!(vars, expected);
     assert_eq!(run.seen().last(), Some(&(Seen::Env, ALL_ENV.to_owned())));
@@ -316,7 +352,11 @@ fn setting_a_variable_stops_the_expansion() {
     let Some(mut run) = Run::new(&env) else { return };
     let name = run.c_str("FOO");
     let value = run.c_str("baz");
-    let stop = run.call(Call::Setenv, &[&name.to_le_bytes(), &value.to_le_bytes(), &1i32.to_le_bytes()], 4);
+    let stop = run.call(
+        Call::Setenv,
+        &[&name.to_le_bytes(), &value.to_le_bytes(), &1i32.to_le_bytes()],
+        4,
+    );
     assert_eq!(
         stop.unwrap_err().0,
         "sets the environment variable `FOO`, which would change it for the whole compiler"
@@ -417,7 +457,15 @@ fn std_s_hashmap_keys_are_fixed_and_other_randomness_is_noted() {
     assert!(run.seen().is_empty());
     let buf = run.room(600);
     let len = 600u64;
-    assert_eq!(run.call(Call::Getrandom, &[&buf.to_le_bytes(), &len.to_le_bytes(), &0u32.to_le_bytes()], 8).unwrap(), 600);
+    assert_eq!(
+        run.call(
+            Call::Getrandom,
+            &[&buf.to_le_bytes(), &len.to_le_bytes(), &0u32.to_le_bytes()],
+            8
+        )
+        .unwrap(),
+        600
+    );
     assert!(run.g.read(buf, 600).unwrap().iter().any(|&it| it != 0));
     run.call(Call::Arc4randomBuf, &[&buf.to_le_bytes(), &len.to_le_bytes()], 0).unwrap();
     assert_eq!(run.seen(), [(Seen::Untraceable, "random".to_owned())]);
@@ -429,7 +477,10 @@ fn the_time_of_day_is_real_and_noted_and_the_monotonic_clock_is_the_evaluators()
     let env = scratch.env();
     let Some(mut run) = Run::new(&env) else { return };
     let buf = run.room(16);
-    assert_eq!(run.call(Call::ClockGettime, &[&0i32.to_le_bytes(), &buf.to_le_bytes()], 4).unwrap(), 0);
+    assert_eq!(
+        run.call(Call::ClockGettime, &[&0i32.to_le_bytes(), &buf.to_le_bytes()], 4).unwrap(),
+        0
+    );
     assert!(run.g.read_u64(buf).unwrap() > 1_700_000_000);
     assert_eq!(run.seen(), [(Seen::Untraceable, "clock".to_owned())]);
     let monotonic = match run.t.system {
@@ -456,7 +507,10 @@ fn syscall_goes_to_the_shims_the_evaluator_or_stops() {
     }
     let futex = run.t.sys_number_of_futex();
     let futex: [&[u8]; 1] = [&futex.to_le_bytes()];
-    assert_eq!(run.os.call(shim(run.t, Call::Syscall), &mut run.g, &futex, &mut ret).unwrap(), Answer::Evaluator);
+    assert_eq!(
+        run.os.call(shim(run.t, Call::Syscall), &mut run.g, &futex, &mut ret).unwrap(),
+        Answer::Evaluator
+    );
     let statx = run.t.sys_number_of_statx();
     let path = run.c_str("data/a.txt");
     let buf = run.room(256);
@@ -472,7 +526,14 @@ fn syscall_goes_to_the_shims_the_evaluator_or_stops() {
     assert_eq!(run.call(Call::Syscall, &args, 8).unwrap(), 0);
     assert_eq!(run.g.read_u64(buf + 40).unwrap(), 12, "stx_size");
     let null = 0u64;
-    let probe: [&[u8]; 6] = [&statx.to_le_bytes(), &0i32.to_le_bytes(), &null.to_le_bytes(), &0i32.to_le_bytes(), &0u32.to_le_bytes(), &null.to_le_bytes()];
+    let probe: [&[u8]; 6] = [
+        &statx.to_le_bytes(),
+        &0i32.to_le_bytes(),
+        &null.to_le_bytes(),
+        &0i32.to_le_bytes(),
+        &0u32.to_le_bytes(),
+        &null.to_le_bytes(),
+    ];
     assert_eq!(run.call(Call::Syscall, &probe, 8).unwrap(), -1);
     assert_eq!(run.g.errno, run.errno(Errno::Fault), "std's probe for statx sees it is there");
 }
@@ -483,15 +544,23 @@ fn realpath_allocates_what_free_takes_back() {
     let env = scratch.env();
     let Some(mut run) = Run::new(&env) else { return };
     let path = run.c_str("src/../data/a.txt");
-    let real = run.call(Call::Realpath, &[&path.to_le_bytes(), &0u64.to_le_bytes()], 8).unwrap() as u64;
+    let real =
+        run.call(Call::Realpath, &[&path.to_le_bytes(), &0u64.to_le_bytes()], 8).unwrap() as u64;
     let expected = format!("{}/data/a.txt", scratch.pkg);
     assert_eq!(run.g.read_c_str(real, 4096).unwrap(), expected.as_bytes());
     let mut ret = [0; 0];
-    assert_eq!(run.os.call(shim(run.t, Call::Free), &mut run.g, &[&real.to_le_bytes()], &mut ret).unwrap(), Answer::Answered);
+    assert_eq!(
+        run.os.call(shim(run.t, Call::Free), &mut run.g, &[&real.to_le_bytes()], &mut ret).unwrap(),
+        Answer::Answered
+    );
     let other = 0x1234u64;
-    let stop = run.os.call(shim(run.t, Call::Free), &mut run.g, &[&other.to_le_bytes()], &mut ret).unwrap_err();
+    let stop = run
+        .os
+        .call(shim(run.t, Call::Free), &mut run.g, &[&other.to_le_bytes()], &mut ret)
+        .unwrap_err();
     assert!(stop.0.starts_with("frees `0x1234`"), "{stop}");
-    let cwd = run.call(Call::Getcwd, &[&0u64.to_le_bytes(), &0u64.to_le_bytes()], 8).unwrap() as u64;
+    let cwd =
+        run.call(Call::Getcwd, &[&0u64.to_le_bytes(), &0u64.to_le_bytes()], 8).unwrap() as u64;
     assert_eq!(run.g.read_c_str(cwd, 4096).unwrap(), scratch.pkg.as_bytes());
 }
 
@@ -565,41 +634,129 @@ fn the_layouts_are_libcs() {
     let t = Target::host().unwrap();
     let stat = t.stat_layout();
     assert_eq!(stat.size, size_of::<libc::stat64>());
-    assert_eq!(stat.dev, Field(offset_of!(libc::stat64, st_dev), width::<libc::stat64, _>(|s| &s.st_dev)));
-    assert_eq!(stat.ino, Field(offset_of!(libc::stat64, st_ino), width::<libc::stat64, _>(|s| &s.st_ino)));
-    assert_eq!(stat.mode, Field(offset_of!(libc::stat64, st_mode), width::<libc::stat64, _>(|s| &s.st_mode)));
-    assert_eq!(stat.nlink, Field(offset_of!(libc::stat64, st_nlink), width::<libc::stat64, _>(|s| &s.st_nlink)));
-    assert_eq!(stat.uid, Field(offset_of!(libc::stat64, st_uid), width::<libc::stat64, _>(|s| &s.st_uid)));
-    assert_eq!(stat.gid, Field(offset_of!(libc::stat64, st_gid), width::<libc::stat64, _>(|s| &s.st_gid)));
-    assert_eq!(stat.rdev, Field(offset_of!(libc::stat64, st_rdev), width::<libc::stat64, _>(|s| &s.st_rdev)));
-    assert_eq!(stat.st_size, Field(offset_of!(libc::stat64, st_size), width::<libc::stat64, _>(|s| &s.st_size)));
-    assert_eq!(stat.blksize, Field(offset_of!(libc::stat64, st_blksize), width::<libc::stat64, _>(|s| &s.st_blksize)));
-    assert_eq!(stat.blocks, Field(offset_of!(libc::stat64, st_blocks), width::<libc::stat64, _>(|s| &s.st_blocks)));
+    assert_eq!(
+        stat.dev,
+        Field(offset_of!(libc::stat64, st_dev), width::<libc::stat64, _>(|s| &s.st_dev))
+    );
+    assert_eq!(
+        stat.ino,
+        Field(offset_of!(libc::stat64, st_ino), width::<libc::stat64, _>(|s| &s.st_ino))
+    );
+    assert_eq!(
+        stat.mode,
+        Field(offset_of!(libc::stat64, st_mode), width::<libc::stat64, _>(|s| &s.st_mode))
+    );
+    assert_eq!(
+        stat.nlink,
+        Field(offset_of!(libc::stat64, st_nlink), width::<libc::stat64, _>(|s| &s.st_nlink))
+    );
+    assert_eq!(
+        stat.uid,
+        Field(offset_of!(libc::stat64, st_uid), width::<libc::stat64, _>(|s| &s.st_uid))
+    );
+    assert_eq!(
+        stat.gid,
+        Field(offset_of!(libc::stat64, st_gid), width::<libc::stat64, _>(|s| &s.st_gid))
+    );
+    assert_eq!(
+        stat.rdev,
+        Field(offset_of!(libc::stat64, st_rdev), width::<libc::stat64, _>(|s| &s.st_rdev))
+    );
+    assert_eq!(
+        stat.st_size,
+        Field(offset_of!(libc::stat64, st_size), width::<libc::stat64, _>(|s| &s.st_size))
+    );
+    assert_eq!(
+        stat.blksize,
+        Field(offset_of!(libc::stat64, st_blksize), width::<libc::stat64, _>(|s| &s.st_blksize))
+    );
+    assert_eq!(
+        stat.blocks,
+        Field(offset_of!(libc::stat64, st_blocks), width::<libc::stat64, _>(|s| &s.st_blocks))
+    );
     assert_eq!(size_of::<libc::stat>(), size_of::<libc::stat64>());
     let dirent = t.dirent_layout();
     assert_eq!(dirent.size, size_of::<libc::dirent64>());
-    assert_eq!(dirent.ino, Field(offset_of!(libc::dirent64, d_ino), width::<libc::dirent64, _>(|s| &s.d_ino)));
-    assert_eq!(dirent.off, Field(offset_of!(libc::dirent64, d_off), width::<libc::dirent64, _>(|s| &s.d_off)));
-    assert_eq!(dirent.reclen, Field(offset_of!(libc::dirent64, d_reclen), width::<libc::dirent64, _>(|s| &s.d_reclen)));
-    assert_eq!(dirent.kind, Field(offset_of!(libc::dirent64, d_type), width::<libc::dirent64, _>(|s| &s.d_type)));
+    assert_eq!(
+        dirent.ino,
+        Field(offset_of!(libc::dirent64, d_ino), width::<libc::dirent64, _>(|s| &s.d_ino))
+    );
+    assert_eq!(
+        dirent.off,
+        Field(offset_of!(libc::dirent64, d_off), width::<libc::dirent64, _>(|s| &s.d_off))
+    );
+    assert_eq!(
+        dirent.reclen,
+        Field(offset_of!(libc::dirent64, d_reclen), width::<libc::dirent64, _>(|s| &s.d_reclen))
+    );
+    assert_eq!(
+        dirent.kind,
+        Field(offset_of!(libc::dirent64, d_type), width::<libc::dirent64, _>(|s| &s.d_type))
+    );
     assert_eq!(dirent.name, offset_of!(libc::dirent64, d_name));
     use super::target::{STATX_SIZE, statx};
     assert_eq!(STATX_SIZE, size_of::<libc::statx>());
-    assert_eq!(statx::MASK, Field(offset_of!(libc::statx, stx_mask), width::<libc::statx, _>(|s| &s.stx_mask)));
-    assert_eq!(statx::BLKSIZE, Field(offset_of!(libc::statx, stx_blksize), width::<libc::statx, _>(|s| &s.stx_blksize)));
-    assert_eq!(statx::NLINK, Field(offset_of!(libc::statx, stx_nlink), width::<libc::statx, _>(|s| &s.stx_nlink)));
-    assert_eq!(statx::UID, Field(offset_of!(libc::statx, stx_uid), width::<libc::statx, _>(|s| &s.stx_uid)));
-    assert_eq!(statx::GID, Field(offset_of!(libc::statx, stx_gid), width::<libc::statx, _>(|s| &s.stx_gid)));
-    assert_eq!(statx::MODE, Field(offset_of!(libc::statx, stx_mode), width::<libc::statx, _>(|s| &s.stx_mode)));
-    assert_eq!(statx::INO, Field(offset_of!(libc::statx, stx_ino), width::<libc::statx, _>(|s| &s.stx_ino)));
-    assert_eq!(statx::SIZE, Field(offset_of!(libc::statx, stx_size), width::<libc::statx, _>(|s| &s.stx_size)));
-    assert_eq!(statx::BLOCKS, Field(offset_of!(libc::statx, stx_blocks), width::<libc::statx, _>(|s| &s.stx_blocks)));
-    assert_eq!(statx::DEV_MAJOR, Field(offset_of!(libc::statx, stx_dev_major), width::<libc::statx, _>(|s| &s.stx_dev_major)));
-    assert_eq!(statx::DEV_MINOR, Field(offset_of!(libc::statx, stx_dev_minor), width::<libc::statx, _>(|s| &s.stx_dev_minor)));
+    assert_eq!(
+        statx::MASK,
+        Field(offset_of!(libc::statx, stx_mask), width::<libc::statx, _>(|s| &s.stx_mask))
+    );
+    assert_eq!(
+        statx::BLKSIZE,
+        Field(offset_of!(libc::statx, stx_blksize), width::<libc::statx, _>(|s| &s.stx_blksize))
+    );
+    assert_eq!(
+        statx::NLINK,
+        Field(offset_of!(libc::statx, stx_nlink), width::<libc::statx, _>(|s| &s.stx_nlink))
+    );
+    assert_eq!(
+        statx::UID,
+        Field(offset_of!(libc::statx, stx_uid), width::<libc::statx, _>(|s| &s.stx_uid))
+    );
+    assert_eq!(
+        statx::GID,
+        Field(offset_of!(libc::statx, stx_gid), width::<libc::statx, _>(|s| &s.stx_gid))
+    );
+    assert_eq!(
+        statx::MODE,
+        Field(offset_of!(libc::statx, stx_mode), width::<libc::statx, _>(|s| &s.stx_mode))
+    );
+    assert_eq!(
+        statx::INO,
+        Field(offset_of!(libc::statx, stx_ino), width::<libc::statx, _>(|s| &s.stx_ino))
+    );
+    assert_eq!(
+        statx::SIZE,
+        Field(offset_of!(libc::statx, stx_size), width::<libc::statx, _>(|s| &s.stx_size))
+    );
+    assert_eq!(
+        statx::BLOCKS,
+        Field(offset_of!(libc::statx, stx_blocks), width::<libc::statx, _>(|s| &s.stx_blocks))
+    );
+    assert_eq!(
+        statx::DEV_MAJOR,
+        Field(
+            offset_of!(libc::statx, stx_dev_major),
+            width::<libc::statx, _>(|s| &s.stx_dev_major)
+        )
+    );
+    assert_eq!(
+        statx::DEV_MINOR,
+        Field(
+            offset_of!(libc::statx, stx_dev_minor),
+            width::<libc::statx, _>(|s| &s.stx_dev_minor)
+        )
+    );
     let open = t.open_flags();
     assert_eq!(open.directory, i64::from(libc::O_DIRECTORY));
     assert_eq!(open.nofollow, i64::from(libc::O_NOFOLLOW));
-    let writes = [libc::O_WRONLY, libc::O_RDWR, libc::O_CREAT, libc::O_TRUNC, libc::O_APPEND, libc::O_TMPFILE];
+    let writes = [
+        libc::O_WRONLY,
+        libc::O_RDWR,
+        libc::O_CREAT,
+        libc::O_TRUNC,
+        libc::O_APPEND,
+        libc::O_TMPFILE,
+    ];
     assert!(writes.iter().all(|&it| open.writes & i64::from(it) != 0));
     assert_eq!(t.at_flags().fdcwd, i64::from(libc::AT_FDCWD));
     assert_eq!(t.at_flags().symlink_nofollow, i64::from(libc::AT_SYMLINK_NOFOLLOW));
@@ -616,24 +773,67 @@ fn the_layouts_are_libcs() {
     let t = Target::host().unwrap();
     let stat = t.stat_layout();
     assert_eq!(stat.size, size_of::<libc::stat>());
-    assert_eq!(stat.dev, Field(offset_of!(libc::stat, st_dev), width::<libc::stat, _>(|s| &s.st_dev)));
-    assert_eq!(stat.ino, Field(offset_of!(libc::stat, st_ino), width::<libc::stat, _>(|s| &s.st_ino)));
-    assert_eq!(stat.mode, Field(offset_of!(libc::stat, st_mode), width::<libc::stat, _>(|s| &s.st_mode)));
-    assert_eq!(stat.nlink, Field(offset_of!(libc::stat, st_nlink), width::<libc::stat, _>(|s| &s.st_nlink)));
-    assert_eq!(stat.uid, Field(offset_of!(libc::stat, st_uid), width::<libc::stat, _>(|s| &s.st_uid)));
-    assert_eq!(stat.gid, Field(offset_of!(libc::stat, st_gid), width::<libc::stat, _>(|s| &s.st_gid)));
-    assert_eq!(stat.rdev, Field(offset_of!(libc::stat, st_rdev), width::<libc::stat, _>(|s| &s.st_rdev)));
-    assert_eq!(stat.st_size, Field(offset_of!(libc::stat, st_size), width::<libc::stat, _>(|s| &s.st_size)));
-    assert_eq!(stat.blksize, Field(offset_of!(libc::stat, st_blksize), width::<libc::stat, _>(|s| &s.st_blksize)));
-    assert_eq!(stat.blocks, Field(offset_of!(libc::stat, st_blocks), width::<libc::stat, _>(|s| &s.st_blocks)));
+    assert_eq!(
+        stat.dev,
+        Field(offset_of!(libc::stat, st_dev), width::<libc::stat, _>(|s| &s.st_dev))
+    );
+    assert_eq!(
+        stat.ino,
+        Field(offset_of!(libc::stat, st_ino), width::<libc::stat, _>(|s| &s.st_ino))
+    );
+    assert_eq!(
+        stat.mode,
+        Field(offset_of!(libc::stat, st_mode), width::<libc::stat, _>(|s| &s.st_mode))
+    );
+    assert_eq!(
+        stat.nlink,
+        Field(offset_of!(libc::stat, st_nlink), width::<libc::stat, _>(|s| &s.st_nlink))
+    );
+    assert_eq!(
+        stat.uid,
+        Field(offset_of!(libc::stat, st_uid), width::<libc::stat, _>(|s| &s.st_uid))
+    );
+    assert_eq!(
+        stat.gid,
+        Field(offset_of!(libc::stat, st_gid), width::<libc::stat, _>(|s| &s.st_gid))
+    );
+    assert_eq!(
+        stat.rdev,
+        Field(offset_of!(libc::stat, st_rdev), width::<libc::stat, _>(|s| &s.st_rdev))
+    );
+    assert_eq!(
+        stat.st_size,
+        Field(offset_of!(libc::stat, st_size), width::<libc::stat, _>(|s| &s.st_size))
+    );
+    assert_eq!(
+        stat.blksize,
+        Field(offset_of!(libc::stat, st_blksize), width::<libc::stat, _>(|s| &s.st_blksize))
+    );
+    assert_eq!(
+        stat.blocks,
+        Field(offset_of!(libc::stat, st_blocks), width::<libc::stat, _>(|s| &s.st_blocks))
+    );
     let dirent = t.dirent_layout();
     assert_eq!(dirent.size, size_of::<libc::dirent>());
-    assert_eq!(dirent.ino, Field(offset_of!(libc::dirent, d_ino), width::<libc::dirent, _>(|s| &s.d_ino)));
-    assert_eq!(dirent.off, Field(offset_of!(libc::dirent, d_seekoff), width::<libc::dirent, _>(|s| &s.d_seekoff)));
-    assert_eq!(dirent.reclen, Field(offset_of!(libc::dirent, d_reclen), width::<libc::dirent, _>(|s| &s.d_reclen)));
-    let namlen = Field(offset_of!(libc::dirent, d_namlen), width::<libc::dirent, _>(|s| &s.d_namlen));
+    assert_eq!(
+        dirent.ino,
+        Field(offset_of!(libc::dirent, d_ino), width::<libc::dirent, _>(|s| &s.d_ino))
+    );
+    assert_eq!(
+        dirent.off,
+        Field(offset_of!(libc::dirent, d_seekoff), width::<libc::dirent, _>(|s| &s.d_seekoff))
+    );
+    assert_eq!(
+        dirent.reclen,
+        Field(offset_of!(libc::dirent, d_reclen), width::<libc::dirent, _>(|s| &s.d_reclen))
+    );
+    let namlen =
+        Field(offset_of!(libc::dirent, d_namlen), width::<libc::dirent, _>(|s| &s.d_namlen));
     assert_eq!(dirent.namlen, Some(namlen));
-    assert_eq!(dirent.kind, Field(offset_of!(libc::dirent, d_type), width::<libc::dirent, _>(|s| &s.d_type)));
+    assert_eq!(
+        dirent.kind,
+        Field(offset_of!(libc::dirent, d_type), width::<libc::dirent, _>(|s| &s.d_type))
+    );
     assert_eq!(dirent.name, offset_of!(libc::dirent, d_name));
     let open = t.open_flags();
     assert_eq!(open.directory, i64::from(libc::O_DIRECTORY));
@@ -645,7 +845,10 @@ fn the_layouts_are_libcs() {
     assert_errnos(t);
 }
 
-#[cfg(all(any(all(target_os = "linux", target_env = "gnu"), target_vendor = "apple"), target_pointer_width = "64"))]
+#[cfg(all(
+    any(all(target_os = "linux", target_env = "gnu"), target_vendor = "apple"),
+    target_pointer_width = "64"
+))]
 fn assert_errnos(t: Target) {
     let pairs = [
         (Errno::Noent, libc::ENOENT),

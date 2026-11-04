@@ -52,9 +52,14 @@ fn places_find_what_a_map_finds() {
 }
 
 fn image_of(versions: &[u32], beside: u32) -> Image {
-    let fns = versions.iter().enumerate().map(|(n, &v)| Version { id: id(n as u32), bound: bound(n as u32, v) }).collect();
+    let fns = versions
+        .iter()
+        .enumerate()
+        .map(|(n, &v)| Version { id: id(n as u32), bound: bound(n as u32, v) })
+        .collect();
     let slots = (0..versions.len() as u32).collect();
-    Image::new(fns, slots, ContentId::of("blaze v2 testsel beside 1", &beside.to_le_bytes())).unwrap()
+    Image::new(fns, slots, ContentId::of("blaze v2 testsel beside 1", &beside.to_le_bytes()))
+        .unwrap()
 }
 
 fn given() -> ContentId {
@@ -97,13 +102,24 @@ fn a_fit_is_what_the_binary_says_of_the_set() {
         let mut image = image_of(&versions, u32::from(round % 50 == 49));
         if rng.below(10) == 0 {
             // A binary without function n.
-            let fns = (0..FNS as u32).filter(|&it| it != n as u32).map(|it| Version { id: id(it), bound: bound(it, versions[it as usize]) });
-            image = Image::new(fns.collect(), Vec::new(), ContentId::of("blaze v2 testsel beside 1", &0u32.to_le_bytes())).unwrap();
+            let fns = (0..FNS as u32)
+                .filter(|&it| it != n as u32)
+                .map(|it| Version { id: id(it), bound: bound(it, versions[it as usize]) });
+            image = Image::new(
+                fns.collect(),
+                Vec::new(),
+                ContentId::of("blaze v2 testsel beside 1", &0u32.to_le_bytes()),
+            )
+            .unwrap();
         }
         selector.advance(image);
         for (id, bytes) in &sets {
             let view = SetView::decode(bytes).unwrap();
-            assert_eq!(selector.fits(*id), selector.image().changed(&view).is_none(), "round {round}, set {id}");
+            assert_eq!(
+                selector.fits(*id),
+                selector.image().changed(&view).is_none(),
+                "round {round}, set {id}"
+            );
         }
     }
     assert!(sets.len() > 50);
@@ -115,7 +131,9 @@ fn advancing_allocates_nothing() {
     let mut versions = vec![0u32; 64];
     let mut selector = Selector::new(given(), image_of(&versions, 0));
     for s in 0..32u32 {
-        let fns = (0..8).map(|k| Version { id: id((s + k) % 64), bound: bound((s + k) % 64, 0) }).collect();
+        let fns = (0..8)
+            .map(|k| Version { id: id((s + k) % 64), bound: bound((s + k) % 64, 0) })
+            .collect();
         let set = Set::of(selector.image().unlogged(), fns);
         let bytes = set.encode();
         let view = SetView::decode(&bytes).unwrap();

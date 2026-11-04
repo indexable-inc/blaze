@@ -24,7 +24,6 @@
 //! written holds a few kilobytes. Every block and generation is counted to [`Tag::Solver`], the
 //! `solver` row of the daemon's memory lines.
 
-
 use super::DbInterner;
 use base_db::{Crate, Db, Nonce};
 use blaze_hash::FixedState;
@@ -177,13 +176,21 @@ struct SharedCaches {
     goals: crate::next_solver::global_goals::Goals,
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one shared solver generation pool: the shared table allocates all its generations here")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one shared solver generation pool: the shared table allocates all its generations here"
+)]
 static SHARED_GENERATIONS: std::sync::LazyLock<Pool<Generation<Scope, View, SharedCaches>>> =
     std::sync::LazyLock::new(pool);
 
-#[expect(clippy::disallowed_types, reason = "the process's one shared solver cache table: all threads share its generations")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one shared solver cache table: all threads share its generations"
+)]
 static SHARED: std::sync::LazyLock<Shared<'static, Scope, View, SharedCaches>> =
-    std::sync::LazyLock::new(|| Shared::new(SHARED_BITS, std::sync::LazyLock::force(&SHARED_GENERATIONS)));
+    std::sync::LazyLock::new(|| {
+        Shared::new(SHARED_BITS, std::sync::LazyLock::force(&SHARED_GENERATIONS))
+    });
 
 /// Runs `f` on the shared cache of `krate` (and `regions`) in `db`, as it is now.
 #[inline]
@@ -540,7 +547,10 @@ const SLOT_BITS: u32 = 9;
 /// (a new view takes `&mut Storage`). So a lookup reads neither; debug builds check.
 struct OfQuery {
     #[cfg(debug_assertions)]
-    #[expect(clippy::disallowed_types, reason = "the database and revision, set once per interner cache: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the database and revision, set once per interner cache: not global"
+    )]
     state: std::sync::OnceLock<(Nonce, View)>,
     cache: Erased,
 }
@@ -556,13 +566,21 @@ impl Default for OfQuery {
     }
 }
 
-#[expect(clippy::disallowed_types, reason = "the process's one query solver generation pool: the query table allocates all its generations here")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one query solver generation pool: the query table allocates all its generations here"
+)]
 static OF_QUERY_GENERATIONS: std::sync::LazyLock<Pool<Generation<Solved, (), OfQuery>>> =
     std::sync::LazyLock::new(pool);
 
-#[expect(clippy::disallowed_types, reason = "the process's one query solver cache table: queries can move between threads")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one query solver cache table: queries can move between threads"
+)]
 static OF_QUERY: std::sync::LazyLock<Shared<'static, Solved, (), OfQuery>> =
-    std::sync::LazyLock::new(|| Shared::new(SLOT_BITS, std::sync::LazyLock::force(&OF_QUERY_GENERATIONS)));
+    std::sync::LazyLock::new(|| {
+        Shared::new(SLOT_BITS, std::sync::LazyLock::force(&OF_QUERY_GENERATIONS))
+    });
 
 // A generation's header is one line; the rest is the search graph's cache.
 const _: () = assert!(
@@ -692,9 +710,7 @@ mod tests {
         table
             .generations
             .iter()
-            .filter(|slot| {
-                table.get(slot.load(Ordering::Acquire)).is_some_and(|it| it.key == key)
-            })
+            .filter(|slot| table.get(slot.load(Ordering::Acquire)).is_some_and(|it| it.key == key))
             .count()
     }
 
@@ -801,7 +817,10 @@ mod tests {
         let task = blaze_reclaim::enter();
         for &query in &written {
             assert_eq!(holding(&table, query), 1, "a lookup gave a written cache away");
-            assert_eq!(table.made(&task, query, 0).and_then(|it| it.lock().get(&7).copied()), Some(1));
+            assert_eq!(
+                table.made(&task, query, 0).and_then(|it| it.lock().get(&7).copied()),
+                Some(1)
+            );
             // A later state's reader is not handed the old state's value, nor makes its own.
             assert!(table.made(&task, query, 1).is_none());
             assert_eq!(holding(&table, query), 1);
@@ -987,7 +1006,8 @@ mod tests {
     struct SlowDrop(std::sync::atomic::AtomicBool);
 
     static SLOW_DROPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static SLOW_OTHER_MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static SLOW_OTHER_MADE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// Rounds a wait of this test yields before it gives up: a drop under the table's lock
     /// leaves the other thread parked on it, so the drop's wait fails here, naming it.
@@ -1032,7 +1052,10 @@ mod tests {
         }
         thread::scope(|scope| {
             scope.spawn(|| {
-                assert!(yield_until(|| SLOW_DROPPING.load(Ordering::Acquire)), "the armed value was never dropped");
+                assert!(
+                    yield_until(|| SLOW_DROPPING.load(Ordering::Acquire)),
+                    "the armed value was never dropped"
+                );
                 let task = blaze_reclaim::enter();
                 table.of(&task, other, 0);
                 SLOW_OTHER_MADE.store(true, Ordering::Release);
@@ -1123,7 +1146,8 @@ mod tests {
         // Every key made retires a generation, and none passes: the filled limbo, the keys, the
         // table's slots and the workers' last ones fit the pool, so the run never meets
         // "pool full".
-        const _: () = assert!(RETIRED as usize + KEYS + (1 << BITS) + WORKERS < super::POOLED as usize);
+        const _: () =
+            assert!(RETIRED as usize + KEYS + (1 << BITS) + WORKERS < super::POOLED as usize);
 
         let table = table::<std::sync::atomic::AtomicBool>(BITS);
         // One task parked first pins the epoch every grace after it waits for.
@@ -1159,7 +1183,8 @@ mod tests {
                     let (table, made) = (&table, &made);
                     scope.spawn(move || {
                         let mut longest = Duration::ZERO;
-                        while Instant::now() < until && made.fetch_add(1, Ordering::Relaxed) < KEYS {
+                        while Instant::now() < until && made.fetch_add(1, Ordering::Relaxed) < KEYS
+                        {
                             let task = blaze_reclaim::enter();
                             let asked = Instant::now();
                             table.of(&task, key(), 0);
@@ -1239,7 +1264,8 @@ mod tests {
                 let (table, queries, shared_hits) = (&table, &queries, &shared_hits);
                 scope.spawn(move || {
                     let mut per_thread = PerThread { caches: Vec::new(), state: 0 };
-                    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_F491_4F6C_DD1D ^ (worker + 1));
+                    let mut rng =
+                        blaze_ids::rng::SplitMix64::new(0x2545_F491_4F6C_DD1D ^ (worker + 1));
                     for step in 0..20_000u32 {
                         let task = blaze_reclaim::enter();
                         // Each query is taken up by every thread, as a task moves; the state
@@ -1271,13 +1297,15 @@ mod tests {
     #[test]
     fn a_release_of_a_crate_retires_its_scopes_and_keeps_every_other() {
         // alloc: a test's pool, once a test.
-        let table: Shared<'static, Scope, u32, SharedGoals> = Shared::new(6, Box::leak(Box::new(pool())));
+        let table: Shared<'static, Scope, u32, SharedGoals> =
+            Shared::new(6, Box::leak(Box::new(pool())));
         let krate = |bits| Crate::from_id(Id::from_u32(bits));
         let (a, b) = (krate(1), krate(2));
         let (ours, theirs) = (Nonce::new(), Nonce::new());
         let scope = |nonce, krate, regions| Scope { nonce, krate, regions };
         let gone = [scope(ours, Some(a), false), scope(ours, Some(a), true)];
-        let ours_kept = [scope(ours, Some(b), false), scope(ours, Some(b), true), scope(ours, None, false)];
+        let ours_kept =
+            [scope(ours, Some(b), false), scope(ours, Some(b), true), scope(ours, None, false)];
         let theirs_kept = scope(theirs, Some(a), false);
         {
             let task = blaze_reclaim::enter();

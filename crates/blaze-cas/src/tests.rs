@@ -193,7 +193,11 @@ fn tickets_wait_on_each_segment_where_one_max_of_them_would_not() {
     for ticket in [earlier, late, Ticket::DURABLE, early] {
         tickets.add(ticket);
     }
-    assert_eq!(tickets.iter().collect::<Vec<_>>(), [earlier.max(early), late], "one per segment, none for DURABLE");
+    assert_eq!(
+        tickets.iter().collect::<Vec<_>>(),
+        [earlier.max(early), late],
+        "one per segment, none for DURABLE"
+    );
     assert_eq!(tickets.pending(|it| store.durable(it)), Some(late));
     tickets.retain_pending(|it| store.durable(it));
     assert_eq!(tickets.iter().collect::<Vec<_>>(), [late]);
@@ -269,7 +273,9 @@ impl Gate {
     }
 }
 
-fn hold_at(stage: crate::segment::PutAt) -> (std::sync::Arc<Gate>, std::sync::Arc<dyn Fn(crate::segment::PutAt) + Send + Sync>) {
+fn hold_at(
+    stage: crate::segment::PutAt,
+) -> (std::sync::Arc<Gate>, std::sync::Arc<dyn Fn(crate::segment::PutAt) + Send + Sync>) {
     let gate = std::sync::Arc::new(Gate::default());
     let at = gate.clone();
     let hook = move |it| {
@@ -316,7 +322,10 @@ fn a_put_that_lost_its_key_to_another_writers_is_durable_after_a_flush_with_noth
     let given = racing.join().unwrap();
     assert_eq!(given, won, "the loser is handed the winner's ticket");
     flush(&mut sim, &mut store);
-    assert!(store.durable(lost), "a flush with nothing to write leaves the loser's count pending for ever");
+    assert!(
+        store.durable(lost),
+        "a flush with nothing to write leaves the loser's count pending for ever"
+    );
     assert!(store.last_puts().is_empty());
 }
 
@@ -331,7 +340,9 @@ fn a_put_that_panics_after_it_is_counted_still_ends_and_its_wait_ends() {
     let mut sim = Sim::new(42, quiet());
     let mut store = open(&mut sim, "store");
     let mut writer = store.writer();
-    writer.own.pause = Some(std::sync::Arc::new(|it| assert_ne!(it, PutAt::Written, "a bug of the put's, past its claim")));
+    writer.own.pause = Some(std::sync::Arc::new(|it| {
+        assert_ne!(it, PutAt::Written, "a bug of the put's, past its claim")
+    }));
     let guard = enter();
     let put = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         writer.put(&guard, key(1), Kind::Query, b"a put that panicked")
@@ -342,7 +353,11 @@ fn a_put_that_panics_after_it_is_counted_still_ends_and_its_wait_ends() {
     let waits = store.last_puts();
     assert!(!waits.is_empty(), "the panicked put was counted");
     flush(&mut sim, &mut store);
-    assert_eq!(waits.pending(|it| store.durable(it)), None, "the wait on everything put ends after a flush");
+    assert_eq!(
+        waits.pending(|it| store.durable(it)),
+        None,
+        "the wait on everything put ends after a flush"
+    );
     assert!(store.last_puts().is_empty());
     let guard = enter();
     let next = writer.put(&guard, key(2), Kind::Query, b"after it").unwrap();
@@ -373,7 +388,8 @@ fn a_put_read_on_another_thread_before_it_ends_is_waited_on_until_a_later_commit
     gate.wait();
     let reader = store.reader();
     let guard = enter();
-    let read = reader.get(&guard, &key(1)).unwrap().is_some_and(|it| it.bytes == b"put on another thread");
+    let read =
+        reader.get(&guard, &key(1)).unwrap().is_some_and(|it| it.bytes == b"put on another thread");
     drop(guard);
     assert!(read, "its key is readable once claimed");
     let waits = store.last_puts();
@@ -383,7 +399,10 @@ fn a_put_read_on_another_thread_before_it_ends_is_waited_on_until_a_later_commit
     let other = store.put(key(2), Kind::Query, b"the loop's own").unwrap();
     flush(&mut sim, &mut store);
     assert!(store.durable(other), "a commit ran");
-    assert!(!store.durable(counted), "a put not ended is not drained, so no commit made it durable");
+    assert!(
+        !store.durable(counted),
+        "a put not ended is not drained, so no commit made it durable"
+    );
     flush(&mut sim, &mut store);
     assert!(!store.durable(counted), "still not ended");
     gate.wait();
@@ -466,7 +485,12 @@ fn batch_map(what: &Mapped) -> bool {
 
 /// A flush whose maps `hold` picks are kept back in `held`: its commit is durable, and its
 /// batch waits for them.
-fn flush_holding(sim: &mut Sim, store: &mut Store, held: &mut Vec<Completion>, hold: impl Fn(&Mapped) -> bool) {
+fn flush_holding(
+    sim: &mut Sim,
+    store: &mut Store,
+    held: &mut Vec<Completion>,
+    hold: impl Fn(&Mapped) -> bool,
+) {
     let mut effects = Vec::new();
     store.flush(&mut effects);
     drive_holding(sim, store, &mut effects, held, hold);
@@ -565,13 +589,18 @@ fn chunk_keys(out: &[u8]) -> Vec<Key> {
 /// Without the copy, B's payload names a chunk no pack holds.
 #[test]
 fn a_chunk_claimed_by_another_writer_after_the_look_is_copied_before_the_put_turns_durable() {
-    let (mut sim, store, out, a_gate, a_put) = a_chunk_claim_race(44, 0, output_with_a_short_last_chunk());
+    let (mut sim, store, out, a_gate, a_put) =
+        a_chunk_claim_race(44, 0, output_with_a_short_last_chunk());
     sim.crash();
     a_gate.wait();
     a_put.join().unwrap();
     drop(store);
     let store = open(&mut sim, "store");
-    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's durable value lost a chunk in the crash");
+    assert_eq!(
+        bytes_of(&store, &key(1)).as_ref(),
+        Some(&out),
+        "B's durable value lost a chunk in the crash"
+    );
     assert_eq!(store.verify(None), Vec::new());
 }
 
@@ -583,14 +612,19 @@ fn a_chunk_claimed_by_another_writer_after_the_look_is_copied_before_the_put_tur
 /// before A ends, B's durable value names a chunk the store does not have.
 #[test]
 fn a_copy_that_is_a_chunks_only_durable_record_survives_an_index_write_and_a_crash() {
-    let (mut sim, store, out, a_gate, a_put) = a_chunk_claim_race(45, INDEX_AFTER as u64, output_with_a_short_last_chunk());
+    let (mut sim, store, out, a_gate, a_put) =
+        a_chunk_claim_race(45, INDEX_AFTER as u64, output_with_a_short_last_chunk());
     assert!(store.tiers[0].head.index.is_some(), "B's flush wrote an index");
     sim.crash();
     a_gate.wait();
     a_put.join().unwrap();
     drop(store);
     let store = open(&mut sim, "store");
-    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's durable value lost a chunk to the index write");
+    assert_eq!(
+        bytes_of(&store, &key(1)).as_ref(),
+        Some(&out),
+        "B's durable value lost a chunk to the index write"
+    );
     assert_eq!(store.verify(None), Vec::new());
 }
 
@@ -602,7 +636,8 @@ fn a_copy_that_is_a_chunks_only_durable_record_survives_an_index_write_and_a_cra
 /// rewritten, and B's value reads whole after a crash.
 #[test]
 fn a_copy_that_is_a_chunks_only_durable_record_survives_a_settle_and_a_crash() {
-    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(46, 0, text_output_with_a_short_last_chunk());
+    let (mut sim, mut store, out, a_gate, a_put) =
+        a_chunk_claim_race(46, 0, text_output_with_a_short_last_chunk());
     let last = *chunk_keys(&out).last().unwrap();
     let home = store.loc_of(&last);
     // A later pack of the unit, so B's copy's pack may be retired.
@@ -621,14 +656,21 @@ fn a_copy_that_is_a_chunks_only_durable_record_survives_a_settle_and_a_crash() {
         }
     }
     assert!(retired >= 1, "a settle retired a pack");
-    assert!(store.tiers[0].packs[home.pack as usize].removed, "the pack of B's copy was retired and removed");
+    assert!(
+        store.tiers[0].packs[home.pack as usize].removed,
+        "the pack of B's copy was retired and removed"
+    );
     assert_ne!(store.found_of(&last).place, Place::Pack(home), "the retire rewrote B's copy");
     sim.crash();
     a_gate.wait();
     a_put.join().unwrap();
     drop(store);
     let store = open(&mut sim, "store");
-    assert_eq!(bytes_of(&store, &key(1)).as_ref(), Some(&out), "B's durable value lost a chunk to a retire");
+    assert_eq!(
+        bytes_of(&store, &key(1)).as_ref(),
+        Some(&out),
+        "B's durable value lost a chunk to a retire"
+    );
     assert_eq!(store.verify(None), Vec::new());
 }
 
@@ -639,7 +681,8 @@ fn a_copy_that_is_a_chunks_only_durable_record_survives_a_settle_and_a_crash() {
 /// replace have no second record of a chunk to land on or count again.
 #[test]
 fn a_chunk_record_drained_after_its_chunks_home_is_never_written() {
-    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(47, 0, output_with_a_short_last_chunk());
+    let (mut sim, mut store, out, a_gate, a_put) =
+        a_chunk_claim_race(47, 0, output_with_a_short_last_chunk());
     let keys = chunk_keys(&out);
     let dead = |store: &Store| store.tiers[0].packs.iter().map(|it| it.dead).sum::<u64>();
     let last = keys.last().unwrap();
@@ -688,7 +731,11 @@ fn assert_dead_is_exact(store: &Store) {
             }
             offset += header.span();
         }
-        assert_eq!(pack.dead, unfound, "{}: its dead bytes are not the records no key finds", pack.file);
+        assert_eq!(
+            pack.dead, unfound,
+            "{}: its dead bytes are not the records no key finds",
+            pack.file
+        );
     }
 }
 
@@ -765,9 +812,18 @@ fn a_key_a_settle_moves_while_a_later_batch_waits_on_its_maps_is_in_the_index_th
         matches!(store.found_of(&last).place, Place::Segment(seg) if seg.segment == a_segment),
         "X points at A's segment while both batches wait"
     );
-    let waiting: Vec<u32> =
-        store.pending.iter().flat_map(|it| &it.moves).filter(|it| it.key == last).map(|it| it.from.segment).collect();
-    assert_eq!(waiting, vec![a_segment], "X's one waiting move is A's record's: B's copy of X was not written");
+    let waiting: Vec<u32> = store
+        .pending
+        .iter()
+        .flat_map(|it| &it.moves)
+        .filter(|it| it.key == last)
+        .map(|it| it.from.segment)
+        .collect();
+    assert_eq!(
+        waiting,
+        vec![a_segment],
+        "X's one waiting move is A's record's: B's copy of X was not written"
+    );
     release(&mut sim, &mut store, first);
     assert_eq!(store.pending.len(), 1, "B's batch waits on its maps");
     let home = store.loc_of(&last);
@@ -787,8 +843,10 @@ fn a_key_a_settle_moves_while_a_later_batch_waits_on_its_maps_is_in_the_index_th
 /// its maps. Settles move X out of B's copy, the last on a commit that writes the index: A's
 /// record (X's first move, from where X no longer is) must not keep X out of it.
 #[test]
-fn a_key_a_settle_moves_while_a_later_record_of_it_waits_on_its_maps_is_in_the_index_the_settle_writes() {
-    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(49, 0, output_with_a_last_chunk_a_settle_moves());
+fn a_key_a_settle_moves_while_a_later_record_of_it_waits_on_its_maps_is_in_the_index_the_settle_writes()
+ {
+    let (mut sim, mut store, out, a_gate, a_put) =
+        a_chunk_claim_race(49, 0, output_with_a_last_chunk_a_settle_moves());
     let last = *chunk_keys(&out).last().unwrap();
     let home = store.loc_of(&last);
     a_gate.wait();
@@ -818,7 +876,8 @@ fn a_key_a_settle_moves_while_a_later_record_of_it_waits_on_its_maps_is_in_the_i
 /// dead bytes stay the records no key finds, and both values read back.
 #[test]
 fn a_record_drained_while_its_key_is_at_a_settles_waiting_record_is_never_written() {
-    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(53, 0, output_with_a_last_chunk_a_settle_moves());
+    let (mut sim, mut store, out, a_gate, a_put) =
+        a_chunk_claim_race(53, 0, output_with_a_last_chunk_a_settle_moves());
     let last = *chunk_keys(&out).last().unwrap();
     settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
@@ -862,7 +921,11 @@ fn end_the_migration(store: &mut Store) {
         assert!(std::time::Instant::now() < deadline, "the index swap's grace never passed");
         std::thread::yield_now();
     }
-    assert!(store.tiers[0].prev.is_none(), "the swap ended: {:?}", store.broken().map(ToString::to_string));
+    assert!(
+        store.tiers[0].prev.is_none(),
+        "the swap ended: {:?}",
+        store.broken().map(ToString::to_string)
+    );
 }
 
 /// Where each table of the store's own tier holds `key`, checked against the record there: a
@@ -870,7 +933,9 @@ fn end_the_migration(store: &mut Store) {
 fn assert_spots_hold_their_value(store: &Store, key: &Key) {
     let own = &store.tiers[0];
     let held = Held::writer(&*store.shared);
-    for (name, table) in std::iter::once(("the delta", &own.delta)).chain(own.prev.iter().map(|it| ("prev", it))) {
+    for (name, table) in
+        std::iter::once(("the delta", &own.delta)).chain(own.prev.iter().map(|it| ("prev", it)))
+    {
         let Some((_, spot)) = table.get(held, key) else { continue };
         let header = match spot.place {
             Place::Pack(loc) => own.packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER),
@@ -879,7 +944,9 @@ fn assert_spots_hold_their_value(store: &Store, key: &Key) {
             Place::Segment(seg) => unsafe { seg.chunk.get().bytes(seg.offset, RECORD_HEADER) },
         }
         .map(RecordHeader::decode);
-        let Some(Ok(header)) = header else { panic!("{name}'s spot of {key:?} at {} names no whole record", spot.place) };
+        let Some(Ok(header)) = header else {
+            panic!("{name}'s spot of {key:?} at {} names no whole record", spot.place)
+        };
         assert_eq!(
             (header.key, header.content),
             (*key, spot.content),
@@ -942,7 +1009,10 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: &[u8])
     let pin = during.then(enter);
     flush(&mut sim, &mut store);
     let first_index = store.tiers[0].head.index.expect("the flush wrote the index");
-    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in, W still in its put");
+    assert!(
+        store.tiers[0].prev.is_some() && store.migrating.is_some(),
+        "the index was swapped in, W still in its put"
+    );
     let d_put = put(d, d_value.to_vec());
     d_gate.wait();
     w_gate.wait();
@@ -950,8 +1020,16 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: &[u8])
     if during {
         flush(&mut sim, &mut store);
         assert!(store.durable(w_ticket), "W's batch is committed");
-        let place = store.tiers[0].prev.as_ref().unwrap().get(Held::writer(&*store.shared), &x).map(|(_, spot)| spot.place);
-        assert!(matches!(place, Some(Place::Pack(_))), "prev's spot moved with W's record: {place:?}");
+        let place = store.tiers[0]
+            .prev
+            .as_ref()
+            .unwrap()
+            .get(Held::writer(&*store.shared), &x)
+            .map(|(_, spot)| spot.place);
+        assert!(
+            matches!(place, Some(Place::Pack(_))),
+            "prev's spot moved with W's record: {place:?}"
+        );
     }
     d_gate.wait();
     d_gate.wait();
@@ -967,7 +1045,11 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: &[u8])
         store.put(key(2000 + n), Kind::Query, &noise(64, 2000 + n)).unwrap();
     }
     flush(&mut sim, &mut store);
-    assert_ne!(store.tiers[0].head.index, Some(first_index), "the flush wrote the index again, D still in its put");
+    assert_ne!(
+        store.tiers[0].head.index,
+        Some(first_index),
+        "the flush wrote the index again, D still in its put"
+    );
     assert_spots_hold_their_value(&store, &x);
     sim.crash();
     drop(store);
@@ -977,14 +1059,20 @@ fn a_key_put_twice_across_an_index_swap(seed: u64, during: bool, d_value: &[u8])
     assert_eq!(bytes_of(&store, &x), Some(w_value.clone()), "W's durable put of X was lost");
     assert_spots_hold_their_value(&store, &x);
     match d_value == w_value.as_slice() {
-        true => assert_eq!(d_result, Ok(w_ticket), "D's claim met W's spot in prev and took its ticket"),
-        false => assert!(matches!(d_result, Err(Mismatch { .. })), "D's put of another value is refused: {d_result:?}"),
+        true => {
+            assert_eq!(d_result, Ok(w_ticket), "D's claim met W's spot in prev and took its ticket")
+        }
+        false => assert!(
+            matches!(d_result, Err(Mismatch { .. })),
+            "D's put of another value is refused: {d_result:?}"
+        ),
     }
     assert_eq!(store.verify(None), Vec::new());
 }
 
 #[test]
-fn a_key_claimed_after_its_record_in_prev_was_made_durable_keeps_that_record_through_the_end_of_the_swap() {
+fn a_key_claimed_after_its_record_in_prev_was_made_durable_keeps_that_record_through_the_end_of_the_swap()
+ {
     a_key_put_twice_across_an_index_swap(55, true, &noise(64, 9));
 }
 
@@ -1044,7 +1132,10 @@ fn a_record_kept_in_a_folded_prev_never_stands_in_for_a_record_of_another_value(
     e_gate.wait();
     c_gate.wait();
     let c_result = c_put.join().unwrap();
-    assert!(matches!(c_result, Err(Mismatch { .. })), "C's put of another value is refused: {c_result:?}");
+    assert!(
+        matches!(c_result, Err(Mismatch { .. })),
+        "C's put of another value is refused: {c_result:?}"
+    );
     flush(&mut sim, &mut store);
     assert_spots_hold_their_value(&store, &x);
     e_gate.wait();
@@ -1102,7 +1193,10 @@ fn a_claim_that_loses_a_folded_prev_to_a_refused_put_is_answered_by_the_delta() 
     e_gate.wait();
     d_gate.wait();
     let d_result = d_put.join().unwrap();
-    assert!(matches!(d_result, Err(Mismatch { .. })), "D won the folded prev and met E's value in the delta: {d_result:?}");
+    assert!(
+        matches!(d_result, Err(Mismatch { .. })),
+        "D won the folded prev and met E's value in the delta: {d_result:?}"
+    );
     c_gate.wait();
     let c_result = c_put.join().unwrap();
     assert!(
@@ -1171,7 +1265,10 @@ fn a_claim_that_meets_a_put_between_prev_and_the_delta_fixes_the_deltas_value_be
     c_gate.wait();
     let c_ticket = c_put.join().unwrap().expect("C met D's spot of its value");
     let e_result = put(e, e_value).join().unwrap();
-    assert!(matches!(e_result, Err(Mismatch { .. })), "E met D's spot, put into the delta by C: {e_result:?}");
+    assert!(
+        matches!(e_result, Err(Mismatch { .. })),
+        "E met D's spot, put into the delta by C: {e_result:?}"
+    );
     d_gate.wait();
     let d_ticket = d_put.join().unwrap().expect("D met its own spot in the delta");
     assert_eq!(c_ticket, d_ticket, "C took D's ticket");
@@ -1252,7 +1349,10 @@ fn a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(seed: u64, lands: CopyLand
     // A task open since before the swap: its grace can't pass until this drops.
     let pin = enter();
     flush(&mut sim, &mut store);
-    assert!(store.tiers[0].prev.is_some() && store.migrating.is_some(), "the index was swapped in, W still in its put");
+    assert!(
+        store.tiers[0].prev.is_some() && store.migrating.is_some(),
+        "the index was swapped in, W still in its put"
+    );
     let c_put = std::thread::spawn({
         let (value, done) = (value.clone(), c_done.clone());
         move || {
@@ -1266,14 +1366,21 @@ fn a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(seed: u64, lands: CopyLand
     c_gate.wait();
     w_gate.wait();
     let w_ticket = w_put.join().unwrap().expect("W's put is X's first");
-    assert!(matches!(places_of(&store, &x), (Some(Place::Segment(_)), None)), "W claimed X in prev alone: {:?}", places_of(&store, &x));
+    assert!(
+        matches!(places_of(&store, &x), (Some(Place::Segment(_)), None)),
+        "W claimed X in prev alone: {:?}",
+        places_of(&store, &x)
+    );
     c_gate.wait();
     c_gate.wait();
     match lands {
         CopyLands::First => {
             c_gate.wait();
             c_done.wait();
-            assert!(matches!(places_of(&store, &x), (Some(Place::Segment(a)), Some(Place::Segment(b))) if a == b), "C copied W's spot");
+            assert!(
+                matches!(places_of(&store, &x), (Some(Place::Segment(a)), Some(Place::Segment(b))) if a == b),
+                "C copied W's spot"
+            );
             flush(&mut sim, &mut store);
         }
         CopyLands::Between => {
@@ -1298,7 +1405,10 @@ fn a_move_of_prevs_spot_meets_a_claim_that_lost_to_it(seed: u64, lands: CopyLand
     let (in_prev, in_delta) = places_of(&store, &x);
     drop(pin);
     end_the_migration(&mut store);
-    assert!(matches!(in_prev, Some(Place::Pack(_))), "the move pointed prev's spot at the pack: {in_prev:?}");
+    assert!(
+        matches!(in_prev, Some(Place::Pack(_))),
+        "the move pointed prev's spot at the pack: {in_prev:?}"
+    );
     assert_eq!(in_delta, in_prev, "the delta holds X where prev does");
     assert_spots_hold_their_value(&store, &x);
     sim.crash();
@@ -1332,7 +1442,8 @@ fn a_move_of_prevs_spot_replaces_a_copy_that_lands_between_its_probe_and_its_ins
 /// would win the delta with its segment spot, and the end of the swap would find the two
 /// tables apart.
 #[test]
-fn a_chunks_copy_moved_while_its_first_claim_is_between_prev_and_the_delta_leaves_both_at_the_pack() {
+fn a_chunks_copy_moved_while_its_first_claim_is_between_prev_and_the_delta_leaves_both_at_the_pack()
+{
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -1370,8 +1481,13 @@ fn a_chunks_copy_moved_while_its_first_claim_is_between_prev_and_the_delta_leave
     };
     let d_put = put(d, key(1), out.clone());
     d_gate.wait();
-    assert!(matches!(places_of(&store, &x), (Some(Place::Segment(_)), None)), "D won X in prev alone: {:?}", places_of(&store, &x));
-    let p_ticket = put(p, key(2), out.clone()).join().unwrap().expect("P's output is key 2's first");
+    assert!(
+        matches!(places_of(&store, &x), (Some(Place::Segment(_)), None)),
+        "D won X in prev alone: {:?}",
+        places_of(&store, &x)
+    );
+    let p_ticket =
+        put(p, key(2), out.clone()).join().unwrap().expect("P's output is key 2's first");
     flush(&mut sim, &mut store);
     assert!(store.durable(p_ticket), "P's batch is committed");
     let (in_prev, in_delta) = places_of(&store, &x);
@@ -1379,7 +1495,10 @@ fn a_chunks_copy_moved_while_its_first_claim_is_between_prev_and_the_delta_leave
     let d_ticket = d_put.join().unwrap().expect("D's output is key 1's first");
     drop(pin);
     end_the_migration(&mut store);
-    assert!(matches!(in_prev, Some(Place::Pack(_))), "the copy's move pointed prev's spot at the pack: {in_prev:?}");
+    assert!(
+        matches!(in_prev, Some(Place::Pack(_))),
+        "the copy's move pointed prev's spot at the pack: {in_prev:?}"
+    );
     assert_eq!(in_delta, in_prev, "the delta holds X where prev does");
     flush(&mut sim, &mut store);
     assert!(store.durable(d_ticket), "D's batch is committed");
@@ -1411,7 +1530,9 @@ fn a_move_of_prevs_spot_that_finds_the_delta_apart_breaks_the_store() {
     let x = key(9);
     store.put(x, Kind::Query, &noise(64, 9)).unwrap();
     assert!(store.tiers[0].prev.is_some(), "the index was swapped in");
-    let (Some(Place::Segment(_)), Some(Place::Segment(_))) = places_of(&store, &x) else { panic!("X is claimed in both tables") };
+    let (Some(Place::Segment(_)), Some(Place::Segment(_))) = places_of(&store, &x) else {
+        panic!("X is claimed in both tables")
+    };
     // X's record drained, its move waiting on its maps: the drain checked the tables agree.
     let mut held = Vec::new();
     flush_holding(&mut sim, &mut store, &mut held, batch_map);
@@ -1421,13 +1542,21 @@ fn a_move_of_prevs_spot_that_finds_the_delta_apart_breaks_the_store() {
         let held = Held::writer(&*store.shared);
         let delta = &store.tiers[0].delta;
         let (_, spot) = delta.get(held, &x).unwrap();
-        let planted = Spot::new(x, content_of(&noise(64, 1000)), Place::Pack(elsewhere), spot.ticket);
+        let planted =
+            Spot::new(x, content_of(&noise(64, 1000)), Place::Pack(elsewhere), spot.ticket);
         assert!(delta.replace(held, planted).is_ok());
     }
     release(&mut sim, &mut store, held);
     let broken = store.broken().expect("the move broke the store").to_string();
     assert!(broken.contains(&format!("moved {:x} from segment", x.0)), "{broken}");
-    assert!(broken.contains(&format!("during an index swap, and the delta holds it as {:x} at {}", content_of(&noise(64, 1000)), Place::Pack(elsewhere))), "{broken}");
+    assert!(
+        broken.contains(&format!(
+            "during an index swap, and the delta holds it as {:x} at {}",
+            content_of(&noise(64, 1000)),
+            Place::Pack(elsewhere)
+        )),
+        "{broken}"
+    );
     let mut effects = Vec::new();
     store.flush(&mut effects);
     assert!(effects.is_empty(), "a broken store commits nothing");
@@ -1455,7 +1584,10 @@ fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
     assert_eq!(store.pending.len(), 2, "both batches wait on their maps");
     let (id, lost) = (store.pending[0].id, store.pending[0].moves[0].to.pack);
     assert!(store.pending.iter().all(|it| !it.chunks.is_empty()), "each batch frees a chunk");
-    assert!(store.pending[1].moves.iter().all(|it| it.to.pack != lost), "the second batch moves into another pack");
+    assert!(
+        store.pending[1].moves.iter().all(|it| it.to.pack != lost),
+        "the second batch moves into another pack"
+    );
     store.tiers[0].packs[lost as usize].retiring = true;
     // A third commit in flight at the break: its steps are asked for and held.
     let head = store.tiers[0].head.clone();
@@ -1474,7 +1606,10 @@ fn a_map_that_comes_after_a_lost_move_broke_the_store_changes_nothing() {
         }
     });
     assert!(!head_asked, "a commit in flight at the break writes no head");
-    assert!(store.committing(), "the withheld commit stays in flight: no later commit starts behind it");
+    assert!(
+        store.committing(),
+        "the withheld commit stays in flight: no later commit starts behind it"
+    );
     assert_eq!(store.tiers[0].head, head, "the store's head is the one from before the break");
     let steps = store.commit_steps();
     release(&mut sim, &mut store, second);
@@ -1504,17 +1639,26 @@ fn the_index_names_the_record_of_the_first_move_from_where_its_key_is() {
     let mut sim = Sim::new(50, quiet());
     let mut store = open(&mut sim, "store");
     store.put(key(1), Kind::Query, &noise(64, 1)).unwrap();
-    let Place::Segment(at) = store.found_of(&key(1)).place else { panic!("key 1 is in the segment") };
+    let Place::Segment(at) = store.found_of(&key(1)).place else {
+        panic!("key 1 is in the segment")
+    };
     let mut held = Vec::new();
     flush_holding(&mut sim, &mut store, &mut held, batch_map);
     let batch = store.pending.back_mut().unwrap();
     let made = *batch.moves.iter().find(|it| it.key == key(1)).unwrap();
     assert_eq!(made.from, at);
     let to = |by: u64| Loc { offset: made.to.offset + by, ..made.to };
-    batch.moves.insert(0, Move { key: key(1), from: Seg { offset: at.offset + 4096, ..at }, to: to(4096) });
+    batch.moves.insert(
+        0,
+        Move { key: key(1), from: Seg { offset: at.offset + 4096, ..at }, to: to(4096) },
+    );
     batch.moves.push(Move { key: key(1), from: at, to: to(8192) });
     let indexed = store.index_entries(&mut Vec::new()).into_iter().find(|(it, _)| *it == key(1));
-    assert_eq!(indexed, Some((key(1), made.to)), "the index names the first move from where the key is");
+    assert_eq!(
+        indexed,
+        Some((key(1), made.to)),
+        "the index names the first move from where the key is"
+    );
     release(&mut sim, &mut store, held);
     assert_eq!(store.loc_of(&key(1)), made.to, "the first move from where the key is is made");
 }
@@ -1529,7 +1673,8 @@ fn the_index_names_the_record_of_the_first_move_from_where_its_key_is() {
 /// records no key finds, through the reopen and the settle, and the store opens after.
 #[test]
 fn a_record_is_counted_dead_once_across_a_reopen_and_a_settle_that_moves_it() {
-    let (mut sim, mut store, out, a_gate, a_put) = a_chunk_claim_race(51, 0, output_with_a_last_chunk_a_settle_moves());
+    let (mut sim, mut store, out, a_gate, a_put) =
+        a_chunk_claim_race(51, 0, output_with_a_last_chunk_a_settle_moves());
     let last = *chunk_keys(&out).last().unwrap();
     let home = store.loc_of(&last);
     store.put(key(3), Kind::Output, &noise(CHUNK_FROM - 1, 3)).unwrap();
@@ -1578,13 +1723,18 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
         store.put(key(n), Kind::Code, &value(n)).unwrap();
     }
     let mut held = Vec::new();
-    flush_holding(&mut sim, &mut store, &mut held, |what| matches!(what, Mapped::Pack { pack: 1, batch: Some(_), .. }));
+    flush_holding(&mut sim, &mut store, &mut held, |what| {
+        matches!(what, Mapped::Pack { pack: 1, batch: Some(_), .. })
+    });
     assert_eq!(store.pending.len(), 1, "the batch waits on its map of pack 1");
     let pack = &store.tiers[0].packs[0];
     assert!(store.tiers[0].packs.len() == 2 && store.tiers[0].dictionaries.is_empty());
     assert!(pack.usable == pack.committed, "pack 0 is mapped");
     assert!(pack.dead * 2 >= pack.committed - PACK_HEADER, "pack 0 is half dead");
-    assert!(store.pending[0].moves.iter().any(|it| it.to.pack == 0), "the batch moves records into pack 0");
+    assert!(
+        store.pending[0].moves.iter().any(|it| it.to.pack == 0),
+        "the batch moves records into pack 0"
+    );
     let settled = settle(&mut sim, &mut store);
     release(&mut sim, &mut store, held);
     for &n in &keys {
@@ -1739,9 +1889,8 @@ fn a_head_of_another_format_is_refused_by_name() {
 fn near_identical_outputs_share_their_chunks() {
     let mut sim = Sim::new(7, quiet());
     let mut store = open(&mut sim, "store");
-    let output_bytes = |store: &Store| -> u64 {
-        store.tiers[0].packs.iter().map(|it| it.end).sum()
-    };
+    let output_bytes =
+        |store: &Store| -> u64 { store.tiers[0].packs.iter().map(|it| it.end).sum() };
     let first = noise(2 << 20, 70);
     let mut second = first.clone();
     second.splice(5000..5000, *b"a patched function").for_each(drop);
@@ -1787,6 +1936,78 @@ fn a_cold_kind_trains_its_dictionary_and_compresses_what_follows() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// A kind of short values (debug info, a few hundred bytes each) fills the samples kept,
+/// [`cold::SAMPLES_MOST`], before their bytes reach [`cold::TRAIN_BYTES`]: it is trained then,
+/// not left raw for good. A failed training waits for twice its samples, which a full set
+/// never gets.
+#[test]
+fn a_kind_of_short_values_trains_once_its_samples_are_full() {
+    let short = (cold::TRAIN_BYTES / cold::SAMPLES_MOST as u64 / 2).max(1);
+    let kept = |samples: usize, after: usize| Training {
+        samples: vec![Vec::new(); samples],
+        bytes: samples as u64 * short,
+        after,
+        ..Training::default()
+    };
+    assert!(!kept(cold::TRAIN_VALUES, 0).ready(), "too few bytes, and samples to keep");
+    assert!(!kept(cold::SAMPLES_MOST - 1, 0).ready());
+    assert!(kept(cold::SAMPLES_MOST, 0).ready(), "the samples kept are full");
+    assert!(
+        !kept(cold::SAMPLES_MOST, cold::SAMPLES_MOST * 2).ready(),
+        "it failed on these samples"
+    );
+    let long = Training {
+        samples: vec![Vec::new(); cold::TRAIN_VALUES],
+        bytes: cold::TRAIN_BYTES,
+        ..Training::default()
+    };
+    assert!(long.ready(), "values and bytes enough");
+    assert!(!Training { samples: vec![Vec::new(); cold::TRAIN_VALUES - 1], ..long }.ready());
+}
+
+/// A short cold record of a kind with no dictionary is met by every settle, to be sampled
+/// after a reopen: it is sampled once, as a value put while the store is open is, so settles
+/// never fill the samples with copies and train on fewer values than a training needs.
+#[test]
+fn settles_sample_each_short_cold_value_once() {
+    let mut sim = Sim::new(61, quiet());
+    let mut store = open(&mut sim, "store");
+    let value = |n: u64| text(n, 200);
+    for n in 0..100 {
+        store.put(key(n), Kind::Debug, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let debug = Kind::Debug.code() as usize;
+    assert_eq!(store.training[debug].samples.len(), 100, "each put is sampled once");
+    for _ in 0..50 {
+        settle(&mut sim, &mut store);
+    }
+    assert_eq!(
+        store.training[debug].samples.len(),
+        100,
+        "a settle samples nothing sampled already"
+    );
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    for _ in 0..50 {
+        settle(&mut sim, &mut store);
+    }
+    assert_eq!(
+        store.training[debug].samples.len(),
+        100,
+        "after a reopen, settles sample each record once"
+    );
+    assert!(
+        store.tiers[0].dictionaries.is_empty(),
+        "100 values neither fill the samples nor reach the bytes"
+    );
+    assert_eq!(store.problems(), &[] as &[String]);
+    for n in 0..100 {
+        assert_eq!(form_of(&store, &key(n)), Form::Raw, "{n}: no dictionary, so it stays");
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n));
+    }
+}
+
 #[test]
 fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
     let mut sim = Sim::new(9, quiet());
@@ -1813,7 +2034,10 @@ fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
     let again = store.place(&key(1), name("target/image"), &mut effects).unwrap();
     drive(&mut sim, &mut store, &mut effects);
     let cloned = PlacedBytes { cloned: big.len() as u64, ..PlacedBytes::default() };
-    assert_eq!(store.placed()[0], Placed { tag: again, to: name("target/image"), result: Ok(()), bytes: cloned });
+    assert_eq!(
+        store.placed()[0],
+        Placed { tag: again, to: name("target/image"), result: Ok(()), bytes: cloned }
+    );
     drop(store);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), big);
@@ -1851,7 +2075,11 @@ fn an_output_is_written_once_and_cloned_to_every_place() {
     assert_eq!(placed[&b].result, Ok(()));
     let mut bytes = placed[&a].bytes;
     bytes += placed[&b].bytes;
-    assert_eq!(bytes, PlacedBytes { cloned: 2 * len, written: len, copied: 0 }, "written once, cloned twice");
+    assert_eq!(
+        bytes,
+        PlacedBytes { cloned: 2 * len, written: len, copied: 0 },
+        "written once, cloned twice"
+    );
     assert_eq!(sim.contents(&name("one/build/a")), out);
     assert_eq!(sim.contents(&name("two/build/a")), out);
     assert_eq!(sim.mode(&file), Some(PLACED_MODE), "the store's copy is read-only");
@@ -1909,7 +2137,11 @@ fn a_placed_file_is_kept_across_an_open_and_cloned_from_again_unwritten() {
     assert!(!sim.exists(&temporary), "a temporary file of an earlier run goes");
     let placed = place_one(&mut sim, &mut store, "two/build/a");
     assert_eq!(placed.result, Ok(()));
-    assert_eq!(placed.bytes, PlacedBytes { cloned: len, written: 0, copied: 0 }, "checked, not written again");
+    assert_eq!(
+        placed.bytes,
+        PlacedBytes { cloned: len, written: 0, copied: 0 },
+        "checked, not written again"
+    );
     assert_eq!(sim.contents(&name("two/build/a")), out);
     assert_eq!(sim.mode(&file), Some(PLACED_MODE));
     assert_eq!(store.problems(), &[] as &[String]);
@@ -1987,7 +2219,11 @@ fn a_placed_file_removed_outside_the_daemon_is_written_again() {
     assert_eq!(placed.result, Ok(()));
     assert_eq!(placed.bytes.written, out.len() as u64);
     assert_eq!(sim.contents(&name("two/build/a")), out);
-    assert!(store.problems().iter().any(|it| it.contains("could not be cloned from")), "{:?}", store.problems());
+    assert!(
+        store.problems().iter().any(|it| it.contains("could not be cloned from")),
+        "{:?}",
+        store.problems()
+    );
 }
 
 #[test]
@@ -1998,7 +2234,11 @@ fn a_placed_file_swapped_for_a_symbolic_link_is_written_again_and_never_cloned_t
     sim.symlink(&file, "../../elsewhere/a");
     let placed = place_one(&mut sim, &mut store, "two/build/a");
     assert_eq!(placed.result, Ok(()));
-    assert_eq!(placed.bytes.written, out.len() as u64, "written again, not cloned through the link");
+    assert_eq!(
+        placed.bytes.written,
+        out.len() as u64,
+        "written again, not cloned through the link"
+    );
     assert_eq!(sim.contents(&name("two/build/a")), out);
     assert_eq!(sim.mode(&file), Some(PLACED_MODE), "a file again, read-only");
     let why = blaze_core::CLONE_THROUGH_A_LINK;
@@ -2045,7 +2285,10 @@ fn a_place_while_the_open_looks_through_placed_waits_for_the_look_and_is_not_swe
     flush(&mut sim, &mut store);
     let file = name(&format!("store/placed/{:x}", content_of(&out)));
     let tag = store.place(&key(2), name("two/build/b"), &mut effects).unwrap();
-    assert!(!format!("{effects:?}").contains("store/placed"), "nothing in placed/ is touched yet: {effects:?}");
+    assert!(
+        !format!("{effects:?}").contains("store/placed"),
+        "nothing in placed/ is touched yet: {effects:?}"
+    );
     drive(&mut sim, &mut store, &mut effects);
     assert_eq!(store.placed(), Vec::new(), "the place waits for the look");
     assert!(!sim.exists(&file), "no write into placed/ began");
@@ -2056,7 +2299,10 @@ fn a_place_while_the_open_looks_through_placed_waits_for_the_look_and_is_not_swe
     assert_eq!(placed[0].bytes.written, out.len() as u64);
     assert_eq!(sim.contents(&file), out, "the place's own file stays");
     assert_eq!(sim.contents(&name("two/build/b")), out);
-    assert!(sim.exists(&kept) && !sim.exists(&temporary), "the look kept the earlier file and swept the leftover");
+    assert!(
+        sim.exists(&kept) && !sim.exists(&temporary),
+        "the look kept the earlier file and swept the leftover"
+    );
     assert_eq!(store.placed_on_open().swept, 1);
 }
 
@@ -2077,7 +2323,10 @@ fn a_placed_directory_that_cannot_be_looked_through_breaks_the_store() {
     if store.place(&key(1), name("two/build/a"), &mut effects).is_some() {
         drive(&mut sim, &mut store, &mut effects);
         let placed = store.placed();
-        assert!(matches!(&placed[0].result, Err(why) if why.contains("store/placed")), "{placed:?}");
+        assert!(
+            matches!(&placed[0].result, Err(why) if why.contains("store/placed")),
+            "{placed:?}"
+        );
     }
     assert!(!sim.exists(&name("two/build/a")));
 }
@@ -2112,13 +2361,18 @@ fn a_look_through_placed_that_keeps_failing_breaks_the_store_naming_it() {
     drive(&mut sim, &mut store, &mut effects);
     let broken = store.broken().expect("broken").to_string();
     let times = format!("failed {FAILURES_MOST} times");
-    for part in ["store/placed", "looking through it as the store opened", "Permission denied", &times] {
+    for part in
+        ["store/placed", "looking through it as the store opened", "Permission denied", &times]
+    {
         assert!(broken.contains(part), "{part:?} not in {broken}");
     }
     if store.place(&key(1), name("two/build/a"), &mut effects).is_some() {
         drive(&mut sim, &mut store, &mut effects);
         let placed = store.placed();
-        assert!(matches!(&placed[0].result, Err(why) if why.contains("store/placed")), "{placed:?}");
+        assert!(
+            matches!(&placed[0].result, Err(why) if why.contains("store/placed")),
+            "{placed:?}"
+        );
     }
     assert!(!sim.exists(&name("two/build/a")));
 }
@@ -2138,7 +2392,9 @@ fn an_unplace_while_the_open_looks_through_placed_removes_nothing_until_the_look
     assert_eq!(sim.lists_held(), 1, "the open's look through placed/ is still going");
     store.unplace(&key(1), &key(9), &mut effects);
     let placed_dir = name("store/placed");
-    let removes = effects.iter().any(|it| matches!(it, Effect::Remove { file, .. } if file.is_under(&placed_dir)));
+    let removes = effects
+        .iter()
+        .any(|it| matches!(it, Effect::Remove { file, .. } if file.is_under(&placed_dir)));
     assert!(!removes, "no remove in placed/ while the look goes on: {effects:?}");
     drive(&mut sim, &mut store, &mut effects);
     assert!(sim.exists(&kept), "the whole file stays while the look goes on");
@@ -2170,8 +2426,15 @@ fn a_place_held_for_the_look_is_refused_when_the_store_breaks_meanwhile() {
     let broken = store.broken().expect("broken").to_string();
     assert!(broken.contains("Input/output error"), "{broken}");
     let placed = store.placed();
-    assert_eq!((placed.len(), placed.first().map(|it| it.tag)), (1, Some(tag)), "refused, not left waiting: {placed:?}");
-    assert!(matches!(&placed[0].result, Err(why) if why.contains("Input/output error")), "{placed:?}");
+    assert_eq!(
+        (placed.len(), placed.first().map(|it| it.tag)),
+        (1, Some(tag)),
+        "refused, not left waiting: {placed:?}"
+    );
+    assert!(
+        matches!(&placed[0].result, Err(why) if why.contains("Input/output error")),
+        "{placed:?}"
+    );
     sim.release_lists();
     drive(&mut sim, &mut store, &mut effects);
     assert_eq!(store.placed(), Vec::new(), "nothing is placed after the refusal");
@@ -2202,11 +2465,10 @@ fn a_layer_is_read_after_the_store_and_never_written() {
     flush(&mut sim, &mut base);
     drop(base);
     let before = sim.contents(&name("base/head"));
-    let mut store = open_with(&mut sim, Config {
-        dir: name("mine"),
-        layers: vec![name("base")],
-        tags: 1 << 40,
-    });
+    let mut store = open_with(
+        &mut sim,
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40 },
+    );
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"from the base");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), noise(400 << 10, 2));
     let ticket = store.put(key(1), Kind::Code, b"from the base").unwrap();
@@ -2452,7 +2714,8 @@ fn a_pack_others_can_write_to_is_not_read() {
 #[test]
 fn the_store_and_its_files_are_the_users_alone() {
     use std::os::unix::fs::PermissionsExt as _;
-    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let chmod = |path: &std::path::Path, mode| {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     };
@@ -2471,7 +2734,10 @@ fn the_store_and_its_files_are_the_users_alone() {
     let head = dir.join("head");
     chmod(&head, 0o666);
     let refused = Driven::open(&root).err().unwrap();
-    assert!(refused.contains("store/head") && refused.contains("can be written to by other users"), "{refused}");
+    assert!(
+        refused.contains("store/head") && refused.contains("can be written to by other users"),
+        "{refused}"
+    );
     assert_eq!(mode(&head), 0o666, "what is refused is never mended");
     chmod(&dir, 0o777);
     let refused = Driven::open(&root).err().unwrap();
@@ -2533,13 +2799,7 @@ fn a_head_round_trips_and_refuses_any_change() {
         index: Some(IndexRef { slot: 1, len: 64 + 1024 * 64, check: 0xdead_beef, count: 3 }),
         packs: vec![
             PackRef { unit: 0, committed: 4096, indexed: 16, dead: 0, removed: true },
-            PackRef {
-                unit: 2,
-                committed: 3 * 4096,
-                indexed: 4096,
-                dead: 112,
-                removed: false,
-            },
+            PackRef { unit: 2, committed: 3 * 4096, indexed: 4096, dead: 112, removed: false },
         ],
         dictionaries: vec![DictionaryRef { kind: Kind::Run, pack: 1, offset: 16 }],
         externals: vec![ExternalRef { content: content_of(b"y"), len: 9 }],
@@ -2622,7 +2882,10 @@ fn a_fetch_the_remote_knows_is_missing_is_answered_at_once() {
     assert_eq!(store.fetch(&key(5), &mut remote, any, &mut effects), None);
     assert!(remote.0.is_empty() && effects.is_empty());
     assert_eq!(store.fetched(), [(key(5), Fetched::Missing)]);
-    assert!(store.fetch(&key(5), &mut Recorded(Vec::new(), Vec::new()), any, &mut effects).is_some(), "not left fetching");
+    assert!(
+        store.fetch(&key(5), &mut Recorded(Vec::new(), Vec::new()), any, &mut effects).is_some(),
+        "not left fetching"
+    );
 }
 
 #[test]
@@ -2716,26 +2979,46 @@ fn machine_code_is_never_kept_from_a_fetch_and_a_value_says_its_directory() {
     base.put(key(7), Kind::Machine, b"a layer's code").unwrap();
     flush(&mut sim, &mut base);
     drop(base);
-    let mut store = open_with(&mut sim, Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40 });
+    let mut store = open_with(
+        &mut sim,
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40 },
+    );
     store.put(key(8), Kind::Machine, b"my code").unwrap();
     let mut remote = Recorded(Vec::new(), Vec::new());
     let mut effects = Vec::new();
     let machine = store.fetch(&key(1), &mut remote, any, &mut effects).unwrap();
     let run = store.fetch(&key(2), &mut remote, any, &mut effects).unwrap();
     let value = |key, kind, bytes: &[u8]| {
-        Done::Read(remote::Answer::Value { key, kind, content: content_of(bytes), bytes: bytes.to_vec() }.encode_framed())
+        Done::Read(
+            remote::Answer::Value { key, kind, content: content_of(bytes), bytes: bytes.to_vec() }
+                .encode_framed(),
+        )
     };
-    store.complete(Completion { tag: machine, done: value(key(1), Kind::Machine, b"far code") }, &mut effects);
-    store.complete(Completion { tag: run, done: value(key(2), Kind::Run, b"far run") }, &mut effects);
+    store.complete(
+        Completion { tag: machine, done: value(key(1), Kind::Machine, b"far code") },
+        &mut effects,
+    );
+    store.complete(
+        Completion { tag: run, done: value(key(2), Kind::Run, b"far run") },
+        &mut effects,
+    );
     let fetched: BTreeMap<Key, Fetched> = store.fetched().into_iter().collect();
-    assert!(matches!(&fetched[&key(1)], Fetched::Refused(why) if why.contains("machine code")), "{fetched:?}");
+    assert!(
+        matches!(&fetched[&key(1)], Fetched::Refused(why) if why.contains("machine code")),
+        "{fetched:?}"
+    );
     assert!(matches!(fetched[&key(2)], Fetched::Kept(_)));
     assert!(!store.has(&key(1)), "refused machine code is not kept");
 
     let (reader, guard) = (store.reader(), enter());
-    let from = |key| reader.get_from(&guard, &key).unwrap().map(|(origin, entry)| (origin, entry.kind));
+    let from =
+        |key| reader.get_from(&guard, &key).unwrap().map(|(origin, entry)| (origin, entry.kind));
     assert_eq!(from(key(8)), Some((Origin::Own, Kind::Machine)));
-    assert_eq!(from(key(2)), Some((Origin::Own, Kind::Run)), "a fetched value is the store's own, of the kind it was sent as");
+    assert_eq!(
+        from(key(2)),
+        Some((Origin::Own, Kind::Run)),
+        "a fetched value is the store's own, of the kind it was sent as"
+    );
     assert_eq!(from(key(7)), Some((Origin::Behind(name("base")), Kind::Machine)));
     assert_eq!(from(key(1)), None);
 }
@@ -2865,7 +3148,9 @@ fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), long);
     flush(&mut sim, &mut store);
     let loc = store.loc_of(&key(1));
-    let header = RecordHeader::decode(store.tiers[0].packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER).unwrap());
+    let header = RecordHeader::decode(
+        store.tiers[0].packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER).unwrap(),
+    );
     assert_eq!(header.unwrap().dictionary, NO_DICTIONARY);
     drop(store);
     let store = open(&mut sim, "store");
@@ -2911,7 +3196,11 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
     }
     flush(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0, "one period is not two");
-    assert_eq!(settle(&mut sim, &mut store).demoted, 0, "a record made in the last two periods stays");
+    assert_eq!(
+        settle(&mut sim, &mut store).demoted,
+        0,
+        "a record made in the last two periods stays"
+    );
     assert_eq!(bytes_of(&store, &key(0)).unwrap(), text(0, 8 << 10));
     let settled = settle(&mut sim, &mut store);
     assert_eq!(settled.demoted, 9, "{settled:?}");
@@ -3098,7 +3387,8 @@ impl OneColumn {
         if warm.len() < WARM_HEAD || warm[8..40] != self.warm_schema.0.0 {
             return Err("not warm columns of the schema".into());
         }
-        let words = warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()));
+        let words =
+            warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()));
         let packed = blaze_format::tiers::Packed {
             min: u32::from_le_bytes(word(warm, 40)),
             bits: u32::from_le_bytes(word(warm, 44)),
@@ -3153,7 +3443,10 @@ fn a_value_of_columns_goes_warm_then_cold_then_comes_back_hot() {
     for round in 0..2 {
         assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
         let (heat, entry) = store.get_in_place(&key(1)).unwrap().unwrap();
-        assert_eq!((heat, entry.bytes, entry.content), (Heat::Hot, hot.as_slice(), content_of(&hot)));
+        assert_eq!(
+            (heat, entry.bytes, entry.content),
+            (Heat::Hot, hot.as_slice(), content_of(&hot))
+        );
         assert_eq!(settle(&mut sim, &mut store).promoted, round);
     }
     assert_eq!(form_of(&store, &key(1)), Form::Raw);
@@ -3204,7 +3497,11 @@ fn columns_that_do_not_decode_to_the_value_are_not_kept() {
         assert_eq!(settle(&mut sim, &mut store).demoted, 0);
     }
     assert_eq!(form_of(&store, &key(1)), Form::Raw);
-    assert!(store.problems().iter().any(|it| it.contains("do not decode")), "{:?}", store.problems());
+    assert!(
+        store.problems().iter().any(|it| it.contains("do not decode")),
+        "{:?}",
+        store.problems()
+    );
     assert!(store.flag_of(&key(1), Flag::Tried));
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
 }
@@ -3292,7 +3589,14 @@ fn each_crate_version_has_packs_of_its_own_and_keeps_them_across_an_open() {
     assert_ne!(unit_a, unit_b);
     for n in 0..6 {
         let unit = if n % 2 == 0 { unit_a } else { unit_b };
-        store.put_in(unit, key(n), [Kind::Query, Kind::Code, Kind::Debug][n as usize % 3], &noise(5000, n)).unwrap();
+        store
+            .put_in(
+                unit,
+                key(n),
+                [Kind::Query, Kind::Code, Kind::Debug][n as usize % 3],
+                &noise(5000, n),
+            )
+            .unwrap();
     }
     store.put(key(10), Kind::Image, &noise(3000, 10)).unwrap();
     flush(&mut sim, &mut store);
@@ -3411,9 +3715,12 @@ fn column_of(trip: &Trip) -> Result<Vec<u32>, String> {
 fn a_record_moved_hot_to_warm_to_cold_and_back_round_trips_every_column_shape() {
     for seed in [1, 2, 3] {
         let forms = std::cell::RefCell::new(Vec::new());
-        let checked =
-            blaze_v2_proof::columns::round_trips(|column| through_the_tiers(column, &forms), column_of, seed)
-                .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        let checked = blaze_v2_proof::columns::round_trips(
+            |column| through_the_tiers(column, &forms),
+            column_of,
+            seed,
+        )
+        .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
         assert!(checked > 100, "{checked} shapes");
         let forms = forms.into_inner();
         assert!(forms.contains(&Form::Warm), "no shape went warm: {forms:?}");
@@ -3440,7 +3747,9 @@ fn moved_once(column: &[u32]) -> InPlace {
         Heat::Hot => InPlace::Hot(entry.bytes.to_vec()),
         Heat::Warm => {
             let warm = entry.bytes;
-            let words = warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()));
+            let words = warm[WARM_HEAD..]
+                .chunks_exact(4)
+                .map(|it| u32::from_le_bytes(it.try_into().unwrap()));
             InPlace::Warm(blaze_format::tiers::Packed {
                 min: u32::from_le_bytes(word(warm, 40)),
                 bits: u32::from_le_bytes(word(warm, 44)),
@@ -3478,7 +3787,10 @@ fn reclaim_all(store: &mut Store) {
     };
     while !store.limbo.is_empty() || store.migrating.is_some() || retired(store) > 0 {
         store.tidy();
-        assert!(std::time::Instant::now() < deadline, "a grace never passed with no task of this test open");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a grace never passed with no task of this test open"
+        );
         std::thread::yield_now();
     }
 }
@@ -3524,14 +3836,22 @@ fn what_a_task_read_stays_whole_through_every_step_of_commits_and_is_freed_after
             }
             if n % 16 == 15 {
                 for (at, bytes) in read.iter().enumerate() {
-                    assert_eq!(*bytes, values[at].as_slice(), "seed {seed}: value {at} changed under its task");
+                    assert_eq!(
+                        *bytes,
+                        values[at].as_slice(),
+                        "seed {seed}: value {at} changed under its task"
+                    );
                 }
             }
         }
         drive(&mut sim, &mut store, &mut effects);
         flush(&mut sim, &mut store);
         for (at, bytes) in read.iter().enumerate() {
-            assert_eq!(*bytes, values[at].as_slice(), "seed {seed}: value {at} changed under its task");
+            assert_eq!(
+                *bytes,
+                values[at].as_slice(),
+                "seed {seed}: value {at} changed under its task"
+            );
         }
         assert!(store.tiers[0].head.index.is_some(), "seed {seed}: an index was written");
         assert!(!store.limbo.is_empty(), "seed {seed}: what the task can still read is held");
@@ -3589,9 +3909,15 @@ fn writers_and_readers_on_other_threads_go_on_through_commits_settles_and_index_
                     for _ in 0..16 {
                         at = (at + 31) % KEYS;
                         let (kind, bytes) = &values[at as usize];
-                        let entry = reader.get(&guard, &key(at)).unwrap_or_else(|corrupt| panic!("{corrupt}"));
+                        let entry = reader
+                            .get(&guard, &key(at))
+                            .unwrap_or_else(|corrupt| panic!("{corrupt}"));
                         if let Some(entry) = entry {
-                            assert_eq!((entry.kind, entry.bytes), (*kind, bytes.as_slice()), "key {at}");
+                            assert_eq!(
+                                (entry.kind, entry.bytes),
+                                (*kind, bytes.as_slice()),
+                                "key {at}"
+                            );
                             found += 1;
                         }
                     }
@@ -3629,7 +3955,10 @@ fn writers_and_readers_on_other_threads_go_on_through_commits_settles_and_index_
     flush(&mut sim, &mut store);
     assert!(store.broken().is_none(), "{:?}", store.broken());
     assert_eq!(tickets.len() as u64, WRITERS * KEYS);
-    assert!(tickets.iter().all(|it| store.durable(*it)), "every put is durable after the last flush");
+    assert!(
+        tickets.iter().all(|it| store.durable(*it)),
+        "every put is durable after the last flush"
+    );
     stop.store(true, Ordering::Relaxed);
     let found: u64 = readers.into_iter().map(|it| it.join().unwrap()).sum();
     assert!(found > 0, "the readers read");
@@ -3657,7 +3986,8 @@ fn hits_and_warm_puts_allocate_nothing() {
     let mut writer = store.writer();
     let reader = store.reader();
     let count = INDEX_AFTER as u64 * 3;
-    let values: Vec<Vec<u8>> = (0..count).map(|n| noise(40 + (n as usize * 53) % 3000, n)).collect();
+    let values: Vec<Vec<u8>> =
+        (0..count).map(|n| noise(40 + (n as usize * 53) % 3000, n)).collect();
     let guard = enter();
     let hits = |store: &Store, upto: u64, what: &str| {
         blaze_alloc_count::assert_at_most(0, what, || {
@@ -3665,26 +3995,34 @@ fn hits_and_warm_puts_allocate_nothing() {
                 let want = values[n as usize].as_slice();
                 let entry = reader.get(&guard, &key(n)).unwrap().expect("put before");
                 assert!(entry.bytes == want, "{what}: {n}");
-                assert!(store.get(&key(n)).unwrap().is_some_and(|it| it.bytes == want), "{what}: {n}");
+                assert!(
+                    store.get(&key(n)).unwrap().is_some_and(|it| it.bytes == want),
+                    "{what}: {n}"
+                );
             }
         });
     };
     // The first put warms what a thread keeps once: its writer's first chunk is made already.
     writer.put(&guard, key(0), Kind::Query, &values[0]).unwrap();
-    let mut pending: Vec<(Key, Vec<u8>)> = (1..count - 16).map(|n| (key(n), values[n as usize].clone())).collect();
+    let mut pending: Vec<(Key, Vec<u8>)> =
+        (1..count - 16).map(|n| (key(n), values[n as usize].clone())).collect();
     let before = store.tiers[0].delta.len();
     blaze_alloc_count::assert_at_most(0, "warm puts", || {
         for (key, bytes) in pending.drain(..) {
             writer.put(&guard, key, Kind::Query, &bytes).unwrap();
         }
     });
-    assert!(store.tiers[0].delta.len() > before + DELTA_FIRST / 2, "the puts went past the delta's first level");
+    assert!(
+        store.tiers[0].delta.len() > before + DELTA_FIRST / 2,
+        "the puts went past the delta's first level"
+    );
     hits(&store, count - 16, "hits in segments");
     drop(guard);
     flush(&mut sim, &mut store);
     reclaim_all(&mut store);
     let guard = enter();
-    let mut rest: Vec<(Key, Vec<u8>)> = (count - 16..count).map(|n| (key(n), values[n as usize].clone())).collect();
+    let mut rest: Vec<(Key, Vec<u8>)> =
+        (count - 16..count).map(|n| (key(n), values[n as usize].clone())).collect();
     blaze_alloc_count::assert_at_most(0, "warm puts after a commit", || {
         for (key, bytes) in rest.drain(..) {
             writer.put(&guard, key, Kind::Query, &bytes).unwrap();
@@ -3700,7 +4038,10 @@ fn hits_and_warm_puts_allocate_nothing() {
                 let entry = reader.get(&guard, &key(n)).unwrap().expect("put before");
                 assert!(entry.bytes == values[n as usize].as_slice(), "{what}: {n}");
                 let in_place = reader.get_in_place(&guard, &key(n)).unwrap();
-                assert!(in_place.is_some_and(|(_, it)| it.bytes == values[n as usize].as_slice()), "{what}: {n}");
+                assert!(
+                    in_place.is_some_and(|(_, it)| it.bytes == values[n as usize].as_slice()),
+                    "{what}: {n}"
+                );
                 assert!(store.has(&key(n)), "{what}: {n}");
             }
         });
@@ -3730,10 +4071,18 @@ fn a_pinned_value_is_held_in_place_past_its_task_and_its_store() {
     let mut pinned = Vec::new();
     for (n, value) in values.iter().enumerate() {
         let it = store.pinned(&key(n as u64)).unwrap().unwrap();
-        assert_eq!((&*it, it.kind, it.content), (value.as_slice(), Kind::Code, content_of(value)), "{n}");
+        assert_eq!(
+            (&*it, it.kind, it.content),
+            (value.as_slice(), Kind::Code, content_of(value)),
+            "{n}"
+        );
         assert!(aligned(&it), "{n}");
         let kept = store.get(&key(n as u64)).unwrap().unwrap().bytes;
-        assert_eq!(it.in_place(), aligned(kept), "{n}: in place exactly when the record is aligned");
+        assert_eq!(
+            it.in_place(),
+            aligned(kept),
+            "{n}: in place exactly when the record is aligned"
+        );
         if it.in_place() {
             assert_eq!(it.as_ptr(), kept.as_ptr(), "{n}: the store's own bytes");
         }
@@ -3782,7 +4131,11 @@ fn a_module_of_machine_code_is_a_file_of_its_own_that_its_pin_names() {
     assert!(pinned.in_place());
     assert_eq!(pinned.file(), Some(&file));
     assert_eq!(&*pinned, code.as_slice());
-    assert_eq!(store.pinned(&key(2)).unwrap().unwrap().file(), None, "a record of a pack is no file of its own");
+    assert_eq!(
+        store.pinned(&key(2)).unwrap().unwrap().file(),
+        None,
+        "a record of a pack is no file of its own"
+    );
     for _ in 0..4 {
         settle(&mut sim, &mut store);
     }
@@ -3811,7 +4164,11 @@ fn a_handle_reads_and_puts_beside_the_store_and_its_puts_are_durable_with_a_flus
     assert!(!handle.durable(ticket));
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), code);
     assert_eq!(&*handle.pinned(&key(2)).unwrap().unwrap(), code.as_slice());
-    assert_eq!(handle.put(key(2), Kind::Machine, &code), Ok(ticket), "the same bytes again are the first put");
+    assert_eq!(
+        handle.put(key(2), Kind::Machine, &code),
+        Ok(ticket),
+        "the same bytes again are the first put"
+    );
     assert!(handle.put(key(2), Kind::Machine, b"other").is_err());
     flush(&mut sim, &mut store);
     assert!(handle.durable(ticket));

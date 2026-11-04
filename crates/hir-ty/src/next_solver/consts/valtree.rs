@@ -1,10 +1,16 @@
-use std::{borrow::Cow, fmt, hash::Hash, marker::PhantomData, num::{NonZero, NonZeroU32}};
+use std::{
+    borrow::Cow,
+    fmt,
+    hash::Hash,
+    marker::PhantomData,
+    num::{NonZero, NonZeroU32},
+};
 
 use base_db::Db;
+use blaze_hashcons::Interned;
 use hir_def::{AdtId, VariantId};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_abi::{Size, TargetDataLayout};
-use blaze_hashcons::Interned;
 use rustc_type_ir::{GenericTypeVisitable, TypeFoldable, TypeVisitable, inherent::IntoKind};
 
 use crate::{
@@ -53,11 +59,7 @@ impl<'db> ValueConst<'db> {
     /// Fails if the value can't be represented as bits (e.g. because it is a reference
     /// or an aggregate).
     #[inline]
-    pub fn try_to_bits(
-        self,
-        db: &'db Db,
-        param_env: ParamEnvAndCrate<'db>,
-    ) -> Option<u128> {
+    pub fn try_to_bits(self, db: &'db Db, param_env: ParamEnvAndCrate<'db>) -> Option<u128> {
         let (TyKind::Bool | TyKind::Char | TyKind::Uint(_) | TyKind::Int(_) | TyKind::Float(_)) =
             self.ty.kind()
         else {
@@ -245,29 +247,30 @@ impl<'db> Reader<'_, 'db> {
             TyKind::Adt(def, args) => {
                 let db = self.interner.db;
                 let layout = self.layout(ty)?;
-                let (variant, index, layout): (VariantId, Option<u32>, Cow<'_, Layout>) =
-                    match def.def_id() {
-                        AdtId::UnionId(_) => return Err(ValTreeCreationError::NonSupportedType(ty)),
-                        AdtId::StructId(id) => (id.into(), None, Cow::Borrowed(&**layout)),
-                        AdtId::EnumId(id) => {
-                            if matches!(layout.variants, hir_def::layout::Variants::Empty) {
-                                return Err(unreadable(ty, "a value of an enum with no variants"));
-                            }
-                            if bytes.len() < layout.size.bytes_usize() {
-                                return Err(unreadable(ty, "fewer bytes than the enum takes"));
-                            }
-                            let (variant, layout) =
-                                detect_variant_from_bytes(&layout, db, self.data_layout, bytes, id)
-                                    .ok_or_else(|| unreadable(ty, "a tag that names no variant"))?;
-                            let index = id
-                                .enum_variants(db)
-                                .variants
-                                .values()
-                                .position(|it| it.0 == variant)
-                                .ok_or_else(|| unreadable(ty, "a variant not of its enum"))?;
-                            (variant.into(), Some(index as u32), layout)
+                let (variant, index, layout): (VariantId, Option<u32>, Cow<'_, Layout>) = match def
+                    .def_id()
+                {
+                    AdtId::UnionId(_) => return Err(ValTreeCreationError::NonSupportedType(ty)),
+                    AdtId::StructId(id) => (id.into(), None, Cow::Borrowed(&**layout)),
+                    AdtId::EnumId(id) => {
+                        if matches!(layout.variants, hir_def::layout::Variants::Empty) {
+                            return Err(unreadable(ty, "a value of an enum with no variants"));
                         }
-                    };
+                        if bytes.len() < layout.size.bytes_usize() {
+                            return Err(unreadable(ty, "fewer bytes than the enum takes"));
+                        }
+                        let (variant, layout) =
+                            detect_variant_from_bytes(&layout, db, self.data_layout, bytes, id)
+                                .ok_or_else(|| unreadable(ty, "a tag that names no variant"))?;
+                        let index = id
+                            .enum_variants(db)
+                            .variants
+                            .values()
+                            .position(|it| it.0 == variant)
+                            .ok_or_else(|| unreadable(ty, "a variant not of its enum"))?;
+                        (variant.into(), Some(index as u32), layout)
+                    }
+                };
                 let interner = self.interner;
                 let fields = db.field_types(variant);
                 let tys = fields
@@ -1033,8 +1036,8 @@ impl fmt::Display for ScalarInt {
 mod tests {
     use base_db::Crate;
     use hir_def::{CallableDefId, ModuleDefId, nameres::crate_def_map};
-    use rustc_type_ir::inherent::Ty as _;
     use hir_expand::fixture;
+    use rustc_type_ir::inherent::Ty as _;
 
     use super::*;
     use crate::{

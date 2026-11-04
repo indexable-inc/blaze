@@ -35,10 +35,10 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 use base_db::{Db, FileId, FileText};
 use blaze_api::{ApiError, Edit, Edited, EditedItem};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::Op;
 use hir::view::Semantics;
+use std::alloc::Global;
 use syntax::{
     Edition, Parse, SourceFile, SyntaxKind,
     view::{self as ast, AstNode as _},
@@ -95,7 +95,10 @@ impl Applied {
     pub fn seeds(&self) -> impl Iterator<Item = Seed> + '_ {
         self.reparsed.iter().filter(|file| file.parse.errors().is_empty()).map(|file| Seed {
             file: file.file,
-            content: FileText::content_of(&file.parse.root().file().text()[..file.end], file.appended),
+            content: FileText::content_of(
+                &file.parse.root().file().text()[..file.end],
+                file.appended,
+            ),
             edition: file.edition,
             parse: file.parse.clone(), // clone: two `Arc` counts, the seed's own
         })
@@ -183,8 +186,10 @@ pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, Ap
             }
             _ => {
                 others_made = true;
-                let path = edit::file_of(edit).expect("an edit other than a replace names its file");
-                let at = cx.open(path).map_err(|what| ApiError::new(what, Some(path.to_owned())))?;
+                let path =
+                    edit::file_of(edit).expect("an edit other than a replace names its file");
+                let at =
+                    cx.open(path).map_err(|what| ApiError::new(what, Some(path.to_owned())))?;
                 edit::apply(&mut cx.working[at as usize], at, edit, &mut cx.touches)
                     .map_err(|what| ApiError::new(what, Some(path.to_owned())))?;
             }
@@ -212,12 +217,15 @@ impl<F: Files> Edits<'_, F> {
             return Ok(at);
         }
         let files = self.files;
-        let path = files.path(file).ok_or_else(|| format!("file {file:?} the edit reaches is outside the view"))?;
+        let path = files
+            .path(file)
+            .ok_or_else(|| format!("file {file:?} the edit reaches is outside the view"))?;
         self.load(file, path)
     }
 
     fn load(&mut self, file: FileId, path: &str) -> Result<u32, String> {
-        let (_, bytes) = self.files.file(path).ok_or_else(|| format!("{path} is not in the view"))?;
+        let (_, bytes) =
+            self.files.file(path).ok_or_else(|| format!("{path} is not in the view"))?;
         let bytes = std::str::from_utf8(bytes).map_err(|_| format!("{path} is not UTF-8"))?;
         let editioned = self.sema.attach_first_edition(file);
         let root = self.sema.parse(editioned).syntax();
@@ -246,7 +254,9 @@ impl<F: Files> Edits<'_, F> {
     /// files they changed, to seed when asked.
     fn finish(self) -> Applied {
         let Edits { db, sema, working, ids, roots, mut touches, moves, .. } = self;
-        let mut ops: Vec<Op> = Vec::with_capacity(working.iter().map(|it| it.splices.len()).sum::<usize>() + moves.len());
+        let mut ops: Vec<Op> = Vec::with_capacity(
+            working.iter().map(|it| it.splices.len()).sum::<usize>() + moves.len(),
+        );
         ops.extend(working.iter().flat_map(Working::ops));
         ops.extend(moves);
         touches.sort_unstable();
@@ -258,7 +268,8 @@ impl<F: Files> Edits<'_, F> {
                 let path = edit::path_at(file, &touch.at);
                 let key = match &touch.at {
                     At::Item(offset) => {
-                        let node = edit::item_at(roots[touch.file as usize], *offset).expect("a touched item starts there");
+                        let node = edit::item_at(roots[touch.file as usize], *offset)
+                            .expect("a touched item starts there");
                         key_of(&sema, db, node)
                     }
                     At::File => file_key(&sema, db, ids[touch.file as usize]),
@@ -289,7 +300,8 @@ impl<F: Files> Edits<'_, F> {
 /// file the front end reads in place is.
 fn begins_with(text: &str, bytes: &str) -> bool {
     text.len() >= bytes.len()
-        && (std::ptr::eq(text.as_ptr(), bytes.as_ptr()) || text.as_bytes()[..bytes.len()] == *bytes.as_bytes())
+        && (std::ptr::eq(text.as_ptr(), bytes.as_ptr())
+            || text.as_bytes()[..bytes.len()] == *bytes.as_bytes())
 }
 
 /// The key ([`blaze_items::ItemKey`]) of the item `node` is, in the view the front end has;
@@ -305,21 +317,39 @@ pub(crate) fn key_of<'db>(
     };
 
     let id = match node.kind() {
-        SyntaxKind::FN => ItemId::Function(FunctionId::try_from(sema.to_fn_def(ast::Fn::cast(node)?)?).ok()?),
-        SyntaxKind::STRUCT => ItemId::Adt(AdtId::StructId(sema.to_struct_def(ast::Struct::cast(node)?)?.into())),
-        SyntaxKind::ENUM => ItemId::Adt(AdtId::EnumId(sema.to_enum_def(ast::Enum::cast(node)?)?.into())),
-        SyntaxKind::UNION => ItemId::Adt(AdtId::UnionId(sema.to_def(ast::Union::cast(node)?)?.into())),
-        SyntaxKind::TRAIT => ItemId::Trait(TraitId::from(sema.to_trait_def(ast::Trait::cast(node)?)?)),
-        SyntaxKind::IMPL => ItemId::Impl(ImplId::try_from(sema.to_impl_def(ast::Impl::cast(node)?)?).ok()?),
-        SyntaxKind::CONST => ItemId::Const(ConstId::from(sema.to_const_def(ast::Const::cast(node)?)?)),
-        SyntaxKind::STATIC => ItemId::Static(StaticId::from(sema.to_static_def(ast::Static::cast(node)?)?)),
-        SyntaxKind::TYPE_ALIAS => ItemId::Alias(TypeAliasId::from(sema.to_def(ast::TypeAlias::cast(node)?)?)),
-        SyntaxKind::MACRO_RULES => {
-            ItemId::Macro(MacroId::from(sema.to_macro_def(ast::Macro::MacroRules(ast::MacroRules::cast(node)?))?))
+        SyntaxKind::FN => {
+            ItemId::Function(FunctionId::try_from(sema.to_fn_def(ast::Fn::cast(node)?)?).ok()?)
         }
-        SyntaxKind::MACRO_DEF => {
-            ItemId::Macro(MacroId::from(sema.to_macro_def(ast::Macro::MacroDef(ast::MacroDef::cast(node)?))?))
+        SyntaxKind::STRUCT => {
+            ItemId::Adt(AdtId::StructId(sema.to_struct_def(ast::Struct::cast(node)?)?.into()))
         }
+        SyntaxKind::ENUM => {
+            ItemId::Adt(AdtId::EnumId(sema.to_enum_def(ast::Enum::cast(node)?)?.into()))
+        }
+        SyntaxKind::UNION => {
+            ItemId::Adt(AdtId::UnionId(sema.to_def(ast::Union::cast(node)?)?.into()))
+        }
+        SyntaxKind::TRAIT => {
+            ItemId::Trait(TraitId::from(sema.to_trait_def(ast::Trait::cast(node)?)?))
+        }
+        SyntaxKind::IMPL => {
+            ItemId::Impl(ImplId::try_from(sema.to_impl_def(ast::Impl::cast(node)?)?).ok()?)
+        }
+        SyntaxKind::CONST => {
+            ItemId::Const(ConstId::from(sema.to_const_def(ast::Const::cast(node)?)?))
+        }
+        SyntaxKind::STATIC => {
+            ItemId::Static(StaticId::from(sema.to_static_def(ast::Static::cast(node)?)?))
+        }
+        SyntaxKind::TYPE_ALIAS => {
+            ItemId::Alias(TypeAliasId::from(sema.to_def(ast::TypeAlias::cast(node)?)?))
+        }
+        SyntaxKind::MACRO_RULES => ItemId::Macro(MacroId::from(
+            sema.to_macro_def(ast::Macro::MacroRules(ast::MacroRules::cast(node)?))?,
+        )),
+        SyntaxKind::MACRO_DEF => ItemId::Macro(MacroId::from(
+            sema.to_macro_def(ast::Macro::MacroDef(ast::MacroDef::cast(node)?))?,
+        )),
         SyntaxKind::MODULE => {
             let module = ModuleId::from(sema.to_module_def(ast::Module::cast(node)?)?);
             return Some(blaze_items::key::module_key(db, module).0);

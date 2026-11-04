@@ -66,9 +66,11 @@ pub mod threads;
 
 /// The wall clock, as reports name it.
 #[cfg(target_vendor = "apple")]
-pub const WALL_CLOCK: &str = "std::time::Instant → CLOCK_UPTIME_RAW (mach_absolute_time; stops during sleep, no NTP slew)";
+pub const WALL_CLOCK: &str =
+    "std::time::Instant → CLOCK_UPTIME_RAW (mach_absolute_time; stops during sleep, no NTP slew)";
 #[cfg(all(unix, not(target_vendor = "apple")))]
-pub const WALL_CLOCK: &str = "std::time::Instant → CLOCK_MONOTONIC (stops during suspend, NTP slew only)";
+pub const WALL_CLOCK: &str =
+    "std::time::Instant → CLOCK_MONOTONIC (stops during suspend, NTP slew only)";
 
 /// A point on the wall clock. Only differences are meaningful.
 #[inline(always)]
@@ -117,7 +119,11 @@ impl Counts {
 
     /// These counts and `other`'s together.
     pub fn plus(self, other: Counts) -> Counts {
-        let level = |a: Level, b: Level| Level { cycles: a.cycles + b.cycles, instructions: a.instructions + b.instructions, time_ns: a.time_ns + b.time_ns };
+        let level = |a: Level, b: Level| Level {
+            cycles: a.cycles + b.cycles,
+            instructions: a.instructions + b.instructions,
+            time_ns: a.time_ns + b.time_ns,
+        };
         Counts { p: level(self.p, other.p), e: level(self.e, other.e) }
     }
 
@@ -280,7 +286,8 @@ pub fn measure_after_gaps_prepared<T: ?Sized>(
         assert!(!work.is_empty(), "a busy gap needs a nonempty work buffer");
     }
     let started_ns = load::now_ns();
-    let empty = || Batch { calls, wall_ns: 0, cpu_ns: None, counts: Some(Counts::default()), started_ns };
+    let empty =
+        || Batch { calls, wall_ns: 0, cpu_ns: None, counts: Some(Counts::default()), started_ns };
     let mut measured = PreparedBatch { calls: empty(), preparation: empty() };
     for call in 0..=calls {
         load::tick();
@@ -298,7 +305,8 @@ pub fn measure_after_gaps_prepared<T: ?Sized>(
         prepare(input);
         measured.preparation.wall_ns += since_ns(t);
         let counts = before.zip(Counts::read()).map(|(before, after)| after.since(before));
-        measured.preparation.counts = measured.preparation.counts.zip(counts).map(|(sum, call)| sum.plus(call));
+        measured.preparation.counts =
+            measured.preparation.counts.zip(counts).map(|(sum, call)| sum.plus(call));
 
         let before = Counts::read();
         let t = now();
@@ -347,11 +355,22 @@ pub fn process_cpu_ns() -> u64 {
         const RUSAGE_CHILDREN: i32 = -1;
         let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
         // Sound: `ts` is writable.
-        assert_eq!(unsafe { clock_gettime(CLOCK, &mut ts) }, 0, "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)");
+        assert_eq!(
+            unsafe { clock_gettime(CLOCK, &mut ts) },
+            0,
+            "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)"
+        );
         let mut children = [0i64; 18];
         // Sound: `children` is writable and as long as a struct rusage.
-        assert_eq!(unsafe { getrusage(RUSAGE_CHILDREN, children.as_mut_ptr()) }, 0, "getrusage(RUSAGE_CHILDREN)");
-        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64 + child::rusage_cpu_ns(&children) + child::running_cpu_ns()
+        assert_eq!(
+            unsafe { getrusage(RUSAGE_CHILDREN, children.as_mut_ptr()) },
+            0,
+            "getrusage(RUSAGE_CHILDREN)"
+        );
+        ts.tv_sec as u64 * 1_000_000_000
+            + ts.tv_nsec as u64
+            + child::rusage_cpu_ns(&children)
+            + child::running_cpu_ns()
     }
 }
 
@@ -393,7 +412,13 @@ mod imp {
     fn levels() -> Option<[ThscTimeCpi; 2]> {
         let mut levels = [ThscTimeCpi::default(); 2];
         // Sound: `levels` is writable for the size passed.
-        let rc = unsafe { thread_selfcounts(THSC_TIME_CPI_PER_PERF_LEVEL, levels.as_mut_ptr().cast(), std::mem::size_of_val(&levels)) };
+        let rc = unsafe {
+            thread_selfcounts(
+                THSC_TIME_CPI_PER_PERF_LEVEL,
+                levels.as_mut_ptr().cast(),
+                std::mem::size_of_val(&levels),
+            )
+        };
         (rc == 0).then_some(levels)
     }
 
@@ -403,17 +428,27 @@ mod imp {
         let (numer, denom) = (*SETUP.get_or_init(|| {
             let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
             // Sound: `info` is writable.
-            let ok = unsafe { mach_timebase_info(&mut info) } == 0 && info.denom != 0 && levels().is_some();
+            let ok = unsafe { mach_timebase_info(&mut info) } == 0
+                && info.denom != 0
+                && levels().is_some();
             ok.then_some((u64::from(info.numer), u64::from(info.denom)))
         }))?;
         let levels = levels().expect("thread_selfcounts failed after succeeding once");
-        let level = |l: ThscTimeCpi| Level { cycles: l.cycles, instructions: l.instructions, time_ns: (l.user_time_mach + l.system_time_mach) * numer / denom };
+        let level = |l: ThscTimeCpi| Level {
+            cycles: l.cycles,
+            instructions: l.instructions,
+            time_ns: (l.user_time_mach + l.system_time_mach) * numer / denom,
+        };
         Some(Counts { p: level(levels[0]), e: level(levels[1]) })
     }
 
     pub fn set_qos(class: u32) {
         // Sound: a plain call on the calling thread.
-        assert_eq!(unsafe { pthread_set_qos_class_self_np(class, 0) }, 0, "pthread_set_qos_class_self_np");
+        assert_eq!(
+            unsafe { pthread_set_qos_class_self_np(class, 0) },
+            0,
+            "pthread_set_qos_class_self_np"
+        );
     }
 
     /// Mach absolute-time ticks as nanoseconds.
@@ -484,7 +519,10 @@ mod tests {
 
     #[test]
     fn counts_subtract_and_rate() {
-        let later = Counts { p: Level { cycles: 4_400, instructions: 9_000, time_ns: 1_000 }, e: Level::default() };
+        let later = Counts {
+            p: Level { cycles: 4_400, instructions: 9_000, time_ns: 1_000 },
+            e: Level::default(),
+        };
         let d = later.since(Counts::default());
         assert_eq!((d.mhz(), d.e_percent()), (4_400, 0));
     }
@@ -514,7 +552,9 @@ mod tests {
         assert_eq!(measured.preparation.cpu_ns, None);
         assert!(measured.calls.wall_ns >= 150_000);
         assert!(measured.preparation.wall_ns >= 300_000);
-        assert!(since_ns(started) >= 4_000_000 + measured.calls.wall_ns + measured.preparation.wall_ns);
+        assert!(
+            since_ns(started) >= 4_000_000 + measured.calls.wall_ns + measured.preparation.wall_ns
+        );
     }
 
     #[test]
@@ -527,7 +567,14 @@ mod tests {
     fn idle_gaps_sleep_outside_the_intervals() {
         let mut calls = 0;
         let started = now();
-        let measured = measure_after_gaps_prepared(5, Gap::Idle, 1_000_000, &mut calls, |c| *c += 1, |_| busy_work(10_000));
+        let measured = measure_after_gaps_prepared(
+            5,
+            Gap::Idle,
+            1_000_000,
+            &mut calls,
+            |c| *c += 1,
+            |_| busy_work(10_000),
+        );
         assert_eq!((calls, measured.calls.calls), (6, 5), "one untimed call, then the five timed");
         let elapsed = since_ns(started);
         assert!(elapsed >= 6_000_000, "each gap sleeps its length");

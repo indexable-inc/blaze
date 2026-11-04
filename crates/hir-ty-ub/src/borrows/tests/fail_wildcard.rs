@@ -19,7 +19,8 @@ use crate::{
     ids::Span,
 };
 
-const DISABLED_READ: &str = "the accessed tag <TAG> has state Disabled which forbids this child read access";
+const DISABLED_READ: &str =
+    "the accessed tag <TAG> has state Disabled which forbids this child read access";
 const NO_EXPOSED: &str = "there are no exposed tags which may perform this access here";
 
 /// The error of a child read through a tag created `initial` and disabled once, by `cause`, the
@@ -27,8 +28,10 @@ const NO_EXPOSED: &str = "there are no exposed tags which may perform this acces
 #[track_caller]
 fn expect_disabled(e: &AliasError, initial: &str, cause: &str, summary: &str) {
     expect_detail(e, DISABLED_READ);
-    let created = format!("the accessed tag <TAG> was created here, in the initial state {initial}");
-    let disabled = format!("the accessed tag <TAG> later transitioned to Disabled due to a {cause}");
+    let created =
+        format!("the accessed tag <TAG> was created here, in the initial state {initial}");
+    let disabled =
+        format!("the accessed tag <TAG> later transitioned to Disabled due to a {cause}");
     expect_history(e, &[created.as_str(), disabled.as_str(), summary]);
 }
 
@@ -124,7 +127,11 @@ fn cross_tree_update_main_invalid_exposed() {
     s.expose(ref3);
     // *ref2 = 13; //~ ERROR: /write access through .* is forbidden/
     // The only exposed writer, t5, is newer than t4, so it can't be t4's parent.
-    let e = expect_ub(s.write(ref2, 4), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
+    let e = expect_ub(
+        s.write(ref2, 4),
+        AliasErrorKind::NoExposedTag,
+        "write access through <wildcard>",
+    );
     expect_no_exposed(&e);
 }
 
@@ -156,7 +163,11 @@ fn cross_tree_update_main_invalid_exposed2() {
     // let _int4 = ref4 as *mut Cell<u32> as usize;
     s.expose(ref4);
     // *ref2 = 13; //~ ERROR: /write access through .* is forbidden/
-    let e = expect_ub(s.write(ref2, 4), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
+    let e = expect_ub(
+        s.write(ref2, 4),
+        AliasErrorKind::NoExposedTag,
+        "write access through <wildcard>",
+    );
     expect_no_exposed(&e);
 }
 
@@ -311,7 +322,8 @@ fn dealloc() {
     s.write(ref2, 4).unwrap();
     // unsafe { std::alloc::dealloc(wild as *mut u8, Layout::new::<u32>()) };
     //~ ERROR: /deallocation through <wildcard> .* is forbidden/
-    let e = expect_ub(s.free(wild, 4), AliasErrorKind::NoExposedTag, "deallocation through <wildcard>");
+    let e =
+        expect_ub(s.free(wild, 4), AliasErrorKind::NoExposedTag, "deallocation through <wildcard>");
     expect_no_exposed(&e);
 }
 
@@ -336,7 +348,8 @@ fn gc() {
     // let wild = int as *const u32;
     let wild = y.wildcard();
     // let _fail = unsafe { *wild }; //~ ERROR: /read access through <wildcard> at .* is forbidden/
-    let e = expect_ub(s.read(wild, 4), AliasErrorKind::NoExposedTag, "read access through <wildcard>");
+    let e =
+        expect_ub(s.read(wild, 4), AliasErrorKind::NoExposedTag, "read access through <wildcard>");
     expect_no_exposed(&e);
 }
 
@@ -430,7 +443,8 @@ fn multi_exposed_siblings_disable() {
     // *ref3 = 13;
     s.write(ref3, 4).unwrap();
     // let _fail = unsafe { *wild }; //~ ERROR: /read access through .* is forbidden/
-    let e = expect_ub(s.read(wild, 4), AliasErrorKind::NoExposedTag, "read access through <wildcard>");
+    let e =
+        expect_ub(s.read(wild, 4), AliasErrorKind::NoExposedTag, "read access through <wildcard>");
     expect_no_exposed(&e);
 }
 
@@ -484,9 +498,16 @@ fn multi_exposed_siblings_local() {
     // let _y = x;
     s.read(x, 4).unwrap();
     // unsafe { wild.write(0) }; //~ ERROR: /write access through <wildcard> at .* is forbidden/
-    let e = expect_ub(s.write(wild, 4), AliasErrorKind::ChildAccessForbidden, "write access through <wildcard>");
+    let e = expect_ub(
+        s.write(wild, 4),
+        AliasErrorKind::ChildAccessForbidden,
+        "write access through <wildcard>",
+    );
     expect_detail(&e, "the accessed tag <wildcard> is a child of the conflicting tag <TAG>");
-    expect_detail(&e, "the conflicting tag <TAG> has state Frozen which forbids this child write access");
+    expect_detail(
+        &e,
+        "the conflicting tag <TAG> has state Frozen which forbids this child write access",
+    );
     expect_history(
         &e,
         &[
@@ -556,8 +577,12 @@ fn protected_wildcard() {
     let _arg = s.arg_mut(arg, 4).unwrap(); // t9, protected
     //     *ref1 = 13; //~ ERROR: /write access through .* is forbidden/
     // Foreign to the whole wildcard subtree of t4, which holds the protected t9.
-    let e = expect_ub(s.write(captured, 4), AliasErrorKind::ProtectedDisabled, "write access through");
-    expect_detail(&e, "the accessed tag <TAG> is foreign to the protected tag <TAG> (i.e., it is not a child)");
+    let e =
+        expect_ub(s.write(captured, 4), AliasErrorKind::ProtectedDisabled, "write access through");
+    expect_detail(
+        &e,
+        "the accessed tag <TAG> is foreign to the protected tag <TAG> (i.e., it is not a child)",
+    );
     expect_detail(
         &e,
         "this foreign write access would cause the protected tag <TAG> (currently Reserved) to become Disabled",
@@ -601,7 +626,11 @@ fn protector_conflicted() {
     // A foreign read: t9 becomes Reserved (conflicted), which a protector forbids writes to.
     s.read(captured, 4).unwrap();
     //     unsafe { *wild = 4 }; //~ ERROR: /write access through <wildcard> at .* is forbidden/
-    let e = expect_ub(s.write(wild, 4), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
+    let e = expect_ub(
+        s.write(wild, 4),
+        AliasErrorKind::NoExposedTag,
+        "write access through <wildcard>",
+    );
     expect_no_exposed(&e);
 }
 
@@ -742,7 +771,8 @@ fn single_exposed_disable() {
     // *ref2 = 13;
     s.write(ref2, 4).unwrap();
     // let _fail = unsafe { *wild }; //~ ERROR: /read access through .* is forbidden/
-    let e = expect_ub(s.read(wild, 4), AliasErrorKind::NoExposedTag, "read access through <wildcard>");
+    let e =
+        expect_ub(s.read(wild, 4), AliasErrorKind::NoExposedTag, "read access through <wildcard>");
     expect_no_exposed(&e);
 }
 
@@ -786,7 +816,11 @@ fn single_exposed_local() {
     // let _y = x;
     s.read(x, 4).unwrap();
     // unsafe { wild.write(0) }; //~ ERROR: /write access through <wildcard> at .* is forbidden/
-    let e = expect_ub(s.write(wild, 4), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
+    let e = expect_ub(
+        s.write(wild, 4),
+        AliasErrorKind::NoExposedTag,
+        "write access through <wildcard>",
+    );
     expect_no_exposed(&e);
 }
 
@@ -804,7 +838,8 @@ fn single_exposed_only_ro() {
     // let ptr = std::ptr::with_exposed_provenance_mut::<i32>(addr);
     let ptr = shared.wildcard();
     // unsafe { *ptr = 0 }; //~ ERROR: /write access through <wildcard> at .* is forbidden/
-    let e = expect_ub(s.write(ptr, 4), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
+    let e =
+        expect_ub(s.write(ptr, 4), AliasErrorKind::NoExposedTag, "write access through <wildcard>");
     expect_no_exposed(&e);
 }
 
@@ -837,7 +872,10 @@ fn strongly_protected_wildcard() {
     let dropped = s.arg_box(b, 4).unwrap(); // t10, `drop`'s argument, weakly protected
     // `drop`'s `Box` drop glue frees through it. //~ ERROR: /deallocation through .* is forbidden/
     let e = expect_ub(s.free(dropped, 4), AliasErrorKind::ProtectedDealloc, "deallocation through");
-    expect_detail(&e, "the allocation of the accessed tag <TAG> also contains the strongly protected tag <TAG>");
+    expect_detail(
+        &e,
+        "the allocation of the accessed tag <TAG> also contains the strongly protected tag <TAG>",
+    );
     expect_detail(&e, "the strongly protected tag <TAG> disallows deallocations");
     expect_history(
         &e,

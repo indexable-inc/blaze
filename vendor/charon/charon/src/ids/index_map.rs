@@ -34,17 +34,11 @@ where
     I: Idx,
 {
     pub fn new() -> Self {
-        IndexMap {
-            vector: IndexVec::new(),
-            elem_count: 0,
-        }
+        IndexMap { vector: IndexVec::new(), elem_count: 0 }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        IndexMap {
-            vector: IndexVec::with_capacity(capacity),
-            elem_count: 0,
-        }
+        IndexMap { vector: IndexVec::with_capacity(capacity), elem_count: 0 }
     }
 
     pub fn get(&self, i: I) -> Option<&T> {
@@ -188,11 +182,7 @@ where
     /// Map each entry to a new one, keeping the same ids.
     pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> IndexMap<I, U> {
         IndexMap {
-            vector: self
-                .vector
-                .into_iter()
-                .map(|x_opt| x_opt.map(&mut f))
-                .collect(),
+            vector: self.vector.into_iter().map(|x_opt| x_opt.map(&mut f)).collect(),
             elem_count: self.elem_count,
         }
     }
@@ -200,11 +190,7 @@ where
     /// Map each entry to a new one, keeping the same ids.
     pub fn map_ref<'a, U>(&'a self, mut f: impl FnMut(&'a T) -> U) -> IndexMap<I, U> {
         IndexMap {
-            vector: self
-                .vector
-                .iter()
-                .map(|x_opt| x_opt.as_ref().map(&mut f))
-                .collect(),
+            vector: self.vector.iter().map(|x_opt| x_opt.as_ref().map(&mut f)).collect(),
             elem_count: self.elem_count,
         }
     }
@@ -212,11 +198,7 @@ where
     /// Map each entry to a new one, keeping the same ids.
     pub fn map_ref_mut<'a, U>(&'a mut self, mut f: impl FnMut(&'a mut T) -> U) -> IndexMap<I, U> {
         IndexMap {
-            vector: self
-                .vector
-                .iter_mut()
-                .map(|x_opt| x_opt.as_mut().map(&mut f))
-                .collect(),
+            vector: self.vector.iter_mut().map(|x_opt| x_opt.as_mut().map(&mut f)).collect(),
             elem_count: self.elem_count,
         }
     }
@@ -247,10 +229,7 @@ where
 
     /// Map each entry to a new one, keeping the same ids. Includes empty slots.
     pub fn map_opt<U>(self, f: impl FnMut(Option<T>) -> Option<U>) -> IndexMap<I, U> {
-        IndexMap {
-            vector: self.vector.into_iter().map(f).collect(),
-            elem_count: self.elem_count,
-        }
+        IndexMap { vector: self.vector.into_iter().map(f).collect(), elem_count: self.elem_count }
     }
 
     /// Map each entry to a new one, keeping the same ids. Includes empty slots.
@@ -276,9 +255,7 @@ where
     }
 
     pub fn iter_enumerated(&self) -> impl Iterator<Item = (I, &T)> {
-        self.vector
-            .iter_enumerated()
-            .flat_map(|(i, opt)| Some((i, opt.as_ref()?)))
+        self.vector.iter_enumerated().flat_map(|(i, opt)| Some((i, opt.as_ref()?)))
     }
     pub fn iter_indexed(&self) -> impl Iterator<Item = (I, &T)> {
         self.iter_enumerated()
@@ -288,18 +265,14 @@ where
     }
 
     pub fn iter_mut_enumerated(&mut self) -> impl Iterator<Item = (I, &mut T)> {
-        self.vector
-            .iter_mut_enumerated()
-            .flat_map(|(i, opt)| Some((i, opt.as_mut()?)))
+        self.vector.iter_mut_enumerated().flat_map(|(i, opt)| Some((i, opt.as_mut()?)))
     }
     pub fn iter_mut_indexed(&mut self) -> impl Iterator<Item = (I, &mut T)> {
         self.iter_mut_enumerated()
     }
 
     pub fn into_iter_enumerated(self) -> impl Iterator<Item = (I, T)> {
-        self.vector
-            .into_iter_enumerated()
-            .flat_map(|(i, opt)| Some((i, opt?)))
+        self.vector.into_iter_enumerated().flat_map(|(i, opt)| Some((i, opt?)))
     }
     pub fn into_iter_indexed(self) -> impl Iterator<Item = (I, T)> {
         self.into_iter_enumerated()
@@ -336,17 +309,15 @@ where
         mut f: F,
     ) -> impl Iterator<Item = (I, T)> + use<'a, I, T, F> {
         let elem_count = &mut self.elem_count;
-        self.vector
-            .iter_mut_enumerated()
-            .filter_map(move |(i, opt)| {
-                if f(i, opt.as_mut()?) {
-                    *elem_count -= 1;
-                    let elem = opt.take()?;
-                    Some((i, elem))
-                } else {
-                    None
-                }
-            })
+        self.vector.iter_mut_enumerated().filter_map(move |(i, opt)| {
+            if f(i, opt.as_mut()?) {
+                *elem_count -= 1;
+                let elem = opt.take()?;
+                Some((i, elem))
+            } else {
+                None
+            }
+        })
     }
 
     /// Remove the elements that don't match the predicate.
@@ -366,10 +337,7 @@ where
     }
     /// Like `Vec::split_off`.
     pub fn split_off(&mut self, at: usize) -> Self {
-        let mut ret = Self {
-            vector: self.vector.split_off(I::from_usize(at)),
-            elem_count: 0,
-        };
+        let mut ret = Self { vector: self.vector.split_off(I::from_usize(at)), elem_count: 0 };
         self.elem_count = self.iter().count();
         ret.elem_count = ret.iter().count();
         ret
@@ -377,11 +345,7 @@ where
 
     pub fn make_contiguous(self) -> crate::ids::IndexVec<I, T> {
         // Ensure that every slot is filled.
-        assert_eq!(
-            self.elem_count(),
-            self.slot_count(),
-            "`IndexMap` is not contiguous"
-        );
+        assert_eq!(self.elem_count(), self.slot_count(), "`IndexMap` is not contiguous");
         self.into_iter().collect()
     }
 }
@@ -504,10 +468,7 @@ impl<'de, I: Idx, T: Deserialize<'de>> Deserialize<'de> for IndexMap<I, T> {
     where
         D: serde::Deserializer<'de>,
     {
-        let mut ret = Self {
-            vector: Deserialize::deserialize(deserializer)?,
-            elem_count: 0,
-        };
+        let mut ret = Self { vector: Deserialize::deserialize(deserializer)?, elem_count: 0 };
         ret.elem_count = ret.iter().count();
         Ok(ret)
     }
@@ -521,10 +482,7 @@ impl<'de, I: Idx, State, T: DeserializeState<'de, State>> DeserializeState<'de, 
         D: serde::Deserializer<'de>,
     {
         let vec: Vec<Option<_>> = DeserializeState::deserialize_state(state, deserializer)?;
-        let mut ret = Self {
-            vector: IndexVec::from(vec),
-            elem_count: 0,
-        };
+        let mut ret = Self { vector: IndexVec::from(vec), elem_count: 0 };
         ret.elem_count = ret.iter().count();
         Ok(ret)
     }

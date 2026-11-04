@@ -126,8 +126,16 @@ impl<I: Interner> AliasTyKind<I> {
 /// solver and this is currently somewhat messy. Please reach out on
 /// #t-types/trait-system-refactor-initiative if you encounter this and it isn't
 /// immediately clear what to do.
-#[derive(Debug, Clone, Copy, Hash, PartialEq)]
-#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Hash,
+    PartialEq,
+    TypeVisitable_Generic,
+    GenericTypeVisitable,
+    TypeFoldable_Generic,
+)]
 #[cfg_attr(
     feature = "nightly",
     derive(Decodable_NoContext, Encodable_NoContext, StableHash_NoContext)

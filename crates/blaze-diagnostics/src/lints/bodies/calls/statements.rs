@@ -16,11 +16,10 @@
 
 use base_db::Db;
 use hir::InFile;
-use intern::{Symbol, sym};
 use hir_def::{
     AdtId, AttrDefId, EnumId, HasModule as _, Lookup as _,
     attrs::AttrFlags,
-    hir::{BindingAnnotation, BinaryOp, Expr, ExprId, Pat, PatId, Statement},
+    hir::{BinaryOp, BindingAnnotation, Expr, ExprId, Pat, PatId, Statement},
     lang_item::LangItems,
     resolver::ValueNs,
     signatures::FunctionSignature,
@@ -32,6 +31,7 @@ use hir_ty::{
     infer::AutoBorrowMutability,
     next_solver::{AliasTy, AliasTyKind, SolverDefId, Ty, TyKind},
 };
+use intern::{Symbol, sym};
 use rustc_type_ir::{
     ClauseKind, Interner as _,
     elaborate::elaborate,
@@ -46,7 +46,7 @@ use syntax::{
 use crate::{
     cx::item_range_view,
     lints::bodies::{
-        BodyCx, ExprKinds, ExprKind, Hooks, LatePass, LintSet, PatKinds, PatKind, lint_set,
+        BodyCx, ExprKind, ExprKinds, Hooks, LatePass, LintSet, PatKind, PatKinds, lint_set,
         types::util::{Solver, diagnostic_item, from_expansion, path_item, path_value},
     },
     lower::{Found, Phase, break_outside_of_loop::up},
@@ -93,7 +93,12 @@ fn is_must_use(db: &Db, def: AttrDefId) -> bool {
 
 /// Whether `id` is core's enum `name` (`Result`, `ControlFlow`): its diagnostic item, or the
 /// enum of its lang-item variant `variant` (`Ok`, `Continue`).
-fn is_enum(b: &BodyCx<'_, '_, '_>, id: EnumId, name: Symbol, variant: Option<hir_def::EnumVariantId>) -> bool {
+fn is_enum(
+    b: &BodyCx<'_, '_, '_>,
+    id: EnumId,
+    name: Symbol,
+    variant: Option<hir_def::EnumVariantId>,
+) -> bool {
     let db = b.db();
     variant.is_some_and(|it| it.lookup(db).parent == id)
         || diagnostic_item(db, AttrDefId::AdtId(AdtId::EnumId(id))) == Some(name)
@@ -111,7 +116,13 @@ impl LatePass for PathStatements {
     const LINTS: LintSet = lint_set(["path_statements"]);
     const HOOKS: Hooks = Hooks::STMT;
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        block: ExprId,
+        index: usize,
+        out: &mut Vec<Found>,
+    ) {
         let Some(expr) = semi_expr(b, block, index) else { return };
         let Expr::Path(_) = b.store().expr(expr) else { return };
         let (Some(stmt), Some(at)) = (expr_stmt(b, expr), b.expr_node(expr)) else { return };
@@ -119,12 +130,18 @@ impl LatePass for PathStatements {
         let solver = Solver::of(b);
         let diag = if needs_drop(&solver, b.infer.expr_ty(expr)) {
             // clone: a span, for the lint's diagnostic
-            let mut diag = Diag::lint("path_statements", "path statement drops value", span.clone());
+            let mut diag =
+                Diag::lint("path_statements", "path statement drops value", span.clone());
             let message = "use `drop` to clarify the intent";
             match b.expr_span(expr).and_then(|it| b.cx.snippet(&it)) {
                 Some(snippet) => {
                     // alloc: the lint's diagnostic
-                    diag.suggestion(span, message, format!("drop({snippet});"), Applicability::MachineApplicable);
+                    diag.suggestion(
+                        span,
+                        message,
+                        format!("drop({snippet});"),
+                        Applicability::MachineApplicable,
+                    );
                 }
                 None => {
                     diag.span_help(span, message);
@@ -159,7 +176,9 @@ struct Written {
 impl Local {
     /// The `let` statement `index` of `block`.
     fn of_stmt(b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize) -> Option<Local> {
-        let Statement::Let { pat, type_ref, initializer, .. } = statement(b, block, index)? else { return None };
+        let Statement::Let { pat, type_ref, initializer, .. } = statement(b, block, index)? else {
+            return None;
+        };
         Some(Local { pat, init: initializer, typed: type_ref.is_some(), assign: None })
     }
 
@@ -194,7 +213,13 @@ impl LatePass for LetUnderscore {
     const HOOKS: Hooks = Hooks::LOCAL;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Assignment]);
 
-    fn check_local(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_local(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        block: ExprId,
+        index: usize,
+        out: &mut Vec<Found>,
+    ) {
         if let Some(local) = Local::of_stmt(b, block, index) {
             let_underscore(b, &local, out);
         }
@@ -232,26 +257,32 @@ fn let_underscore(b: &BodyCx<'_, '_, '_>, local: &Local, out: &mut Vec<Found>) {
         let Some(local_at) = written.get_or_insert_with(|| local.written(b)) else { return };
         let lang = lang_items(&solver);
         let lock = match ty.as_adt() {
-            Some((AdtId::EnumId(id), args)) if is_enum(b, id, sym::Result, lang.ResultOk) => args.type_at(0),
+            Some((AdtId::EnumId(id), args)) if is_enum(b, id, sym::Result, lang.ResultOk) => {
+                args.type_at(0)
+            }
             _ => ty,
         };
         // rustc's guards of a lock, which `let _ = ` drops at once.
         let guards = [sym::MutexGuard, sym::RwLockReadGuard, sym::RwLockWriteGuard];
-        let is_sync_lock = lock
-            .as_adt()
-            .is_some_and(|(adt, _)| diagnostic_item(b.db(), AttrDefId::AdtId(adt)).is_some_and(|it| guards.contains(&it)));
+        let is_sync_lock = lock.as_adt().is_some_and(|(adt, _)| {
+            diagnostic_item(b.db(), AttrDefId::AdtId(adt)).is_some_and(|it| guards.contains(&it))
+        });
         let Some(pat_span) = b.pat_span(pat) else { continue };
         let init = if index == 0 { local.init.and_then(|it| b.expr_span(it)) } else { None };
-        let drop_fn = init.as_ref().filter(|it| it.file == local_at.span.file).map(|init| {
-            (local_at.span.with_hi(init.lo), init.shrink_to_hi())
-        });
+        let drop_fn = init
+            .as_ref()
+            .filter(|it| it.file == local_at.span.file)
+            .map(|init| (local_at.span.with_hi(init.lo), init.shrink_to_hi()));
         let assign = local.assign.is_some();
         if is_sync_lock {
             let mut diag =
                 // clone: a span, for the lint's diagnostic
                 Diag::lint("let_underscore_lock", "non-binding let on a synchronization lock", pat_span.clone());
             // clone: a span, for the lint's diagnostic
-            diag.span_label(pat_span.clone(), "this lock is not assigned to a binding and is immediately dropped");
+            diag.span_label(
+                pat_span.clone(),
+                "this lock is not assigned to a binding and is immediately dropped",
+            );
             non_binding_let_sub(&mut diag, pat_span, drop_fn, assign);
             out.push(b.lint(diag, Phase::Late, local_at.at));
         } else if init.is_some() {
@@ -273,7 +304,12 @@ fn non_binding_let_sub(diag: &mut Diag, pat: Span, drop_fn: Option<(Span, Span)>
     if drop_fn.is_some() || !assign {
         let prefix = if assign { "let " } else { "" };
         // alloc: the lint's diagnostic
-        diag.suggestion_verbose(pat, binding, format!("{prefix}_unused"), Applicability::MachineApplicable);
+        diag.suggestion_verbose(
+            pat,
+            binding,
+            format!("{prefix}_unused"),
+            Applicability::MachineApplicable,
+        );
     } else {
         diag.span_help(pat, binding);
     }
@@ -312,7 +348,13 @@ impl LatePass for UnusedResults {
     const LINTS: LintSet = lint_set(["unused_results"]);
     const HOOKS: Hooks = Hooks::STMT;
 
-    fn check_stmt(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_stmt(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        block: ExprId,
+        index: usize,
+        out: &mut Vec<Found>,
+    ) {
         let Some(stmt_expr) = semi_expr(b, block, index) else { return };
         let store = b.store();
         let db = b.db();
@@ -337,10 +379,13 @@ impl LatePass for UnusedResults {
             Expr::MethodCall { .. } => b.infer.method_resolution(expr).map(|(it, _)| it),
             _ => None,
         };
-        if callee.is_some_and(|it| is_must_use(db, AttrDefId::FunctionId(it))) || is_must_use_op(b, expr) {
+        if callee.is_some_and(|it| is_must_use(db, AttrDefId::FunctionId(it)))
+            || is_must_use_op(b, expr)
+        {
             return;
         }
-        let (Some(stmt), Some(at), Some(node)) = (expr_stmt(b, stmt_expr), b.expr_node(stmt_expr), b.expr_node(expr))
+        let (Some(stmt), Some(at), Some(node)) =
+            (expr_stmt(b, stmt_expr), b.expr_node(stmt_expr), b.expr_node(expr))
         else {
             return;
         };
@@ -348,7 +393,11 @@ impl LatePass for UnusedResults {
         let Some(ty) = b.cx.vsema.type_of_expr(written) else { return };
         let ty = b.cx.ty(&ty.original);
         // alloc: the lint's diagnostic
-        let diag = Diag::lint("unused_results", format!("unused result of type `{ty}`"), stmt_span(b, &stmt));
+        let diag = Diag::lint(
+            "unused_results",
+            format!("unused result of type `{ty}`"),
+            stmt_span(b, &stmt),
+        );
         out.push(b.lint(diag, Phase::Late, at));
     }
 }
@@ -357,11 +406,14 @@ impl LatePass for UnusedResults {
 /// `unused_must_use` of it and nothing else.
 fn awaits_must_use_async_fn(b: &BodyCx<'_, '_, '_>, future: ExprId) -> bool {
     let db = b.db();
-    let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) = b.infer.expr_ty(future).kind() else {
+    let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) =
+        b.infer.expr_ty(future).kind()
+    else {
         return false;
     };
     let ImplTraitId::ReturnTypeImplTrait(function, _) = def_id.0.loc(db) else { return false };
-    FunctionSignature::of(db, function).is_async() && is_must_use(db, AttrDefId::FunctionId(function))
+    FunctionSignature::of(db, function).is_async()
+        && is_must_use(db, AttrDefId::FunctionId(function))
 }
 
 /// rustc's operators whose value is to be used (`UnusedResults::check_stmt`'s `must_use_op`):
@@ -381,14 +433,20 @@ fn is_must_use_op(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
 
 /// rustc's `is_ty_must_use` of `ty`, the type of `expr` (whose elements, when it is a tuple,
 /// are the elements' expressions).
-fn ty_must_use<'db>(b: &BodyCx<'_, '_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, expr: Option<ExprId>) -> MustUse {
+fn ty_must_use<'db>(
+    b: &BodyCx<'_, '_, 'db>,
+    solver: &Solver<'db>,
+    ty: Ty<'db>,
+    expr: Option<ExprId>,
+) -> MustUse {
     if ty.is_unit() {
         return MustUse::Trivial;
     }
     let db = b.db();
     let module = b.owner.module(db);
-    let uninhabited =
-        |ty: Ty<'db>| hir_ty::inhabitedness::is_ty_uninhabited_from(&solver.infcx, ty, module, solver.env);
+    let uninhabited = |ty: Ty<'db>| {
+        hir_ty::inhabitedness::is_ty_uninhabited_from(&solver.infcx, ty, module, solver.env)
+    };
     if uninhabited(ty) {
         return MustUse::Trivial;
     }
@@ -407,7 +465,9 @@ fn ty_must_use<'db>(b: &BodyCx<'_, '_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, 
                 if is_enum(b, id, sym::Result, lang.ResultOk) && uninhabited(args.type_at(1)) {
                     return ty_must_use(b, solver, args.type_at(0), expr);
                 }
-                if is_enum(b, id, sym::ControlFlow, lang.ControlFlowContinue) && uninhabited(args.type_at(0)) {
+                if is_enum(b, id, sym::ControlFlow, lang.ControlFlowContinue)
+                    && uninhabited(args.type_at(0))
+                {
                     return ty_must_use(b, solver, args.type_at(1), expr);
                 }
             }
@@ -421,14 +481,16 @@ fn ty_must_use<'db>(b: &BodyCx<'_, '_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, 
             };
             let interner = solver.interner();
             let bounds = interner.item_self_bounds(def_id).skip_binder();
-            yes(elaborate(interner, bounds).filter_only_self().any(|clause| match clause.kind().skip_binder() {
-                ClauseKind::Trait(pred) => is_must_use(db, AttrDefId::TraitId(pred.def_id().0)),
-                _ => false,
+            yes(elaborate(interner, bounds).filter_only_self().any(|clause| {
+                match clause.kind().skip_binder() {
+                    ClauseKind::Trait(pred) => is_must_use(db, AttrDefId::TraitId(pred.def_id().0)),
+                    _ => false,
+                }
             }))
         }
-        TyKind::Dynamic(predicates, _) => {
-            yes(predicates.principal_def_id().is_some_and(|it| is_must_use(db, AttrDefId::TraitId(it.0))))
-        }
+        TyKind::Dynamic(predicates, _) => yes(predicates
+            .principal_def_id()
+            .is_some_and(|it| is_must_use(db, AttrDefId::TraitId(it.0)))),
         TyKind::Tuple(tys) => {
             let elements: Option<&[ExprId]> = match expr.map(|it| b.store().expr(it)) {
                 Some(Expr::Tuple { exprs }) if exprs.len() == tys.len() => Some(exprs),
@@ -472,7 +534,13 @@ impl LatePass for UnitBindings {
     const HOOKS: Hooks = Hooks::LOCAL;
     const EXPRS: ExprKinds = ExprKinds::of(&[ExprKind::Assignment]);
 
-    fn check_local(&mut self, b: &BodyCx<'_, '_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+    fn check_local(
+        &mut self,
+        b: &BodyCx<'_, '_, '_>,
+        block: ExprId,
+        index: usize,
+        out: &mut Vec<Found>,
+    ) {
         if let Some(local) = Local::of_stmt(b, block, index) {
             unit_binding(b, &local, out);
         }
@@ -530,7 +598,9 @@ impl LatePass for NonShorthandFieldPatterns {
             }
             let Some(node) = b.pat_node(field.pat) else { continue };
             let node = b.cx.syntax_view(node);
-            let Some(written) = node.value.parent().and_then(ast::RecordPatField::cast) else { continue };
+            let Some(written) = node.value.parent().and_then(ast::RecordPatField::cast) else {
+                continue;
+            };
             if written.colon_token().is_none() {
                 continue;
             }

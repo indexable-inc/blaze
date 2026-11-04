@@ -64,7 +64,9 @@ fn names_of_a_clean_crate_cost_the_same_at_any_size() {
 fn primitive_items(n: usize) -> String {
     let mut out = String::from("//- /main.rs crate:main\n");
     for i in 0..n {
-        out.push_str(&format!("pub fn p{i}(x: u8, y: &str, z: bool) -> f64 {{ let _ = (x, y, z); 0.0 }}\n"));
+        out.push_str(&format!(
+            "pub fn p{i}(x: u8, y: &str, z: bool) -> f64 {{ let _ = (x, y, z); 0.0 }}\n"
+        ));
         out.push_str(&format!("pub struct P{i}(u128, char, isize);\n"));
     }
     out.push_str("fn main() {}\n");
@@ -77,7 +79,10 @@ fn primitive_items(n: usize) -> String {
 fn primitive_types_of_a_clean_crate_cost_the_same_at_any_size() {
     let allocations = |n: usize| {
         with_cx(&primitive_items(n), |cx| {
-            assert!(!cx.krate.shadows_primitive_type(cx.db), "nothing of the fixture shadows a primitive");
+            assert!(
+                !cx.krate.shadows_primitive_type(cx.db),
+                "nothing of the fixture shadows a primitive"
+            );
             let scopes = defs::scopes(cx);
             assert!(names::check(cx, &scopes).is_empty(), "the fixture's signatures resolve");
             measure(|| names::check(cx, &scopes)).1.allocations
@@ -105,7 +110,10 @@ fn a_shadowed_primitive_type_is_resolved() {
 fn with_owners<R>(check: impl for<'db> FnOnce(&Cx<'_, 'db>, &[Owner<'db>]) -> R) -> R {
     with_cx(&generic_items(8), |cx| {
         let owners = owners(cx, cx.walk());
-        assert!(owners.iter().map(|it| it.attrs.len()).sum::<usize>() >= 32, "the fixture has attributes");
+        assert!(
+            owners.iter().map(|it| it.attrs.len()).sum::<usize>() >= 32,
+            "the fixture has attributes"
+        );
         check(cx, &owners)
     })
 }
@@ -134,7 +142,10 @@ fn an_owners_lowering_is_read_without_allocating() {
         let mut found = Vec::new();
         let lowered = attrs::parsed(cx, &session, owners, &mut found);
         assert!(found.is_empty(), "the fixture's attributes parse");
-        assert!((0..owners.len()).any(|at| !lowered.of(at).is_empty()), "some attribute lowers to something");
+        assert!(
+            (0..owners.len()).any(|at| !lowered.of(at).is_empty()),
+            "some attribute lowers to something"
+        );
         assert_at_most(0, "an owner's lowered attributes", || {
             for at in 0..owners.len() {
                 std::hint::black_box(lowered.of(at));

@@ -56,11 +56,7 @@ fn wilson_bound(fails: f64, runs: f64, upper: bool) -> f64 {
     let denom = 1.0 + z2 / runs;
     let center = p + z2 / (2.0 * runs);
     let margin = z * libm::sqrt((p * (1.0 - p) + z2 / (4.0 * runs)) / runs);
-    let bound = if upper {
-        (center + margin) / denom
-    } else {
-        (center - margin) / denom
-    };
+    let bound = if upper { (center + margin) / denom } else { (center - margin) / denom };
     bound.clamp(0.0, 1.0)
 }
 
@@ -175,11 +171,7 @@ pub(crate) enum GauntletVerdict {
 /// [`GAUNTLET_GAMMA`] below [`RETENTION_HIGH_WATER`] and 1.0 at or above
 /// it.
 pub(crate) fn gauntlet_threshold(anchor: f64) -> f64 {
-    let gamma = if anchor >= RETENTION_HIGH_WATER {
-        1.0
-    } else {
-        GAUNTLET_GAMMA
-    };
+    let gamma = if anchor >= RETENTION_HIGH_WATER { 1.0 } else { GAUNTLET_GAMMA };
     (gamma * anchor).max(GAUNTLET_FLOOR)
 }
 
@@ -236,10 +228,7 @@ pub(crate) struct GauntletSpend {
 
 impl Default for GauntletSpend {
     fn default() -> Self {
-        GauntletSpend {
-            remaining: GAUNTLET_ALPHA_BUDGET,
-            min_fails: GAUNTLET_MIN_FAILS,
-        }
+        GauntletSpend { remaining: GAUNTLET_ALPHA_BUDGET, min_fails: GAUNTLET_MIN_FAILS }
     }
 }
 
@@ -267,10 +256,7 @@ impl GauntletSpend {
             if drive {
                 gauntlet_alpha(*seed, threshold, min_fails)
             } else {
-                let recruited = Evidence {
-                    fails: seed.fails + 1,
-                    runs: seed.runs + 1,
-                };
+                let recruited = Evidence { fails: seed.fails + 1, runs: seed.runs + 1 };
                 CHARGE_FLUKE_RATE * gauntlet_alpha(recruited, threshold, min_fails)
             }
         };

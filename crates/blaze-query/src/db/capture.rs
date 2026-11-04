@@ -255,11 +255,7 @@ pub fn replay_reads<D: Database>(db: &D, reads: Reads) {
 ///
 /// `write` must not ask for a query that may be on this thread's stack: the cycle through it
 /// would make the running query a member of a cycle whose read this forgets.
-pub fn for_span_text<D: Database>(
-    db: &D,
-    out: &mut String,
-    write: impl FnOnce(&D, &mut String),
-) {
+pub fn for_span_text<D: Database>(db: &D, out: &mut String, write: impl FnOnce(&D, &mut String)) {
     let _restore = untracked(db);
     write(db, out);
 }

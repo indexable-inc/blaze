@@ -112,7 +112,8 @@ impl Reads {
                 .to_owned());
         }
         // alloc: once per unit stored, a crate of its closure each
-        let closure: blaze_hash::HashSet<Crate, std::alloc::Global> = krate.transitive_deps(db).iter().copied().collect();
+        let closure: blaze_hash::HashSet<Crate, std::alloc::Global> =
+            krate.transitive_deps(db).iter().copied().collect();
         // alloc: once per unit stored, a variable read each
         let mut names = Vec::new();
         // alloc: once per unit stored, a crate that read `CARGO_PRIMARY_PACKAGE` each
@@ -139,15 +140,23 @@ impl Reads {
         names.dedup();
         primary.sort_unstable();
         primary.dedup();
-        let read = hir_def::deps::closure_expansion_reads(db, krate)
-            .map_err(|refused| format!("no key covers what a proc-macro expansion read: {refused}"))?;
+        let read = hir_def::deps::closure_expansion_reads(db, krate).map_err(|refused| {
+            format!("no key covers what a proc-macro expansion read: {refused}")
+        })?;
         // alloc: once per unit stored, a crate of its closure whose expansions read something each
         let mut expansions: Vec<(Crate, Expansions)> = Vec::with_capacity(read.len());
         for (by, shapes) in read {
             // alloc: a crate's variables, once per unit stored, a crate as above each
-            let mut env: Vec<(String, String)> = by.env(db).iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+            let mut env: Vec<(String, String)> = by
+                .env(db)
+                .iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect();
             env.sort_unstable();
-            let shapes = shapes.into_iter().map(|(shape, values)| (shape.into_vec(), Some(values))).collect();
+            let shapes = shapes
+                .into_iter()
+                .map(|(shape, values)| (shape.into_vec(), Some(values)))
+                .collect();
             expansions.push((by, Expansions { env, shapes }));
         }
         expansions.sort_unstable_by(|a, b| a.1.env.cmp(&b.1.env));
@@ -170,7 +179,12 @@ impl Reads {
                 ));
             }
         }
-        Ok(Reads { names, expansions: expansions.into_iter().map(|(_, it)| it).collect(), primary, files })
+        Ok(Reads {
+            names,
+            expansions: expansions.into_iter().map(|(_, it)| it).collect(),
+            primary,
+            files,
+        })
     }
 
     #[cfg(test)]
@@ -185,19 +199,28 @@ impl Reads {
     /// `manifest`, and nothing else.
     #[cfg(test)]
     pub(crate) fn primary(manifest: &str) -> Reads {
-        Reads { names: Vec::new(), expansions: Vec::new(), primary: vec![manifest.to_owned()], files: Vec::new() }
+        Reads {
+            names: Vec::new(),
+            expansions: Vec::new(),
+            primary: vec![manifest.to_owned()],
+            files: Vec::new(),
+        }
     }
 
     /// Reads of the files at `files` (absolute paths) with the content IDs read of them.
     #[cfg(test)]
     pub(crate) fn of_files(files: &[(&str, ContentId)]) -> Reads {
-        let mut files: Vec<_> = files.iter().map(|&(path, id)| (path.to_owned(), Some(id))).collect();
+        let mut files: Vec<_> =
+            files.iter().map(|&(path, id)| (path.to_owned(), Some(id))).collect();
         files.sort_unstable();
         Reads { names: Vec::new(), expansions: Vec::new(), primary: Vec::new(), files }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.expansions.is_empty() && self.primary.is_empty() && self.files.is_empty()
+        self.names.is_empty()
+            && self.expansions.is_empty()
+            && self.primary.is_empty()
+            && self.files.is_empty()
     }
 
     /// The names, as a slot keeps them: [`VERSION`], the variables' count and each, then the
@@ -206,10 +229,14 @@ impl Reads {
     /// crates that read `CARGO_PRIMARY_PACKAGE` and each, then the files' count and each one's
     /// path. Every string and shape framed by its length, every count and length a `u32` LE.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let names: usize = self.names.iter().chain(&self.primary).map(|it| it.len() + 4).sum::<usize>() + 4;
+        let names: usize =
+            self.names.iter().chain(&self.primary).map(|it| it.len() + 4).sum::<usize>() + 4;
         let files: usize = self.files.iter().map(|(path, _)| path.len() + 4).sum::<usize>() + 4;
         let expansions: usize = (self.expansions.iter())
-            .map(|it| 8 + it.env.iter().map(|(n, v)| n.len() + v.len() + 8).sum::<usize>() + it.shapes.iter().map(|(s, _)| s.len() + 4).sum::<usize>())
+            .map(|it| {
+                8 + it.env.iter().map(|(n, v)| n.len() + v.len() + 8).sum::<usize>()
+                    + it.shapes.iter().map(|(s, _)| s.len() + 4).sum::<usize>()
+            })
             .sum();
         // alloc: one slot's bytes, once per unit stored that read something
         let mut out = Vec::with_capacity(names + expansions + files + 9);
@@ -290,13 +317,17 @@ impl Reads {
             primary.push(read.str_u32().map_err(text)?.to_owned()); // alloc: as above
         }
         if !primary.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err("a record's crates that read `CARGO_PRIMARY_PACKAGE` out of order or repeated");
+            return Err(
+                "a record's crates that read `CARGO_PRIMARY_PACKAGE` out of order or repeated",
+            );
         }
         let count = read.count_u32(4).map_err(short)?;
         // alloc: as above
         let mut files = Vec::with_capacity(count);
         for _ in 0..count {
-            let path = read.str_u32().map_err(|_| "a record's read file whose path is cut short or not UTF-8")?;
+            let path = read
+                .str_u32()
+                .map_err(|_| "a record's read file whose path is cut short or not UTF-8")?;
             files.push((path.to_owned(), None)); // alloc: as above
         }
         if !files.windows(2).all(|pair| pair[0].0 < pair[1].0) {
@@ -314,9 +345,18 @@ impl Reads {
     /// [`blaze_units::query::Units::is_primary_manifest`]) has it, each expansion's as it
     /// reported them, each file's content ID as the front end read it. An error for reads
     /// decoded from a slot, which know no values.
-    fn values_then(&self, env: &[(String, String)], primary: &dyn Fn(&str) -> bool) -> Result<ContentId, String> {
+    fn values_then(
+        &self,
+        env: &[(String, String)],
+        primary: &dyn Fn(&str) -> bool,
+    ) -> Result<ContentId, String> {
         let unknown = || "a record's reads read from the store, filed as if made here".to_owned();
-        self.hash(env, primary, |_, _, then| then.ok_or_else(unknown), |_, then| then.ok_or_else(unknown))
+        self.hash(
+            env,
+            primary,
+            |_, _, then| then.ok_or_else(unknown),
+            |_, then| then.ok_or_else(unknown),
+        )
     }
 
     /// The hash of the values the reads have now: the variables' in `env`, the
@@ -336,7 +376,8 @@ impl Reads {
                 let manifest = it.env.iter().find(|(name, _)| name == "CARGO_MANIFEST_PATH");
                 // clone: a crate's variables, once per slot asked that holds expansions
                 let own: base_db::Env = it.env.iter().cloned().collect();
-                base_db::given_macro_env(&own, manifest.is_some_and(|(_, path)| primary(path))).into_owned()
+                base_db::given_macro_env(&own, manifest.is_some_and(|(_, path)| primary(path)))
+                    .into_owned()
             })
             .collect();
         self.hash(env, primary, |at, shape, _| now(&given[at], shape), |path, _| Ok(file_now(path)))
@@ -354,7 +395,8 @@ impl Reads {
         mut expansion: impl FnMut(usize, &[u8], Option<ContentId>) -> Result<ContentId, String>,
         mut file: impl FnMut(&str, Option<ContentId>) -> Result<ContentId, String>,
     ) -> Result<ContentId, String> {
-        let var = |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_bytes());
+        let var =
+            |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_bytes());
         let mut hasher = Hasher::new(DOMAIN);
         hasher.part(b"values");
         for name in &self.names {
@@ -418,8 +460,11 @@ pub(crate) fn find<'g>(
     for n in 0..SLOTS {
         let at = slot(base, n);
         let Some(record) = get(&at) else { break };
-        let reads = Reads::decode(record).map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
-        let values = reads.values_now(env, primary, &mut now, &mut file_now).map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
+        let reads = Reads::decode(record)
+            .map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
+        let values = reads
+            .values_now(env, primary, &mut now, &mut file_now)
+            .map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
         let key = filed(base, record, values);
         if found(&key) {
             return Ok(Some(Found { key, slot: Some(at) }));

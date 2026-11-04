@@ -42,20 +42,11 @@ pub enum OpCode {
     /// `(BRANCH, (None, items))`: alternation `a|b|c`.
     Branch(Vec<SubPattern>),
     /// `(SUBPATTERN, (group, add_flags, del_flags, p))`: group `(...)`.
-    Subpattern {
-        group: Option<u32>,
-        add_flags: u32,
-        del_flags: u32,
-        p: SubPattern,
-    },
+    Subpattern { group: Option<u32>, add_flags: u32, del_flags: u32, p: SubPattern },
     /// `(GROUPREF, gid)`: backreference to a previously captured group.
     GroupRef(u32),
     /// `(GROUPREF_EXISTS, (cond_group, yes, no))`: `(?(id)yes|no)`.
-    GroupRefExists {
-        cond_group: u32,
-        yes: SubPattern,
-        no: Option<SubPattern>,
-    },
+    GroupRefExists { cond_group: u32, yes: SubPattern, no: Option<SubPattern> },
     /// `(ASSERT, (dir, p))`: positive lookahead/lookbehind.
     Assert { direction: i32, p: SubPattern },
     /// `(ASSERT_NOT, (dir, p))`: negative lookahead/lookbehind.
@@ -63,23 +54,11 @@ pub enum OpCode {
     /// `(ATOMIC_GROUP, p)`: `(?>...)`.
     AtomicGroup(SubPattern),
     /// `(MAX_REPEAT, (min, max, item))`: greedy repetition.
-    MaxRepeat {
-        min: u32,
-        max: u32,
-        item: SubPattern,
-    },
+    MaxRepeat { min: u32, max: u32, item: SubPattern },
     /// `(MIN_REPEAT, (min, max, item))`: non-greedy repetition.
-    MinRepeat {
-        min: u32,
-        max: u32,
-        item: SubPattern,
-    },
+    MinRepeat { min: u32, max: u32, item: SubPattern },
     /// `(POSSESSIVE_REPEAT, (min, max, item))`: possessive repetition.
-    PossessiveRepeat {
-        min: u32,
-        max: u32,
-        item: SubPattern,
-    },
+    PossessiveRepeat { min: u32, max: u32, item: SubPattern },
     /// `(FAILURE, ())`: emitted for empty negative-lookahead `(?!)`.
     Failure,
 }
@@ -183,10 +162,7 @@ impl core::error::Error for ParseError {}
 /// the message.
 impl From<InternalError> for ParseError {
     fn from(e: InternalError) -> Self {
-        ParseError {
-            msg: e.to_string(),
-            pos: 0,
-        }
+        ParseError { msg: e.to_string(), pos: 0 }
     }
 }
 
@@ -221,10 +197,7 @@ impl State {
         let gid = self.groups();
         self.groupwidths.push(None);
         if self.groups() > MAXGROUPS {
-            return Err(ParseError {
-                msg: "too many groups".into(),
-                pos: 0,
-            });
+            return Err(ParseError { msg: "too many groups".into(), pos: 0 });
         }
         if let Some(n) = name {
             if let Some(&ogid) = self.groupdict.get(n) {
@@ -256,10 +229,9 @@ impl State {
                 return Err(tok.error("cannot refer to an open group", 0));
             }
             if gid >= lb {
-                return Err(tok.error(
-                    "cannot refer to group defined in the same lookbehind subpattern",
-                    0,
-                ));
+                return Err(
+                    tok.error("cannot refer to group defined in the same lookbehind subpattern", 0)
+                );
             }
         }
         Ok(())
@@ -276,11 +248,7 @@ struct Tokenizer {
 
 impl Tokenizer {
     fn new(pattern: &str) -> ParseResult<Self> {
-        let mut tok = Tokenizer {
-            chars: pattern.chars().collect(),
-            index: 0,
-            next: None,
-        };
+        let mut tok = Tokenizer { chars: pattern.chars().collect(), index: 0, next: None };
         tok.advance()?;
         Ok(tok)
     }
@@ -380,10 +348,7 @@ impl Tokenizer {
     }
     fn error(&self, msg: &str, offset: usize) -> ParseError {
         let pos = self.tell().saturating_sub(offset);
-        ParseError {
-            msg: msg.to_string(),
-            pos,
-        }
+        ParseError { msg: msg.to_string(), pos }
     }
     fn checkgroupname(&self, name: &str, offset: usize) -> ParseResult<()> {
         if !is_python_identifier(name) {
@@ -502,19 +467,15 @@ fn class_escape(source: &mut Tokenizer, escape: &str) -> ParseResult<ClassEscape
     if let Some(CategoryCode::In(cat)) = lookup_category(escape) {
         return Ok(ClassEscapeResult::Category(cat));
     }
-    let c = escape
-        .chars()
-        .nth(1)
-        .ok_or_else(|| source.error("bad escape (end of pattern)", 0))?;
+    let c = escape.chars().nth(1).ok_or_else(|| source.error("bad escape (end of pattern)", 0))?;
     let mut escape = escape.to_string();
     match c {
         'x' => {
             escape.push_str(&source.getwhile(2, HEXDIGITS)?);
             if escape.chars().count() != 4 {
-                return Err(source.error(
-                    &format!("incomplete escape {}", escape),
-                    escape.chars().count(),
-                ));
+                return Err(
+                    source.error(&format!("incomplete escape {}", escape), escape.chars().count())
+                );
             }
             let hex: String = escape.chars().skip(2).collect();
             let n = parse_escape_value(source, &escape, &hex, 16)?;
@@ -523,10 +484,9 @@ fn class_escape(source: &mut Tokenizer, escape: &str) -> ParseResult<ClassEscape
         'u' => {
             escape.push_str(&source.getwhile(4, HEXDIGITS)?);
             if escape.chars().count() != 6 {
-                return Err(source.error(
-                    &format!("incomplete escape {}", escape),
-                    escape.chars().count(),
-                ));
+                return Err(
+                    source.error(&format!("incomplete escape {}", escape), escape.chars().count())
+                );
             }
             let hex: String = escape.chars().skip(2).collect();
             let n = parse_escape_value(source, &escape, &hex, 16)?;
@@ -541,10 +501,9 @@ fn class_escape(source: &mut Tokenizer, escape: &str) -> ParseResult<ClassEscape
         'U' => {
             escape.push_str(&source.getwhile(8, HEXDIGITS)?);
             if escape.chars().count() != 10 {
-                return Err(source.error(
-                    &format!("incomplete escape {}", escape),
-                    escape.chars().count(),
-                ));
+                return Err(
+                    source.error(&format!("incomplete escape {}", escape), escape.chars().count())
+                );
             }
             let hex: String = escape.chars().skip(2).collect();
             let n = parse_escape_value(source, &escape, &hex, 16)?;
@@ -553,10 +512,8 @@ fn class_escape(source: &mut Tokenizer, escape: &str) -> ParseResult<ClassEscape
             }
             Ok(ClassEscapeResult::Literal(n))
         }
-        'N' => Err(source.error(
-            r"\N{...} named unicode escapes not yet supported in native regex parser",
-            0,
-        )),
+        'N' => Err(source
+            .error(r"\N{...} named unicode escapes not yet supported in native regex parser", 0)),
         ch if OCTDIGITS.contains(ch) => {
             escape.push_str(&source.getwhile(2, OCTDIGITS)?);
             let oct: String = escape.chars().skip(1).collect();
@@ -602,19 +559,15 @@ fn escape_code(
     if let Some(cp) = lookup_escape_literal(escape) {
         return Ok(EscapeResult::Literal(cp));
     }
-    let c = escape
-        .chars()
-        .nth(1)
-        .ok_or_else(|| source.error("bad escape (end of pattern)", 0))?;
+    let c = escape.chars().nth(1).ok_or_else(|| source.error("bad escape (end of pattern)", 0))?;
     let mut escape = escape.to_string();
     match c {
         'x' => {
             escape.push_str(&source.getwhile(2, HEXDIGITS)?);
             if escape.chars().count() != 4 {
-                return Err(source.error(
-                    &format!("incomplete escape {}", escape),
-                    escape.chars().count(),
-                ));
+                return Err(
+                    source.error(&format!("incomplete escape {}", escape), escape.chars().count())
+                );
             }
             let hex: String = escape.chars().skip(2).collect();
             let n = parse_escape_value(source, &escape, &hex, 16)?;
@@ -623,10 +576,9 @@ fn escape_code(
         'u' => {
             escape.push_str(&source.getwhile(4, HEXDIGITS)?);
             if escape.chars().count() != 6 {
-                return Err(source.error(
-                    &format!("incomplete escape {}", escape),
-                    escape.chars().count(),
-                ));
+                return Err(
+                    source.error(&format!("incomplete escape {}", escape), escape.chars().count())
+                );
             }
             let hex: String = escape.chars().skip(2).collect();
             let n = parse_escape_value(source, &escape, &hex, 16)?;
@@ -641,10 +593,9 @@ fn escape_code(
         'U' => {
             escape.push_str(&source.getwhile(8, HEXDIGITS)?);
             if escape.chars().count() != 10 {
-                return Err(source.error(
-                    &format!("incomplete escape {}", escape),
-                    escape.chars().count(),
-                ));
+                return Err(
+                    source.error(&format!("incomplete escape {}", escape), escape.chars().count())
+                );
             }
             let hex: String = escape.chars().skip(2).collect();
             let n = parse_escape_value(source, &escape, &hex, 16)?;
@@ -653,10 +604,8 @@ fn escape_code(
             }
             Ok(EscapeResult::Literal(n))
         }
-        'N' => Err(source.error(
-            r"\N{...} named unicode escapes not yet supported in native regex parser",
-            0,
-        )),
+        'N' => Err(source
+            .error(r"\N{...} named unicode escapes not yet supported in native regex parser", 0)),
         '0' => {
             escape.push_str(&source.getwhile(2, OCTDIGITS)?);
             let oct: String = escape.chars().skip(1).collect();
@@ -672,10 +621,7 @@ fn escape_code(
                     let e_chars: Vec<char> = escape.chars().collect();
                     if OCTDIGITS.contains(e_chars[1])
                         && OCTDIGITS.contains(e_chars[2])
-                        && source
-                            .peek_next_char()
-                            .map(|c| OCTDIGITS.contains(c))
-                            .unwrap_or(false)
+                        && source.peek_next_char().map(|c| OCTDIGITS.contains(c)).unwrap_or(false)
                     {
                         let more = source.get()?.unwrap();
                         escape.push_str(&more);
@@ -702,10 +648,8 @@ fn escape_code(
                 state.checklookbehindgroup(group, source)?;
                 return Ok(EscapeResult::GroupRef(group));
             }
-            Err(source.error(
-                &format!("invalid group reference {}", group),
-                escape.chars().count() - 1,
-            ))
+            Err(source
+                .error(&format!("invalid group reference {}", group), escape.chars().count() - 1))
         }
         ch => {
             if ASCIILETTERS.contains(ch) {
@@ -724,10 +668,7 @@ enum EscapeResult {
 
 fn uniq_set(items: Vec<SetItem>) -> Vec<SetItem> {
     let mut seen = crate::native::HashSet::default();
-    items
-        .into_iter()
-        .filter(|item| seen.insert(item.clone()))
-        .collect()
+    items.into_iter().filter(|item| seen.insert(item.clone())).collect()
 }
 
 fn is_repeat_opcode(op: &OpCode) -> bool {
@@ -882,10 +823,8 @@ fn parse(
             loop {
                 let got = source.get()?;
                 let Some(cur) = got else {
-                    return Err(source.error(
-                        "unterminated character set",
-                        source.tell().saturating_sub(here),
-                    ));
+                    return Err(source
+                        .error("unterminated character set", source.tell().saturating_sub(here)));
                 };
                 if cur == "]" && !set.is_empty() {
                     break;
@@ -1049,12 +988,7 @@ fn parse(
                 ));
             }
             let inner = match item_op {
-                OpCode::Subpattern {
-                    group: None,
-                    add_flags: 0,
-                    del_flags: 0,
-                    p,
-                } => p,
+                OpCode::Subpattern { group: None, add_flags: 0, del_flags: 0, p } => p,
                 other => {
                     let mut sp = SubPattern::new();
                     sp.push(other);
@@ -1064,23 +998,11 @@ fn parse(
 
             subpattern.data.pop();
             let repeat = if source.take_match('?')? {
-                OpCode::MinRepeat {
-                    min,
-                    max,
-                    item: inner,
-                }
+                OpCode::MinRepeat { min, max, item: inner }
             } else if source.take_match('+')? {
-                OpCode::PossessiveRepeat {
-                    min,
-                    max,
-                    item: inner,
-                }
+                OpCode::PossessiveRepeat { min, max, item: inner }
             } else {
-                OpCode::MaxRepeat {
-                    min,
-                    max,
-                    item: inner,
-                }
+                OpCode::MaxRepeat { min, max, item: inner }
             };
             subpattern.push(repeat);
             continue;
@@ -1287,18 +1209,14 @@ fn parse(
                         }
                     }
                 } else {
-                    return Err(source.error(
-                        &format!("unknown extension ?{}", ch),
-                        ch.chars().count() + 1,
-                    ));
+                    return Err(
+                        source.error(&format!("unknown extension ?{}", ch), ch.chars().count() + 1)
+                    );
                 }
             }
 
-            let group: Option<u32> = if capture {
-                Some(state.opengroup(name.as_deref())?)
-            } else {
-                None
-            };
+            let group: Option<u32> =
+                if capture { Some(state.opengroup(name.as_deref())?) } else { None };
             let sub_verbose = (verbose || (add_flags & SRE_FLAG_VERBOSE) != 0)
                 && (del_flags & SRE_FLAG_VERBOSE) == 0;
             let p = parse_sub(source, state, sub_verbose, nested + 1)?;
@@ -1315,12 +1233,7 @@ fn parse(
                 hegel_internal_debug_assert!(group.is_none());
                 subpattern.push(OpCode::AtomicGroup(p));
             } else {
-                subpattern.push(OpCode::Subpattern {
-                    group,
-                    add_flags,
-                    del_flags,
-                    p,
-                });
+                subpattern.push(OpCode::Subpattern { group, add_flags, del_flags, p });
             }
             continue;
         }
@@ -1339,12 +1252,7 @@ fn parse(
         i -= 1;
         let take_inner = matches!(
             &subpattern.data[i],
-            OpCode::Subpattern {
-                group: None,
-                add_flags: 0,
-                del_flags: 0,
-                ..
-            }
+            OpCode::Subpattern { group: None, add_flags: 0, del_flags: 0, .. }
         );
         if take_inner {
             let p = hegel_internal_unwrap!(
@@ -1393,17 +1301,15 @@ fn parse_flags(
                 "parse_flags called with non-flag char {ch:?}"
             );
             if ch == "L" {
-                return Err(source.error(
-                    "bad inline flags: cannot use 'L' flag with a str pattern",
-                    0,
-                ));
+                return Err(
+                    source.error("bad inline flags: cannot use 'L' flag with a str pattern", 0)
+                );
             }
             add_flags |= flag;
             if flag & TYPE_FLAGS != 0 && (add_flags & TYPE_FLAGS) != flag {
-                return Err(source.error(
-                    "bad inline flags: flags 'a', 'u' and 'L' are incompatible",
-                    0,
-                ));
+                return Err(
+                    source.error("bad inline flags: flags 'a', 'u' and 'L' are incompatible", 0)
+                );
             }
             let got = source.get()?;
             let Some(n) = got else {
@@ -1444,10 +1350,9 @@ fn parse_flags(
         loop {
             let flag = flag_for_char(ch.chars().next().unwrap()).unwrap();
             if flag & TYPE_FLAGS != 0 {
-                return Err(source.error(
-                    "bad inline flags: cannot turn off flags 'a', 'u' and 'L'",
-                    0,
-                ));
+                return Err(
+                    source.error("bad inline flags: cannot turn off flags 'a', 'u' and 'L'", 0)
+                );
             }
             del_flags |= flag;
             let got = source.get()?;
@@ -1478,18 +1383,12 @@ fn parse_flags(
 /// point ([`parse_pattern`]) parses str patterns.
 fn fix_flags(mut flags: u32) -> ParseResult<u32> {
     if flags & SRE_FLAG_LOCALE != 0 {
-        return Err(ParseError {
-            msg: "cannot use LOCALE flag with a str pattern".into(),
-            pos: 0,
-        });
+        return Err(ParseError { msg: "cannot use LOCALE flag with a str pattern".into(), pos: 0 });
     }
     if flags & SRE_FLAG_ASCII == 0 {
         flags |= SRE_FLAG_UNICODE;
     } else if flags & SRE_FLAG_UNICODE != 0 {
-        return Err(ParseError {
-            msg: "ASCII and UNICODE flags are incompatible".into(),
-            pos: 0,
-        });
+        return Err(ParseError { msg: "ASCII and UNICODE flags are incompatible".into(), pos: 0 });
     }
     Ok(flags)
 }
@@ -1513,18 +1412,11 @@ pub fn parse_pattern(pattern: &str, flags: u32) -> ParseResult<ParsedPattern> {
 
     for (&g, &pos) in &state.grouprefpos {
         if g >= state.groups() {
-            return Err(ParseError {
-                msg: format!("invalid group reference {}", g),
-                pos,
-            });
+            return Err(ParseError { msg: format!("invalid group reference {}", g), pos });
         }
     }
 
-    Ok(ParsedPattern {
-        group_refs: has_group_refs(&p),
-        pattern: p,
-        flags: state.flags,
-    })
+    Ok(ParsedPattern { group_refs: has_group_refs(&p), pattern: p, flags: state.flags })
 }
 
 #[cfg(test)]

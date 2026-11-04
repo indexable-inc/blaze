@@ -31,7 +31,11 @@ fn every_stream_completes_on_one_cpu() {
     // long n / 64 (a byte array would set CPU 56 on big-endian targets).
     let mask: [core::ffi::c_ulong; 1] = [1];
     // Sound: one long with CPU 0's bit, for this process.
-    assert_eq!(unsafe { sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr()) }, 0, "pin the process to CPU 0");
+    assert_eq!(
+        unsafe { sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr()) },
+        0,
+        "pin the process to CPU 0"
+    );
     assert_eq!(std::thread::available_parallelism().unwrap().get(), 1);
     blake3_servil::initialize_multithreaded(None);
     // Messages short (gathered into tasks) and long (pieces), borrowed,
@@ -47,8 +51,12 @@ fn every_stream_completes_on_one_cpu() {
         })
         .collect();
     let batch = input(64 * 4096);
-    let blocks: Vec<blake3_servil::performance::Block> = batch.chunks_exact(64).map(|b| blake3_servil::performance::Block(b.try_into().unwrap())).collect();
-    let batch_inputs = [16, 4096].map(|count| blake3_servil::performance::Batch::from_blocks(&blocks[..count], 64));
+    let blocks: Vec<blake3_servil::performance::Block> = batch
+        .chunks_exact(64)
+        .map(|b| blake3_servil::performance::Block(b.try_into().unwrap()))
+        .collect();
+    let batch_inputs = [16, 4096]
+        .map(|count| blake3_servil::performance::Batch::from_blocks(&blocks[..count], 64));
     let mut want = Vec::new();
     let mut got = vec![Hash::from_bytes([0; 32]); 3 * messages.len() + 16 + 4096];
     let handed = std::cell::Cell::new(0);
@@ -72,7 +80,9 @@ fn every_stream_completes_on_one_cpu() {
                 s.submit_reader(&message[..], None, singles.next().unwrap()).unwrap();
                 want.extend([reference(message); 3]);
             }
-            for (count, input, out) in [(16, &batch_inputs[0], small), (4096, &batch_inputs[1], large)] {
+            for (count, input, out) in
+                [(16, &batch_inputs[0], small), (4096, &batch_inputs[1], large)]
+            {
                 s.submit_batch(input, out);
                 want.extend(batch[..64 * count].chunks(64).map(reference));
             }

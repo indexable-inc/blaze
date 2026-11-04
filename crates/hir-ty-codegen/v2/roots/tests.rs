@@ -15,7 +15,6 @@ use super::{
 };
 use db::TestDB;
 
-
 /// What a test of `harness` is given as usercode's fork server: its two names, no more.
 const FORK_SERVER: &str = "\n    pub mod fork_server {\n        \
      pub const SOCKET: &str = \"__BLAZE_FORK_SERVER\";\n        \
@@ -56,7 +55,8 @@ fn function(db: &TestDB, frontend: &HirFrontend<'_>, name: &str) -> HirInstance 
 /// root file.
 fn with_harness(fixture: &str) -> String {
     let (db, frontend) = frontend(fixture);
-    let harness = frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
+    let harness =
+        frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
     let harness = harness.expect("a harness").expect("the crate has `cfg(test)`");
     format!("{fixture}{harness}")
 }
@@ -181,7 +181,10 @@ static UNNAMED: u8 = 0;
     let main = fixture::test_crate(db);
     let dep = |name: &str| {
         let deps = &main.data(db).dependencies;
-        deps.iter().find(|it| it.name.as_str() == name).expect("a dependency of the fixture").crate_id
+        deps.iter()
+            .find(|it| it.name.as_str() == name)
+            .expect("a dependency of the fixture")
+            .crate_id
     };
     let named = test_items::static_item(db, dep("named"), "NAMED");
     assert_eq!(roots.statics, [HirStatic(named)]);
@@ -316,7 +319,9 @@ fn a_crate_with_tests_and_no_harness_is_refused() {
 #[test]
 fn a_harness_with_panic_abort_is_refused() {
     let (db, frontend) = frontend("//- /lib.rs crate:main cfg:test\n#[test]\nfn a() {}\n");
-    let what = frontend.harness(fixture::test_crate(&db), Panic::Abort, Mode::Output, fork_server).expect_err("refused");
+    let what = frontend
+        .harness(fixture::test_crate(&db), Panic::Abort, Mode::Output, fork_server)
+        .expect_err("refused");
     assert!(what.what.contains("-Zpanic-abort-tests"), "{}", what.what);
 }
 
@@ -346,7 +351,8 @@ fn pure() {}
 fn the_text_on_disk_is_before_what_blaze_appends() {
     let fixture = "//- /lib.rs crate:main cfg:test\n#[test]\nfn a() {}\n";
     let (db, frontend) = frontend(fixture);
-    let harness = frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
+    let harness =
+        frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
     let harness = harness.expect("a harness").expect("cfg(test)");
     let text = format!("fn a() {{}}\n{harness}");
     assert_eq!(HirFrontend::on_disk(&text), "fn a() {}\n");
@@ -356,7 +362,8 @@ fn the_text_on_disk_is_before_what_blaze_appends() {
 #[test]
 fn a_crate_without_cfg_test_has_no_harness() {
     let (db, frontend) = frontend("//- /main.rs crate:main\nfn main() {}\n");
-    let harness = frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
+    let harness =
+        frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
     assert_eq!(harness.expect("no refusal"), None);
 }
 

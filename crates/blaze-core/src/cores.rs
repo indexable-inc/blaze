@@ -87,9 +87,13 @@ impl Cores {
 impl fmt::Display for Cores {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.setting {
-            Setting::Default => write!(f, "{VAR} unset: {} of {} cores", self.budget, self.machine)?,
+            Setting::Default => {
+                write!(f, "{VAR} unset: {} of {} cores", self.budget, self.machine)?
+            }
             Setting::All => write!(f, "{VAR}=all: all {} cores", self.machine)?,
-            Setting::Exactly(n) => write!(f, "{VAR}={n}: {} of {} cores", self.budget, self.machine)?,
+            Setting::Exactly(n) => {
+                write!(f, "{VAR}={n}: {} of {} cores", self.budget, self.machine)?
+            }
         }
         match self.lowered() {
             true => f.write_str(" at background priority"),
@@ -199,7 +203,9 @@ pub fn get() -> Result<Cores, CoresError> {
                   sized by it before anything could pass it there"
     )]
     static CORES: std::sync::OnceLock<Result<Cores, CoresError>> = std::sync::OnceLock::new();
-    CORES.get_or_init(|| machine().and_then(|machine| of(std::env::var_os(VAR).as_deref(), machine))).clone() // clone: an error's text at most, once per site
+    CORES
+        .get_or_init(|| machine().and_then(|machine| of(std::env::var_os(VAR).as_deref(), machine)))
+        .clone() // clone: an error's text at most, once per site
 }
 
 /// Why the process's priority was not lowered: the call, and what the OS said.
@@ -271,7 +277,10 @@ fn nice_at_least(nice: i32) -> Result<(), PriorityError> {
     // SAFETY: one system call on the calling process, no memory passed.
     match unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } {
         0 => Ok(()),
-        _ => Err(PriorityError { call: "setpriority(PRIO_PROCESS, 0, 10)", why: std::io::Error::last_os_error() }),
+        _ => Err(PriorityError {
+            call: "setpriority(PRIO_PROCESS, 0, 10)",
+            why: std::io::Error::last_os_error(),
+        }),
     }
 }
 
@@ -280,7 +289,10 @@ fn nice_at_least(_nice: i32) -> Result<(), PriorityError> {
     Err(PriorityError {
         call: "lowering the process's priority",
         // alloc: error path, once
-        why: std::io::Error::new(std::io::ErrorKind::Unsupported, format!("not done on {}", std::env::consts::OS)),
+        why: std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("not done on {}", std::env::consts::OS),
+        ),
     })
 }
 
@@ -301,11 +313,22 @@ mod tests {
         assert_eq!(parse(Some(OsStr::new("all"))), Ok(Setting::All));
         assert_eq!(parse(Some(OsStr::new("1"))), Ok(Setting::Exactly(n(1))));
         assert_eq!(parse(Some(OsStr::new("64"))), Ok(Setting::Exactly(n(64))));
-        for bad in ["0", "-1", "+4", " 4", "4 ", "ALL", "All", "half", "1.5", "99999999999999999999999"] {
-            assert_eq!(parse(Some(OsStr::new(bad))), Err(CoresError::Invalid { value: bad.to_owned() }), "{bad:?}");
+        for bad in
+            ["0", "-1", "+4", " 4", "4 ", "ALL", "All", "half", "1.5", "99999999999999999999999"]
+        {
+            assert_eq!(
+                parse(Some(OsStr::new(bad))),
+                Err(CoresError::Invalid { value: bad.to_owned() }),
+                "{bad:?}"
+            );
         }
         let said = parse(Some(OsStr::new("lots"))).unwrap_err().to_string();
-        assert!(said.contains("BLAZE_CORES=\"lots\"") && said.contains("`all`") && said.contains("whole number"), "{said}");
+        assert!(
+            said.contains("BLAZE_CORES=\"lots\"")
+                && said.contains("`all`")
+                && said.contains("whole number"),
+            "{said}"
+        );
     }
 
     #[test]
@@ -331,7 +354,10 @@ mod tests {
         assert!(daemon.agrees(&of(None, n(18)).unwrap()));
         assert!(daemon.agrees(&of(Some("16".as_ref()), n(18)).unwrap()));
         assert!(!daemon.agrees(&of(Some("all".as_ref()), n(18)).unwrap()));
-        assert_eq!(of(Some("x".as_ref()), n(18)), Err(CoresError::Invalid { value: "x".to_owned() }));
+        assert_eq!(
+            of(Some("x".as_ref()), n(18)),
+            Err(CoresError::Invalid { value: "x".to_owned() })
+        );
         // `all` on a machine the default would also give every core still differs: priority.
         let all = Cores::resolve(Setting::All, n(18));
         assert!(!all.agrees(&of(Some("18".as_ref()), n(18)).unwrap()));

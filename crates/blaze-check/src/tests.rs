@@ -30,7 +30,10 @@ use crate::{
 use Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
 /// Every outcome `f` returns over the model's executions.
-fn outcomes<T: Ord + Clone + 'static>(builder: &Builder, f: impl Fn() -> T + 'static) -> BTreeSet<T> {
+fn outcomes<T: Ord + Clone + 'static>(
+    builder: &Builder,
+    f: impl Fn() -> T + 'static,
+) -> BTreeSet<T> {
     let seen = StdArc::new(StdMutex::new(BTreeSet::new()));
     let into = StdArc::clone(&seen);
     builder.check(move || {

@@ -10,7 +10,6 @@
 
 use base_db::{Db, EditionedFileId, FileId, FileText};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::{AsId, Database as _, FromId, Id};
 use hir_def::{BlockIdLt, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, Lookup, ModuleIdLt};
 use hir_expand::{AstId, HirFileId};
@@ -21,6 +20,7 @@ use hir_ty::{
         InternedOpaqueTyId,
     },
 };
+use std::alloc::Global;
 use syntax::{AstNode, TextRange};
 
 /// How deep the fields of interned arguments are followed: a query's arguments, the
@@ -65,7 +65,14 @@ pub(crate) fn whose(db: &Db, interned: &Interned, edited: &Edited, key: Id) -> W
     whose_at(db, interned, edited, key, DEPTH, &mut ids)
 }
 
-fn whose_at(db: &Db, interned: &Interned, edited: &Edited, id: Id, depth: u32, ids: &mut Vec<Id>) -> Whose {
+fn whose_at(
+    db: &Db,
+    interned: &Interned,
+    edited: &Edited,
+    id: Id,
+    depth: u32,
+    ids: &mut Vec<Id>,
+) -> Whose {
     if id == edited.def.as_id() {
         return Whose::Own;
     }
@@ -80,14 +87,20 @@ fn whose_at(db: &Db, interned: &Interned, edited: &Edited, id: Id, depth: u32, i
     match name {
         "InternedClosureId" => owned(InternedClosureId::from_id(id).loc(db).owner),
         "InternedCoroutineId" => owned(InternedCoroutineId::from_id(id).loc(db).owner),
-        "InternedCoroutineClosureId" => owned(InternedCoroutineClosureId::from_id(id).loc(db).owner),
+        "InternedCoroutineClosureId" => {
+            owned(InternedCoroutineClosureId::from_id(id).loc(db).owner)
+        }
         "InternedOpaqueTyId" => own(match InternedOpaqueTyId::from_id(id).loc(db) {
             ImplTraitId::ReturnTypeImplTrait(func, _) => DefWithBodyId::from(func) == edited.def,
             ImplTraitId::TypeAliasImplTrait(..) => false,
         }),
-        "AnonConstId" => own(AnonConstId::from_id(id).loc(db).owner == ExpressionStoreOwnerId::Body(edited.def)),
+        "AnonConstId" => {
+            own(AnonConstId::from_id(id).loc(db).owner == ExpressionStoreOwnerId::Body(edited.def))
+        }
         "BlockIdLt" => own(within(db, edited, BlockIdLt::from_id(id).ast_id(db))),
-        "ModuleIdLt" => own(ModuleIdLt::from_id(id).block(db).is_some_and(|block| within(db, edited, block.ast_id(db)))),
+        "ModuleIdLt" => own(ModuleIdLt::from_id(id)
+            .block(db)
+            .is_some_and(|block| within(db, edited, block.ast_id(db)))),
         "FunctionId" => own(within(db, edited, FunctionId::from_id(id).lookup(db).id)),
         "MacroCallId" => own(interned.get(&id) == Some(&edited.index)),
         "EditionedFileId" if EditionedFileId::from_id(id).file_id(db) == edited.vfs => Whose::File,

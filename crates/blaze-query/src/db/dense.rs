@@ -107,7 +107,11 @@ impl<T: Zeroed, const WHOLE: usize> Dense<T, WHOLE> {
         let bytes = capacity.checked_mul(size_of::<T>()).unwrap_or_else(|| {
             panic!("the query database's {capacity}-place column of {name}: its size overflows")
         });
-        let region = if WHOLE > 0 { Region::reserve_sparse(bytes, tag) } else { Region::reserve(bytes, tag) };
+        let region = if WHOLE > 0 {
+            Region::reserve_sparse(bytes, tag)
+        } else {
+            Region::reserve(bytes, tag)
+        };
         let region = region.unwrap_or_else(|why| {
             panic!("the query database's {capacity}-place column of {name}: {why}")
         });
@@ -137,7 +141,10 @@ impl<T: Zeroed, const WHOLE: usize> Dense<T, WHOLE> {
     /// committed again before it is next read: `Dense::grow`'s invariant holds from 0.
     pub(crate) fn clear(&mut self) {
         if let Err(why) = self.region.decommit_after(0) {
-            panic!("the query database's column of {} could not give its pages back: {why}", self.name);
+            panic!(
+                "the query database's column of {} could not give its pages back: {why}",
+                self.name
+            );
         }
         *self.len.get_mut() = 0;
     }
@@ -422,8 +429,9 @@ mod tests {
             .expect_err("a read at a whole column's capacity panics");
         let message = refused.downcast_ref::<String>().expect("a formatted panic");
         assert!(
-            message.contains(&format!("place {N} of the whole dense query column of a test's directory"))
-                && message.contains(&format!("past its {N} places")),
+            message.contains(&format!(
+                "place {N} of the whole dense query column of a test's directory"
+            )) && message.contains(&format!("past its {N} places")),
             "{message}"
         );
         whole.get_to_write(1000).store(5, Ordering::Release);
@@ -434,9 +442,15 @@ mod tests {
         // publishes every place.
         let committed = whole.len();
         if cfg!(windows) {
-            assert_eq!(committed, N, "writing place 1000 published {committed} of {N} places committed whole");
+            assert_eq!(
+                committed, N,
+                "writing place 1000 published {committed} of {N} places committed whole"
+            );
         } else {
-            assert!((1001..N).contains(&committed), "writing place 1000 committed {committed} of {N} places");
+            assert!(
+                (1001..N).contains(&committed),
+                "writing place 1000 committed {committed} of {N} places"
+            );
         }
         assert!(std::panic::catch_unwind(|| whole.get_to_write(N)).is_err());
     }
@@ -483,7 +497,8 @@ mod tests {
                 for reader in 0..READERS {
                     let (column, start, grown, raced) = (&column, &start, &grown, &raced);
                     scope.spawn(move || {
-                        let mut rng = blaze_ids::rng::SplitMix64::new((round * READERS + reader) as u64);
+                        let mut rng =
+                            blaze_ids::rng::SplitMix64::new((round * READERS + reader) as u64);
                         let (mut last, mut moved) = (0, 0);
                         start.wait();
                         while grown.load(Ordering::Acquire) < GROWERS {
@@ -504,14 +519,23 @@ mod tests {
                                 len - 1
                             );
                             let at = rng.index(len);
-                            let got = column.get_checked(at).map_or(0, |it| it.load(Ordering::Acquire));
-                            assert!(got == 0 || got == at as u64 + 1, "round {round}: place {at} read {got}");
+                            let got =
+                                column.get_checked(at).map_or(0, |it| it.load(Ordering::Acquire));
+                            assert!(
+                                got == 0 || got == at as u64 + 1,
+                                "round {round}: place {at} read {got}"
+                            );
                         }
                         raced.fetch_add(moved, Ordering::Relaxed);
                     });
                 }
             });
-            assert_eq!(column.len(), CAP, "round {round}: the growers grew the column to {} places", column.len());
+            assert_eq!(
+                column.len(),
+                CAP,
+                "round {round}: the growers grew the column to {} places",
+                column.len()
+            );
         }
         let raced = raced.load(Ordering::Relaxed);
         assert!(

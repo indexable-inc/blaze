@@ -93,8 +93,12 @@ pub unsafe fn hash_many<const N: usize>(
     // The chunk kernel takes flags, flags_start, and flags_end packed into
     // one word; the parent kernel applies flags | flags_start | flags_end to
     // its single block, which is what hash_many means for one-block inputs.
-    let (kernel, packed_flags): (Option<Kernel>, u32) = if N == CHUNK_LEN && increment_counter.yes() {
-        (Some(ffi::blake3_servil_sme2_hash16_chunks_512), flags as u32 | (flags_start as u32) << 8 | (flags_end as u32) << 16)
+    let (kernel, packed_flags): (Option<Kernel>, u32) = if N == CHUNK_LEN && increment_counter.yes()
+    {
+        (
+            Some(ffi::blake3_servil_sme2_hash16_chunks_512),
+            flags as u32 | (flags_start as u32) << 8 | (flags_end as u32) << 16,
+        )
     } else if N == BLOCK_LEN && !increment_counter.yes() {
         (Some(ffi::blake3_servil_sme2_hash16_parents_512), (flags | flags_start | flags_end) as u32)
     } else {
@@ -106,7 +110,12 @@ pub unsafe fn hash_many<const N: usize>(
     // the message kernel, sixteen per group (the chunk kernel with a block
     // count and one counter for every lane).
     let blocks = N / BLOCK_LEN;
-    if kernel.is_none() && N % BLOCK_LEN == 0 && (2..=16).contains(&blocks) && !increment_counter.yes() && full_groups > 0 {
+    if kernel.is_none()
+        && N % BLOCK_LEN == 0
+        && (2..=16).contains(&blocks)
+        && !increment_counter.yes()
+        && full_groups > 0
+    {
         let lanes = unsafe {
             crate::ran_kernel(ffi::blake3_servil_sme2_hash16_messages_512 as *const ());
             ffi::blake3_servil_sme2_hash16_messages_512(
@@ -130,9 +139,21 @@ pub unsafe fn hash_many<const N: usize>(
             // contiguous run. Every caller in this crate already stores
             // parent inputs that way; anyone else gets a copy.
             let base = inputs[0].as_ptr();
-            let contiguous = inputs[..count].iter().enumerate().all(|(i, input)| input.as_ptr() == unsafe { base.add(i * BLOCK_LEN) });
+            let contiguous = inputs[..count]
+                .iter()
+                .enumerate()
+                .all(|(i, input)| input.as_ptr() == unsafe { base.add(i * BLOCK_LEN) });
             if contiguous {
-                unsafe { kernel(base, key.as_ptr(), counter, packed_flags, out.as_mut_ptr(), full_groups as u64) }
+                unsafe {
+                    kernel(
+                        base,
+                        key.as_ptr(),
+                        counter,
+                        packed_flags,
+                        out.as_mut_ptr(),
+                        full_groups as u64,
+                    )
+                }
             } else {
                 // Gather up to GATHER groups per kernel call, so one entry
                 // into streaming mode covers them all.
@@ -144,15 +165,32 @@ pub unsafe fn hash_many<const N: usize>(
                     for (i, input) in inputs[group * GROUP..][..groups * GROUP].iter().enumerate() {
                         buf[i * BLOCK_LEN..][..BLOCK_LEN].copy_from_slice(&input[..]);
                     }
-                    let lanes =
-                        unsafe { kernel(buf.as_ptr(), key.as_ptr(), counter, packed_flags, out[group * GROUP * OUT_LEN..].as_mut_ptr(), groups as u64) };
+                    let lanes = unsafe {
+                        kernel(
+                            buf.as_ptr(),
+                            key.as_ptr(),
+                            counter,
+                            packed_flags,
+                            out[group * GROUP * OUT_LEN..].as_mut_ptr(),
+                            groups as u64,
+                        )
+                    };
                     assert_eq!(lanes, 16, "SME2 streaming vector length changed under us");
                     group += groups;
                 }
                 16
             }
         } else {
-            unsafe { kernel(inputs.as_ptr() as *const u8, key.as_ptr(), counter, packed_flags, out.as_mut_ptr(), full_groups as u64) }
+            unsafe {
+                kernel(
+                    inputs.as_ptr() as *const u8,
+                    key.as_ptr(),
+                    counter,
+                    packed_flags,
+                    out.as_mut_ptr(),
+                    full_groups as u64,
+                )
+            }
         };
         assert_eq!(lanes, 16, "SME2 streaming vector length changed under us");
         done = count;
@@ -169,9 +207,19 @@ pub unsafe fn hash_many<const N: usize>(
     if N == BLOCK_LEN && !increment_counter.yes() && done > 0 && rest >= OVERLAP_MIN {
         let mut last = [0u8; GROUP * OUT_LEN];
         unsafe {
-            hash_many(&inputs[inputs.len() - GROUP..], key, counter, increment_counter, flags, flags_start, flags_end, &mut last);
+            hash_many(
+                &inputs[inputs.len() - GROUP..],
+                key,
+                counter,
+                increment_counter,
+                flags,
+                flags_start,
+                flags_end,
+                &mut last,
+            );
         }
-        out[done * OUT_LEN..inputs.len() * OUT_LEN].copy_from_slice(&last[(GROUP - rest) * OUT_LEN..]);
+        out[done * OUT_LEN..inputs.len() * OUT_LEN]
+            .copy_from_slice(&last[(GROUP - rest) * OUT_LEN..]);
         return;
     }
 
@@ -181,7 +229,16 @@ pub unsafe fn hash_many<const N: usize>(
         // (integer + vector hybrids, see neon_hybrid.rs) are the fastest
         // path there.
         unsafe {
-            crate::neon_hybrid::hash_many(&inputs[done..], key, rest_counter, increment_counter, flags, flags_start, flags_end, &mut out[done * OUT_LEN..]);
+            crate::neon_hybrid::hash_many(
+                &inputs[done..],
+                key,
+                rest_counter,
+                increment_counter,
+                flags,
+                flags_start,
+                flags_end,
+                &mut out[done * OUT_LEN..],
+            );
         }
     }
 }
@@ -195,13 +252,24 @@ pub unsafe fn hash_many<const N: usize>(
 /// lanes whose values the kernel computes and never stores. One kernel
 /// call, so one entry into streaming mode. Unsafe because the CPU must
 /// have SME2 with 512-bit streaming vectors.
-pub unsafe fn hash_messages<const N: usize>(lanes: &[&[u8; N]], key: &CVWords, flags: u8, flags_start: u8, flags_end: u8, last_len: usize, out: &mut [u8]) {
+pub unsafe fn hash_messages<const N: usize>(
+    lanes: &[&[u8; N]],
+    key: &CVWords,
+    flags: u8,
+    flags_start: u8,
+    flags_end: u8,
+    last_len: usize,
+    out: &mut [u8],
+) {
     let blocks = N / BLOCK_LEN;
     assert!(N % BLOCK_LEN == 0 && (1..=16).contains(&blocks), "slots of 1 to 16 whole blocks");
     assert!((1..=BLOCK_LEN).contains(&last_len), "a last block of 1 to 64 bytes");
     let count = out.len() / OUT_LEN;
     assert!(
-        out.len() % OUT_LEN == 0 && lanes.len() % GROUP == 0 && count <= lanes.len() && lanes.len() - count < GROUP,
+        out.len() % OUT_LEN == 0
+            && lanes.len() % GROUP == 0
+            && count <= lanes.len()
+            && lanes.len() - count < GROUP,
         "whole groups of lanes, fewer than sixteen of them spare, all in the last group"
     );
     if count == 0 {
@@ -214,7 +282,11 @@ pub unsafe fn hash_messages<const N: usize>(lanes: &[&[u8; N]], key: &CVWords, f
             lanes.as_ptr() as *const *const u8,
             key.as_ptr(),
             0,
-            flags as u64 | (flags_start as u64) << 8 | (flags_end as u64) << 16 | stored << 24 | ((last_len % BLOCK_LEN) as u64) << 40,
+            flags as u64
+                | (flags_start as u64) << 8
+                | (flags_end as u64) << 16
+                | stored << 24
+                | ((last_len % BLOCK_LEN) as u64) << 40,
             out.as_mut_ptr(),
             (lanes.len() / GROUP) as u64,
             blocks as u64,
@@ -229,8 +301,19 @@ pub unsafe fn hash_messages<const N: usize>(lanes: &[&[u8; N]], key: &CVWords, f
 /// sixteen chaining values to `out[512 g..]`. One kernel call, so one
 /// entry into streaming mode. Unsafe because the CPU must have SME2 with
 /// 512-bit streaming vectors.
-pub unsafe fn hash_groups_at(chunks: &[&[u8; CHUNK_LEN]], counters: &[u64], key: &CVWords, flags: u8, flags_start: u8, flags_end: u8, out: &mut [u8]) {
-    assert!(chunks.len() == GROUP * counters.len() && out.len() == chunks.len() * OUT_LEN, "sixteen chunks and their values for each counter");
+pub unsafe fn hash_groups_at(
+    chunks: &[&[u8; CHUNK_LEN]],
+    counters: &[u64],
+    key: &CVWords,
+    flags: u8,
+    flags_start: u8,
+    flags_end: u8,
+    out: &mut [u8],
+) {
+    assert!(
+        chunks.len() == GROUP * counters.len() && out.len() == chunks.len() * OUT_LEN,
+        "sixteen chunks and their values for each counter"
+    );
     if counters.is_empty() {
         return;
     }
@@ -263,7 +346,13 @@ pub const MESSAGE_CHUNKS: core::ops::RangeInclusive<usize> = 2..=15;
 /// the mode (IV and 0 for plain hashing). Unsafe because the CPU
 /// must have SME2 with 512-bit streaming vectors and every pointer must
 /// reach `len` rounded up to whole blocks.
-pub unsafe fn hash_chunked_messages(lanes: &[*const u8; GROUP], len: usize, key: &CVWords, flags: u8, out: &mut [u8]) {
+pub unsafe fn hash_chunked_messages(
+    lanes: &[*const u8; GROUP],
+    len: usize,
+    key: &CVWords,
+    flags: u8,
+    out: &mut [u8],
+) {
     use crate::{CHUNK_END, CHUNK_START, PARENT, ROOT};
     let chunks = len.div_ceil(CHUNK_LEN);
     assert!(MESSAGE_CHUNKS.contains(&chunks), "messages of 2 to 15 chunks");
@@ -298,7 +387,15 @@ pub unsafe fn hash_chunked_messages(lanes: &[*const u8; GROUP], len: usize, key:
         // The whole chunks, one group per chunk index, the counter stepping
         // by one from group to group; then the last chunk.
         crate::ran_kernel(ffi::blake3_servil_sme2_hash16_messages_512 as *const ());
-        let n = ffi::blake3_servil_sme2_hash16_messages_512(table, key.as_ptr(), 0, chunk_flags | 1 << 32, cvs, (chunks - 1) as u64, 16);
+        let n = ffi::blake3_servil_sme2_hash16_messages_512(
+            table,
+            key.as_ptr(),
+            0,
+            chunk_flags | 1 << 32,
+            cvs,
+            (chunks - 1) as u64,
+            16,
+        );
         assert_eq!(n, 16, "SME2 streaming vector length changed under us");
         let last_flags = chunk_flags | ((last_len % BLOCK_LEN) as u64) << 40;
         crate::ran_kernel(ffi::blake3_servil_sme2_hash16_messages_512 as *const ());
@@ -332,12 +429,26 @@ pub unsafe fn hash_chunked_messages(lanes: &[*const u8; GROUP], len: usize, key:
                 core::ptr::copy_nonoverlapping(cv(nodes - 1, 0), cv(parents, 0), GROUP * OUT_LEN);
             }
             crate::ran_kernel(ffi::blake3_servil_sme2_hash16_parents_512 as *const ());
-            let n = ffi::blake3_servil_sme2_hash16_parents_512(pairs, key.as_ptr(), 0, (flags | PARENT) as u32, cvs, parents as u64);
+            let n = ffi::blake3_servil_sme2_hash16_parents_512(
+                pairs,
+                key.as_ptr(),
+                0,
+                (flags | PARENT) as u32,
+                cvs,
+                parents as u64,
+            );
             assert_eq!(n, 16, "SME2 streaming vector length changed under us");
             nodes = parents + nodes % 2;
         }
         crate::ran_kernel(ffi::blake3_servil_sme2_hash16_parents_512 as *const ());
-        let n = ffi::blake3_servil_sme2_hash16_parents_512(pairs, key.as_ptr(), 0, (flags | PARENT | ROOT) as u32, cvs, 1);
+        let n = ffi::blake3_servil_sme2_hash16_parents_512(
+            pairs,
+            key.as_ptr(),
+            0,
+            (flags | PARENT | ROOT) as u32,
+            cvs,
+            1,
+        );
         assert_eq!(n, 16, "SME2 streaming vector length changed under us");
         core::ptr::copy_nonoverlapping(cvs, out.as_mut_ptr(), count * OUT_LEN);
     }
@@ -370,7 +481,8 @@ pub const FLAT_MAX_CHUNKS: usize = 1024;
 /// Whether [`compress_subtree_flat`] takes an input of `len` bytes.
 #[inline]
 pub fn flat_takes(len: usize) -> bool {
-    len.is_power_of_two() && (FLAT_MIN_CHUNKS * CHUNK_LEN..=FLAT_MAX_CHUNKS * CHUNK_LEN).contains(&len)
+    len.is_power_of_two()
+        && (FLAT_MIN_CHUNKS * CHUNK_LEN..=FLAT_MAX_CHUNKS * CHUNK_LEN).contains(&len)
 }
 
 /*
@@ -388,7 +500,14 @@ pub fn flat_takes(len: usize) -> bool {
  * have room for DEGREE values.
  */
 #[inline(never)]
-pub unsafe fn compress_subtree_flat(input: &[u8], ahead: usize, key: &CVWords, chunk_counter: u64, flags: u8, out: &mut [u8]) -> usize {
+pub unsafe fn compress_subtree_flat(
+    input: &[u8],
+    ahead: usize,
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+    out: &mut [u8],
+) -> usize {
     unsafe { flat_walk(input, ahead, key, chunk_counter, flags, DEGREE, out) }
 }
 
@@ -400,7 +519,13 @@ pub unsafe fn compress_subtree_flat(input: &[u8], ahead: usize, key: &CVWords, c
 /// the SME unit in its slow state for the next ones (the module's
 /// documentation). Unsafe for the reasons of [`compress_subtree_flat`].
 #[inline(never)]
-pub unsafe fn compress_subtree_flat_to_parent(input: &[u8], ahead: usize, key: &CVWords, chunk_counter: u64, flags: u8) -> [u8; crate::BLOCK_LEN] {
+pub unsafe fn compress_subtree_flat_to_parent(
+    input: &[u8],
+    ahead: usize,
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+) -> [u8; crate::BLOCK_LEN] {
     let mut out = [0u8; crate::BLOCK_LEN];
     unsafe { flat_walk(input, ahead, key, chunk_counter, flags, 2, &mut out) };
     out
@@ -410,7 +535,13 @@ pub unsafe fn compress_subtree_flat_to_parent(input: &[u8], ahead: usize, key: &
 /// that cannot be the root (input comes before it). Unsafe for the
 /// reasons of [`compress_subtree_flat`].
 #[inline(never)]
-pub unsafe fn compress_subtree_flat_to_cv(input: &[u8], ahead: usize, key: &CVWords, chunk_counter: u64, flags: u8) -> crate::CVBytes {
+pub unsafe fn compress_subtree_flat_to_cv(
+    input: &[u8],
+    ahead: usize,
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+) -> crate::CVBytes {
     let mut out = [0u8; OUT_LEN];
     unsafe { flat_walk(input, ahead, key, chunk_counter, flags, 1, &mut out) };
     out
@@ -426,17 +557,33 @@ pub unsafe fn compress_subtree_flat_to_cv(input: &[u8], ahead: usize, key: &CVWo
 /// caller's input are never prefetched (a lone 1 MiB from DRAM ran 10%
 /// slower so).
 #[inline(always)]
-unsafe fn flat_walk(input: &[u8], ahead: usize, key: &CVWords, chunk_counter: u64, flags: u8, keep: usize, out: &mut [u8]) -> usize {
+unsafe fn flat_walk(
+    input: &[u8],
+    ahead: usize,
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+    keep: usize,
+    out: &mut [u8],
+) -> usize {
     assert!(flat_takes(input.len()), "a whole subtree of 32 to 1024 chunks");
-    assert!(keep == DEGREE || keep == 2 || keep == 1, "the flat walk keeps DEGREE, 2, or 1 chaining values");
+    assert!(
+        keep == DEGREE || keep == 2 || keep == 1,
+        "the flat walk keeps DEGREE, 2, or 1 chaining values"
+    );
     assert!(out.len() >= keep * OUT_LEN, "room for the chaining values kept");
-    assert!(keep < input.len() / CHUNK_LEN, "the flat walk keeps fewer chaining values than its subtree has chunks");
+    assert!(
+        keep < input.len() / CHUNK_LEN,
+        "the flat walk keeps fewer chaining values than its subtree has chunks"
+    );
     let n = input.len() / CHUNK_LEN;
     let mut line = input.as_ptr() as usize + input.len();
     let end = line + ahead.min(input.len());
     while line < end {
         // Sound: a prefetch never faults, whatever the address.
-        unsafe { core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) line, options(nostack, readonly, preserves_flags)) };
+        unsafe {
+            core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) line, options(nostack, readonly, preserves_flags))
+        };
         line += 128;
     }
     #[cfg(feature = "std")]
@@ -452,9 +599,19 @@ unsafe fn flat_walk(input: &[u8], ahead: usize, key: &CVWords, chunk_counter: u6
 /// [`walk_in`] with the scratch on the stack, out of line so the usual
 /// path keeps a small frame.
 #[inline(never)]
-unsafe fn walk_on_stack(input: &[u8], key: &CVWords, chunk_counter: u64, flags: u8, keep: usize, out: &mut [u8], n: usize) -> usize {
+unsafe fn walk_on_stack(
+    input: &[u8],
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+    keep: usize,
+    out: &mut [u8],
+    n: usize,
+) -> usize {
     let mut block = Scratch([core::mem::MaybeUninit::<u8>::uninit(); SCRATCH]);
-    unsafe { walk_in(input, key, chunk_counter, flags, keep, out, n, block.0.as_mut_ptr() as *mut u8) }
+    unsafe {
+        walk_in(input, key, chunk_counter, flags, keep, out, n, block.0.as_mut_ptr() as *mut u8)
+    }
 }
 
 /// The flat walk's scratch, on a 4 KiB boundary, so the residues mod 4 KiB
@@ -486,7 +643,16 @@ std::thread_local! {
 /// also want 32-byte boundaries (VM, up to 21% slower off them).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn walk_in(input: &[u8], key: &CVWords, chunk_counter: u64, flags: u8, keep: usize, out: &mut [u8], n: usize, base: *mut u8) -> usize {
+unsafe fn walk_in(
+    input: &[u8],
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+    keep: usize,
+    out: &mut [u8],
+    n: usize,
+    base: *mut u8,
+) -> usize {
     let (cvs_at, half_at) = scratch_layout(n);
     let table = base as *mut *const u8;
     for i in 0..n {
@@ -495,14 +661,22 @@ unsafe fn walk_in(input: &[u8], key: &CVWords, chunk_counter: u64, flags: u8, ke
     let table = table as *const *const u8;
     let (mut src, mut dst) = unsafe { (base.add(cvs_at), base.add(half_at)) };
 
-    let chunk_flags = flags as u32 | (crate::CHUNK_START as u32) << 8 | (crate::CHUNK_END as u32) << 16;
+    let chunk_flags =
+        flags as u32 | (crate::CHUNK_START as u32) << 8 | (crate::CHUNK_END as u32) << 16;
     let lane_groups = 8 * (n / 144);
     let plain_groups = (n - HYBRID_GROUP * lane_groups) / GROUP;
     debug_assert_eq!(HYBRID_GROUP * lane_groups + GROUP * plain_groups, n);
     unsafe {
         if lane_groups > 0 {
             crate::ran_kernel(ffi::blake3_servil_sme2x2_hash_chunks_512 as *const ());
-            let lanes = ffi::blake3_servil_sme2x2_hash_chunks_512(table, key.as_ptr(), chunk_counter, chunk_flags, src, lane_groups as u64);
+            let lanes = ffi::blake3_servil_sme2x2_hash_chunks_512(
+                table,
+                key.as_ptr(),
+                chunk_counter,
+                chunk_flags,
+                src,
+                lane_groups as u64,
+            );
             assert_eq!(lanes, 16, "SME2 streaming vector length changed under us");
         }
         let done = HYBRID_GROUP * lane_groups;
@@ -525,7 +699,14 @@ unsafe fn walk_in(input: &[u8], key: &CVWords, chunk_counter: u64, flags: u8, ke
             let parents = count / 2;
             let groups = parents.div_ceil(GROUP);
             crate::ran_kernel(ffi::blake3_servil_sme2_hash16_parents_512 as *const ());
-            let lanes = ffi::blake3_servil_sme2_hash16_parents_512(src, key.as_ptr(), 0, (flags | crate::PARENT) as u32, dst, groups as u64);
+            let lanes = ffi::blake3_servil_sme2_hash16_parents_512(
+                src,
+                key.as_ptr(),
+                0,
+                (flags | crate::PARENT) as u32,
+                dst,
+                groups as u64,
+            );
             assert_eq!(lanes, 16, "SME2 streaming vector length changed under us");
             count = parents;
             core::mem::swap(&mut src, &mut dst);
@@ -560,7 +741,10 @@ pub const HYBRID_GROUP: usize = 18;
 /// Prefetch the code of c/blake3_sme2_aarch64.S (its chunk, message, and
 /// parent kernels, 11 KB), which a call of 16 chunks to 64 KiB runs.
 pub fn prefetch_code() {
-    crate::platform::prefetch_code((ffi::blake3_servil_sme2_hash16_chunks_512 as *const () as usize, &raw const ffi::blake3_servil_sme2_text_end as usize));
+    crate::platform::prefetch_code((
+        ffi::blake3_servil_sme2_hash16_chunks_512 as *const () as usize,
+        &raw const ffi::blake3_servil_sme2_text_end as usize,
+    ));
 }
 
 /// Fill `out`'s whole groups of sixteen 64-byte blocks with extended
@@ -569,7 +753,14 @@ pub fn prefetch_code() {
 /// state. Returns the bytes filled (a multiple of 1024; the rest is the
 /// caller's). Unsafe because the CPU must have SME2 with 512-bit streaming
 /// vectors (the platform's detect()).
-pub unsafe fn xof_many(cv: &CVWords, block: &[u8; crate::BLOCK_LEN], block_len: u8, counter: u64, flags: u8, out: &mut [u8]) -> usize {
+pub unsafe fn xof_many(
+    cv: &CVWords,
+    block: &[u8; crate::BLOCK_LEN],
+    block_len: u8,
+    counter: u64,
+    flags: u8,
+    out: &mut [u8],
+) -> usize {
     let groups = out.len() / (GROUP * crate::BLOCK_LEN);
     if groups == 0 {
         return 0;
@@ -578,7 +769,14 @@ pub unsafe fn xof_many(cv: &CVWords, block: &[u8; crate::BLOCK_LEN], block_len: 
     // found SME2.
     crate::ran_kernel(ffi::blake3_servil_sme2_xof16_512 as *const ());
     let lanes = unsafe {
-        ffi::blake3_servil_sme2_xof16_512(cv.as_ptr(), block.as_ptr(), counter, flags as u64 | (block_len as u64) << 8, out.as_mut_ptr(), groups as u64)
+        ffi::blake3_servil_sme2_xof16_512(
+            cv.as_ptr(),
+            block.as_ptr(),
+            counter,
+            flags as u64 | (block_len as u64) << 8,
+            out.as_mut_ptr(),
+            groups as u64,
+        )
     };
     assert_eq!(lanes, 16, "SME2 streaming vector length changed under us");
     groups * GROUP * crate::BLOCK_LEN
@@ -611,7 +809,14 @@ pub mod ffi {
             groups: u64,
         ) -> u64;
         /// Sixteen extended-output blocks per group (see xof_many).
-        pub fn blake3_servil_sme2_xof16_512(cv: *const u32, block: *const u8, counter: u64, flags_len: u64, out: *mut u8, groups: u64) -> u64;
+        pub fn blake3_servil_sme2_xof16_512(
+            cv: *const u32,
+            block: *const u8,
+            counter: u64,
+            flags_len: u64,
+            out: *mut u8,
+            groups: u64,
+        ) -> u64;
         /// Where c/blake3_sme2_aarch64.S's code ends.
         #[cfg(feature = "std")]
         pub static blake3_servil_sme2_text_end: u8;
@@ -619,7 +824,14 @@ pub mod ffi {
         /// two on the integer units beside them (generated by
         /// tools/gen_sme2_hybrid.py). `inputs` is a table of `18 * groups`
         /// chunk pointers; otherwise as `blake3_servil_sme2_hash16_chunks_512`.
-        pub fn blake3_servil_sme2x2_hash_chunks_512(inputs: *const *const u8, key: *const u32, counter: u64, flags: u32, out: *mut u8, groups: u64) -> u64;
+        pub fn blake3_servil_sme2x2_hash_chunks_512(
+            inputs: *const *const u8,
+            key: *const u32,
+            counter: u64,
+            flags: u32,
+            out: *mut u8,
+            groups: u64,
+        ) -> u64;
 
         /// Sixteen separate messages of `blocks` whole blocks (1 to 16) per
         /// group, every one at `counter`. `inputs` is a table of
@@ -647,13 +859,27 @@ pub mod ffi {
         /// and increments per chunk; `flags` packs `flags | flags_start << 8
         /// | flags_end << 16`. Writes `16 * groups` 32-byte chaining values
         /// to `out`. Returns the streaming vector length in 32-bit lanes.
-        pub fn blake3_servil_sme2_hash16_chunks_512(inputs: *const u8, key: *const u32, counter: u64, flags: u32, out: *mut u8, groups: u64) -> u64;
+        pub fn blake3_servil_sme2_hash16_chunks_512(
+            inputs: *const u8,
+            key: *const u32,
+            counter: u64,
+            flags: u32,
+            out: *mut u8,
+            groups: u64,
+        ) -> u64;
 
         /// Sixteen parent compressions per group. `pairs` points at
         /// `16 * groups` adjacent 64-byte parent blocks; `counter` is used
         /// unchanged for every block; `flags` are the parent flags. Writes
         /// `16 * groups` 32-byte chaining values to `out`. Returns the
         /// streaming vector length in 32-bit lanes.
-        pub fn blake3_servil_sme2_hash16_parents_512(pairs: *const u8, key: *const u32, counter: u64, flags: u32, out: *mut u8, groups: u64) -> u64;
+        pub fn blake3_servil_sme2_hash16_parents_512(
+            pairs: *const u8,
+            key: *const u32,
+            counter: u64,
+            flags: u32,
+            out: *mut u8,
+            groups: u64,
+        ) -> u64;
     }
 }

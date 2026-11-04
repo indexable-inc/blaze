@@ -36,15 +36,15 @@ fn identifiers_punctuation_and_whitespace() {
 
 #[test]
 fn comments_and_doc_comments() {
-    assert_eq!(kinds("// plain\n//// plain too\n/// outer\n//! inner\n"), [
-        Kind::OuterDoc,
-        Kind::InnerDoc
-    ]);
+    assert_eq!(
+        kinds("// plain\n//// plain too\n/// outer\n//! inner\n"),
+        [Kind::OuterDoc, Kind::InnerDoc]
+    );
     assert_eq!(kinds("///"), [Kind::OuterDoc], "an empty doc comment is one");
-    assert_eq!(kinds("/**/ /***/ /* a */ /** outer */ /*! inner */"), [
-        Kind::OuterDoc,
-        Kind::InnerDoc
-    ]);
+    assert_eq!(
+        kinds("/**/ /***/ /* a */ /** outer */ /*! inner */"),
+        [Kind::OuterDoc, Kind::InnerDoc]
+    );
     assert_eq!(kinds("/* a /* nested */ still a comment */ x"), [Kind::Ident]);
     assert!(kinds("/* a /* b /* c */ */ */").is_empty());
     assert_eq!(kinds("/*/ still open */ x"), [Kind::Ident]);
@@ -99,16 +99,19 @@ fn raw_strings() {
 
 #[test]
 fn characters_and_lifetimes() {
-    assert_eq!(kinds(r"'a' '\n' '\'' '\x41' '\u{e9}' 'é' '\\' '{'"), [
-        Kind::Char('a'),
-        Kind::Char('\n'),
-        Kind::Char('\''),
-        Kind::Char('A'),
-        Kind::Char('é'),
-        Kind::Char('é'),
-        Kind::Char('\\'),
-        Kind::Char('{'),
-    ]);
+    assert_eq!(
+        kinds(r"'a' '\n' '\'' '\x41' '\u{e9}' 'é' '\\' '{'"),
+        [
+            Kind::Char('a'),
+            Kind::Char('\n'),
+            Kind::Char('\''),
+            Kind::Char('A'),
+            Kind::Char('é'),
+            Kind::Char('é'),
+            Kind::Char('\\'),
+            Kind::Char('{'),
+        ]
+    );
     assert_eq!(kinds("'a 'static"), [Kind::Lifetime, Kind::Lifetime]);
     for refused in ["'\t'", "'\n'", "'''", "'ab'", "'\\\n'", "'a'b", "''", "'é"] {
         assert!(lex(refused).is_err(), "{refused:?}");
@@ -117,13 +120,10 @@ fn characters_and_lifetimes() {
 
 #[test]
 fn numbers() {
-    assert_eq!(kinds("0 42 1_000 007 1_"), [
-        Kind::Int(0),
-        Kind::Int(42),
-        Kind::Int(1000),
-        Kind::Int(7),
-        Kind::Int(1)
-    ]);
+    assert_eq!(
+        kinds("0 42 1_000 007 1_"),
+        [Kind::Int(0), Kind::Int(42), Kind::Int(1000), Kind::Int(7), Kind::Int(1)]
+    );
     assert_eq!(kinds("1u8 0x1f 0o7 0b1 1e5 1_i32"), vec![Kind::Number; 6]);
     assert_eq!(kinds("1.5"), [Kind::Int(1), Kind::Punct('.'), Kind::Int(5)]);
     assert_eq!(kinds(&"9".repeat(40)), [Kind::Number], "more than a u128 holds");
@@ -250,20 +250,86 @@ fn as_reference<'a>(token: &Token<'a>) -> reference::Token<'a> {
 #[test]
 fn the_one_pass_lexer_lexes_as_the_old_one() {
     let pieces = [
-        "fn", "main", " ", "\n", "\t", "\x0b", "(", ")", "{", "}", "[", "]", "!", ";", ",", "::",
-        "println", "print", "true", "\"a{}b\"", "\"\\n\\x41\\u{7b}\\\"\"", "\"esc\\\n  x\"",
-        "\"", "\\", "\\x", "\\u{", "\\u{e9}", "\\x7", "r\"raw\"", "r#\"a\"b\"#", "r#", "r##\"x\"#",
-        "r", "#", "'a'", "'\\''", "'\\u{e9}'", "'\u{e9}'", "'a", "'", "'\\n", "//", "///",
-        "//!", "////", "/*", "*/", "/**", "/*!", "/**/", "*", "/", "0", "42", "1_000", "0x1f",
-        "1u8", "1e5", "007", "340282366920938463463374607431768211456", "_", "x_1",
-        "\u{e9}", "\u{a0}", "b\"x\"", "\r", "\u{202e}", "\u{2020}", "x\"y", "\"\u{e9}\"",
-        "'\t'", "`", "@",
+        "fn",
+        "main",
+        " ",
+        "\n",
+        "\t",
+        "\x0b",
+        "(",
+        ")",
+        "{",
+        "}",
+        "[",
+        "]",
+        "!",
+        ";",
+        ",",
+        "::",
+        "println",
+        "print",
+        "true",
+        "\"a{}b\"",
+        "\"\\n\\x41\\u{7b}\\\"\"",
+        "\"esc\\\n  x\"",
+        "\"",
+        "\\",
+        "\\x",
+        "\\u{",
+        "\\u{e9}",
+        "\\x7",
+        "r\"raw\"",
+        "r#\"a\"b\"#",
+        "r#",
+        "r##\"x\"#",
+        "r",
+        "#",
+        "'a'",
+        "'\\''",
+        "'\\u{e9}'",
+        "'\u{e9}'",
+        "'a",
+        "'",
+        "'\\n",
+        "//",
+        "///",
+        "//!",
+        "////",
+        "/*",
+        "*/",
+        "/**",
+        "/*!",
+        "/**/",
+        "*",
+        "/",
+        "0",
+        "42",
+        "1_000",
+        "0x1f",
+        "1u8",
+        "1e5",
+        "007",
+        "340282366920938463463374607431768211456",
+        "_",
+        "x_1",
+        "\u{e9}",
+        "\u{a0}",
+        "b\"x\"",
+        "\r",
+        "\u{202e}",
+        "\u{2020}",
+        "x\"y",
+        "\"\u{e9}\"",
+        "'\t'",
+        "`",
+        "@",
     ];
     let mut rng = SplitMix64::new(0xbb67_ae85_84ca_a73b);
     let (mut lexed, mut refused) = (0, 0);
     let mut pushed = String::new();
     for _ in 0..60_000 {
-        let source: String = (0..1 + rng.index(8)).map(|_| pieces[rng.index(pieces.len())]).collect();
+        let source: String =
+            (0..1 + rng.index(8)).map(|_| pieces[rng.index(pieces.len())]).collect();
         let new = lex(&source);
         let old = reference::lex(&source);
         let new_as_old = new

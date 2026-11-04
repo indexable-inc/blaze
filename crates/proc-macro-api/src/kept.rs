@@ -53,7 +53,7 @@ use blaze_usercode::{
     Given, RunKind,
     index::{self, FindError},
     inputs,
-    roots::{Role, RoleSet, Roots, Rooted},
+    roots::{Role, RoleSet, Rooted, Roots},
     trace::Inputs,
 };
 use hir_expand::proc_macro::ProcMacroKind;
@@ -90,7 +90,8 @@ impl Mode {
         match value {
             None => Ok(Mode::Keep),
             Some("check") => Ok(Mode::Check),
-            Some(other) => Err(format!( // alloc: error path
+            Some(other) => Err(format!(
+                // alloc: error path
                 "{CACHE}={other:?} is not a mode: every expansion that can be kept is, and \
                  `check` expands what was kept again and compares"
             )),
@@ -223,7 +224,10 @@ impl<'a> Seen<'a> {
 
 impl Inputs for Seen<'_> {
     type Error = inputs::Unreadable;
-    fn entry(&mut self, path: &std::path::Path) -> Result<blaze_usercode::trace::Entry, Self::Error> {
+    fn entry(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<blaze_usercode::trace::Entry, Self::Error> {
         inputs::Now { files: inputs::Files::shared(), env: &self.none }.entry(path)
     }
 
@@ -242,7 +246,9 @@ impl Inputs for Seen<'_> {
     fn env_all(&mut self) -> &[(std::ffi::OsString, std::ffi::OsString)] {
         let (passed, call) = (self.passed, self.call);
         // alloc: a run that read the whole environment: it is sorted once per call, as its key needs.
-        self.made.get_or_insert_with(|| inputs::Env::new(Environment::seen(passed, call.iter()))).vars()
+        self.made
+            .get_or_insert_with(|| inputs::Env::new(Environment::seen(passed, call.iter())))
+            .vars()
     }
 
     fn names(
@@ -269,7 +275,12 @@ impl Keeping {
             Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")), // alloc: error path
         };
         let mode = Mode::of(var(CACHE)?.as_deref())?;
-        Ok(Keeping { expansions, mode, retractions: Retractions::default(), durable: crossbeam_queue::SegQueue::new() })
+        Ok(Keeping {
+            expansions,
+            mode,
+            retractions: Retractions::default(),
+            durable: crossbeam_queue::SegQueue::new(),
+        })
     }
 
     /// [`Retractions::now`]: what a warm front end is lowered into only while it is the epoch
@@ -341,14 +352,21 @@ const VERIFIED_SHAPE: &[u8] = b"blaze v2 verified expansion reads 1\0";
 /// retracts it. Its values change once the record is put, so what `hir_def::deps` filed by
 /// them is made again, and the expansion is looked up again (and not given the retracted
 /// value).
-pub fn verified_reads(depends: &blaze_cas::Key, shape: &[u8], values: ContentId) -> (Vec<u8>, ContentId) {
+pub fn verified_reads(
+    depends: &blaze_cas::Key,
+    shape: &[u8],
+    values: ContentId,
+) -> (Vec<u8>, ContentId) {
     // alloc: once per verified hit, the shape the query reporting it owns
     let shape = [VERIFIED_SHAPE, &depends.0.0[..], shape].concat();
     (shape, retracted_or_not(values, false))
 }
 
 fn retracted_or_not(values: ContentId, retracted: bool) -> ContentId {
-    blaze_ids::Hasher::new("blaze v2 verified expansion values 1").id(&values).update(&[u8::from(retracted)]).finish()
+    blaze_ids::Hasher::new("blaze v2 verified expansion values 1")
+        .id(&values)
+        .update(&[u8::from(retracted)])
+        .finish()
 }
 
 /// [`reads_in`], with the store that says whether a verified expansion's reads
@@ -437,9 +455,11 @@ fn plain_reads(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<C
         Ok(None) => Ok(ContentId::of("blaze v2 expansion reads gone", shape)),
         Err(FindError::NotAShape { why, .. }) => Err(format!("a shape that does not read: {why}")), // alloc: error path
         Err(FindError::Inputs(unreadable)) => Err(format!("{unreadable}")), // alloc: error path
-        Err(FindError::Corrupt(corrupt)) => Err(format!("{corrupt}")), // alloc: error path
+        Err(FindError::Corrupt(corrupt)) => Err(format!("{corrupt}")),      // alloc: error path
         // Never from `values`, which reads one shape: named all the same.
-        Err(FindError::TooManyShapes { run }) => Err(format!("run {run:?} has more than {} shapes", index::MOST_SHAPES)), // alloc: error path
+        Err(FindError::TooManyShapes { run }) => {
+            Err(format!("run {run:?} has more than {} shapes", index::MOST_SHAPES))
+        } // alloc: error path
     }
 }
 
@@ -601,7 +621,10 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
             .part("attrs columns", attrs)
             .part("span parts", shapes.as_slice());
     });
-    given.env_keyed_ported(call.env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())), roots);
+    given.env_keyed_ported(
+        call.env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+        roots,
+    );
     (given, spans)
 }
 
@@ -643,12 +666,15 @@ pub fn read(bytes: &[u8], spans: &Spans) -> Result<tt::TopSubtree, String> {
         let Scratch { parts, room, .. } = scratch;
         parts.clear();
         for (at, row) in table.as_chunks::<8>().0.iter().enumerate() {
-            let field = |i: usize| u32::from_le_bytes(row[i..i + 4].try_into().expect("four bytes"));
+            let field =
+                |i: usize| u32::from_le_bytes(row[i..i + 4].try_into().expect("four bytes"));
             let anchor = spans.anchors.get(field(0) as usize);
             let ctx = spans.contexts.get(field(4) as usize);
             let Some((&anchor, &ctx)) = anchor.zip(ctx) else {
                 // alloc: error path.
-                return Err(format!("a kept expansion's span part {at} is of an anchor or context its call has not"));
+                return Err(format!(
+                    "a kept expansion's span part {at} is of an anchor or context its call has not"
+                ));
             };
             if parts.part(anchor, ctx) as usize != at {
                 // alloc: error path.
@@ -700,7 +726,8 @@ mod budget {
     fn a_kept_expansion_is_found_with_no_allocation() {
         let mut sim = Sim::new(5, Faults::default());
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let config =
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -709,7 +736,10 @@ mod budget {
         let lib = std::env::temp_dir().join(format!("blaze-kept-budget-{}", std::process::id()));
         std::fs::write(&lib, b"a macro's library").unwrap();
         let hash = inputs::hash_reader(b"a macro's library".as_slice()).unwrap();
-        let run = RunKey { code: ContentId::of("blaze v2 test 1", b"macro"), given: ContentId::default() };
+        let run = RunKey {
+            code: ContentId::of("blaze v2 test 1", b"macro"),
+            given: ContentId::default(),
+        };
         let traced = Traced {
             files: vec![(lib.clone(), Some(hash))],
             env: vec![
@@ -722,7 +752,8 @@ mod budget {
         index::keep(&mut store, &run, &traced, b"expansion").unwrap();
         let passed = [("PATH".to_owned(), "/bin".to_owned())];
         let call: Env = [("CARGO_PKG_NAME".to_owned(), "a".to_owned())].into_iter().collect();
-        let mut seen = Seen { passed: &passed, call: &call, made: None, none: inputs::Env::default() };
+        let mut seen =
+            Seen { passed: &passed, call: &call, made: None, none: inputs::Env::default() };
         let reader = store.reader();
         let guard = blaze_cas::enter();
         let values = index::VALUES.traced(&traced);
@@ -733,7 +764,11 @@ mod budget {
             )
         };
         assert!(find());
-        assert!(blaze_alloc_count::assert_at_most(0, "a kept expansion found through Seen", &mut find));
+        assert!(blaze_alloc_count::assert_at_most(
+            0,
+            "a kept expansion found through Seen",
+            &mut find
+        ));
         drop(guard);
         _ = std::fs::remove_file(&lib);
     }
@@ -745,7 +780,8 @@ mod budget {
     fn the_reads_an_expansion_reports_are_worked_out_again_until_a_file_changes() {
         let mut sim = Sim::new(5, Faults::default());
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let config =
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -764,7 +800,10 @@ mod budget {
         let call: Env = [("CARGO_PKG_NAME".to_owned(), "a".to_owned())].into_iter().collect();
         assert_eq!(reads_in(&[], &call, &shape), Ok(reported));
 
-        let run = RunKey { code: ContentId::of("blaze v2 test 1", b"reads"), given: ContentId::default() };
+        let run = RunKey {
+            code: ContentId::of("blaze v2 test 1", b"reads"),
+            given: ContentId::default(),
+        };
         index::keep(&mut store, &run, &traced, b"expansion").unwrap();
         let reader = store.reader();
         let guard = blaze_cas::enter();

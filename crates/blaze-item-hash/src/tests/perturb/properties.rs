@@ -2,8 +2,8 @@
 //! any `//` or `/* */` comments, any order of the items around it and any edit of their
 //! literals, and changes when any literal of its own does.
 
-use hegel::{Hegel, Settings, TestCase};
 use hegel::generators as gs;
+use hegel::{Hegel, Settings, TestCase};
 
 use super::{differ, same, with_dep};
 
@@ -148,8 +148,11 @@ fn keeps_and_loses_its_identity(tc: &TestCase) {
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
 fn run_cases(cases: u64, mut property: impl FnMut(&TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(move |tc: TestCase| property(&tc)).settings(Settings::new().test_cases(cases).database(None)).run();
+    let cases =
+        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
+    Hegel::new(move |tc: TestCase| property(&tc))
+        .settings(Settings::new().test_cases(cases).database(None))
+        .run();
 }
 
 /// `HEGEL_TEST_CASES=<n>` runs it longer.

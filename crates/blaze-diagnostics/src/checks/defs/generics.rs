@@ -36,22 +36,41 @@ pub(super) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
                 hir::ModuleDef::Trait(it) => {
                     let Some(source) = cx.vsema.source(it) else { continue };
                     let item = item_id(cx.db, def);
-                    let outer = check_item(cx, item, source.map(|it| it.syntax()), None, &mut found);
+                    let outer =
+                        check_item(cx, item, source.map(|it| it.syntax()), None, &mut found);
                     for assoc in it.items_iter(cx.db) {
                         check_assoc(cx, assoc, outer, &mut found);
                     }
                 }
                 hir::ModuleDef::Function(it) => {
                     let Some(source) = cx.vsema.source(it) else { continue };
-                    check_item(cx, item_id(cx.db, def), source.map(|it| it.syntax()), None, &mut found);
+                    check_item(
+                        cx,
+                        item_id(cx.db, def),
+                        source.map(|it| it.syntax()),
+                        None,
+                        &mut found,
+                    );
                 }
                 hir::ModuleDef::Adt(it) => {
                     let Some(source) = cx.vsema.source(it) else { continue };
-                    check_item(cx, item_id(cx.db, def), source.map(|it| it.syntax()), None, &mut found);
+                    check_item(
+                        cx,
+                        item_id(cx.db, def),
+                        source.map(|it| it.syntax()),
+                        None,
+                        &mut found,
+                    );
                 }
                 hir::ModuleDef::TypeAlias(it) => {
                     let Some(source) = cx.vsema.source(it) else { continue };
-                    check_item(cx, item_id(cx.db, def), source.map(|it| it.syntax()), None, &mut found);
+                    check_item(
+                        cx,
+                        item_id(cx.db, def),
+                        source.map(|it| it.syntax()),
+                        None,
+                        &mut found,
+                    );
                 }
                 _ => {}
             }
@@ -68,7 +87,12 @@ pub(super) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     found
 }
 
-fn check_assoc<'db>(cx: &Cx<'_, 'db>, assoc: hir::AssocItem, outer: Option<List<'db>>, found: &mut Vec<Found>) {
+fn check_assoc<'db>(
+    cx: &Cx<'_, 'db>,
+    assoc: hir::AssocItem,
+    outer: Option<List<'db>>,
+    found: &mut Vec<Found>,
+) {
     let node = match assoc {
         hir::AssocItem::Function(it) => cx.vsema.source(it).map(|it| it.map(|it| it.syntax())),
         hir::AssocItem::Const(it) => cx.vsema.source(it).map(|it| it.map(|it| it.syntax())),
@@ -166,7 +190,13 @@ fn check_item<'db>(
 /// rustc's `with_generic_param_rib` over one parameter list, `outer` being the lists whose
 /// names are in scope where it starts (rustc's `seen_bindings` of the type and value ribs
 /// and its `seen_lifetimes`), outermost first: E0403 and E0262.
-fn check_list(cx: &Cx<'_, '_>, list: List<'_>, outer: &[Option<List<'_>>], fact: Option<&Fact>, found: &mut Vec<Found>) {
+fn check_list(
+    cx: &Cx<'_, '_>,
+    list: List<'_>,
+    outer: &[Option<List<'_>>],
+    fact: Option<&Fact>,
+    found: &mut Vec<Found>,
+) {
     let outer = || outer.iter().flatten();
     // A lifetime shadowing one of the item around is E0496, which is not this check's.
     let shadows = |name: &ParamName<'_>, file: HirFileId| {
@@ -174,7 +204,8 @@ fn check_list(cx: &Cx<'_, '_>, list: List<'_>, outer: &[Option<List<'_>>], fact:
         name.is_lifetime()
             && outer().any(|it| {
                 it.value.lifetime_params().filter_map(|it| it.lifetime()).any(|lt| {
-                    lt.text() == name.text() && key(cx, it.file_id, lt.syntax().text_range()) == name_key
+                    lt.text() == name.text()
+                        && key(cx, it.file_id, lt.syntax().text_range()) == name_key
                 })
             })
     };
@@ -186,13 +217,16 @@ fn check_list(cx: &Cx<'_, '_>, list: List<'_>, outer: &[Option<List<'_>>], fact:
         let text = name.text();
         let name_key = name.key(cx, list.file_id);
         // The same parameter: its text and its key ([`key`]).
-        let same = |it: &ParamName<'_>, file: HirFileId| it.text() == text && it.key(cx, file) == name_key;
+        let same =
+            |it: &ParamName<'_>, file: HirFileId| it.text() == text && it.key(cx, file) == name_key;
         // The outermost declaration of a name wins, as rustc extends its map rib by rib
         // outwards; the lifetimes around are not in it.
         let first = outer()
             .find_map(|outer| {
                 let mut names = outer.value.generic_params().filter_map(ParamName::of);
-                names.find(|it| !it.is_lifetime() && same(it, outer.file_id)).map(|it| outer.with_value(it.range()))
+                names
+                    .find(|it| !it.is_lifetime() && same(it, outer.file_id))
+                    .map(|it| outer.with_value(it.range()))
             })
             .or_else(|| {
                 let mut names = list.value.generic_params().take(at).filter_map(ParamName::of);

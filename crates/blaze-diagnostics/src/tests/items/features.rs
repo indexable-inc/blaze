@@ -19,7 +19,9 @@ fn ui(name: &str, edition: &str, source: &str) -> String {
 
 /// A UI test `name` with minicore's `flags` as its core, checked with compiletest's flags.
 fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"))
+    ui_fixture(&format!(
+        "//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"
+    ))
 }
 
 /// The `.stderr` of a fixture whose workspace crate is the UI test and whose `library` crates are

@@ -36,8 +36,9 @@ use blaze_ids::bits::BitSet;
 use either::Either;
 use hir::InFile;
 use hir_def::{
-    AdtId, CallableDefId, ConstParamId, DefWithBodyId, EnumVariantId, GenericDefId, GenericParamId, ItemContainerId,
-    Lookup, VariantId, hir::ExprId, layout::BackendRepr, src::HasChildSourceView as _,
+    AdtId, CallableDefId, ConstParamId, DefWithBodyId, EnumVariantId, GenericDefId, GenericParamId,
+    ItemContainerId, Lookup, VariantId, hir::ExprId, layout::BackendRepr,
+    src::HasChildSourceView as _,
 };
 use hir_expand::{MacroDefKind, builtin::BuiltinFnLikeExpander};
 use hir_ty::{
@@ -46,13 +47,13 @@ use hir_ty::{
     db::{HirDatabase, InternedClosureId},
     method_resolution::lookup_impl_const,
     mir::{
-        AggregateKind, AsmOperand, AssertKind, BasicBlockId, BinOp, BorrowKind, CastKind, LocalId, MirBody, MirSpan,
-        Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace, Terminator, TerminatorKind,
-        UnOp,
+        AggregateKind, AsmOperand, AssertKind, BasicBlockId, BinOp, BorrowKind, CastKind, LocalId,
+        MirBody, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind,
+        StoredPlace, Terminator, TerminatorKind, UnOp,
     },
     next_solver::{
-        AliasConst, AliasConstKind, Allocation, Const, ConstKind, DbInterner, FreeConstAliasId, GenericArgKind,
-        InherentAssocConstId, ParamEnv, TraitAssocConstId, Ty, TyKind, TypingMode,
+        AliasConst, AliasConstKind, Allocation, Const, ConstKind, DbInterner, FreeConstAliasId,
+        GenericArgKind, InherentAssocConstId, ParamEnv, TraitAssocConstId, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
     utils::detect_variant_from_bytes,
@@ -77,7 +78,8 @@ use crate::{
 };
 
 /// The lints this module gives: it runs only when one may fire.
-pub(super) const LINTS: super::LintSet = super::lint_set(["arithmetic_overflow", "unconditional_panic"]);
+pub(super) const LINTS: super::LintSet =
+    super::lint_set(["arithmetic_overflow", "unconditional_panic"]);
 
 /// The known-panics lint of the body and of the closures in it, each closure after the body
 /// it is in, in the order they are written. None of a body rustc builds no runtime MIR of
@@ -127,7 +129,10 @@ fn runs_on(b: &BodyCx<'_, '_, '_>) -> bool {
     match b.owner {
         DefWithBodyId::FunctionId(_) => true,
         DefWithBodyId::ConstId(it) => {
-            matches!(it.lookup(b.db()).container, ItemContainerId::ImplId(_) | ItemContainerId::TraitId(_))
+            matches!(
+                it.lookup(b.db()).container,
+                ItemContainerId::ImplId(_) | ItemContainerId::TraitId(_)
+            )
         }
         DefWithBodyId::StaticId(_) | DefWithBodyId::VariantId(_) => false,
     }
@@ -148,15 +153,20 @@ fn has_checks(body: &MirBody<'_>) -> bool {
         let operation = block.statements.iter().any(|it| {
             matches!(
                 it.kind,
-                StatementKind::Assign(_, Rvalue::BinaryOp(..) | Rvalue::CheckedBinaryOp(..) | Rvalue::UnaryOp(..))
+                StatementKind::Assign(
+                    _,
+                    Rvalue::BinaryOp(..) | Rvalue::CheckedBinaryOp(..) | Rvalue::UnaryOp(..)
+                )
             )
         });
         operation
             || match block.terminator.as_ref().map(|it| &it.kind) {
                 Some(TerminatorKind::Assert { .. }) => true,
-                Some(TerminatorKind::Call { func, .. }) => func
-                    .fn_def()
-                    .is_some_and(|(_, args)| args.iter().any(|it| matches!(it.kind(), GenericArgKind::Const(_)))),
+                Some(TerminatorKind::Call { func, .. }) => {
+                    func.fn_def().is_some_and(|(_, args)| {
+                        args.iter().any(|it| matches!(it.kind(), GenericArgKind::Const(_)))
+                    })
+                }
                 _ => false,
             }
     })
@@ -228,15 +238,32 @@ impl fmt::Display for Panic {
                 int(len, false),
                 int(index, false)
             ),
-            Panic::Shl(by) => write!(f, "attempt to shift left by `{}`, which would overflow", int(by, true)),
-            Panic::Shr(by) => write!(f, "attempt to shift right by `{}`, which would overflow", int(by, true)),
-            Panic::Overflow { op, l, r } => {
-                write!(f, "attempt to compute `{} {op} {}`, which would overflow", int(l, true), int(r, true))
+            Panic::Shl(by) => {
+                write!(f, "attempt to shift left by `{}`, which would overflow", int(by, true))
             }
-            Panic::OverflowNeg(value) => write!(f, "attempt to negate `{}`, which would overflow", int(value, true)),
-            Panic::DivisionByZero(value) => write!(f, "attempt to divide `{}` by zero", int(value, true)),
+            Panic::Shr(by) => {
+                write!(f, "attempt to shift right by `{}`, which would overflow", int(by, true))
+            }
+            Panic::Overflow { op, l, r } => {
+                write!(
+                    f,
+                    "attempt to compute `{} {op} {}`, which would overflow",
+                    int(l, true),
+                    int(r, true)
+                )
+            }
+            Panic::OverflowNeg(value) => {
+                write!(f, "attempt to negate `{}`, which would overflow", int(value, true))
+            }
+            Panic::DivisionByZero(value) => {
+                write!(f, "attempt to divide `{}` by zero", int(value, true))
+            }
             Panic::RemainderByZero(value) => {
-                write!(f, "attempt to calculate the remainder of `{}` with a divisor of zero", int(value, true))
+                write!(
+                    f,
+                    "attempt to calculate the remainder of `{}` with a divisor of zero",
+                    int(value, true)
+                )
             }
         }
     }
@@ -310,14 +337,22 @@ impl<'db> Owner<'db> {
     fn new(b: &BodyCx<'_, '_, 'db>) -> Self {
         let db = b.db();
         let krate = b.cx.krate.base();
-        let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::non_body_analysis());
+        let infcx =
+            DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::non_body_analysis());
         // With what the body's `for const` loops assume of their binders, as inference had it.
-        let env = hir_ty::comptime_env::body_env(&infcx, b.infer, db.trait_environment(b.owner.generic_def(db)));
+        let env = hir_ty::comptime_env::body_env(
+            &infcx,
+            b.infer,
+            db.trait_environment(b.owner.generic_def(db)),
+        );
         Owner {
             infcx,
             env,
             krate,
-            pointer_size: db.target_data_layout(krate).ok().map(|it| it.pointer_size().bytes() as u8),
+            pointer_size: db
+                .target_data_layout(krate)
+                .ok()
+                .map(|it| it.pointer_size().bytes() as u8),
         }
     }
 }
@@ -405,9 +440,15 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
             for statement in &data.statements {
                 match &statement.kind {
                     StatementKind::Assign(_, Rvalue::Ref(BorrowKind::Shallow, _)) => {}
-                    StatementKind::Assign(place, rvalue) => self.assign(place, rvalue, statement.span),
-                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => self.remove_const(*local),
-                    StatementKind::Deinit(place) if !is_indirect(place) => self.remove_const(place.local),
+                    StatementKind::Assign(place, rvalue) => {
+                        self.assign(place, rvalue, statement.span)
+                    }
+                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                        self.remove_const(*local)
+                    }
+                    StatementKind::Deinit(place) if !is_indirect(place) => {
+                        self.remove_const(place.local)
+                    }
                     StatementKind::InlineAsm(asm) => {
                         let outputs = asm.operands.iter().filter_map(|it| match it {
                             AsmOperand::Reg { output, .. } => output.as_ref(),
@@ -499,9 +540,10 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 }
             }
             match block.terminator.as_ref().map(|it| &it.kind) {
-                Some(TerminatorKind::Drop { place: dropped, .. } | TerminatorKind::DropAndReplace { place: dropped, .. }) => {
-                    place(dropped, Use::Escape)
-                }
+                Some(
+                    TerminatorKind::Drop { place: dropped, .. }
+                    | TerminatorKind::DropAndReplace { place: dropped, .. },
+                ) => place(dropped, Use::Escape),
                 Some(TerminatorKind::Call { destination, .. }) => place(destination, Use::Store),
                 Some(TerminatorKind::Yield { resume_arg, .. }) => place(resume_arg, Use::Escape),
                 _ => {}
@@ -537,7 +579,9 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         if self.check_rvalue(rvalue, span).is_none() || is_indirect(place) {
             return;
         }
-        if self.s.modes[index(place.local)] != Mode::NoPropagation && self.eval_rvalue(rvalue, place).is_none() {
+        if self.s.modes[index(place.local)] != Mode::NoPropagation
+            && self.eval_rvalue(rvalue, place).is_none()
+        {
             self.remove_const(place.local);
         }
     }
@@ -549,12 +593,16 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         match rvalue {
             Rvalue::UnaryOp(op, arg) => self.check_unary_op(*op, arg, span)?,
             Rvalue::BinaryOp(op, left, right) => self.check_binary_op(op, left, right, span)?,
-            Rvalue::CheckedBinaryOp(op, left, right) => self.check_binary_op(with_overflow(op), left, right, span)?,
+            Rvalue::CheckedBinaryOp(op, left, right) => {
+                self.check_binary_op(with_overflow(op), left, right, span)?
+            }
             Rvalue::Ref(_, place) => {
                 self.remove_const(place.local);
                 return None;
             }
-            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
+            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => {
+                match *never {}
+            }
             Rvalue::Use(_)
             | Rvalue::Repeat(..)
             | Rvalue::Len(_)
@@ -586,7 +634,13 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
 
     /// `check_binary_op`: a shift by the width of its left side or more, even when the left
     /// side is not known, and an addition, subtraction or multiplication that overflows.
-    fn check_binary_op(&mut self, op: &BinOp, left: &Operand, right: &Operand, span: MirSpan) -> Option<()> {
+    fn check_binary_op(
+        &mut self,
+        op: &BinOp,
+        left: &Operand,
+        right: &Operand,
+        span: MirSpan,
+    ) -> Option<()> {
         let r = self.eval_operand(right);
         let l = self.eval_operand(left);
         if let BinOp::Shl | BinOp::Shr = op {
@@ -602,7 +656,10 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         let op = with_overflow(op);
         if let (Some(Value::Scalar(l)), Some(Value::Scalar(r))) = (l, r)
             && l.is_integral()
-            && matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow)
+            && matches!(
+                op,
+                BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow
+            )
             && scalar::overflows(op, l, r)?
         {
             self.report(span, Lint::ArithmeticOverflow, Panic::overflow(op, Some(l), Some(r))?);
@@ -629,7 +686,9 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 let Some(panic) = Panic::overflow(op, int(self, l), int(self, r)) else { return };
                 panic
             }
-            AssertKind::BoundsCheck { len, index } => Panic::BoundsCheck { len: int(self, len), index: int(self, index) },
+            AssertKind::BoundsCheck { len, index } => {
+                Panic::BoundsCheck { len: int(self, len), index: int(self, index) }
+            }
             AssertKind::Overflow(..) | AssertKind::OverflowNeg(_) => return,
             // rustc's "need proper const propagator for these": never linted here.
             AssertKind::MisalignedPointerDereference { .. }
@@ -659,7 +718,8 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 match scalar::binary_op(op, l, r)? {
                     Output::One(value) => Value::Scalar(value),
                     Output::Pair(value, overflowed) => {
-                        let fields = [Value::Scalar(value), Value::Scalar(Scalar::from_bool(overflowed))];
+                        let fields =
+                            [Value::Scalar(value), Value::Scalar(Scalar::from_bool(overflowed))];
                         self.aggregate(None, fields)
                     }
                 }
@@ -688,7 +748,9 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 let (to, size) = self.scalar_kind(to.as_ref())?;
                 Value::Scalar(match kind {
                     CastKind::IntToInt | CastKind::IntToFloat => scalar::int_cast(value, to, size)?,
-                    CastKind::FloatToFloat | CastKind::FloatToInt => scalar::float_cast(value, to, size)?,
+                    CastKind::FloatToFloat | CastKind::FloatToInt => {
+                        scalar::float_cast(value, to, size)?
+                    }
                     _ => return None,
                 })
             }
@@ -707,12 +769,18 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 Value::Scalar(Scalar::new(bits, size, kind))
             }
             Rvalue::Repeat(..) | Rvalue::Ref(..) | Rvalue::Len(_) => return None,
-            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
+            Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => {
+                match *never {}
+            }
         };
         self.set(dest.local, value)
     }
 
-    fn aggregate<const N: usize>(&mut self, variant: Option<EnumVariantId>, fields: [Value<'db>; N]) -> Value<'db> {
+    fn aggregate<const N: usize>(
+        &mut self,
+        variant: Option<EnumVariantId>,
+        fields: [Value<'db>; N],
+    ) -> Value<'db> {
         let start = self.s.fields.len() as u32;
         self.s.fields.extend(fields);
         self.s.aggregates.push(Aggregate { variant, start, len: N as u32 });
@@ -723,12 +791,14 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
     fn read_discriminant(&self, allocation: Allocation<'db>) -> Option<EnumVariantId> {
         let TyKind::Adt(def, _) = allocation.ty.kind() else { return None };
         let AdtId::EnumId(enum_) = def.def_id() else { return None };
-        let layout = self.db.layout_of_ty(allocation.ty.store(), self.env_and_crate().store()).ok()?;
+        let layout =
+            self.db.layout_of_ty(allocation.ty.store(), self.env_and_crate().store()).ok()?;
         if matches!(layout.variants, hir_def::layout::Variants::Empty) {
             return None;
         }
         let target = self.db.target_data_layout(self.owner.krate).ok()?;
-        detect_variant_from_bytes(&layout, self.db, target, &allocation.memory, enum_).map(|(it, _)| it)
+        detect_variant_from_bytes(&layout, self.db, target, &allocation.memory, enum_)
+            .map(|(it, _)| it)
     }
 
     /// `visit_terminator`: an `Assert`'s check, a call's const parameters, and the blocks to
@@ -772,7 +842,10 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 };
                 hir_ty::generics::generics(db, def)
             });
-            let Some((GenericParamId::ConstParamId(param), _)) = generics.iter(false).nth(at) else { continue };
+            let Some((GenericParamId::ConstParamId(param), _)) = generics.iter(false).nth(at)
+            else {
+                continue;
+            };
             let Some(name) = panics_when_zero(db, param) else { continue };
             // alloc: the lint's text, for a lint found
             self.emit(span, Lint::UnconditionalPanic, format!("const parameter `{name}` is zero"));
@@ -822,7 +895,9 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                     let (id, args) = lookup_impl_const(&self.owner.infcx, self.owner.env, id, args);
                     self.db.const_eval(id, args, None).ok()?
                 }
-                AliasConstKind::Anon { def_id } => self.db.anon_const_eval(def_id.0, args, None).ok()?,
+                AliasConstKind::Anon { def_id } => {
+                    self.db.anon_const_eval(def_id.0, args, None).ok()?
+                }
                 AliasConstKind::InherentSelf { .. } => return None,
             },
             _ => return None,
@@ -846,8 +921,10 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         if !def.is_enum() {
             return None;
         }
-        let layout = self.db.layout_of_ty(allocation.ty.store(), self.env_and_crate().store()).ok()?;
-        let pair = matches!(layout.backend_repr, BackendRepr::Scalar(_) | BackendRepr::ScalarPair { .. });
+        let layout =
+            self.db.layout_of_ty(allocation.ty.store(), self.env_and_crate().store()).ok()?;
+        let pair =
+            matches!(layout.backend_repr, BackendRepr::Scalar(_) | BackendRepr::ScalarPair { .. });
         (pair && layout.size.bytes() == memory.len() as u64).then_some(Value::Enum(allocation))
     }
 
@@ -865,10 +942,14 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
             let at = match elem {
                 ProjectionElem::Field(field) => field.0,
                 ProjectionElem::Index(local) => match self.s.locals[index(*local)] {
-                    Value::Scalar(it) if Some(it.size) == self.owner.pointer_size => u32::try_from(it.bits).ok()?,
+                    Value::Scalar(it) if Some(it.size) == self.owner.pointer_size => {
+                        u32::try_from(it.bits).ok()?
+                    }
                     _ => return None,
                 },
-                ProjectionElem::ConstantIndex { offset, from_end: false, .. } => u32::try_from(*offset).ok()?,
+                ProjectionElem::ConstantIndex { offset, from_end: false, .. } => {
+                    u32::try_from(*offset).ok()?
+                }
                 _ => return None,
             };
             value = match at < aggregate.len {
@@ -887,14 +968,15 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         found
             || match rvalue {
                 Rvalue::Repeat(_, count) => count.as_ref().has_non_region_param(),
-                Rvalue::Ref(_, place) | Rvalue::Len(place) | Rvalue::Discriminant(place) | Rvalue::CopyForDeref(place) => {
-                    self.place_has_param(place)
-                }
+                Rvalue::Ref(_, place)
+                | Rvalue::Len(place)
+                | Rvalue::Discriminant(place)
+                | Rvalue::CopyForDeref(place) => self.place_has_param(place),
                 Rvalue::Cast(_, _, ty) => ty.as_ref().has_non_region_param(),
                 Rvalue::Aggregate(kind, _) => match kind {
-                    AggregateKind::Array(ty) | AggregateKind::Tuple(ty) | AggregateKind::Closure(ty) => {
-                        ty.as_ref().has_non_region_param()
-                    }
+                    AggregateKind::Array(ty)
+                    | AggregateKind::Tuple(ty)
+                    | AggregateKind::Closure(ty) => ty.as_ref().has_non_region_param(),
                     AggregateKind::Adt(_, args) => args.as_ref().has_non_region_param(),
                     AggregateKind::Union(..) => false,
                 },
@@ -923,7 +1005,11 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         }
         let mut ty = PlaceTy::from_ty(local);
         for elem in place.projection.as_slice() {
-            ty = ty.multi_projection_ty(&self.owner.infcx, self.owner.env, std::slice::from_ref(elem));
+            ty = ty.multi_projection_ty(
+                &self.owner.infcx,
+                self.owner.env,
+                std::slice::from_ref(elem),
+            );
             if let ProjectionElem::Field(_) = elem
                 && ty.ty.has_non_region_param()
             {
@@ -1039,7 +1125,9 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
 fn panics_when_zero(db: &Db, param: ConstParamId) -> Option<String> {
     let source = param.parent().child_source_view(db, param.local_id());
     let Either::Left(ast::TypeOrConstParam::Const(node)) = source.value? else { return None };
-    let marked = node.attrs().any(|attr| attr.path().is_some_and(|path| path.syntax().text() == "rustc_panics_when_zero"));
+    let marked = node.attrs().any(|attr| {
+        attr.path().is_some_and(|path| path.syntax().text() == "rustc_panics_when_zero")
+    });
     // alloc: the lint's text, for a lint found
     marked.then(|| node.name().map(|it| it.text().to_string()))?
 }

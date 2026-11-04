@@ -1,8 +1,8 @@
 //! What codegen compiles of a crate: every instance its functions reach, each by what its
 //! store key is made of (its code hash and the facts of its type arguments).
 
-use std::{collections::HashMap, sync::Arc};
 use std::alloc::Global;
+use std::{collections::HashMap, sync::Arc};
 
 use base_db::{Crate, Db, FileId};
 use blaze_codegen::{
@@ -36,9 +36,17 @@ impl Codegen {
     ) -> Result<Codegen, String> {
         // The harness's own code generator: it keeps no store, so nothing it compiles is read by
         // another blaze build.
-        let code = hir_ty_codegen::v2::CodegenCode(blaze_ids::ContentId::of("blaze v2 hir-firewall code", b""));
-        let toolchain =
-            hir_ty_codegen::v2::toolchain_for(&code, hir_ty_codegen::Target::host(), target_data, &[], Runs::Here)?;
+        let code = hir_ty_codegen::v2::CodegenCode(blaze_ids::ContentId::of(
+            "blaze v2 hir-firewall code",
+            b"",
+        ));
+        let toolchain = hir_ty_codegen::v2::toolchain_for(
+            &code,
+            hir_ty_codegen::Target::host(),
+            target_data,
+            &[],
+            Runs::Here,
+        )?;
         hir_ty_codegen::v2::select(&toolchain)?;
         let policy = Policy {
             toolchain,
@@ -89,7 +97,8 @@ pub(crate) fn instances(db: &Db, krate: Crate, codegen: &Codegen) -> Result<Keys
         if keys.contains_key(&instance) {
             continue;
         }
-        let described = frontend.describe(&instance, &codegen.origin).map_err(|error| error.what)?;
+        let described =
+            frontend.describe(&instance, &codegen.origin).map_err(|error| error.what)?;
         if described.owner == Owner::Workspace {
             for reference in &described.refs {
                 if let FrontRef::Function(callee) = reference

@@ -62,7 +62,9 @@ pub(super) fn check_fn<'t>(cx: &mut Cx<'_, 't>, f: ast::Fn<'t>) {
     }
     let db = cx.db();
     let Some(func) = cx.fn_def(f) else { return };
-    if func.as_assoc_item(db).is_some_and(|it| it.implemented_trait(db).is_some()) || cx.is_in_test(f.syntax()) {
+    if func.as_assoc_item(db).is_some_and(|it| it.implemented_trait(db).is_some())
+        || cx.is_in_test(f.syntax())
+    {
         return;
     }
     let Some(ret) = f.ret_type().and_then(|it| it.ty()) else { return };
@@ -114,7 +116,8 @@ fn hot(cx: &Cx<'_, '_>) -> bool {
 
 /// Whether `f` is `#[cold]` or `#[inline(never)]`.
 fn cold(db: &Db, f: hir_def::FunctionId) -> bool {
-    AttrFlags::query(db, AttrDefId::FunctionId(f)).intersects(AttrFlags::COLD | AttrFlags::INLINE_NEVER)
+    AttrFlags::query(db, AttrDefId::FunctionId(f))
+        .intersects(AttrFlags::COLD | AttrFlags::INLINE_NEVER)
 }
 
 fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
@@ -138,7 +141,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let name = hir::Function::from(own).name(db);
     let name = name.as_str();
     let is_string = |ty: &hir::Type<'_>| {
-        ty.as_adt().is_some_and(|adt| Some(adt) == string || facts::adt_is(db, adt, "blaze_mem", "String"))
+        ty.as_adt()
+            .is_some_and(|adt| Some(adt) == string || facts::adt_is(db, adt, "blaze_mem", "String"))
     };
     let builds = |at: ExprId| -> Option<String> {
         // alloc: the worklist of one error's expressions
@@ -172,7 +176,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     };
     for (id, expr) in body.exprs() {
         let (made, site) = match expr {
-            Expr::Call { callee, args: [arg] } if is_variant(db, def, body, callee, err) => (*arg, "this `Err(..)`"),
+            Expr::Call { callee, args: [arg] } if is_variant(db, def, body, callee, err) => {
+                (*arg, "this `Err(..)`")
+            }
             Expr::MethodCall { receiver, method_name, args: [arg], .. } => {
                 let method = method_name.as_str();
                 let of = analysis.ty(infer.expr_ty(receiver)).strip_references().as_adt();
@@ -193,7 +199,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         };
         let Some(what) = builds(made) else { continue };
         let Some(range) = analysis.expr_range(id) else { continue };
-        let message = format!("{site} builds its error inline with {what} in `fn {name}`, on a hot path");
+        let message =
+            format!("{site} builds its error inline with {what} in `fn {name}`, on a hot path");
         let note = "the error's code sits in the hot function, growing it and spreading it over more of the \
                     instruction cache, and keeps it from being inlined: build the error in a `#[cold] \
                     #[inline(never)] fn` that returns it, so the hot path keeps one call";
@@ -203,7 +210,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 }
 
 /// Whether the path `callee` of `def`'s body names the enum variant `variant`.
-fn is_variant(db: &Db, def: DefWithBodyId, body: &Body, callee: ExprId, variant: hir_def::EnumVariantId) -> bool {
+fn is_variant(
+    db: &Db,
+    def: DefWithBodyId,
+    body: &Body,
+    callee: ExprId,
+    variant: hir_def::EnumVariantId,
+) -> bool {
     let Expr::Path(path) = body.expr(callee) else { return false };
     let scope = ExprScopes::of(db, def).scope_for(callee);
     matches!(
@@ -266,11 +279,17 @@ pub fn outlined(x: u32) -> Result<u32, String> {
         let warm = lint(FIXTURE.trim_start(), "-A clippy::all --warn=blaze::cold_error");
         assert!(found_large(&warm), "{warm}");
         assert!(!warm.contains("`fn small` returns"), "{warm}");
-        assert!(!warm.contains("builds its error inline"), "only a hot path is checked inline:\n{warm}");
-        let hot = lint(FIXTURE.trim_start(), "-A clippy::all --deny=blaze::hot --warn=blaze::cold_error");
+        assert!(
+            !warm.contains("builds its error inline"),
+            "only a hot path is checked inline:\n{warm}"
+        );
+        let hot =
+            lint(FIXTURE.trim_start(), "-A clippy::all --deny=blaze::hot --warn=blaze::cold_error");
         assert!(found_large(&hot), "{hot}");
         assert!(
-            hot.contains("this `Err(..)` builds its error inline with a `String` (`format!`) in `fn hot`"),
+            hot.contains(
+                "this `Err(..)` builds its error inline with a `String` (`format!`) in `fn hot`"
+            ),
             "{hot}"
         );
         assert!(!hot.contains("in `fn outlined`"), "a `#[cold]` builder is the fix:\n{hot}");

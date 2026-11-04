@@ -25,9 +25,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CastToUnsized<'db>) -> Vec<F
     let operand = cast.and_then(|it| it.expr());
     let expr_ty = operand.and_then(|it| cx.vsema.type_of_expr(it)).map(|it| it.original);
     let expr_span = operand.map(|it| cx.span(InFile::new(file, it.syntax().text_range())));
-    let cast_span = cast
-        .and_then(|it| it.ty())
-        .map(|it| cx.span(InFile::new(file, it.syntax().text_range())));
+    let cast_span =
+        cast.and_then(|it| it.ty()).map(|it| cx.span(InFile::new(file, it.syntax().text_range())));
 
     // alloc: a type printed for the error's message
     let expr_str = expr_ty.as_ref().map_or_else(|| "_".to_owned(), |it| cx.ty(it));

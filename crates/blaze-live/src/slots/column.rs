@@ -28,7 +28,8 @@ const FAULT: usize = 4096;
 
 const _: () = assert!(STEP.is_multiple_of(os::GRAIN));
 // The name (two words), the limit and the length: 32 bytes on a 64-bit target.
-const _: () = assert!(size_of::<Column<u64>>() == 4 * size_of::<usize>() + size_of::<os::Reserved>());
+const _: () =
+    assert!(size_of::<Column<u64>>() == 4 * size_of::<usize>() + size_of::<os::Reserved>());
 
 /// At most `limit` rows of `T`, in address space reserved for all of them. 56 bytes (the
 /// reservation is 24); a row is `size_of::<T>()` bytes, and an index is a compare against

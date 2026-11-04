@@ -54,11 +54,7 @@ pub fn scope_with(name: &'static str, suffix: Option<String>) -> Option<Guard> {
         return None;
     }
     NESTED.with_borrow_mut(|stack| stack.push(Duration::ZERO));
-    Some(Guard {
-        name,
-        suffix,
-        start: Instant::now(),
-    })
+    Some(Guard { name, suffix, start: Instant::now() })
 }
 
 impl Drop for Guard {
@@ -71,10 +67,7 @@ impl Drop for Guard {
             }
             nested
         });
-        let long_key = self
-            .suffix
-            .as_ref()
-            .map(|suffix| format!("{}/{suffix}", self.name));
+        let long_key = self.suffix.as_ref().map(|suffix| format!("{}/{suffix}", self.name));
         let key: &str = long_key.as_deref().unwrap_or(self.name);
         let mut measures = MEASURES.lock().unwrap();
         // Avoid allocating a fresh `String` on each call.
@@ -114,10 +107,7 @@ pub fn report(crate_name: &str) {
 
     let mut out = String::new();
     out += &format!("\n=== charon timings for crate `{crate_name}` ===\n");
-    out += &format!(
-        "{:<60} {:>12} {:>12} {:>10}\n",
-        "scope", "total (ms)", "self (ms)", "calls"
-    );
+    out += &format!("{:<60} {:>12} {:>12} {:>10}\n", "scope", "total (ms)", "self (ms)", "calls");
     for (name, m) in &entries {
         out += &format!(
             "{:<60} {:>12.2} {:>12.2} {:>10}\n",
@@ -130,10 +120,7 @@ pub fn report(crate_name: &str) {
     eprint!("{out}");
 
     if setting != "1"
-        && let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(setting)
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(setting)
     {
         for (name, m) in &entries {
             let _ = writeln!(

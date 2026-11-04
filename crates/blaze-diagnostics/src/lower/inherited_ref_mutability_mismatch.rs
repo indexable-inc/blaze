@@ -36,7 +36,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InheritedRefMutabilityMismatch) ->
     // clone: a handle, on the error path
     let mut diag = Diag::error(Some("E0308"), "mismatched types", at.clone());
     diag.note("cannot match inherited `&` with `&mut` pattern");
-    diag.suggestion_verbose(at, "replace this `&mut` pattern with `&`", "&", Applicability::MachineApplicable);
+    diag.suggestion_verbose(
+        at,
+        "replace this `&mut` pattern with `&`",
+        "&",
+        Applicability::MachineApplicable,
+    );
     code_fact(cx, &mut diag, ptr);
     // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]

@@ -49,9 +49,7 @@ impl VisitAstMut for NormalizeTraitRefs<'_> {
                     self.visit(&mut proof);
                     proof
                 }
-                TraitRefKind::BuiltinOrAuto {
-                    parent_trait_refs, ..
-                } => {
+                TraitRefKind::BuiltinOrAuto { parent_trait_refs, .. } => {
                     let Some(proof) = parent_trait_refs.get(*clause_id) else {
                         return;
                     };
@@ -72,10 +70,8 @@ impl TransformPass for Transform {
     fn transform_ctx(&self, ctx: &mut TransformCtx) {
         // Items are temporarily removed from the crate while we mutate them, so keep the original
         // impl proofs separately.
-        let impl_parent_refs = ctx
-            .translated
-            .trait_impls
-            .map_ref(|timpl| timpl.implied_trait_refs.clone());
+        let impl_parent_refs =
+            ctx.translated.trait_impls.map_ref(|timpl| timpl.implied_trait_refs.clone());
         ctx.for_each_item_mut(|_, mut item| {
             let _ = item.drive_mut(&mut NormalizeTraitRefs {
                 impl_parent_refs: &impl_parent_refs,

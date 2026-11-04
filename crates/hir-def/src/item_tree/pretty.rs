@@ -8,17 +8,13 @@ use span::{Edition, ErasedFileAstId};
 use crate::{
     item_tree::{
         Const, Enum, ExternBlock, ExternCrate, Function, Impl, ItemTree, Macro2, MacroCall,
-        MacroRules, Mod, ModItemId, ModItemKind, ModKind, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use, UseTreeId, UseTreeKind,
-        attrs::AttrsOrCfgRef,
+        MacroRules, Mod, ModItemId, ModItemKind, ModKind, RawVisibilityId, Static, Struct, Trait,
+        TypeAlias, Union, Use, UseTreeId, UseTreeKind, attrs::AttrsOrCfgRef,
     },
     visibility::RawVisibility,
 };
 
-pub(super) fn print_item_tree(
-    db: &Db,
-    tree: &ItemTree,
-    edition: Edition,
-) -> String {
+pub(super) fn print_item_tree(db: &Db, tree: &ItemTree, edition: Edition) -> String {
     let buf = String::new(); // alloc: a printout for tests and debugging, the edge
     let mut p = Printer { db, tree, buf, indent_level: 0, needs_indent: true, edition };
 

@@ -24,13 +24,21 @@ fn stderr(fixture: &str) -> String {
 /// [`crate::tests::ui`] of a UI test that needs core's items: core is minicore with `flags`
 /// (`crates/test-utils/src/minicore.rs`).
 pub(crate) fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    stderr(&format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"))
+    stderr(&format!(
+        "//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"
+    ))
 }
 
 /// [`ui_core`] of a UI test that uses std: `std` is a crate of `std_items`, written as std
 /// writes them, with a prelude of core's and of `prelude`, what std's prelude adds that the
 /// test uses.
-pub(crate) fn ui_std(name: &str, edition: &str, flags: &str, std: (&str, &str), source: &str) -> String {
+pub(crate) fn ui_std(
+    name: &str,
+    edition: &str,
+    flags: &str,
+    std: (&str, &str),
+    source: &str,
+) -> String {
     let (std_items, prelude) = std;
     let preludes: String = ["rust_2015", "rust_2018", "rust_2021", "rust_2024"]
         .iter()

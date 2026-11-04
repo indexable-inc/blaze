@@ -42,9 +42,8 @@ fn has_assoc_types(
 /// ADTs that have at least one trait clause pointing at a trait with associated types
 /// (transitively). We leave these ADTs entirely untouched.
 fn untouchable_adts(translated: &TranslatedCrate) -> HashSet<TypeDeclId> {
-    let mut cache: IndexMap<TraitDeclId, CycleDetector<bool>> = translated
-        .trait_decls
-        .map_ref_opt(|_| Some(CycleDetector::Unprocessed));
+    let mut cache: IndexMap<TraitDeclId, CycleDetector<bool>> =
+        translated.trait_decls.map_ref_opt(|_| Some(CycleDetector::Unprocessed));
     translated
         .type_decls
         .iter()
@@ -99,11 +98,7 @@ impl VisitAstMut for RemoveAdtClausesVisitor<'_> {
         let TraitRefKind::Clause(var, _) = &tref.kind else {
             return;
         };
-        if self
-            .binder_stack
-            .get_var::<_, GenericParams>(*var)
-            .is_some()
-        {
+        if self.binder_stack.get_var::<_, GenericParams>(*var).is_some() {
             return;
         }
         let new_kind = build_removed_clause_placeholder(self.translated, &tref.trait_decl_ref);

@@ -6,8 +6,8 @@ use hir_expand::fixture;
 
 use super::{edit, items, single};
 use crate::{
-    Fact, FactSet, HashColumns, ItemKey, NameHash, SimplifiedType, crate_hashes, hashes,
-    item_key, kinds,
+    Fact, FactSet, HashColumns, ItemKey, NameHash, SimplifiedType, crate_hashes, hashes, item_key,
+    kinds,
 };
 
 fn id(n: u8) -> ContentId {

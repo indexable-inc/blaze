@@ -16,7 +16,6 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
-use blaze_bytes::le::u32 as u32_at;
 use super::{Kind, NONE, Plan, Sel, compile_in, slots::GLOBAL, survey_in};
 use crate::{
     Cpu, Error, Os, Target, TlsModel,
@@ -26,6 +25,7 @@ use crate::{
     shape::{self, Disp, Dst, IntCc, Isa, Op, Shape, Src, Ty},
     table::format::{Hole, HoleKind, Reader, Variant, Writer},
 };
+use blaze_bytes::le::u32 as u32_at;
 
 /// What the tests read of a compile's plan, copied out of its frame.
 #[derive(Default)]
@@ -179,7 +179,8 @@ fn build(keep: impl Fn(Shape) -> bool) -> Vec<u8> {
     shape::each_on(Isa::X86_64, |shape| {
         if keep(shape) {
             let (code, holes) = stencil(shape);
-            let access = matches!(shape.op, Op::Load | Op::Store | Op::LoadConfined | Op::StoreConfined);
+            let access =
+                matches!(shape.op, Op::Load | Op::Store | Op::LoadConfined | Op::StoreConfined);
             let faults: &[u16] = if access { &[FAULT] } else { &[] };
             writer.push_with_faults(shape, &code, 5, &holes, faults).unwrap();
         }
@@ -300,7 +301,11 @@ struct Decoded {
 
 impl Decoded {
     fn field(&self, kind: HoleKind) -> i64 {
-        self.fields.iter().find(|it| it.0 == kind).unwrap_or_else(|| panic!("{} has no {kind:?}", self.shape)).1
+        self.fields
+            .iter()
+            .find(|it| it.0 == kind)
+            .unwrap_or_else(|| panic!("{} has no {kind:?}", self.shape))
+            .1
     }
 }
 
@@ -337,7 +342,13 @@ fn decode_to(code: &Code, end: usize) -> Vec<Piece> {
                 } else {
                     p as u32
                 };
-                out.push(Piece::Stencil(Decoded { at: at as u32, shape, tail, next, fields: values }));
+                out.push(Piece::Stencil(Decoded {
+                    at: at as u32,
+                    shape,
+                    tail,
+                    next,
+                    fields: values,
+                }));
                 at = p;
             }
             RELAY => {
@@ -424,7 +435,11 @@ fn compile(scratch: &mut Scratch, func: &ir::Function) -> Code {
 }
 
 /// A compile against `library`, keeping what the tests read of its plan.
-fn try_compile(scratch: &mut Scratch, func: &ir::Function, library: &Reader<'_>) -> Result<Code, Error> {
+fn try_compile(
+    scratch: &mut Scratch,
+    func: &ir::Function,
+    library: &Reader<'_>,
+) -> Result<Code, Error> {
     compile_in::<Mock, _>(func, &TARGET, library, |code, plan| {
         scratch.plan = Seen::of(plan);
         code.to_code()
@@ -528,10 +543,10 @@ fn narrowing_and_widening_are_named_by_their_result_type() {
     });
     let mut scratch = Scratch::new();
     let s = stencils(&decode(&compile(&mut scratch, &func)));
-    assert_eq!(s.iter().map(|it| (it.shape.op, it.shape.ty)).collect::<Vec<_>>(), [
-        (Op::Snarrow, Ty::I16x8),
-        (Op::SwidenLow, Ty::I32x4)
-    ]);
+    assert_eq!(
+        s.iter().map(|it| (it.shape.op, it.shape.ty)).collect::<Vec<_>>(),
+        [(Op::Snarrow, Ty::I16x8), (Op::SwidenLow, Ty::I32x4)]
+    );
 }
 
 #[test]
@@ -553,8 +568,16 @@ fn local_slots_are_reused_after_their_last_use_and_never_by_an_operand() {
     compile(&mut scratch, &func);
     let [v1, v2, v3, v4, _, _, v7] = values[..] else { unreachable!() };
     assert_eq!(slot_of(&scratch, v2), NONE);
-    assert_ne!(slot_of(&scratch, v3), slot_of(&scratch, v1), "a result shares no slot with an operand");
-    assert_eq!(slot_of(&scratch, v4), slot_of(&scratch, v1), "v1's slot is free after its last use");
+    assert_ne!(
+        slot_of(&scratch, v3),
+        slot_of(&scratch, v1),
+        "a result shares no slot with an operand"
+    );
+    assert_eq!(
+        slot_of(&scratch, v4),
+        slot_of(&scratch, v1),
+        "v1's slot is free after its last use"
+    );
     assert_ne!(slot_of(&scratch, v7), slot_of(&scratch, v3));
     let p = func.dfg.block_params(func.layout.entry_block().unwrap()).to_vec();
     assert_ne!(slot_of(&scratch, p[0]), slot_of(&scratch, p[1]));
@@ -584,7 +607,11 @@ fn values_other_blocks_read_keep_a_slot_of_their_own() {
     for local in [y, w, z] {
         let slot = slot_of(&scratch, local);
         if slot != NONE {
-            assert_ne!(slot, slot_of(&scratch, x), "{local} took the slot of a value live across blocks");
+            assert_ne!(
+                slot,
+                slot_of(&scratch, x),
+                "{local} took the slot of a value live across blocks"
+            );
         }
     }
     assert_ne!(slot_of(&scratch, y), NONE, "y has two uses: its slot and the accumulator");
@@ -629,7 +656,10 @@ fn icmp_and_brif_fuse_and_fall_through_to_the_next_block() {
     });
     let s = stencils(&decode(&compile(&mut scratch, &func)));
     assert_eq!(s.len(), 1);
-    assert_eq!(s[0].shape, Shape { aux: IntCc::Equal as u8, ..shape(Op::BrIcmp, Ty::I64, [S, I, N], Dst::None) });
+    assert_eq!(
+        s[0].shape,
+        Shape { aux: IntCc::Equal as u8, ..shape(Op::BrIcmp, Ty::I64, [S, I, N], Dst::None) }
+    );
     assert_eq!(s[0].field(HoleKind::Imm1), 7);
 
     // Not right before its branch: written apart.
@@ -661,8 +691,14 @@ fn select_of_icmp_is_one_stencil_either_way_round() {
     assert_eq!(s.len(), 2);
     let ult = IntCc::UnsignedLessThan as u8 | (Ty::I64 as u8) << 4;
     let ugt = IntCc::UnsignedGreaterThan as u8 | (Ty::I64 as u8) << 4;
-    assert_eq!(s[0].shape, Shape { aux: ult, ..shape(Op::SelectIcmp, Ty::I64, [S, S, N], Dst::Slot) });
-    assert_eq!(s[1].shape, Shape { aux: ugt, ..shape(Op::SelectIcmp, Ty::I64, [S, S, N], Dst::Slot) });
+    assert_eq!(
+        s[0].shape,
+        Shape { aux: ult, ..shape(Op::SelectIcmp, Ty::I64, [S, S, N], Dst::Slot) }
+    );
+    assert_eq!(
+        s[1].shape,
+        Shape { aux: ugt, ..shape(Op::SelectIcmp, Ty::I64, [S, S, N], Dst::Slot) }
+    );
     let p = func.dfg.block_params(func.layout.entry_block().unwrap()).to_vec();
     assert_eq!(s[1].field(HoleKind::Slot0), place(&scratch, p[1]));
     assert_eq!(s[1].field(HoleKind::Slot1), place(&scratch, p[0]));
@@ -670,14 +706,22 @@ fn select_of_icmp_is_one_stencil_either_way_round() {
 
 #[test]
 fn an_fma_by_an_fneg_is_the_negated_fma_of_its_operand_wherever_the_fneg_is() {
-    use crate::arch::aarch64::{Aarch64, tests::{LINUX, library_of}};
+    use crate::arch::aarch64::{
+        Aarch64,
+        tests::{LINUX, library_of},
+    };
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    let library = Reader::new(BYTES.get_or_init(|| library_of(&[Op::Fma, Op::Fneg, Op::Fadd, Op::Copy, Op::Jump]))).unwrap();
+    let library = Reader::new(
+        BYTES.get_or_init(|| library_of(&[Op::Fma, Op::Fneg, Op::Fadd, Op::Copy, Op::Jump])),
+    )
+    .unwrap();
     let negated = |srcs| Shape { aux: 1, ..shape(Op::Fma, Ty::F64, srcs, Dst::Slot) };
     let plan = |func: &ir::Function| {
-        compile_in::<Aarch64, _>(func, &LINUX, &library, |_, plan| Seen::of(plan)).unwrap_or_else(|e| panic!("{e}"))
+        compile_in::<Aarch64, _>(func, &LINUX, &library, |_, plan| Seen::of(plan))
+            .unwrap_or_else(|e| panic!("{e}"))
     };
-    let sel = |plan: &Seen, func: &ir::Function, value| plan.sels[inst_of(func, value).as_u32() as usize];
+    let sel =
+        |plan: &Seen, func: &ir::Function, value| plan.sels[inst_of(func, value).as_u32() as usize];
     let mut values = Vec::new();
 
     // Its one use: the `fneg` is dropped and its operand handed on in the accumulator.
@@ -756,11 +800,19 @@ fn block_arguments_move_in_parallel_and_a_swap_goes_through_the_scratch_slot() {
     let brif = s.iter().find(|it| it.shape.op == Op::Brif).unwrap();
     let count = glue(&pieces).iter().find(|it| it.1 == COUNT).unwrap().0;
     let ret = glue(&pieces).iter().find(|it| it.1 == RET).unwrap().0;
-    assert_eq!(brif.field(HoleKind::Target), i64::from(count), "the taken edge has code of its own");
+    assert_eq!(
+        brif.field(HoleKind::Target),
+        i64::from(count),
+        "the taken edge has code of its own"
+    );
     assert!(brif.tail && brif.next == ret, "the other edge is a jump to the exit");
     let jump = s.iter().find(|it| it.shape.op == Op::Jump).expect("the back edge's jump");
     assert_eq!(jump.next, body);
-    assert_eq!(s.iter().filter(|it| it.shape.op == Op::Jump).count(), 1, "the entry edge falls through");
+    assert_eq!(
+        s.iter().filter(|it| it.shape.op == Op::Jump).count(),
+        1,
+        "the entry edge falls through"
+    );
 }
 
 #[test]
@@ -804,7 +856,9 @@ fn far_slots_are_relayed_through_near_ones() {
         }
     }
     assert_eq!(far, (0..140).filter(|k| 112 + 8 * k >= 1024).count());
-    let Some(Piece::Relay { from, .. }) = pieces.iter().rev().find(|it| matches!(it, Piece::Relay { .. })) else {
+    let Some(Piece::Relay { from, .. }) =
+        pieces.iter().rev().find(|it| matches!(it, Piece::Relay { .. }))
+    else {
         panic!("the last result is far and relayed back");
     };
     assert_eq!(*from, 32 + 16 * 3);
@@ -822,7 +876,8 @@ fn instructions_of_one_trap_code_share_its_stub() {
     let mut scratch = Scratch::new();
     let code = compile(&mut scratch, &func);
     let pieces = decode(&code);
-    let stubs: Vec<u32> = glue(&pieces).iter().filter(|it| it.1 == STUB[0]).map(|it| it.0).collect();
+    let stubs: Vec<u32> =
+        glue(&pieces).iter().filter(|it| it.1 == STUB[0]).map(|it| it.0).collect();
     assert_eq!(stubs.len(), 2);
     let traps: Vec<i64> = stencils(&pieces).iter().map(|it| it.field(HoleKind::Trap)).collect();
     assert_eq!(traps.len(), 4);
@@ -834,7 +889,10 @@ fn instructions_of_one_trap_code_share_its_stub() {
     }
     assert_eq!(
         code.traps,
-        [(traps[0] as u32, TrapCode::INTEGER_DIVISION_BY_ZERO), (traps[2] as u32, TrapCode::unwrap_user(1))],
+        [
+            (traps[0] as u32, TrapCode::INTEGER_DIVISION_BY_ZERO),
+            (traps[2] as u32, TrapCode::unwrap_user(1))
+        ],
         "each stub's offset and code, by offset"
     );
     assert_eq!(code.trap_at(traps[2] as u32), Some(TrapCode::unwrap_user(1)));
@@ -888,7 +946,11 @@ fn constants_are_placed_once_each_16_aligned_after_the_code() {
     let mut scratch = Scratch::new();
     let code = compile(&mut scratch, &func);
     let first = |pieces: &[Piece]| {
-        stencils(pieces).iter().filter(|it| it.shape.op == Op::Vconst).map(|it| it.field(HoleKind::Const) as usize).min()
+        stencils(pieces)
+            .iter()
+            .filter(|it| it.shape.op == Op::Vconst)
+            .map(|it| it.field(HoleKind::Const) as usize)
+            .min()
     };
     // The constants follow the code: decode up to the first one.
     let mut end = code.bytes.len();
@@ -966,20 +1028,28 @@ fn stack_loads_and_stores_are_an_address_and_an_access() {
         let v = b.ins().stack_load(types::I64, types::I64, ss, 8);
         b.ins().return_(&[v]);
     });
-    let opcodes: Vec<Opcode> =
-        func.layout.block_insts(func.layout.entry_block().unwrap()).map(|inst| func.dfg.insts[inst].opcode()).collect();
-    assert_eq!(opcodes, [Opcode::StackAddr, Opcode::Store, Opcode::StackAddr, Opcode::Load, Opcode::Return]);
+    let opcodes: Vec<Opcode> = func
+        .layout
+        .block_insts(func.layout.entry_block().unwrap())
+        .map(|inst| func.dfg.insts[inst].opcode())
+        .collect();
+    assert_eq!(
+        opcodes,
+        [Opcode::StackAddr, Opcode::Store, Opcode::StackAddr, Opcode::Load, Opcode::Return]
+    );
     let mut scratch = Scratch::new();
     let s = stencils(&decode(&compile(&mut scratch, &func)));
-    assert_eq!(s.iter().map(|it| it.shape.op).collect::<Vec<_>>(), [
-        Op::StackAddr,
-        Op::Store,
-        Op::StackAddr,
-        Op::Load
-    ]);
+    assert_eq!(
+        s.iter().map(|it| it.shape.op).collect::<Vec<_>>(),
+        [Op::StackAddr, Op::Store, Op::StackAddr, Op::Load]
+    );
     let offset = i64::from(scratch.plan.stack_slot(ir::StackSlot::from_u32(0)));
     assert_eq!(s[0].field(HoleKind::Offset), offset + 8);
-    assert_eq!(s[1].field(HoleKind::Offset), 0, "the store's own offset: the address has the slot's");
+    assert_eq!(
+        s[1].field(HoleKind::Offset),
+        0,
+        "the store's own offset: the address has the slot's"
+    );
 }
 
 #[test]
@@ -1039,7 +1109,8 @@ fn what_no_stencil_and_no_glue_takes_is_an_error_naming_it() {
     assert!(error.what.contains("get_stack_pointer"), "{error}");
 
     static NO_UDIV: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = NO_UDIV.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.op != Op::Udiv));
+    let bytes =
+        NO_UDIV.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.op != Op::Udiv));
     let func = function(&[types::I64, types::I64], &[types::I64], |b, p| {
         let q = b.ins().udiv(p[0], p[1]);
         b.ins().return_(&[q]);
@@ -1052,18 +1123,21 @@ fn what_no_stencil_and_no_glue_takes_is_an_error_naming_it() {
 #[test]
 fn the_survey_lists_every_refused_instruction_by_its_opcode_and_type() {
     static NO_UDIV: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = NO_UDIV.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.op != Op::Udiv));
+    let bytes =
+        NO_UDIV.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.op != Op::Udiv));
     let library = Reader::new(bytes).unwrap();
-    let func = function(&[types::I64, types::I64, types::I32, types::I32], &[types::I64], |b, p| {
-        let sp = b.ins().get_stack_pointer(types::I64);
-        let q = b.ins().udiv(p[0], p[1]);
-        let r = b.ins().udiv(p[2], p[3]);
-        let r = b.ins().uextend(types::I64, r);
-        let s = b.ins().iadd(q, r);
-        let s = b.ins().iadd(s, sp);
-        b.ins().return_(&[s]);
-    });
-    let gaps: Vec<_> = survey_in::<Mock>(&func, &TARGET, &library).iter().map(|e| (e.inst, e.gap)).collect();
+    let func =
+        function(&[types::I64, types::I64, types::I32, types::I32], &[types::I64], |b, p| {
+            let sp = b.ins().get_stack_pointer(types::I64);
+            let q = b.ins().udiv(p[0], p[1]);
+            let r = b.ins().udiv(p[2], p[3]);
+            let r = b.ins().uextend(types::I64, r);
+            let s = b.ins().iadd(q, r);
+            let s = b.ins().iadd(s, sp);
+            b.ins().return_(&[s]);
+        });
+    let gaps: Vec<_> =
+        survey_in::<Mock>(&func, &TARGET, &library).iter().map(|e| (e.inst, e.gap)).collect();
     let gap = |opcode, ty| Some(crate::Gap { opcode, ty });
     assert_eq!(
         gaps,
@@ -1075,7 +1149,11 @@ fn the_survey_lists_every_refused_instruction_by_its_opcode_and_type() {
     );
     let mut scratch = Scratch::new();
     let first = try_compile(&mut scratch, &func, &library).unwrap_err();
-    assert_eq!(first.gap, gap(ir::Opcode::GetStackPointer, types::I64), "a compile stops at the first, typed");
+    assert_eq!(
+        first.gap,
+        gap(ir::Opcode::GetStackPointer, types::I64),
+        "a compile stops at the first, typed"
+    );
 }
 
 #[test]
@@ -1138,7 +1216,10 @@ fn a_warm_compile_into_a_reused_code_allocates_nothing() {
         "a warm compile: its columns on the frame, its code into the vectors of the last"
     );
     assert!(!code.bytes.is_empty() && !code.lines.is_empty() && !code.traps.is_empty());
-    assert!(blaze_mem::frame::spare_frames() > 0, "the compile's frame went back to the thread's spares");
+    assert!(
+        blaze_mem::frame::spare_frames() > 0,
+        "the compile's frame went back to the thread's spares"
+    );
 }
 
 #[test]
@@ -1164,10 +1245,13 @@ fn copying_into_a_reused_code_gives_the_fresh_code() {
 
 #[test]
 fn many_constants_are_each_placed_once_in_first_use_order() {
-    let values: Vec<[u8; 16]> = (0..20u8).map(|i| [i.wrapping_mul(13).wrapping_add(1); 16]).collect();
+    let values: Vec<[u8; 16]> =
+        (0..20u8).map(|i| [i.wrapping_mul(13).wrapping_add(1); 16]).collect();
     let func = function(&[], &[types::I8X16], |b, _| {
-        let handles: Vec<_> =
-            values.iter().map(|it| b.func.dfg.constants.insert(ConstantData::from(it.to_vec()))).collect();
+        let handles: Vec<_> = values
+            .iter()
+            .map(|it| b.func.dfg.constants.insert(ConstantData::from(it.to_vec())))
+            .collect();
         let mut acc = b.ins().vconst(types::I8X16, handles[0]);
         for i in 1..40 {
             let k = b.ins().vconst(types::I8X16, handles[i % 20]);
@@ -1180,7 +1264,11 @@ fn many_constants_are_each_placed_once_in_first_use_order() {
     assert_eq!(first, again, "the constant area is laid out the same each compile");
     let mut at = first.bytes.len() - 20 * 16;
     for value in &values {
-        assert_eq!(first.bytes[at..at + 16], value[..], "each constant once, in the order first used");
+        assert_eq!(
+            first.bytes[at..at + 16],
+            value[..],
+            "each constant once, in the order first used"
+        );
         at += 16;
     }
 }
@@ -1267,13 +1355,18 @@ fn a_confined_access_is_one_stencil_of_its_address_and_access() {
             assert_eq!(s[0].shape.confined(), Some((access, disp)), "{func}");
             let p = func.dfg.block_params(func.layout.entry_block().unwrap()).to_vec();
             let operands = if store { vec![p[2], p[0], p[1]] } else { vec![p[0], p[1]] };
-            for (kind, value) in [HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2].into_iter().zip(operands) {
+            for (kind, value) in
+                [HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2].into_iter().zip(operands)
+            {
                 assert_eq!(s[0].field(kind), place(&scratch, value), "{func}");
             }
             let hole = s[0].fields.iter().find(|it| it.0 == HoleKind::Offset).map(|it| it.1);
             assert_eq!(hole, offset, "the offset wrapped to 32 bits: {func}");
             for value in &parts[usize::from(off.is_none())..] {
-                assert_eq!(scratch.plan.sels[inst_of(&func, *value).as_u32() as usize].kind, Kind::Fused);
+                assert_eq!(
+                    scratch.plan.sels[inst_of(&func, *value).as_u32() as usize].kind,
+                    Kind::Fused
+                );
             }
             assert_eq!(
                 code.traps,
@@ -1286,7 +1379,8 @@ fn a_confined_access_is_one_stencil_of_its_address_and_access() {
 
 #[test]
 fn a_confined_access_is_apart_when_it_has_an_offset_or_a_value_of_its_address_another_use() {
-    let ops = |code: &Code| stencils(&decode(code)).iter().map(|it| it.shape.op).collect::<Vec<_>>();
+    let ops =
+        |code: &Code| stencils(&decode(code)).iter().map(|it| it.shape.op).collect::<Vec<_>>();
     let mut parts = Vec::new();
     let mut apart = [Op::Iadd, Op::Ireduce, Op::Uextend, Op::Iadd, Op::Load];
     let func = confined(Some(16), 8, false, None, &mut parts);
@@ -1302,7 +1396,8 @@ fn a_confined_access_is_apart_when_it_has_an_offset_or_a_value_of_its_address_an
     assert_eq!(s[1].shape.confined(), Some((Op::Load, Disp::Zero)), "the sum, used again, is `p`");
 
     static UNFUSED: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = UNFUSED.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.confined().is_none()));
+    let bytes = UNFUSED
+        .get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.confined().is_none()));
     let library = Reader::new(bytes).unwrap();
     for store in [false, true] {
         apart[4] = if store { Op::Store } else { Op::Load };
@@ -1332,6 +1427,10 @@ fn a_confined_access_keeps_its_operands_live_to_itself() {
     let [sum, y, z] = values[..] else { unreachable!() };
     assert_eq!(s.last().unwrap().field(HoleKind::Slot0), place(&scratch, sum));
     for later in [y, z] {
-        assert_ne!(slot_of(&scratch, later), slot_of(&scratch, sum), "{later} took the slot of `p`");
+        assert_ne!(
+            slot_of(&scratch, later),
+            slot_of(&scratch, sum),
+            "{later} took the slot of `p`"
+        );
     }
 }

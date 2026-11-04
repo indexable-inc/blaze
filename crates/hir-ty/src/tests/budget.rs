@@ -5,8 +5,8 @@
 use base_db::{Db, all_crates};
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_mem::{Tag, frame};
-use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::crate_def_map};
 use blaze_query::db::{Database, Durability};
+use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::crate_def_map};
 use hir_expand::fixture;
 
 use crate::{InferenceResult, infer::infer_body_in};
@@ -135,9 +135,7 @@ fn a_recheck_of_unchanged_bodies_allocates_nothing() {
     db.storage_mut().synthetic_write(Durability::LOW);
     infer_all(&db, &bodies);
     db.storage_mut().synthetic_write(Durability::LOW);
-    assert_at_most(0, "re-checking the inference of unchanged bodies", || {
-        infer_all(&db, &bodies)
-    });
+    assert_at_most(0, "re-checking the inference of unchanged bodies", || infer_all(&db, &bodies));
 }
 
 #[test]
@@ -169,7 +167,8 @@ fn a_cold_infer_allocates_its_result_alone() {
 
 /// `fn chain() -> u32` of `lets` statements, each adding one to the last.
 fn chain(lets: usize) -> String {
-    let mut text = String::from("//- minicore: sized, copy, add\nfn chain() -> u32 {\n    let x0: u32 = 1;\n");
+    let mut text =
+        String::from("//- minicore: sized, copy, add\nfn chain() -> u32 {\n    let x0: u32 = 1;\n");
     for at in 1..lets {
         text.push_str(&format!("    let x{at} = x{} + 1;\n", at - 1));
     }
@@ -195,5 +194,8 @@ fn frame_use_is_linear_in_the_body() {
     let large = peak_of_chain(800);
     assert!(small > 0, "inference's temporaries are frame values");
     // Four times the statements: at most four times the bytes and the fixed part again.
-    assert!(large <= 4 * small + small / 2, "frame peak {small} bytes for 200 lets, {large} for 800");
+    assert!(
+        large <= 4 * small + small / 2,
+        "frame peak {small} bytes for 200 lets, {large} for 800"
+    );
 }

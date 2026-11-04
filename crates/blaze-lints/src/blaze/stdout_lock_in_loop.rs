@@ -10,7 +10,11 @@
 //! counting the rest. Test code is not checked. No fix: the lock's scope is the author's choice
 //! (nothing else in the loop may print while it is held).
 
-use hir_def::{DefWithBodyId, hir::{Expr, ExprId}, signatures::FunctionSignature};
+use hir_def::{
+    DefWithBodyId,
+    hir::{Expr, ExprId},
+    signatures::FunctionSignature,
+};
 
 use super::{Finding, Lint, alloc::written_callee, exempt, facts, loops};
 use crate::check::Cx;
@@ -60,8 +64,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 if !WRITES.contains(&FunctionSignature::of(db, callee).name.as_str()) {
                     continue;
                 }
-                let Some(adt) = analysis.ty(infer.expr_ty(receiver)).strip_references().as_adt() else { continue };
-                if !(facts::adt_is(db, adt, "std", "Stdout") || facts::adt_is(db, adt, "std", "Stderr")) {
+                let Some(adt) = analysis.ty(infer.expr_ty(receiver)).strip_references().as_adt()
+                else {
+                    continue;
+                };
+                if !(facts::adt_is(db, adt, "std", "Stdout")
+                    || facts::adt_is(db, adt, "std", "Stderr"))
+                {
                     continue;
                 }
                 false
@@ -88,7 +97,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             1 => String::new(),
             n => format!(" (and {} more in the same loop)", n - 1),
         };
-        let message = format!("{what} is inside a loop{others}: each one locks the stream and writes on its own");
+        let message = format!(
+            "{what} is inside a loop{others}: each one locks the stream and writes on its own"
+        );
         let note = "lock once before the loop and write to the lock: `let mut out = std::io::stdout().lock();` (wrap \
                     it in `std::io::BufWriter::new(..)` for few large writes), then `writeln!(out, ..)?` in the loop"
             .to_owned(); // alloc: a message's part

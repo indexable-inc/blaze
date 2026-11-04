@@ -31,7 +31,9 @@ pub(super) const INTS_WIDE: [Ty; 5] = [Ty::I8, Ty::I16, Ty::I32, Ty::I64, Ty::I1
 
 /// The index of `ty` in [`TYS`].
 pub(super) fn index(ty: Ty) -> usize {
-    TYS.iter().position(|it| *it == ty).unwrap_or_else(|| panic!("{} is not a type the generator makes", ty.name()))
+    TYS.iter()
+        .position(|it| *it == ty)
+        .unwrap_or_else(|| panic!("{} is not a type the generator makes", ty.name()))
 }
 
 /// One op the generator draws, with the types it draws it at.
@@ -120,14 +122,18 @@ fn allowed(isa: Isa, op: Op, ty: Ty) -> bool {
         Op::Bitcast => ty != Ty::I128,
         Op::AtomicCas => ty != Ty::I128,
         Op::Cls => !x64,
-        Op::UaddSat | Op::SaddSat | Op::UsubSat | Op::SsubSat => !x64 || matches!(ty, Ty::I8x16 | Ty::I16x8),
+        Op::UaddSat | Op::SaddSat | Op::UsubSat | Op::SsubSat => {
+            !x64 || matches!(ty, Ty::I8x16 | Ty::I16x8)
+        }
         Op::Fcopysign | Op::Popcnt => !(x64 && vector),
         Op::Smin | Op::Umin | Op::Smax | Op::Umax | Op::Icmp => !(x64 && ty == Ty::I64x2),
         Op::Uunarrow | Op::IaddPairwise => !x64,
         // From `i64x2` operands.
         Op::Snarrow | Op::Unarrow | Op::SqmulRoundSat => !(x64 && ty == Ty::I32x4),
         Op::VhighBits => x64 || !matches!(ty, Ty::F32x4 | Ty::F64x2),
-        Op::FcvtToUintSat | Op::FcvtToSintSat => !(x64 && matches!(ty, Ty::I8 | Ty::I16 | Ty::I64x2)),
+        Op::FcvtToUintSat | Op::FcvtToSintSat => {
+            !(x64 && matches!(ty, Ty::I8 | Ty::I16 | Ty::I64x2))
+        }
         Op::FcvtFromUint | Op::FcvtFromSint => !(x64 && ty == Ty::F64x2),
         // x64's `bitcast_gpr_to_xmm`, which lowers it from a GPR, has no 8-bit rule.
         Op::ScalarToVector => !(x64 && ty == Ty::I8x16),
@@ -161,9 +167,14 @@ pub(super) fn sources(isa: Isa, op: Op, ty: Ty) -> Vec<Ty> {
     match op {
         Op::Select => ints(&INTS),
         Op::Bmask => ints(&INTS_WIDE),
-        Op::Bitcast => TYS.into_iter().filter(|it| it.bytes() == ty.bytes() && *it != ty && *it != Ty::I128).collect(),
+        Op::Bitcast => TYS
+            .into_iter()
+            .filter(|it| it.bytes() == ty.bytes() && *it != ty && *it != Ty::I128)
+            .collect(),
         Op::Ireduce => INTS_WIDE.into_iter().filter(|it| it.bytes() > ty.bytes()).collect(),
-        Op::Uextend | Op::Sextend => INTS.into_iter().filter(|it| it.bytes() < ty.bytes()).collect(),
+        Op::Uextend | Op::Sextend => {
+            INTS.into_iter().filter(|it| it.bytes() < ty.bytes()).collect()
+        }
         Op::FcvtToUintSat | Op::FcvtToSintSat => match ty {
             Ty::I32x4 => vec![Ty::F32x4],
             Ty::I64x2 => vec![Ty::F64x2],
@@ -177,7 +188,10 @@ pub(super) fn sources(isa: Isa, op: Op, ty: Ty) -> Vec<Ty> {
             _ => Vec::new(),
         },
         Op::ScalarToVector => vec![ty.lane()],
-        Op::VhighBits => INTS.into_iter().filter(|it| u32::from(it.bytes()) * 8 >= u32::from(ty.lanes())).collect(),
+        Op::VhighBits => INTS
+            .into_iter()
+            .filter(|it| u32::from(it.bytes()) * 8 >= u32::from(ty.lanes()))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -188,7 +202,9 @@ pub(super) fn float_ccs(isa: Isa, vector: bool) -> Vec<FloatCC> {
         .iter()
         .copied()
         .filter(|cc| match isa {
-            Isa::X86_64 => !(vector && matches!(cc, FloatCC::UnorderedOrEqual | FloatCC::OrderedNotEqual)),
+            Isa::X86_64 => {
+                !(vector && matches!(cc, FloatCC::UnorderedOrEqual | FloatCC::OrderedNotEqual))
+            }
             Isa::Aarch64 => {
                 !matches!(cc, FloatCC::OrderedNotEqual | FloatCC::UnorderedOrEqual)
                     && !(vector
@@ -218,9 +234,19 @@ fn every_candidate_is_of_the_stencil_set() {
         for candidate in &candidates {
             let info = candidate.op.info();
             for ty in &candidate.tys {
-                assert!(info.tys.contains(*ty) && candidate.op.on(isa), "{} {}", info.name, ty.name());
+                assert!(
+                    info.tys.contains(*ty) && candidate.op.on(isa),
+                    "{} {}",
+                    info.name,
+                    ty.name()
+                );
                 if has_sources(candidate.op) {
-                    assert!(!sources(isa, candidate.op, *ty).is_empty(), "{} {}", info.name, ty.name());
+                    assert!(
+                        !sources(isa, candidate.op, *ty).is_empty(),
+                        "{} {}",
+                        info.name,
+                        ty.name()
+                    );
                 }
             }
         }
@@ -236,7 +262,12 @@ fn the_type_set_covers_what_every_drawn_op_needs() {
         for candidate in candidates(isa) {
             for ty in &candidate.tys {
                 for source in sources(isa, candidate.op, *ty) {
-                    assert!(TYS.contains(&source), "{} from {}", candidate.op.info().name, source.name());
+                    assert!(
+                        TYS.contains(&source),
+                        "{} from {}",
+                        candidate.op.info().name,
+                        source.name()
+                    );
                 }
             }
         }

@@ -15,8 +15,8 @@
 use std::ops::ControlFlow;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir::{HirFileId, InFile};
+use std::alloc::Global;
 use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, WalkEvent,
     view::{self as ast, AstNode as _, AstToken as _},
@@ -54,7 +54,9 @@ pub(super) fn visit(cx: &Cx<'_, '_>, walk: &Walk<'_>, features: &Features) -> Ve
         .found
         .into_iter()
         .enumerate()
-        .map(|(seq, (anchor, posted))| ((places.of(cx, anchor.file_id, anchor.value.text_range()), seq), posted))
+        .map(|(seq, (anchor, posted))| {
+            ((places.of(cx, anchor.file_id, anchor.value.text_range()), seq), posted)
+        })
         // alloc: on the error path (the gates hit, in rustc's order)
         .collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -78,14 +80,28 @@ impl Visitor<'_, '_, '_, '_> {
             SyntaxKind::IMPL => self.impl_(file, node),
             SyntaxKind::TRAIT => {
                 if token(node, T![=]).is_some() {
-                    self.gate(file, node, "trait_alias", item_range(node), "trait aliases are experimental", None);
+                    self.gate(
+                        file,
+                        node,
+                        "trait_alias",
+                        item_range(node),
+                        "trait aliases are experimental",
+                        None,
+                    );
                 } else if token(node, T![auto]).is_some() {
                     let explain = "auto traits are experimental and possibly buggy";
                     self.gate(file, node, "auto_traits", item_range(node), explain, None);
                 }
             }
             SyntaxKind::MACRO_DEF => {
-                self.gate(file, node, "decl_macro", item_range(node), "`macro` is experimental", None);
+                self.gate(
+                    file,
+                    node,
+                    "decl_macro",
+                    item_range(node),
+                    "`macro` is experimental",
+                    None,
+                );
             }
             SyntaxKind::TYPE_ALIAS | SyntaxKind::CONST | SyntaxKind::FN | SyntaxKind::STATIC => {
                 match node.parent().map(|it| it.kind()) {
@@ -96,16 +112,33 @@ impl Visitor<'_, '_, '_, '_> {
             }
             SyntaxKind::FOR_BINDER => self.binder(file, node),
             SyntaxKind::PATTERN_TYPE => {
-                self.gate(file, node, "pattern_types", node.text_range(), "pattern types are unstable", None);
+                self.gate(
+                    file,
+                    node,
+                    "pattern_types",
+                    node.text_range(),
+                    "pattern types are unstable",
+                    None,
+                );
             }
             SyntaxKind::BLOCK_EXPR => {
                 if let Some(modifier) = child(node, SyntaxKind::TRY_BLOCK_MODIFIER)
-                    && !modifier.children_with_tokens().filter_map(NodeOrToken::into_token).any(|it| {
-                        it.kind() == T![bikeshed] || (it.kind() == SyntaxKind::IDENT && it.text() == "bikeshed")
-                    })
+                    && !modifier.children_with_tokens().filter_map(NodeOrToken::into_token).any(
+                        |it| {
+                            it.kind() == T![bikeshed]
+                                || (it.kind() == SyntaxKind::IDENT && it.text() == "bikeshed")
+                        },
+                    )
                 {
                     let at = TextRange::new(modifier.text_range().start(), node.text_range().end());
-                    self.gate(file, node, "try_blocks", at, "`try` expression is experimental", None);
+                    self.gate(
+                        file,
+                        node,
+                        "try_blocks",
+                        at,
+                        "`try` expression is experimental",
+                        None,
+                    );
                 }
             }
             SyntaxKind::LITERAL => self.literal(file, node),
@@ -118,7 +151,14 @@ impl Visitor<'_, '_, '_, '_> {
                     };
                     if half_open(sub.unwrap_or(pat)) {
                         let explain = "`X..` patterns in slices are experimental";
-                        self.gate(file, node, "half_open_range_patterns_in_slices", pat.text_range(), explain, None);
+                        self.gate(
+                            file,
+                            node,
+                            "half_open_range_patterns_in_slices",
+                            pat.text_range(),
+                            explain,
+                            None,
+                        );
                     }
                 }
             }
@@ -140,7 +180,8 @@ impl Visitor<'_, '_, '_, '_> {
         if self.features.enabled(feature) || allows_unstable(self.cx, file, at, feature) {
             return;
         }
-        let mut diag = feature_err(self.features, feature, self.cx.span(InFile::new(file, at)), explain);
+        let mut diag =
+            feature_err(self.features, feature, self.cx.span(InFile::new(file, at)), explain);
         if let Some(help) = help {
             diag.help(help);
         }
@@ -159,36 +200,52 @@ impl Visitor<'_, '_, '_, '_> {
         let Some(attr) = ast::Attr::cast(node) else { return };
         let top = attr.meta();
         let cfg = self.walk.cfg;
-        hir_expand::attrs::expand_cfg_attr_view::<()>(std::iter::once(attr), || cfg, |meta, _| {
-            let ast::Meta::TokenTreeMeta(list) = meta else { return ControlFlow::Continue(()) };
-            let is_doc = list.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "doc");
-            let Some(tt) = list.token_tree().filter(|_| is_doc) else { return ControlFlow::Continue(()) };
-            let at = match top {
-                Some(top) if top.syntax() == meta.syntax() => node.text_range(),
-                _ => meta.syntax().text_range(),
-            };
-            nested_names(tt, |name| {
-                if let Some((feature, explain)) = doc_gate(name) {
-                    self.gate(file, node, feature, at, explain, None);
-                }
-            });
-            ControlFlow::Continue(())
-        });
+        hir_expand::attrs::expand_cfg_attr_view::<()>(
+            std::iter::once(attr),
+            || cfg,
+            |meta, _| {
+                let ast::Meta::TokenTreeMeta(list) = meta else { return ControlFlow::Continue(()) };
+                let is_doc = list
+                    .path()
+                    .and_then(|it| it.as_single_name_ref())
+                    .is_some_and(|it| it.text() == "doc");
+                let Some(tt) = list.token_tree().filter(|_| is_doc) else {
+                    return ControlFlow::Continue(());
+                };
+                let at = match top {
+                    Some(top) if top.syntax() == meta.syntax() => node.text_range(),
+                    _ => meta.syntax().text_range(),
+                };
+                nested_names(tt, |name| {
+                    if let Some((feature, explain)) = doc_gate(name) {
+                        self.gate(file, node, feature, at, explain, None);
+                    }
+                });
+                ControlFlow::Continue(())
+            },
+        );
     }
 
     /// `visit_item` of an impl: a negative one (`!` to the trait's path), a `default` one.
     fn impl_(&mut self, file: HirFileId, node: ast::Node<'_>) {
         if let Some(bang) = token(node, T![!])
-            && let Some(trait_) = node
-                .children()
-                .find(|it| ast::Type::can_cast(it.kind()) && it.text_range().start() >= bang.text_range().end())
+            && let Some(trait_) = node.children().find(|it| {
+                ast::Type::can_cast(it.kind()) && it.text_range().start() >= bang.text_range().end()
+            })
         {
             let at = TextRange::new(bang.text_range().start(), trait_.text_range().end());
             let explain = "negative impls are experimental";
             self.gate(file, node, "negative_impls", at, explain, Some("use marker types for now"));
         }
         if token(node, T![default]).is_some() && token(node, T![for]).is_some() {
-            self.gate(file, node, "specialization", item_range(node), "specialization is experimental", None);
+            self.gate(
+                file,
+                node,
+                "specialization",
+                item_range(node),
+                "specialization is experimental",
+                None,
+            );
         }
     }
 
@@ -211,7 +268,10 @@ impl Visitor<'_, '_, '_, '_> {
     /// `visit_assoc_item`: associated type defaults, `impl Trait` in an associated type, an
     /// associated `type const`, and `default` (a function's needs only `min_specialization`).
     fn assoc_item(&mut self, file: HirFileId, node: ast::Node<'_>) {
-        let in_trait = node.parent().and_then(|it| it.parent()).is_some_and(|it| it.kind() == SyntaxKind::TRAIT);
+        let in_trait = node
+            .parent()
+            .and_then(|it| it.parent())
+            .is_some_and(|it| it.kind() == SyntaxKind::TRAIT);
         let at = item_range(node);
         let defaults = "associated type defaults are unstable";
         match node.kind() {
@@ -245,7 +305,12 @@ impl Visitor<'_, '_, '_, '_> {
                 || (is_fn && (self.features.enabled("min_specialization") || blaze()));
             if !enabled && !allows_unstable(self.cx, file, at, "specialization") {
                 let span = self.cx.span(InFile::new(file, at));
-                let diag = feature_err(self.features, "specialization", span, "specialization is experimental");
+                let diag = feature_err(
+                    self.features,
+                    "specialization",
+                    span,
+                    "specialization is experimental",
+                );
                 self.push(file, node, diag, false);
             }
         }
@@ -259,7 +324,14 @@ impl Visitor<'_, '_, '_, '_> {
                 self.gate(file, node, "link_llvm_intrinsics", item_range(node), explain, None);
             }
             SyntaxKind::TYPE_ALIAS => {
-                self.gate(file, node, "extern_types", item_range(node), "extern types are experimental", None);
+                self.gate(
+                    file,
+                    node,
+                    "extern_types",
+                    item_range(node),
+                    "extern types are experimental",
+                    None,
+                );
             }
             _ => {}
         }
@@ -269,7 +341,10 @@ impl Visitor<'_, '_, '_, '_> {
     fn links_to_llvm(&self, node: ast::Node<'_>) -> bool {
         let Some(owner) = ast::AnyHasAttrs::cast(node) else { return false };
         for (meta, _) in self.walk.attrs(owner) {
-            let named = meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "link_name");
+            let named = meta
+                .path()
+                .and_then(|it| it.as_single_name_ref())
+                .is_some_and(|it| it.text() == "link_name");
             if !named {
                 continue;
             }
@@ -283,7 +358,13 @@ impl Visitor<'_, '_, '_, '_> {
 
     /// `check_impl_trait`: each `impl Trait` in the type `ty` of `item`, not in what is an
     /// anonymous constant (an array's length, a const argument).
-    fn impl_trait(&mut self, file: HirFileId, item: ast::Node<'_>, ty: ast::Node<'_>, in_associated_ty: bool) {
+    fn impl_trait(
+        &mut self,
+        file: HirFileId,
+        item: ast::Node<'_>,
+        ty: ast::Node<'_>,
+        in_associated_ty: bool,
+    ) {
         let (feature, explain) = match in_associated_ty {
             true => ("impl_trait_in_assoc_type", "`impl Trait` in associated types is unstable"),
             false => ("type_alias_impl_trait", "`impl Trait` in type aliases is unstable"),
@@ -293,7 +374,9 @@ impl Visitor<'_, '_, '_, '_> {
             let WalkEvent::Enter(node) = event else { continue };
             match node.kind() {
                 SyntaxKind::CONST_ARG => events.skip_subtree(),
-                SyntaxKind::IMPL_TRAIT_TYPE => self.gate(file, item, feature, node.text_range(), explain, None),
+                SyntaxKind::IMPL_TRAIT_TYPE => {
+                    self.gate(file, item, feature, node.text_range(), explain, None)
+                }
                 _ => {}
             }
         }
@@ -327,7 +410,12 @@ impl Visitor<'_, '_, '_, '_> {
             if !spans.is_empty() {
                 // alloc: empty, allocates nothing
                 let spans = MultiSpan { primary: spans, labels: Vec::new() };
-                let diag = feature_err(self.features, feature, spans, "only lifetime parameters can be used in this context");
+                let diag = feature_err(
+                    self.features,
+                    feature,
+                    spans,
+                    "only lifetime parameters can be used in this context",
+                );
                 self.push(file, node, diag, false);
             }
         } else if let Some(diag) = multi_error(
@@ -340,7 +428,8 @@ impl Visitor<'_, '_, '_, '_> {
             let Some(list) = child(param, SyntaxKind::TYPE_BOUND_LIST) else { continue };
             let bounds = || list.children().filter(|it| it.kind() == SyntaxKind::TYPE_BOUND);
             let fatal = bounds().any(|it| {
-                child(it, SyntaxKind::LIFETIME).is_none() && child(it, SyntaxKind::USE_BOUND_GENERIC_ARGS).is_none()
+                child(it, SyntaxKind::LIFETIME).is_none()
+                    && child(it, SyntaxKind::USE_BOUND_GENERIC_ARGS).is_none()
             });
             let spans = bounds().map(|it| span_of(it.text_range()));
             if let Some(diag) = multi_error("bounds cannot be used in this context", spans) {
@@ -358,13 +447,16 @@ impl Visitor<'_, '_, '_, '_> {
             _ => None,
         };
         // The gate of the first numeric token with a suffix.
-        let gate = node.children_with_tokens().filter_map(NodeOrToken::into_token).find_map(|token| {
-            match token.kind() {
-                SyntaxKind::INT_NUMBER => ast::IntNumber::cast(token)?.suffix().map(gate_of),
-                SyntaxKind::FLOAT_NUMBER => ast::FloatNumber::cast(token)?.suffix().map(gate_of),
-                _ => None,
-            }
-        });
+        let gate =
+            node.children_with_tokens().filter_map(NodeOrToken::into_token).find_map(|token| {
+                match token.kind() {
+                    SyntaxKind::INT_NUMBER => ast::IntNumber::cast(token)?.suffix().map(gate_of),
+                    SyntaxKind::FLOAT_NUMBER => {
+                        ast::FloatNumber::cast(token)?.suffix().map(gate_of)
+                    }
+                    _ => None,
+                }
+            });
         let Some(Some((feature, explain))) = gate else { return };
         if node.ancestors().any(|it| it.kind() == SyntaxKind::ATTR) {
             return;
@@ -408,7 +500,8 @@ fn half_open(pat: ast::Node<'_>) -> bool {
 /// The names of the items of the list `tt` of `#[doc(..)]`: rustc's `meta_item_list`, each
 /// item's name when its path is one word.
 fn nested_names(tt: ast::TokenTree<'_>, mut f: impl FnMut(&str)) {
-    let mut elements = tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).peekable();
+    let mut elements =
+        tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).peekable();
     // The opening delimiter.
     elements.next();
     let mut at_start = true;
@@ -419,7 +512,8 @@ fn nested_names(tt: ast::TokenTree<'_>, mut f: impl FnMut(&str)) {
                 continue;
             }
             NodeOrToken::Token(token) if at_start && token.kind() == SyntaxKind::IDENT => {
-                let path_goes_on = elements.peek().is_some_and(|it| matches!(it.kind(), T![::] | T![:]));
+                let path_goes_on =
+                    elements.peek().is_some_and(|it| matches!(it.kind(), T![::] | T![:]));
                 if !path_goes_on {
                     f(token.text().strip_prefix("r#").unwrap_or(token.text()));
                 }
@@ -439,8 +533,12 @@ fn doc_gate(name: &str) -> Option<(&'static str, &'static str)> {
         "notable_trait" => ("doc_notable_trait", "`#[doc(notable_trait)]` is experimental"),
         "attribute" => ("rustdoc_internals", "`#[doc(attribute)]` is meant for internal use only"),
         "keyword" => ("rustdoc_internals", "`#[doc(keyword)]` is meant for internal use only"),
-        "fake_variadic" => ("rustdoc_internals", "`#[doc(fake_variadic)]` is meant for internal use only"),
-        "search_unbox" => ("rustdoc_internals", "`#[doc(search_unbox)]` is meant for internal use only"),
+        "fake_variadic" => {
+            ("rustdoc_internals", "`#[doc(fake_variadic)]` is meant for internal use only")
+        }
+        "search_unbox" => {
+            ("rustdoc_internals", "`#[doc(search_unbox)]` is meant for internal use only")
+        }
         _ => return None,
     })
 }
@@ -530,7 +628,8 @@ mod tests {
         let open: Vec<bool> = slice
             .pats()
             .map(|pat| {
-                let inner = ast::IdentPat::cast(pat.syntax()).and_then(|it| it.pat()).unwrap_or(pat);
+                let inner =
+                    ast::IdentPat::cast(pat.syntax()).and_then(|it| it.pat()).unwrap_or(pat);
                 half_open(inner.syntax())
             })
             .collect();

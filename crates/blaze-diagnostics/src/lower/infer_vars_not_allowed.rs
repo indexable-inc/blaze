@@ -114,9 +114,10 @@ fn impl_trait<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> Option<String> {
         if !ty.impls_trait(db, trait_, &[]) {
             return None;
         }
-        let alias = trait_.items_iter(db).filter_map(|it| it.as_type_alias()).find(|it| {
-            it.name(db).as_str() == assoc
-        })?;
+        let alias = trait_
+            .items_iter(db)
+            .filter_map(|it| it.as_type_alias())
+            .find(|it| it.name(db).as_str() == assoc)?;
         let item = ty.normalize_trait_assoc_type(db, &[], alias)?;
         // alloc: the suggestion's text, for an error hir found
         Some(format!(
@@ -134,7 +135,9 @@ fn impl_trait<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> Option<String> {
     let callable = ty.as_callable(db)?;
     let trait_name = match callable.kind() {
         CallableKind::Closure(closure) => closure.fn_trait(db).as_str(),
-        CallableKind::Function(_) | CallableKind::TupleStruct(_) | CallableKind::TupleEnumVariant(_) => "Fn",
+        CallableKind::Function(_)
+        | CallableKind::TupleStruct(_)
+        | CallableKind::TupleEnumVariant(_) => "Fn",
         _ => return None,
     };
     // alloc: the suggestion's text, for an error hir found
@@ -179,17 +182,21 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found>
         ast::Item::Static(it) => {
             it.ty().zip(it.body()).map(|(ty, body)| (ty.syntax(), body, "static variable", false))
         }
-        ast::Item::Fn(it) => it.ret_type().and_then(|ret| ret.ty()).zip(it.body()).map(|(ty, body)| {
-            (ty.syntax(), ast::Expr::BlockExpr(body), "return type", true)
-        }),
+        ast::Item::Fn(it) => it
+            .ret_type()
+            .and_then(|ret| ret.ty())
+            .zip(it.body())
+            .map(|(ty, body)| (ty.syntax(), ast::Expr::BlockExpr(body), "return type", true)),
         _ => None,
     }
     .filter(|(ty, ..)| ty.text_range().contains_range(at));
 
     let Some((ty, body, kind, is_return)) = grouped else {
-        let in_variant = node.value.ancestors().take_while(|it| *it != item.syntax()).any(|it| {
-            ast::Variant::can_cast(it.kind())
-        });
+        let in_variant = node
+            .value
+            .ancestors()
+            .take_while(|it| *it != item.syntax())
+            .any(|it| ast::Variant::can_cast(it.kind()));
         let kind = if in_variant { "variant" } else { item_descr(item) };
         let mut diag = bad_placeholder(cx, file, &[at], kind);
         site_fact(cx, &mut diag, node);

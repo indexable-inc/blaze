@@ -60,7 +60,9 @@ pub(crate) struct Words<A> {
 #[cfg(not(blaze_check))]
 impl<A: Zeroed> Words<A> {
     const SIZE: usize = {
-        assert!(std::mem::size_of::<A>() != 0 && std::mem::align_of::<A>() <= std::mem::size_of::<A>());
+        assert!(
+            std::mem::size_of::<A>() != 0 && std::mem::align_of::<A>() <= std::mem::size_of::<A>()
+        );
         std::mem::size_of::<A>()
     };
 
@@ -156,7 +158,8 @@ mod tests {
         }
         let (mut at, mut len) = (0, 64);
         for stretch in 0..14 {
-            let got: Vec<u64> = words.get(stretch, at, len).iter().map(|it| it.load(Ordering::Relaxed)).collect();
+            let got: Vec<u64> =
+                words.get(stretch, at, len).iter().map(|it| it.load(Ordering::Relaxed)).collect();
             assert_eq!(got, model[at..at + len], "stretch {stretch}");
             at += len;
             len *= 2;

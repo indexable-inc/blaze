@@ -9,7 +9,9 @@ use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Relocation, 
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 
-use super::{Change, Disk, Image, Linked, Sparse, TO, function, id, key, name, output, rel32, returns};
+use super::{
+    Change, Disk, Image, Linked, Sparse, TO, function, id, key, name, output, rel32, returns,
+};
 
 /// `lea rax, [rip + table]; ret`
 const START: [u8; 8] = [0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3];
@@ -27,7 +29,10 @@ fn table(to: &[u8]) -> Static {
         item: ItemKey(id(40)),
         instance: ContentId::default(),
         align: 8,
-        init: Init::Bytes { bytes: vec![0; 8 * to.len()], relocs: relocs.collect::<Vec<_>>().into() },
+        init: Init::Bytes {
+            bytes: vec![0; 8 * to.len()],
+            relocs: relocs.collect::<Vec<_>>().into(),
+        },
         data: Vec::new(),
         mutable: false,
         thread_local: false,
@@ -38,8 +43,17 @@ fn table(to: &[u8]) -> Static {
 
 /// `_start` (1) and three instances that return 7: 2 and 3 may fold, 4 is exported.
 fn build() -> (Vec<CompiledFunction>, Vec<Static>) {
-    let start = function(1, &START, vec![rel32(3, Target::Static { item: ItemKey(id(40)), instance: ContentId::default() })]);
-    let functions = vec![start, function(2, &returns(7), Vec::new()), function(3, &returns(7), Vec::new()), function(4, &returns(7), Vec::new())];
+    let start = function(
+        1,
+        &START,
+        vec![rel32(3, Target::Static { item: ItemKey(id(40)), instance: ContentId::default() })],
+    );
+    let functions = vec![
+        start,
+        function(2, &returns(7), Vec::new()),
+        function(3, &returns(7), Vec::new()),
+        function(4, &returns(7), Vec::new()),
+    ];
     (functions, vec![table(&[2, 3, 4])])
 }
 
@@ -49,7 +63,8 @@ fn exported(it: &InstanceKey) -> bool {
 
 /// Dedupes and links `functions` and `statics` into a fresh image: its file.
 fn link(mut functions: Vec<CompiledFunction>, mut statics: Vec<Static>) -> Sparse {
-    let (deduped, renamed) = dedupe(&mut functions, &mut statics, |it| !exported(it) && *it != key(1)).unwrap();
+    let (deduped, renamed) =
+        dedupe(&mut functions, &mut statics, |it| !exported(it) && *it != key(1)).unwrap();
     assert_eq!(deduped.merged.into_iter().collect::<Vec<_>>(), [(key(3), key(2))]);
     assert_eq!(renamed, [0], "the table named 3");
     assert_eq!(deduped.bytes, returns(7).len() as u64);

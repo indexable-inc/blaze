@@ -8,12 +8,12 @@
 use base_db::{Crate, Db};
 use blaze_alloc_count::assert_at_most;
 use hir_def::{AdtId, GenericDefId, ModuleDefId, TraitId, nameres::crate_def_map};
+use hir_expand::fixture;
 use rustc_next_trait_solver::solve::SolverDelegateEvalExt;
 use rustc_type_ir::{
     Mutability, TypingMode,
     inherent::{Clause as _, Ty as _},
 };
-use hir_expand::fixture;
 
 use crate::{
     Span,
@@ -247,12 +247,8 @@ fn a_warm_fulfillment_context_allocates_nothing() {
     let infcx = build(DbInterner::new_with(&db, krate));
     let var = infcx.next_ty_var(Span::Dummy);
     let goal = wrap_is_tr(&infcx, &items, var);
-    let obligation = Obligation::new(
-        infcx.interner,
-        ObligationCause::dummy(),
-        goal.param_env,
-        goal.predicate,
-    );
+    let obligation =
+        Obligation::new(infcx.interner, ObligationCause::dummy(), goal.param_env, goal.predicate);
     let register = || {
         let mut fulfill = FulfillmentCtxt::new(&infcx);
         for _ in 0..50 {

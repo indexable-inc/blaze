@@ -154,7 +154,9 @@ impl<'t, I: Iterator<Item = ast::Element<'t>>> Cursor<'t, I> {
             }
             SyntaxKind::COLON => {
                 let second = self.get(1)?.into_token()?;
-                if second.kind() != SyntaxKind::COLON || second.text_range().start() != first.text_range().end() {
+                if second.kind() != SyntaxKind::COLON
+                    || second.text_range().start() != first.text_range().end()
+                {
                     return None;
                 }
                 self.bump();
@@ -166,7 +168,8 @@ impl<'t, I: Iterator<Item = ast::Element<'t>>> Cursor<'t, I> {
     }
 
     fn at_path_sep(&self) -> bool {
-        self.peek_token().is_some_and(|it| matches!(it.kind(), SyntaxKind::COLON2 | SyntaxKind::COLON))
+        self.peek_token()
+            .is_some_and(|it| matches!(it.kind(), SyntaxKind::COLON2 | SyntaxKind::COLON))
     }
 
     /// rustc's `parse_meta_item_inner`: a literal, else a meta item.
@@ -251,7 +254,8 @@ mod tests {
         parsed("(a, b::c, ::d, e = \"f\", g(h), 1, x: :y)", |it| assert!(it.is_none()));
         parsed("(a, b::c, ::d, e = \"f\", g(h), 1,)", |it| {
             let it = it.unwrap();
-            let words: Vec<Option<&str>> = it.iter().map(|it| it.item().and_then(Item::word)).collect();
+            let words: Vec<Option<&str>> =
+                it.iter().map(|it| it.item().and_then(Item::word)).collect();
             assert_eq!(words, [Some("a"), None, None, Some("e"), Some("g"), None]);
             assert!(matches!(it[3].item().unwrap().args, ItemArgs::NameValue(_)));
             assert!(matches!(it[4].item().unwrap().args, ItemArgs::List(_)));

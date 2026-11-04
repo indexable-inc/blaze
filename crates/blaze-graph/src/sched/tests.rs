@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hegel::TestCase;
 use hegel::generators as gs;
+use std::alloc::Global;
 
 use super::*;
 
@@ -93,7 +93,7 @@ struct Sim {
     woken: Vec<u32>,
     /// Cores whose move flag is set.
     flags: HashSet<u32, Global>, // alloc: a test's model
-    ran: HashSet<u32, Global>, // alloc: a test's model
+    ran: HashSet<u32, Global>,  // alloc: a test's model
     done: HashSet<u32, Global>, // alloc: a test's model
 }
 
@@ -106,15 +106,15 @@ impl Sim {
             mode,
             jobs: 0,
             rank: Vec::new(),
-            maps: HashMap::new_in(Global), // alloc: a test's model
+            maps: HashMap::new_in(Global),    // alloc: a test's model
             counted: HashMap::new_in(Global), // alloc: a test's model
-            waits: HashMap::new_in(Global), // alloc: a test's model
+            waits: HashMap::new_in(Global),   // alloc: a test's model
             flights: HashMap::new_in(Global), // alloc: a test's model
             next_key: 0,
             woken: Vec::new(),
             flags: HashSet::new_in(Global), // alloc: a test's model
-            ran: HashSet::new_in(Global), // alloc: a test's model
-            done: HashSet::new_in(Global), // alloc: a test's model
+            ran: HashSet::new_in(Global),   // alloc: a test's model
+            done: HashSet::new_in(Global),  // alloc: a test's model
         }
     }
 
@@ -123,12 +123,17 @@ impl Sim {
     }
 
     fn running(&self) -> Vec<u32> {
-        (0..self.cores()).filter_map(|core| self.sched.running(CoreId(core))).map(|job| job.0).collect()
+        (0..self.cores())
+            .filter_map(|core| self.sched.running(CoreId(core)))
+            .map(|job| job.0)
+            .collect()
     }
 
     fn big_parked(&self) -> bool {
-        (0..self.cores())
-            .any(|core| self.sched.cores().is_big(core) && self.sched.core_state(CoreId(core)) == CoreState::Parked)
+        (0..self.cores()).any(|core| {
+            self.sched.cores().is_big(core)
+                && self.sched.core_state(CoreId(core)) == CoreState::Parked
+        })
     }
 
     /// Takes the decisions, checks them and the scheduler's structures.
@@ -143,13 +148,18 @@ impl Sim {
                 }
                 Decision::Wake { core, job } => {
                     assert_ne!(self.sched.job_state(job), JobState::Done, "{decision:?}");
-                    if self.sched.core_state(core) == CoreState::Woken && !self.woken.contains(&core.0) {
+                    if self.sched.core_state(core) == CoreState::Woken
+                        && !self.woken.contains(&core.0)
+                    {
                         self.woken.push(core.0);
                     }
                 }
                 Decision::Yield { core, job } => {
                     assert_eq!(self.sched.running(core), Some(job), "{decision:?}");
-                    assert!(self.sched.is_critical(job) && !self.sched.cores().is_big(core.0), "{decision:?}");
+                    assert!(
+                        self.sched.is_critical(job) && !self.sched.cores().is_big(core.0),
+                        "{decision:?}"
+                    );
                     self.flags.insert(core.0);
                 }
             }
@@ -157,7 +167,9 @@ impl Sim {
         self.sched.audit();
         let steals = std::mem::take(self.sched.steals());
         for steal in &steals {
-            if self.sched.cores().info(steal.thief).node != self.sched.cores().info(steal.victim).node {
+            if self.sched.cores().info(steal.thief).node
+                != self.sched.cores().info(steal.victim).node
+            {
                 assert_eq!(
                     steal.on_thief_node, 0,
                     "core {} stole across nodes from core {} while its node had work",
@@ -172,7 +184,11 @@ impl Sim {
             for core in 0..self.cores() {
                 if let Some(job) = self.sched.running(CoreId(core)) {
                     if self.sched.is_critical(job) && !self.sched.cores().is_big(core) {
-                        assert!(self.flags.contains(&core), "critical job {} left on small core {core}", job.0);
+                        assert!(
+                            self.flags.contains(&core),
+                            "critical job {} left on small core {core}",
+                            job.0
+                        );
                     }
                 }
             }
@@ -207,9 +223,14 @@ impl Sim {
         match wait {
             ModelWait::Job(job) => vec![job],
             ModelWait::Key(k) => self.flights.get(&k).copied().flatten().into_iter().collect(),
-            ModelWait::Counter(c) => {
-                self.counted.get(&c).into_iter().flatten().copied().filter(|it| !self.done.contains(it)).collect()
-            }
+            ModelWait::Counter(c) => self
+                .counted
+                .get(&c)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|it| !self.done.contains(it))
+                .collect(),
             ModelWait::Until(_) => Vec::new(),
         }
     }
@@ -257,14 +278,20 @@ impl Sim {
                 self.waits.insert(job, wait);
             }
             Err(cycle) => {
-                assert!(closes, "job {job}'s wait {wait:?} was refused as {cycle:?}, closing no cycle");
+                assert!(
+                    closes,
+                    "job {job}'s wait {wait:?} was refused as {cycle:?}, closing no cycle"
+                );
                 assert_eq!(self.mode, Mode::Any, "a DAG of waits has no cycle: {cycle}");
                 let jobs: Vec<u32> = cycle.jobs.iter().map(|it| it.0).collect();
                 assert_eq!(jobs[0], job, "{cycle}");
                 for (at, &from) in jobs.iter().enumerate() {
                     let to = jobs[(at + 1) % jobs.len()];
                     let edge = if at == 0 { wait } else { self.waits[&from] };
-                    assert!(self.resolve(edge).contains(&to), "{cycle}: job {from} does not wait for job {to}");
+                    assert!(
+                        self.resolve(edge).contains(&to),
+                        "{cycle}: job {from} does not wait for job {to}"
+                    );
                 }
             }
         }
@@ -278,7 +305,8 @@ impl Sim {
     fn done(&mut self, job: u32) {
         self.sched.done(JobId(job));
         self.done.insert(job);
-        let claimed: Vec<u32> = self.flights.iter().filter(|it| *it.1 == Some(job)).map(|it| *it.0).collect();
+        let claimed: Vec<u32> =
+            self.flights.iter().filter(|it| *it.1 == Some(job)).map(|it| *it.0).collect();
         for k in &claimed {
             self.flights.remove(k);
         }
@@ -338,7 +366,9 @@ impl Sim {
         if !self.flags.remove(&core) {
             return;
         }
-        let expect = self.big_parked() && self.sched.is_critical(JobId(job)) && !self.sched.cores().is_big(core);
+        let expect = self.big_parked()
+            && self.sched.is_critical(JobId(job))
+            && !self.sched.cores().is_big(core);
         let moved = self.sched.yielded(JobId(job));
         assert_eq!(moved == Yielded::Moved, expect, "job {job} on core {core}");
         if moved == Yielded::Moved {
@@ -358,14 +388,17 @@ impl Sim {
                     .then_some(ModelWait::Job(other))
             }
             1 => {
-                let flights: Vec<(u32, Option<u32>)> = self.flights.iter().map(|it| (*it.0, *it.1)).collect();
+                let flights: Vec<(u32, Option<u32>)> =
+                    self.flights.iter().map(|it| (*it.0, *it.1)).collect();
                 if flights.is_empty() {
                     return None;
                 }
                 let (k, by) = flights[below(tc, flights.len())];
                 let ok = match by {
                     None => true,
-                    Some(by) => self.mode == Mode::Any || self.rank[by as usize] > self.rank[job as usize],
+                    Some(by) => {
+                        self.mode == Mode::Any || self.rank[by as usize] > self.rank[job as usize]
+                    }
                 };
                 ok.then_some(ModelWait::Key(k))
             }
@@ -383,8 +416,12 @@ impl Sim {
             }
             1 if !running.is_empty() && self.jobs < MAX_SIM_JOBS => {
                 let parent = running[below(tc, running.len())];
-                let how = Spawn::child(JobId(parent)).hint(self.hint(tc)).critical(tc.draw(gs::booleans()));
-                let rank = self.rank[parent as usize] + 1 + tc.draw(gs::integers::<u64>().max_value(1 << 20));
+                let how = Spawn::child(JobId(parent))
+                    .hint(self.hint(tc))
+                    .critical(tc.draw(gs::booleans()));
+                let rank = self.rank[parent as usize]
+                    + 1
+                    + tc.draw(gs::integers::<u64>().max_value(1 << 20));
                 self.spawn(how, rank);
             }
             // A parallel map: the job spawns its items on one counter and waits on it once;
@@ -397,9 +434,14 @@ impl Sim {
                 let counter = self.sched.counter();
                 let count = 1 + below(tc, 6);
                 for _ in 0..count {
-                    let rank = self.rank[parent as usize] + 1 + tc.draw(gs::integers::<u64>().max_value(1 << 20));
+                    let rank = self.rank[parent as usize]
+                        + 1
+                        + tc.draw(gs::integers::<u64>().max_value(1 << 20));
                     let critical = tc.draw(gs::booleans());
-                    self.spawn(Spawn::child(JobId(parent)).critical(critical).counted(counter), rank);
+                    self.spawn(
+                        Spawn::child(JobId(parent)).critical(critical).counted(counter),
+                        rank,
+                    );
                 }
                 self.maps.insert(parent, counter);
                 self.join(parent);
@@ -497,11 +539,20 @@ impl Sim {
         // With cycles refused, the waits that stand are a DAG in either mode.
         for job in 0..self.jobs {
             let state = self.sched.job_state(JobId(job));
-            assert_eq!(state, JobState::Done, "job {job} never ended (waits: {:?})", self.waits.get(&job));
+            assert_eq!(
+                state,
+                JobState::Done,
+                "job {job} never ended (waits: {:?})",
+                self.waits.get(&job)
+            );
             assert!(self.ran.contains(&job), "job {job} ended without a run");
         }
         for core in 0..self.cores() {
-            assert_eq!(self.sched.core_state(CoreId(core)), CoreState::Parked, "core {core} at the end");
+            assert_eq!(
+                self.sched.core_state(CoreId(core)),
+                CoreState::Parked,
+                "core {core} at the end"
+            );
         }
     }
 }
@@ -530,7 +581,9 @@ fn every_runnable_job_runs(tc: TestCase) {
 fn no_deadlock_when_waits_form_a_dag(tc: TestCase) {
     let cores = 1 + below(&tc, 3);
     let mut sim = Sim::new(
-        (0..cores as u32).map(|core| CoreInfo { smt: core, l3: 0, node: 0, socket: 0, capacity: 1024 }).collect(),
+        (0..cores as u32)
+            .map(|core| CoreInfo { smt: core, l3: 0, node: 0, socket: 0, capacity: 1024 })
+            .collect(),
         &Distances::one_node(),
         Mode::Dag,
     );
@@ -568,7 +621,10 @@ fn a_critical_job_is_never_left_on_a_slow_core_while_a_fast_one_idles(tc: TestCa
     let fast = 1 + below(&tc, 2);
     let slow = 1 + below(&tc, 3);
     let cores = Cores::classes(&[(1024, fast), (512, slow)]).unwrap();
-    let mut sim = Sim { sched: Sched::new(cores, 16), ..Sim::new(vec![flat_core(0)], &Distances::one_node(), Mode::Dag) };
+    let mut sim = Sim {
+        sched: Sched::new(cores, 16),
+        ..Sim::new(vec![flat_core(0)], &Distances::one_node(), Mode::Dag)
+    };
     let steps = 1 + below(&tc, 300);
     for _ in 0..steps {
         sim.step(&tc);
@@ -585,7 +641,13 @@ fn flat_core(core: u32) -> CoreInfo {
 fn two_nodes() -> Cores {
     let mut info = Vec::new();
     for core in 0..8u32 {
-        info.push(CoreInfo { smt: core / 2, l3: core / 4, node: core / 4, socket: core / 4, capacity: 1024 });
+        info.push(CoreInfo {
+            smt: core / 2,
+            l3: core / 4,
+            node: core / 4,
+            socket: core / 4,
+            capacity: 1024,
+        });
     }
     Cores::new(info, &Distances::new(2, vec![10, 20, 20, 10]).unwrap()).unwrap()
 }
@@ -686,7 +748,9 @@ fn an_idle_core_steals_its_sibling_then_its_l3_then_its_node_then_anywhere() {
 /// 3 nearer node 0 than node 2 is. Core 0 steals by the table, never by id.
 #[test]
 fn other_nodes_are_stolen_from_nearest_by_the_distance_table() {
-    let info = (0..4).map(|node| CoreInfo { smt: node, l3: node, node, socket: node / 2, capacity: 1024 }).collect();
+    let info = (0..4)
+        .map(|node| CoreInfo { smt: node, l3: node, node, socket: node / 2, capacity: 1024 })
+        .collect();
     #[rustfmt::skip]
     let table = vec![
         10, 12, 30, 20,
@@ -811,7 +875,10 @@ fn a_cycle_names_its_jobs_in_wait_order() {
     assert_eq!(sched.suspended(JobId(1), Wait::Job(JobId(2))), Ok(Suspend::Waiting));
     let cycle = sched.suspended(JobId(2), Wait::Job(JobId(0))).unwrap_err();
     assert_eq!(cycle.jobs, [JobId(2), JobId(0), JobId(1)]);
-    assert_eq!(cycle.to_string(), "a wait would close a cycle of waits: job 2 -> job 0 -> job 1 -> job 2");
+    assert_eq!(
+        cycle.to_string(),
+        "a wait would close a cycle of waits: job 2 -> job 0 -> job 1 -> job 2"
+    );
     assert_eq!(sched.suspended(JobId(2), Wait::Job(JobId(2))).unwrap_err().jobs, [JobId(2)]);
     // Refused, job 2 runs on, and nothing changed.
     assert_eq!(sched.job_state(JobId(2)), JobState::Running);
@@ -831,24 +898,36 @@ fn a_give_way_is_kept_by_its_job_until_it_ends() {
     assert!(sched.claim(a, Some(JobId(0))));
     assert!(sched.claim(b, Some(JobId(1))));
     assert_eq!(sched.suspended(JobId(0), Wait::Key(b)), Ok(Suspend::Waiting));
-    let cycle = sched.suspended(JobId(1), Wait::Key(a)).expect_err("job 1's wait for a closes the cycle");
+    let cycle =
+        sched.suspended(JobId(1), Wait::Key(a)).expect_err("job 1's wait for a closes the cycle");
     assert_eq!(cycle.jobs, [JobId(1), JobId(0)]);
     let world = &mut sched.world;
     let owner = world.observed(JobId(0));
     world.gave_way(JobId(1), a, "Chain(a)".into(), a, cycle.jobs[1]);
     let kept = world.give_way_of(JobId(1)).expect("job 1's give-way").clone();
-    assert_eq!((kept.asked, &*kept.named, kept.flight, kept.to, kept.owner, kept.streak), (a, "Chain(a)", a, JobId(0), owner, 1));
+    assert_eq!(
+        (kept.asked, &*kept.named, kept.flight, kept.to, kept.owner, kept.streak),
+        (a, "Chain(a)", a, JobId(0), owner, 1)
+    );
     assert_eq!(world.give_way_of(JobId(0)), None, "job 0 gave way to nothing");
     let mut said = String::new();
     kept.name_wait(&mut said);
     assert_eq!(said, "a retry after giving way: the run of Chain(a) by job 0");
     let c = key(3);
     world.gave_way(JobId(1), c, "Chain(c)".into(), c, JobId(0));
-    assert_eq!(world.give_way_of(JobId(1)).map(|it| (it.flight, it.streak)), Some((c, 2)), "again, to another run");
+    assert_eq!(
+        world.give_way_of(JobId(1)).map(|it| (it.flight, it.streak)),
+        Some((c, 2)),
+        "again, to another run"
+    );
     world.set_give_way_aside(JobId(1));
     assert_eq!(world.give_way_of(JobId(1)).map(|it| it.streak), Some(1), "a loop set one aside");
     world.gave_way(JobId(1), a, "Chain(a)".into(), a, JobId(0));
-    assert_eq!(world.give_way_of(JobId(1)).map(|it| it.streak), Some(2), "the streak goes on after the set-aside");
+    assert_eq!(
+        world.give_way_of(JobId(1)).map(|it| it.streak),
+        Some(2),
+        "the streak goes on after the set-aside"
+    );
     world.forget_give_way(JobId(1));
     assert_eq!(world.give_way_of(JobId(1)), None, "its retry's wait ended");
     world.gave_way(JobId(1), a, "Chain(a)".into(), a, JobId(0));
@@ -1032,12 +1111,18 @@ fn a_shape_that_is_not_nested_is_refused() {
         Cores::new(vec![core(0, 0, 0, 0), core(1, 1, 0, 1)], &two).err(),
         Some(ShapeError::NodeSplit { core: 0, other: 1 })
     );
-    assert_eq!(Cores::new(vec![core(0, 0, 2, 0)], &two).err(), Some(ShapeError::NodeOutOfTable { core: 0, node: 2 }));
+    assert_eq!(
+        Cores::new(vec![core(0, 0, 2, 0)], &two).err(),
+        Some(ShapeError::NodeOutOfTable { core: 0, node: 2 })
+    );
     assert_eq!(
         Cores::new(vec![CoreInfo { capacity: 0, ..core(0, 0, 0, 0) }], &one).err(),
         Some(ShapeError::NoCapacity { core: 0 })
     );
-    assert_eq!(Distances::new(2, vec![10, 20, 20]).err(), Some(ShapeError::Distances { nodes: 2, len: 3 }));
+    assert_eq!(
+        Distances::new(2, vec![10, 20, 20]).err(),
+        Some(ShapeError::Distances { nodes: 2, len: 3 })
+    );
     assert_eq!(Cores::new(Vec::new(), &one).err(), Some(ShapeError::NoCores));
 }
 
@@ -1092,7 +1177,10 @@ fn a_warm_scheduler_allocates_nothing() {
                     CoreState::Busy => {
                         let job = sched.running(CoreId(core)).unwrap();
                         if job == JobId(3) && !dropped {
-                            assert_eq!(sched.suspended(job, Wait::Counter(counter)), Ok(Suspend::Ready));
+                            assert_eq!(
+                                sched.suspended(job, Wait::Counter(counter)),
+                                Ok(Suspend::Ready)
+                            );
                             sched.drop_counter(counter);
                             dropped = true;
                         }
@@ -1113,11 +1201,15 @@ fn a_warm_scheduler_allocates_nothing() {
     let mut sched = Sched::new(two_nodes(), 64);
     round(&mut sched, 0);
     round(&mut sched, 100);
-    blaze_alloc_count::assert_at_most(0, "a warm scheduler's spawns, runs, waits and timers", || {
-        for at in 0..200u64 {
-            round(&mut sched, 200 + at * 20);
-        }
-    });
+    blaze_alloc_count::assert_at_most(
+        0,
+        "a warm scheduler's spawns, runs, waits and timers",
+        || {
+            for at in 0..200u64 {
+                round(&mut sched, 200 + at * 20);
+            }
+        },
+    );
     sched.audit();
 }
 

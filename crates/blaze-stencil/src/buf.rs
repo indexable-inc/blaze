@@ -229,7 +229,8 @@ impl<'f> Buf<'f> {
         if let Some(reach) = self.tracked(form)
             && !reaches(&self.labels, &fixup)
         {
-            let deadline = (i64::from(at) - addend + reach.ahead).clamp(0, i64::from(NEVER - 1)) as u32;
+            let deadline =
+                (i64::from(at) - addend + reach.ahead).clamp(0, i64::from(NEVER - 1)) as u32;
             self.near.push(Near { fixup: index, deadline });
             self.due = self.due.min(deadline);
         }
@@ -286,7 +287,11 @@ impl<'f> Buf<'f> {
             return Ok(());
         }
         let Some(island) = island else {
-            let first = self.near.iter().min_by_key(|it| it.deadline).map(|it| self.fixups[it.fixup as usize]);
+            let first = self
+                .near
+                .iter()
+                .min_by_key(|it| it.deadline)
+                .map(|it| self.fixups[it.fixup as usize]);
             // alloc: the error's message, once per failed compile.
             return Err(Error::new(format!(
                 "at {:#x}, {} fields are about to be out of reach ({}) and the library has no \
@@ -402,7 +407,8 @@ impl<'f> Buf<'f> {
             let fixup = self.fixups[served[first] as usize];
             let same = served[first..].iter().take_while(|&&it| {
                 let it = &self.fixups[it as usize];
-                (it.label, it.form.reach().map(|reach| reach.far)) == (fixup.label, fixup.form.reach().map(|reach| reach.far))
+                (it.label, it.form.reach().map(|reach| reach.far))
+                    == (fixup.label, fixup.form.reach().map(|reach| reach.far))
             });
             let end = first + same.count();
             match fixup.form.reach().map(|reach| reach.far) {
@@ -410,7 +416,10 @@ impl<'f> Buf<'f> {
                 Some(Far::Place) => self.place(island, &fixup, &mut data)?,
                 Some(Far::Never) | None => {
                     // alloc: the error's message, once per failed compile.
-                    return Err(Error::new(format!("{}, and nothing stands in for its target", describe(&fixup))));
+                    return Err(Error::new(format!(
+                        "{}, and nothing stands in for its target",
+                        describe(&fixup)
+                    )));
                 }
             }
             first = end;
@@ -432,7 +441,9 @@ impl<'f> Buf<'f> {
     /// which they go to instead.
     fn veneer(&mut self, island: &Island<'_>, served: &[u32]) -> Result<(), Error> {
         let to = self.fixups[served[0] as usize].label;
-        if let Some(fixup) = served.iter().map(|&it| self.fixups[it as usize]).find(|it| it.addend != 0) {
+        if let Some(fixup) =
+            served.iter().map(|&it| self.fixups[it as usize]).find(|it| it.addend != 0)
+        {
             // alloc: the error's message, once per failed compile.
             return Err(Error::new(format!(
                 "{}: its addend is {}, so a veneer it went to would be entered off its start",
@@ -562,7 +573,8 @@ fn value(fixup: &Fixup, target: u32) -> i64 {
 
 /// Whether `fixup`'s label is bound and its field reaches it.
 fn reaches(labels: &[u32], fixup: &Fixup) -> bool {
-    offset(labels, fixup.label).is_some_and(|target| enc::check(fixup.form, value(fixup, target)).is_ok())
+    offset(labels, fixup.label)
+        .is_some_and(|target| enc::check(fixup.form, value(fixup, target)).is_ok())
 }
 
 /// A fixup, as an error names it.

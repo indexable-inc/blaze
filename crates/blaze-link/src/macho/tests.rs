@@ -39,7 +39,11 @@ fn output_at(arch: Arch, kind: OutputKind, minimum: u32) -> Output {
         exec_log: false,
         sanitize: blaze_codegen::settings::Sanitize::default(),
         rpaths: Vec::new(),
-        triple: match arch { Arch::X86_64 => "x86_64-apple-darwin", _ => "aarch64-apple-darwin" }.into(),
+        triple: match arch {
+            Arch::X86_64 => "x86_64-apple-darwin",
+            _ => "aarch64-apple-darwin",
+        }
+        .into(),
     }
 }
 
@@ -235,12 +239,7 @@ fn spans() -> Vec<linkedit::Span> {
             end: 0x1_0000_8000,
             writable: false,
         },
-        linkedit::Span {
-            name: "__DATA",
-            start: 0x1_0000_8000,
-            end: 0x1_0001_0000,
-            writable: true,
-        },
+        linkedit::Span { name: "__DATA", start: 0x1_0000_8000, end: 0x1_0001_0000, writable: true },
     ]
 }
 
@@ -260,7 +259,10 @@ fn encode_rebases(addrs: &[u64], spans: &[linkedit::Span]) -> Result<Vec<u8>, St
     appended(|out| linkedit::rebases(addrs, spans, out))
 }
 
-fn encode_binds(binds: &mut [linkedit::Bind<'_>], spans: &[linkedit::Span]) -> Result<Vec<u8>, String> {
+fn encode_binds(
+    binds: &mut [linkedit::Bind<'_>],
+    spans: &[linkedit::Span],
+) -> Result<Vec<u8>, String> {
     appended(|out| linkedit::binds(binds, spans, out))
 }
 
@@ -283,7 +285,16 @@ fn names_cross_the_edge_both_ways() {
     assert!(core_name(&[b'_', 0xff]).is_err());
     let mut names = crate::model::Names::default();
     let (fits, long) = ("l".repeat(255), "l".repeat(256));
-    for raw in [&b"_main"[..], b"__mh_execute_header", b"section$start$__DATA$__x", b"_", b"x", b"", fits.as_bytes(), long.as_bytes()] {
+    for raw in [
+        &b"_main"[..],
+        b"__mh_execute_header",
+        b"section$start$__DATA$__x",
+        b"_",
+        b"x",
+        b"",
+        fits.as_bytes(),
+        long.as_bytes(),
+    ] {
         let name = super::push_core_name(&mut names, raw).unwrap();
         assert_eq!(names.at(name), core_name(raw).unwrap());
     }
@@ -320,14 +331,8 @@ fn trie_finds_every_export() {
 
 #[test]
 fn rebases_in_runs() {
-    let addrs = [
-        0x1_0000_8000,
-        0x1_0000_8008,
-        0x1_0000_8010,
-        0x1_0000_9000,
-        0x1_0000_a000,
-        0x1_0000_a008,
-    ];
+    let addrs =
+        [0x1_0000_8000, 0x1_0000_8008, 0x1_0000_8010, 0x1_0000_9000, 0x1_0000_a000, 0x1_0000_a008];
     let mut many: Vec<u64> = (0..40).map(|it| 0x1_0000_c000 + it * 8).collect();
     many.extend(addrs);
     let stream = encode_rebases(&many, &spans()).unwrap();
@@ -542,7 +547,8 @@ fn a_big_image_keeps_its_reach_with_patch_room() {
 
     let regions = lay_out(GIB / 2);
     let at = |class: Class| regions.iter().find(|it| it.class == class).unwrap();
-    let (patch, code, eh_frame, got) = (at(Class::Patch), at(Class::Text), at(Class::EhFrame), at(Class::Got));
+    let (patch, code, eh_frame, got) =
+        (at(Class::Patch), at(Class::Text), at(Class::EhFrame), at(Class::Got));
     assert_eq!(patch.capacity, GIB, "the room is as large as the code, at most 1 GiB");
     assert_eq!(patch.addr, plan.base + plan.headers, "the room is first, after the headers");
     assert!(patch.addr + patch.capacity <= code.addr, "and before the code");
@@ -571,12 +577,20 @@ fn a_big_image_keeps_its_reach_with_patch_room() {
     };
     let mut bytes = [0u8; 8];
     apply(pointers.apply(), &ctx, &mut bytes).unwrap();
-    assert_eq!(field.wrapping_add(u64::from_le_bytes(bytes)), function, "the 8-byte field reads back");
-    assert!(apply(Pointers::Sdata4.apply(), &ctx, &mut bytes[..4]).is_err(), "a 4-byte field doesn't reach");
+    assert_eq!(
+        field.wrapping_add(u64::from_le_bytes(bytes)),
+        function,
+        "the 8-byte field reads back"
+    );
+    assert!(
+        apply(Pointers::Sdata4.apply(), &ctx, &mut bytes[..4]).is_err(),
+        "a 4-byte field doesn't reach"
+    );
 
     // 2 GiB of read-only data: `__const` ends past 4 GiB from the base.
     let big = lay_out(2 * GIB);
-    let (region, end) = past_window(big.iter(), plan.base, super::WINDOW.bytes).expect("past the window");
+    let (region, end) =
+        past_window(big.iter(), plan.base, super::WINDOW.bytes).expect("past the window");
     assert_eq!(region.class, Class::Rodata);
     assert!(end - plan.base > super::WINDOW.bytes);
     assert_eq!(writer.section_name(&region.class), "__TEXT,__const");
@@ -586,7 +600,10 @@ fn a_big_image_keeps_its_reach_with_patch_room() {
     let mut zero = lay_out(GIB / 2);
     let bss = zero.iter_mut().find(|it| it.class == Class::Bss).unwrap();
     (bss.size, bss.capacity) = (5 * GIB, 5 * GIB);
-    assert!(past_window(zero.iter(), plan.base, super::WINDOW.bytes).is_none(), "zero-fill is not counted");
+    assert!(
+        past_window(zero.iter(), plan.base, super::WINDOW.bytes).is_none(),
+        "zero-fill is not counted"
+    );
 
     // An incremental stage's refusal is relinked from scratch; a full link's is final.
     let refusal = |scratch| crate::LinkError {
@@ -620,19 +637,38 @@ fn link_sections_and_specials() {
     let section = |end| Some(Special::Section { name: "__DATA,__linkme_X".into(), end });
     assert_eq!(writer.special("\x01section$start$__DATA$__linkme_X"), section(false));
     assert_eq!(writer.special("\x01section$end$__DATA$__linkme_X"), section(true));
-    assert_eq!(writer.section("__DATA,__mod_init_func,mod_init_funcs", false, false, false).unwrap().0, Class::InitArray);
-    assert_eq!(writer.section("__TEXT,__text,regular,pure_instructions", false, true, false).unwrap().0, Class::Text);
+    assert_eq!(
+        writer.section("__DATA,__mod_init_func,mod_init_funcs", false, false, false).unwrap().0,
+        Class::InitArray
+    );
+    assert_eq!(
+        writer.section("__TEXT,__text,regular,pure_instructions", false, true, false).unwrap().0,
+        Class::Text
+    );
     assert_eq!(writer.section("__DATA,__data", true, false, false).unwrap().0, Class::Data);
     assert_eq!(writer.section("__DATA,__thread_data", true, false, true).unwrap().0, Class::Tdata);
-    assert_eq!(writer.section("__DATA,__thread_bss,thread_local_zerofill", true, false, true).unwrap().0, Class::Tbss);
-    for bad in ["nocomma", "__FOO,__bar", "__DATA,__x,bogus", "__DATA,__x,regular,bogus", "__DATA,__seventeen_bytes_", "__DATA,__nl,non_lazy_symbol_pointers"] {
+    assert_eq!(
+        writer.section("__DATA,__thread_bss,thread_local_zerofill", true, false, true).unwrap().0,
+        Class::Tbss
+    );
+    for bad in [
+        "nocomma",
+        "__FOO,__bar",
+        "__DATA,__x,bogus",
+        "__DATA,__x,regular,bogus",
+        "__DATA,__seventeen_bytes_",
+        "__DATA,__nl,non_lazy_symbol_pointers",
+    ] {
         assert!(writer.section(bad, true, false, false).is_err(), "{bad}");
     }
     assert_eq!(writer.special("_mh_execute_header"), Some(Special::ImageBase));
     assert_eq!(writer.special("_mh_dylib_header"), None);
     assert_eq!(writer.special("__dso_handle"), Some(Special::ImageBase));
     assert_eq!(writer.special("__blaze_live"), Some(Special::LiveDescriptor));
-    assert_eq!(writer.special("\x01section$start$__DATA$__mod_init_func"), Some(Special::Start(Class::InitArray)));
+    assert_eq!(
+        writer.special("\x01section$start$__DATA$__mod_init_func"),
+        Some(Special::Start(Class::InitArray))
+    );
     assert_eq!(writer.special("\x01segment$start$__TEXT"), Some(Special::ImageBase));
     let regions = hello(executable(Arch::Aarch64)).regions;
     let segment = |name: &str| match writer.special(name) {
@@ -655,14 +691,36 @@ fn link_sections_and_specials() {
     assert_eq!(writer.special("malloc"), None);
     assert_eq!(writer.special("\x01section$start$__NOPE$__x"), None);
 
-    assert_eq!(super::classify("__LD", "__compact_unwind", 0x0200_0000).unwrap(), SectionKind::Unwind(super::compact_unwind()));
+    assert_eq!(
+        super::classify("__LD", "__compact_unwind", 0x0200_0000).unwrap(),
+        SectionKind::Unwind(super::compact_unwind())
+    );
     assert_eq!(super::classify("__TEXT", "__eh_frame", 0x6800_000b).unwrap(), SectionKind::EhFrame);
-    assert_eq!(super::classify("__DWARF", "__debug_info", 0x0200_0000).unwrap(), SectionKind::Dropped);
-    assert_eq!(super::classify("__TEXT", "__cstring", macho::S_CSTRING_LITERALS.to_flags().0).unwrap(), SectionKind::Alloc(Class::Rodata, u32::MAX));
-    assert_eq!(super::classify("__DATA", "__common", macho::S_ZEROFILL.to_flags().0).unwrap(), SectionKind::Alloc(Class::Bss, u32::MAX));
-    assert_eq!(super::classify("__DATA", "__thread_vars", macho::S_THREAD_LOCAL_VARIABLES.to_flags().0).unwrap(), SectionKind::Alloc(Class::ThreadVars, u32::MAX));
-    assert_eq!(super::classify("__DATA", "__const", macho::S_REGULAR.to_flags().0).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
-    assert_eq!(super::classify("__DATA_CONST", "__const", macho::S_REGULAR.to_flags().0).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
+    assert_eq!(
+        super::classify("__DWARF", "__debug_info", 0x0200_0000).unwrap(),
+        SectionKind::Dropped
+    );
+    assert_eq!(
+        super::classify("__TEXT", "__cstring", macho::S_CSTRING_LITERALS.to_flags().0).unwrap(),
+        SectionKind::Alloc(Class::Rodata, u32::MAX)
+    );
+    assert_eq!(
+        super::classify("__DATA", "__common", macho::S_ZEROFILL.to_flags().0).unwrap(),
+        SectionKind::Alloc(Class::Bss, u32::MAX)
+    );
+    assert_eq!(
+        super::classify("__DATA", "__thread_vars", macho::S_THREAD_LOCAL_VARIABLES.to_flags().0)
+            .unwrap(),
+        SectionKind::Alloc(Class::ThreadVars, u32::MAX)
+    );
+    assert_eq!(
+        super::classify("__DATA", "__const", macho::S_REGULAR.to_flags().0).unwrap(),
+        SectionKind::Alloc(Class::RelRo, u32::MAX)
+    );
+    assert_eq!(
+        super::classify("__DATA_CONST", "__const", macho::S_REGULAR.to_flags().0).unwrap(),
+        SectionKind::Alloc(Class::RelRo, u32::MAX)
+    );
 }
 
 /// What a test image is made of, owned, so a `Placed` can borrow it.
@@ -729,7 +787,14 @@ const DATA: u64 = BASE + 0xc000;
 const VARS: u64 = DATA + 16;
 
 fn import(name: &str, library: Option<u32>, weak: bool) -> Import {
-    Import { name: name.to_owned(), library, version: None, kind: SymbolKind::Function, weak, wasm: None }
+    Import {
+        name: name.to_owned(),
+        library,
+        version: None,
+        kind: SymbolKind::Function,
+        weak,
+        wasm: None,
+    }
 }
 
 /// An arm64 executable: code, a GOT of an import and a local, an initializer, data with a
@@ -838,7 +903,8 @@ fn name16(bytes: &[u8; 16]) -> String {
 fn read(file: &[u8]) -> Read {
     use object::read::macho::LoadCommandVariant as V;
     let header = macho::MachHeader64::<LE>::parse(file, 0).expect("a Mach-O header");
-    let mut read = Read { flags: header.flags(LE).0, filetype: header.filetype(LE).0, ..Read::default() };
+    let mut read =
+        Read { flags: header.flags(LE).0, filetype: header.filetype(LE).0, ..Read::default() };
     let mut commands = header.load_commands(LE, file, 0).unwrap();
     while let Some(command) = commands.next().unwrap() {
         match command.variant().unwrap() {
@@ -874,7 +940,8 @@ fn read(file: &[u8]) -> Read {
             }
             V::Uuid(uuid) => read.uuid = Some(uuid.uuid),
             V::BuildVersion(build, _) => {
-                read.build = Some((build.platform.get(LE).0, build.minos.get(LE).0, build.sdk.get(LE).0))
+                read.build =
+                    Some((build.platform.get(LE).0, build.minos.get(LE).0, build.sdk.get(LE).0))
             }
             V::EntryPoint(entry) => read.entry = Some(entry.entryoff.get(LE)),
             V::DyldInfo(info) => {
@@ -953,7 +1020,12 @@ fn executable_reads_back() {
     let read = read(&file);
 
     assert_eq!(read.filetype, macho::MH_EXECUTE.0);
-    for flag in [macho::MH_PIE.0, macho::MH_DYLDLINK.0, macho::MH_TWOLEVEL.0, macho::MH_HAS_TLV_DESCRIPTORS.0] {
+    for flag in [
+        macho::MH_PIE.0,
+        macho::MH_DYLDLINK.0,
+        macho::MH_TWOLEVEL.0,
+        macho::MH_HAS_TLV_DESCRIPTORS.0,
+    ] {
         assert_ne!(read.flags & flag, 0, "{flag:#x}");
     }
     let header = macho::MachHeader64::<LE>::parse(&*file, 0).unwrap();
@@ -974,9 +1046,8 @@ fn executable_reads_back() {
     assert_eq!(linkedit.3 % 0x4000, 0);
     assert_eq!(linkedit.3 + linkedit.4, file.len() as u64);
 
-    let sections: Vec<(&str, &str, u64, u64)> = (read.sections.iter())
-        .map(|it| (it.0.as_str(), it.1.as_str(), it.2, it.3))
-        .collect();
+    let sections: Vec<(&str, &str, u64, u64)> =
+        (read.sections.iter()).map(|it| (it.0.as_str(), it.1.as_str(), it.2, it.3)).collect();
     assert_eq!(
         sections[..9],
         [
@@ -1006,12 +1077,13 @@ fn executable_reads_back() {
             macho::S_ZEROFILL.to_flags().0,
         ]
     );
-    assert_eq!(&sections[9..], [("__DWARF", "__debug_line", linkedit.1 - 0x4000, 4), (
-        "__DWARF",
-        "__debug_str_offs",
-        linkedit.1 - 0x4000 + 4,
-        8
-    )]);
+    assert_eq!(
+        &sections[9..],
+        [
+            ("__DWARF", "__debug_line", linkedit.1 - 0x4000, 4),
+            ("__DWARF", "__debug_str_offs", linkedit.1 - 0x4000 + 4, 8)
+        ]
+    );
     // Region bytes are where the sections say.
     assert_eq!(&file[0x4000..0x4008], &parts.contents[0][..]);
     assert_eq!(&file[(DATA - BASE) as usize..][..8], &TEXT.to_le_bytes());
@@ -1029,11 +1101,14 @@ fn executable_reads_back() {
     rebases.sort();
     assert_eq!(rebases, [GOT + 8, INIT, DATA]);
     let binds = decode_binds(range(&file, info[1]), &segments);
-    assert_eq!(binds, [
-        (GOT, 1, b"_free".to_vec(), 0, 0),
-        (DATA + 8, -2, b"_maybe".to_vec(), macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0, 0),
-        (VARS, 1, b"__tlv_bootstrap".to_vec(), 0, 0),
-    ]);
+    assert_eq!(
+        binds,
+        [
+            (GOT, 1, b"_free".to_vec(), 0, 0),
+            (DATA + 8, -2, b"_maybe".to_vec(), macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0, 0),
+            (VARS, 1, b"__tlv_bootstrap".to_vec(), 0, 0),
+        ]
+    );
     assert_eq!((info[2].1, info[3].1), (0, 0));
     let trie = range(&file, info[4]);
     assert_eq!(trie_lookup(trie, b"_main"), Some(0x4000));
@@ -1057,7 +1132,10 @@ fn executable_reads_back() {
 
     let starts = range(&file, read.starts.unwrap());
     let mut at = 0;
-    assert_eq!((uleb(starts, &mut at), uleb(starts, &mut at), uleb(starts, &mut at)), (0x4000, 4, 0));
+    assert_eq!(
+        (uleb(starts, &mut at), uleb(starts, &mut at), uleb(starts, &mut at)),
+        (0x4000, 4, 0)
+    );
     assert_eq!(read.in_code.unwrap().1, 0);
 
     let (signed, len) = read.signature.unwrap();
@@ -1076,7 +1154,8 @@ fn executable_reads_back() {
 
 #[test]
 fn a_dylib_reads_back() {
-    let shared = OutputKind::Shared { name: "@rpath/libhello.dylib".to_owned(), exports: Vec::new() };
+    let shared =
+        OutputKind::Shared { name: "@rpath/libhello.dylib".to_owned(), exports: Vec::new() };
     let mut parts = hello(output(Arch::X86_64, shared));
     let delta = BASE;
     for region in &mut parts.regions {
@@ -1127,10 +1206,16 @@ fn weak_dylib_when_every_import_is_weak() {
     parts.imports[0].weak = true;
     let writer = super::writer(&parts.output).unwrap();
     let file = written(&writer, &parts.placed(&parts.slices()));
-    assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_DYLIB.0, "/usr/lib/libSystem.B.dylib".to_owned())]);
+    assert_eq!(
+        read(&file).dylibs,
+        [(macho::LC_LOAD_DYLIB.0, "/usr/lib/libSystem.B.dylib".to_owned())]
+    );
     parts.imports[2].weak = true;
     let file = written(&writer, &parts.placed(&parts.slices()));
-    assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_WEAK_DYLIB.0, "/usr/lib/libSystem.B.dylib".to_owned())]);
+    assert_eq!(
+        read(&file).dylibs,
+        [(macho::LC_LOAD_WEAK_DYLIB.0, "/usr/lib/libSystem.B.dylib".to_owned())]
+    );
 }
 
 #[test]
@@ -1195,7 +1280,9 @@ fn reads_universal_slices() {
 /// An arm64 object with code, data and C strings in atoms, a local and an undefined symbol,
 /// and pointers to both.
 fn an_object() -> Vec<u8> {
-    use object::write::{Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection};
+    use object::write::{
+        Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection,
+    };
     use object::{
         Architecture, BinaryFormat, Endianness, RelocationFlags, SymbolFlags, SymbolKind as Type,
         SymbolScope,
@@ -1225,9 +1312,13 @@ fn an_object() -> Vec<u8> {
     symbol("_d", 0, 16, Type::Data, SymbolScope::Linkage, SymbolSection::Section(data));
     let ext = symbol("_ext", 0, 0, Type::Unknown, SymbolScope::Dynamic, SymbolSection::Undefined);
     for (at, target) in [(0, f), (8, ext)] {
-        let flags =
-            RelocationFlags::MachO { r_type: macho::ARM64_RELOC_UNSIGNED, r_pcrel: false, r_length: 3 };
-        b.add_relocation(data, Relocation { offset: at, symbol: target, addend: 0, flags }).unwrap();
+        let flags = RelocationFlags::MachO {
+            r_type: macho::ARM64_RELOC_UNSIGNED,
+            r_pcrel: false,
+            r_length: 3,
+        };
+        b.add_relocation(data, Relocation { offset: at, symbol: target, addend: 0, flags })
+            .unwrap();
     }
     b.write().unwrap()
 }
@@ -1241,18 +1332,18 @@ fn native_object(read: Result<crate::model::NativeFile, String>) -> crate::model
 }
 
 /// `a`, read from `a_input`, and `b`, from `b_input`, say the same through every accessor.
-fn same_object(
-    a: &crate::model::Object,
-    a_input: &[u8],
-    b: &crate::model::Object,
-    b_input: &[u8],
-) {
+fn same_object(a: &crate::model::Object, a_input: &[u8], b: &crate::model::Object, b_input: &[u8]) {
     assert_eq!(a.sections.len(), b.sections.len());
     for (x, y) in a.sections.iter().zip(&b.sections) {
         assert_eq!(a.name(x.name), b.name(y.name));
         assert_eq!((&x.what, x.align, x.retain), (&y.what, y.align, y.retain));
         assert_eq!(x.data.len(), y.data.len());
-        assert_eq!(x.data.bytes(a_input).unwrap(), y.data.bytes(b_input).unwrap(), "{}", a.name(x.name));
+        assert_eq!(
+            x.data.bytes(a_input).unwrap(),
+            y.data.bytes(b_input).unwrap(),
+            "{}",
+            a.name(x.name)
+        );
         assert_eq!(a.section_fixups(x), b.section_fixups(y));
     }
     assert_eq!(a.symbols, b.symbols);
@@ -1274,7 +1365,9 @@ fn objects_are_read_in_place_wherever_they_start() {
                 held += range.end - range.start;
             }
             Data::Zero(_) => {}
-            Data::Bytes(_) => panic!("{}: copied, not a range of the input", thin.name(section.name)),
+            Data::Bytes(_) => {
+                panic!("{}: copied, not a range of the input", thin.name(section.name))
+            }
             Data::Made(_) => panic!("{}: made, not a range of the input", thin.name(section.name)),
         }
     }
@@ -1301,9 +1394,10 @@ fn universal_objects_name_bytes_of_the_whole_file() {
     for field in [macho::FAT_MAGIC, 2] {
         fat.extend_from_slice(&field.to_be_bytes());
     }
-    for (cpu, offset, size, align) in
-        [(macho::CPU_TYPE_X86_64.0, 0x1000, 8, 12), (macho::CPU_TYPE_ARM64.0, at, bytes.len() as u32, 14)]
-    {
+    for (cpu, offset, size, align) in [
+        (macho::CPU_TYPE_X86_64.0, 0x1000, 8, 12),
+        (macho::CPU_TYPE_ARM64.0, at, bytes.len() as u32, 14),
+    ] {
         for field in [cpu, 0, offset, size, align] {
             fat.extend_from_slice(&field.to_be_bytes());
         }
@@ -1356,7 +1450,10 @@ fn trie_by_insertion(exports: &mut [(Vec<u8>, u64, u64)]) -> Vec<u8> {
             let (label, child) = nodes[node].edges[edge].clone();
             let common = label.iter().zip(name).take_while(|(a, b)| a == b).count();
             if common < label.len() {
-                nodes.push(Node { edges: vec![(label[common..].to_vec(), child)], ..Node::default() });
+                nodes.push(Node {
+                    edges: vec![(label[common..].to_vec(), child)],
+                    ..Node::default()
+                });
                 let middle = nodes.len() - 1;
                 nodes[node].edges[edge] = (label[..common].to_vec(), middle);
                 node = middle;
@@ -1437,7 +1534,8 @@ fn trie_is_the_insertion_trie() {
 
 #[test]
 fn names_sort_as_their_mach_o_spelling() {
-    let names = ["main", "\x01main", "\x01_main", "_main", "\x01", "a", "\x01a", "\x01`", "Z", "\x01Z"];
+    let names =
+        ["main", "\x01main", "\x01_main", "_main", "\x01", "a", "\x01a", "\x01`", "Z", "\x01Z"];
     for a in names {
         for b in names {
             let want = macho_name(a).into_bytes().cmp(&macho_name(b).into_bytes());
@@ -1452,19 +1550,33 @@ fn rebases_and_starts_sorted_or_not_are_the_same() {
     let mut shuffled = sorted.clone();
     shuffled.reverse();
     shuffled.swap(3, 30);
-    assert_eq!(encode_rebases(&sorted, &spans()).unwrap(), encode_rebases(&shuffled, &spans()).unwrap());
     assert_eq!(
-        encode_starts(0x1_0000_0000, &sorted),
-        encode_starts(0x1_0000_0000, &shuffled)
+        encode_rebases(&sorted, &spans()).unwrap(),
+        encode_rebases(&shuffled, &spans()).unwrap()
     );
+    assert_eq!(encode_starts(0x1_0000_0000, &sorted), encode_starts(0x1_0000_0000, &shuffled));
     let mut twice = sorted.clone();
     twice.push(sorted[10]);
     assert_eq!(encode_starts(0x1_0000_0000, &twice), encode_starts(0x1_0000_0000, &sorted));
 }
 
 /// What the core says changed since the link `from`: nothing moved, `written` rewritten.
-fn delta<'a>(from: u64, same_names: bool, written: &'a [(u64, u64)], functions: &'a [Splice]) -> Delta<'a> {
-    Delta { functions, rebase: &[], got: &[], binds: &[], same_names, same_regions: true, written, from }
+fn delta<'a>(
+    from: u64,
+    same_names: bool,
+    written: &'a [(u64, u64)],
+    functions: &'a [Splice],
+) -> Delta<'a> {
+    Delta {
+        functions,
+        rebase: &[],
+        got: &[],
+        binds: &[],
+        same_names,
+        same_regions: true,
+        written,
+        from,
+    }
 }
 
 /// A writer that keeps its last link writes the same file as one that doesn't, link after
@@ -1474,10 +1586,15 @@ fn delta<'a>(from: u64, same_names: bool, written: &'a [(u64, u64)], functions: 
 #[test]
 fn the_signing_cache_writes_the_same_file() {
     for minimum in [OPCODES, CHAINED] {
-        let mut incremental = output_at(Arch::Aarch64, OutputKind::Executable { entry: "main".to_owned() }, minimum);
+        let mut incremental =
+            output_at(Arch::Aarch64, OutputKind::Executable { entry: "main".to_owned() }, minimum);
         incremental.incremental = true;
         let cached = super::writer(&incremental).unwrap();
-        let mut parts = hello(output_at(Arch::Aarch64, OutputKind::Executable { entry: "main".to_owned() }, minimum));
+        let mut parts = hello(output_at(
+            Arch::Aarch64,
+            OutputKind::Executable { entry: "main".to_owned() },
+            minimum,
+        ));
         for round in 0..5u8 {
             let (wrote, same_names): (&[(u64, u64)], bool) = match round {
                 1 => {
@@ -1508,7 +1625,11 @@ fn the_signing_cache_writes_the_same_file() {
                 ..parts.placed(&slices)
             };
             let file = written(&cached, &placed);
-            assert_eq!(file, written(&fresh, &parts.placed(&slices)), "round {round} at {minimum:#x}");
+            assert_eq!(
+                file,
+                written(&fresh, &parts.placed(&slices)),
+                "round {round} at {minimum:#x}"
+            );
             let read = read(&file);
             let (at, len) = read.signature.unwrap();
             check_signature(range(&file, (at, len)), &file[..at as usize], "hello");
@@ -1546,7 +1667,8 @@ fn a_relink_patches_the_symbol_table_as_a_full_build_writes_it() {
     let fresh = super::writer(&parts.output).unwrap();
     assert_eq!(file, written(&fresh, &parts.placed(&slices)));
     let read = read(&file);
-    let names: Vec<(String, u64)> = symbols(&file, &read).into_iter().map(|it| (it.0, it.4)).collect();
+    let names: Vec<(String, u64)> =
+        symbols(&file, &read).into_iter().map(|it| (it.0, it.4)).collect();
     assert!(names.contains(&("__ZN5hello6helper17hfedcba9876543210E".to_owned(), TEXT + 6)));
 
     // A name of another length is built again, and still a full build's bytes.
@@ -1561,7 +1683,10 @@ fn a_relink_patches_the_symbol_table_as_a_full_build_writes_it() {
     // A delta from a link the writer didn't keep (a rollback) patches nothing.
     let since = delta(1, true, &[], &[]);
     let fourth = Placed { synthesis: 4, delta: Some(&since), ..parts.placed(&slices) };
-    assert_eq!(written(&cached, &fourth), written(&super::writer(&parts.output).unwrap(), &parts.placed(&slices)));
+    assert_eq!(
+        written(&cached, &fourth),
+        written(&super::writer(&parts.output).unwrap(), &parts.placed(&slices))
+    );
 }
 
 #[test]
@@ -1591,13 +1716,16 @@ fn an_archive_index_read_is_bounded_by_its_index() {
         strings.extend_from_slice(symbol.as_bytes());
         strings.push(0);
     }
-    let names = "a.o".len() + symbols.iter().map(|it| core_name(it.as_bytes()).unwrap().len()).sum::<usize>();
+    let names = "a.o".len()
+        + symbols.iter().map(|it| core_name(it.as_bytes()).unwrap().len()).sum::<usize>();
     // The members, their header offsets, their ranges, the index, its entries by string
     // offset and the names, and the radix sort's scratch: the entries are out of offset order.
     let used = [128, 8192].map(|entries| {
         let entries: Vec<(u32, usize)> = (0..entries).map(|it| (offsets[3 - it % 4], 0)).collect();
-        let bytes = super::archive::tests::bsd_raw(&[("a.o", &b"aaaa"[..])], strings.clone(), &entries);
-        let (archive, used) = blaze_alloc_count::measure(|| super::archive::read("libsym.a", &bytes));
+        let bytes =
+            super::archive::tests::bsd_raw(&[("a.o", &b"aaaa"[..])], strings.clone(), &entries);
+        let (archive, used) =
+            blaze_alloc_count::measure(|| super::archive::read("libsym.a", &bytes));
         let archive = archive.unwrap();
         assert_eq!(archive.index.len(), entries.len());
         assert_eq!(archive.names.bytes(), names, "one name a string, however many entries name it");
@@ -1609,7 +1737,8 @@ fn an_archive_index_read_is_bounded_by_its_index() {
 #[test]
 fn signing_allocates_nothing_per_page() {
     // One worker, measured on it: the pages are hashed on the thread that signs.
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     for pages in [3, 300] {
         let file: Vec<u8> = (0..pages * sign::PAGE + 100).map(|it| (it * 31 % 251) as u8).collect();
         // Two parts, so the page across them is gathered.
@@ -1618,14 +1747,20 @@ fn signing_allocates_nothing_per_page() {
         let mut cache = sign::Cache::default();
         let len = sign::len("x", file.len() as u64);
         // The pages kept: the headers' and the last two (as `__LINKEDIT`'s).
-        let kept = [(0, 0x4000), (file.len() as u64 - 2 * sign::PAGE as u64, 2 * sign::PAGE as u64)];
+        let kept =
+            [(0, 0x4000), (file.len() as u64 - 2 * sign::PAGE as u64, 2 * sign::PAGE as u64)];
         pool.install(|| {
             let cold = sign::Cached { cache: &mut cache, synthesis: 1, since: None, kept: &kept };
             sign::signature(&view, "x", 0, 0x4000, true, Some(cold), &mut Vec::new());
             let mut out = Vec::new();
-            let ((), plain) =
-                blaze_alloc_count::measure(|| sign::signature(&view, "x", 0, 0x4000, true, None, &mut out));
-            assert_eq!((plain.allocations, plain.bytes), (1, len), "{pages} pages: the output alone");
+            let ((), plain) = blaze_alloc_count::measure(|| {
+                sign::signature(&view, "x", 0, 0x4000, true, None, &mut out)
+            });
+            assert_eq!(
+                (plain.allocations, plain.bytes),
+                (1, len),
+                "{pages} pages: the output alone"
+            );
             check_signature(&out, &file, "x");
             let want = std::mem::take(&mut out);
             out.reserve(want.len());
@@ -1645,7 +1780,8 @@ fn linkedit_encodes_into_one_buffer() {
     const IMPORTS: [&[u8]; 4] = [b"_malloc", b"_free", b"_open", b"_close"];
     let spans = spans();
     // One worker, measured on it: the rebases are checked on the pool's threads.
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     for n in [100u64, 2000] {
         // In order, as `Placed` lists them.
         let rebases: Vec<u64> = (0..n).map(|it| 0x1_0000_8000 + 8 * it).collect();
@@ -1663,8 +1799,12 @@ fn linkedit_encodes_into_one_buffer() {
         let mut exports: Vec<(&[u8], u64, u64)> =
             names.iter().zip(0..).map(|(name, it)| (&name[..], 0, 0x4000 + 16 * it)).collect();
         exports.sort_unstable();
-        let mut out =
-            Vec::with_capacity(linkedit::capacity(rebases.len(), &binds, &exports, functions.len()));
+        let mut out = Vec::with_capacity(linkedit::capacity(
+            rebases.len(),
+            &binds,
+            &exports,
+            functions.len(),
+        ));
         let (at, room) = (out.as_ptr(), out.capacity());
         let (len, used) = pool.install(|| {
             blaze_alloc_count::measure(|| {
@@ -1719,13 +1859,18 @@ fn the_locals_in_parallel_are_the_locals_one_by_one() {
     let sect = |addr: u64, _: &str| -> Result<u8, crate::LinkError> { Ok((addr % 7) as u8 + 1) };
     let failing = |addr: u64, name: &str| -> Result<u8, crate::LinkError> {
         if addr % 4099 == 4098 {
-            return Err(crate::LinkError { function: None, what: format!("{name} at {addr:#x}"), refusal: None });
+            return Err(crate::LinkError {
+                function: None,
+                what: format!("{name} at {addr:#x}"),
+                refusal: None,
+            });
         }
         Ok(1)
     };
     for count in [0, 1, 4095, 4096, 4097, 10_000] {
-        let locals: Vec<(u64, &str)> =
-            (names[..count].iter().enumerate()).map(|(nth, it)| (0x1000 + nth as u64, it.as_str())).collect();
+        let locals: Vec<(u64, &str)> = (names[..count].iter().enumerate())
+            .map(|(nth, it)| (0x1000 + nth as u64, it.as_str()))
+            .collect();
         let (mut strings, mut nlist) = (b" \0".to_vec(), vec![0xaa; 32]);
         let (mut want_strings, mut want_nlist) = (strings.clone(), nlist.clone());
         super::locals_into(&locals, &sect, &mut strings, &mut nlist).unwrap();
@@ -1735,7 +1880,11 @@ fn the_locals_in_parallel_are_the_locals_one_by_one() {
 
         let ours = super::locals_into(&locals, &failing, &mut Vec::new(), &mut Vec::new());
         let theirs = locals_one_by_one(&locals, &failing, &mut Vec::new(), &mut Vec::new());
-        assert_eq!(ours.map_err(|it| it.what), theirs.map_err(|it| it.what), "{count} locals: the first error");
+        assert_eq!(
+            ours.map_err(|it| it.what),
+            theirs.map_err(|it| it.what),
+            "{count} locals: the first error"
+        );
     }
 }
 
@@ -1759,14 +1908,18 @@ fn decode_chained(file: &[u8], read: &Read, base: u64) -> Vec<(u64, Fixup)> {
     let u16_at = |at: usize| u16::from_le_bytes(blob[at..at + 2].try_into().unwrap());
     let u32_at = |at: usize| u32::from_le_bytes(blob[at..at + 4].try_into().unwrap());
     assert_eq!(u32_at(0), 0, "fixups_version");
-    let (starts, imports_at, symbols_at) = (u32_at(4) as usize, u32_at(8) as usize, u32_at(12) as usize);
+    let (starts, imports_at, symbols_at) =
+        (u32_at(4) as usize, u32_at(8) as usize, u32_at(12) as usize);
     let (count, format) = (u32_at(16) as usize, u32_at(20));
     assert_eq!(u32_at(24), 0, "uncompressed names");
     let imports: Vec<(Vec<u8>, i64, bool, i64)> = (0..count)
         .map(|nth| {
             let (word, addend) = match format {
                 1 => (u32_at(imports_at + 4 * nth), 0),
-                2 => (u32_at(imports_at + 8 * nth), i64::from(u32_at(imports_at + 8 * nth + 4) as i32)),
+                2 => (
+                    u32_at(imports_at + 8 * nth),
+                    i64::from(u32_at(imports_at + 8 * nth + 4) as i32),
+                ),
                 other => panic!("import format {other}"),
             };
             let mut at = symbols_at + (word >> 9) as usize;
@@ -1822,23 +1975,40 @@ fn chained_fixups_slide_and_bind_what_the_opcodes_do() {
         let slices = parts.slices();
         written(&writer, &parts.placed(&slices))
     };
-    let (old, new) = (file_of(&hello(executable(Arch::Aarch64))), file_of(&hello(chained_executable())));
+    let (old, new) =
+        (file_of(&hello(executable(Arch::Aarch64))), file_of(&hello(chained_executable())));
     let (old_read, new_read) = (read(&old), read(&new));
     assert_eq!(new_read.info, None, "no LC_DYLD_INFO_ONLY");
     assert_eq!(new_read.build, Some((1, CHAINED, 0x000f_0000)));
 
     let segments: Vec<u64> = old_read.segments.iter().map(|it| it.1).collect();
     let info = old_read.info.unwrap();
-    let held = |addr: u64| u64::from_le_bytes(old[(addr - BASE) as usize..][..8].try_into().unwrap());
-    let mut want: Vec<(u64, Fixup)> =
-        decode_rebases(range(&old, info[0]), &segments).into_iter().map(|it| (it, Fixup::Rebase(held(it)))).collect();
-    want.extend(decode_binds(range(&old, info[1]), &segments).into_iter().map(|(addr, ordinal, name, flags, addend)| {
-        (addr, Fixup::Bind(name, ordinal, flags & macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0 != 0, addend))
-    }));
+    let held =
+        |addr: u64| u64::from_le_bytes(old[(addr - BASE) as usize..][..8].try_into().unwrap());
+    let mut want: Vec<(u64, Fixup)> = decode_rebases(range(&old, info[0]), &segments)
+        .into_iter()
+        .map(|it| (it, Fixup::Rebase(held(it))))
+        .collect();
+    want.extend(decode_binds(range(&old, info[1]), &segments).into_iter().map(
+        |(addr, ordinal, name, flags, addend)| {
+            (
+                addr,
+                Fixup::Bind(
+                    name,
+                    ordinal,
+                    flags & macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0 != 0,
+                    addend,
+                ),
+            )
+        },
+    ));
     want.sort_by_key(|it| it.0);
     assert_eq!(want.len(), 6);
     assert_eq!(decode_chained(&new, &new_read, BASE), want);
-    assert_eq!(decode_trie(range(&new, new_read.exports_trie.unwrap())), decode_trie(range(&old, info[4])));
+    assert_eq!(
+        decode_trie(range(&new, new_read.exports_trie.unwrap())),
+        decode_trie(range(&old, info[4]))
+    );
     let (at, len) = new_read.signature.unwrap();
     check_signature(range(&new, (at, len)), &new[..at as usize], "hello");
 }
@@ -1868,7 +2038,12 @@ fn chained_starts_count_no_zero_fill_page() {
             continue;
         }
         let pages = u16::from_le_bytes(table[starts + offset + 20..][..2].try_into().unwrap());
-        assert_eq!(u64::from(pages), segment.4.div_ceil(0x4000), "{}'s pages in the file", segment.0);
+        assert_eq!(
+            u64::from(pages),
+            segment.4.div_ceil(0x4000),
+            "{}'s pages in the file",
+            segment.0
+        );
         counted += 1;
     }
     assert_eq!(counted, 2, "`__DATA_CONST` and `__DATA` have slots");
@@ -1896,11 +2071,16 @@ fn a_bind_added_rewrites_two_slots() {
 /// a hash per page) whatever their size.
 #[test]
 fn the_debug_sections_are_the_cores_not_copies() {
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let sizes = [1usize << 20, 3 << 20];
     let used = sizes.map(|size| {
         let mut parts = hello(executable(Arch::Aarch64));
-        parts.debug = vec![(".debug_line", vec![3; size]), (".debug_abbrev", Vec::new()), (".debug_str", vec![5; size / 2])];
+        parts.debug = vec![
+            (".debug_line", vec![3; size]),
+            (".debug_abbrev", Vec::new()),
+            (".debug_str", vec![5; size / 2]),
+        ];
         let writer = super::writer(&parts.output).unwrap();
         let slices = parts.slices();
         let placed = parts.placed(&slices);
@@ -1922,7 +2102,10 @@ fn the_debug_sections_are_the_cores_not_copies() {
     });
     assert_eq!(used[0].0, used[1].0, "as many buffers");
     let pages = (sizes[1] + sizes[1] / 2 - sizes[0] - sizes[0] / 2) / sign::PAGE;
-    assert!(used[1].1 - used[0].1 <= (pages * 32 + 16) as u64, "{used:?}: only the signature grows");
+    assert!(
+        used[1].1 - used[0].1 <= (pages * 32 + 16) as u64,
+        "{used:?}: only the signature grows"
+    );
 }
 
 const ARENA: u64 = BASE + 0x10000;
@@ -1945,9 +2128,20 @@ fn dev_hello(output: Output) -> Parts {
     parts.contents.insert(1, vec![0x1f, 0x20, 0x03, 0xd5]);
     let asked = parts.output.dev_run.unwrap_or(DevRun { arena: 0, cells: 0, fixed: 0 });
     let mut at = ARENA;
-    for (reserve, len) in [(Reserve::Arena, asked.arena), (Reserve::Cells, asked.cells), (Reserve::Fixed, asked.fixed)] {
+    for (reserve, len) in [
+        (Reserve::Arena, asked.arena),
+        (Reserve::Cells, asked.cells),
+        (Reserve::Fixed, asked.fixed),
+    ] {
         if len != 0 {
-            parts.regions.push(Region { class: Class::Reserve(reserve), addr: at, capacity: len, size: 0, prot: Prot::NONE, align: 0x4000 });
+            parts.regions.push(Region {
+                class: Class::Reserve(reserve),
+                addr: at,
+                capacity: len,
+                size: 0,
+                prot: Prot::NONE,
+                align: 0x4000,
+            });
             parts.contents.push(Vec::new());
             at += len;
         }
@@ -1968,7 +2162,16 @@ fn segments_of(file: &[u8]) -> Vec<(String, u64, u64, u64, u64, u32, u32, u32)> 
     while let Some(command) = commands.next().unwrap() {
         if let V::Segment64(it, _) = command.variant().unwrap() {
             let name = name16(it.segname());
-            out.push((name, it.vmaddr(LE), it.vmsize(LE), it.fileoff(LE), it.filesize(LE), it.maxprot(LE).0, it.initprot(LE).0, it.nsects(LE)));
+            out.push((
+                name,
+                it.vmaddr(LE),
+                it.vmsize(LE),
+                it.fileoff(LE),
+                it.filesize(LE),
+                it.maxprot(LE).0,
+                it.initprot(LE).0,
+                it.nsects(LE),
+            ));
         }
     }
     out
@@ -1988,7 +2191,11 @@ fn a_dev_runs_start_hook_is_the_first_initializer() {
     let writer = super::writer(&parts.output).unwrap();
     let (class, rank) = writer.start_hook().unwrap();
     assert_eq!(class, Class::InitArray);
-    for name in ["__DATA,__mod_init_func,mod_init_funcs", "__DATA_CONST,__mod_init_func", "__DATA,__mod_init_func"] {
+    for name in [
+        "__DATA,__mod_init_func,mod_init_funcs",
+        "__DATA_CONST,__mod_init_func",
+        "__DATA,__mod_init_func",
+    ] {
         let (class, input) = writer.section(name, false, false, false).unwrap();
         assert_eq!(class, Class::InitArray, "{name}");
         assert!(rank < input, "{name}: the hook's rank {rank} sorts before {input}");
@@ -2028,13 +2235,22 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
     for minimum in [OPCODES, CHAINED] {
         let file = dev_file(minimum);
         let segments = segments_of(&file);
-        let code: Vec<_> = segments.iter().filter(|it| it.6 & macho::VM_PROT_EXECUTE.0 != 0).collect();
+        let code: Vec<_> =
+            segments.iter().filter(|it| it.6 & macho::VM_PROT_EXECUTE.0 != 0).collect();
         assert_eq!(code.len(), 1);
         for it in code {
             assert_eq!(it.0, "__TEXT");
-            assert_eq!((it.1 % 0x4000, it.3 % 0x4000), (0, 0), "on a page in memory and in the file");
+            assert_eq!(
+                (it.1 % 0x4000, it.3 % 0x4000),
+                (0, 0),
+                "on a page in memory and in the file"
+            );
             assert_eq!(it.2, it.4, "all file bytes");
-            assert_eq!((it.5 | it.6) & macho::VM_PROT_WRITE.0, 0, "never writable, nor able to be made so");
+            assert_eq!(
+                (it.5 | it.6) & macho::VM_PROT_WRITE.0,
+                0,
+                "never writable, nor able to be made so"
+            );
             for other in segments.iter().filter(|other| other.0 != it.0) {
                 let memory = other.2 != 0 && other.1 < it.1 + it.2 && it.1 < other.1 + other.2;
                 let in_file = other.4 != 0 && other.3 < it.3 + it.4 && it.3 < other.3 + other.4;
@@ -2046,7 +2262,8 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
         assert_eq!((patch.0.as_str(), patch.2), ("__TEXT", PATCH), "live patches' code is code");
         assert_ne!(patch.4 & macho::S_ATTR_PURE_INSTRUCTIONS.0, 0);
 
-        let layout = blaze_inproc::image::layout(blaze_inproc::Format::MachO, &file, 0x4000).unwrap();
+        let layout =
+            blaze_inproc::image::layout(blaze_inproc::Format::MachO, &file, 0x4000).unwrap();
         assert_eq!(layout.header, BASE);
         assert_eq!(layout.code, [blaze_inproc::Segment { offset: 0, linked: BASE, len: 0x8000 }]);
         assert_eq!(layout.reserved, [ARENA..CELLS, CELLS..FIXED, FIXED..FIXED + ASKED.fixed]);
@@ -2062,7 +2279,10 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
         flags: 0,
         sections: Vec::new(),
     };
-    let (rx, rw) = (macho::VM_PROT_READ.0 | macho::VM_PROT_EXECUTE.0, macho::VM_PROT_READ.0 | macho::VM_PROT_WRITE.0);
+    let (rx, rw) = (
+        macho::VM_PROT_READ.0 | macho::VM_PROT_EXECUTE.0,
+        macho::VM_PROT_READ.0 | macho::VM_PROT_WRITE.0,
+    );
     let text = || segment("__TEXT", BASE, 0x8000, 0, 0x8000, rx);
     let data = |vmaddr, fileoff, filesize| segment("__DATA", vmaddr, 0x4000, fileoff, filesize, rw);
     assert!(super::code_alone(&[text(), data(BASE + 0x8000, 0x8000, 0x10)], 0x4000).is_ok());
@@ -2071,7 +2291,10 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
         assert!(error.contains(says), "{error} doesn't say {says:?}");
     };
     refused(&[segment("__TEXT", BASE, 0x8000, 0, 0x8000, rx | rw)], "is writable");
-    refused(&[segment("__TEXT", BASE + 0x1000, 0x8000, 0x1000, 0x8000, rx)], "does not start on a page");
+    refused(
+        &[segment("__TEXT", BASE + 0x1000, 0x8000, 0x1000, 0x8000, rx)],
+        "does not start on a page",
+    );
     refused(&[segment("__TEXT", BASE, 0x8000, 0, 0x6000, rx)], "is not all file bytes");
     refused(&[text(), data(BASE + 0x6000, 0x8000, 0x10)], "shares a page with `__DATA`");
     refused(&[text(), data(BASE + 0x8000, 0x7000, 0x10)], "shares a page with `__DATA`");
@@ -2080,8 +2303,19 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
 #[test]
 fn a_dev_run_reserves_its_three_ranges_last() {
     let writer = super::writer(&dev_run(OPCODES)).unwrap();
-    let reserves = [Class::Reserve(Reserve::Arena), Class::Reserve(Reserve::Cells), Class::Reserve(Reserve::Fixed)];
-    let mut classes = vec![reserves[2].clone(), Class::Bss, reserves[0].clone(), Class::Text, reserves[1].clone(), Class::Data];
+    let reserves = [
+        Class::Reserve(Reserve::Arena),
+        Class::Reserve(Reserve::Cells),
+        Class::Reserve(Reserve::Fixed),
+    ];
+    let mut classes = vec![
+        reserves[2].clone(),
+        Class::Bss,
+        reserves[0].clone(),
+        Class::Text,
+        reserves[1].clone(),
+        Class::Data,
+    ];
     writer.order(&mut classes);
     assert_eq!(classes[..3], [Class::Text, Class::Data, Class::Bss]);
     assert_eq!(classes[3..], reserves);
@@ -2099,24 +2333,43 @@ fn a_dev_run_reserves_its_three_ranges_last() {
         let file = dev_file(minimum);
         let segments = segments_of(&file);
         let names: Vec<&str> = segments.iter().map(|it| it.0.as_str()).collect();
-        assert_eq!(names, [
-            "__PAGEZERO",
-            "__TEXT",
-            "__DATA_CONST",
-            "__DATA",
-            "__BLAZE_ARENA",
-            "__BLAZE_CELLS",
-            "__BLAZE_FIXED",
-            "__DWARF",
-            "__LINKEDIT"
-        ]);
-        for (it, (at, len)) in segments[4..7].iter().zip([(ARENA, ASKED.arena), (CELLS, ASKED.cells), (FIXED, ASKED.fixed)]) {
+        assert_eq!(
+            names,
+            [
+                "__PAGEZERO",
+                "__TEXT",
+                "__DATA_CONST",
+                "__DATA",
+                "__BLAZE_ARENA",
+                "__BLAZE_CELLS",
+                "__BLAZE_FIXED",
+                "__DWARF",
+                "__LINKEDIT"
+            ]
+        );
+        for (it, (at, len)) in segments[4..7].iter().zip([
+            (ARENA, ASKED.arena),
+            (CELLS, ASKED.cells),
+            (FIXED, ASKED.fixed),
+        ]) {
             assert_eq!((it.1, it.2), (at, len), "{}", it.0);
-            assert_eq!((it.3, it.4, it.5, it.6, it.7), (0, 0, 0, 0, 0), "{}: no file bytes, no access, no sections", it.0);
+            assert_eq!(
+                (it.3, it.4, it.5, it.6, it.7),
+                (0, 0, 0, 0, 0),
+                "{}: no file bytes, no access, no sections",
+                it.0
+            );
         }
-        assert!(segments.windows(2).all(|it| it[0].1 + it[0].2 <= it[1].1), "in address order, none overlapping");
+        assert!(
+            segments.windows(2).all(|it| it[0].1 + it[0].2 <= it[1].1),
+            "in address order, none overlapping"
+        );
         let linkedit = segments.last().unwrap();
-        assert_eq!(linkedit.3 + linkedit.4, file.len() as u64, "`__LINKEDIT` last, the signature at its end");
+        assert_eq!(
+            linkedit.3 + linkedit.4,
+            file.len() as u64,
+            "`__LINKEDIT` last, the signature at its end"
+        );
         if minimum == CHAINED {
             let chained = read(&file).chained.unwrap();
             let table = range(&file, chained);
@@ -2125,7 +2378,11 @@ fn a_dev_run_reserves_its_three_ranges_last() {
             assert_eq!(count, segments.len(), "a chained start for every segment");
             for nth in 4..7 {
                 let at = starts + 4 + 4 * nth;
-                assert_eq!(u32::from_le_bytes(table[at..at + 4].try_into().unwrap()), 0, "a reservation has no slots");
+                assert_eq!(
+                    u32::from_le_bytes(table[at..at + 4].try_into().unwrap()),
+                    0,
+                    "a reservation has no slots"
+                );
             }
         }
     }
@@ -2138,19 +2395,31 @@ fn a_dev_run_reserves_its_three_ranges_last() {
     let mut short = dev_hello(dev_run(OPCODES));
     short.regions.last_mut().unwrap().capacity = 0x4000;
     let error = encode_error(&short);
-    assert!(error.contains("`__BLAZE_FIXED` reserves 0x4000 bytes where the dev run asks 0x8000"), "{error}");
+    assert!(
+        error.contains("`__BLAZE_FIXED` reserves 0x4000 bytes where the dev run asks 0x8000"),
+        "{error}"
+    );
     let mut none = dev_hello(dev_run(OPCODES));
     none.output.dev_run = Some(DevRun { fixed: 0, ..ASKED });
     let error = encode_error(&none);
-    assert!(error.contains("`__BLAZE_FIXED` reserves 0x8000 bytes where the dev run asks 0x0"), "{error}");
+    assert!(
+        error.contains("`__BLAZE_FIXED` reserves 0x8000 bytes where the dev run asks 0x0"),
+        "{error}"
+    );
     let mut missing = dev_hello(dev_run(OPCODES));
     missing.output.dev_run = Some(DevRun { arena: 0x20_0000, ..ASKED });
     let error = encode_error(&missing);
-    assert!(error.contains("`__BLAZE_ARENA` reserves 0x100000 bytes where the dev run asks 0x200000"), "{error}");
+    assert!(
+        error.contains("`__BLAZE_ARENA` reserves 0x100000 bytes where the dev run asks 0x200000"),
+        "{error}"
+    );
     let mut stray = dev_hello(dev_run(OPCODES));
     stray.output.dev_run = None;
     let error = encode_error(&stray);
-    assert!(error.contains("`__BLAZE_ARENA` reserves 0x100000 bytes in an image that is not a dev run"), "{error}");
+    assert!(
+        error.contains("`__BLAZE_ARENA` reserves 0x100000 bytes in an image that is not a dev run"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2163,7 +2432,11 @@ fn a_dev_run_is_signed_ad_hoc_without_the_hardened_runtime() {
         let be = |at: usize| u32::from_be_bytes(signature[at..at + 4].try_into().unwrap());
         let flags = be(be(16) as usize + 12);
         assert_ne!(flags & 0x2, 0, "CS_ADHOC");
-        assert_eq!(flags & 0x1_0000, 0, "CS_RUNTIME, the hardened runtime, kills the overlaid code");
+        assert_eq!(
+            flags & 0x1_0000,
+            0,
+            "CS_RUNTIME, the hardened runtime, kills the overlaid code"
+        );
     }
 }
 
@@ -2172,15 +2445,25 @@ fn a_dev_run_is_signed_ad_hoc_without_the_hardened_runtime() {
 #[test]
 fn without_a_dev_run_the_image_is_unchanged() {
     for minimum in [OPCODES, CHAINED] {
-        let plain = hello(output_at(Arch::Aarch64, OutputKind::Executable { entry: "main".to_owned() }, minimum));
+        let plain = hello(output_at(
+            Arch::Aarch64,
+            OutputKind::Executable { entry: "main".to_owned() },
+            minimum,
+        ));
         let mut dev = hello(plain.output.clone());
         dev.output.dev_run = Some(DevRun { arena: 0, cells: 0, fixed: 0 });
         let (plain_slices, dev_slices) = (plain.slices(), dev.slices());
         let without = written(&super::writer(&plain.output).unwrap(), &plain.placed(&plain_slices));
-        let with = written(&super::writer(&dev.output).unwrap(), &Placed { symbol: &the_hook, ..dev.placed(&dev_slices) });
+        let with = written(
+            &super::writer(&dev.output).unwrap(),
+            &Placed { symbol: &the_hook, ..dev.placed(&dev_slices) },
+        );
         assert_eq!(without, with, "at {minimum:#x}");
         let names: Vec<String> = segments_of(&without).into_iter().map(|it| it.0).collect();
-        assert_eq!(names, ["__PAGEZERO", "__TEXT", "__DATA_CONST", "__DATA", "__DWARF", "__LINKEDIT"]);
+        assert_eq!(
+            names,
+            ["__PAGEZERO", "__TEXT", "__DATA_CONST", "__DATA", "__DWARF", "__LINKEDIT"]
+        );
     }
 }
 
@@ -2196,7 +2479,10 @@ fn what_a_dev_run_cannot_overlay_is_an_error() {
     preinit.regions[3].class = Class::PreinitArray;
     let writer = super::writer(&preinit.output).unwrap();
     let error = writer.encode(&preinit.placed(&preinit.slices())).unwrap_err().what;
-    assert!(error.contains("a `.preinit_array` region at 0x100008010 in a Mach-O image"), "{error}");
+    assert!(
+        error.contains("a `.preinit_array` region at 0x100008010 in a Mach-O image"),
+        "{error}"
+    );
 
     // dyld writes nothing in code, dev run or not.
     let images: [fn() -> Parts; 3] = [
@@ -2220,18 +2506,32 @@ fn what_a_dev_run_cannot_overlay_is_an_error() {
         let mut bound = image();
         bound.binds.insert(0, Bind { addr: TEXT + 0x100, import: 0, addend: 0 });
         let error = encode_error(&bound);
-        assert!(error.contains("dyld binds a pointer at 0x100004100 to `_free`, in `__TEXT,__unwind_info`"), "{error}");
+        assert!(
+            error.contains(
+                "dyld binds a pointer at 0x100004100 to `_free`, in `__TEXT,__unwind_info`"
+            ),
+            "{error}"
+        );
         let mut cell = image();
         cell.got.insert(0, GotEntry { addr: TEXT + 0x108, holds: Holds::Import(0) });
         let error = encode_error(&cell);
-        assert!(error.contains("dyld fixes up a GOT cell at 0x100004108 to `_free`, in `__TEXT,__unwind_info`"), "{error}");
+        assert!(
+            error.contains(
+                "dyld fixes up a GOT cell at 0x100004108 to `_free`, in `__TEXT,__unwind_info`"
+            ),
+            "{error}"
+        );
     }
 }
 
 #[test]
 fn an_executable_with_the_execution_log_starts_on_its_log_stubs_on_both_arches() {
     for arch in [Arch::Aarch64, Arch::X86_64] {
-        let logged = crate::table::linked::logged(output_at(arch, OutputKind::Executable { entry: "main".into() }, CHAINED));
+        let logged = crate::table::linked::logged(output_at(
+            arch,
+            OutputKind::Executable { entry: "main".into() },
+            CHAINED,
+        ));
         assert!(logged.header.is_multiple_of(8), "{arch:?}");
     }
 }

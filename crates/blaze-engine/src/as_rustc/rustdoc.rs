@@ -20,7 +20,10 @@ pub(crate) fn command() -> ! {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let host = blaze_cargo::toolchain::host();
     let code = match answer(&args, host) {
-        Ok(said) => match std::io::stdout().write_all(said.as_bytes()).and_then(|()| std::io::stdout().flush()) {
+        Ok(said) => match std::io::stdout()
+            .write_all(said.as_bytes())
+            .and_then(|()| std::io::stdout().flush())
+        {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("error: writing rustdoc's answer: {error}");
@@ -29,7 +32,10 @@ pub(crate) fn command() -> ! {
         },
         Err(why) => {
             let shown: Vec<_> = args.iter().map(|it| it.to_string_lossy()).collect();
-            eprintln!("error: blaze can't answer `rustdoc {}` for a build script: {why}", shown.join(" "));
+            eprintln!(
+                "error: blaze can't answer `rustdoc {}` for a build script: {why}",
+                shown.join(" ")
+            );
             1
         }
     };
@@ -56,11 +62,13 @@ fn answer(args: &[OsString], host: Option<&str>) -> Result<String, String> {
     }
     let host = host.ok_or("blaze knows no target triple of this machine")?;
     let told = target::rustc_verbose_version(host);
-    let told = told.replacen("rustc ", "rustdoc ", 1).replacen("binary: rustc", "binary: rustdoc", 1);
+    let told =
+        told.replacen("rustc ", "rustdoc ", 1).replacen("binary: rustc", "binary: rustdoc", 1);
     Ok(told)
 }
 
-const UNANSWERED: &str = "blaze documents nothing for a build script, and runs no rustdoc (docs/no-rustc.md)";
+const UNANSWERED: &str =
+    "blaze documents nothing for a build script, and runs no rustdoc (docs/no-rustc.md)";
 
 #[cfg(test)]
 mod tests {
@@ -86,7 +94,9 @@ mod tests {
 
     #[test]
     fn documents_nothing() {
-        for args in [&[][..], &["src/lib.rs"], &["-v"], &["--test", "src/lib.rs"], &["-V", "src/lib.rs"]] {
+        for args in
+            [&[][..], &["src/lib.rs"], &["-v"], &["--test", "src/lib.rs"], &["-V", "src/lib.rs"]]
+        {
             assert_eq!(asked(args), Err(UNANSWERED.to_owned()), "{args:?}");
         }
     }

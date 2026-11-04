@@ -5,7 +5,9 @@ use blaze_codegen::Arch;
 use object::LittleEndian as LE;
 use object::Object as _;
 use object::pe::{self, ImageNtHeaders64};
-use object::read::pe::{ExportTarget, Import as PeImport, ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
+use object::read::pe::{
+    ExportTarget, ImageNtHeaders as _, ImageOptionalHeader as _, Import as PeImport, PeFile64,
+};
 
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_format::cursor::Put;
@@ -13,12 +15,13 @@ use blaze_format::cursor::Put;
 use super::coff::{ImportName, asked_libraries, words};
 use super::image::{self, Buf, Image, Tables, alignment, pdb_stem};
 use super::{
-    DEBUG, GRANULE, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, START_HOOK, TLS_DIR, TLS_INDEX, place, rank, writer,
+    DEBUG, GRANULE, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, START_HOOK, TLS_DIR, TLS_INDEX, place,
+    rank, writer,
 };
 use crate::model::{
-    Apply, Bind, Binding, Class, Counts, Data, Delta, Directive, Export, Function, GotEntry, Holds, Import, Library,
-    NativeFile, NativeFixup, Placed, Plan, Prot, Region, Reserve, SectionKind, Special, Splice, SymbolDef, SymbolKind,
-    Tls, WindowsUnwind, Writer,
+    Apply, Bind, Binding, Class, Counts, Data, Delta, Directive, Export, Function, GotEntry, Holds,
+    Import, Library, NativeFile, NativeFixup, Placed, Plan, Prot, Region, Reserve, SectionKind,
+    Special, Splice, SymbolDef, SymbolKind, Tls, WindowsUnwind, Writer,
 };
 use crate::output::Debug;
 use crate::{DevRun, Format, LinkError, NativeKind, Output, OutputKind};
@@ -170,7 +173,12 @@ impl Fixture {
     }
 
     /// [`Fixture::placed`] as synthesis `synthesis`, with what changed since the last.
-    fn placed_at<T>(&self, synthesis: u64, delta: Option<&Delta<'_>>, then: impl FnOnce(&Placed<'_>) -> T) -> T {
+    fn placed_at<T>(
+        &self,
+        synthesis: u64,
+        delta: Option<&Delta<'_>>,
+        then: impl FnOnce(&Placed<'_>) -> T,
+    ) -> T {
         let contents: Vec<&[u8]> = self.contents.iter().map(Vec::as_slice).collect();
         let symbols = &self.symbols;
         let symbol = |name: &str| symbols.iter().find(|it| it.0 == name).map(|it| it.1);
@@ -207,7 +215,10 @@ impl Fixture {
         let synthesized = self.placed(|placed| self.pe.synthesize(placed))?;
         for (class, bytes) in synthesized {
             let index = self.regions.iter().position(|it| it.class == class).unwrap();
-            assert!(bytes.len() as u64 <= self.regions[index].capacity, "{class:?} outgrew its region");
+            assert!(
+                bytes.len() as u64 <= self.regions[index].capacity,
+                "{class:?} outgrew its region"
+            );
             self.regions[index].size = bytes.len() as u64;
             self.contents[index] = bytes.contiguous().into_owned();
         }
@@ -271,8 +282,13 @@ fn executable() -> Fixture {
         (Class::Tdata, Data::Bytes(vec![7; 8])),
     ];
     let mut f = Fixture::new(exe(), pieces, &counts);
-    let (text, rodata, data, got, tdata) =
-        (f.at(&Class::Text), f.at(&Class::Rodata), f.at(&Class::Data), f.at(&Class::Got), f.at(&Class::Tdata));
+    let (text, rodata, data, got, tdata) = (
+        f.at(&Class::Text),
+        f.at(&Class::Rodata),
+        f.at(&Class::Data),
+        f.at(&Class::Got),
+        f.at(&Class::Tdata),
+    );
     f.libraries = vec![
         Library { name: "KERNEL32.dll".into(), as_needed: false },
         Library { name: "WS2_32.dll".into(), as_needed: false },
@@ -288,7 +304,8 @@ fn executable() -> Fixture {
         GotEntry { addr: got + 24, holds: Holds::Import(2) },
     ];
     f.rebase = vec![data, data + 8];
-    f.exports = vec![Export { name: "__blaze_live".into(), addr: data, size: 16, kind: SymbolKind::Data }];
+    f.exports =
+        vec![Export { name: "__blaze_live".into(), addr: data, size: 16, kind: SymbolKind::Data }];
     f.functions = vec![function(text, 0x10, rodata), function(text + 0x10, 0x20, rodata + 8)];
     f.entry = Some(text);
     f.tls = Some(Tls { addr: tdata, init: 8, size: 8, align: 8 });
@@ -329,10 +346,15 @@ fn executable_headers_and_sections() {
         let va = section.virtual_address.get(LE);
         assert_eq!(va % 0x1000, 0);
         if section.size_of_raw_data.get(LE) > 0 {
-            assert_eq!(section.pointer_to_raw_data.get(LE), va, "a section's file offset is its RVA");
+            assert_eq!(
+                section.pointer_to_raw_data.get(LE),
+                va,
+                "a section's file offset is its RVA"
+            );
         }
     }
-    let flags: Vec<u32> = file.section_table().iter().map(|it| it.characteristics.get(LE).0).collect();
+    let flags: Vec<u32> =
+        file.section_table().iter().map(|it| it.characteristics.get(LE).0).collect();
     assert_ne!(flags[0] & pe::IMAGE_SCN_MEM_EXECUTE.0, 0);
     assert_eq!(flags[1] & (pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_MEM_EXECUTE.0), 0);
     assert_ne!(flags[2] & pe::IMAGE_SCN_MEM_WRITE.0, 0);
@@ -351,7 +373,8 @@ fn import_directory_names_each_dll_and_function() {
     let mut descriptors = table.descriptors().unwrap();
     let mut seen = Vec::new();
     while let Some(descriptor) = descriptors.next().unwrap() {
-        let dll = String::from_utf8_lossy(table.name(descriptor.name.get(LE)).unwrap()).into_owned();
+        let dll =
+            String::from_utf8_lossy(table.name(descriptor.name.get(LE)).unwrap()).into_owned();
         let mut thunks = table.thunks(descriptor.original_first_thunk.get(LE)).unwrap();
         let mut imports = Vec::new();
         while let Some(thunk) = thunks.next::<ImageNtHeaders64>().unwrap() {
@@ -366,12 +389,19 @@ fn import_directory_names_each_dll_and_function() {
     assert_eq!(
         seen,
         [
-            ("KERNEL32.dll".to_owned(), got, vec!["356 ExitProcess".to_owned(), "700 GetStdHandle".to_owned()]),
+            (
+                "KERNEL32.dll".to_owned(),
+                got,
+                vec!["356 ExitProcess".to_owned(), "700 GetStdHandle".to_owned()]
+            ),
             ("WS2_32.dll".to_owned(), got + 24, vec!["#115".to_owned()]),
         ]
     );
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_IAT), (got, 40));
-    assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_IMPORT), (f.rva(f.at(&Class::Synthetic(IDATA))), 60));
+    assert_eq!(
+        directory(&file, pe::IMAGE_DIRECTORY_ENTRY_IMPORT),
+        (f.rva(f.at(&Class::Synthetic(IDATA))), 60)
+    );
 }
 
 #[test]
@@ -379,7 +409,11 @@ fn base_relocations_cover_every_rebase_and_the_tls_directory() {
     let mut f = executable();
     let image = f.image().unwrap();
     let file = PeFile64::parse(&image[..]).unwrap();
-    let mut blocks = file.data_directories().relocation_blocks(&image[..], &file.section_table()).unwrap().unwrap();
+    let mut blocks = file
+        .data_directories()
+        .relocation_blocks(&image[..], &file.section_table())
+        .unwrap()
+        .unwrap();
     let mut seen = Vec::new();
     while let Some(block) = blocks.next().unwrap() {
         assert_eq!(block.virtual_address() % 0x1000, 0);
@@ -404,15 +438,17 @@ fn pdata_merges_functions_and_native_entries_sorted() {
     let (at, size) = directory(&file, pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     assert_eq!(at, f.rva(f.at(&Class::Synthetic(PDATA))));
     let bytes = &image[at as usize..][..size as usize];
-    let entries: Vec<(u32, u32, u32)> = bytes
-        .chunks_exact(12)
-        .map(|it| (u32_at(it, 0), u32_at(it, 4), u32_at(it, 8)))
-        .collect();
+    let entries: Vec<(u32, u32, u32)> =
+        bytes.chunks_exact(12).map(|it| (u32_at(it, 0), u32_at(it, 4), u32_at(it, 8))).collect();
     let text = f.rva(f.at(&Class::Text));
     let rodata = f.rva(f.at(&Class::Rodata));
     assert_eq!(
         entries,
-        [(text, text + 0x10, rodata), (text + 0x10, text + 0x30, rodata + 8), (text + 0x30, text + 0x38, rodata + 0x10)]
+        [
+            (text, text + 0x10, rodata),
+            (text + 0x10, text + 0x30, rodata + 8),
+            (text + 0x30, text + 0x38, rodata + 0x10)
+        ]
     );
 }
 
@@ -425,7 +461,10 @@ fn debug_directory_has_rsds() {
     assert_eq!(&codeview.guid(), b"blaze image id!!");
     assert_eq!(codeview.age(), 1);
     assert_eq!(codeview.path(), b"app.pdb");
-    assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_DEBUG), (f.rva(f.at(&Class::Synthetic(DEBUG))), 28));
+    assert_eq!(
+        directory(&file, pe::IMAGE_DIRECTORY_ENTRY_DEBUG),
+        (f.rva(f.at(&Class::Synthetic(DEBUG))), 28)
+    );
 }
 
 #[test]
@@ -454,19 +493,29 @@ fn executable_exports_the_live_descriptor() {
     let exports = file.export_table().unwrap().unwrap().exports().unwrap();
     assert_eq!(exports.len(), 1);
     assert_eq!(exports[0].name, Some(&b"__blaze_live"[..]));
-    assert!(matches!(exports[0].target, ExportTarget::Address(at) if at == f.rva(f.at(&Class::Data))));
+    assert!(
+        matches!(exports[0].target, ExportTarget::Address(at) if at == f.rva(f.at(&Class::Data)))
+    );
 }
 
 #[test]
 fn dll_exports_sorted_by_name() {
     let counts = Counts { exports: 3, export_names: 14, ..Counts::default() };
-    let pieces = vec![(Class::Text, Data::Bytes(vec![0xc3; 0x30])), (Class::Data, Data::Bytes(vec![0; 0x10]))];
+    let pieces = vec![
+        (Class::Text, Data::Bytes(vec![0xc3; 0x30])),
+        (Class::Data, Data::Bytes(vec![0; 0x10])),
+    ];
     let mut f = Fixture::new(dll(), pieces, &counts);
     let text = f.at(&Class::Text);
     f.exports = ["zeta", "alpha", "mid"]
         .iter()
         .enumerate()
-        .map(|(at, name)| Export { name: (*name).into(), addr: text + 0x10 * at as u64, size: 0x10, kind: SymbolKind::Function })
+        .map(|(at, name)| Export {
+            name: (*name).into(),
+            addr: text + 0x10 * at as u64,
+            size: 0x10,
+            kind: SymbolKind::Function,
+        })
         .collect();
     let image = f.image().unwrap();
     let file = PeFile64::parse(&image[..]).unwrap();
@@ -475,7 +524,10 @@ fn dll_exports_sorted_by_name() {
     let optional = file.nt_headers().optional_header();
     assert_eq!(optional.image_base(), 0x1_8000_0000);
     assert_eq!(optional.address_of_entry_point(), 0);
-    assert_eq!(optional.dll_characteristics().0 & pe::IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE.0, 0);
+    assert_eq!(
+        optional.dll_characteristics().0 & pe::IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE.0,
+        0
+    );
     assert_eq!(section_names(&file), [".text", ".rdata", ".data", ".reloc"]);
     assert!(file.import_table().unwrap().is_none());
 
@@ -493,12 +545,17 @@ fn dll_exports_sorted_by_name() {
     let rva = f.rva(text);
     assert_eq!(
         names,
-        [("alpha".to_owned(), rva + 0x10), ("mid".to_owned(), rva + 0x20), ("zeta".to_owned(), rva)]
+        [
+            ("alpha".to_owned(), rva + 0x10),
+            ("mid".to_owned(), rva + 0x20),
+            ("zeta".to_owned(), rva)
+        ]
     );
     let sorted: Vec<u32> = table.name_pointers().iter().map(|it| it.get(LE)).collect();
     let mut by_name = Vec::new();
     for pointer in sorted {
-        by_name.push(String::from_utf8_lossy(table.name_from_pointer(pointer).unwrap()).into_owned());
+        by_name
+            .push(String::from_utf8_lossy(table.name_from_pointer(pointer).unwrap()).into_owned());
     }
     assert_eq!(by_name, ["alpha", "mid", "zeta"]);
     let directory = table.directory();
@@ -593,7 +650,10 @@ fn crt_tls_range_ends_before_its_end_marker() {
 
 #[test]
 fn load_config_directory_is_sized_by_its_first_word() {
-    let pieces = vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Rodata, Data::Bytes(vec![0; 0x140]))];
+    let pieces = vec![
+        (Class::Text, Data::Bytes(vec![0xc3; 0x10])),
+        (Class::Rodata, Data::Bytes(vec![0; 0x140])),
+    ];
     let mut f = Fixture::new(exe(), pieces, &Counts::default());
     let (text, rodata) = (f.at(&Class::Text), f.at(&Class::Rodata));
     f.entry = Some(text);
@@ -626,7 +686,10 @@ fn what_pe_cannot_say_is_an_error() {
     f.fails("no zero cell");
 
     let mut f = executable();
-    f.got.push(GotEntry { addr: f.at(&Class::Got) + 32, holds: Holds::TlsGd { import: None, offset: 0 } });
+    f.got.push(GotEntry {
+        addr: f.at(&Class::Got) + 32,
+        holds: Holds::TlsGd { import: None, offset: 0 },
+    });
     f.fails("thread-locals");
 
     let mut f = executable();
@@ -644,7 +707,8 @@ fn what_pe_cannot_say_is_an_error() {
 
     let mut f = executable();
     let first = &f.exports[0];
-    let twice = Export { name: first.name.clone(), addr: first.addr, size: first.size, kind: first.kind };
+    let twice =
+        Export { name: first.name.clone(), addr: first.addr, size: first.size, kind: first.kind };
     f.exports.push(twice);
     f.fails("exported twice");
 }
@@ -674,7 +738,10 @@ fn grouped_sections_sort_by_suffix() {
     assert!(section(".CRT$XLA").1 < section(".CRT$XLB").1);
     assert!(section(".CRT$XCZ").1 < section(".CRT$XIA").1);
     let (tls, tls_, tls_end) = (section(".tls"), section(".tls$"), section(".tls$ZZZ"));
-    assert_eq!((tls.0.clone(), tls_.0.clone(), tls_end.0.clone()), (Class::Tdata, Class::Tdata, Class::Tdata));
+    assert_eq!(
+        (tls.0.clone(), tls_.0.clone(), tls_end.0.clone()),
+        (Class::Tdata, Class::Tdata, Class::Tdata)
+    );
     assert!(tls.1 < tls_.1 && tls_.1 < tls_end.1);
     assert_eq!(tls_.1, 1);
     assert_eq!(pe.own(&Class::Tbss), (Class::Tdata, 1));
@@ -684,7 +751,10 @@ fn grouped_sections_sort_by_suffix() {
     assert_eq!(a.0, Class::Named { name: ".lme".into(), write: false, exec: false });
     assert!(a.1 < b.1 && b.1 < c.1);
     let items = pe.section("linkme_ITEMS$b", true, false, false).unwrap();
-    assert_eq!(items, (Class::Named { name: "linkme_ITEMS".into(), write: true, exec: false }, rank(Some("b"))));
+    assert_eq!(
+        items,
+        (Class::Named { name: "linkme_ITEMS".into(), write: true, exec: false }, rank(Some("b")))
+    );
 
     assert_eq!(section(".text$mn"), (Class::Text, rank(Some("mn"))));
     assert_eq!(section(".rdata$r"), (Class::Rodata, rank(Some("r"))));
@@ -798,8 +868,14 @@ fn encoders() {
         assert_eq!(ImportName::parse("g", Some(&version)), Ok(import));
     }
 
-    assert_eq!(ImportName::parse("f", Some("12 f")), Ok(ImportName::Name { hint: 12, name: "f".into() }));
-    assert_eq!(ImportName::parse("f", Some("3 g")), Ok(ImportName::Name { hint: 3, name: "g".into() }));
+    assert_eq!(
+        ImportName::parse("f", Some("12 f")),
+        Ok(ImportName::Name { hint: 12, name: "f".into() })
+    );
+    assert_eq!(
+        ImportName::parse("f", Some("3 g")),
+        Ok(ImportName::Name { hint: 3, name: "g".into() })
+    );
     assert_eq!(ImportName::parse("f", Some("#7")), Ok(ImportName::Ordinal(7)));
     assert_eq!(ImportName::parse("f", None), Ok(ImportName::Name { hint: 0, name: "f".into() }));
     assert!(ImportName::parse("f", Some("f")).is_err());
@@ -815,13 +891,25 @@ fn encoders() {
 
 #[test]
 fn synthetic_sizes() {
-    let classes =
-        |counts: &Counts| -> Vec<Class> { image::synthetic(counts, false).into_iter().map(|it| it.0).collect() };
+    let classes = |counts: &Counts| -> Vec<Class> {
+        image::synthetic(counts, false).into_iter().map(|it| it.0).collect()
+    };
     assert_eq!(
         classes(&Counts::default()),
-        [Class::Synthetic(DEBUG), Class::Synthetic(TLS_DIR), Class::Synthetic(TLS_INDEX), Class::Synthetic(RELOC)]
+        [
+            Class::Synthetic(DEBUG),
+            Class::Synthetic(TLS_DIR),
+            Class::Synthetic(TLS_INDEX),
+            Class::Synthetic(RELOC)
+        ]
     );
-    let counts = Counts { libraries: 1, imports: 1, import_names: 10, library_names: 12, ..Counts::default() };
+    let counts = Counts {
+        libraries: 1,
+        imports: 1,
+        import_names: 10,
+        library_names: 12,
+        ..Counts::default()
+    };
     let sizes = image::synthetic(&counts, false);
     let idata = sizes.iter().find(|it| it.0 == Class::Synthetic(IDATA)).unwrap().1;
     // Two descriptors, a lookup table of 2, a hint/name entry, the DLL name.
@@ -830,8 +918,12 @@ fn synthetic_sizes() {
 
 #[test]
 fn base_relocation_blocks_encode() {
-    let pieces = vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Data, Data::Bytes(vec![0; 0x2000]))];
-    let mut f = Fixture::new(exe(), pieces, &Counts { absolute: 3, image: 0x2000, ..Counts::default() });
+    let pieces = vec![
+        (Class::Text, Data::Bytes(vec![0xc3; 0x10])),
+        (Class::Data, Data::Bytes(vec![0; 0x2000])),
+    ];
+    let mut f =
+        Fixture::new(exe(), pieces, &Counts { absolute: 3, image: 0x2000, ..Counts::default() });
     let data = f.at(&Class::Data);
     assert_eq!(data % 0x1000, 0);
     f.rebase = vec![data + 0x1008, data, data + 0x10, data];
@@ -852,7 +944,10 @@ fn base_relocation_blocks_encode() {
 
 #[test]
 fn base_relocations_are_the_same_bytes_in_any_number_of_pieces() {
-    let pieces = vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Data, Data::Bytes(vec![0; 0x40000]))];
+    let pieces = vec![
+        (Class::Text, Data::Bytes(vec![0xc3; 0x10])),
+        (Class::Data, Data::Bytes(vec![0; 0x40000])),
+    ];
     let mut f = Fixture::new(exe(), pieces, &Counts::default());
     let data = f.at(&Class::Data);
     // Dense pages, sparse pages, duplicates, and an odd count per page (a pad entry), unsorted.
@@ -862,13 +957,18 @@ fn base_relocations_are_the_same_bytes_in_any_number_of_pieces() {
     rebase.reverse();
     f.rebase = rebase;
     let extra = [data + 0x3f008, data + 0x18, data + 0x25000];
-    let whole = f.placed(|placed| image::relocations(Image::of(placed), &extra, usize::MAX)).unwrap();
+    let whole =
+        f.placed(|placed| image::relocations(Image::of(placed), &extra, usize::MAX)).unwrap();
     for piece in [1, 2, 7, 512, 4096] {
-        let split = f.placed(|placed| image::relocations(Image::of(placed), &extra, piece)).unwrap();
+        let split =
+            f.placed(|placed| image::relocations(Image::of(placed), &extra, piece)).unwrap();
         assert_eq!(split, whole, "pieces of {piece}");
     }
-    let threads = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
-    let one = threads.install(|| f.placed(|placed| image::relocations(Image::of(placed), &extra, 7))).unwrap();
+    let threads =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let one = threads
+        .install(|| f.placed(|placed| image::relocations(Image::of(placed), &extra, 7)))
+        .unwrap();
     assert_eq!(one, whole);
 
     let mut blocks = 0;
@@ -886,19 +986,43 @@ fn base_relocations_are_the_same_bytes_in_any_number_of_pieces() {
 }
 
 /// Each synthetic table's bytes, in the order `Tables::of` gives them.
-fn tables(pe: &Pe, f: &Fixture, synthesis: u64, delta: Option<&Delta<'_>>) -> Vec<(Class, Vec<u8>)> {
+fn tables(
+    pe: &Pe,
+    f: &Fixture,
+    synthesis: u64,
+    delta: Option<&Delta<'_>>,
+) -> Vec<(Class, Vec<u8>)> {
     let tables = f.placed_at(synthesis, delta, |placed| Tables::of(pe, placed)).unwrap();
-    tables.regions.into_iter().map(|(class, bytes)| (class, bytes.contiguous().into_owned())).collect()
+    tables
+        .regions
+        .into_iter()
+        .map(|(class, bytes)| (class, bytes.contiguous().into_owned()))
+        .collect()
 }
 
-fn table(pe: &Pe, f: &Fixture, synthesis: u64, delta: Option<&Delta<'_>>, name: &'static str) -> Vec<u8> {
+fn table(
+    pe: &Pe,
+    f: &Fixture,
+    synthesis: u64,
+    delta: Option<&Delta<'_>>,
+    name: &'static str,
+) -> Vec<u8> {
     let class = Class::Synthetic(name);
     tables(pe, f, synthesis, delta).into_iter().find(|it| it.0 == class).unwrap().1
 }
 
 /// What changed since synthesis `from`: no region moved, the same names, no GOT cell or bind.
 fn delta<'a>(functions: &'a [Splice], rebase: &'a [Splice], from: u64) -> Delta<'a> {
-    Delta { functions, rebase, got: &[], binds: &[], same_names: true, same_regions: true, written: &[], from }
+    Delta {
+        functions,
+        rebase,
+        got: &[],
+        binds: &[],
+        same_names: true,
+        same_regions: true,
+        written: &[],
+        from,
+    }
 }
 
 fn splice(at: u32) -> Splice {
@@ -920,7 +1044,10 @@ fn incremental_tables_are_patched_to_a_builds_bytes() {
     f.functions[1].size = 0x18;
     f.rebase[1] = data + 4;
     let (functions, rebase) = ([splice(1)], [splice(1)]);
-    assert_eq!(tables(&kept, &f, 2, Some(&delta(&functions, &rebase, 1))), tables(&built, &f, 0, None));
+    assert_eq!(
+        tables(&kept, &f, 2, Some(&delta(&functions, &rebase, 1))),
+        tables(&built, &f, 0, None)
+    );
     let counts = |pe: &Pe| {
         let last = pe.last().unwrap();
         (last.pdata.patched, last.reloc.patched, last.idata.reused, last.edata.reused)
@@ -932,7 +1059,10 @@ fn incremental_tables_are_patched_to_a_builds_bytes() {
     f.functions[0] = function(text + 0x38, 8, rodata);
     f.rebase[1] = f.rebase[0];
     let (functions, rebase) = ([splice(0)], [splice(1)]);
-    assert_eq!(tables(&kept, &f, 3, Some(&delta(&functions, &rebase, 2))), tables(&built, &f, 0, None));
+    assert_eq!(
+        tables(&kept, &f, 3, Some(&delta(&functions, &rebase, 2))),
+        tables(&built, &f, 0, None)
+    );
     assert_eq!(counts(&kept), (1, 1, 2, 2));
 
     // Changes from a synthesis the tables are not of: every table built.
@@ -974,12 +1104,17 @@ fn pdata_in_pieces_is_the_sorted_merge() {
                 .map(|it| (f.rva(it.addr), f.rva(it.addr + it.size), f.rva(rodata))),
         );
         entries.sort_unstable();
-        entries.iter().flat_map(|&(begin, end, info)| [begin, end, info]).flat_map(u32::to_le_bytes).collect::<Vec<u8>>()
+        entries
+            .iter()
+            .flat_map(|&(begin, end, info)| [begin, end, info])
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<u8>>()
     };
     let built = pe(exe());
     let whole = table(&built, &f, 0, None, PDATA);
     assert_eq!(whole, expected(&f));
-    let threads = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let threads =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     assert_eq!(threads.install(|| table(&built, &f, 0, None, PDATA)), whole);
 
     let kept = incremental();
@@ -996,8 +1131,15 @@ fn pdata_in_pieces_is_the_sorted_merge() {
 
 #[test]
 fn incremental_base_relocations_are_a_builds_bytes() {
-    let pieces = vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Data, Data::Bytes(vec![0; 0x40000]))];
-    let mut f = Fixture::new(exe(), pieces, &Counts { absolute: 0x4000, image: 0x40000, ..Counts::default() });
+    let pieces = vec![
+        (Class::Text, Data::Bytes(vec![0xc3; 0x10])),
+        (Class::Data, Data::Bytes(vec![0; 0x40000])),
+    ];
+    let mut f = Fixture::new(
+        exe(),
+        pieces,
+        &Counts { absolute: 0x4000, image: 0x40000, ..Counts::default() },
+    );
     let data = f.at(&Class::Data);
     f.rebase = (0..0x4000).map(|it| data + it * 16).collect();
     let (built, kept) = (pe(exe()), incremental());
@@ -1006,32 +1148,53 @@ fn incremental_base_relocations_are_a_builds_bytes() {
     f.rebase[100] += 8;
     f.rebase[9000] += 4;
     let rebase = [splice(100), splice(9000)];
-    assert_eq!(table(&kept, &f, 2, Some(&delta(&[], &rebase, 1)), RELOC), table(&built, &f, 0, None, RELOC));
+    assert_eq!(
+        table(&kept, &f, 2, Some(&delta(&[], &rebase, 1)), RELOC),
+        table(&built, &f, 0, None, RELOC)
+    );
     assert_eq!(kept.last().unwrap().reloc.patched, 1);
 
     // Onto the address after it: a build has one entry for the two.
     f.rebase[101] = f.rebase[102];
     let rebase = [splice(101)];
-    assert_eq!(table(&kept, &f, 3, Some(&delta(&[], &rebase, 2)), RELOC), table(&built, &f, 0, None, RELOC));
+    assert_eq!(
+        table(&kept, &f, 3, Some(&delta(&[], &rebase, 2)), RELOC),
+        table(&built, &f, 0, None, RELOC)
+    );
     // And back: the address after it needs its entry again.
     f.rebase[101] = data + 101 * 16;
-    assert_eq!(table(&kept, &f, 4, Some(&delta(&[], &rebase, 3)), RELOC), table(&built, &f, 0, None, RELOC));
+    assert_eq!(
+        table(&kept, &f, 4, Some(&delta(&[], &rebase, 3)), RELOC),
+        table(&built, &f, 0, None, RELOC)
+    );
     // The first of a page into the page before, in order still: its block is another.
     f.rebase[256] = data + 0xff8;
     let rebase = [splice(256)];
-    assert_eq!(table(&kept, &f, 5, Some(&delta(&[], &rebase, 4)), RELOC), table(&built, &f, 0, None, RELOC));
+    assert_eq!(
+        table(&kept, &f, 5, Some(&delta(&[], &rebase, 4)), RELOC),
+        table(&built, &f, 0, None, RELOC)
+    );
     assert_eq!(kept.last().unwrap().reloc.patched, 1);
 }
 
 // Inputs.
 
-const TEXT: u32 = pe::IMAGE_SCN_CNT_CODE.0 | pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_ALIGN_16BYTES.0;
-const DATA: u32 =
-    pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_ALIGN_8BYTES.0;
-const RDATA: u32 = pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_ALIGN_4BYTES.0;
-const BSS: u32 =
-    pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_ALIGN_8BYTES.0;
-const INFO: u32 = pe::IMAGE_SCN_LNK_INFO.0 | pe::IMAGE_SCN_LNK_REMOVE.0 | pe::IMAGE_SCN_ALIGN_1BYTES.0;
+const TEXT: u32 = pe::IMAGE_SCN_CNT_CODE.0
+    | pe::IMAGE_SCN_MEM_EXECUTE.0
+    | pe::IMAGE_SCN_MEM_READ.0
+    | pe::IMAGE_SCN_ALIGN_16BYTES.0;
+const DATA: u32 = pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0
+    | pe::IMAGE_SCN_MEM_READ.0
+    | pe::IMAGE_SCN_MEM_WRITE.0
+    | pe::IMAGE_SCN_ALIGN_8BYTES.0;
+const RDATA: u32 =
+    pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_ALIGN_4BYTES.0;
+const BSS: u32 = pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA.0
+    | pe::IMAGE_SCN_MEM_READ.0
+    | pe::IMAGE_SCN_MEM_WRITE.0
+    | pe::IMAGE_SCN_ALIGN_8BYTES.0;
+const INFO: u32 =
+    pe::IMAGE_SCN_LNK_INFO.0 | pe::IMAGE_SCN_LNK_REMOVE.0 | pe::IMAGE_SCN_ALIGN_1BYTES.0;
 const FUNCTION: u16 = pe::IMAGE_SYM_DTYPE_FUNCTION.0 << 4;
 
 struct CoffSection {
@@ -1058,7 +1221,13 @@ impl Coff {
     }
 
     fn bss(&mut self, name: &'static str, flags: u32, size: u32) -> i16 {
-        self.sections.push(CoffSection { name, flags, data: Vec::new(), zero: size, relocations: Vec::new() });
+        self.sections.push(CoffSection {
+            name,
+            flags,
+            data: Vec::new(),
+            zero: size,
+            relocations: Vec::new(),
+        });
         self.sections.len() as i16
     }
 
@@ -1067,7 +1236,15 @@ impl Coff {
     }
 
     /// Adds a symbol and its aux records; its index in the table.
-    fn symbol(&mut self, name: &str, value: u32, section: i16, typ: u16, class: u8, aux: &[[u8; 18]]) -> u32 {
+    fn symbol(
+        &mut self,
+        name: &str,
+        value: u32,
+        section: i16,
+        typ: u16,
+        class: u8,
+        aux: &[[u8; 18]],
+    ) -> u32 {
         let index = self.symbols.len() as u32;
         let mut record = [0u8; 18];
         if name.len() <= 8 {
@@ -1178,7 +1355,8 @@ fn object() -> Vec<u8> {
     let mut entry = vec![0u8; 12];
     entry[4..8].copy_from_slice(&4u32.to_le_bytes());
     let pdata = coff.section(".pdata", RDATA | pe::IMAGE_SCN_LNK_COMDAT.0, entry);
-    let xdata = coff.section(".xdata", RDATA | pe::IMAGE_SCN_LNK_COMDAT.0, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+    let xdata =
+        coff.section(".xdata", RDATA | pe::IMAGE_SCN_LNK_COMDAT.0, vec![1, 0, 0, 0, 0, 0, 0, 0]);
     let tls = coff.section(".tls$", DATA, vec![0; 8]);
     let bss = coff.bss(".bss", BSS, 32);
 
@@ -1199,12 +1377,18 @@ fn object() -> Vec<u8> {
     assert_eq!(coff.section_symbol(inline, 0, pe::IMAGE_COMDAT_SELECT_ANY.0), 6);
     assert_eq!(coff.symbol("inline_fn", 0, inline, FUNCTION, external, &[]), 8);
     assert_eq!(coff.section_symbol(pdata, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0), 9);
-    assert_eq!(coff.section_symbol(xdata, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0), 11);
+    assert_eq!(
+        coff.section_symbol(xdata, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0),
+        11
+    );
     assert_eq!(coff.symbol("callee", 0, 0, FUNCTION, external, &[]), 13);
     assert_eq!(coff.symbol("tls_var", 0, tls, 0, external, &[]), 14);
     assert_eq!(coff.symbol("main_fn", 0, text, FUNCTION, external, &[]), 15);
     let weak = weak_aux(15, pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS.0);
-    assert_eq!(coff.symbol("weak_fn", 0, 0, FUNCTION, pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL.0, &[weak]), 16);
+    assert_eq!(
+        coff.symbol("weak_fn", 0, 0, FUNCTION, pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL.0, &[weak]),
+        16
+    );
     assert_eq!(coff.symbol("common_v", 24, 0, 0, external, &[]), 18);
     assert_eq!(coff.symbol("a_very_long_symbol_name", 8, data, 0, external, &[]), 19);
     assert_eq!(coff.symbol("zeroed", 0, bss, 0, external, &[]), 20);
@@ -1260,7 +1444,11 @@ fn coff_object_sections_and_groups() {
         ]
     );
     let tie = |section, to| crate::model::Tie { section, to, ordered: false };
-    assert_eq!(object.ties, [tie(4, 3), tie(5, 3)], "`.pdata` and `.xdata` are kept with `.text$mn`");
+    assert_eq!(
+        object.ties,
+        [tie(4, 3), tie(5, 3)],
+        "`.pdata` and `.xdata` are kept with `.text$mn`"
+    );
 }
 
 /// SanitizerCoverage's tables of a COMDAT function: counters associative to the function,
@@ -1284,7 +1472,11 @@ fn coff_associative_sections_are_tied_to_their_parent() {
     assert_eq!(object.ties, [tie(2, 1), tie(3, 2), tie(4, 0)], "each to its own parent");
     assert_eq!(object.group_sections(&object.groups[0]), [1, 2, 3], "and in its root's group");
     let retain: Vec<bool> = object.sections.iter().map(|it| it.retain).collect();
-    assert_eq!(retain, [true, false, false, false, true], "a non-COMDAT parent is always kept, so is its child");
+    assert_eq!(
+        retain,
+        [true, false, false, false, true],
+        "a non-COMDAT parent is always kept, so is its child"
+    );
 }
 
 #[test]
@@ -1312,7 +1504,8 @@ fn coff_object_symbols() {
             "alias",
         ]
     );
-    let symbol = |name: &str| object.symbols.iter().find(|it| object.name(it.name) == name).unwrap();
+    let symbol =
+        |name: &str| object.symbols.iter().find(|it| object.name(it.name) == name).unwrap();
     assert_eq!(symbol(".text").kind, SymbolKind::Section);
     assert_eq!(symbol(".text").def, SymbolDef::Section { section: 0, value: 0, size: 16 });
     assert_eq!(symbol(".text").binding, Binding::Local);
@@ -1325,7 +1518,10 @@ fn coff_object_symbols() {
     assert_eq!(symbol("weak_fn").def, SymbolDef::Fallback { symbol: 9, search: true });
     assert_eq!(symbol("weak_fn").binding, Binding::Weak);
     assert_eq!(symbol("common_v").def, SymbolDef::Common { size: 24, align: 32 });
-    assert_eq!(symbol("a_very_long_symbol_name").def, SymbolDef::Section { section: 1, value: 8, size: 8 });
+    assert_eq!(
+        symbol("a_very_long_symbol_name").def,
+        SymbolDef::Section { section: 1, value: 8, size: 8 }
+    );
     assert_eq!(symbol("zeroed").def, SymbolDef::Section { section: 7, value: 0, size: 32 });
     assert_eq!(symbol("target").def, SymbolDef::Undefined);
     assert_eq!(symbol("alias").def, SymbolDef::Fallback { symbol: 14, search: false });
@@ -1348,7 +1544,11 @@ fn coff_object_relocations() {
     assert_eq!(fixups(1), [fixup(0, Apply::Abs64, 7, 16), fixup(8, Apply::Abs32, 9, 0)]);
     assert_eq!(
         fixups(4),
-        [fixup(0, Apply::ImageRel32, 4, 0), fixup(4, Apply::ImageRel32, 4, 4), fixup(8, Apply::ImageRel32, 6, 0)]
+        [
+            fixup(0, Apply::ImageRel32, 4, 0),
+            fixup(4, Apply::ImageRel32, 4, 4),
+            fixup(8, Apply::ImageRel32, 6, 0)
+        ]
     );
     assert!(fixups(2).is_empty());
     assert!(fixups(7).is_empty());
@@ -1359,7 +1559,8 @@ fn coff_object_relocations() {
 
 #[test]
 fn what_blaze_does_not_link_is_named() {
-    let read = |coff: &Coff| pe(exe()).read("bad.obj", &coff.bytes(), &NativeKind::Object).err().unwrap();
+    let read =
+        |coff: &Coff| pe(exe()).read("bad.obj", &coff.bytes(), &NativeKind::Object).err().unwrap();
 
     let mut coff = Coff::default();
     let text = coff.section(".text", TEXT, vec![0; 8]);
@@ -1367,7 +1568,10 @@ fn what_blaze_does_not_link_is_named() {
     let target = coff.symbol("f", 0, 0, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]);
     coff.relocate(text, 0, target, pe::IMAGE_REL_AMD64_SSPAN32.0);
     let error = read(&coff);
-    assert!(error.contains("SSPAN32") && error.contains("bad.obj") && error.contains('f'), "{error}");
+    assert!(
+        error.contains("SSPAN32") && error.contains("bad.obj") && error.contains('f'),
+        "{error}"
+    );
 
     let mut coff = Coff::default();
     let text = coff.section(".text$x", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0; 8]);
@@ -1470,11 +1674,18 @@ pub(crate) fn archive(members: &[(&str, Vec<u8>, &[&str])]) -> Vec<u8> {
 #[test]
 fn short_import_members() {
     let pe = pe(exe());
-    let read = |bytes: &[u8]| match pe.read("k32.lib(k32.dll)", bytes, &NativeKind::Object).unwrap() {
+    let read = |bytes: &[u8]| match pe.read("k32.lib(k32.dll)", bytes, &NativeKind::Object).unwrap()
+    {
         NativeFile::Shared(shared) => shared,
         _ => panic!("an import member not read as a DLL's import"),
     };
-    let shared = read(&short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0));
+    let shared = read(&short_import(
+        "ExitProcess",
+        "KERNEL32.dll",
+        356,
+        pe::IMPORT_OBJECT_CODE.0,
+        pe::IMPORT_OBJECT_NAME.0,
+    ));
     assert_eq!(shared.name, "KERNEL32.dll");
     assert_eq!(shared.symbols.len(), 1);
     assert_eq!(shared.symbol_name(&shared.symbols[0]), "ExitProcess");
@@ -1484,25 +1695,50 @@ fn short_import_members() {
     assert_eq!(shared.symbols[0].kind, SymbolKind::Function);
     assert!(!shared.symbols[0].weak);
 
-    let shared = read(&short_import("_f@8", "X.dll", 2, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME_UNDECORATE.0));
+    let shared = read(&short_import(
+        "_f@8",
+        "X.dll",
+        2,
+        pe::IMPORT_OBJECT_CODE.0,
+        pe::IMPORT_OBJECT_NAME_UNDECORATE.0,
+    ));
     assert_eq!(shared.symbol_name(&shared.symbols[0]), "_f@8");
     assert_eq!(shared.version(&shared.symbols[0]), Some("2 f"));
-    let shared = read(&short_import("_g", "X.dll", 3, pe::IMPORT_OBJECT_DATA.0, pe::IMPORT_OBJECT_NAME_NO_PREFIX.0));
+    let shared = read(&short_import(
+        "_g",
+        "X.dll",
+        3,
+        pe::IMPORT_OBJECT_DATA.0,
+        pe::IMPORT_OBJECT_NAME_NO_PREFIX.0,
+    ));
     assert_eq!(shared.version(&shared.symbols[0]), Some("3 g"));
     assert_eq!(shared.symbols[0].kind, SymbolKind::Data);
-    let shared = read(&short_import("ord", "X.dll", 115, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_ORDINAL.0));
+    let shared = read(&short_import(
+        "ord",
+        "X.dll",
+        115,
+        pe::IMPORT_OBJECT_CODE.0,
+        pe::IMPORT_OBJECT_ORDINAL.0,
+    ));
     assert_eq!(shared.version(&shared.symbols[0]), Some("#115"));
 
-    let error = pe.read("x.lib(x)", &short_import("h", "X.dll", 0, 3, 1), &NativeKind::Object).err().unwrap();
+    let error = pe
+        .read("x.lib(x)", &short_import("h", "X.dll", 0, 3, 1), &NativeKind::Object)
+        .err()
+        .unwrap();
     assert!(error.contains("import type 3"), "{error}");
-    let error = pe.read("x.lib(x)", &short_import("h", "X.dll", 0, 0, 5), &NativeKind::Object).err().unwrap();
+    let error = pe
+        .read("x.lib(x)", &short_import("h", "X.dll", 0, 0, 5), &NativeKind::Object)
+        .err()
+        .unwrap();
     assert!(error.contains("import name type 5"), "{error}");
 }
 
 #[test]
 fn a_name_that_is_not_utf8_is_an_error() {
     let pe = pe(exe());
-    let mut import = short_import("hello", "X.dll", 0, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
+    let mut import =
+        short_import("hello", "X.dll", 0, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
     import[20] = 0xff;
     let error = pe.read("x.lib(x)", &import, &NativeKind::Object).err().unwrap();
     assert!(error.contains("x.lib(x)") && error.contains("not UTF-8"), "{error}");
@@ -1517,13 +1753,21 @@ fn a_name_that_is_not_utf8_is_an_error() {
 
 #[test]
 fn archive_index_names_members() {
-    let import = short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
+    let import = short_import(
+        "ExitProcess",
+        "KERNEL32.dll",
+        356,
+        pe::IMPORT_OBJECT_CODE.0,
+        pe::IMPORT_OBJECT_NAME.0,
+    );
     let bytes = archive(&[
         ("test.obj", object(), &["main_fn", "inline_fn"]),
         ("k32.dll", import.clone(), &["ExitProcess", "__imp_ExitProcess"]),
     ]);
     let pe = pe(exe());
-    let NativeFile::Archive(archive) = pe.read("t.lib", &bytes, &NativeKind::Archive { whole: false }).unwrap() else {
+    let NativeFile::Archive(archive) =
+        pe.read("t.lib", &bytes, &NativeKind::Archive { whole: false }).unwrap()
+    else {
         panic!("not read as an archive")
     };
     let members: Vec<&str> = archive.members.iter().map(|it| archive.name(it.name)).collect();
@@ -1532,7 +1776,10 @@ fn archive_index_names_members() {
     let mut index: Vec<(&str, u32)> =
         archive.index.iter().map(|&(name, member)| (archive.name(name), member)).collect();
     index.sort();
-    assert_eq!(index, [("ExitProcess", 1), ("__imp_ExitProcess", 1), ("inline_fn", 0), ("main_fn", 0)]);
+    assert_eq!(
+        index,
+        [("ExitProcess", 1), ("__imp_ExitProcess", 1), ("inline_fn", 0), ("main_fn", 0)]
+    );
     let member = &bytes[archive.members[0].bytes.clone()];
     let object = read_object(member);
     assert_eq!(object.groups.len(), 1);
@@ -1546,12 +1793,26 @@ fn import_library_is_a_shared_per_dll() {
     let code = pe::IMPORT_OBJECT_CODE.0;
     let name = pe::IMPORT_OBJECT_NAME.0;
     let bytes = archive(&[
-        ("k32.dll", short_import("ExitProcess", "KERNEL32.dll", 1, code, name), &["ExitProcess", "__imp_ExitProcess"]),
-        ("u32.dll", short_import("MessageBoxW", "USER32.dll", 2, code, name), &["MessageBoxW", "__imp_MessageBoxW"]),
-        ("k32.dll", short_import("Sleep", "KERNEL32.dll", 3, code, name), &["Sleep", "__imp_Sleep"]),
+        (
+            "k32.dll",
+            short_import("ExitProcess", "KERNEL32.dll", 1, code, name),
+            &["ExitProcess", "__imp_ExitProcess"],
+        ),
+        (
+            "u32.dll",
+            short_import("MessageBoxW", "USER32.dll", 2, code, name),
+            &["MessageBoxW", "__imp_MessageBoxW"],
+        ),
+        (
+            "k32.dll",
+            short_import("Sleep", "KERNEL32.dll", 3, code, name),
+            &["Sleep", "__imp_Sleep"],
+        ),
     ]);
     let pe = pe(exe());
-    let NativeFile::Shared(shared) = pe.read("mixed.lib", &bytes, &NativeKind::Shared { as_needed: true }).unwrap() else {
+    let NativeFile::Shared(shared) =
+        pe.read("mixed.lib", &bytes, &NativeKind::Shared { as_needed: true }).unwrap()
+    else {
         panic!("not read as an import library")
     };
     assert_eq!(shared.name, "KERNEL32.dll");
@@ -1565,7 +1826,8 @@ fn import_library_is_a_shared_per_dll() {
     assert_eq!(user32.symbol_name(&user32.symbols[0]), "MessageBoxW");
     assert_eq!(user32.version(&user32.symbols[0]), Some("2 MessageBoxW"));
 
-    let error = pe.read("x.dll", b"MZ\x90\0", &NativeKind::Shared { as_needed: true }).err().unwrap();
+    let error =
+        pe.read("x.dll", b"MZ\x90\0", &NativeKind::Shared { as_needed: true }).err().unwrap();
     assert!(error.contains("import library"), "{error}");
 }
 
@@ -1577,14 +1839,17 @@ fn import_library_groups_as_one_pass_would() {
     let pe = pe(exe());
     let (members, dlls) = (3 * 1000 + 11, 7);
     let bytes = import_archive(members, dlls);
-    let NativeFile::Shared(shared) = pe.read("x.lib", &bytes, &NativeKind::Shared { as_needed: true }).unwrap() else {
+    let NativeFile::Shared(shared) =
+        pe.read("x.lib", &bytes, &NativeKind::Shared { as_needed: true }).unwrap()
+    else {
         panic!("not read as an import library")
     };
     assert_eq!(shared.more.len(), dlls - 1);
     for (dll, read) in std::iter::once(&shared).chain(&shared.more).enumerate() {
         assert_eq!(read.name, format!("D{dll}.dll"));
         let names: Vec<&str> = read.symbols.iter().map(|it| read.symbol_name(it)).collect();
-        let expected: Vec<String> = (dll..members).step_by(dlls).map(|at| format!("F{at}")).collect();
+        let expected: Vec<String> =
+            (dll..members).step_by(dlls).map(|at| format!("F{at}")).collect();
         assert_eq!(names, expected, "D{dll}.dll");
     }
 
@@ -1596,7 +1861,8 @@ fn import_library_groups_as_one_pass_would() {
         ("u32.dll", short_import("MessageBoxW", "USER32.dll", 2, code, name), &["MessageBoxW"]),
         ("second.obj", object(), &["other_fn"]),
     ]);
-    let error = pe.read("mixed.lib", &bytes, &NativeKind::Shared { as_needed: true }).err().unwrap();
+    let error =
+        pe.read("mixed.lib", &bytes, &NativeKind::Shared { as_needed: true }).err().unwrap();
     assert!(error.contains("first.obj") && !error.contains("second.obj"), "{error}");
 }
 
@@ -1612,24 +1878,47 @@ fn directives_only(directives: &str) -> Vec<u8> {
 
 #[test]
 fn archive_members_ask_for_their_default_libraries() {
-    let import = short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
+    let import = short_import(
+        "ExitProcess",
+        "KERNEL32.dll",
+        356,
+        pe::IMPORT_OBJECT_CODE.0,
+        pe::IMPORT_OBJECT_NAME.0,
+    );
     let bytes = archive(&[
-        ("a.obj", directives_only("/DEFAULTLIB:vcruntime -defaultlib:\"ucrt.lib\" /DEFAULTLIB:libcmt /nodefaultlib:LIBCMT.LIB /INCLUDE:x"), &[]),
+        (
+            "a.obj",
+            directives_only(
+                "/DEFAULTLIB:vcruntime -defaultlib:\"ucrt.lib\" /DEFAULTLIB:libcmt /nodefaultlib:LIBCMT.LIB /INCLUDE:x",
+            ),
+            &[],
+        ),
         ("k32.dll", import, &[]),
         ("b.obj", directives_only("/DEFAULTLIB:VCRUNTIME.lib /DEFAULTLIB:oldnames"), &[]),
         ("c.obj", directives_only("/DEFAULTLIB:gone /NODEFAULTLIB"), &[]),
         ("test.obj", object(), &["main_fn"]),
     ]);
     let asked = asked_libraries("msvcrt.lib", &bytes).unwrap();
-    let asked: Vec<(&str, &str)> = asked.iter().map(|(member, library)| (member.as_str(), library.as_str())).collect();
+    let asked: Vec<(&str, &str)> =
+        asked.iter().map(|(member, library)| (member.as_str(), library.as_str())).collect();
     assert_eq!(
         asked,
-        [("a.obj", "vcruntime.lib"), ("a.obj", "ucrt.lib"), ("b.obj", "oldnames.lib"), ("test.obj", "msvcrt.lib")],
+        [
+            ("a.obj", "vcruntime.lib"),
+            ("a.obj", "ucrt.lib"),
+            ("b.obj", "oldnames.lib"),
+            ("test.obj", "msvcrt.lib")
+        ],
         "each once, in member order, less its member's own /NODEFAULTLIBs"
     );
 
-    let error = asked_libraries("x.lib", &archive(&[("bad.obj", directives_only("/DEFAULTLIB"), &[])])).unwrap_err();
-    assert!(error.contains("x.lib(bad.obj)") && error.contains("/DEFAULTLIB needs an argument"), "{error}");
+    let error =
+        asked_libraries("x.lib", &archive(&[("bad.obj", directives_only("/DEFAULTLIB"), &[])]))
+            .unwrap_err();
+    assert!(
+        error.contains("x.lib(bad.obj)") && error.contains("/DEFAULTLIB needs an argument"),
+        "{error}"
+    );
     assert!(asked_libraries("empty.lib", b"!<arch>\n").unwrap().is_empty());
 }
 
@@ -1645,7 +1934,13 @@ fn functions_object(functions: usize) -> Vec<u8> {
     let mut coff = Coff::default();
     let data = coff.section(".data", DATA, vec![0; 8 * functions]);
     let texts: Vec<i16> = (0..functions)
-        .map(|_| coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0xe8, 0, 0, 0, 0, 0xc3]))
+        .map(|_| {
+            coff.section(
+                ".text$mn",
+                TEXT | pe::IMAGE_SCN_LNK_COMDAT.0,
+                vec![0xe8, 0, 0, 0, 0, 0xc3],
+            )
+        })
         .collect();
     // `.data`'s symbol and its aux record, then per function its section's symbol, the aux
     // record and the function.
@@ -1658,7 +1953,10 @@ fn functions_object(functions: usize) -> Vec<u8> {
     for (at, &text) in texts.iter().enumerate() {
         assert_eq!(coff.section_symbol(text, 0, pe::IMAGE_COMDAT_SELECT_ANY.0), function(at) - 2);
         let name = format!("f{at}");
-        assert_eq!(coff.symbol(&name, 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]), function(at));
+        assert_eq!(
+            coff.symbol(&name, 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]),
+            function(at)
+        );
     }
     coff.bytes()
 }
@@ -1667,12 +1965,19 @@ fn functions_object(functions: usize) -> Vec<u8> {
 /// spread over `dlls` DLLs.
 fn import_archive(members: usize, dlls: usize) -> Vec<u8> {
     let names: Vec<String> = (0..members).map(|at| format!("m{at}.dll")).collect();
-    let symbols: Vec<[String; 2]> = (0..members).map(|at| [format!("F{at}"), format!("__imp_F{at}")]).collect();
+    let symbols: Vec<[String; 2]> =
+        (0..members).map(|at| [format!("F{at}"), format!("__imp_F{at}")]).collect();
     let indexed: Vec<[&str; 2]> = symbols.iter().map(|[a, b]| [a.as_str(), b.as_str()]).collect();
     let list: Vec<(&str, Vec<u8>, &[&str])> = (0..members)
         .map(|at| {
             let dll = format!("D{}.dll", at % dlls);
-            let bytes = short_import(&symbols[at][0], &dll, 1, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
+            let bytes = short_import(
+                &symbols[at][0],
+                &dll,
+                1,
+                pe::IMPORT_OBJECT_CODE.0,
+                pe::IMPORT_OBJECT_NAME.0,
+            );
             (names[at].as_str(), bytes, &indexed[at][..])
         })
         .collect();
@@ -1728,7 +2033,8 @@ fn archive_read_allocates_its_three_columns() {
 fn import_library_read_allocates_per_member() {
     let pe = pe(exe());
     // One worker, measured on it: the members are parsed and grouped on the pool's threads.
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let read = |members: usize| {
         let bytes = import_archive(members, 3);
         let used = pool
@@ -1737,7 +2043,10 @@ fn import_library_read_allocates_per_member() {
         used
     };
     let (small, large) = (read(64), read(256));
-    assert!(large - small <= 2 * (256 - 64), "{small} and {large} allocations: at most two more per member");
+    assert!(
+        large - small <= 2 * (256 - 64),
+        "{small} and {large} allocations: at most two more per member"
+    );
 }
 
 /// The writer's lookups by name allocate nothing: what a name is to the link, a section's
@@ -1760,13 +2069,21 @@ fn name_lookups_allocate_nothing() {
         for name in specials {
             std::hint::black_box(pe.special(name));
         }
-        let sections = [".text$mn", ".rdata$r", ".xdata", ".data", ".bss", ".tls$", ".tls$ZZZ", ".CRT$XCU", ".pdata", ".rsrc$01"];
+        let sections = [
+            ".text$mn", ".rdata$r", ".xdata", ".data", ".bss", ".tls$", ".tls$ZZZ", ".CRT$XCU",
+            ".pdata", ".rsrc$01",
+        ];
         for name in sections {
             std::hint::black_box(pe.section(name, false, false, false).is_ok());
         }
         std::hint::black_box(ImportName::parse("f", Some("356 ExitProcess")));
         std::hint::black_box(ImportName::parse("f", Some("#115")));
-        std::hint::black_box((rank(Some("XCU")), place(&Class::Got), pe.prot(&Class::Text), pe.own(&Class::Tbss)));
+        std::hint::black_box((
+            rank(Some("XCU")),
+            place(&Class::Got),
+            pe.prot(&Class::Text),
+            pe.own(&Class::Tbss),
+        ));
     });
 }
 
@@ -1775,13 +2092,16 @@ fn name_lookups_allocate_nothing() {
 #[test]
 fn base_relocations_of_one_piece_are_one_buffer() {
     for count in [16u64, 4096] {
-        let pieces =
-            vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Data, Data::Bytes(vec![0; count as usize * 8]))];
+        let pieces = vec![
+            (Class::Text, Data::Bytes(vec![0xc3; 0x10])),
+            (Class::Data, Data::Bytes(vec![0; count as usize * 8])),
+        ];
         let mut f = Fixture::new(exe(), pieces, &Counts::default());
         let data = f.at(&Class::Data);
         f.rebase = (0..count).map(|it| data + it * 8).collect();
-        let (relocations, used) =
-            f.placed(|placed| measure(|| image::relocations(Image::of(placed), &[data], usize::MAX)));
+        let (relocations, used) = f.placed(|placed| {
+            measure(|| image::relocations(Image::of(placed), &[data], usize::MAX))
+        });
         assert!(relocations.is_ok());
         assert_eq!(used.allocations, 1, "{count} addresses: the bytes of `.reloc` alone");
     }
@@ -1838,7 +2158,8 @@ fn callbacks(cells: &[u64]) -> Vec<u8> {
 }
 
 fn rebased(file: &PeFile64<'_>, image: &[u8]) -> Vec<u32> {
-    let mut blocks = file.data_directories().relocation_blocks(image, &file.section_table()).unwrap().unwrap();
+    let mut blocks =
+        file.data_directories().relocation_blocks(image, &file.section_table()).unwrap().unwrap();
     let mut seen = Vec::new();
     while let Some(block) = blocks.next().unwrap() {
         seen.extend(block.map(|it| it.virtual_address));
@@ -1862,7 +2183,8 @@ fn section_headers(file: &PeFile64<'_>) -> Vec<(u32, u32, u32, u32, u32)> {
         .collect()
 }
 
-const ACCESS: u32 = pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_MEM_EXECUTE.0;
+const ACCESS: u32 =
+    pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_MEM_EXECUTE.0;
 
 #[test]
 fn dev_run_start_hook_is_the_first_tls_callback_after_xl_a() {
@@ -1878,12 +2200,16 @@ fn dev_run_start_hook_is_the_first_tls_callback_after_xl_a() {
     let mut f = dev_executable();
     let image = f.image().unwrap();
     let file = PeFile64::parse(&image[..]).unwrap();
-    let (text, crt, dir) = (f.at(&Class::Text), f.at(&crt_class()), f.at(&Class::Synthetic(TLS_DIR)));
+    let (text, crt, dir) =
+        (f.at(&Class::Text), f.at(&crt_class()), f.at(&Class::Synthetic(TLS_DIR)));
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(dir), 40));
     let list = u64_at(&image[f.rva(dir) as usize..], 24);
     assert_eq!(list, crt + 8, "the callbacks are the CRT's run after `__xl_a`");
     assert_eq!(u64_at(&image, f.rva(list) as usize), text + HOOK);
-    assert!(rebased(&file, &image).contains(&f.rva(crt + 8)), "the hook's pointer is data the loader rebases");
+    assert!(
+        rebased(&file, &image).contains(&f.rva(crt + 8)),
+        "the hook's pointer is data the loader rebases"
+    );
 
     // The CRT's `_tls_used`.
     let mut f = dev_executable();
@@ -1906,7 +2232,11 @@ fn dev_run_start_hook_is_the_first_tls_callback_after_xl_a() {
         }
         let image = f.image().unwrap();
         let file = PeFile64::parse(&image[..]).unwrap();
-        assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(dir), 40), "a directory, thread-locals or not");
+        assert_eq!(
+            directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS),
+            (f.rva(dir), 40),
+            "a directory, thread-locals or not"
+        );
         let bytes = &image[f.rva(dir) as usize..][..56];
         assert_eq!(u64_at(bytes, 24), dir + 40);
         assert_eq!(u64_at(bytes, 40), text + HOOK);
@@ -1947,8 +2277,16 @@ fn dev_run_code_is_on_its_own_granules() {
     assert_eq!(at, va);
     assert!(size <= raw, "the code is all raw data");
     assert_eq!(sections[1].0, 0x2_0000, "the next section starts on the next granule");
-    assert!(sections[1..].iter().all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE.0 == 0), "code before all else");
-    assert!(sections.iter().all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE.0 == 0 || it.4 & pe::IMAGE_SCN_MEM_WRITE.0 == 0));
+    assert!(
+        sections[1..].iter().all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE.0 == 0),
+        "code before all else"
+    );
+    assert!(
+        sections
+            .iter()
+            .all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE.0 == 0
+                || it.4 & pe::IMAGE_SCN_MEM_WRITE.0 == 0)
+    );
     assert_eq!(optional.address_of_entry_point(), f.rva(f.at(&Class::Text)));
     for pair in sections.windows(2) {
         assert_eq!(pair[0].0 + pair[0].1, pair[1].0, "adjacent, as the NT loader wants");
@@ -1963,7 +2301,10 @@ fn dev_run_code_is_on_its_own_granules() {
 
     let pieces = vec![
         (Class::Text, Data::Bytes(vec![0xcc; 0x40])),
-        (Class::Named { name: ".wx".into(), write: true, exec: true }, Data::Bytes(vec![0x90; 0x10])),
+        (
+            Class::Named { name: ".wx".into(), write: true, exec: true },
+            Data::Bytes(vec![0x90; 0x10]),
+        ),
     ];
     let mut f = Fixture::new(dev_exe(), pieces, &Counts::default());
     f.entry = Some(f.at(&Class::Text));
@@ -1983,11 +2324,14 @@ fn dev_run_reservations_are_the_last_sections_with_no_access() {
         Class::Data,
     ];
     writer.order(&mut classes);
-    assert_eq!(classes[3..], [
-        Class::Reserve(Reserve::Arena),
-        Class::Reserve(Reserve::Cells),
-        Class::Reserve(Reserve::Fixed)
-    ]);
+    assert_eq!(
+        classes[3..],
+        [
+            Class::Reserve(Reserve::Arena),
+            Class::Reserve(Reserve::Cells),
+            Class::Reserve(Reserve::Fixed)
+        ]
+    );
     for reserve in [Reserve::Arena, Reserve::Cells, Reserve::Fixed] {
         assert_eq!(writer.prot(&Class::Reserve(reserve)), Prot::NONE);
     }
@@ -2000,13 +2344,19 @@ fn dev_run_reservations_are_the_last_sections_with_no_access() {
     let sections = section_headers(&file);
     let arena = f.at(&Class::Reserve(Reserve::Arena));
     let mut at = f.rva(arena);
-    for (&(va, size, raw, raw_at, flags), want) in sections[sections.len() - 3..].iter().zip([0x2_0000, 0x1_0000, 0x3_0000]) {
+    for (&(va, size, raw, raw_at, flags), want) in
+        sections[sections.len() - 3..].iter().zip([0x2_0000, 0x1_0000, 0x3_0000])
+    {
         assert_eq!((va, size, raw, raw_at), (at, want, 0, 0));
         assert_eq!(flags & ACCESS, 0, "no access");
         assert_eq!(u64::from(va) % GRANULE, 0);
         at += want;
     }
-    assert_eq!(file.nt_headers().optional_header().size_of_image(), at, "the image covers the reservations");
+    assert_eq!(
+        file.nt_headers().optional_header().size_of_image(),
+        at,
+        "the image covers the reservations"
+    );
     f.placed(|placed| {
         for region in placed.regions.iter().filter(|it| matches!(it.class, Class::Reserve(_))) {
             assert_eq!(f.pe.offset(placed, region), None, "not in the file");
@@ -2029,7 +2379,13 @@ fn dev_run_has_no_base_relocation_in_code_and_no_cfg() {
 
     let mut f = dev_executable();
     let text = f.at(&Class::Text);
-    f.functions = vec![Function { addr: text, size: 0x10, fde: None, windows: None, name: Some("absolute".into()) }];
+    f.functions = vec![Function {
+        addr: text,
+        size: 0x10,
+        fde: None,
+        windows: None,
+        name: Some("absolute".into()),
+    }];
     f.rebase.insert(0, text + 8);
     f.fails("`absolute` (+0x8)");
     let mut f = dev_executable();
@@ -2065,7 +2421,11 @@ fn without_a_dev_run_the_image_is_unchanged() {
     let writer = pe(exe());
     let plan = writer.plan();
     assert_eq!((plan.page, plan.headers), (0x1000, 0x1000));
-    let tls = |dev_run| image::synthetic(&Counts::default(), dev_run).into_iter().find(|it| it.0 == Class::Synthetic(TLS_DIR));
+    let tls = |dev_run| {
+        image::synthetic(&Counts::default(), dev_run)
+            .into_iter()
+            .find(|it| it.0 == Class::Synthetic(TLS_DIR))
+    };
     assert_eq!(tls(false), Some((Class::Synthetic(TLS_DIR), 48)));
     assert_eq!(tls(true), Some((Class::Synthetic(TLS_DIR), 56)));
     let mut dll = dev_exe();
@@ -2091,7 +2451,11 @@ fn without_a_dev_run_the_image_is_unchanged() {
     let sections = section_headers(&file);
     assert_eq!((sections[0].0, sections[0].1, sections[0].2), (0x1000, 0x40, 0x1000));
     assert_eq!(sections[1].0, 0x2000);
-    assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (0, 0), "no TLS directory with no thread-locals");
+    assert_eq!(
+        directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS),
+        (0, 0),
+        "no TLS directory with no thread-locals"
+    );
     let last = sections.last().unwrap();
     assert_eq!(optional.size_of_image(), (last.0 + last.1).next_multiple_of(0x1000));
 }
@@ -2104,14 +2468,27 @@ fn dev_run_image_is_what_the_start_hook_maps() {
     let base = f.plan.base;
     let arena = f.at(&Class::Reserve(Reserve::Arena));
     assert_eq!(layout.header, base);
-    assert_eq!(layout.code, [blaze_inproc::Segment { offset: 0x1_0000, linked: base + 0x1_0000, len: 0x1_0000 }]);
-    assert_eq!(layout.reserved, [arena..arena + 0x2_0000, arena + 0x2_0000..arena + 0x3_0000, arena + 0x3_0000..arena + 0x6_0000]);
+    assert_eq!(
+        layout.code,
+        [blaze_inproc::Segment { offset: 0x1_0000, linked: base + 0x1_0000, len: 0x1_0000 }]
+    );
+    assert_eq!(
+        layout.reserved,
+        [
+            arena..arena + 0x2_0000,
+            arena + 0x2_0000..arena + 0x3_0000,
+            arena + 0x3_0000..arena + 0x6_0000
+        ]
+    );
     assert_eq!(layout.span, base..arena + 0x6_0000);
     assert_eq!(blaze_inproc::image::headers_len(blaze_inproc::Format::Pe, &image), Some(0x1_0000));
 
     let mut f = executable();
     let image = f.image().unwrap();
-    assert!(blaze_inproc::image::layout(blaze_inproc::Format::Pe, &image, GRANULE).is_err(), "a build's code shares a granule");
+    assert!(
+        blaze_inproc::image::layout(blaze_inproc::Format::Pe, &image, GRANULE).is_err(),
+        "a build's code shares a granule"
+    );
 }
 
 #[test]

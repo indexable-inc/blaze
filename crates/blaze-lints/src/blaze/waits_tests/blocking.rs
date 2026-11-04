@@ -108,5 +108,8 @@ pub fn off_the_pool(shared: &Shared) {
     assert!(out.contains("`std::thread::sleep` blocks the pool thread `job` runs on"), "{out}");
     assert!(out.contains("`Read::read` on `File` blocks the pool thread"), "{out}");
     assert!(out.contains("`std::fs::read` blocks the pool thread"), "{out}");
-    assert!(out.contains("`blaze_graph::sched::wait(Wait::Until(deadline))`"), "the sleep says what to wait with:\n{out}");
+    assert!(
+        out.contains("`blaze_graph::sched::wait(Wait::Until(deadline))`"),
+        "the sleep says what to wait with:\n{out}"
+    );
 }

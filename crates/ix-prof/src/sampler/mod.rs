@@ -93,12 +93,19 @@ pub fn start(hz: u32, sink: Sink) -> Result<Sampler, Unsampled> {
 /// Waits out `d` on the sampler thread, or less when [`Sampler`]'s drop unparks it.
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
 fn pause(d: std::time::Duration) {
-    #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here, and the stop unparks it")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here, and the stop unparks it"
+    )]
     std::thread::park_timeout(d);
 }
 
 #[cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))]
-fn run(hz: u32, sink: Sink, stop: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, &'static str), Unsampled> {
+fn run(
+    hz: u32,
+    sink: Sink,
+    stop: Arc<AtomicBool>,
+) -> Result<(std::thread::JoinHandle<()>, &'static str), Unsampled> {
     #[cfg(target_os = "linux")]
     use linux as platform;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -112,7 +119,11 @@ fn run(hz: u32, sink: Sink, stop: Arc<AtomicBool>) -> Result<(std::thread::JoinH
 }
 
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
-fn run(_hz: u32, _sink: Sink, _stop: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, &'static str), Unsampled> {
+fn run(
+    _hz: u32,
+    _sink: Sink,
+    _stop: Arc<AtomicBool>,
+) -> Result<(std::thread::JoinHandle<()>, &'static str), Unsampled> {
     Err(Unsampled(format!(
         "ix-prof has no in-process sampler for {}-{} yet (a SIGPROF sampler is planned)",
         std::env::consts::ARCH,

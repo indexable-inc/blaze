@@ -7,8 +7,8 @@ use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, CallableDefId, ConstId, ConstParamId, EnumVariantId,
-    ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId, ModuleId,
-    StaticId, TraitId, TypeAliasId, VariantId,
+    ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId, ModuleId, StaticId,
+    TraitId, TypeAliasId, VariantId,
     builtin_derive::BuiltinDeriveImplMethod,
     expr_store::ExpressionStore,
     hir::{ClosureKind, ExprId},
@@ -20,8 +20,8 @@ use span::Edition;
 use stdx::impl_from;
 
 use crate::{
-    GenericDefaultsRef, GenericPredicates, ImplTraitId, InferBodyId, TyDefId,
-    TyLoweringDiagnostic, TyLoweringResult, ValueTyDefId,
+    GenericDefaultsRef, GenericPredicates, ImplTraitId, InferBodyId, TyDefId, TyLoweringDiagnostic,
+    TyLoweringResult, ValueTyDefId,
     consteval::ConstEvalError,
     dyn_compatibility::DynCompatibilityViolation,
     layout::{InternedLayout, LayoutError},
@@ -360,8 +360,7 @@ pub trait HirDatabase: sealed::Sealed {
 
     fn impl_trait<'db>(&'db self, def: ImplId) -> Option<EarlyBinder<'db, TraitRef<'db>>>;
 
-    fn field_types_with_diagnostics<'db>(&'db self, var: VariantId)
-    -> Lowered<'db, FieldTypes>;
+    fn field_types_with_diagnostics<'db>(&'db self, var: VariantId) -> Lowered<'db, FieldTypes>;
 
     fn field_types(&self, var: VariantId) -> &FieldTypes;
 
@@ -640,8 +639,7 @@ impl HirDatabase for Db {
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        providers::monomorphized_runtime_mir_body_query(self, def, subst, env)
-            .map_err(Clone::clone)
+        providers::monomorphized_runtime_mir_body_query(self, def, subst, env).map_err(Clone::clone)
     }
 
     #[inline]
@@ -673,10 +671,8 @@ impl HirDatabase for Db {
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-        providers::monomorphized_runtime_mir_body_for_coroutine_by_move_query(
-            self, def, subst, env,
-        )
-        .map_err(Clone::clone)
+        providers::monomorphized_runtime_mir_body_for_coroutine_by_move_query(self, def, subst, env)
+            .map_err(Clone::clone)
     }
 
     #[inline]
@@ -1613,10 +1609,14 @@ pub mod kinds {
         fn every_query_has_a_kind() {
             let declared = declared();
             // alloc: test code
-            let unkinded: Vec<&str> = declared.iter().filter(|it| of(it).is_none()).map(String::as_str).collect();
+            let unkinded: Vec<&str> =
+                declared.iter().filter(|it| of(it).is_none()).map(String::as_str).collect();
             // alloc: test code
-            let gone: Vec<&str> =
-                ALL.iter().map(|&(_, name)| name).filter(|name| !declared.iter().any(|it| it == name)).collect();
+            let gone: Vec<&str> = ALL
+                .iter()
+                .map(|&(_, name)| name)
+                .filter(|name| !declared.iter().any(|it| it == name))
+                .collect();
             assert!(
                 unkinded.is_empty() && gone.is_empty(),
                 "queries with no kind in `hir_ty::db::kinds`: {unkinded:?}; kinds of no query of hir-ty: {gone:?}"

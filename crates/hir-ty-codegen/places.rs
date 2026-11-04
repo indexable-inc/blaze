@@ -83,11 +83,7 @@ fn compare<T: PartialEq + fmt::Debug + Copy>(
     }
 }
 
-fn resolve(
-    db: &Db,
-    owner: DefWithBodyId,
-    place: Place,
-) -> Option<(base_db::FileId, u32, u32)> {
+fn resolve(db: &Db, owner: DefWithBodyId, place: Place) -> Option<(base_db::FileId, u32, u32)> {
     match place {
         Place::At(file, line, column) => Some((file, line, column)),
         Place::Anchored { row, column } => {
@@ -99,10 +95,7 @@ fn resolve(
 
 /// File, line and column of where the anchor of the body begins.
 #[blaze_query::tracked]
-fn anchor_location(
-    db: &Db,
-    owner: DefWithBodyId,
-) -> Option<(base_db::FileId, u32, u32)> {
+fn anchor_location(db: &Db, owner: DefWithBodyId) -> Option<(base_db::FileId, u32, u32)> {
     let file_id = body_syntax(db, owner).as_ref()?.file_id.file_id()?;
     let start = Body::anchor_offset(db, owner)?;
     line_and_column(db, FileRange { file_id, range: TextRange::empty(start) })
@@ -123,13 +116,8 @@ fn anchored(db: &Db, owner: DefWithBodyId, offset: TextSize) -> Option<Place> {
 }
 
 /// The place of a span: in the anchor of the body when it is relative to that anchor.
-fn place_of_span(
-    db: &Db,
-    owner: DefWithBodyId,
-    syntax: &BodySyntax,
-    span: Span,
-) -> Option<Place> {
-    if span.anchor == syntax.span_map.span_for_range(TextRange::empty(0.into())).anchor {
+fn place_of_span(db: &Db, owner: DefWithBodyId, syntax: &BodySyntax, span: Span) -> Option<Place> {
+    if span.anchor == syntax.anchor {
         return anchored(db, owner, span.range.start());
     }
     let (file, line, column) = line_and_column(db, hir_expand::resolve_span(db, span))?;

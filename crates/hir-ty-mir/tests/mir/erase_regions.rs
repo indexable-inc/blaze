@@ -1,13 +1,13 @@
 //! `erase_and_anonymize_regions` against the two folders it replaced: codegen's vtable
 //! `LifetimeEraser` and the evaluator's `TypeId` erasing followed by `Anonymized`.
 
+use hir_expand::fixture;
 use hir_ty::{
     db::HirDatabase,
     next_solver::{Binder, DbInterner, Region, RegionExt as _, RegionKind, Ty},
 };
 use hir_ty_mir::mir::erase_and_anonymize_regions;
 use rustc_type_ir::{Interner, TypeFoldable, TypeFolder, TypeSuperFoldable, inherent::IntoKind};
-use hir_expand::fixture;
 
 use crate::function;
 

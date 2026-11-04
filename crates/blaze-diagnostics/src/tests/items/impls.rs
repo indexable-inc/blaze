@@ -12,14 +12,21 @@ use crate::{
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
 pub(super) fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
+    let fixture =
+        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 /// [`ui_core`] of a file that uses std: a crate `std` of `std_items` over minicore, whose
 /// prelude is core's and `prelude`.
-pub(super) fn ui_std(name: &str, flags: &str, std_items: &str, prelude: &str, source: &str) -> String {
+pub(super) fn ui_std(
+    name: &str,
+    flags: &str,
+    std_items: &str,
+    prelude: &str,
+    source: &str,
+) -> String {
     let fixture = format!(
         "//- minicore: {flags}\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; {prelude} }} }}\n\
@@ -51,8 +58,17 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0116`.
 "#;
-    assert_eq!(ui_std("E0116.rs", "sized", r#"pub struct Vec<T>(T);
-"#, "pub use crate::Vec;", source), stderr);
+    assert_eq!(
+        ui_std(
+            "E0116.rs",
+            "sized",
+            r#"pub struct Vec<T>(T);
+"#,
+            "pub use crate::Vec;",
+            source
+        ),
+        stderr
+    );
 }
 
 #[test]
@@ -100,9 +116,18 @@ fn an_inherent_impl_of_a_type_parameter() {
 
 fn main() {}
 "#;
-    assert_reports(&ui_std("E0118.rs", "sized", r#"pub struct String;
+    assert_reports(
+        &ui_std(
+            "E0118.rs",
+            "sized",
+            r#"pub struct String;
 impl String { pub fn new() -> String { String } }
-"#, "pub use crate::String;", source), &[error(1, &[])]);
+"#,
+            "pub use crate::String;",
+            source,
+        ),
+        &[error(1, &[])],
+    );
 }
 
 #[test]
@@ -119,7 +144,10 @@ impl fn(Foo) {} //~ ERROR E0390
 fn main() {
 }
 "#;
-    assert_reports(&ui("E0390.rs", "2015", source), &[error(5, &["`impl`"]), error(7, &["`impl`"])]);
+    assert_reports(
+        &ui("E0390.rs", "2015", source),
+        &[error(5, &["`impl`"]), error(7, &["`impl`"])],
+    );
 }
 
 #[test]
@@ -306,7 +334,10 @@ impl Fuzz for Baz {
 fn main() {
 }
 "#;
-    assert_reports(&ui_core("E0049.rs", "default", source), &[error(8, &["`foo`"]), error(18, &["`fuzz`"])]);
+    assert_reports(
+        &ui_core("E0049.rs", "default", source),
+        &[error(8, &["`foo`"]), error(18, &["`fuzz`"])],
+    );
 }
 
 #[test]
@@ -668,7 +699,14 @@ fn main() {}
     assert!(!stderr.contains("though rustc's finds"), "{stderr}");
     assert_reports(
         &stderr,
-        &[error(4, &["E0117", "is not defined in the current crate", "impl doesn't have any local type before any uncovered type parameters"])],
+        &[error(
+            4,
+            &[
+                "E0117",
+                "is not defined in the current crate",
+                "impl doesn't have any local type before any uncovered type parameters",
+            ],
+        )],
     );
 }
 

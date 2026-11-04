@@ -6,11 +6,11 @@
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (`LangString::parse`, `map_line`).
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use pulldown_cmark::{
     BrokenLink, BrokenLinkCallback, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Parser,
     Tag, TagEnd,
 };
+use std::alloc::Global;
 
 use crate::{
     html::{Writer, escape},
@@ -370,7 +370,8 @@ impl LangString {
                 // whether the block is Rust.
                 x if x.starts_with("edition") => {
                     let year = &x["edition".len()..];
-                    out.edition = matches!(year, "2015" | "2018" | "2021" | "2024" | "future").then(|| year.to_owned());
+                    out.edition = matches!(year, "2015" | "2018" | "2021" | "2024" | "future")
+                        .then(|| year.to_owned());
                 }
                 // `E` and four characters: an error code when they are a number (`u32`'s
                 // parse, which takes a leading `+`), else a word of another language.
@@ -423,7 +424,8 @@ fn is_separator(c: char) -> bool {
 /// was one. Words are separated by spaces, commas and tabs; a `"quoted"` word may hold any
 /// other character; `{ .class key=value }` is a block of attributes; `(...)` is a comment.
 fn tokens(data: &str) -> (Vec<Token<'_>>, bool) {
-    let mut tags = Tags { inner: data.char_indices().peekable(), data, in_block: false, error: false };
+    let mut tags =
+        Tags { inner: data.char_indices().peekable(), data, in_block: false, error: false };
     // alloc: once per code block, its few words
     let mut out = Vec::new();
     while let Some(token) = tags.next() {
@@ -515,7 +517,8 @@ impl<'a> Tags<'a> {
             self.error = true;
             return None;
         }
-        self.after_token().then(|| Token::KeyValue(&self.data[key.0..key.1], &self.data[value.0..value.1]))
+        self.after_token()
+            .then(|| Token::KeyValue(&self.data[key.0..key.1], &self.data[value.0..value.1]))
     }
 
     /// Whether what follows a token may: a `}`, a separator, a comment or the end.
@@ -588,7 +591,8 @@ impl<'a> Tags<'a> {
                     return Some(Token::Lang(&self.data[start..pos]));
                 }
                 return self.next();
-            } else if (pos == start && is_leading_char(c)) || (pos != start && is_bareword_char(c)) {
+            } else if (pos == start && is_leading_char(c)) || (pos != start && is_bareword_char(c))
+            {
                 continue;
             } else {
                 self.error = true;
@@ -667,7 +671,13 @@ fn code_block(kind: &CodeBlockKind<'_>, text: &str) -> String {
     let (wrap, tooltip) = if lang.ignore {
         (" ignore", Some("This example is not tested".to_owned()))
     } else if !lang.ignore_on.is_empty() {
-        (" ignore", Some(format!("This example is not tested on {}", stdx::list::list(&lang.ignore_on, stdx::list::Join::Or, false))))
+        (
+            " ignore",
+            Some(format!(
+                "This example is not tested on {}",
+                stdx::list::list(&lang.ignore_on, stdx::list::Join::Or, false)
+            )),
+        )
     } else if lang.compile_fail {
         (" compile_fail", Some("This example deliberately fails to compile".to_owned()))
     } else if lang.should_panic {

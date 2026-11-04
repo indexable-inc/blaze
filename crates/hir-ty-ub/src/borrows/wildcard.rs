@@ -194,8 +194,10 @@ impl Tree {
             for id in self.nodes.iter() {
                 let state = exposed_cache.0.get(id).copied().unwrap_or_default();
                 let exposed_as = if self.nodes.is_exposed(id) {
-                    let perm =
-                        perms.get(id).copied().unwrap_or_else(|| self.nodes.default_location_state(id));
+                    let perm = perms
+                        .get(id)
+                        .copied()
+                        .unwrap_or_else(|| self.nodes.default_location_state(id));
                     perm.permission().strongest_allowed_local_access(self.nodes.is_protected(id))
                 } else {
                     WildcardAccessLevel::None
@@ -206,10 +208,16 @@ impl Tree {
                     .iter()
                     .map(|&id| exposed_cache.0.get(id).copied().unwrap_or_default())
                     .fold((0, 0), |acc, wc| (acc.0 + wc.local_reads, acc.1 + wc.local_writes));
-                let expected_reads = child_reads + u16::from(exposed_as >= WildcardAccessLevel::Read);
+                let expected_reads =
+                    child_reads + u16::from(exposed_as >= WildcardAccessLevel::Read);
                 let expected_writes =
                     child_writes + u16::from(exposed_as >= WildcardAccessLevel::Write);
-                assert_eq!(state.local_reads, expected_reads, "local_reads of {:?}", self.nodes.tag(id));
+                assert_eq!(
+                    state.local_reads,
+                    expected_reads,
+                    "local_reads of {:?}",
+                    self.nodes.tag(id)
+                );
                 assert_eq!(
                     state.local_writes,
                     expected_writes,

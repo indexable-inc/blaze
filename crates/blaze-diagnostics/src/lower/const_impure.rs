@@ -18,8 +18,11 @@ use crate::{
 const LINT: &str = "blaze::const_impure";
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ConstImpure) -> Vec<Found> {
-    let lint = registry::lint(LINT).expect("`blaze::const_impure` is in the registry's blaze table");
-    if !cx.lint_may_fire(registry::LintId::of(lint)) || !hir_ty::fn_cache::uses_fn_cache(cx.db, cx.krate.into()) {
+    let lint =
+        registry::lint(LINT).expect("`blaze::const_impure` is in the registry's blaze table");
+    if !cx.lint_may_fire(registry::LintId::of(lint))
+        || !hir_ty::fn_cache::uses_fn_cache(cx.db, cx.krate.into())
+    {
         // alloc: none, an empty `Vec` allocates nothing.
         return Vec::new();
     }

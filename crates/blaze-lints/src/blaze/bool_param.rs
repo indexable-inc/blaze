@@ -55,7 +55,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, f: ast::Fn<'t>) {
             Some(pat) => format!(
                 "`fn {name}` takes `{pat}: bool`: a caller's `true` or `false` does not say what it chooses"
             ),
-            None => format!("`fn {name}` takes a `bool`: a caller's `true` or `false` does not say what it chooses"),
+            None => format!(
+                "`fn {name}` takes a `bool`: a caller's `true` or `false` does not say what it chooses"
+            ),
         };
         let span = cx.span(range);
         cx.blaze(LINT, ty.syntax(), span, message)

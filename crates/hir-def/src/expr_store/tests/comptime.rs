@@ -73,7 +73,11 @@ fn for_const_lowers_to_a_comptime_for() {
     // Not desugared: no `IntoIterator::into_iter` call, no `loop`.
     assert!(!store.exprs().any(|(_, it)| matches!(it, Expr::Loop { .. } | Expr::Call { .. })));
     // `break 'l` targets the comptime loop's label.
-    assert!(store.exprs().any(|(_, it)| matches!(it, Expr::Break { label: Some(l), .. } if Some(l) == label)));
+    assert!(
+        store
+            .exprs()
+            .any(|(_, it)| matches!(it, Expr::Break { label: Some(l), .. } if Some(l) == label))
+    );
 
     let (forms, db, def) = lower_body(text, false);
     assert_eq!(forms, [ComptimeForm::ForConst]);
@@ -100,7 +104,11 @@ fn a_reflected_field_lowers_to_a_reflected_field() {
     let (forms, db, def) = lower_body(text, false);
     assert_eq!(forms, [ComptimeForm::ReflectedField]);
     let store = Body::of(&db, def);
-    assert!(!store.exprs().any(|(_, it)| matches!(it, Expr::ReflectedField { .. } | Expr::Index { .. })));
+    assert!(
+        !store
+            .exprs()
+            .any(|(_, it)| matches!(it, Expr::ReflectedField { .. } | Expr::Index { .. }))
+    );
 }
 
 #[test]
@@ -115,7 +123,9 @@ fn a_bounded_binder_parameter_is_a_binder_param_of_the_generics() {
         .where_predicates()
         .iter()
         .filter_map(|it| match *it {
-            WherePredicate::TypeBound { binder, lifetimes, .. } => Some((binder, lifetimes.is_some())),
+            WherePredicate::TypeBound { binder, lifetimes, .. } => {
+                Some((binder, lifetimes.is_some()))
+            }
             WherePredicate::Lifetime { .. } => None,
         })
         .collect();

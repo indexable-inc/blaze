@@ -37,7 +37,9 @@ impl<'de> Deserializer<'de> for Binary<'_> {
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, value::Error> {
         match self.0 {
             Given::Bytes(bytes) => visitor.visit_bytes(bytes),
-            Given::Array(bytes) => visitor.visit_seq(value::SeqDeserializer::new(bytes.iter().copied())),
+            Given::Array(bytes) => {
+                visitor.visit_seq(value::SeqDeserializer::new(bytes.iter().copied()))
+            }
         }
     }
 
@@ -76,7 +78,10 @@ fn a_wrong_length_is_refused() {
     }
     for len in [0, 15, 17] {
         assert!(postcard::from_bytes::<Fingerprint>(&framed(&long[..len])).is_err(), "{len} bytes");
-        assert!(Fingerprint::deserialize(Binary(Given::Bytes(&long[..len]))).is_err(), "{len} bytes");
+        assert!(
+            Fingerprint::deserialize(Binary(Given::Bytes(&long[..len]))).is_err(),
+            "{len} bytes"
+        );
     }
     assert_eq!(ContentId::deserialize(Binary(Given::Bytes(&id().0))).unwrap(), id());
 }

@@ -94,9 +94,7 @@ fn changed_in(db: &Db, def: DefWithBodyId, out: &mut HashSet<FieldId, Global>) {
     let analysis = hir::BodyAnalysis::new(db, hir::DefWithBody::from(def));
     let body = analysis.body();
     let infer = analysis.infer();
-    let ref_mut = |pat: PatId| {
-        matches!(infer.binding_mode(pat), Some(BindingMode(ByRef::Yes(m), _)) if m.is_mut())
-    };
+    let ref_mut = |pat: PatId| matches!(infer.binding_mode(pat), Some(BindingMode(ByRef::Yes(m), _)) if m.is_mut());
     let any_ref_mut = body.pats().any(|(id, pat)| matches!(pat, Pat::Bind { .. }) && ref_mut(id));
     let mut parents = None;
     for (id, expr) in body.exprs() {
@@ -117,7 +115,9 @@ fn changed_in(db: &Db, def: DefWithBodyId, out: &mut HashSet<FieldId, Global>) {
     }
     let binds_mut = |pat: PatId| {
         let mut found = false;
-        body.walk_pats(pat, &mut |it| found |= matches!(body.pat(it), Pat::Bind { .. }) && ref_mut(it));
+        body.walk_pats(pat, &mut |it| {
+            found |= matches!(body.pat(it), Pat::Bind { .. }) && ref_mut(it)
+        });
         found
     };
     for (id, pat) in body.pats() {
@@ -145,7 +145,12 @@ fn changed_in(db: &Db, def: DefWithBodyId, out: &mut HashSet<FieldId, Global>) {
 
 /// Whether the field place `expr` is changed where it is used: borrowed mutably, assigned, or
 /// the place of a projection that is.
-fn changes(analysis: &hir::BodyAnalysis<'_>, parents: &facts::Parents, expr: ExprId, any_ref_mut: bool) -> bool {
+fn changes(
+    analysis: &hir::BodyAnalysis<'_>,
+    parents: &facts::Parents,
+    expr: ExprId,
+    any_ref_mut: bool,
+) -> bool {
     let body = analysis.body();
     let mut at = expr;
     for _ in 0..UP {
@@ -193,7 +198,8 @@ enum Kind {
 fn kind(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<Kind> {
     let db = cx.db();
     let adt = ty.as_adt()?;
-    let item = |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
+    let item =
+        |name: &str| cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
     if item("Vec") {
         return Some(Kind::Vec);
     }
@@ -268,7 +274,11 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
 
 /// The syntax of the field named `name`, the `index`th of `item`: a record field by its name, a
 /// tuple field by its place (only when no field has an attribute that could `cfg` it out).
-pub(super) fn field_node<'t>(item: ast::Struct<'t>, name: &hir::Name, index: usize) -> Option<ast::Node<'t>> {
+pub(super) fn field_node<'t>(
+    item: ast::Struct<'t>,
+    name: &hir::Name,
+    index: usize,
+) -> Option<ast::Node<'t>> {
     match item.field_list()? {
         ast::FieldList::RecordFieldList(list) => list
             .fields()
@@ -316,7 +326,9 @@ impl Table {
 "#,
         );
         assert!(
-            found.contains("the field `names` of `Table` is a `Vec<u32>` that nothing in the crate changes"),
+            found.contains(
+                "the field `names` of `Table` is a `Vec<u32>` that nothing in the crate changes"
+            ),
             "{found}"
         );
         assert_eq!(found.matches("that nothing in the crate changes").count(), 1, "{found}");

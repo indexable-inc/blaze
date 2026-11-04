@@ -8,9 +8,9 @@ use std::fmt;
 use std::path::Path;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use serde::Deserialize;
 use serde_untagged::UntaggedEnumVisitor;
+use std::alloc::Global;
 
 use super::{ConfigRelativePath, OptValue, PathAndArgs, StringList, Value};
 

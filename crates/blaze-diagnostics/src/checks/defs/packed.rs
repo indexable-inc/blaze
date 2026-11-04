@@ -39,13 +39,21 @@ pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
     let attrs = ast::AnyHasAttrs::cast(node.value).into_iter().flat_map(|it| it.attrs());
     for written in attrs.filter(|it| it.simple_name() == Some("repr")).flat_map(packs) {
         if written != Some(pack.bytes()) {
-            let mut diag = Diag::error(Some("E0634"), "type has conflicting packed representation hints", span());
+            let mut diag = Diag::error(
+                Some("E0634"),
+                "type has conflicting packed representation hints",
+                span(),
+            );
             diag.fact(fact(), what());
             found.push(Found::new(diag, Phase::Items));
         }
     }
     if repr.align.is_some() {
-        let mut diag = Diag::error(Some("E0587"), "type has conflicting packed and align representation hints", span());
+        let mut diag = Diag::error(
+            Some("E0587"),
+            "type has conflicting packed and align representation hints",
+            span(),
+        );
         diag.fact(fact(), what());
         found.push(Found::new(diag, Phase::Items));
     }
@@ -55,7 +63,10 @@ pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
 /// The alignment of each `packed` hint of a `#[repr(..)]`: 1 for `packed`, `N` for
 /// `packed(N)`, `None` for one whose argument is no integer (its parser reports it).
 fn packs(attr: ast::Attr<'_>) -> impl Iterator<Item = Option<u64>> + '_ {
-    let hints = attr.meta().and_then(|it| it.as_simple_call()).map(|(_, tt)| tt.syntax().children_with_tokens());
+    let hints = attr
+        .meta()
+        .and_then(|it| it.as_simple_call())
+        .map(|(_, tt)| tt.syntax().children_with_tokens());
     let mut hints = hints.into_iter().flatten().filter(|it| !it.kind().is_trivia()).peekable();
     std::iter::from_fn(move || {
         loop {

@@ -30,7 +30,12 @@ pub(crate) fn capacity(output: &Output) -> u32 {
 /// The pair of `key` (interned as `id`): the one it was given before, else the next one.
 /// Counting code in an image that is not a dev run, and a dev run whose cells are all given
 /// out, are errors naming `key`.
-pub(crate) fn pair(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey) -> Result<u32, LinkError> {
+pub(crate) fn pair(
+    output: &Output,
+    state: &mut State,
+    id: IdNo,
+    key: &InstanceKey,
+) -> Result<u32, LinkError> {
     give(output, state, id, key, false)
 }
 
@@ -38,11 +43,22 @@ pub(crate) fn pair(output: &Output, state: &mut State, id: IdNo, key: &InstanceK
 /// in flight on a copy of the state: a new pair is the next from the top of the cells, never
 /// one a stage gives from the bottom, and the commit of that stage carries it over
 /// ([`crate::Image::commit`]). A key has one pair whichever gave it.
-pub(crate) fn placed_pair(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey) -> Result<u32, LinkError> {
+pub(crate) fn placed_pair(
+    output: &Output,
+    state: &mut State,
+    id: IdNo,
+    key: &InstanceKey,
+) -> Result<u32, LinkError> {
     give(output, state, id, key, true)
 }
 
-fn give(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey, placed: bool) -> Result<u32, LinkError> {
+fn give(
+    output: &Output,
+    state: &mut State,
+    id: IdNo,
+    key: &InstanceKey,
+    placed: bool,
+) -> Result<u32, LinkError> {
     if let Some(pair) = state.pairs.of(id) {
         return Ok(pair);
     }

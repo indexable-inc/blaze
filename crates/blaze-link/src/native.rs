@@ -27,8 +27,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
 use blaze_hash::hash_map::Entry;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,7 +191,12 @@ impl Table {
     }
 
     /// Gives the name `value` unless a value has it already: then that value.
-    fn insert(&mut self, hash: u64, value: u32, mut eq: impl FnMut(u32) -> bool) -> Result<(), u32> {
+    fn insert(
+        &mut self,
+        hash: u64,
+        value: u32,
+        mut eq: impl FnMut(u32) -> bool,
+    ) -> Result<(), u32> {
         debug_assert_ne!(value, NONE);
         if (self.len + 1) * 2 > self.slots.len() {
             self.grow();
@@ -236,7 +241,8 @@ fn archive_index(archive: &Archive) -> Table {
     let mut table = Table::with_capacity(archive.index.len());
     for (at, (name, _)) in archive.index.iter().enumerate() {
         let name = archive.name(*name);
-        let _ = table.insert(hash(name), at as u32, |it| archive.name(archive.index[it as usize].0) == name);
+        let _ = table
+            .insert(hash(name), at as u32, |it| archive.name(archive.index[it as usize].0) == name);
     }
     table
 }
@@ -244,7 +250,9 @@ fn archive_index(archive: &Archive) -> Table {
 /// The member an archive's index says defines `name`, whose [`hash`] is `hashed`: a name
 /// looked for in every searched archive is hashed once for all of them.
 fn archive_find(table: &Table, archive: &Archive, hashed: u64, name: &str) -> Option<u32> {
-    table.find(hashed, |it| archive.name(archive.index[it as usize].0) == name).map(|it| archive.index[it as usize].1)
+    table
+        .find(hashed, |it| archive.name(archive.index[it as usize].0) == name)
+        .map(|it| archive.index[it as usize].1)
 }
 
 /// The first searched archive (in link-line order) whose index names `name`, and the member
@@ -252,7 +260,9 @@ fn archive_find(table: &Table, archive: &Archive, hashed: u64, name: &str) -> Op
 fn search(archives: &[(u32, Arc<Table>)], inputs: &[Input], name: &str) -> Option<(u32, u32)> {
     let hashed = hash(name);
     archives.iter().find_map(|(input, table)| match &*inputs[*input as usize].file {
-        NativeFile::Archive(archive) => archive_find(table, archive, hashed, name).map(|member| (*input, member)),
+        NativeFile::Archive(archive) => {
+            archive_find(table, archive, hashed, name).map(|member| (*input, member))
+        }
         _ => None,
     })
 }
@@ -280,20 +290,29 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
                 // alloc: error path
                 return Err(format!("{name}: bytes {range:?}, past the input's {len}"));
             }
-            Data::Made(range) if range.start > range.end || range.end > object.made.len() as u64 => {
+            Data::Made(range)
+                if range.start > range.end || range.end > object.made.len() as u64 =>
+            {
                 // alloc: error path
-                return Err(format!("{name}: bytes {range:?}, past the {} the reader made", object.made.len()));
+                return Err(format!(
+                    "{name}: bytes {range:?}, past the {} the reader made",
+                    object.made.len()
+                ));
             }
             _ => {}
         }
         let fixups = &section.fixups;
         if fixups.start > fixups.end || fixups.end as usize > object.fixups.len() {
             // alloc: error path
-            return Err(format!("{name}: relocations {fixups:?}, past the object's {}", object.fixups.len()));
+            return Err(format!(
+                "{name}: relocations {fixups:?}, past the object's {}",
+                object.fixups.len()
+            ));
         }
     }
     for (at, fixup) in object.fixups.iter().enumerate() {
-        if fixup.symbol as usize >= symbols || fixup.minus.is_some_and(|it| it as usize >= symbols) {
+        if fixup.symbol as usize >= symbols || fixup.minus.is_some_and(|it| it as usize >= symbols)
+        {
             // alloc: error path
             return Err(format!("relocation {at} refers to a symbol past the object's {symbols}"));
         }
@@ -306,11 +325,15 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
         match symbol.def {
             SymbolDef::Section { section, .. } if section as usize >= sections => {
                 // alloc: error path
-                return Err(format!("`{name}` is in section {section}, past the object's {sections}"));
+                return Err(format!(
+                    "`{name}` is in section {section}, past the object's {sections}"
+                ));
             }
             SymbolDef::Fallback { symbol: to, .. } if to as usize >= symbols => {
                 // alloc: error path
-                return Err(format!("`{name}` falls back to symbol {to}, past the object's {symbols}"));
+                return Err(format!(
+                    "`{name}` falls back to symbol {to}, past the object's {symbols}"
+                ));
             }
             _ => {}
         }
@@ -323,7 +346,10 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
         let range = &group.sections;
         if range.start > range.end || range.end as usize > object.grouped.len() {
             // alloc: error path
-            return Err(format!("COMDAT group `{name}`: sections {range:?}, past the object's {}", object.grouped.len()));
+            return Err(format!(
+                "COMDAT group `{name}`: sections {range:?}, past the object's {}",
+                object.grouped.len()
+            ));
         }
     }
     if let Some(it) = object.grouped.iter().find(|it| **it as usize >= sections) {
@@ -333,7 +359,10 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
     for (at, tie) in object.ties.iter().enumerate() {
         if tie.section as usize >= sections || tie.to as usize >= sections {
             // alloc: error path
-            return Err(format!("section {} is tied to section {}, past the object's {sections}", tie.section, tie.to));
+            return Err(format!(
+                "section {} is tied to section {}, past the object's {sections}",
+                tie.section, tie.to
+            ));
         }
         if tie.section == tie.to {
             // alloc: error path
@@ -341,7 +370,10 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
         }
         if at > 0 && object.ties[at - 1].section >= tie.section {
             // alloc: error path
-            return Err(format!("section {} is tied twice, or the ties are not in section order", tie.section));
+            return Err(format!(
+                "section {} is tied twice, or the ties are not in section order",
+                tie.section
+            ));
         }
     }
     if let Some(it) = object.live_support.iter().find(|it| **it as usize >= sections) {
@@ -350,7 +382,9 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
     }
     if object.live_support.windows(2).any(|it| it[0] >= it[1]) {
         // alloc: error path
-        return Err("the live support sections are not in section order, or one is listed twice".to_owned());
+        return Err(
+            "the live support sections are not in section order, or one is listed twice".to_owned()
+        );
     }
     for (at, import) in &object.imports {
         let Some(symbol) = object.symbols.get(*at as usize) else {
@@ -364,12 +398,16 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
         }
         if names.get(import.module).is_none() || names.get(import.field).is_none() {
             // alloc: error path
-            return Err(format!("the wasm import of `{name}` has a name outside the object's names"));
+            return Err(format!(
+                "the wasm import of `{name}` has a name outside the object's names"
+            ));
         }
         let ty = &import.ty;
         if ty.start > ty.end || ty.end > len {
             // alloc: error path
-            return Err(format!("the wasm import of `{name}`: its type, bytes {ty:?}, past the input's {len}"));
+            return Err(format!(
+                "the wasm import of `{name}`: its type, bytes {ty:?}, past the input's {len}"
+            ));
         }
     }
     Ok(())
@@ -393,7 +431,10 @@ fn check_archive(archive: &Archive, len: usize) -> Result<(), String> {
         };
         if *member as usize >= archive.members.len() {
             // alloc: error path
-            return Err(format!("the archive's index puts `{name}` in member {member}, past its {}", archive.members.len()));
+            return Err(format!(
+                "the archive's index puts `{name}` in member {member}, past its {}",
+                archive.members.len()
+            ));
         }
     }
     Ok(())
@@ -407,7 +448,11 @@ fn check_shared(shared: &Shared) -> Result<(), String> {
         };
         if let Some(version) = symbol.version.filter(|it| *it as usize >= shared.versions.len()) {
             // alloc: error path
-            return Err(format!("{}: `{name}` has version {version}, past its {}", shared.name, shared.versions.len()));
+            return Err(format!(
+                "{}: `{name}` has version {version}, past its {}",
+                shared.name,
+                shared.versions.len()
+            ));
         }
     }
     shared.more.iter().try_for_each(check_shared)
@@ -424,13 +469,18 @@ fn line_has(names: &HashSet<&str, std::alloc::Global>, wanted: &str) -> bool {
         Some(lib) => match lib.strip_prefix(':') {
             Some(exact) => names.iter().any(|it| file(it) == exact),
             None => names.iter().any(|it| {
-                file(it).strip_prefix("lib").and_then(|it| it.strip_prefix(lib)).is_some_and(|it| it == ".so" || it == ".a")
+                file(it)
+                    .strip_prefix("lib")
+                    .and_then(|it| it.strip_prefix(lib))
+                    .is_some_and(|it| it == ".so" || it == ".a")
             }),
         },
         None => {
             names.contains(wanted)
                 || names.iter().any(|it| {
-                    it.len() > wanted.len() && it.ends_with(wanted) && it.as_bytes()[it.len() - wanted.len() - 1] == b'/'
+                    it.len() > wanted.len()
+                        && it.ends_with(wanted)
+                        && it.as_bytes()[it.len() - wanted.len() - 1] == b'/'
                 })
         }
     }
@@ -442,7 +492,9 @@ fn same_library(a: &str, b: &str) -> bool {
     fn stem(it: &str) -> &str {
         let file = it.rsplit(['/', '\\']).next().unwrap_or(it);
         match file.len().checked_sub(4) {
-            Some(at) if file.is_char_boundary(at) && file[at..].eq_ignore_ascii_case(".lib") => &file[..at],
+            Some(at) if file.is_char_boundary(at) && file[at..].eq_ignore_ascii_case(".lib") => {
+                &file[..at]
+            }
             _ => file,
         }
     }
@@ -472,7 +524,9 @@ fn default_libraries(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
                 continue;
             }
             checked.push(library);
-            if left_out.iter().any(|it| same_library(it, library)) || inputs.iter().any(|it| same_library(&it.name, library)) {
+            if left_out.iter().any(|it| same_library(it, library))
+                || inputs.iter().any(|it| same_library(&it.name, library))
+            {
                 continue;
             }
             return Err(error(
@@ -502,7 +556,8 @@ fn linker_options(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
                 continue;
             }
             // alloc: error path
-            let asked = crate::macho::autolink(option).map_err(|what| error(None, format!("{}: {what}", asker(inputs, load))))?;
+            let asked = crate::macho::autolink(option)
+                .map_err(|what| error(None, format!("{}: {what}", asker(inputs, load))))?;
             if !autolinked(inputs, asked) {
                 return Err(error(
                     None,
@@ -543,7 +598,9 @@ fn autolinked(inputs: &[Input], asked: crate::macho::Autolink<'_>) -> bool {
 fn asker(inputs: &[Input], load: &Load) -> String {
     let input = &inputs[load.input as usize];
     let member = match (&*input.file, load.parsed.obj.member.checked_sub(1)) {
-        (NativeFile::Archive(archive), Some(at)) => archive.members.get(at as usize).map(|it| archive.name(it.name)),
+        (NativeFile::Archive(archive), Some(at)) => {
+            archive.members.get(at as usize).map(|it| archive.name(it.name))
+        }
         _ => None,
     };
     match member {
@@ -642,8 +699,9 @@ impl Parsed {
         let NativeFile::Object(object) = &*file else { unreachable!("only objects are parsed") };
         let sections = object.sections.len();
         let minus = object.fixups.iter().filter(|it| it.minus.is_some()).count();
-        let mut pairs: Vec<(u32, u32)> =
-            Vec::with_capacity((object.fixups.len() + minus).max(object.symbols.len()).max(2 * object.ties.len()));
+        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(
+            (object.fixups.len() + minus).max(object.symbols.len()).max(2 * object.ties.len()),
+        );
         for (at, section) in object.sections.iter().enumerate() {
             let start = pairs.len();
             for fixup in object.section_fixups(section) {
@@ -674,7 +732,9 @@ impl Parsed {
             Csr::default()
         } else {
             pairs.clear();
-            pairs.extend(object.ties.iter().flat_map(|it| [(it.to, it.section), (it.section, it.to)]));
+            pairs.extend(
+                object.ties.iter().flat_map(|it| [(it.to, it.section), (it.section, it.to)]),
+            );
             Csr::build(sections, pairs.iter().copied())
         };
         // alloc: once per object read, kept with it
@@ -695,7 +755,10 @@ impl Parsed {
                     && (kept_by_name(object.name(section.name))
                         || matches!(
                             section.what,
-                            SectionKind::Alloc(Class::PreinitArray | Class::InitArray | Class::FiniArray, _)
+                            SectionKind::Alloc(
+                                Class::PreinitArray | Class::InitArray | Class::FiniArray,
+                                _
+                            )
                         )))
         };
         let (mut root_count, mut unwind_count) = (0, 0);
@@ -736,17 +799,24 @@ impl Parsed {
         let frame_count: usize = records.iter().map(|(_, it)| it.len()).sum();
         let frame_relocs = |section: &u32| object.sections[*section as usize].fixups.len();
         let mut frames: Vec<Frame> = Vec::with_capacity(frame_count);
-        let mut fixup_pairs: Vec<(u32, u32)> = Vec::with_capacity(records.iter().map(|(it, _)| frame_relocs(it)).sum());
-        let mut by_at: Vec<(u64, u32)> = Vec::with_capacity(records.iter().map(|(it, _)| frame_relocs(it)).max().unwrap_or(0));
+        let mut fixup_pairs: Vec<(u32, u32)> =
+            Vec::with_capacity(records.iter().map(|(it, _)| frame_relocs(it)).sum());
+        let mut by_at: Vec<(u64, u32)> =
+            Vec::with_capacity(records.iter().map(|(it, _)| frame_relocs(it)).max().unwrap_or(0));
         for (section, records) in records {
             let s = &object.sections[*section as usize];
             by_at.clear();
-            by_at.extend((s.fixups.start..s.fixups.end).map(|it| (object.fixups[it as usize].at, it)));
+            by_at.extend(
+                (s.fixups.start..s.fixups.end).map(|it| (object.fixups[it as usize].at, it)),
+            );
             radix::sort_copy_by_key(&mut by_at, |&(at, it)| radix::pack_64(at, u64::from(it)));
             let first = frames.len();
             for record in records {
                 let (start, end) = (record.range.start as u64, record.range.end as u64);
-                let (lo, hi) = (by_at.partition_point(|it| it.0 < start), by_at.partition_point(|it| it.0 < end));
+                let (lo, hi) = (
+                    by_at.partition_point(|it| it.0 < start),
+                    by_at.partition_point(|it| it.0 < end),
+                );
                 let index = frames.len() as u32;
                 let mut function = NONE;
                 for &(at, fixup) in &by_at[lo..hi] {
@@ -823,17 +893,26 @@ impl Parsed {
 }
 
 /// The keys of an object's symbols, sections and frame records, in [`Parsed::new`]'s order.
-fn object_keys<'f>(obj: Obj, object: &'f Object, records: &[(u32, Vec<unwind::Native>)], out: &mut Vec<Wide<'f>>) {
+fn object_keys<'f>(
+    obj: Obj,
+    object: &'f Object,
+    records: &[(u32, Vec<unwind::Native>)],
+    out: &mut Vec<Wide<'f>>,
+) {
     for (at, symbol) in object.symbols.iter().enumerate() {
         out.push(match (symbol.binding, symbol.kind, symbol.def) {
-            (_, SymbolKind::Section, SymbolDef::Section { section, .. }) => Wide::Key(SymKey::Section(obj, section)),
+            (_, SymbolKind::Section, SymbolDef::Section { section, .. }) => {
+                Wide::Key(SymKey::Section(obj, section))
+            }
             (Binding::Local, _, _) => Wide::Key(SymKey::Local(obj, at as u32)),
             _ => Wide::Name(object.name(symbol.name)),
         });
     }
     out.extend((0..object.sections.len() as u32).map(|it| Wide::Key(SymKey::Section(obj, it))));
     for (section, records) in records {
-        out.extend(records.iter().map(|it| Wide::Key(SymKey::Frame(obj, *section, it.range.start as u32))));
+        out.extend(
+            records.iter().map(|it| Wide::Key(SymKey::Frame(obj, *section, it.range.start as u32))),
+        );
     }
 }
 
@@ -849,7 +928,10 @@ pub(crate) fn describe(symbols: &Symbols, states: &[&State], writer: &Formats, s
         SymKey::Local(obj, _) | SymKey::Section(obj, _) | SymKey::Frame(obj, ..) => obj,
         _ => return symbols.describe(sym),
     };
-    let found = states.iter().flat_map(|it| it.inputs.iter()).find(|it| symbols.find_id(&it.id) == Some(obj.native));
+    let found = states
+        .iter()
+        .flat_map(|it| it.inputs.iter())
+        .find(|it| symbols.find_id(&it.id) == Some(obj.native));
     let Some(input) = found else {
         // alloc: error path
         return format!("{} (of a native input no longer on the link line)", symbols.describe(sym));
@@ -858,7 +940,9 @@ pub(crate) fn describe(symbols: &Symbols, states: &[&State], writer: &Formats, s
     let (path, object) = match (&*input.file, obj.member) {
         // alloc: error path
         (NativeFile::Object(object), 0) => (input.name.to_string(), object),
-        (NativeFile::Archive(archive), member) if member as usize <= archive.members.len() && member > 0 => {
+        (NativeFile::Archive(archive), member)
+            if member as usize <= archive.members.len() && member > 0 =>
+        {
             let entry = &archive.members[member as usize - 1];
             // alloc: error path
             let path = format!("{}({})", input.name, archive.name(entry.name));
@@ -871,13 +955,27 @@ pub(crate) fn describe(symbols: &Symbols, states: &[&State], writer: &Formats, s
             match &read {
                 Ok(NativeFile::Object(object)) => (path, object),
                 // alloc: error path
-                Ok(_) => return format!("{} of {path}, which is not an object", symbols.describe(sym)),
+                Ok(_) => {
+                    return format!("{} of {path}, which is not an object", symbols.describe(sym));
+                }
                 // alloc: error path
-                Err(why) => return format!("{} of {path}, which doesn't read: {why}", symbols.describe(sym)),
+                Err(why) => {
+                    return format!(
+                        "{} of {path}, which doesn't read: {why}",
+                        symbols.describe(sym)
+                    );
+                }
             }
         }
         // alloc: error path
-        _ => return format!("{} of {}, which has no member {}", symbols.describe(sym), input.name, obj.member),
+        _ => {
+            return format!(
+                "{} of {}, which has no member {}",
+                symbols.describe(sym),
+                input.name,
+                obj.member
+            );
+        }
     };
     match key {
         // alloc: error path
@@ -885,10 +983,14 @@ pub(crate) fn describe(symbols: &Symbols, states: &[&State], writer: &Formats, s
         // alloc: error path
         SymKey::Section(_, at) => format!("{} of {path}", section_in(object, at)),
         SymKey::Frame(_, section, start) => {
-            let fde = (object.sections.get(section as usize))
-                .and_then(|it| object.section_fixups(it).iter().find(|it| it.at == u64::from(start) + 8));
+            let fde = (object.sections.get(section as usize)).and_then(|it| {
+                object.section_fixups(it).iter().find(|it| it.at == u64::from(start) + 8)
+            });
             // alloc: error path
-            let record = format!("the call frame record at {start:#x} of {} of {path}", section_in(object, section));
+            let record = format!(
+                "the call frame record at {start:#x} of {} of {path}",
+                section_in(object, section)
+            );
             match fde {
                 // alloc: error path
                 Some(it) => format!("{record} (the FDE of {})", symbol_in(object, it.symbol)),
@@ -982,26 +1084,38 @@ impl Exports {
             }
             orders.resize(flat.len(), *order);
         }
-        let mut first: HashMap<&str, u32, std::alloc::Global> = HashMap::with_capacity_in(flat.len(), std::alloc::Global);
+        let mut first: HashMap<&str, u32, std::alloc::Global> =
+            HashMap::with_capacity_in(flat.len(), std::alloc::Global);
         let mut canonical: Vec<u32> = Vec::with_capacity(flat.len());
-        canonical.extend(flat.iter().enumerate().map(|(at, (it, _))| *first.entry(it.name.as_str()).or_insert(at as u32)));
+        canonical.extend(
+            flat.iter()
+                .enumerate()
+                .map(|(at, (it, _))| *first.entry(it.name.as_str()).or_insert(at as u32)),
+        );
         let mut libraries = Vec::with_capacity(flat.len());
         // alloc: each library's own name (the writers' `Library`), once per change of the libraries
-        libraries.extend(flat.iter().map(|(it, as_needed)| Library { name: it.name.clone(), as_needed: *as_needed }));
+        libraries.extend(
+            flat.iter()
+                .map(|(it, as_needed)| Library { name: it.name.clone(), as_needed: *as_needed }),
+        );
         let count: usize = flat.iter().map(|it| it.0.symbols.len()).sum();
         let mut names = Names::with_capacity(flat.iter().map(|it| it.0.names.bytes()).sum());
         let mut table = Table::with_capacity(count);
         let mut symbols: Vec<Export> = Vec::with_capacity(count);
         let distinct: usize = flat.iter().map(|it| it.0.versions.len()).sum();
         let mut versions: Vec<String> = Vec::with_capacity(distinct);
-        let mut version_of: HashMap<&str, u32, std::alloc::Global> = HashMap::with_capacity_in(distinct, std::alloc::Global);
+        let mut version_of: HashMap<&str, u32, std::alloc::Global> =
+            HashMap::with_capacity_in(distinct, std::alloc::Global);
         for (at, (shared, _)) in flat.iter().enumerate() {
             for symbol in &shared.symbols {
                 let name = shared.symbol_name(symbol);
                 // One probe: the slot is taken for the export pushed next, unless an earlier
                 // library's symbol has the name.
                 let index = symbols.len() as u32;
-                if table.insert(hash(name), index, |it| names.at(symbols[it as usize].name) == name).is_err() {
+                if table
+                    .insert(hash(name), index, |it| names.at(symbols[it as usize].name) == name)
+                    .is_err()
+                {
                     continue;
                 }
                 let version = match shared.version(symbol) {
@@ -1013,7 +1127,13 @@ impl Exports {
                     }),
                 };
                 let stored = names.push(name)?;
-                symbols.push(Export { name: stored, library: canonical[at], version, kind: symbol.kind, weak: symbol.weak });
+                symbols.push(Export {
+                    name: stored,
+                    library: canonical[at],
+                    version,
+                    kind: symbol.kind,
+                    weak: symbol.weak,
+                });
             }
         }
         Ok(Exports { roots, libraries, orders, canonical, names, versions, symbols, table })
@@ -1033,7 +1153,11 @@ impl Exports {
     /// Whether these are the libraries it was built from.
     fn same(&self, roots: &[(Arc<NativeFile>, bool, u32)]) -> bool {
         self.roots.len() == roots.len()
-            && self.roots.iter().zip(roots).all(|(a, b)| Arc::ptr_eq(&a.0, &b.0) && a.1 == b.1 && a.2 == b.2)
+            && self
+                .roots
+                .iter()
+                .zip(roots)
+                .all(|(a, b)| Arc::ptr_eq(&a.0, &b.0) && a.1 == b.1 && a.2 == b.2)
     }
 }
 
@@ -1165,7 +1289,13 @@ impl Graph {
             Entry::Occupied(it) => *it.get(),
             Entry::Vacant(it) => {
                 it.insert(next);
-                self.slots.push(Slot { sym, best: NONE64, strength: 0, flags: 0, fallback: NONE64 });
+                self.slots.push(Slot {
+                    sym,
+                    best: NONE64,
+                    strength: 0,
+                    flags: 0,
+                    fallback: NONE64,
+                });
                 next
             }
         }
@@ -1199,7 +1329,9 @@ impl Graph {
         }
         let (load, symbol) = unpack(it);
         match self.object(load).symbols[symbol as usize].def {
-            SymbolDef::Section { section, .. } if self.discarded.get(self.flat(load, section)) => None,
+            SymbolDef::Section { section, .. } if self.discarded.get(self.flat(load, section)) => {
+                None
+            }
             _ => Some((load, symbol)),
         }
     }
@@ -1207,7 +1339,9 @@ impl Graph {
     /// Whether a load's symbol is its name's winning definition.
     fn wins(&self, load: u32, symbol: u32) -> bool {
         let slot = self.loads[load as usize].slots[symbol as usize];
-        slot != NONE && self.slots[slot as usize].best == pack(load, symbol) && self.best(slot).is_some()
+        slot != NONE
+            && self.slots[slot as usize].best == pack(load, symbol)
+            && self.best(slot).is_some()
     }
 
     /// Whether the natives, Rust or the image beside define the name.
@@ -1224,7 +1358,10 @@ impl Graph {
         match self.best(slot) {
             Some((load, symbol))
                 if !self.loads[load as usize].pulled
-                    && !matches!(self.object(load).symbols[symbol as usize].def, SymbolDef::Common { .. }) =>
+                    && !matches!(
+                        self.object(load).symbols[symbol as usize].def,
+                        SymbolDef::Common { .. }
+                    ) =>
             {
                 O_FIXED
             }
@@ -1274,7 +1411,8 @@ impl Graph {
     /// Once per graph built: each list is sized from the loads, but the live support's (as
     /// many as its sections' relocations).
     fn index(&mut self) {
-        let sum = |of: fn(&Parsed) -> usize| self.loads.iter().map(|it| of(&it.parsed)).sum::<usize>();
+        let sum =
+            |of: fn(&Parsed) -> usize| self.loads.iter().map(|it| of(&it.parsed)).sum::<usize>();
         let mut unwinds = Vec::with_capacity(sum(|it| it.unwind.len()));
         let mut fdes = Vec::with_capacity(sum(|it| it.frames.len()));
         let mut named = Vec::with_capacity(sum(|it| it.named.len()));
@@ -1309,7 +1447,9 @@ impl Graph {
                     fdes.push((self.flat(l, s) as u32, it.frames + at as u32));
                 }
             }
-            named.extend(it.parsed.named.iter().map(|(name, section)| (*name, it.sections + section)));
+            named.extend(
+                it.parsed.named.iter().map(|(name, section)| (*name, it.sections + section)),
+            );
             roots.extend(it.parsed.roots.iter().map(|section| it.sections + section));
         }
         radix::sort_copy_by_key(&mut named, |&(name, flat)| radix::pack_32(name.0, flat));
@@ -1373,7 +1513,13 @@ fn settled(outcome: u8, before: u8, after: u8, full: bool) -> Next {
         // The member may no longer be pulled.
         O_PULLED => after < before,
         // A full link drops an import nothing refers to.
-        O_IMPORT => if still { flips } else { full },
+        O_IMPORT => {
+            if still {
+                flips
+            } else {
+                full
+            }
+        }
         O_NEEDED => !still || flips,
         _ => still && flips,
     };
@@ -1433,7 +1579,8 @@ impl Refs {
 /// Whether a piece's references are Rust's, not the natives' or the linker's
 /// ([`What::is_linkers_cell`]).
 fn counted(what: What) -> bool {
-    !what.is_linkers_cell() && !matches!(what, What::Native { .. } | What::NativeFrame { .. } | What::Common)
+    !what.is_linkers_cell()
+        && !matches!(what, What::Native { .. } | What::NativeFrame { .. } | What::Common)
 }
 
 /// What collection kept, over a [`Graph`]'s flat numbering.
@@ -1498,7 +1645,12 @@ impl<'g> Marker<'g> {
     /// A walk over `graph`: what it marks has room for every section and frame record of the
     /// graph, so those two lists are allocated once (untouched room is never paged in); the
     /// work stack, one entry per edge waiting, grows by doubling past 64Ki entries.
-    fn new(graph: &'g Graph, marks: &'g mut Marks, symbols: &'g Symbols, writer: &'g Formats) -> Marker<'g> {
+    fn new(
+        graph: &'g Graph,
+        marks: &'g mut Marks,
+        symbols: &'g Symbols,
+        writer: &'g Formats,
+    ) -> Marker<'g> {
         let (sections, frames) = (graph.sections as usize, graph.frames as usize);
         Marker {
             graph,
@@ -1576,7 +1728,12 @@ impl<'g> Marker<'g> {
     fn special(&mut self, slot: u32) {
         let mut it = self.marks.special.get(slot as usize).copied().unwrap_or(UNKNOWN);
         if it == UNKNOWN {
-            it = special_mark(self.graph, self.symbols, self.writer, self.graph.slots[slot as usize].sym);
+            it = special_mark(
+                self.graph,
+                self.symbols,
+                self.writer,
+                self.graph.slots[slot as usize].sym,
+            );
             self.marks.special.set(slot as usize, it, || UNKNOWN);
         }
         if it == NOTHING {
@@ -1627,14 +1784,24 @@ impl<'g> Marker<'g> {
 
 /// Notes the names what a walk marked refers to; into `rose`, when given, the slots whose note
 /// rose, from and to.
-fn note_native(graph: &Graph, marks: &mut Marks, sections: &[u64], frames: &[u64], mut rose: Option<&mut Vec<(u32, u8, u8)>>) {
+fn note_native(
+    graph: &Graph,
+    marks: &mut Marks,
+    sections: &[u64],
+    frames: &[u64],
+    mut rose: Option<&mut Vec<(u32, u8, u8)>>,
+) {
     let mut note = |marks: &mut Marks, load: u32, symbol: u32| {
         let it = &graph.loads[load as usize];
         let slot = it.slots[symbol as usize];
         if slot == NONE {
             return;
         }
-        let level = if it.parsed.object().symbols[symbol as usize].binding == Binding::Weak { 1 } else { 2 };
+        let level = if it.parsed.object().symbols[symbol as usize].binding == Binding::Weak {
+            1
+        } else {
+            2
+        };
         let was = marks.native_of(slot);
         if level > was {
             marks.native.set(slot as usize, level, || 0);
@@ -1667,7 +1834,8 @@ fn section_defines(graph: &Graph, load: u32, section: u32, out: &mut Vec<Sym>) {
     let own = parsed.section_sym(section);
     for symbol in parsed.defs.row(section as usize) {
         let sym = parsed.sym(*symbol);
-        if sym != own && (is_local(&object.symbols[*symbol as usize]) || graph.wins(load, *symbol)) {
+        if sym != own && (is_local(&object.symbols[*symbol as usize]) || graph.wins(load, *symbol))
+        {
             out.push(sym);
         }
     }
@@ -1730,7 +1898,10 @@ impl Resolved {
     /// The global names the natives define, each once, as resolution chose them: neither
     /// Rust's nor the image beside's. One defined as an alias of its fallback is weak, at
     /// the fallback's place on the line. `inputs` are those it was resolved from.
-    pub(crate) fn native_defs<'r>(&'r self, inputs: &'r [Input]) -> impl Iterator<Item = NativeDef> + 'r {
+    pub(crate) fn native_defs<'r>(
+        &'r self,
+        inputs: &'r [Input],
+    ) -> impl Iterator<Item = NativeDef> + 'r {
         self.graph.as_deref().into_iter().flat_map(move |graph| {
             let order = move |load: u32| inputs[graph.loads[load as usize].input as usize].order;
             (0..graph.slots.len() as u32).filter_map(move |slot| {
@@ -1743,10 +1914,19 @@ impl Resolved {
                         SymbolDef::Section { size, .. } | SymbolDef::Common { size, .. } => size,
                         _ => 0,
                     };
-                    return Some(NativeDef { sym: it.sym, weak: it.strength < 3, order: order(load), size });
+                    return Some(NativeDef {
+                        sym: it.sym,
+                        weak: it.strength < 3,
+                        order: order(load),
+                        size,
+                    });
                 }
-                (it.flags & ALIAS != 0)
-                    .then(|| NativeDef { sym: it.sym, weak: true, order: order(unpack(it.fallback).0), size: 0 })
+                (it.flags & ALIAS != 0).then(|| NativeDef {
+                    sym: it.sym,
+                    weak: true,
+                    order: order(unpack(it.fallback).0),
+                    size: 0,
+                })
             })
         })
     }
@@ -1857,7 +2037,10 @@ impl Build {
         let graph = &mut self.graph;
         for slot in 0..graph.slots.len() as u32 {
             let it = graph.slots[slot as usize];
-            if it.fallback != NONE64 && it.flags & (RUST | OUTSIDE) == 0 && graph.best(slot).is_none() {
+            if it.fallback != NONE64
+                && it.flags & (RUST | OUTSIDE) == 0
+                && graph.best(slot).is_none()
+            {
                 graph.slots[slot as usize].flags |= ALIAS;
             }
         }
@@ -1876,7 +2059,10 @@ impl Build {
                 if next == slot {
                     let name = symbols.name_of(graph.slots[slot as usize].sym).unwrap_or("?");
                     // alloc: error path
-                    return Err(error(None, format!("the weak external `{name}` falls back to itself")));
+                    return Err(error(
+                        None,
+                        format!("the weak external `{name}` falls back to itself"),
+                    ));
                 }
                 if seen.contains(&next) || graph.slots[next as usize].flags & ALIAS == 0 {
                     break;
@@ -1922,7 +2108,10 @@ impl<'a> Stage<'a> {
                 }
                 Entry::Occupied(_) if matches!(native.kind, NativeKind::Object) => {
                     // alloc: error path
-                    return Err(error(None, format!("{}: the object is on the link line twice", native.name)));
+                    return Err(error(
+                        None,
+                        format!("{}: the object is on the link line twice", native.name),
+                    ));
                 }
                 Entry::Occupied(_) => {}
             }
@@ -1947,18 +2136,17 @@ impl<'a> Stage<'a> {
         let listed = &change.natives;
         let mut files: Vec<Result<NativeFile, LinkError>> = Vec::with_capacity(fresh.len());
         files.clear();
-        par::extend(
-            &mut files,
-            &fresh,
-            |at| {
-                let native = &listed[*at];
-                // alloc: error path (the message is made only on `Err`)
-                let file = writer.read(native.name, native.bytes, &native.kind).map_err(|it| error(None, format!("{}: {it}", native.name)))?;
-                // alloc: error path (the message is made only on `Err`)
-                check_file(&file, native.bytes.len()).map_err(|it| error(None, format!("{}: {it}", native.name)))?;
-                Ok(file)
-            },
-        );
+        par::extend(&mut files, &fresh, |at| {
+            let native = &listed[*at];
+            // alloc: error path (the message is made only on `Err`)
+            let file = writer
+                .read(native.name, native.bytes, &native.kind)
+                .map_err(|it| error(None, format!("{}: {it}", native.name)))?;
+            // alloc: error path (the message is made only on `Err`)
+            check_file(&file, native.bytes.len())
+                .map_err(|it| error(None, format!("{}: {it}", native.name)))?;
+            Ok(file)
+        });
         let mut bytes: HashMap<blaze_ids::ContentId, &'a [u8], std::alloc::Global> =
             HashMap::with_capacity_in(inputs.len() + fresh.len(), std::alloc::Global);
         inputs.reserve(fresh.len());
@@ -1977,7 +2165,8 @@ impl<'a> Stage<'a> {
             bytes.insert(native.id, &native.bytes[..]);
         }
         inputs.sort_by_key(|it| (it.order, it.id));
-        let mut names: HashSet<&str, std::alloc::Global> = HashSet::with_capacity_in(inputs.len(), std::alloc::Global);
+        let mut names: HashSet<&str, std::alloc::Global> =
+            HashSet::with_capacity_in(inputs.len(), std::alloc::Global);
         names.extend(inputs.iter().map(|it| &*it.name));
         // A Mach-O library is on the line by its install name too, which is where an SDK's
         // `.tbd` stands for the `/usr/lib` dylib another library re-exports.
@@ -1994,12 +2183,21 @@ impl<'a> Stage<'a> {
                 let what = match wanted.strip_prefix("-l") {
                     Some(file) if file.starts_with(':') => {
                         // alloc: error path
-                        format!("{} names {wanted}, and the link line has no {}", input.name, &file[1..])
+                        format!(
+                            "{} names {wanted}, and the link line has no {}",
+                            input.name,
+                            &file[1..]
+                        )
                     }
                     // alloc: error path
-                    Some(lib) => format!("{} names {wanted}, and the link line has no lib{lib}.so or lib{lib}.a", input.name),
+                    Some(lib) => format!(
+                        "{} names {wanted}, and the link line has no lib{lib}.so or lib{lib}.a",
+                        input.name
+                    ),
                     // alloc: error path
-                    None => format!("{} names {wanted}, which the link line does not have", input.name),
+                    None => {
+                        format!("{} names {wanted}, which the link line does not have", input.name)
+                    }
                 };
                 return Err(error(None, what));
             }
@@ -2013,8 +2211,15 @@ impl<'a> Stage<'a> {
         self.native.bytes.extend(inputs.iter().map(|it| bytes[&it.id]));
         self.native.filled = true;
         if !removed.is_empty() {
-            let mut gone: HashSet<u32, std::alloc::Global> = HashSet::with_capacity_in(removed.len(), std::alloc::Global);
-            gone.extend(removed.iter().filter(|it| !given.contains_key(*it)).filter_map(|it| self.symbols.find_id(it)).map(|it| it.0));
+            let mut gone: HashSet<u32, std::alloc::Global> =
+                HashSet::with_capacity_in(removed.len(), std::alloc::Global);
+            gone.extend(
+                removed
+                    .iter()
+                    .filter(|it| !given.contains_key(*it))
+                    .filter_map(|it| self.symbols.find_id(it))
+                    .map(|it| it.0),
+            );
             if !gone.is_empty() {
                 self.objects.retain(|obj, _| !gone.contains(&obj.native.0));
             }
@@ -2024,15 +2229,26 @@ impl<'a> Stage<'a> {
 
     /// A section's bytes, or `within` them: borrowed from the input, or copied to the arena
     /// when the reader made them; none for zeros.
-    fn content(&self, object: &Object, data: &Data, input: u32, base: usize, within: Range<usize>) -> Content<'a> {
+    fn content(
+        &self,
+        object: &Object,
+        data: &Data,
+        input: u32,
+        base: usize,
+        within: Range<usize>,
+    ) -> Content<'a> {
         match data {
             Data::Made(range) => {
                 let arena: &'a blaze_mem::Frame = self.arena;
                 let start = range.start as usize;
-                Content::Bytes(arena.alloc_slice_copy(&object.made[start + within.start..start + within.end]))
+                Content::Bytes(
+                    arena.alloc_slice_copy(&object.made[start + within.start..start + within.end]),
+                )
             }
             Data::Input(range) => {
-                debug_assert!(self.native.filled || Arc::ptr_eq(&self.old.inputs, &self.new.inputs));
+                debug_assert!(
+                    self.native.filled || Arc::ptr_eq(&self.old.inputs, &self.new.inputs)
+                );
                 let bytes: &'a [u8] = self.native.input(self.old, input);
                 let start = base + range.start as usize;
                 Content::Bytes(&bytes[start + within.start..start + within.end])
@@ -2080,71 +2296,82 @@ impl<'a> Stage<'a> {
         Ok(out)
     }
 
-    fn read_misses(&mut self, wanted: &[(u32, u32)], objs: &[Obj], misses: &[usize]) -> Result<Vec<Read>, LinkError> {
+    fn read_misses(
+        &mut self,
+        wanted: &[(u32, u32)],
+        objs: &[Obj],
+        misses: &[usize],
+    ) -> Result<Vec<Read>, LinkError> {
         struct Got {
             file: Arc<NativeFile>,
             base: usize,
             records: Vec<(u32, Vec<unwind::Native>)>,
         }
         let writer = self.writer;
-        let (inputs, native, old): (&[Input], &Pass<'a>, &'a State) = (&self.new.inputs[..], &self.native, self.old);
+        let (inputs, native, old): (&[Input], &Pass<'a>, &'a State) =
+            (&self.new.inputs[..], &self.native, self.old);
         let mut got: Vec<Result<Got, LinkError>> = Vec::with_capacity(misses.len());
         got.clear();
-        par::extend(
-            &mut got,
-            misses,
-            |at| {
-                let (input, member) = wanted[*at];
-                let it = &inputs[input as usize];
-                let all = native.input(old, input);
-                let (file, base, member_name) = if member == 0 {
-                    // clone: an `Arc`: the object is the input's own file
-                    (it.file.clone(), 0, None)
-                } else {
-                    let NativeFile::Archive(archive) = &*it.file else { unreachable!("a member of an archive") };
-                    let entry = &archive.members[member as usize - 1];
-                    let member_name = archive.name(entry.name);
-                    // alloc: error path
-                    let fail = |what: &str| error(None, format!("{}({member_name}): {what}", it.name));
-                    let slice = &all[entry.bytes.start..entry.bytes.end];
-                    // A reader names the object only in its errors: the archive's name; the member's is added here.
-                    let file = writer.read(&it.name, slice, &NativeKind::Object).map_err(|what| fail(&what))?;
-                    check_file(&file, slice.len()).map_err(|what| fail(&what))?;
-                    if matches!(file, NativeFile::Archive(_)) {
-                        return Err(fail("an archive in an archive"));
-                    }
-                    // alloc: once per member read, shared by every stage after
-                    (Arc::new(file), entry.bytes.start, Some(member_name))
+        par::extend(&mut got, misses, |at| {
+            let (input, member) = wanted[*at];
+            let it = &inputs[input as usize];
+            let all = native.input(old, input);
+            let (file, base, member_name) = if member == 0 {
+                // clone: an `Arc`: the object is the input's own file
+                (it.file.clone(), 0, None)
+            } else {
+                let NativeFile::Archive(archive) = &*it.file else {
+                    unreachable!("a member of an archive")
                 };
-                // alloc: none for an object without `.eh_frame`; once per object read otherwise
-                let mut records = Vec::new();
-                if let NativeFile::Object(object) = &*file {
-                    for (at, section) in object.sections.iter().enumerate() {
-                        if section.what != SectionKind::EhFrame {
-                            continue;
+                let entry = &archive.members[member as usize - 1];
+                let member_name = archive.name(entry.name);
+                // alloc: error path
+                let fail = |what: &str| error(None, format!("{}({member_name}): {what}", it.name));
+                let slice = &all[entry.bytes.start..entry.bytes.end];
+                // A reader names the object only in its errors: the archive's name; the member's is added here.
+                let file = writer
+                    .read(&it.name, slice, &NativeKind::Object)
+                    .map_err(|what| fail(&what))?;
+                check_file(&file, slice.len()).map_err(|what| fail(&what))?;
+                if matches!(file, NativeFile::Archive(_)) {
+                    return Err(fail("an archive in an archive"));
+                }
+                // alloc: once per member read, shared by every stage after
+                (Arc::new(file), entry.bytes.start, Some(member_name))
+            };
+            // alloc: none for an object without `.eh_frame`; once per object read otherwise
+            let mut records = Vec::new();
+            if let NativeFile::Object(object) = &*file {
+                for (at, section) in object.sections.iter().enumerate() {
+                    if section.what != SectionKind::EhFrame {
+                        continue;
+                    }
+                    let data = match &section.data {
+                        Data::Input(range) => {
+                            &all[base + range.start as usize..base + range.end as usize]
                         }
-                        let data = match &section.data {
-                            Data::Input(range) => &all[base + range.start as usize..base + range.end as usize],
-                            Data::Made(range) => &object.made[range.start as usize..range.end as usize],
-                            Data::Bytes(bytes) => &bytes[..],
-                            Data::Zero(_) => continue,
-                        };
-                        let split = unwind::split(data).map_err(|what| {
-                            let section = object.name(section.name);
-                            // alloc: error path
-                            error(None, match member_name {
+                        Data::Made(range) => &object.made[range.start as usize..range.end as usize],
+                        Data::Bytes(bytes) => &bytes[..],
+                        Data::Zero(_) => continue,
+                    };
+                    let split = unwind::split(data).map_err(|what| {
+                        let section = object.name(section.name);
+                        // alloc: error path
+                        error(
+                            None,
+                            match member_name {
                                 // alloc: error path
                                 Some(member) => format!("{}({member}): {section}: {what}", it.name),
                                 // alloc: error path
                                 None => format!("{}: {section}: {what}", it.name),
-                            })
-                        })?;
-                        records.push((at as u32, split));
-                    }
+                            },
+                        )
+                    })?;
+                    records.push((at as u32, split));
                 }
-                Ok(Got { file, base, records })
-            },
-        );
+            }
+            Ok(Got { file, base, records })
+        });
         // alloc: one buffer per batch read, the objects of the batch
         let got: Vec<Got> = got.into_iter().collect::<Result<_, _>>()?;
         // One batch for every object's symbols, sections and frame records, and one for the
@@ -2154,8 +2381,11 @@ impl<'a> Stage<'a> {
             let NativeFile::Object(object) = &*it.file else { continue };
             key_count += object.symbols.len() + object.sections.len();
             key_count += it.records.iter().map(|(_, records)| records.len()).sum::<usize>();
-            name_count +=
-                object.sections.iter().filter(|it| matches!(it.what, SectionKind::Alloc(Class::Named { .. }, _))).count();
+            name_count += object
+                .sections
+                .iter()
+                .filter(|it| matches!(it.what, SectionKind::Alloc(Class::Named { .. }, _)))
+                .count();
         }
         let mut starts = Vec::with_capacity(got.len() + 1);
         let syms;
@@ -2179,27 +2409,23 @@ impl<'a> Stage<'a> {
         }
         let mut reads: Vec<Read> = Vec::with_capacity(got.len());
         reads.clear();
-        par::extend(
-            &mut reads,
-            par::enumerate(par::zip(got, misses)),
-            |(n, (it, at))| {
-                if matches!(*it.file, NativeFile::Shared(_)) {
-                    return Read::Shared(it.file);
-                }
-                let ((keys, names), (keys_end, names_end)) = (starts[n], starts[n + 1]);
-                let parsed = Parsed::new(
-                    objs[*at],
-                    it.file,
-                    it.base,
-                    // alloc: the object's own symbols, once per object read, kept with it
-                    syms[keys..keys_end].to_vec(),
-                    &name_ids[names..names_end],
-                    &it.records,
-                );
-                // alloc: once per object read, shared by every stage after
-                Read::Object(Arc::new(parsed))
-            },
-        );
+        par::extend(&mut reads, par::enumerate(par::zip(got, misses)), |(n, (it, at))| {
+            if matches!(*it.file, NativeFile::Shared(_)) {
+                return Read::Shared(it.file);
+            }
+            let ((keys, names), (keys_end, names_end)) = (starts[n], starts[n + 1]);
+            let parsed = Parsed::new(
+                objs[*at],
+                it.file,
+                it.base,
+                // alloc: the object's own symbols, once per object read, kept with it
+                syms[keys..keys_end].to_vec(),
+                &name_ids[names..names_end],
+                &it.records,
+            );
+            // alloc: once per object read, shared by every stage after
+            Read::Object(Arc::new(parsed))
+        });
         Ok(reads)
     }
 
@@ -2211,24 +2437,20 @@ impl<'a> Stage<'a> {
         let objects = &*self.objects;
         let mut out: Vec<(u32, Arc<Table>)> = Vec::with_capacity(lazy.len());
         out.clear();
-        par::extend(
-            &mut out,
-            par::zip(lazy, &objs),
-            |(input, obj)| {
-                let table = match objects.get(obj) {
-                    // clone: an `Arc`: the archive's index as the image keeps it
-                    Some(Read::Index(it)) => it.clone(),
-                    _ => {
-                        let NativeFile::Archive(archive) = &*inputs[*input as usize].file else {
-                            unreachable!("searched inputs are archives")
-                        };
-                        // alloc: once per archive searched, kept for the image's life
-                        Arc::new(archive_index(archive))
-                    }
-                };
-                (*input, table)
-            },
-        );
+        par::extend(&mut out, par::zip(lazy, &objs), |(input, obj)| {
+            let table = match objects.get(obj) {
+                // clone: an `Arc`: the archive's index as the image keeps it
+                Some(Read::Index(it)) => it.clone(),
+                _ => {
+                    let NativeFile::Archive(archive) = &*inputs[*input as usize].file else {
+                        unreachable!("searched inputs are archives")
+                    };
+                    // alloc: once per archive searched, kept for the image's life
+                    Arc::new(archive_index(archive))
+                }
+            };
+            (*input, table)
+        });
         for (obj, (_, table)) in objs.iter().zip(&out) {
             // clone: an `Arc`: the image's handle on the index
             self.objects.entry(*obj).or_insert_with(|| Read::Index(table.clone()));
@@ -2238,7 +2460,13 @@ impl<'a> Stage<'a> {
 
     /// Adds an object to the graph: its groups, directives, imports and globals, in lld's
     /// order of precedence (the graph's loads are in link-line order, then pull rounds).
-    fn register(&mut self, b: &mut Build, parsed: &Arc<Parsed>, input: u32, pulled: bool) -> Result<(), LinkError> {
+    fn register(
+        &mut self,
+        b: &mut Build,
+        parsed: &Arc<Parsed>,
+        input: u32,
+        pulled: bool,
+    ) -> Result<(), LinkError> {
         let object = parsed.object();
         let load = b.graph.loads.len() as u32;
         // alloc: the load's slot of each symbol, once per object per graph built
@@ -2257,7 +2485,10 @@ impl<'a> Stage<'a> {
 
         let size = |graph: &Graph, load: u32, group: u32| -> u64 {
             let object = graph.object(load);
-            object.group_sections(&object.groups[group as usize]).first().map_or(0, |it| object.sections[*it as usize].data.len())
+            object
+                .group_sections(&object.groups[group as usize])
+                .first()
+                .map_or(0, |it| object.sections[*it as usize].data.len())
         };
         for (index, group) in object.groups.iter().enumerate() {
             let index = index as u32;
@@ -2298,7 +2529,11 @@ impl<'a> Stage<'a> {
                     // alloc: the set's own name, once per `/EXPORT` directive per graph built
                     if b.asked.insert(name.clone()) {
                         // alloc: the writers' own names, once per name exported per graph built
-                        Arc::make_mut(&mut b.graph.asked).push((name.clone(), symbol.clone(), *data));
+                        Arc::make_mut(&mut b.graph.asked).push((
+                            name.clone(),
+                            symbol.clone(),
+                            *data,
+                        ));
                     }
                 }
                 Directive::Mismatch { key, value } => match b.mismatches.get(key) {
@@ -2329,20 +2564,32 @@ impl<'a> Stage<'a> {
             let bad = |what: String| {
                 let name = object.name(object.symbols[*at as usize].name);
                 // alloc: error path
-                error(None, format!("{}: the wasm import of `{name}`: {what}", self.input_name(input)))
+                error(
+                    None,
+                    format!("{}: the wasm import of `{name}`: {what}", self.input_name(input)),
+                )
             };
             let ty = it.type_bytes(all).map_err(bad)?;
             // alloc: the type's params and results, once per import per graph built; error path
-            let ty = blaze_codegen::wasm::Signature::decode(ty, &mut 0).map_err(|what| bad(what.to_string()))?;
+            let ty = blaze_codegen::wasm::Signature::decode(ty, &mut 0)
+                .map_err(|what| bad(what.to_string()))?;
             // alloc: the graph's own wasm import (module and field names, its type), once per import per graph built
-            let import = blaze_codegen::wasm::Import { module: object.name(it.module).to_owned(), field: object.name(it.field).to_owned(), ty };
+            let import = blaze_codegen::wasm::Import {
+                module: object.name(it.module).to_owned(),
+                field: object.name(it.field).to_owned(),
+                ty,
+            };
             match b.graph.wasm.get(&sym) {
                 Some((by, known)) if *known != import => {
                     let name = object.name(object.symbols[*at as usize].name);
                     return Err(error(
                         None,
                         // alloc: error path
-                        format!("`{name}` is imported as {known:?} by {} and as {import:?} by {}", self.input_name(*by), self.input_name(input)),
+                        format!(
+                            "`{name}` is imported as {known:?} by {} and as {import:?} by {}",
+                            self.input_name(*by),
+                            self.input_name(input)
+                        ),
                     ));
                 }
                 Some(_) => {}
@@ -2415,13 +2662,19 @@ impl<'a> Stage<'a> {
                 Some(_) if strength > it.strength => true,
                 Some((l, i)) if strength == 3 && it.strength == 3 => {
                     let first = match b.graph.object(l).symbols[i as usize].def {
-                        SymbolDef::Section { .. } => self.input_name(b.graph.loads[l as usize].input),
+                        SymbolDef::Section { .. } => {
+                            self.input_name(b.graph.loads[l as usize].input)
+                        }
                         _ => "an absolute definition",
                     };
                     return Err(error(
                         None,
                         // alloc: error path
-                        format!("duplicate symbol `{}`: in {first} and in {}", object.name(symbol.name), self.input_name(input)),
+                        format!(
+                            "duplicate symbol `{}`: in {first} and in {}",
+                            object.name(symbol.name),
+                            self.input_name(input)
+                        ),
                     ));
                 }
                 Some(_) => false,
@@ -2481,7 +2734,10 @@ impl<'a> Stage<'a> {
                     return Err(error(
                         None,
                         // alloc: error path
-                        format!("`{name}` is imported as {a:?} by {} and as {b:?} by Rust code", self.new.inputs[*by as usize].name),
+                        format!(
+                            "`{name}` is imported as {a:?} by {} and as {b:?} by Rust code",
+                            self.new.inputs[*by as usize].name
+                        ),
                     ));
                 }
             }
@@ -2503,7 +2759,10 @@ impl<'a> Stage<'a> {
                 _ => Err(error(
                     None,
                     // alloc: error path
-                    format!("undefined symbol `{name}`{}, which no input says the wasm import of", self.referrer(sym)),
+                    format!(
+                        "undefined symbol `{name}`{}, which no input says the wasm import of",
+                        self.referrer(sym)
+                    ),
                 )),
             };
         }
@@ -2512,7 +2771,14 @@ impl<'a> Stage<'a> {
         }
         if !executable {
             // alloc: the writers' `Import` owns its name: once per import a resolution makes
-            let import = Import { name: name.to_owned(), library: None, version: None, kind: SymbolKind::Other, weak, wasm: None };
+            let import = Import {
+                name: name.to_owned(),
+                library: None,
+                version: None,
+                kind: SymbolKind::Other,
+                weak,
+                wasm: None,
+            };
             return Ok(Decision::Import(import, NONE));
         }
         if optional(name) {
@@ -2531,7 +2797,8 @@ impl<'a> Stage<'a> {
         match piece.what() {
             What::Native { obj, .. } | What::NativeFrame { obj, .. } => {
                 let id = self.symbols.content(obj.native);
-                let name = self.new.inputs.iter().find(|it| it.id == *id).map_or("?", |it| &*it.name);
+                let name =
+                    self.new.inputs.iter().find(|it| it.id == *id).map_or("?", |it| &*it.name);
                 // alloc: error path
                 format!(", referred to by {name}")
             }
@@ -2541,7 +2808,13 @@ impl<'a> Stage<'a> {
     }
 
     /// Makes a kept section's piece, its bytes borrowed from its input.
-    fn make_section(&mut self, graph: &Graph, load: u32, section: u32, scratch: &mut Scratch) -> Result<(), LinkError> {
+    fn make_section(
+        &mut self,
+        graph: &Graph,
+        load: u32,
+        section: u32,
+        scratch: &mut Scratch,
+    ) -> Result<(), LinkError> {
         let it = &graph.loads[load as usize];
         let parsed = &it.parsed;
         let object = parsed.object();
@@ -2555,7 +2828,10 @@ impl<'a> Stage<'a> {
         if zeroed && !matches!(s.data, Data::Zero(_)) {
             let name = &self.new.inputs[it.input as usize].name;
             // alloc: error path
-            return Err(error(None, format!("{name}: {} has bytes, in a zeroed section", object.name(s.name))));
+            return Err(error(
+                None,
+                format!("{name}: {} has bytes, in a zeroed section", object.name(s.name)),
+            ));
         }
         scratch.fixups.clear();
         scratch.weak.clear();
@@ -2565,20 +2841,37 @@ impl<'a> Stage<'a> {
             if symbol.binding == Binding::Weak && symbol.def == SymbolDef::Undefined {
                 scratch.weak.push(target);
             }
-            scratch.fixups.push(Fixup { at: f.at, apply: f.apply, target, addend: f.addend, minus: f.minus.map(|m| parsed.sym(m)) });
+            scratch.fixups.push(Fixup {
+                at: f.at,
+                apply: f.apply,
+                target,
+                addend: f.addend,
+                minus: f.minus.map(|m| parsed.sym(m)),
+            });
         }
         scratch.weak.sort_unstable();
         scratch.weak.dedup();
         section_defines(graph, load, section, &mut scratch.defines);
-        let content =
-            if zeroed { Content::Zero } else { self.content(object, &s.data, it.input, parsed.base, 0..s.data.len() as usize) };
+        let content = if zeroed {
+            Content::Zero
+        } else {
+            self.content(object, &s.data, it.input, parsed.base, 0..s.data.len() as usize)
+        };
         let order = self.new.inputs[it.input as usize].order;
         let what = What::Native { obj: parsed.obj, section, unwind };
-        let mut piece = self.piece(parsed.section_sym(section), class, s.align, s.data.len(), &scratch.fixups, what);
+        let mut piece = self.piece(
+            parsed.section_sym(section),
+            class,
+            s.align,
+            s.data.len(),
+            &scratch.fixups,
+            what,
+        );
         piece.rank = rank;
         // lld's `SHF_LINK_ORDER`: in the order of the sections tied to, so that parallel
         // tables (SanitizerCoverage's counters and PCs) stay one entry each per kept function.
-        let placed = tie_of(object, section).filter(|tie| tie.ordered).map_or(section, |tie| tie.to);
+        let placed =
+            tie_of(object, section).filter(|tie| tie.ordered).map_or(section, |tie| tie.to);
         piece.order = [order, parsed.obj.member, placed];
         piece.zero = zeroed;
         piece.weak = scratch.weak.as_slice();
@@ -2588,7 +2881,13 @@ impl<'a> Stage<'a> {
     }
 
     /// Makes a kept frame record's piece: an FDE's CIE pointer is a fixup to its CIE's piece.
-    fn make_frame(&mut self, graph: &Graph, load: u32, frame: u32, fixups: &mut Vec<Fixup>) -> Result<(), LinkError> {
+    fn make_frame(
+        &mut self,
+        graph: &Graph,
+        load: u32,
+        frame: u32,
+        fixups: &mut Vec<Fixup>,
+    ) -> Result<(), LinkError> {
         let it = &graph.loads[load as usize];
         let parsed = &it.parsed;
         let object = parsed.object();
@@ -2598,12 +2897,21 @@ impl<'a> Stage<'a> {
         if (end - start) % 4 != 0 {
             let name = self.input_name(it.input);
             // alloc: error path
-            return Err(error(None, format!("{name}: {}: a frame record not a multiple of 4 long", object.name(s.name))));
+            return Err(error(
+                None,
+                format!("{name}: {}: a frame record not a multiple of 4 long", object.name(s.name)),
+            ));
         }
         if record.fde && record.cie == NONE {
             let name = self.input_name(it.input);
             // alloc: error path
-            return Err(error(None, format!("{name}: {}: an FDE at {start:#x} whose CIE is no record", object.name(s.name))));
+            return Err(error(
+                None,
+                format!(
+                    "{name}: {}: an FDE at {start:#x} whose CIE is no record",
+                    object.name(s.name)
+                ),
+            ));
         }
         let sym = parsed.frame_sym(frame);
         fixups.clear();
@@ -2620,10 +2928,17 @@ impl<'a> Stage<'a> {
         if record.fde {
             let cie = parsed.frame_sym(record.cie);
             fixups.retain(|f| f.at != 4);
-            fixups.push(Fixup { at: 4, apply: Apply::Delta32, target: sym, addend: 4, minus: Some(cie) });
+            fixups.push(Fixup {
+                at: 4,
+                apply: Apply::Delta32,
+                target: sym,
+                addend: 4,
+                minus: Some(cie),
+            });
         }
         fixups.sort_by_key(|f| f.at);
-        let content = self.content(object, &s.data, it.input, parsed.base, start as usize..end as usize);
+        let content =
+            self.content(object, &s.data, it.input, parsed.base, start as usize..end as usize);
         let order = self.new.inputs[it.input as usize].order;
         let what = What::NativeFrame { obj: parsed.obj, section: record.section, fde: record.fde };
         let mut piece = self.piece(sym, &Class::EhFrame, 4, end - start, fixups.as_slice(), what);
@@ -2643,7 +2958,8 @@ impl<'a> Stage<'a> {
 
     fn unmake_common(&mut self, name: Sym) {
         let SymKey::Name(id) = self.symbols.key(name) else { return };
-        if let Some(piece) = self.symbols.find(SymKey::Common(id)).and_then(|it| self.piece_of(it)) {
+        if let Some(piece) = self.symbols.find(SymKey::Common(id)).and_then(|it| self.piece_of(it))
+        {
             self.unmake(piece);
         }
     }
@@ -2674,7 +2990,9 @@ impl<'a> Stage<'a> {
         // alloc: none until a piece came or went; then the names touched, once per stage
         let mut touched: Vec<Sym> = Vec::new();
         for id in self.new.removed_since(old.removals) {
-            let Some(list) = refs.of.get(id as usize).copied().filter(|it| !it.is_empty()) else { continue };
+            let Some(list) = refs.of.get(id as usize).copied().filter(|it| !it.is_empty()) else {
+                continue;
+            };
             for at in 0..list.len() {
                 let entry = refs.lists.get(list)[at];
                 refs.count(entry, -1);
@@ -2727,7 +3045,8 @@ impl<'a> Stage<'a> {
         let same = old.graph.is_some()
             && Arc::ptr_eq(&old.inputs, &self.new.inputs)
             && (Arc::ptr_eq(&old.names, &self.new.names) || *old.names == *self.new.names)
-            && (Arc::ptr_eq(&old.wasm, &self.new.wasm_imports) || *old.wasm == *self.new.wasm_imports)
+            && (Arc::ptr_eq(&old.wasm, &self.new.wasm_imports)
+                || *old.wasm == *self.new.wasm_imports)
             && !(self.full && old.stale);
         if same
             && changes.is_empty()
@@ -2806,9 +3125,14 @@ impl<'a> Stage<'a> {
                     // No loaded object mentions a name new to the graph, so only archives
                     // could define it, and the image beside comes before them.
                     let def = match slot {
-                        Some(slot) if graph.slots[slot as usize].flags & OUTSIDE != 0 => graph.outside.get(&slot).copied(),
+                        Some(slot) if graph.slots[slot as usize].flags & OUTSIDE != 0 => {
+                            graph.outside.get(&slot).copied()
+                        }
                         Some(_) => None,
-                        None => symbols.name_of(sym).and_then(|name| outside.name(name)).map(outside_def),
+                        None => symbols
+                            .name_of(sym)
+                            .and_then(|name| outside.name(name))
+                            .map(outside_def),
                     };
                     if let Some(def) = def {
                         beside.push((sym, def));
@@ -2870,14 +3194,24 @@ impl<'a> Stage<'a> {
             let strong = flags & (REQUIRED | STRONG) != 0 || native == 2;
             let others = strong || flags & ROOT != 0 || native > 0;
             let weak = !strong && refs.class(sym) != 2;
-            let bits = if weak { O_WEAK } else { 0 } | if strong { O_STRONG } else { 0 } | if others { O_OTHERS } else { 0 };
+            let bits = if weak { O_WEAK } else { 0 }
+                | if strong { O_STRONG } else { 0 }
+                | if others { O_OTHERS } else { 0 };
             let decision = self.decide(&graph, sym, weak)?;
             let kind = match &decision {
-                Decision::Special(Special::Section { .. } | Special::Got { .. }) => return Ok(None),
+                Decision::Special(Special::Section { .. } | Special::Got { .. }) => {
+                    return Ok(None);
+                }
                 Decision::Special(_) | Decision::Zero | Decision::Skip => O_OTHER,
                 Decision::Import(_, library) if *library == NONE => O_IMPORT,
-                Decision::Import(_, library) if old.library_index[*library as usize] == NONE => return Ok(None),
-                Decision::Import(_, library) if graph.exports.libraries[*library as usize].as_needed => O_NEEDED,
+                Decision::Import(_, library) if old.library_index[*library as usize] == NONE => {
+                    return Ok(None);
+                }
+                Decision::Import(_, library)
+                    if graph.exports.libraries[*library as usize].as_needed =>
+                {
+                    O_NEEDED
+                }
                 Decision::Import(..) => O_IMPORT,
             };
             decisions.push((sym, decision, kind | bits));
@@ -2889,7 +3223,9 @@ impl<'a> Stage<'a> {
         radix::sort(&mut sections);
         for (load, section) in sections.iter().map(|it| unpack(*it)) {
             let parsed = &graph.loads[load as usize].parsed;
-            if !makes_piece(&parsed.object().sections[section as usize].what) || self.piece_of(parsed.section_sym(section)).is_some() {
+            if !makes_piece(&parsed.object().sections[section as usize].what)
+                || self.piece_of(parsed.section_sym(section)).is_some()
+            {
                 continue;
             }
             self.make_section(&graph, load, section, &mut scratch)?;
@@ -2964,7 +3300,12 @@ impl<'a> Stage<'a> {
     /// between its definition and theirs: strong beats weak (a common is weaker than
     /// either), of two weak ones the first on the line wins, two strong ones are the
     /// duplicate symbol error. Rust's names lose to none.
-    fn beside_names<O: Outside>(&self, b: &mut Build, inputs: &[Input], outside: &O) -> Result<(), LinkError> {
+    fn beside_names<O: Outside>(
+        &self,
+        b: &mut Build,
+        inputs: &[Input],
+        outside: &O,
+    ) -> Result<(), LinkError> {
         for slot in 0..b.graph.slots.len() as u32 {
             let it = b.graph.slots[slot as usize];
             let Some(name) = self.symbols.name_of(it.sym) else { continue };
@@ -2972,7 +3313,12 @@ impl<'a> Stage<'a> {
             let strength = if theirs.strength == Strength::Strong { 3 } else { 2 };
             let duplicate = |ours: &str| {
                 // alloc: error path
-                error(None, format!("duplicate symbol `{name}`: {ours}, and so does the image this one is linked beside"))
+                error(
+                    None,
+                    format!(
+                        "duplicate symbol `{name}`: {ours}, and so does the image this one is linked beside"
+                    ),
+                )
             };
             let wins = if it.flags & RUST != 0 {
                 if strength == 3 {
@@ -2984,15 +3330,22 @@ impl<'a> Stage<'a> {
                     None => true,
                     Some((load, _)) if strength == 3 && it.strength == 3 => {
                         // alloc: error path
-                        return Err(duplicate(&format!("{} defines it", self.input_name(b.graph.loads[load as usize].input))));
+                        return Err(duplicate(&format!(
+                            "{} defines it",
+                            self.input_name(b.graph.loads[load as usize].input)
+                        )));
                     }
                     Some(_) if strength != it.strength => strength > it.strength,
-                    Some((load, _)) => theirs.order < inputs[b.graph.loads[load as usize].input as usize].order,
+                    Some((load, _)) => {
+                        theirs.order < inputs[b.graph.loads[load as usize].input as usize].order
+                    }
                 }
             };
             if !wins && theirs.strength == Strength::Weak && outside.reached_directly(name) {
                 let ours = match b.graph.best(slot) {
-                    Some((load, _)) if it.flags & RUST == 0 => self.input_name(b.graph.loads[load as usize].input),
+                    Some((load, _)) if it.flags & RUST == 0 => {
+                        self.input_name(b.graph.loads[load as usize].input)
+                    }
                     _ => "Rust code",
                 };
                 return Err(error(
@@ -3019,7 +3372,12 @@ impl<'a> Stage<'a> {
 
     /// Builds the graph again from the kept objects and makes the image's natives and names
     /// what it gives, touching only what differs.
-    fn rebuild<O: Outside>(&mut self, old: &Resolved, refs: &Refs, outside: &O) -> Result<Resolved, LinkError> {
+    fn rebuild<O: Outside>(
+        &mut self,
+        old: &Resolved,
+        refs: &Refs,
+        outside: &O,
+    ) -> Result<Resolved, LinkError> {
         let output = self.output;
         // clone: an `Arc`: the inputs, read while the stage defines and makes pieces
         let inputs = self.new.inputs.clone();
@@ -3030,7 +3388,9 @@ impl<'a> Stage<'a> {
         // few and grow it at most once.
         b.reserve(names.len() + refs.names.len() + 3);
         let mut rust: Vec<(Sym, Sym)> = Vec::with_capacity(names.len());
-        rust.extend(names.iter().map(|(name, target)| (self.symbols.intern(SymKey::Name(*name)), *target)));
+        rust.extend(
+            names.iter().map(|(name, target)| (self.symbols.intern(SymKey::Name(*name)), *target)),
+        );
         for (sym, _) in &rust {
             let slot = b.slot(*sym);
             b.flag(slot, RUST);
@@ -3050,7 +3410,9 @@ impl<'a> Stage<'a> {
         }
         let entry = match &output.kind {
             OutputKind::Executable { entry } => Some(self.symbols.sym_name(entry)),
-            OutputKind::Shared { .. } => self.writer.shared_entry().map(|it| self.symbols.sym_name(it)),
+            OutputKind::Shared { .. } => {
+                self.writer.shared_entry().map(|it| self.symbols.sym_name(it))
+            }
         };
         if let Some(sym) = entry {
             let slot = b.slot(sym);
@@ -3071,7 +3433,11 @@ impl<'a> Stage<'a> {
         // Load: the line's objects and whole archives, then members for what is strongly
         // undefined, round by round.
         let whole = |input: &Input| match &*input.file {
-            NativeFile::Archive(archive) if matches!(input.kind, NativeKind::Archive { whole: true }) => archive.members.len(),
+            NativeFile::Archive(archive)
+                if matches!(input.kind, NativeKind::Archive { whole: true }) =>
+            {
+                archive.members.len()
+            }
             _ => 1,
         };
         let mut round: Vec<(u32, u32)> = Vec::with_capacity(inputs.iter().map(whole).sum());
@@ -3080,7 +3446,9 @@ impl<'a> Stage<'a> {
             let at = at as u32;
             match &*input.file {
                 NativeFile::Object(_) => round.push((at, 0)),
-                NativeFile::Archive(archive) if matches!(input.kind, NativeKind::Archive { whole: true }) => {
+                NativeFile::Archive(archive)
+                    if matches!(input.kind, NativeKind::Archive { whole: true }) =>
+                {
                     round.extend((1..=archive.members.len() as u32).map(|member| (at, member)));
                 }
                 NativeFile::Archive(_) => lazy.push(at),
@@ -3095,7 +3463,12 @@ impl<'a> Stage<'a> {
         let mut pulled = false;
         loop {
             let reads = self.read(&round)?;
-            b.reserve(reads.iter().map(|it| if let Read::Object(parsed) = it { parsed.globals } else { 0 }).sum());
+            b.reserve(
+                reads
+                    .iter()
+                    .map(|it| if let Read::Object(parsed) = it { parsed.globals } else { 0 })
+                    .sum(),
+            );
             for (&(input, _), read) in round.iter().zip(reads) {
                 match read {
                     Read::Object(parsed) => self.register(&mut b, &parsed, input, pulled)?,
@@ -3109,7 +3482,9 @@ impl<'a> Stage<'a> {
                 if b.graph.slots[slot as usize].flags & RUST != 0 || b.graph.best(slot).is_some() {
                     continue;
                 }
-                let Some(name) = self.symbols.name_of(b.graph.slots[slot as usize].sym) else { continue };
+                let Some(name) = self.symbols.name_of(b.graph.slots[slot as usize].sym) else {
+                    continue;
+                };
                 // A member is pulled only for what is still undefined after the image beside.
                 if O::ANY && outside.name(name).is_some() {
                     continue;
@@ -3139,7 +3514,8 @@ impl<'a> Stage<'a> {
         let mut commons: Vec<(Sym, u64, u64)> = Vec::with_capacity(b.commons.len());
         for (slot, (size, align)) in &b.commons {
             let Some((load, symbol)) = b.graph.best(*slot) else { continue };
-            if matches!(b.graph.object(load).symbols[symbol as usize].def, SymbolDef::Common { .. }) {
+            if matches!(b.graph.object(load).symbols[symbol as usize].def, SymbolDef::Common { .. })
+            {
                 commons.push((b.graph.slots[*slot as usize].sym, *size, *align));
             }
         }
@@ -3185,7 +3561,9 @@ impl<'a> Stage<'a> {
             for (l, it) in was.loads.iter().enumerate() {
                 let now = graph.by_obj.get(&it.parsed.obj).copied();
                 for s in 0..it.parsed.object().sections.len() as u32 {
-                    if old.marks.sections.get(was.flat(l as u32, s)) && !now.is_some_and(|n| marks.sections.get(graph.flat(n, s))) {
+                    if old.marks.sections.get(was.flat(l as u32, s))
+                        && !now.is_some_and(|n| marks.sections.get(graph.flat(n, s)))
+                    {
                         gone.push(it.parsed.section_sym(s));
                         if let Some(n) = now {
                             affected.set(n as usize);
@@ -3193,7 +3571,9 @@ impl<'a> Stage<'a> {
                     }
                 }
                 for f in 0..it.parsed.frames.len() as u32 {
-                    let kept = now.is_some_and(|n| marks.frames.get((graph.loads[n as usize].frames + f) as usize));
+                    let kept = now.is_some_and(|n| {
+                        marks.frames.get((graph.loads[n as usize].frames + f) as usize)
+                    });
                     if old.marks.frames.get((it.frames + f) as usize) && !kept {
                         gone.push(it.parsed.frame_sym(f));
                     }
@@ -3242,7 +3622,9 @@ impl<'a> Stage<'a> {
             let load = load as u32;
             let object = it.parsed.object();
             for s in 0..object.sections.len() as u32 {
-                if !marks.sections.get(graph.flat(load, s)) || !makes_piece(&object.sections[s as usize].what) {
+                if !marks.sections.get(graph.flat(load, s))
+                    || !makes_piece(&object.sections[s as usize].what)
+                {
                     continue;
                 }
                 if self.piece_of(it.parsed.section_sym(s)).is_none() {
@@ -3251,7 +3633,9 @@ impl<'a> Stage<'a> {
                 }
             }
             for f in 0..it.parsed.frames.len() as u32 {
-                if marks.frames.get((it.frames + f) as usize) && self.piece_of(it.parsed.frame_sym(f)).is_none() {
+                if marks.frames.get((it.frames + f) as usize)
+                    && self.piece_of(it.parsed.frame_sym(f)).is_none()
+                {
                     self.make_frame(&graph, load, f, &mut scratch.fixups)?;
                 }
             }
@@ -3265,11 +3649,13 @@ impl<'a> Stage<'a> {
             if affected.get(load) {
                 continue;
             }
-            let was = old.graph.as_ref().and_then(|was| Some((was, *was.by_obj.get(&it.parsed.obj)?)));
+            let was =
+                old.graph.as_ref().and_then(|was| Some((was, *was.by_obj.get(&it.parsed.obj)?)));
             let changed = match was {
                 None => true,
-                Some((was, w)) => (0..it.slots.len() as u32)
-                    .any(|i| it.slots[i as usize] != NONE && graph.wins(load as u32, i) != was.wins(w, i)),
+                Some((was, w)) => (0..it.slots.len() as u32).any(|i| {
+                    it.slots[i as usize] != NONE && graph.wins(load as u32, i) != was.wins(w, i)
+                }),
             };
             if changed {
                 affected.set(load);
@@ -3292,9 +3678,12 @@ impl<'a> Stage<'a> {
                         if sym == parsed.section_sym(section) {
                             continue;
                         }
-                        self.piece_of(parsed.section_sym(section)).map_or(Def::None, |piece| Def::Piece { piece, offset: value })
+                        self.piece_of(parsed.section_sym(section))
+                            .map_or(Def::None, |piece| Def::Piece { piece, offset: value })
                     }
-                    SymbolDef::Absolute(value) if symbol.kind == SymbolKind::Tls => Def::TlsOffset(value),
+                    SymbolDef::Absolute(value) if symbol.kind == SymbolKind::Tls => {
+                        Def::TlsOffset(value)
+                    }
                     SymbolDef::Absolute(value) => Def::Absolute(value),
                     _ => Def::None,
                 };
@@ -3303,7 +3692,11 @@ impl<'a> Stage<'a> {
             for s in 0..object.sections.len() as u32 {
                 let Some(piece) = self.piece_of(parsed.section_sym(s)) else { continue };
                 section_defines(&graph, load, s, &mut scratch.defines);
-                if self.new.piece(piece).is_some_and(|it| it.defines() != scratch.defines.as_slice()) {
+                if self
+                    .new
+                    .piece(piece)
+                    .is_some_and(|it| it.defines() != scratch.defines.as_slice())
+                {
                     self.new.set_defines(piece, &scratch.defines);
                 }
             }
@@ -3318,10 +3711,12 @@ impl<'a> Stage<'a> {
                 let parsed = &graph.loads[load as usize].parsed;
                 let s = &parsed.object().symbols[symbol as usize];
                 match s.def {
-                    SymbolDef::Section { section, value, .. } => {
-                        self.piece_of(parsed.section_sym(section)).map_or(Def::None, |piece| Def::Piece { piece, offset: value })
+                    SymbolDef::Section { section, value, .. } => self
+                        .piece_of(parsed.section_sym(section))
+                        .map_or(Def::None, |piece| Def::Piece { piece, offset: value }),
+                    SymbolDef::Absolute(value) if s.kind == SymbolKind::Tls => {
+                        Def::TlsOffset(value)
                     }
-                    SymbolDef::Absolute(value) if s.kind == SymbolKind::Tls => Def::TlsOffset(value),
                     SymbolDef::Absolute(value) => Def::Absolute(value),
                     SymbolDef::Common { .. } => {
                         let SymKey::Name(name) = self.symbols.key(it.sym) else { continue };
@@ -3344,7 +3739,8 @@ impl<'a> Stage<'a> {
             self.define(*sym, Def::Alias(*target));
             defined.push(*sym);
         }
-        let live = output.live.is_some().then(|| self.symbols.sym_name(blaze_live::patch::DESCRIPTOR));
+        let live =
+            output.live.is_some().then(|| self.symbols.sym_name(blaze_live::patch::DESCRIPTOR));
         if let Some(live) = live {
             let descriptor = self.sym(SymKey::Descriptor);
             self.define(live, Def::Alias(descriptor));
@@ -3363,7 +3759,10 @@ impl<'a> Stage<'a> {
         // alloc: the names left to resolve, once per graph built
         let mut wanted: Vec<Sym> = Vec::new();
         for (slot, it) in graph.slots.iter().enumerate() {
-            if it.flags & (ROOT | REQUIRED) != 0 || marks.native_of(slot as u32) > 0 || refs.class(it.sym) > 0 {
+            if it.flags & (ROOT | REQUIRED) != 0
+                || marks.native_of(slot as u32) > 0
+                || refs.class(it.sym) > 0
+            {
                 wanted.push(it.sym);
             }
         }
@@ -3373,7 +3772,9 @@ impl<'a> Stage<'a> {
                 continue;
             }
             let Some(name) = self.symbols.name_of(*sym) else { continue };
-            let Some(target) = self.writer.special(name).and_then(|it| it.got_target(name)) else { continue };
+            let Some(target) = self.writer.special(name).and_then(|it| it.got_target(name)) else {
+                continue;
+            };
             let target = match self.symbols.find_sym_name(target) {
                 Some(it) => it,
                 None => {
@@ -3400,17 +3801,25 @@ impl<'a> Stage<'a> {
             let strong = flags & (REQUIRED | STRONG) != 0 || native == 2 || cells.contains(&sym);
             let others = strong || flags & ROOT != 0 || native > 0;
             let weak = !strong && refs.class(sym) != 2;
-            let bits = if weak { O_WEAK } else { 0 } | if strong { O_STRONG } else { 0 } | if others { O_OTHERS } else { 0 };
+            let bits = if weak { O_WEAK } else { 0 }
+                | if strong { O_STRONG } else { 0 }
+                | if others { O_OTHERS } else { 0 };
             let kind = match kind_of(sym) {
                 Some(kind) => kind,
                 None => match self.decide(&graph, sym, weak)? {
                     Decision::Special(special) => {
-                        let kind = if matches!(special, Special::Section { .. } | Special::Got { .. }) { O_MARKS } else { O_OTHER };
+                        let kind =
+                            if matches!(special, Special::Section { .. } | Special::Got { .. }) {
+                                O_MARKS
+                            } else {
+                                O_OTHER
+                            };
                         specials.push((sym, special));
                         kind
                     }
                     Decision::Import(import, library) => {
-                        let needed = library != NONE && graph.exports.libraries[library as usize].as_needed;
+                        let needed =
+                            library != NONE && graph.exports.libraries[library as usize].as_needed;
                         imports.push((sym, import, library));
                         if needed { O_NEEDED } else { O_IMPORT }
                     }
@@ -3458,9 +3867,11 @@ impl<'a> Stage<'a> {
                 library_orders.push(exports.orders[at]);
             }
         }
-        let mut current: HashMap<Sym, Import, std::alloc::Global> = HashMap::with_capacity_in(imports.len(), std::alloc::Global);
+        let mut current: HashMap<Sym, Import, std::alloc::Global> =
+            HashMap::with_capacity_in(imports.len(), std::alloc::Global);
         for (sym, mut import, library) in imports {
-            import.library = (library != NONE).then(|| index[library as usize]).filter(|it| *it != NONE);
+            import.library =
+                (library != NONE).then(|| index[library as usize]).filter(|it| *it != NONE);
             current.insert(sym, import);
         }
         // An import an incremental link no longer needs keeps its index (nothing binds to it),
@@ -3468,7 +3879,8 @@ impl<'a> Stage<'a> {
         // and stub go with it (`Stage::cells_of_removed`); on PE, where the GOT is the import
         // address table, the cells after it move, and their readers are written again
         // (`Stage::relay`).
-        let mut order: Vec<(Sym, Import, bool)> = Vec::with_capacity(current.len() + old.imports.len());
+        let mut order: Vec<(Sym, Import, bool)> =
+            Vec::with_capacity(current.len() + old.imports.len());
         if !self.full {
             for (sym, import) in old.import_syms.iter().zip(old.imports.iter()) {
                 match current.remove(sym) {
@@ -3497,7 +3909,8 @@ impl<'a> Stage<'a> {
                 defined.push(*sym);
             }
         }
-        let (import_syms, imports): (Vec<Sym>, Vec<Import>) = order.into_iter().map(|(sym, import, _)| (sym, import)).unzip();
+        let (import_syms, imports): (Vec<Sym>, Vec<Import>) =
+            order.into_iter().map(|(sym, import, _)| (sym, import)).unzip();
 
         // A name the image's resolution defined and this one does not is undefined now.
         let mut now = CowFlags::default();
@@ -3512,7 +3925,10 @@ impl<'a> Stage<'a> {
         if let Some(entry) = graph.entry {
             if self.new.def(entry) == Def::None {
                 // alloc: error path
-                return Err(error(None, format!("the entry point {} is not defined", self.symbols.describe(entry))));
+                return Err(error(
+                    None,
+                    format!("the entry point {} is not defined", self.symbols.describe(entry)),
+                ));
             }
         }
 
@@ -3604,8 +4020,16 @@ mod tests {
             assert_eq!(table.insert(hash(key), at as u32, eq), Ok(()));
         }
         for (at, key) in keys.iter().enumerate() {
-            assert_eq!(table.insert(hash(key), (at + keys.len()) as u32, |it| keys[it as usize % keys.len()] == *key), Err(at as u32));
-            assert_eq!(table.find(hash(key), |it| keys[it as usize % keys.len()] == *key), Some(at as u32));
+            assert_eq!(
+                table.insert(hash(key), (at + keys.len()) as u32, |it| keys
+                    [it as usize % keys.len()]
+                    == *key),
+                Err(at as u32)
+            );
+            assert_eq!(
+                table.find(hash(key), |it| keys[it as usize % keys.len()] == *key),
+                Some(at as u32)
+            );
         }
         assert_eq!(table.find(hash("absent"), |_| true), None);
         assert_eq!(Table::default().find(hash("x"), |_| true), None);
@@ -3640,10 +4064,15 @@ mod tests {
             let mut written: Vec<Vec<(String, u32)>> = Vec::with_capacity(count);
             for at in 0..count {
                 let mut names = Names::default();
-                let members: Vec<crate::model::Member> =
-                    (0..4).map(|it| crate::model::Member { name: names.push(&format!("m{it}.o")).unwrap(), bytes: 0..0 }).collect();
+                let members: Vec<crate::model::Member> = (0..4)
+                    .map(|it| crate::model::Member {
+                        name: names.push(&format!("m{it}.o")).unwrap(),
+                        bytes: 0..0,
+                    })
+                    .collect();
                 let entries = rng.below(24) as usize;
-                let (mut index, mut listed) = (Vec::with_capacity(entries), Vec::with_capacity(entries));
+                let (mut index, mut listed) =
+                    (Vec::with_capacity(entries), Vec::with_capacity(entries));
                 for _ in 0..entries {
                     let name = &pool[rng.below(pool.len() as u64) as usize];
                     let member = rng.below(4) as u32;
@@ -3664,16 +4093,20 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(at, it)| {
-                    let NativeFile::Archive(archive) = &*it.file else { unreachable!("made as archives") };
+                    let NativeFile::Archive(archive) = &*it.file else {
+                        unreachable!("made as archives")
+                    };
                     (at as u32, Arc::new(archive_index(archive)))
                 })
                 .collect();
             for name in &pool {
-                let scanned = written
-                    .iter()
-                    .enumerate()
-                    .find_map(|(at, listed)| listed.iter().find(|it| it.0 == *name).map(|it| (at as u32, it.1)));
-                let found = blaze_alloc_count::assert_at_most(0, "a search of the archives", || search(&archives, &inputs, name));
+                let scanned = written.iter().enumerate().find_map(|(at, listed)| {
+                    listed.iter().find(|it| it.0 == *name).map(|it| (at as u32, it.1))
+                });
+                let found =
+                    blaze_alloc_count::assert_at_most(0, "a search of the archives", || {
+                        search(&archives, &inputs, name)
+                    });
                 assert_eq!(found, scanned, "{name}");
             }
         }
@@ -3703,7 +4136,15 @@ mod tests {
 
     #[test]
     fn sections_kept_by_name_are_lld_s() {
-        for it in [".init", ".init_array", ".init_array.5", ".fini_array.00100", ".ctors", ".note.GNU-stack", ".jcr"] {
+        for it in [
+            ".init",
+            ".init_array",
+            ".init_array.5",
+            ".fini_array.00100",
+            ".ctors",
+            ".note.GNU-stack",
+            ".jcr",
+        ] {
             assert!(kept_by_name(it), "{it}");
         }
         for it in [".initx", ".text.init", ".data", ".init_arrayx"] {
@@ -3716,9 +4157,25 @@ mod tests {
         let good = || {
             let (names, list) = names(&[".text", "f"]);
             Object {
-                sections: vec![section(list[0], SectionKind::Alloc(Class::Text, 0), Data::Input(0..16), 0..1)],
-                symbols: vec![symbol(list[1], SymbolDef::Section { section: 0, value: 0, size: 4 }, Binding::Global, SymbolKind::Function)],
-                fixups: vec![crate::model::NativeFixup { at: 0, apply: Apply::Abs64, symbol: 0, addend: 0, minus: None }],
+                sections: vec![section(
+                    list[0],
+                    SectionKind::Alloc(Class::Text, 0),
+                    Data::Input(0..16),
+                    0..1,
+                )],
+                symbols: vec![symbol(
+                    list[1],
+                    SymbolDef::Section { section: 0, value: 0, size: 4 },
+                    Binding::Global,
+                    SymbolKind::Function,
+                )],
+                fixups: vec![crate::model::NativeFixup {
+                    at: 0,
+                    apply: Apply::Abs64,
+                    symbol: 0,
+                    addend: 0,
+                    minus: None,
+                }],
                 names,
                 ..Object::default()
             }
@@ -3761,21 +4218,40 @@ mod tests {
         frame[fde_at + 4..fde_at + 8].copy_from_slice(&back.to_le_bytes());
 
         let (names, list) = names(&[".text", ".eh_frame", "f", "g", ".init_array", "my_section"]);
-        let fixup = |at: u64, symbol: u32| crate::model::NativeFixup { at, apply: Apply::Abs64, symbol, addend: 0, minus: None };
+        let fixup = |at: u64, symbol: u32| crate::model::NativeFixup {
+            at,
+            apply: Apply::Abs64,
+            symbol,
+            addend: 0,
+            minus: None,
+        };
         let object = Object {
             sections: vec![
-                section(list[0], SectionKind::Alloc(Class::Text, 0), Data::Bytes(vec![0x90; 8]), 0..1),
+                section(
+                    list[0],
+                    SectionKind::Alloc(Class::Text, 0),
+                    Data::Bytes(vec![0x90; 8]),
+                    0..1,
+                ),
                 section(list[1], SectionKind::EhFrame, Data::Bytes(frame.clone()), 1..2),
                 section(list[4], SectionKind::Alloc(Class::InitArray, 0), Data::Zero(8), 2..2),
                 section(
                     list[5],
-                    SectionKind::Alloc(Class::Named { name: "my_section".into(), write: true, exec: false }, 0),
+                    SectionKind::Alloc(
+                        Class::Named { name: "my_section".into(), write: true, exec: false },
+                        0,
+                    ),
                     Data::Zero(8),
                     2..2,
                 ),
             ],
             symbols: vec![
-                symbol(list[2], SymbolDef::Section { section: 0, value: 0, size: 4 }, Binding::Global, SymbolKind::Function),
+                symbol(
+                    list[2],
+                    SymbolDef::Section { section: 0, value: 0, size: 4 },
+                    Binding::Global,
+                    SymbolKind::Function,
+                ),
                 symbol(list[3], SymbolDef::Undefined, Binding::Weak, SymbolKind::Function),
             ],
             fixups: vec![fixup(4, 1), fixup(fde_at as u64 + 8, 0)],
@@ -3786,7 +4262,8 @@ mod tests {
         assert_eq!(records[0].1.len(), 2);
         let syms: Vec<Sym> = (0..2 + 4 + 2).map(Sym).collect();
         let obj = Obj { native: IdNo(0), member: 0 };
-        let parsed = Parsed::new(obj, Arc::new(NativeFile::Object(object)), 0, syms, &[NameId(9)], &records);
+        let parsed =
+            Parsed::new(obj, Arc::new(NativeFile::Object(object)), 0, syms, &[NameId(9)], &records);
 
         assert_eq!(parsed.refs.row(0), &[1], "the text refers to `g`");
         assert_eq!(parsed.refs.row(1), &[0], "the frame records refer to `f`");
@@ -3807,12 +4284,29 @@ mod tests {
     fn chain(n: u32) -> Object {
         let (names, list) = names(&[".text", "f"]);
         Object {
-            sections: (0..n).map(|it| section(list[0], SectionKind::Alloc(Class::Text, 0), Data::Zero(8), it..it + 1)).collect(),
+            sections: (0..n)
+                .map(|it| {
+                    section(list[0], SectionKind::Alloc(Class::Text, 0), Data::Zero(8), it..it + 1)
+                })
+                .collect(),
             symbols: (0..n)
-                .map(|it| symbol(list[1], SymbolDef::Section { section: it, value: 0, size: 8 }, Binding::Global, SymbolKind::Function))
+                .map(|it| {
+                    symbol(
+                        list[1],
+                        SymbolDef::Section { section: it, value: 0, size: 8 },
+                        Binding::Global,
+                        SymbolKind::Function,
+                    )
+                })
                 .collect(),
             fixups: (0..n)
-                .map(|it| crate::model::NativeFixup { at: 0, apply: Apply::Abs64, symbol: (it + 1) % n, addend: 0, minus: None })
+                .map(|it| crate::model::NativeFixup {
+                    at: 0,
+                    apply: Apply::Abs64,
+                    symbol: (it + 1) % n,
+                    addend: 0,
+                    minus: None,
+                })
                 .collect(),
             names,
             ..Object::default()
@@ -3825,17 +4319,22 @@ mod tests {
         let mut counts = Vec::new();
         for n in [10, 1000] {
             let object = chain(n);
-            blaze_alloc_count::assert_at_most(0, "an object checked", || check_object(&object, 0).unwrap());
+            blaze_alloc_count::assert_at_most(0, "an object checked", || {
+                check_object(&object, 0).unwrap()
+            });
             {
                 let mut keys = Vec::with_capacity(2 * n as usize);
-                blaze_alloc_count::assert_at_most(0, "an object's keys into reserved room", || object_keys(obj, &object, &[], &mut keys));
+                blaze_alloc_count::assert_at_most(0, "an object's keys into reserved room", || {
+                    object_keys(obj, &object, &[], &mut keys)
+                });
                 assert_eq!(keys.len(), 2 * n as usize);
             }
 
             let file = Arc::new(NativeFile::Object(object));
             let syms: Vec<Sym> = (0..2 * n).map(Sym).collect();
             // The pairs, two indexes of two lists each and the groups: none per section or symbol.
-            let (parsed, used) = blaze_alloc_count::measure(|| Parsed::new(obj, file, 0, syms, &[], &[]));
+            let (parsed, used) =
+                blaze_alloc_count::measure(|| Parsed::new(obj, file, 0, syms, &[], &[]));
             assert!(used.allocations <= 8, "{n} sections and symbols: {used:?}");
             assert_eq!(parsed.refs.row(0), &[1]);
             assert_eq!(parsed.defs.row(n as usize - 1), &[n - 1]);
@@ -3854,11 +4353,23 @@ mod tests {
         assert_eq!(settled(defined, 1, 2, false), Next::Nothing);
         assert_eq!(settled(O_PULLED, 2, 1, false), Next::Rebuild, "the member may go");
         assert_eq!(settled(O_PULLED, 1, 2, false), Next::Nothing);
-        assert_eq!(settled(O_IMPORT, 2, 0, false), Next::Nothing, "an incremental link keeps it in place");
+        assert_eq!(
+            settled(O_IMPORT, 2, 0, false),
+            Next::Nothing,
+            "an incremental link keeps it in place"
+        );
         assert_eq!(settled(O_IMPORT, 2, 0, true), Next::Rebuild, "a full link drops it");
         assert_eq!(settled(O_IMPORT, 2, 1, false), Next::Rebuild, "it becomes weak");
-        assert_eq!(settled(O_IMPORT | O_STRONG | O_OTHERS, 2, 1, false), Next::Nothing, "still strong");
-        assert_eq!(settled(O_IMPORT | O_WEAK | O_OTHERS, 0, 2, false), Next::Rebuild, "it becomes strong");
+        assert_eq!(
+            settled(O_IMPORT | O_STRONG | O_OTHERS, 2, 1, false),
+            Next::Nothing,
+            "still strong"
+        );
+        assert_eq!(
+            settled(O_IMPORT | O_WEAK | O_OTHERS, 0, 2, false),
+            Next::Rebuild,
+            "it becomes strong"
+        );
         assert_eq!(settled(O_NEEDED, 2, 0, false), Next::Rebuild, "its library may go");
         assert_eq!(settled(O_OTHER | O_WEAK, 1, 0, true), Next::Nothing);
         assert_eq!(settled(O_MARKS, 2, 0, false), Next::Rebuild);

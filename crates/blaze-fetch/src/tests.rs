@@ -16,8 +16,8 @@ use blaze_cas::{Driven, Handle};
 use blaze_cas::Kind as Stored;
 
 use crate::{
-    Algo, Blake3, Digest, DigestRefused, Failure, FetchError, Fetcher, Flights, Form, Made, Net, Object, Objects,
-    Origin, Policy, Produced, Producer, Source, StoreOf, Tree, TreeFile,
+    Algo, Blake3, Digest, DigestRefused, Failure, FetchError, Fetcher, Flights, Form, Made, Net,
+    Object, Objects, Origin, Policy, Produced, Producer, Source, StoreOf, Tree, TreeFile,
     decisions::{Attempts, Decision},
     flight::Role,
     store::{CHUNK_LEN, CHUNKED, INLINE, chunk_key, object_key},
@@ -64,7 +64,8 @@ impl Net for Fake {
         }
         if ask < self.fail {
             // Half a body, then a cut: a retry must start from nothing.
-            sink(&self.body[..self.body.len() / 2]).map_err(|e| Failure::Permanent(e.to_string()))?;
+            sink(&self.body[..self.body.len() / 2])
+                .map_err(|e| Failure::Permanent(e.to_string()))?;
             return Err(Failure::Transient("connection reset".to_owned()));
         }
         // Small pieces for a small body, so a piece boundary falls everywhere; large ones for
@@ -83,7 +84,9 @@ fn quick() -> Policy {
 
 fn fetcher(store: &'static Handle, net: Arc<Fake>, scratch: &Path) -> Fetcher {
     let flights = Box::leak(Box::new(Flights::new()));
-    Fetcher::new(StoreOf::Given(store), net, scratch.to_owned()).with_policy(quick()).with_flights(flights)
+    Fetcher::new(StoreOf::Given(store), net, scratch.to_owned())
+        .with_policy(quick())
+        .with_flights(flights)
 }
 
 /// The record a URL's body pinned by `pin` is filed under.
@@ -103,7 +106,10 @@ fn digests_parse_and_print_as_algo_colon_hex() {
         "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     assert_eq!(Digest::parse(&sha256.to_string()), Ok(sha256));
-    assert_eq!(Digest::parse(&sha256.to_string().to_uppercase().replace("SHA256", "sha256")), Ok(sha256));
+    assert_eq!(
+        Digest::parse(&sha256.to_string().to_uppercase().replace("SHA256", "sha256")),
+        Ok(sha256)
+    );
     let sha512 = Digest::of(Algo::Sha512, b"abc");
     assert!(sha512.to_string().starts_with("sha512:ddaf35a193617aba"));
     assert_eq!(Digest::parse(&sha512.to_string()), Ok(sha512));
@@ -117,10 +123,20 @@ fn digests_parse_and_print_as_algo_colon_hex() {
 #[test]
 fn weak_unknown_and_malformed_digests_are_refused_by_name() {
     let refused = |text: &str| Digest::parse(text).unwrap_err();
-    assert!(matches!(refused("md5:900150983cd24fb0d6963f7d28e17f72"), DigestRefused::Weak { algo, .. } if algo == "md5"));
-    assert!(matches!(refused("sha1:a9993e364706816aba3e25717850c26c9cd0d89d"), DigestRefused::Weak { .. }));
-    assert!(matches!(refused("SHA-1:a9993e364706816aba3e25717850c26c9cd0d89d"), DigestRefused::Weak { .. }));
-    assert!(matches!(refused("crc32:352441c2"), DigestRefused::Unknown { algo, .. } if algo == "crc32"));
+    assert!(
+        matches!(refused("md5:900150983cd24fb0d6963f7d28e17f72"), DigestRefused::Weak { algo, .. } if algo == "md5")
+    );
+    assert!(matches!(
+        refused("sha1:a9993e364706816aba3e25717850c26c9cd0d89d"),
+        DigestRefused::Weak { .. }
+    ));
+    assert!(matches!(
+        refused("SHA-1:a9993e364706816aba3e25717850c26c9cd0d89d"),
+        DigestRefused::Weak { .. }
+    ));
+    assert!(
+        matches!(refused("crc32:352441c2"), DigestRefused::Unknown { algo, .. } if algo == "crc32")
+    );
     assert!(matches!(refused("ba7816bf"), DigestRefused::NoAlgo { .. }));
     assert!(matches!(refused("sha256:zz"), DigestRefused::NotHex { algo: Algo::Sha256, .. }));
     assert!(matches!(refused("sha256:ba78"), DigestRefused::Length { digits: 4, .. }));
@@ -196,7 +212,11 @@ fn transient_failures_are_tried_again_from_nothing_and_bounded() {
 
 #[test]
 fn the_retry_policy_is_a_transcript() {
-    let mut attempts = Attempts::new(Policy { tries: 3, first_wait: Duration::from_secs(1), most_wait: Duration::from_secs(3) });
+    let mut attempts = Attempts::new(Policy {
+        tries: 3,
+        first_wait: Duration::from_secs(1),
+        most_wait: Duration::from_secs(3),
+    });
     assert_eq!(attempts.next_decision(), Decision::Ask { attempt: 1 });
     attempts.failed(Failure::Transient("503".to_owned()));
     assert_eq!(attempts.next_decision(), Decision::Wait { until: Duration::from_secs(1) });
@@ -207,12 +227,18 @@ fn the_retry_policy_is_a_transcript() {
     attempts.advance_clock(Duration::from_secs(3));
     assert_eq!(attempts.next_decision(), Decision::Ask { attempt: 3 });
     attempts.failed(Failure::Transient("reset".to_owned()));
-    assert_eq!(attempts.next_decision(), Decision::GiveUp { tries: 3, last: Failure::Transient("reset".to_owned()) });
+    assert_eq!(
+        attempts.next_decision(),
+        Decision::GiveUp { tries: 3, last: Failure::Transient("reset".to_owned()) }
+    );
 
     let mut attempts = Attempts::new(Policy::default());
     assert_eq!(attempts.next_decision(), Decision::Ask { attempt: 1 });
     attempts.failed(Failure::Permanent("404".to_owned()));
-    assert_eq!(attempts.next_decision(), Decision::GiveUp { tries: 1, last: Failure::Permanent("404".to_owned()) });
+    assert_eq!(
+        attempts.next_decision(),
+        Decision::GiveUp { tries: 1, last: Failure::Permanent("404".to_owned()) }
+    );
 }
 
 #[test]
@@ -224,7 +250,9 @@ fn one_download_per_pin() {
     let net = Arc::new(Fake { gate: Some((started, gate)), ..Fake::new(b"one download") });
     let (followed, on_follow) = crossbeam_channel::unbounded();
     let flights: &'static Flights = Box::leak(Box::new(Flights::watched(followed)));
-    let fetcher = Arc::new(fetcher(store, Arc::clone(&net), &dir.path().join("scratch")).with_flights(flights));
+    let fetcher = Arc::new(
+        fetcher(store, Arc::clone(&net), &dir.path().join("scratch")).with_flights(flights),
+    );
     let pin = Digest::of(Algo::Sha256, b"one download");
     let ask = |fetcher: &Arc<Fetcher>| {
         let fetcher = Arc::clone(fetcher);
@@ -243,7 +271,10 @@ fn one_download_per_pin() {
     // The same pin into another store is a flight of its own.
     let other_dir = tempfile::tempdir().unwrap();
     let (_other_driven, other) = crate::tests::store(other_dir.path());
-    assert!(matches!(flights.begin((Objects::new(other).store_id(), blob(&pin).key()), pin), Role::Lead(_)));
+    assert!(matches!(
+        flights.begin((Objects::new(other).store_id(), blob(&pin).key()), pin),
+        Role::Lead(_)
+    ));
     let followers: Vec<_> = (0..3).map(|_| ask(&fetcher)).collect();
     // Each of the three is waiting on the leader before the leader is let go: none of them
     // can have found the store filled or downloaded itself.
@@ -288,8 +319,20 @@ fn a_step_records_its_output_by_code_and_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let (_driven, store) = store(dir.path());
     let objects = Objects::new(store);
-    let input = objects.keep_pinned(&Digest::of(Algo::Sha256, b"input"), Producer::Given("a test".to_owned()), b"input").unwrap();
-    let tree = Tree { files: vec![TreeFile { path: "out".to_owned(), kind: Kind::File, bytes: b"output".to_vec() }] };
+    let input = objects
+        .keep_pinned(
+            &Digest::of(Algo::Sha256, b"input"),
+            Producer::Given("a test".to_owned()),
+            b"input",
+        )
+        .unwrap();
+    let tree = Tree {
+        files: vec![TreeFile {
+            path: "out".to_owned(),
+            kind: Kind::File,
+            bytes: b"output".to_vec(),
+        }],
+    };
     let code = blaze_ids::ContentId::of("a step's code", b"unpack v1");
     let inputs = [input.id()];
     let output = objects.keep_step(code, &inputs, "unpack", &tree).unwrap();
@@ -301,9 +344,13 @@ fn a_step_records_its_output_by_code_and_inputs() {
     // the tree itself; then `ensure` with it kept never runs the graph.
     let pin = Digest::of(Algo::Blake3, &objects.read(&output).unwrap());
     let from = Producer::Step("unpack".to_owned());
-    let pinned = crate::ensure(objects, &pin, Form::Tree, || Ok(Produced { made: Made::Tree(&tree), from })).unwrap();
+    let pinned =
+        crate::ensure(objects, &pin, Form::Tree, || Ok(Produced { made: Made::Tree(&tree), from }))
+            .unwrap();
     assert_eq!(pinned, output);
-    let got = crate::ensure(objects, &pin, Form::Tree, || panic!("the graph ran with its output kept")).unwrap();
+    let got =
+        crate::ensure(objects, &pin, Form::Tree, || panic!("the graph ran with its output kept"))
+            .unwrap();
     assert_eq!(got, output);
     // A file pinned by the same digest is another record (`Form` is in the key).
     assert_eq!(objects.lookup(blob(&pin)).unwrap(), None);
@@ -390,17 +437,22 @@ fn a_tree_with_a_file_gone_is_a_miss() {
     };
     let listing = crate::store::listing_of(&tree, &Producer::Given("a test".to_owned())).unwrap();
     let pin = Digest::of(Algo::Blake3, &listing);
-    let object = Object { blake3: Blake3::of(&listing), len: listing.len() as u64, form: Form::Tree };
+    let object =
+        Object { blake3: Blake3::of(&listing), len: listing.len() as u64, form: Form::Tree };
     // The listing and its first file are kept, the second is not.
     let mut value = vec![INLINE];
     value.extend_from_slice(&listing);
     store.put(object_key(object.blake3), Stored::Output, &value).unwrap();
-    store.put(object_key(Blake3::of(b"kept")), Stored::Output, &[&[INLINE][..], b"kept"].concat()).unwrap();
+    store
+        .put(object_key(Blake3::of(b"kept")), Stored::Output, &[&[INLINE][..], b"kept"].concat())
+        .unwrap();
     let origin = Origin::Pinned { pin: &pin, form: Form::Tree };
     objects.record(&object, origin).unwrap();
     assert_eq!(objects.lookup(origin).unwrap(), None);
     let from = Producer::Given("a test".to_owned());
-    let kept = crate::ensure(objects, &pin, Form::Tree, || Ok(Produced { made: Made::Tree(&tree), from })).unwrap();
+    let kept =
+        crate::ensure(objects, &pin, Form::Tree, || Ok(Produced { made: Made::Tree(&tree), from }))
+            .unwrap();
     assert_eq!(kept, object);
     assert_eq!(objects.lookup(origin).unwrap(), Some(object));
 }
@@ -413,7 +465,9 @@ fn bytes_kept_wrong_are_never_given() {
     let pin = Digest::of(Algo::Sha256, b"right");
     let object = Object { blake3: Blake3::of(b"right"), len: 5, form: Form::Blob };
     // Under the key of `right`'s BLAKE3, other bytes of the same length.
-    store.put(object_key(object.blake3), Stored::Output, &[&[INLINE][..], b"wrong"].concat()).unwrap();
+    store
+        .put(object_key(object.blake3), Stored::Output, &[&[INLINE][..], b"wrong"].concat())
+        .unwrap();
     objects.record(&object, blob(&pin)).unwrap();
     let error = objects.read(&object).unwrap_err();
     assert!(error.to_string().contains("kept wrong"), "{error}");
@@ -436,14 +490,22 @@ fn a_body_past_the_limit_is_stopped_and_not_kept() {
 
 #[test]
 fn a_url_is_said_with_no_credential() {
-    assert_eq!(crate::redact("https://user:token@example.com/x.crate?X-Amz-Signature=abc#frag"), "https://example.com/x.crate");
+    assert_eq!(
+        crate::redact("https://user:token@example.com/x.crate?X-Amz-Signature=abc#frag"),
+        "https://example.com/x.crate"
+    );
     assert_eq!(crate::redact("https://example.com/a?token=1"), "https://example.com/a");
     assert_eq!(crate::redact("https://example.com/a"), "https://example.com/a");
 }
 
 #[test]
 fn a_listing_is_sorted_and_refuses_escapes() {
-    let entry = |path: &str, kind| Entry { path: path.to_owned(), kind, blake3: Blake3::of(path.as_bytes()), len: path.len() as u64 };
+    let entry = |path: &str, kind| Entry {
+        path: path.to_owned(),
+        kind,
+        blake3: Blake3::of(path.as_bytes()),
+        len: path.len() as u64,
+    };
     let mut one = [entry("b/c", Kind::File), entry("a", Kind::Exec), entry("b/a", Kind::Link)];
     let mut two = [entry("b/a", Kind::Link), entry("b/c", Kind::File), entry("a", Kind::Exec)];
     let listing = tree::listing(&mut one).unwrap();
@@ -459,12 +521,17 @@ fn a_listing_is_sorted_and_refuses_escapes() {
     assert!(tree::listing(&mut [entry("a", Kind::File), entry("a/b", Kind::File)]).is_err());
     // Case aside, as a case-insensitive disk sees them: `A` a link and `a/b` written through it.
     assert!(tree::listing(&mut [entry("A", Kind::Link), entry("a/b", Kind::File)]).is_err());
-    assert!(tree::listing(&mut [entry("Readme", Kind::File), entry("README", Kind::File)]).is_err());
+    assert!(
+        tree::listing(&mut [entry("Readme", Kind::File), entry("README", Kind::File)]).is_err()
+    );
     assert!(tree::listing(&mut [entry("x/.GIT/config", Kind::File)]).is_err());
     // One directory spelled two ways is one directory on a case-insensitive disk, ASCII or not,
     // and in either Unicode normal form.
     let twice = |a: &str, b: &str| {
-        matches!(tree::listing(&mut [entry(a, Kind::File), entry(b, Kind::File)]), Err(tree::TreeRefused::Twice { .. }))
+        matches!(
+            tree::listing(&mut [entry(a, Kind::File), entry(b, Kind::File)]),
+            Err(tree::TreeRefused::Twice { .. })
+        )
     };
     assert!(twice("Dir/a", "dir/b"));
     assert!(twice("src/Ä/a", "src/ä/b"));
@@ -488,19 +555,29 @@ fn a_listing_is_sorted_and_refuses_escapes() {
     ] {
         assert!(tree::parse(bad.as_bytes()).is_err(), "{bad:?}");
     }
-    assert_eq!(tree::parse(format!("blaze tree 2\nfile {hex} 1 a b\n").as_bytes()).unwrap()[0].path, "a b");
+    assert_eq!(
+        tree::parse(format!("blaze tree 2\nfile {hex} 1 a b\n").as_bytes()).unwrap()[0].path,
+        "a b"
+    );
 }
 
 #[test]
 fn a_request_takes_one_source_and_refuses_unknown_fields() {
     let pin = Digest::of(Algo::Sha256, b"x");
-    let asked = crate::request::parse(&format!(r#"{{"url":"https://e.com/x","digest":"{pin}"}}"#)).unwrap();
+    let asked =
+        crate::request::parse(&format!(r#"{{"url":"https://e.com/x","digest":"{pin}"}}"#)).unwrap();
     assert_eq!(asked.source, Source::Url { url: "https://e.com/x".to_owned(), digest: pin });
     assert_eq!((asked.most_bytes, asked.out), (None, None));
-    let asked = crate::request::parse(&format!(r#"{{"url":"u","digest":"{pin}","most_bytes":9,"out":"d"}}"#)).unwrap();
+    let asked = crate::request::parse(&format!(
+        r#"{{"url":"u","digest":"{pin}","most_bytes":9,"out":"d"}}"#
+    ))
+    .unwrap();
     assert_eq!((asked.most_bytes, asked.out.as_deref()), (Some(9), Some("d")));
     let rev = "0123456789abcdef0123456789abcdef01234567";
-    let asked = crate::request::parse(&format!(r#"{{"git":{{"repo":"https://e.com/r","rev":"{rev}"}},"digest":"{pin}"}}"#)).unwrap();
+    let asked = crate::request::parse(&format!(
+        r#"{{"git":{{"repo":"https://e.com/r","rev":"{rev}"}},"digest":"{pin}"}}"#
+    ))
+    .unwrap();
     assert!(matches!(asked.source, Source::Git { .. }));
     for bad in [
         format!(r#"{{"url":"u","digest":"{pin}","sha256":"x"}}"#),
@@ -520,7 +597,12 @@ struct FakeGit {
 }
 
 impl crate::Git for FakeGit {
-    fn checkout(&self, _repo: &str, _rev: &str, scratch: &Path) -> Result<std::path::PathBuf, String> {
+    fn checkout(
+        &self,
+        _repo: &str,
+        _rev: &str,
+        scratch: &Path,
+    ) -> Result<std::path::PathBuf, String> {
         let root = scratch.join("checkout");
         for (path, bytes) in &self.files {
             let at = root.join(path);
@@ -537,7 +619,8 @@ const REV: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// Every value of `object` in `store` (its own, each chunk's), read as the store keeps them.
 fn values(store: &Handle, object: &Object) -> Vec<Vec<u8>> {
-    let read = |key| store.read(&key, |entry| entry.bytes.to_vec()).unwrap().expect("the store has it");
+    let read =
+        |key| store.read(&key, |entry| entry.bytes.to_vec()).unwrap().expect("the store has it");
     let own = read(object_key(object.blake3));
     let mut out = vec![own.clone()];
     if own[0] == CHUNKED {
@@ -552,21 +635,32 @@ fn values(store: &Handle, object: &Object) -> Vec<Vec<u8>> {
 fn a_chunked_object_and_a_tree_restore_as_a_fresh_store_builds_them() {
     let body: Vec<u8> = (0..2 * CHUNK_LEN + 3).map(|i| (i * 7 % 253) as u8).collect();
     let url_pin = Digest::of(Algo::Sha256, &body);
-    let git = || Arc::new(FakeGit { files: vec![("src/lib.rs", b"pub fn f() {}"), ("README", b"hi")] });
+    let git =
+        || Arc::new(FakeGit { files: vec![("src/lib.rs", b"pub fn f() {}"), ("README", b"hi")] });
     let tree_files = Tree {
         files: vec![
-            TreeFile { path: "src/lib.rs".to_owned(), kind: Kind::File, bytes: b"pub fn f() {}".to_vec() },
+            TreeFile {
+                path: "src/lib.rs".to_owned(),
+                kind: Kind::File,
+                bytes: b"pub fn f() {}".to_vec(),
+            },
             TreeFile { path: "README".to_owned(), kind: Kind::File, bytes: b"hi".to_vec() },
         ],
     };
-    let listing = crate::store::listing_of(&tree_files, &Producer::Given("a test".to_owned())).unwrap();
+    let listing =
+        crate::store::listing_of(&tree_files, &Producer::Given("a test".to_owned())).unwrap();
     let tree_pin = Digest::of(Algo::Blake3, &listing);
-    let git_source = Source::Git { repo: "https://example.com/r".to_owned(), rev: REV.to_owned(), digest: tree_pin };
+    let git_source = Source::Git {
+        repo: "https://example.com/r".to_owned(),
+        rev: REV.to_owned(),
+        digest: tree_pin,
+    };
     // Kept, flushed and opened again.
     let kept_dir = tempfile::tempdir().unwrap();
     {
         let (mut driven, store) = store(kept_dir.path());
-        let fetcher = fetcher(store, Arc::new(Fake::new(&body)), &kept_dir.path().join("scratch")).with_git(git());
+        let fetcher = fetcher(store, Arc::new(Fake::new(&body)), &kept_dir.path().join("scratch"))
+            .with_git(git());
         fetcher.get(&url(url_pin)).unwrap();
         fetcher.get(&git_source).unwrap();
         driven.flush().unwrap();
@@ -575,7 +669,9 @@ fn a_chunked_object_and_a_tree_restore_as_a_fresh_store_builds_them() {
     // Built fresh, in a store of its own.
     let fresh_dir = tempfile::tempdir().unwrap();
     let (_fresh_driven, fresh) = crate::tests::store(fresh_dir.path());
-    let fresh_fetcher = fetcher(fresh, Arc::new(Fake::new(&body)), &fresh_dir.path().join("scratch")).with_git(git());
+    let fresh_fetcher =
+        fetcher(fresh, Arc::new(Fake::new(&body)), &fresh_dir.path().join("scratch"))
+            .with_git(git());
     let blob = fresh_fetcher.get(&url(url_pin)).unwrap();
     let tree = fresh_fetcher.get(&git_source).unwrap();
     // Offline: the restored store answers both, with every value equal byte for byte.
@@ -588,7 +684,11 @@ fn a_chunked_object_and_a_tree_restore_as_a_fresh_store_builds_them() {
     assert_eq!(values(restored, &blob), values(fresh, &blob));
     assert_eq!(values(restored, &tree), values(fresh, &tree));
     for file in &tree_files.files {
-        let object = Object { blake3: Blake3::of(&file.bytes), len: file.bytes.len() as u64, form: Form::Blob };
+        let object = Object {
+            blake3: Blake3::of(&file.bytes),
+            len: file.bytes.len() as u64,
+            form: Form::Blob,
+        };
         assert_eq!(values(restored, &object), values(fresh, &object));
     }
     assert_eq!(restored_fetcher.bytes(&blob).unwrap(), body);
@@ -602,9 +702,12 @@ fn a_checkout_past_the_limit_is_refused_and_not_kept() {
     let dir = tempfile::tempdir().unwrap();
     let (_driven, store) = store(dir.path());
     let git = Arc::new(FakeGit { files: vec![("big", &[7u8; 64][..])] });
-    let fetcher = fetcher(store, Arc::new(Fake::new(b"")), &dir.path().join("scratch")).with_git(git).with_most(32);
+    let fetcher = fetcher(store, Arc::new(Fake::new(b"")), &dir.path().join("scratch"))
+        .with_git(git)
+        .with_most(32);
     let pin = Digest::of(Algo::Blake3, b"whatever");
-    let source = Source::Git { repo: "https://example.com/r".to_owned(), rev: REV.to_owned(), digest: pin };
+    let source =
+        Source::Git { repo: "https://example.com/r".to_owned(), rev: REV.to_owned(), digest: pin };
     let error = fetcher.get(&source).unwrap_err();
     assert!(matches!(error, FetchError::TooBig { most: 32, .. }), "{error}");
     assert_eq!(Objects::new(store).lookup(source.origin()).unwrap(), None);
@@ -642,7 +745,14 @@ fn a_url_in_any_message_is_scrubbed() {
 fn a_request_is_checked_one_way_wherever_it_comes_from() {
     let pin = Digest::of(Algo::Sha256, b"x").to_string();
     let from_fields = |url: Option<&str>, repo: Option<&str>, rev: Option<&str>, most| {
-        crate::request::from_fields(url.map(str::to_owned), repo.map(str::to_owned), rev.map(str::to_owned), &pin, most, None)
+        crate::request::from_fields(
+            url.map(str::to_owned),
+            repo.map(str::to_owned),
+            rev.map(str::to_owned),
+            &pin,
+            most,
+            None,
+        )
     };
     assert!(from_fields(Some("https://e.com/x"), None, None, None).is_ok());
     assert!(from_fields(Some("https://e.com/x"), None, None, Some(0)).is_err());

@@ -22,7 +22,11 @@ fn program() -> Vec<CompiledFunction> {
     out
 }
 
-fn change<'a>(functions: &'a [CompiledFunction], heat: Option<&'a Heat>, cold: Vec<InstanceKey>) -> Change<'a> {
+fn change<'a>(
+    functions: &'a [CompiledFunction],
+    heat: Option<&'a Heat>,
+    cold: Vec<InstanceKey>,
+) -> Change<'a> {
     Change {
         added: functions.iter().collect(),
         names: vec![("_start".into(), Target::Direct(key(1)))],
@@ -88,6 +92,7 @@ fn an_incremental_link_moves_nothing_for_a_profile() {
     disk.link(&mut image, change(&functions, None, Vec::new())).unwrap();
     let before = image.functions();
     let heat = heat(false);
-    disk.link(&mut image, Change { heat: Some(&heat), cold: vec![key(1)], ..Change::default() }).unwrap();
+    disk.link(&mut image, Change { heat: Some(&heat), cold: vec![key(1)], ..Change::default() })
+        .unwrap();
     assert_eq!(image.functions(), before);
 }

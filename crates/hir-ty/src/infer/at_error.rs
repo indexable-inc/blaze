@@ -76,7 +76,11 @@ impl<'db> TypeFolder<DbInterner<'db>> for NumericVarsAtError<'db> {
         if !ct.has_infer() {
             return ct;
         }
-        if ct.is_ct_infer() { Const::new_error(self.interner, ErrorGuaranteed) } else { ct.super_fold_with(self) }
+        if ct.is_ct_infer() {
+            Const::new_error(self.interner, ErrorGuaranteed)
+        } else {
+            ct.super_fold_with(self)
+        }
     }
 
     fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {

@@ -44,7 +44,10 @@ enum Opened {
     Stderr,
     File(File),
     /// A directory: where it is, and its entries once listed.
-    Dir { path: PathBuf, entries: Option<Vec<Entry>> },
+    Dir {
+        path: PathBuf,
+        entries: Option<Vec<Entry>>,
+    },
 }
 
 /// One entry of a listed directory.
@@ -67,7 +70,9 @@ pub(crate) struct Host {
 }
 
 /// `strings`, each NUL-terminated, back to back, and how many; one with a NUL inside is refused.
-fn joined<'s>(strings: impl Iterator<Item = (&'s OsStr, Option<&'s OsStr>)>) -> Result<(Vec<u8>, usize), String> {
+fn joined<'s>(
+    strings: impl Iterator<Item = (&'s OsStr, Option<&'s OsStr>)>,
+) -> Result<(Vec<u8>, usize), String> {
     // alloc: once per run
     let mut bytes = Vec::new();
     let mut n = 0;
@@ -90,9 +95,13 @@ fn joined<'s>(strings: impl Iterator<Item = (&'s OsStr, Option<&'s OsStr>)>) -> 
 }
 
 impl Host {
-    pub(crate) fn new(args: &[std::ffi::OsString], env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Result<Host, String> {
+    pub(crate) fn new(
+        args: &[std::ffi::OsString],
+        env: &[(std::ffi::OsString, std::ffi::OsString)],
+    ) -> Result<Host, String> {
         let args = joined(args.iter().map(|arg| (arg.as_os_str(), None)))?;
-        let env = joined(env.iter().map(|(name, value)| (name.as_os_str(), Some(value.as_os_str()))))?;
+        let env =
+            joined(env.iter().map(|(name, value)| (name.as_os_str(), Some(value.as_os_str()))))?;
         // alloc: once per run
         let fds = vec![
             Some(Opened::Stdin),
@@ -184,7 +193,10 @@ fn filetype(meta: &Metadata) -> Filetype {
 
 /// A time in nanoseconds since the epoch, from its seconds and nanoseconds (0 before it).
 fn ns(secs: i64, nsecs: i64) -> u64 {
-    u64::try_from(secs).unwrap_or(0).saturating_mul(1_000_000_000).saturating_add(u64::try_from(nsecs).unwrap_or(0))
+    u64::try_from(secs)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(nsecs).unwrap_or(0))
 }
 
 fn filestat(meta: &Metadata) -> Filestat {
@@ -212,7 +224,11 @@ fn list(path: &Path) -> io::Result<Vec<Entry>> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let meta = entry.metadata()?;
-        entries.push(Entry { name: entry.file_name().as_bytes().to_vec(), ino: meta.ino(), filetype: filetype(&meta) }); // alloc: as above
+        entries.push(Entry {
+            name: entry.file_name().as_bytes().to_vec(),
+            ino: meta.ino(),
+            filetype: filetype(&meta),
+        }); // alloc: as above
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
@@ -244,7 +260,9 @@ impl System for Host {
     fn clock_time(&mut self, id: u32, _fuel_left: Option<u64>) -> Answer<u64> {
         Ok(match id {
             // The seed asked for the time of day: the host's clock is the answer.
-            0 => Ok(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_nanos() as u64)),
+            0 => Ok(SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos() as u64)),
             1 => Ok(self.started.elapsed().as_nanos() as u64),
             2 => cpu_clock(libc::CLOCK_PROCESS_CPUTIME_ID),
             3 => cpu_clock(libc::CLOCK_THREAD_CPUTIME_ID),
@@ -258,7 +276,10 @@ impl System for Host {
             // SAFETY: `chunk` is a live buffer of `chunk.len()` bytes, at most 256.
             if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
                 // alloc: error path
-                return Err(Stop(format!("asked for random bytes, and the host had none (getentropy): {}", io::Error::last_os_error())));
+                return Err(Stop(format!(
+                    "asked for random bytes, and the host had none (getentropy): {}",
+                    io::Error::last_os_error()
+                )));
             }
         }
         Ok(())
@@ -295,7 +316,9 @@ impl System for Host {
         Ok(match self.get(fd) {
             Ok(Opened::Stdin | Opened::Stdout | Opened::Stderr) => Ok(Filetype::CharacterDevice),
             Ok(Opened::Dir { .. }) => Ok(Filetype::Directory),
-            Ok(Opened::File(file)) => file.metadata().map(|meta| filetype(&meta)).map_err(|e| errno(&e)),
+            Ok(Opened::File(file)) => {
+                file.metadata().map(|meta| filetype(&meta)).map_err(|e| errno(&e))
+            }
             Err(errno) => Err(errno),
         })
     }
@@ -340,7 +363,16 @@ impl System for Host {
             Ok(Opened::File(file)) => file.metadata(),
             Ok(Opened::Dir { path, .. }) => fs::metadata(path),
             Ok(Opened::Stdin | Opened::Stdout | Opened::Stderr) => {
-                let stat = Filestat { dev: 0, ino: 0, filetype: Filetype::CharacterDevice, nlink: 1, size: 0, atim: 0, mtim: 0, ctim: 0 };
+                let stat = Filestat {
+                    dev: 0,
+                    ino: 0,
+                    filetype: Filetype::CharacterDevice,
+                    nlink: 1,
+                    size: 0,
+                    atim: 0,
+                    mtim: 0,
+                    ctim: 0,
+                };
                 return Ok(Ok(stat));
             }
             Err(errno) => return Ok(Err(errno)),
@@ -357,7 +389,9 @@ impl System for Host {
         let found = metadata(&path, how.follow());
         if how.directory() || (!writes && found.as_ref().is_ok_and(Metadata::is_dir)) {
             return match found {
-                Ok(meta) if meta.is_dir() => Ok(Ok(self.insert(Opened::Dir { path, entries: None })?)),
+                Ok(meta) if meta.is_dir() => {
+                    Ok(Ok(self.insert(Opened::Dir { path, entries: None })?))
+                }
                 Ok(_) => Ok(Err(Errno::NOTDIR)),
                 Err(e) => Ok(Err(errno(&e))),
             };
@@ -390,7 +424,9 @@ impl System for Host {
     fn readlink(&mut self, at: u32, path: &[u8]) -> Answer<Vec<u8>> {
         Ok(match self.resolve(at, path) {
             // alloc: the link's target, given to the guest
-            Ok(path) => fs::read_link(path).map(|target| target.into_os_string().into_vec()).map_err(|e| errno(&e)),
+            Ok(path) => fs::read_link(path)
+                .map(|target| target.into_os_string().into_vec())
+                .map_err(|e| errno(&e)),
             Err(errno) => Err(errno),
         })
     }
@@ -408,7 +444,11 @@ impl System for Host {
             }
         }
         let entry = entries.as_ref().and_then(|entries| entries.get(usize::try_from(cookie).ok()?));
-        Ok(Ok(entry.map(|entry| Dirent { ino: entry.ino, filetype: entry.filetype, name: &entry.name })))
+        Ok(Ok(entry.map(|entry| Dirent {
+            ino: entry.ino,
+            filetype: entry.filetype,
+            name: &entry.name,
+        })))
     }
 
     fn poll_oneoff(&mut self) -> Stop {
@@ -492,7 +532,13 @@ impl Seed for Host {
         std::os::unix::fs::symlink(OsStr::from_bytes(target), host(path)).map_err(|e| errno(&e))
     }
 
-    fn set_times(&mut self, path: &[u8], follow: bool, atime: Time, mtime: Time) -> Result<(), Errno> {
+    fn set_times(
+        &mut self,
+        path: &[u8],
+        follow: bool,
+        atime: Time,
+        mtime: Time,
+    ) -> Result<(), Errno> {
         set_times_at(host(path), follow, atime, mtime)
     }
 
@@ -530,7 +576,11 @@ impl Seed for Host {
         // writable pages, which only the seed, stopped in this call, references.
         unsafe { crate::memory::decommit(range.as_mut_ptr(), range.len()) }.map_err(|why| {
             // alloc: error path
-            Stop(format!("decommitted {} bytes at {:p} of its memory, which the host refused: {why}", range.len(), range.as_ptr()))
+            Stop(format!(
+                "decommitted {} bytes at {:p} of its memory, which the host refused: {why}",
+                range.len(),
+                range.as_ptr()
+            ))
         })
     }
 }

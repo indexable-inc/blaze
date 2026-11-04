@@ -45,14 +45,21 @@ fn ui(ui: Ui<'_>) -> String {
                 )
                 .unwrap();
             }
-            writeln!(fixture, "}}\n#[doc(hidden)]\npub mod __prelude {{\n{prelude}\n}}\n{items}").unwrap();
+            writeln!(fixture, "}}\n#[doc(hidden)]\npub mod __prelude {{\n{prelude}\n}}\n{items}")
+                .unwrap();
             " deps:std"
         }
         None => "",
     };
-    write!(fixture, "//- /{} crate:other:main edition:{}{deps}\n{}", ui.name, ui.edition, ui.source).unwrap();
+    write!(
+        fixture,
+        "//- /{} crate:other:main edition:{}{deps}\n{}",
+        ui.name, ui.edition, ui.source
+    )
+    .unwrap();
     let options = compiletest(ui.mode, &Options::default());
-    let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = checked_with(&fixture, "$DIR/", &options)
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
 }
 
@@ -110,7 +117,10 @@ macro_rules! test_case {
         fn $test() {
             let source = include_str!(concat!("dead/", $name, ".rs"));
             let expected = include_str!(concat!("dead/", $name, ".stderr"));
-            assert_eq!(ui(Ui { name: concat!($name, ".rs"), core: $core, source, ..Ui::default() }), expected);
+            assert_eq!(
+                ui(Ui { name: concat!($name, ".rs"), core: $core, source, ..Ui::default() }),
+                expected
+            );
         }
     };
 }
@@ -137,13 +147,25 @@ test_case!(unused_struct_derive_default, "unused-struct-derive-default", core: "
 test_case!(pub_field_in_priv_mod, "pub-field-in-priv-mod");
 test_case!(issue_41883, "issue-41883", core: "fmt");
 test_case!(impl_trait, "impl-trait");
-test_case!(unused_adt_impl_pub_trait_with_assoc_const, "unused-adt-impl-pub-trait-with-assoc-const");
+test_case!(
+    unused_adt_impl_pub_trait_with_assoc_const,
+    "unused-adt-impl-pub-trait-with-assoc-const"
+);
 
 #[test]
 fn in_closure() {
     let source = include_str!("dead/in-closure.rs");
     let expected = include_str!("dead/in-closure.stderr");
-    assert_eq!(ui(Ui { name: "in-closure.rs", edition: "2021", core: "future, fn", source, ..Ui::default() }), expected);
+    assert_eq!(
+        ui(Ui {
+            name: "in-closure.rs",
+            edition: "2021",
+            core: "future, fn",
+            source,
+            ..Ui::default()
+        }),
+        expected
+    );
 }
 
 #[test]
@@ -206,7 +228,9 @@ fn tuple_struct_field() {
 /// `.stderr`.
 #[test]
 fn passes() {
-    let run_pass = |name: &str, source: &str| crate::tests::ui_run_pass(name, "2015", source, &Options::default());
+    let run_pass = |name: &str, source: &str| {
+        crate::tests::ui_run_pass(name, "2015", source, &Options::default())
+    };
     let source = include_str!("dead/trait-impl.rs");
     assert_eq!(plain("trait-impl.rs", source), "");
     let source = include_str!("dead/issue-68408-false-positive.rs");
@@ -256,7 +280,10 @@ struct Private;
 "#;
     assert_eq!(
         dead(fixture),
-        ["dead_code: function `unused` is never used", "dead_code: struct `Private` is never constructed"]
+        [
+            "dead_code: function `unused` is never used",
+            "dead_code: struct `Private` is never constructed"
+        ]
     );
 }
 
@@ -307,7 +334,10 @@ fn main() {
     r#x = x;
 }
 "#;
-    assert_eq!(dead(fixture), ["dead_code: useless assignment of variable of type `i32` to itself"]);
+    assert_eq!(
+        dead(fixture),
+        ["dead_code: useless assignment of variable of type `i32` to itself"]
+    );
 }
 
 /// `Self(a, _)` in an impl of a tuple struct reads the fields it binds, as `S(a, _)` does
@@ -368,9 +398,7 @@ fn basic() {
     let source = include_str!("dead/basic.rs");
     assert_reports(
         &ui(Ui { name: "basic.rs", core: "panic", source, ..Ui::default() }),
-        &[
-            error(4, &["`foo`"]),
-        ],
+        &[error(4, &["`foo`"])],
     );
 }
 
@@ -406,7 +434,8 @@ pub struct Shown(u64);
 "#;
     let checked = crate::tests::checked_expanding_derives(fixture, &crate::Options::default());
     let stderr = checked.stderr();
-    let dead: Vec<_> = checked.diags.iter().filter(|it| it.lint_name() == Some("dead_code")).collect();
+    let dead: Vec<_> =
+        checked.diags.iter().filter(|it| it.lint_name() == Some("dead_code")).collect();
     assert_eq!(dead.len(), 1, "only `Shown`'s field: {stderr}");
     assert!(stderr.contains("`Shown` has derived impls for the traits"), "{stderr}");
     assert!(!checked.diags.iter().any(|it| it.is_error()), "{stderr}");

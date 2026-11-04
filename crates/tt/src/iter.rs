@@ -8,8 +8,7 @@ use intern::sym;
 use span::Span;
 
 use crate::{
-    Ident, Leaf, MAX_GLUED_PUNCT_LEN, Punct, Spacing, Subtree, TokenTreesView,
-    buffer::Cursor,
+    Ident, Leaf, MAX_GLUED_PUNCT_LEN, Punct, Spacing, Subtree, TokenTreesView, buffer::Cursor,
 };
 
 #[derive(Clone)]

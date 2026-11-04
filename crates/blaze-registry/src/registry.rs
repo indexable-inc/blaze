@@ -362,7 +362,8 @@ impl Registry {
         in_cache
             || crate::pinned::crate_pin(checksum).is_some_and(|pin| {
                 self.context.store.is_some_and(|store| {
-                    let origin = blaze_fetch::Origin::Pinned { pin: &pin, form: blaze_fetch::Form::Blob };
+                    let origin =
+                        blaze_fetch::Origin::Pinned { pin: &pin, form: blaze_fetch::Form::Blob };
                     let lookup = blaze_fetch::Objects::new(store).lookup(origin);
                     lookup.is_ok_and(|it| it.is_some())
                 })

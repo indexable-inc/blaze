@@ -75,11 +75,16 @@ impl<'f> RegionValues<'f> {
 /// so it runs until a round adds none; each round adds at least one of the finitely many from
 /// a region to an assumed `'r`, which bounds the rounds; past that it answers none and says
 /// so (`Regions::answers_unsettled`).
-pub(super) fn answer_placeholders<'f>(frame: &'f Frame, regions: &mut Regions<'f, '_>, count: usize) {
+pub(super) fn answer_placeholders<'f>(
+    frame: &'f Frame,
+    regions: &mut Regions<'f, '_>,
+    count: usize,
+) {
     if regions.placeholder_bounds.is_empty() {
         return;
     }
-    let bounds: FVec<'_, (Rv, Rv)> = mem::collect(frame, regions.placeholder_bounds.iter().copied());
+    let bounds: FVec<'_, (Rv, Rv)> =
+        mem::collect(frame, regions.placeholder_bounds.iter().copied());
     let placeholders: FVec<'_, Rv> = mem::collect(
         frame,
         regions
@@ -90,9 +95,7 @@ pub(super) fn answer_placeholders<'f>(frame: &'f Frame, regions: &mut Regions<'f
     );
     let static_rv = regions.static_rv;
     let answers = |sup: Rv, scc: &[u32], component: u32| {
-        sup < count
-            && sup != static_rv
-            && !(scc[sup] == component && placeholders.contains(&sup))
+        sup < count && sup != static_rv && !(scc[sup] == component && placeholders.contains(&sup))
     };
     let mut added: FVec<'_, Outlives> = Vec::new_in(frame);
     let mut answered_edges: FVec<'_, (Rv, Rv, Rv)> = Vec::new_in(frame);
@@ -100,7 +103,8 @@ pub(super) fn answer_placeholders<'f>(frame: &'f Frame, regions: &mut Regions<'f
     for _ in 0..fuel {
         let edges = outlives_edges(frame, regions, count);
         let (scc, sccs) = strongly_connected(frame, &edges);
-        let answered = answered_components(frame, &bounds, &placeholders, &scc, sccs, count, &answers);
+        let answered =
+            answered_components(frame, &bounds, &placeholders, &scc, sccs, count, &answers);
         added.clear();
         answered_edges.clear();
         for at in 0..regions.outlives.len() {
@@ -174,7 +178,8 @@ fn answered_components<'f>(
     let mut answered = bits(frame, sccs);
     let mut unanswered = bits(frame, sccs);
     for &rv in placeholders {
-        if !bounds.iter().any(|&(sup, sub)| (sup == rv || sub == rv) && sup < count && sub < count) {
+        if !bounds.iter().any(|&(sup, sub)| (sup == rv || sub == rv) && sup < count && sub < count)
+        {
             continue;
         }
         let at = scc[rv];
@@ -212,9 +217,9 @@ pub(super) fn infer<'f>(
     // outlive is checked against `'x` itself.
     let placeholder = |rv: Rv| {
         rv < count
-            && regions.universal(rv).is_some_and(|it| {
-                regions.universals[it].1 == UniversalKind::Placeholder
-            })
+            && regions
+                .universal(rv)
+                .is_some_and(|it| regions.universals[it].1 == UniversalKind::Placeholder)
     };
     let mut barriers = bits(frame, sccs);
     for &(sup, sub) in regions.placeholder_bounds.iter() {
@@ -266,8 +271,7 @@ pub(super) fn infer<'f>(
         }
         universals.insert(at, index);
     }
-    let members =
-        Csr::build(frame, sccs, scc.iter().enumerate().map(|(rv, &at)| (at, rv as u32)));
+    let members = Csr::build(frame, sccs, scc.iter().enumerate().map(|(rv, &at)| (at, rv as u32)));
     let seen = frame.alloc_slice_fill_with(sccs, |_| u32::MAX);
     for at in 0..sccs {
         for &rv in members.of(at) {

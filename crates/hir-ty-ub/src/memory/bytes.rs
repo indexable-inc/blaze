@@ -136,10 +136,11 @@ impl Bytes {
     /// Whether byte `i` is initialized (bytes past the end are not).
     #[inline]
     pub fn is_init(&self, i: usize) -> bool {
-        i < self.len && (self.init.is_empty() || {
-            let (word, mask) = locate(i);
-            self.init[word] & mask != 0
-        })
+        i < self.len
+            && (self.init.is_empty() || {
+                let (word, mask) = locate(i);
+                self.init[word] & mask != 0
+            })
     }
 
     /// Whether any byte of `range` carries provenance.
@@ -285,7 +286,8 @@ impl Bytes {
         self.prov.drain(lo..hi);
         if last.end() > end {
             let cut = (end - last.at) as u8;
-            let rest = Run { at: end, idx: last.idx + cut, len: last.len - cut, whole: false, ..last };
+            let rest =
+                Run { at: end, idx: last.idx + cut, len: last.len - cut, whole: false, ..last };
             self.prov.insert(lo, rest);
         }
         if first.at < start {

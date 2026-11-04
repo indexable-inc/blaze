@@ -1,5 +1,5 @@
 //! This module resolves `mod foo;` declaration to file.
-use base_db::{Db, AnchoredPath, Crate};
+use base_db::{AnchoredPath, Crate, Db};
 use hir_expand::{EditionedFileId, name::Name};
 use intern::Symbol;
 
@@ -158,7 +158,8 @@ impl DirPath {
         if path.is_empty() {
             return None;
         };
-        let idx = path[..path.len() - '/'.len_utf8()].rfind('/').map_or(0, |it| it + '/'.len_utf8());
+        let idx =
+            path[..path.len() - '/'.len_utf8()].rfind('/').map_or(0, |it| it + '/'.len_utf8());
         Some(&path[..idx])
     }
     /// So this is the case which doesn't really work I think if we try to be

@@ -29,10 +29,14 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     // alloc: the findings of one body, reported at the edge
     let mut found = Vec::new();
     let Some(analysis) = cx.analysis() else { return found };
-    let Ok(DefWithBodyId::FunctionId(f)) = DefWithBodyId::try_from(analysis.def()) else { return found };
+    let Ok(DefWithBodyId::FunctionId(f)) = DefWithBodyId::try_from(analysis.def()) else {
+        return found;
+    };
     let db = cx.db();
     let Some(drop) = cx.lang_trait(hir::LangItem::Drop) else { return found };
-    let Some(hir::AssocItemContainer::Impl(imp)) = hir::Function::from(f).as_assoc_item(db).map(|it| it.container(db)) else {
+    let Some(hir::AssocItemContainer::Impl(imp)) =
+        hir::Function::from(f).as_assoc_item(db).map(|it| it.container(db))
+    else {
         return found;
     };
     if imp.trait_(db) != Some(drop) || hir::Function::from(f).name(db).as_str() != "drop" {

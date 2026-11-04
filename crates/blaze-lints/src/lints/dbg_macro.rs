@@ -18,7 +18,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         return;
     }
     let Some(call) = ast::MacroCall::cast(node) else { return };
-    if !super::print_stdout::named(call, &["dbg"]) || cx.std_macro(call).is_none_or(|it| it.as_str() != "dbg") {
+    if !super::print_stdout::named(call, &["dbg"])
+        || cx.std_macro(call).is_none_or(|it| it.as_str() != "dbg")
+    {
         return;
     }
     if cx.conf().bool("allow-dbg-in-tests", false) && cx.is_in_test(node) {

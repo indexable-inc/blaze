@@ -45,9 +45,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, expr: ast::Expr<'t>) {
     {
         return;
     }
-    let is_byte = |member: ast::Expr<'_>| {
-        matches!(member, ast::Expr::Literal(it) if matches!(it.kind(), ast::LiteralKind::Byte(_)))
-    };
+    let is_byte = |member: ast::Expr<'_>| matches!(member, ast::Expr::Literal(it) if matches!(it.kind(), ast::LiteralKind::Byte(_)));
     if !array.exprs().all(is_byte) {
         return;
     }
@@ -86,4 +84,3 @@ fn past_parens(expr: ast::Expr<'_>) -> ast::Node<'_> {
     }
     node
 }
-

@@ -2,15 +2,18 @@
 //! [`blaze_intent`] over the job's view: an edit reads the view's files as the VFS has them
 //! and builds nothing; a build ahead picks the test units its filters select and runs nothing.
 
-#[expect(clippy::disallowed_types, reason = "each read once, the first time an edit asks: per edit, not global")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "each read once, the first time an edit asks: per edit, not global"
+)]
 use std::cell::OnceCell;
 
 use base_db::FileId;
 use blaze_api::{ApiError, Edit, Edited};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_intent::ahead;
 use blaze_vfs::Bytes;
+use std::alloc::Global;
 
 use super::{Job, UnitReader, answer_macros_built, files::Mounted, graph::flag};
 use crate::serve::work::Failed;
@@ -63,16 +66,24 @@ pub(crate) fn ahead(job: &Job, reader: &UnitReader, filter: &[String]) -> Result
     }
     let tests: Vec<Vec<ahead::Test<'_>>> = listed
         .iter()
-        .map(|(_, tests)| tests.iter().map(|it| ahead::Test { name: &it.name, reached: &[] }).collect())
+        .map(|(_, tests)| {
+            tests.iter().map(|it| ahead::Test { name: &it.name, reached: &[] }).collect()
+        })
         .collect();
-    let binaries: Vec<ahead::Binary<'_>> =
-        listed.iter().zip(&tests).map(|((unit, _), tests)| ahead::Binary { unit: *unit, tests }).collect();
+    let binaries: Vec<ahead::Binary<'_>> = listed
+        .iter()
+        .zip(&tests)
+        .map(|((unit, _), tests)| ahead::Binary { unit: *unit, tests })
+        .collect();
     Ok(ahead::plan(&binaries, filter).units)
 }
 
 /// The front end's files in the view, by their path in it, each one's bytes read from the VFS
 /// the first time an edit opens it.
-#[expect(clippy::disallowed_types, reason = "each read once, the first time an edit asks: per edit, not global")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "each read once, the first time an edit asks: per edit, not global"
+)]
 struct ViewFiles<'a> {
     mounted: &'a Mounted,
     files: Vec<ViewFile<'a>>,
@@ -82,7 +93,10 @@ struct ViewFiles<'a> {
     corrupt: OnceCell<(String, String)>,
 }
 
-#[expect(clippy::disallowed_types, reason = "each read once, the first time an edit asks: per edit, not global")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "each read once, the first time an edit asks: per edit, not global"
+)]
 struct ViewFile<'a> {
     id: FileId,
     absolute: &'a str,
@@ -91,7 +105,10 @@ struct ViewFile<'a> {
 }
 
 impl<'a> ViewFiles<'a> {
-    fn new(mounted: &'a Mounted, paths: &'a std::collections::HashMap<FileId, String>) -> ViewFiles<'a> {
+    fn new(
+        mounted: &'a Mounted,
+        paths: &'a std::collections::HashMap<FileId, String>,
+    ) -> ViewFiles<'a> {
         let mut files = Vec::new();
         let (mut by_path, mut by_id) = (HashMap::new_in(Global), HashMap::new_in(Global));
         for (&id, absolute) in paths {
@@ -136,7 +153,11 @@ mod tests {
     #[test]
     fn only_the_views_files_are_named_and_each_by_its_path_in_it() {
         let (mut vfs, _) = Vfs::restore(FileName::new("vfs/journal").unwrap(), 0, &[], None);
-        let write = Op::Write { mode: Mode::Regular, path: "src/lib.rs".into(), bytes: b"pub fn a() {}\n".to_vec() };
+        let write = Op::Write {
+            mode: Mode::Regular,
+            path: "src/lib.rs".into(),
+            bytes: b"pub fn a() {}\n".to_vec(),
+        };
         let root = vfs.apply(vfs.empty(), &[write]).unwrap();
         let mounts = [Mount { at: "/w".into(), origin: Origin::View, under: String::new() }];
         let mounted = Mounted::new(vfs.reader(), root, &mounts, "/w");

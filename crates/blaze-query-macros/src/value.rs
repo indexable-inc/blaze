@@ -4,9 +4,9 @@
 // alloc: expansion time, once per annotated item; no query runs this
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
+use std::alloc::Global;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::visit::Visit;

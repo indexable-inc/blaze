@@ -222,34 +222,52 @@ fn check_variants(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expec
             let mut lines = Vec::new();
             for (expr, it) in body.exprs() {
                 let Expr::Path(path) = it else { continue };
-                let Some(ValueNs::EnumVariantId(variant)) = infer.value_resolution(expr.into()) else {
+                let Some(ValueNs::EnumVariantId(variant)) = infer.value_resolution(expr.into())
+                else {
                     continue;
                 };
                 lines.push(format!("    {} -> {}", written(&db, path), variant_of(&db, variant)));
             }
             for (expr, it) in body.exprs() {
                 let Expr::RecordLit { path, .. } = it else { continue };
-                let Some(VariantId::EnumVariantId(variant)) = infer.variant_resolution_for_expr(expr) else {
+                let Some(VariantId::EnumVariantId(variant)) =
+                    infer.variant_resolution_for_expr(expr)
+                else {
                     continue;
                 };
-                lines.push(format!("    record {} -> {}", written(&db, path), variant_of(&db, variant)));
+                lines.push(format!(
+                    "    record {} -> {}",
+                    written(&db, path),
+                    variant_of(&db, variant)
+                ));
             }
             for (pat, it) in body.pats() {
                 let path = match it {
                     Pat::Path(path) => {
-                        let Some(ValueNs::EnumVariantId(variant)) = infer.value_resolution(pat.into()) else {
+                        let Some(ValueNs::EnumVariantId(variant)) =
+                            infer.value_resolution(pat.into())
+                        else {
                             panic!("the pattern {} names no variant", written(&db, path));
                         };
-                        lines.push(format!("    pattern {} -> {}", written(&db, path), variant_of(&db, variant)));
+                        lines.push(format!(
+                            "    pattern {} -> {}",
+                            written(&db, path),
+                            variant_of(&db, variant)
+                        ));
                         continue;
                     }
                     Pat::Record { path, .. } | Pat::TupleStruct { path, .. } => path,
                     _ => continue,
                 };
-                let Some(VariantId::EnumVariantId(variant)) = infer.variant_resolution_for_pat(pat) else {
+                let Some(VariantId::EnumVariantId(variant)) = infer.variant_resolution_for_pat(pat)
+                else {
                     panic!("the pattern {} names no variant", written(&db, path));
                 };
-                lines.push(format!("    pattern {} -> {}", written(&db, path), variant_of(&db, variant)));
+                lines.push(format!(
+                    "    pattern {} -> {}",
+                    written(&db, path),
+                    variant_of(&db, variant)
+                ));
             }
             if !lines.is_empty() {
                 writeln!(out, "fn {name}:").unwrap();
@@ -282,7 +300,8 @@ fn collect_functions(db: &base_db::Db, map: &DefMap, out: &mut Vec<FunctionId>) 
 
 /// The path as written: `<_>::V` for a path after a type.
 fn written(db: &base_db::Db, path: Path<'_>) -> String {
-    let segments = path.mod_path().map_or_else(String::new, |it| it.display_verbatim(db).to_string());
+    let segments =
+        path.mod_path().map_or_else(String::new, |it| it.display_verbatim(db).to_string());
     match path.type_anchor() {
         Some(_) => format!("<_>::{segments}"),
         None => segments,

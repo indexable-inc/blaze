@@ -410,9 +410,9 @@ mod tests {
             parse("{:é>5} {}", &[]),
             Some(vec![at(0, Trait::Display), at(1, Trait::Display)])
         );
-        assert_eq!(parse("{é}", &[]), Some(vec![Placeholder {
-            arg: Arg::Captured("é"),
-            ..at(0, Trait::Display)
-        }]));
+        assert_eq!(
+            parse("{é}", &[]),
+            Some(vec![Placeholder { arg: Arg::Captured("é"), ..at(0, Trait::Display) }])
+        );
     }
 }

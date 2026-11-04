@@ -85,6 +85,7 @@ blaze-source.workspace = true
 blaze-build-script.workspace = true
 paths.workspace = true
 syntax.workspace = true
+span.workspace = true
 stdx.workspace = true
 # The toolchain's downloads (`toolchain.rs`): a current-thread runtime, its timers and channels,
 # each a feature tokio has on wasm too, so the seed builds the same.

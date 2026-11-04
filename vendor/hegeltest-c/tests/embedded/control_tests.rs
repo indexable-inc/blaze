@@ -13,10 +13,7 @@ fn internal_error_carries_location_and_bug_report_framing() {
     assert!(msg.contains(file!()), "{msg}");
     assert!(msg.contains("boom: 7"), "{msg}");
     assert!(msg.contains("bug in hegel"), "{msg}");
-    assert!(
-        msg.contains("https://github.com/hegeldev/hegel/issues"),
-        "{msg}"
-    );
+    assert!(msg.contains("https://github.com/hegeldev/hegel/issues"), "{msg}");
 }
 
 #[test]
@@ -54,10 +51,7 @@ fn internal_assert_includes_the_condition_when_it_fails() {
         Ok(())
     }
     let msg = assert_err(check(3));
-    assert!(
-        msg.contains("internal assertion failed: value == 4"),
-        "{msg}"
-    );
+    assert!(msg.contains("internal assertion failed: value == 4"), "{msg}");
 }
 
 #[test]

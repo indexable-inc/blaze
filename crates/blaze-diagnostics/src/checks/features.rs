@@ -35,9 +35,9 @@ mod library;
 use std::ops::ControlFlow;
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
+use std::alloc::Global;
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange,
     view::{self as ast, AstNode as _},
@@ -62,13 +62,24 @@ use crate::{
 /// `misc_checking_1`.
 ///
 /// The gates of the attributes of macro calls, as expansion gives them.
-pub(crate) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
+pub(crate) fn expansion(
+    cx: &Cx<'_, '_>,
+    walk: &Walk<'_>,
+    owners: &[Owner<'_>],
+    features: &Features,
+) -> Vec<Found> {
     attributes::expansion(cx, walk, owners, features)
 }
 
 /// `feature_gate::check_crate`: the checks of the features themselves ([`staged`]), then the
 /// gates of syntax.
-pub(crate) fn early(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], features: &Features, flags: &Flags) -> Vec<Found> {
+pub(crate) fn early(
+    cx: &Cx<'_, '_>,
+    walk: &Walk<'_>,
+    owners: &[Owner<'_>],
+    features: &Features,
+    flags: &Flags,
+) -> Vec<Found> {
     let mut found = staged(cx, owners, features, flags);
     found.extend(gates::check(cx, walk, features, flags));
     found
@@ -76,7 +87,11 @@ pub(crate) fn early(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>], feat
 
 /// `check_unused_or_stable_features`: E0635, E0557 of a removed library feature,
 /// `stable_features`, `duplicate_features`.
-pub(crate) fn unused_or_stable(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) -> Vec<Found> {
+pub(crate) fn unused_or_stable(
+    cx: &Cx<'_, '_>,
+    owners: &[Owner<'_>],
+    features: &Features,
+) -> Vec<Found> {
     library::check(cx, owners, features)
 }
 
@@ -146,13 +161,21 @@ impl Features {
 /// The crate's `#![feature(..)]`s: each feature it names, with the attribute it is in.
 fn crate_features<'a>(owners: &'a [Owner<'_>]) -> Vec<Named<'a>> {
     // alloc: setup, the crate's `#![feature]`s, once per caller per check
-    owners.iter().find(|it| it.target == Target::Crate).map(|it| named(it).collect()).unwrap_or_default()
+    owners
+        .iter()
+        .find(|it| it.target == Target::Crate)
+        .map(|it| named(it).collect())
+        .unwrap_or_default()
 }
 
 /// rustc's `features`: what `#![feature]` enables, and its errors as expansion reads the
 /// crate's attributes: a removed language feature (E0557), one `-Z allow-features` leaves out
 /// (E0725).
-pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner<'_>], flags: &Flags) -> (Features, Vec<Found>) {
+pub(crate) fn configured(
+    cx: &Cx<'_, '_>,
+    owners: &[Owner<'_>],
+    flags: &Flags,
+) -> (Features, Vec<Found>) {
     let bootstrap = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP");
     // alloc: setup, the crate's name, once per check
     let crate_name = cx.krate.display_name(cx.db).map(|it| it.crate_name().to_string());
@@ -175,7 +198,11 @@ pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner<'_>], flags: &Flags) -
             let since = lang.map_or("", |it| it.since);
             let pull_note = pull
                 // alloc: the error's note
-                .map(|pull| format!("; see <https://github.com/rust-lang/rust/pull/{pull}> for more information"))
+                .map(|pull| {
+                    format!(
+                        "; see <https://github.com/rust-lang/rust/pull/{pull}> for more information"
+                    )
+                })
                 .unwrap_or_default();
             // alloc: the error's note
             diag.note(format!("removed in {since}{pull_note}"));
@@ -269,7 +296,13 @@ const DEPENDENT_FEATURES: &[(&str, Dependent)] = &[
         "function_arg_const_generics",
         Dependent::Or(&[Dependent::Leaf("gca_min_const_items"), Dependent::Leaf("gca_adts")]),
     ),
-    ("gca_adts", Dependent::Or(&[Dependent::Leaf("min_adt_const_params"), Dependent::Leaf("adt_const_params")])),
+    (
+        "gca_adts",
+        Dependent::Or(&[
+            Dependent::Leaf("min_adt_const_params"),
+            Dependent::Leaf("adt_const_params"),
+        ]),
+    ),
     ("gca_const_items", Dependent::Leaf("gca_min_const_items")),
     ("gca_macroless_args", Dependent::Leaf("gca_min_const_items")),
     ("gca_macroless_items", Dependent::Leaf("gca_min_const_items")),
@@ -279,7 +312,12 @@ const DEPENDENT_FEATURES: &[(&str, Dependent)] = &[
 /// The checks `check_crate` makes of the features themselves before its gates:
 /// `maybe_stage_features` (E0554), `check_incompatible_features`, `check_dependent_features`,
 /// `warn_next_solver_and_gce`, `check_features_requiring_new_solver`.
-pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features, flags: &Flags) -> Vec<Found> {
+pub(crate) fn staged(
+    cx: &Cx<'_, '_>,
+    owners: &[Owner<'_>],
+    features: &Features,
+    flags: &Flags,
+) -> Vec<Found> {
     // alloc: empty, allocates only when a feature is in error
     let mut diags = Vec::new();
     if !features.crate_nightly
@@ -292,7 +330,9 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features,
         let first = |name: &str| features.in_stable_order().find(|it| it.name == name);
         if let (Some(a), Some(b)) = (first(f1), first(f2)) {
             // alloc: the error's message
-            let message = format!("`{f1}` and `{f2}` are incompatible, using them at the same time is not allowed");
+            let message = format!(
+                "`{f1}` and `{f2}` are incompatible, using them at the same time is not allowed"
+            );
             let mut diag = Diag::error(None, message, cx.span(a.at));
             diag.primary(cx.span(b.at));
             diag.help("remove one of these features");
@@ -315,7 +355,8 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features,
     if flags.next_solver_globally
         && let Some(gce) = features.lang.iter().find(|it| it.name == "generic_const_exprs")
     {
-        let message = "`feature(generic_const_exprs)` is not supported with the next-generation trait solver";
+        let message =
+            "`feature(generic_const_exprs)` is not supported with the next-generation trait solver";
         let mut diag = Diag::new(Level::Warning, None, message);
         diag.span = cx.span(gce.at).into();
         diag.note("`-Znext-solver=globally` is currently enabled by default for testing");
@@ -427,7 +468,9 @@ pub(crate) fn feature_warn(features: &Features, feature: &str, span: Span, expla
     diag.span = MultiSpan::of(span);
     feature_notes(&mut diag, features, feature);
     diag.warn("unstable syntax can change at any point in the future, causing a hard error!");
-    diag.note("for more information, see issue #154045 <https://github.com/rust-lang/rust/issues/154045>");
+    diag.note(
+        "for more information, see issue #154045 <https://github.com/rust-lang/rust/issues/154045>",
+    );
     diag
 }
 
@@ -435,14 +478,18 @@ pub(crate) fn feature_warn(features: &Features, feature: &str, span: Span, expla
 fn feature_notes(diag: &mut Diag, features: &Features, feature: &str) {
     if let Some(n) = table::issue(feature) {
         // alloc: the error's note
-        diag.note(format!("see issue #{n} <https://github.com/rust-lang/rust/issues/{n}> for more information"));
+        diag.note(format!(
+            "see issue #{n} <https://github.com/rust-lang/rust/issues/{n}> for more information"
+        ));
     }
     if features.nightly {
         // alloc: the error's help
         diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
         if feature != "rustc_attrs" {
             // alloc: the error's note
-            diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
+            diag.note(format!(
+                "this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"
+            ));
         }
     }
 }
@@ -451,7 +498,12 @@ fn feature_notes(diag: &mut Diag, features: &Features, feature: &str) {
 /// token comes from is of a macro defined with `#[allow_internal_unstable(feature)]`. A builtin
 /// macro's expansion is the front end's own rendering of what rustc builds without its parser
 /// (`format_args!` as `builtin # format_args`), so nothing in it is gated.
-pub(crate) fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: &str) -> bool {
+pub(crate) fn allows_unstable(
+    cx: &Cx<'_, '_>,
+    file: HirFileId,
+    range: TextRange,
+    feature: &str,
+) -> bool {
     use hir_expand::MacroDefKind;
     if !file.is_macro() {
         return false;
@@ -486,7 +538,8 @@ pub(crate) fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange
 fn names_feature(tt: ast::TokenTree<'_>, feature: &str) -> bool {
     tt.syntax().children_with_tokens().any(|it| match it {
         NodeOrToken::Token(token) => {
-            token.kind() == SyntaxKind::IDENT && token.text().strip_prefix("r#").unwrap_or(token.text()) == feature
+            token.kind() == SyntaxKind::IDENT
+                && token.text().strip_prefix("r#").unwrap_or(token.text()) == feature
         }
         NodeOrToken::Node(_) => false,
     })
@@ -523,7 +576,8 @@ mod tests {
         };
         let or = Dependent::Or(&[Dependent::Leaf("a"), Dependent::Leaf("c")]);
         assert_eq!(missing(&or), (false, "`a` or `c`".to_owned()));
-        let and = Dependent::And(&[Dependent::Leaf("a"), Dependent::Leaf("b"), Dependent::Leaf("c")]);
+        let and =
+            Dependent::And(&[Dependent::Leaf("a"), Dependent::Leaf("b"), Dependent::Leaf("c")]);
         assert_eq!(missing(&and), (false, "`a` and `c`".to_owned()));
         assert!(Dependent::Or(&[Dependent::Leaf("a"), Dependent::Leaf("b")]).enabled(&features));
     }

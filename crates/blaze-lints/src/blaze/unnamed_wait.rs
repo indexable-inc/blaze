@@ -93,7 +93,9 @@ impl Instead {
             Instead::Span => {
                 "open the wait's span around it, `blaze_graph::wait::wait(WaitOn::Key(name), owner, || ..)`, or wait on a `Condvar` with `wait::wait_until(condvar, held, name, until)`"
             }
-            Instead::Name => "write the name of what is awaited: the key, what the lock guards, what the channel carries",
+            Instead::Name => {
+                "write the name of what is awaited: the key, what the lock guards, what the channel carries"
+            }
         }
     }
 }
@@ -135,13 +137,18 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             ("wait::wait".to_owned(), Said::Placeholder(it), Instead::Name) // alloc: a finding's name
         } else if Some(f) == api.lock || Some(f) == api.until {
             let at = if Some(f) == api.lock { 1 } else { 2 };
-            let Some(it) = arg(body, id, at, false).and_then(|it| placeholder(body, it)) else { continue };
+            let Some(it) = arg(body, id, at, false).and_then(|it| placeholder(body, it)) else {
+                continue;
+            };
             (format!("wait::{name}"), Said::Placeholder(it), Instead::Name)
         } else if of.is_some() && of == api.flights {
             let said = match name {
                 "get_or_run" | "hold" => Said::Hash,
                 "get_or_run_named" | "hold_named" => {
-                    let Some(said) = arg(body, id, 1, true).and_then(|it| named_by(body, it)) else { continue };
+                    let Some(said) = arg(body, id, 1, true).and_then(|it| named_by(body, it))
+                    else {
+                        continue;
+                    };
                     said
                 }
                 _ => continue,
@@ -151,7 +158,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 Said::Placeholder(_) => Instead::Name,
             };
             (format!("Flights::{name}"), said, instead)
-        } else if Some(f) == api.sched_wait || (of.is_some() && of == api.event_wait && name == "wait") {
+        } else if Some(f) == api.sched_wait
+            || (of.is_some() && of == api.event_wait && name == "wait")
+        {
             let parents = parents.get_or_insert_with(|| Parents::of(body));
             if in_wait_block(&api, analysis, parents, id) {
                 continue;
@@ -181,7 +190,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         let message = match &said {
             Said::Nothing => format!("`{api_name}` names nothing it waits for"),
             Said::Hash => format!("`{api_name}` names what it waits for only as its key's hash"),
-            Said::Placeholder(it) => format!("`{api_name}` names what it waits for only as `{it:?}`"),
+            Said::Placeholder(it) => {
+                format!("`{api_name}` names what it waits for only as `{it:?}`")
+            }
         };
         let note = format!(
             "a wait opens a span naming what it waits for, and the profile test fails on one with no name (AGENTS.md \
@@ -224,7 +235,9 @@ fn named_by(body: &Body, expr: ExprId) -> Option<Said> {
             return None;
         }
         match body.expr(at) {
-            Expr::MethodCall { method_name, args: [text], .. } if method_name.as_str() == "push_str" => {
+            Expr::MethodCall { method_name, args: [text], .. }
+                if method_name.as_str() == "push_str" =>
+            {
                 let it = placeholder(body, *text)?;
                 first.get_or_insert(it);
             }
@@ -237,7 +250,12 @@ fn named_by(body: &Body, expr: ExprId) -> Option<Said> {
 }
 
 /// Whether `id` is inside the block closure of a `wait::wait`, which names the wait.
-fn in_wait_block(api: &Api, analysis: &hir::BodyAnalysis<'_>, parents: &Parents, id: ExprId) -> bool {
+fn in_wait_block(
+    api: &Api,
+    analysis: &hir::BodyAnalysis<'_>,
+    parents: &Parents,
+    id: ExprId,
+) -> bool {
     let Some(wait) = api.wait else { return false };
     let body = analysis.body();
     parents.up(id, MOST_PARENTS).any(|closure| {

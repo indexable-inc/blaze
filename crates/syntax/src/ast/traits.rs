@@ -291,7 +291,14 @@ mod tests {
             .collect();
         assert_eq!(
             with_doc,
-            [(false, true), (false, false), (false, false), (true, false), (true, true), (true, false)]
+            [
+                (false, true),
+                (false, false),
+                (false, false),
+                (true, false),
+                (true, true),
+                (true, false)
+            ]
         );
         let names = |attrs: AttrsIncludingInner| -> Vec<String> {
             attrs.map(|it| it.meta().unwrap().syntax().text().to_string()).collect()

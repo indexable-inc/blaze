@@ -57,7 +57,11 @@ impl fmt::Display for Unplaced {
 
 impl std::error::Error for Unplaced {}
 
-fn placed(range: std::ops::Range<u16>, what: &'static str, number: u16) -> Result<QueryKind, Unplaced> {
+fn placed(
+    range: std::ops::Range<u16>,
+    what: &'static str,
+    number: u16,
+) -> Result<QueryKind, Unplaced> {
     match range.start.checked_add(number) {
         Some(kind) if kind < range.end => Ok(QueryKind(kind)),
         _ => Err(Unplaced { what, number }),
@@ -66,7 +70,9 @@ fn placed(range: std::ops::Range<u16>, what: &'static str, number: u16) -> Resul
 
 /// The step an entry row is of, `None` for a key that is no kernel entry's.
 pub fn step_of(key: &QueryKey) -> Option<StepId> {
-    kinds::KERNEL_ENTRIES.contains(&key.kind.0).then(|| StepId(key.kind.0 - kinds::KERNEL_ENTRIES.start))
+    kinds::KERNEL_ENTRIES
+        .contains(&key.kind.0)
+        .then(|| StepId(key.kind.0 - kinds::KERNEL_ENTRIES.start))
 }
 
 /// The row of the entry of `step` kept under `at`.
@@ -122,10 +128,16 @@ pub fn record<'r>(
 
 /// [`record`] of what [`blaze_kernel::Kernel::get`] gave for `identity`: a hit with the reads its
 /// entry recorded, a computed value with the reads it made.
-pub fn record_got(trace: &mut TraceBuilder, identity: &Identity, got: &Got<'_>) -> Result<(), Unplaced> {
+pub fn record_got(
+    trace: &mut TraceBuilder,
+    identity: &Identity,
+    got: &Got<'_>,
+) -> Result<(), Unplaced> {
     let at = row(identity)?;
     match got {
         Got::Hit(entry) => record(trace, at, value(entry.value), entry.reads(), true),
-        Got::Computed { value: bytes, reads, .. } => record(trace, at, value(bytes), reads.iter(), false),
+        Got::Computed { value: bytes, reads, .. } => {
+            record(trace, at, value(bytes), reads.iter(), false)
+        }
     }
 }

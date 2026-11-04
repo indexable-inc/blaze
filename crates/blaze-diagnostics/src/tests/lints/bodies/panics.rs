@@ -11,7 +11,8 @@ fn ui(name: &str, source: &str) -> String {
 /// [`ui`] with core's indexing, unsizing and negation, which rustc's type check reaches only
 /// through their lang items, as the UI test has them from std.
 fn ui_core(name: &str, source: &str) -> String {
-    const FLAGS: &str = "sized, copy, unsize, coerce_unsized, index, slice, unary_ops, builtin_impls, int_bounds";
+    const FLAGS: &str =
+        "sized, copy, unsize, coerce_unsized, index, slice, unary_ops, builtin_impls, int_bounds";
     crate::tests::items::ui_core(name, "2015", FLAGS, source)
 }
 
@@ -26,10 +27,7 @@ fn main() {
     [1][1u64 as usize]; //~ ERROR operation will panic
 }
 "##;
-    assert_reports(
-        &ui_core("issue-54348.rs", source),
-        &[error(5, &[]), error(6, &[])],
-    );
+    assert_reports(&ui_core("issue-54348.rs", source), &[error(5, &[]), error(6, &[])]);
 }
 
 #[test]
@@ -43,10 +41,7 @@ fn main() {
     let _ = xs[7]; //~ ERROR: this operation will panic at runtime [unconditional_panic]
 }
 "##;
-    assert_reports(
-        &ui_core("unconditional_panic_98444.rs", source),
-        &[error(6, &[])],
-    );
+    assert_reports(&ui_core("unconditional_panic_98444.rs", source), &[error(6, &[])]);
 }
 
 #[test]
@@ -61,10 +56,7 @@ fn main() {
     let _ = slice[2]; //~ ERROR: this operation will panic at runtime [unconditional_panic]
 }
 "##;
-    assert_reports(
-        &ui_core("unconditional_panic_promoted.rs", source),
-        &[error(7, &[])],
-    );
+    assert_reports(&ui_core("unconditional_panic_promoted.rs", source), &[error(7, &[])]);
 }
 
 #[test]
@@ -80,10 +72,7 @@ fn main() {
     //~^ WARN operation will panic
 }
 "##;
-    assert_reports(
-        &ui_core("array-literal-index-oob.rs", source),
-        &[warning(7, &[])],
-    );
+    assert_reports(&ui_core("array-literal-index-oob.rs", source), &[warning(7, &[])]);
 }
 
 #[test]
@@ -95,10 +84,7 @@ fn main() {
     [0; 3][3u64 as usize]; //~ ERROR this operation will panic at runtime
 }
 "##;
-    assert_reports(
-        &ui_core("const-prop-ice.rs", source),
-        &[error(4, &[])],
-    );
+    assert_reports(&ui_core("const-prop-ice.rs", source), &[error(4, &[])]);
 }
 
 #[test]
@@ -129,7 +115,10 @@ fn oob_error_for_slices() {
     }
 }
 "##;
-    assert_reports(&ui_core("mir_detects_invalid_ops.rs", source), &[error(11, &[]), error(16, &[])]);
+    assert_reports(
+        &ui_core("mir_detects_invalid_ops.rs", source),
+        &[error(11, &[]), error(16, &[])],
+    );
 }
 
 #[test]
@@ -146,10 +135,7 @@ fn main() {
     //~^ ERROR this operation will panic at runtime [unconditional_panic]
 }
 "##;
-    assert_reports(
-        &ui_core("index-bounds.rs", source),
-        &[error(4, &[]), error(8, &[])],
-    );
+    assert_reports(&ui_core("index-bounds.rs", source), &[error(4, &[]), error(8, &[])]);
 }
 
 #[test]
@@ -382,10 +368,7 @@ fn shifts_by_the_width_of_the_left_side() {
     let _z = 1_u64 << 63;
 }
 "##;
-    assert_reports(
-        &ui("shifts.rs", source),
-        &[error(2, &[]), error(3, &[])],
-    );
+    assert_reports(&ui("shifts.rs", source), &[error(2, &[]), error(3, &[])]);
 }
 
 #[test]

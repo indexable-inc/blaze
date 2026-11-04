@@ -265,12 +265,29 @@ fn push_set(hits: &mut Vec<u8>, n: usize, value: u64) {
 #[derive(PartialEq, Eq, Debug)]
 pub enum Frame {
     /// `fork` is how long one fork of the server took, in nanoseconds.
-    Hello { version: u32, pid: u32, fork: u64, tests: Vec<String> },
-    Ended { id: u64, end: End, output: Vec<u8>, executed: Executed },
-    Run { id: u64, index: u32 },
-    Kill { id: u64 },
+    Hello {
+        version: u32,
+        pid: u32,
+        fork: u64,
+        tests: Vec<String>,
+    },
+    Ended {
+        id: u64,
+        end: End,
+        output: Vec<u8>,
+        executed: Executed,
+    },
+    Run {
+        id: u64,
+        index: u32,
+    },
+    Kill {
+        id: u64,
+    },
     Quit,
-    Replicate { count: u32 },
+    Replicate {
+        count: u32,
+    },
 }
 
 /// A frame read in place from the bytes it came in: every length checked against them, every
@@ -303,7 +320,8 @@ impl<'a> Names<'a> {
 
     pub fn iter(&self) -> impl Iterator<Item = &'a str> + 'a {
         let mut at = Cursor { bytes: self.bytes, at: 0 };
-        (0..self.count).map(move |_| at.string("test name").expect("a name checked when its hello was read"))
+        (0..self.count)
+            .map(move |_| at.string("test name").expect("a name checked when its hello was read"))
     }
 }
 
@@ -325,7 +343,13 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 /// [`Frame::Hello`] of these parts, with its length, added to `out`: the bytes
 /// [`Frame::encode`] adds for it, from borrowed names, so a server says hello straight from its
 /// tests' names, with no list of its own.
-pub fn encode_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, tests: impl Iterator<Item = &'a str>) {
+pub fn encode_hello<'a>(
+    out: &mut Vec<u8>,
+    version: u32,
+    pid: u32,
+    fork: u64,
+    tests: impl Iterator<Item = &'a str>,
+) {
     let start = out.len();
     put_u32(out, 0);
     put_hello(out, version, pid, fork, tests);
@@ -333,7 +357,13 @@ pub fn encode_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, te
     out[start..start + 4].copy_from_slice(&len.to_le_bytes());
 }
 
-fn put_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, tests: impl Iterator<Item = &'a str>) {
+fn put_hello<'a>(
+    out: &mut Vec<u8>,
+    version: u32,
+    pid: u32,
+    fork: u64,
+    tests: impl Iterator<Item = &'a str>,
+) {
     out.push(HELLO);
     put_u32(out, version);
     put_u32(out, pid);
@@ -351,7 +381,13 @@ fn put_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, tests: im
 /// [`Frame::Ended`] of these parts, with its length, added to `out`: the bytes
 /// [`Frame::encode`] adds for it, from borrowed parts, so a server encodes each test's output
 /// and hits once, straight from the buffers they were read into.
-pub fn encode_ended<'a>(out: &mut Vec<u8>, id: u64, end: EndView<'a>, output: &[u8], executed: ExecView<'a>) {
+pub fn encode_ended<'a>(
+    out: &mut Vec<u8>,
+    id: u64,
+    end: EndView<'a>,
+    output: &[u8],
+    executed: ExecView<'a>,
+) {
     let why = match end {
         EndView::NotStarted(why) => why.len() + 4,
         EndView::Exited(_) | EndView::Signaled(_) => 4,
@@ -425,7 +461,9 @@ impl Frame {
         let start = out.len();
         put_u32(out, 0);
         match self {
-            Frame::Hello { version, pid, fork, tests } => put_hello(out, *version, *pid, *fork, tests.iter().map(String::as_str)),
+            Frame::Hello { version, pid, fork, tests } => {
+                put_hello(out, *version, *pid, *fork, tests.iter().map(String::as_str))
+            }
             Frame::Ended { id, end, output, executed } => {
                 out.push(ENDED);
                 put_u64(out, *id);
@@ -491,7 +529,12 @@ impl<'a> View<'a> {
                 for _ in 0..count {
                     at.string("test name")?;
                 }
-                View::Hello { version, pid, fork, tests: Names { count, bytes: &body[from..at.at] } }
+                View::Hello {
+                    version,
+                    pid,
+                    fork,
+                    tests: Names { count, bytes: &body[from..at.at] },
+                }
             }
             ENDED => {
                 let id = at.u64("run id")?;
@@ -507,13 +550,16 @@ impl<'a> View<'a> {
                         let slots = at.u32("slot count")?;
                         let count = at.u32("hit count")? as usize;
                         let hits = "slots hit";
-                        let len = count.checked_mul(4).ok_or_else(|| format!("a frame ends early, in its {}", hits))?; // alloc: error path
+                        let len = count
+                            .checked_mul(4)
+                            .ok_or_else(|| format!("a frame ends early, in its {}", hits))?; // alloc: error path
                         let bytes = at.take(len, hits)?;
                         let hits = Hits(bytes);
                         let mut last: Option<u32> = None;
                         for hit in hits.iter() {
                             if hit >= slots || last.is_some_and(|it| it >= hit) {
-                                return Err(format!( // alloc: error path
+                                return Err(format!(
+                                    // alloc: error path
                                     "an execution record names slot {} out of order or past its {} slots",
                                     hit, slots
                                 ));
@@ -550,7 +596,12 @@ impl<'a> View<'a> {
                 Frame::Hello { version, pid, fork, tests: names }
             }
             View::Ended { id, end, output, executed } => {
-                Frame::Ended { id, end: end.to_end(), output: output.to_vec(), executed: executed.to_executed() } // alloc: the owned frame: what a result keeps
+                Frame::Ended {
+                    id,
+                    end: end.to_end(),
+                    output: output.to_vec(),
+                    executed: executed.to_executed(),
+                } // alloc: the owned frame: what a result keeps
             }
             View::Run { id, index } => Frame::Run { id, index },
             View::Kill { id } => Frame::Kill { id },

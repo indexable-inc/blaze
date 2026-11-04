@@ -606,7 +606,12 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             DeclOp::InitDeriveAttribute { module, adt, attr, attr_call, derive_calls } => {
                 // clone: a `SmallVec` of four, inline for all but the longest `#[derive]`s.
                 let derive_calls = derive_calls.clone();
-                self.scope_mut(*module).init_derive_attribute(*adt, *attr, *attr_call, derive_calls);
+                self.scope_mut(*module).init_derive_attribute(
+                    *adt,
+                    *attr,
+                    *attr_call,
+                    derive_calls,
+                );
             }
             // clone: the worklist owns its imports across rounds; once per import and component.
             DeclOp::Import(it) => self.state.imports.push(&mut self.queues, it.clone()),
@@ -623,7 +628,9 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             DeclOp::Diagnostic(diagnostic) => panic!(
                 "nameres facts: a unit is given the diagnostic {diagnostic:?} by reference; diagnostics go through `Sink::apply`"
             ),
-            DeclOp::NotIntroducing(_) | DeclOp::ResolvedMacroPath { .. } | DeclOp::DeriveHelperUse(_) => {
+            DeclOp::NotIntroducing(_)
+            | DeclOp::ResolvedMacroPath { .. }
+            | DeclOp::DeriveHelperUse(_) => {
                 panic!(
                     "nameres facts: a unit is given the name record {op:?} by reference; records go through `Sink::apply`"
                 )
@@ -693,7 +700,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     /// Retries unresolved import `at`; whether it recorded anything.
     fn retry_unresolved(&mut self, at: u32) -> bool {
         let i = at as usize;
-        let _reading = crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
+        let _reading =
+            crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
         self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
@@ -724,7 +732,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     fn retry_indeterminate(&mut self, seq: u32) -> bool {
         let (at, settled) = self.state.imports.indeterminate[seq as usize];
         let i = at as usize;
-        let _reading = crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
+        let _reading =
+            crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
         self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
@@ -790,16 +799,15 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         // Where a `macro`'s def-site hygiene starts the path (rustc's `resolve_path` with each
         // segment's span): as written, or a scope the expansion's names or its def site have.
         let mut strayed = false;
-        let origin = def_map.import_origin(db, importer, path, directive.op.ctxt, &mut |read| {
-            match read {
+        let origin =
+            def_map.import_origin(db, importer, path, directive.op.ctxt, &mut |read| match read {
                 PathRead::Slot(at, _) | PathRead::LegacyMacro(at, _)
                     if local_to(at) && !around(db, &*def_map, importer, at) =>
                 {
                     strayed = true;
                 }
                 read => reads(read),
-            }
-        });
+            });
         let (map, from, path) = match origin {
             _ if strayed => return PartialResolvedImport::Unresolved,
             Hygienic::At(at, _) if local_to(at) && !around(db, &*def_map, importer, at) => {
@@ -877,23 +885,26 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                 // segment by def-site hygiene, as an import's (`resolve_import`).
                 let mut strayed = false;
                 let types = Some(Namespace::Types);
-                let origin = def_map.hygienic_origin_reading(db, module, path, types, *ctxt, &mut |read| {
-                    match read {
-                        PathRead::Slot(at, _) | PathRead::LegacyMacro(at, _)
-                            if local_to(at) && !around(db, &*def_map, module, at) =>
-                        {
-                            strayed = true;
+                let origin =
+                    def_map.hygienic_origin_reading(db, module, path, types, *ctxt, &mut |read| {
+                        match read {
+                            PathRead::Slot(at, _) | PathRead::LegacyMacro(at, _)
+                                if local_to(at) && !around(db, &*def_map, module, at) =>
+                            {
+                                strayed = true;
+                            }
+                            read => reads(read),
                         }
-                        read => reads(read),
-                    }
-                });
+                    });
                 let (map, from, path) = match origin {
                     _ if strayed => return Err(VisibilityError::Unresolved),
                     Hygienic::At(at, _) if local_to(at) && !around(db, &*def_map, module, at) => {
                         return Err(VisibilityError::Unresolved);
                     }
                     Hygienic::Here => (&*def_map, module, *path),
-                    Hygienic::At(at, key) => (def_map.map_for(db, at), at, def_site::keyed_path(path, key)),
+                    Hygienic::At(at, key) => {
+                        (def_map.map_for(db, at), at, def_site::keyed_path(path, key))
+                    }
                     Hygienic::Unknown => return Err(VisibilityError::Unresolved),
                 };
                 let result = map.resolve_path_fp_recording(
@@ -975,7 +986,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     def.values = None;
                     def.macros = None;
                 }
-                let imp = ImportOrExternCrate::Import(ImportId { use_: source.id, idx: source.use_tree });
+                let imp =
+                    ImportOrExternCrate::Import(ImportId { use_: source.id, idx: source.use_tree });
 
                 // `extern crate crate_name` things can be re-exported as `pub use crate_name`.
                 // But they cannot be re-exported as `pub use self::crate_name`, `pub use crate::crate_name`
@@ -1036,10 +1048,17 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                                     // only keep visible names...
                                     .filter_map(|(n, res)| {
                                         let n = match n {
-                                            Some(n) => Some(def_site::glob_imported_name(db, n, expn, glob_ctxt)?),
+                                            Some(n) => Some(def_site::glob_imported_name(
+                                                db, n, expn, glob_ctxt,
+                                            )?),
                                             None => None,
                                         };
-                                        Some((n, res.filter_visibility(|v| v.is_visible_from_other_crate())))
+                                        Some((
+                                            n,
+                                            res.filter_visibility(|v| {
+                                                v.is_visible_from_other_crate()
+                                            }),
+                                        ))
                                     })
                                     .filter(|(_, res)| !res.is_none()),
                             );
@@ -1072,14 +1091,26 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                             // Two globs of one module share an edge. The one its names are bound
                             // through (`glob_takes_over`) takes it over, so what the source gains
                             // later is credited as when it was pulled.
-                            self.state.globs.add(m, module_id, (vis, glob), |(old_vis, old_glob)| {
-                                if glob_takes_over(db, def_map, glob, vis, Some(*old_glob), *old_vis) {
-                                    *old_glob = glob;
-                                }
-                                if let Some(new_vis) = old_vis.max(db, vis, def_map) {
-                                    *old_vis = new_vis;
-                                }
-                            });
+                            self.state.globs.add(
+                                m,
+                                module_id,
+                                (vis, glob),
+                                |(old_vis, old_glob)| {
+                                    if glob_takes_over(
+                                        db,
+                                        def_map,
+                                        glob,
+                                        vis,
+                                        Some(*old_glob),
+                                        *old_vis,
+                                    ) {
+                                        *old_glob = glob;
+                                    }
+                                    if let Some(new_vis) = old_vis.max(db, vis, def_map) {
+                                        *old_vis = new_vis;
+                                    }
+                                },
+                            );
                         }
                     }
                     Some(ModuleDefId::AdtId(AdtId::EnumId(e))) => {
@@ -1099,7 +1130,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         let start = self.held.len();
                         self.held.extend(e.enum_variants(db).variants.iter().filter_map(
                             |(name, &(variant, shape))| {
-                                let name = def_site::glob_imported_name(db, *name, expn, glob_ctxt)?;
+                                let name =
+                                    def_site::glob_imported_name(db, *name, expn, glob_ctxt)?;
                                 // We don't need to reduce the visibility, since enum variants and their fields do not have visibility on their own.
                                 let res = if shape.has_value_ns_ctor() {
                                     PerNs::both(variant.into(), variant.into(), vis, None)
@@ -1109,7 +1141,12 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                                 Some((Some(name), res))
                             },
                         ));
-                        self.update_held(module_id, start, vis, Some(ImportOrExternCrate::Glob(glob)));
+                        self.update_held(
+                            module_id,
+                            start,
+                            vis,
+                            Some(ImportOrExternCrate::Glob(glob)),
+                        );
                     }
                     Some(ModuleDefId::TraitId(it)) => {
                         // glob import from trait => its associated items, as rustc's traits are
@@ -1131,7 +1168,12 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         if listed.is_err() {
                             self.held.truncate(start);
                         }
-                        self.update_held(module_id, start, vis, Some(ImportOrExternCrate::Glob(glob)));
+                        self.update_held(
+                            module_id,
+                            start,
+                            vis,
+                            Some(ImportOrExternCrate::Glob(glob)),
+                        );
                     }
                     Some(d) => {
                         tracing::debug!("glob import from non-module/enum {:?}", d);
@@ -1189,7 +1231,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             // Pulling adds no glob edge, so the list read as it goes is the list as it was.
             let mut edge = self.state.globs.first(source);
             while edge != NONE {
-                let ImporterEdge { importer, data: (vis, glob), next } = self.state.globs.edge(edge);
+                let ImporterEdge { importer, data: (vis, glob), next } =
+                    self.state.globs.edge(edge);
                 edge = next;
                 self.pull_glob(source, importer, vis, glob);
             }
@@ -1248,7 +1291,9 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     ) {
         if depth > GLOB_RECURSION_LIMIT {
             // prevent stack overflows (but this shouldn't be possible)
-            panic!("nameres: glob imports into {module_id:?} recurse past {GLOB_RECURSION_LIMIT} levels");
+            panic!(
+                "nameres: glob imports into {module_id:?} recurse past {GLOB_RECURSION_LIMIT} levels"
+            );
         }
         let mut changed = false;
 
@@ -1258,7 +1303,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             let (name, res) = self.held[at];
             match name {
                 Some(name) => {
-                    changed |= self.push_res_and_update_glob_vis(module_id, &name, res, vis, import);
+                    changed |=
+                        self.push_res_and_update_glob_vis(module_id, &name, res, vis, import);
                 }
                 None => {
                     let tr = match res.take_types_full() {
@@ -1269,8 +1315,11 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         }
                         None => continue,
                     };
-                    let old_vis =
-                        self.def_map.module(self.db, module_id).scope(self.db).unnamed_trait_vis(tr);
+                    let old_vis = self
+                        .def_map
+                        .module(self.db, module_id)
+                        .scope(self.db)
+                        .unnamed_trait_vis(tr);
                     let should_update = match old_vis {
                         None => true,
                         Some(old_vis) => {
@@ -1314,7 +1363,9 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                 Some(name) => {
                     let now = scope.get(&name);
                     PerNs {
-                        types: res.types.filter(|it| now.types.is_some_and(|now| now.def == it.def)),
+                        types: res
+                            .types
+                            .filter(|it| now.types.is_some_and(|now| now.def == it.def)),
                         values: res
                             .values
                             .filter(|it| now.values.is_some_and(|now| now.def == it.def)),
@@ -1354,19 +1405,29 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                 let (name, res) = self.held[at];
                 // The name as this importer's glob binds it (`def_site::glob_imported_name`).
                 let name = match name {
-                    Some(name) => match def_site::glob_imported_name(self.db, name, expn, glob_ctxt) {
-                        Some(it) => Some(it),
-                        None => continue,
-                    },
+                    Some(name) => {
+                        match def_site::glob_imported_name(self.db, name, expn, glob_ctxt) {
+                            Some(it) => Some(it),
+                            None => continue,
+                        }
+                    }
                     None => None,
                 };
-                let res = res.filter_visibility(|it| it.is_visible_from_def_map(self.db, &self.def_map, importer));
+                let res = res.filter_visibility(|it| {
+                    it.is_visible_from_def_map(self.db, &self.def_map, importer)
+                });
                 if !res.is_none() {
                     self.held.push((name, res));
                 }
             }
             let visible = from..self.held.len();
-            self.update_recursive(importer, visible, vis, Some(ImportOrExternCrate::Glob(glob)), depth + 1);
+            self.update_recursive(
+                importer,
+                visible,
+                vis,
+                Some(ImportOrExternCrate::Glob(glob)),
+                depth + 1,
+            );
             self.held.truncate(from);
         }
         self.held.truncate(held);
@@ -1485,7 +1546,10 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         &self.def_map,
                         glob,
                         def.vis,
-                        prev_def.import.map(ImportOrExternCrate::from).and_then(ImportOrExternCrate::glob),
+                        prev_def
+                            .import
+                            .map(ImportOrExternCrate::from)
+                            .and_then(ImportOrExternCrate::glob),
                         prev_def.vis,
                     )
                 {
@@ -1685,7 +1749,8 @@ pub(crate) fn local_scope(
 #[blaze_query::tracked(returns(copy))]
 fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
     let shape = queries::import_shape(db, round);
-    let at = shape.modules.iter().position(|it| it.imports.iter().any(|import| import.is_prelude))?;
+    let at =
+        shape.modules.iter().position(|it| it.imports.iter().any(|import| import.is_prelude))?;
     Some(at as u32)
 }
 
@@ -1773,19 +1838,24 @@ pub(crate) fn round_active(db: &Db, round: RoundKey) -> RoundActive {
     for component in 0..n {
         let on = match holder == Some(component) {
             true => members_change(db, round, component),
-            false => members_change(db, round, component) || {
-                let anchor = partition.anchor(component);
-                let ran = modules.ran(anchor).expect("a component whose members did not change ran before");
-                let anchor = modules.order[anchor as usize];
-                let then = queries::scc_state(db, SccKey::new(db, anchor, krate, ran));
-                then.upstream.iter().any(|&(module, _)| {
+            false => {
+                members_change(db, round, component)
+                    || {
+                        let anchor = partition.anchor(component);
+                        let ran = modules
+                            .ran(anchor)
+                            .expect("a component whose members did not change ran before");
+                        let anchor = modules.order[anchor as usize];
+                        let then = queries::scc_state(db, SccKey::new(db, anchor, krate, ran));
+                        then.upstream.iter().any(|&(module, _)| {
                     let Some(at) = modules.at(module) else {
                         panic!("nameres facts: {anchor:?} read {module:?} at round {ran}, which is not a module of round {r}")
                     };
                     let upstream = partition.of(at);
                     upstream >= component || runs(&bits, upstream)
                 })
-            },
+                    }
+            }
         };
         if on {
             bits[(component / 64) as usize] |= 1 << (component % 64);
@@ -1840,10 +1910,12 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
         && installed_prelude(db, prev_round, member_at) == (holds_prelude, prelude)
         && member_at.iter().all(|&at| {
             let module = modules.order[at as usize];
-            !modules.gains(at) || queries::module_round(db, FactKey::new(db, module, krate, r)).ops.is_empty()
+            !modules.gains(at)
+                || queries::module_round(db, FactKey::new(db, module, krate, r)).ops.is_empty()
         })
         && prev.upstream.iter().all(|&(module, handle)| {
-            check.may_read(module) && queries::fact_handle(db, fact_key_of(db, round, module)) == handle
+            check.may_read(module)
+                && queries::fact_handle(db, fact_key_of(db, round, module)) == handle
         })
     {
         return SccState {

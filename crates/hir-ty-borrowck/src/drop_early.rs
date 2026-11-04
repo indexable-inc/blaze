@@ -87,7 +87,9 @@ impl Refusal {
             Refusal::ByReference => "it is bound by reference",
             Refusal::Moved => "it is moved out of",
             Refusal::Assigned => "it is given a value more than once",
-            Refusal::UsedOutside => "it, or a value borrowed from it, is used outside its block's statements",
+            Refusal::UsedOutside => {
+                "it, or a value borrowed from it, is used outside its block's statements"
+            }
             Refusal::UsedByTail => "the block's value uses it",
             Refusal::NothingAfter => "its last use is the last statement of its scope",
             Refusal::Shadowed => "a later statement binds its name again",
@@ -97,7 +99,12 @@ impl Refusal {
 
 /// Where `drop(x);` goes for `binding` of `def`'s own body (not a closure's or `async`
 /// block's), read from `mir`, the body's MIR.
-pub fn drop_point(db: &Db, def: DefWithBodyId, mir: &MirBody<'_>, binding: BindingId) -> Result<DropPoint, Refusal> {
+pub fn drop_point(
+    db: &Db,
+    def: DefWithBodyId,
+    mir: &MirBody<'_>,
+    binding: BindingId,
+) -> Result<DropPoint, Refusal> {
     let body = Body::of(db, def);
     let store: &ExpressionStore = &body;
     let local = *mir.binding_locals.get(binding).ok_or(Refusal::NotLet)?;
@@ -109,7 +116,13 @@ pub fn drop_point(db: &Db, def: DefWithBodyId, mir: &MirBody<'_>, binding: Bindi
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         // Which statement of the block, from the `let` on, each expression, pattern and
         // binding is in; the tail is `TAIL`.
-        let mut of = Statements { store, exprs: mem::map(frame), pats: mem::map(frame), bindings: mem::map(frame), at: 0 };
+        let mut of = Statements {
+            store,
+            exprs: mem::map(frame),
+            pats: mem::map(frame),
+            bindings: mem::map(frame),
+            at: 0,
+        };
         for (index, statement) in statements.iter().enumerate().skip(let_at) {
             of.at = index;
             match statement {
@@ -202,10 +215,17 @@ pub fn drop_point(db: &Db, def: DefWithBodyId, mir: &MirBody<'_>, binding: Bindi
 /// The borrow check of `def` with `point`'s drop lowered into its body
 /// ([`hir_ty_mir::mir::lower_with_early_drops`]), in `mode`. An error when lowering refuses
 /// the body or does not reach the drop.
-pub fn check(db: &Db, def: DefWithBodyId, point: &DropPoint, mode: Mode) -> Result<BorrowckResult, String> {
-    let drops = [EarlyDrop { block: point.block, statement: point.statement, binding: point.binding }];
+pub fn check(
+    db: &Db,
+    def: DefWithBodyId,
+    point: &DropPoint,
+    mode: Mode,
+) -> Result<BorrowckResult, String> {
+    let drops =
+        [EarlyDrop { block: point.block, statement: point.statement, binding: point.binding }];
     let _span = tracing::info_span!(target: "blaze", "borrowck.drop_early", def = ?def, binding = ?point.binding).entered();
-    let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops).map_err(|it| blaze_query::db::attach(db, || format!("{it:?}")))?; // alloc: error path
+    let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops)
+        .map_err(|it| blaze_query::db::attach(db, || format!("{it:?}")))?; // alloc: error path
     Ok(crate::borrowck_rewritten(db, def, &body, mode))
 }
 
@@ -217,8 +237,12 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
         return;
     }
     // alloc: the variables of one body's errors, a few, on the error path only
-    let mut bindings: Vec<BindingId> =
-        result.diagnostics.iter().filter(|it| it.is_error()).filter_map(|it| it.dropped_at_scope_end).collect();
+    let mut bindings: Vec<BindingId> = result
+        .diagnostics
+        .iter()
+        .filter(|it| it.is_error())
+        .filter_map(|it| it.dropped_at_scope_end)
+        .collect();
     if bindings.is_empty() {
         return;
     }
@@ -244,8 +268,11 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
                 continue;
             }
         };
-        let same = |a: &BorrowckDiagnostic, b: &BorrowckDiagnostic| a.code == b.code && a.span == b.span;
-        let errors = |it: &BorrowckResult| it.diagnostics.iter().filter(|it| it.is_error()).cloned().collect::<Vec<_>>(); // alloc: error path
+        let same =
+            |a: &BorrowckDiagnostic, b: &BorrowckDiagnostic| a.code == b.code && a.span == b.span;
+        let errors = |it: &BorrowckResult| {
+            it.diagnostics.iter().filter(|it| it.is_error()).cloned().collect::<Vec<_>>()
+        }; // alloc: error path
         let (before, after) = (errors(result), errors(&rewritten));
         if after.iter().any(|new| !before.iter().any(|old| same(old, new))) {
             continue;
@@ -253,11 +280,17 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
         let name = store[binding].name.as_str();
         let ty: Ty<'_> = mir.locals[point.local].ty.as_ref();
         for diagnostic in result.diagnostics.iter_mut() {
-            if diagnostic.dropped_at_scope_end != Some(binding) || after.iter().any(|it| same(it, diagnostic)) {
+            if diagnostic.dropped_at_scope_end != Some(binding)
+                || after.iter().any(|it| same(it, diagnostic))
+            {
                 continue;
             }
             let spans = point.last_use.map(PartSpan::At).into_iter().collect(); // alloc: error path, one span
-            let labels = point.last_use.map(|it| (PartSpan::At(it), "last used here".to_owned())).into_iter().collect(); // alloc: error path
+            let labels = point
+                .last_use
+                .map(|it| (PartSpan::At(it), "last used here".to_owned()))
+                .into_iter()
+                .collect(); // alloc: error path
             diagnostic.children.push(crate::Child {
                 level: Sublevel::Note,
                 // alloc: error path, the note's text
@@ -288,11 +321,21 @@ fn tail_of(store: &ExpressionStore, block: ExprId) -> Option<ExprId> {
 
 /// The block whose `let x = ..;` statement binds `binding`, the statement's index and the
 /// block's statements.
-fn binding_let(store: &ExpressionStore, binding: BindingId) -> Result<(ExprId, usize, hir_def::hir::Statements<'_>), Refusal> {
+fn binding_let(
+    store: &ExpressionStore,
+    binding: BindingId,
+) -> Result<(ExprId, usize, hir_def::hir::Statements<'_>), Refusal> {
     for (id, expr) in store.exprs() {
         let hir_def::hir::Expr::Block { statements, .. } = expr else { continue };
         for (index, statement) in statements.iter().enumerate() {
-            let Statement::Let { pat, initializer: Some(_), else_branch: None, is_super: false, .. } = statement else {
+            let Statement::Let {
+                pat,
+                initializer: Some(_),
+                else_branch: None,
+                is_super: false,
+                ..
+            } = statement
+            else {
                 continue;
             };
             if matches!(store.pat(pat), Pat::Bind { id, subpat: None } if id == binding) {
@@ -318,7 +361,9 @@ fn moved_or_assigned(mir: &MirBody<'_>, local: LocalId) -> Result<(), Refusal> {
         let Some(terminator) = &data.terminator else { continue };
         terminator.kind.for_each_operand(&mut |it| moved |= moves(it));
         match &terminator.kind {
-            TerminatorKind::Call { destination, .. } => assigned += usize::from(whole(destination, local)),
+            TerminatorKind::Call { destination, .. } => {
+                assigned += usize::from(whole(destination, local))
+            }
             TerminatorKind::DropAndReplace { place, .. } if place.local == local => assigned += 2,
             _ => {}
         }
@@ -448,7 +493,10 @@ pub fn statement_places(kind: &StatementKind, f: &mut dyn FnMut(&StoredPlace)) {
                 f(place);
             }
             match rvalue {
-                Rvalue::Ref(_, it) | Rvalue::Len(it) | Rvalue::Discriminant(it) | Rvalue::CopyForDeref(it) => f(it),
+                Rvalue::Ref(_, it)
+                | Rvalue::Len(it)
+                | Rvalue::Discriminant(it)
+                | Rvalue::CopyForDeref(it) => f(it),
                 _ => rvalue.for_each_operand(&mut |it| operand_place(it, &mut *f)),
             }
         }
@@ -463,8 +511,12 @@ pub fn statement_places(kind: &StatementKind, f: &mut dyn FnMut(&StoredPlace)) {
 pub fn terminator_places(kind: &TerminatorKind, dropped: LocalId, f: &mut dyn FnMut(&StoredPlace)) {
     match kind {
         TerminatorKind::Drop { place, .. } if whole(place, dropped) => {}
-        TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => f(place),
-        TerminatorKind::Call { destination, .. } if !destination.projection.is_empty() => f(destination),
+        TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
+            f(place)
+        }
+        TerminatorKind::Call { destination, .. } if !destination.projection.is_empty() => {
+            f(destination)
+        }
         _ => {}
     }
     kind.for_each_operand(&mut |it| operand_place(it, &mut *f));

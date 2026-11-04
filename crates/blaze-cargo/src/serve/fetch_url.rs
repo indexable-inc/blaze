@@ -57,19 +57,21 @@ impl FetchUrls {
     pub fn ask(&self, to: RequestRef, asked: Asked) {
         let send = self.send.clone();
         // alloc: a thread's name, once a request
-        let spawned = std::thread::Builder::new().name("blaze fetch-url".to_owned()).spawn(move || {
-            // The request is the job: a panic fails it with an error, and the daemon and every
-            // other fetch go on.
-            let answer = catch_unwind(AssertUnwindSafe(|| {
-                let state = super::state().map_err(|e| format!("the daemon's state directory: {e:#}"))?; // alloc: error path
-                fetch(&state, asked)
-            }))
-            .unwrap_or_else(|payload| {
-                let panic = super::plane::panicked(&*payload);
-                Err(format!("the fetch {panic}; only this request failed")) // alloc: error path
+        let spawned =
+            std::thread::Builder::new().name("blaze fetch-url".to_owned()).spawn(move || {
+                // The request is the job: a panic fails it with an error, and the daemon and every
+                // other fetch go on.
+                let answer = catch_unwind(AssertUnwindSafe(|| {
+                    let state = super::state()
+                        .map_err(|e| format!("the daemon's state directory: {e:#}"))?; // alloc: error path
+                    fetch(&state, asked)
+                }))
+                .unwrap_or_else(|payload| {
+                    let panic = super::plane::panicked(&*payload);
+                    Err(format!("the fetch {panic}; only this request failed")) // alloc: error path
+                });
+                answer_with(&send, to, answer);
             });
-            answer_with(&send, to, answer);
-        });
         if let Err(e) = spawned {
             answer_with(&self.send, to, Err(format!("no thread to fetch on: {e}"))); // alloc: error path
         }

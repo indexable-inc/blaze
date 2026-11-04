@@ -94,10 +94,7 @@ impl LarkGenerator {
         G: Generator<String> + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
     {
         self.handle = OnceLock::new();
-        self.explicit.push(Explicit {
-            name: name.to_string(),
-            generator: Box::new(generator),
-        });
+        self.explicit.push(Explicit { name: name.to_string(), generator: Box::new(generator) });
         self.relabel();
         self
     }
@@ -174,10 +171,8 @@ impl LarkGenerator {
             .find(|c| compiled.markers.iter().any(|m| m.starts_with(c)))
             .map(|at| from + at)
         {
-            let Some(i) = compiled
-                .markers
-                .iter()
-                .position(|marker| rest[at..].starts_with(marker.as_str()))
+            let Some(i) =
+                compiled.markers.iter().position(|marker| rest[at..].starts_with(marker.as_str()))
             else {
                 from = at + rest[at..].chars().next().unwrap().len_utf8();
                 continue;
@@ -205,9 +200,8 @@ impl LarkGenerator {
                 invalid_argument!("max_depth must be at least 1");
             }
             let names: Vec<String> = self.explicit.iter().map(|e| e.name.clone()).collect();
-            if let Some(name) = names
-                .iter()
-                .find(|name| names.iter().filter(|n| n == name).count() > 1)
+            if let Some(name) =
+                names.iter().find(|name| names.iter().filter(|n| n == name).count() > 1)
             {
                 invalid_argument!("explicit terminal '{name}' is given more than one generator");
             }
@@ -222,10 +216,8 @@ impl LarkGenerator {
                 self.import_dir.as_deref(),
             )
             .and_then(|grammar| {
-                let markers = names
-                    .iter()
-                    .map(|name| grammar.placeholder(name))
-                    .collect::<Result<_, _>>()?;
+                let markers =
+                    names.iter().map(|name| grammar.placeholder(name)).collect::<Result<_, _>>()?;
                 Ok(Compiled { grammar, markers })
             })
             .unwrap_or_else(|msg| invalid_argument!("{msg}"))

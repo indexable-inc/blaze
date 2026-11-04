@@ -57,7 +57,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let body = analysis.body();
     let infer = analysis.infer();
     // alloc: each callee asked once per body
-    let mut known: HashMap<FunctionId, Option<(Query, FunctionId)>, Global> = HashMap::new_in(Global);
+    let mut known: HashMap<FunctionId, Option<(Query, FunctionId)>, Global> =
+        HashMap::new_in(Global);
     let mut parents = None;
     for (id, expr) in body.exprs() {
         let args = match expr {
@@ -135,7 +136,11 @@ fn batch_of(db: &Db, f: FunctionId, query: &Query) -> Option<FunctionId> {
         let theirs = key_types(db, it);
         let batch = !theirs.is_empty()
             && theirs != keys
-            && it.ret_type(db).strip_references().without_params(db).is_some_and(|ret| wraps(db, &ret, &one, WRAP_DEPTH));
+            && it
+                .ret_type(db)
+                .strip_references()
+                .without_params(db)
+                .is_some_and(|ret| wraps(db, &ret, &one, WRAP_DEPTH));
         batch.then_some(id)
     })
 }
@@ -165,7 +170,9 @@ fn wraps<'db>(db: &'db Db, ret: &hir::Type<'db>, one: &hir::Type<'db>, depth: u3
     let Some(depth) = depth.checked_sub(1) else { return false };
     let element = |it: &hir::Type<'db>| {
         let it = it.strip_references();
-        it == *one || (it.is_tuple() && it.tuple_fields(db).iter().any(|field| field.strip_references() == *one))
+        it == *one
+            || (it.is_tuple()
+                && it.tuple_fields(db).iter().any(|field| field.strip_references() == *one))
     };
     if let Some(inner) = ret.as_slice() {
         return element(&inner) || wraps(db, &inner, one, depth);
@@ -176,7 +183,8 @@ fn wraps<'db>(db: &'db Db, ret: &hir::Type<'db>, one: &hir::Type<'db>, depth: u3
     let Some(adt) = ret.as_adt() else { return false };
     let krate = adt.module(db).krate(db);
     let pointer = POINTERS.iter().any(|(of, names)| {
-        names.contains(&adt.name(db).as_str()) && (facts::crate_is(db, krate, of) || facts::crate_is(db, krate, "std"))
+        names.contains(&adt.name(db).as_str())
+            && (facts::crate_is(db, krate, of) || facts::crate_is(db, krate, "std"))
     });
     if pointer {
         return ret.type_arguments().next().is_some_and(|inner| wraps(db, &inner, one, depth));
@@ -184,7 +192,8 @@ fn wraps<'db>(db: &'db Db, ret: &hir::Type<'db>, one: &hir::Type<'db>, depth: u3
     if facts::adt_is(db, adt, "core", "Option") || facts::adt_is(db, adt, "core", "Result") {
         return false;
     }
-    ret.into_iterator_iter(db).is_some() && ret.type_arguments().any(|it| element(&it) || wraps(db, &it, one, depth))
+    ret.into_iterator_iter(db).is_some()
+        && ret.type_arguments().any(|it| element(&it) || wraps(db, &it, one, depth))
 }
 
 /// `f` as a message names it: `Trait::name` for a database method, its name otherwise.

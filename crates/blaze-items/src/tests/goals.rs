@@ -4,9 +4,10 @@
 use blaze_alloc_count::assert_at_most;
 use blaze_ids::ContentId;
 use blaze_query::QueryKind;
+use blaze_query::db::AsId;
 use cfg::CfgOptions;
 use hir_def::{AdtId, AssocItemId, ImplId, TraitId, lang_item::lang_items};
-use intern::Symbol;
+use hir_expand::fixture;
 use hir_ty::{
     method_resolution::{ImplPair, RelevantImplsKey, SelfTyKey, relevant_impls},
     next_solver::{
@@ -14,16 +15,15 @@ use hir_ty::{
         goal_store::{FactObject, FactRef, GoalFacts},
     },
 };
-use blaze_query::db::AsId;
-use hir_expand::fixture;
+use intern::Symbol;
 
 use super::{TestDB, edit, item, items, single, table::every_kind};
 use crate::{
     Fact, ImplEntry, ImplIndexKey, ItemId, blanket_impls,
     goals::{FactRefKey, Goals, fact_of_read, fact_ref_key, fact_value},
-    hidden_types, implements, impls, rpitit_tys,
+    hidden_types, implements, impls,
     index::impl_self_ty,
-    item_key, key, kinds, specializes,
+    item_key, key, kinds, rpitit_tys, specializes,
     table::{fact_of_ref, fact_ref},
     value, whole_crate,
 };
@@ -158,7 +158,9 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
         })
         .expect("`Tr` has a type");
 
-    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, fixture::test_crate(&db), name, key);
+    let read = |name: &str, key: blaze_query::db::Id| {
+        fact_of_read(&db, fixture::test_crate(&db), name, key)
+    };
     for name in [
         "ImplSignature::kept",
         "ImplItems::of",
@@ -221,7 +223,9 @@ fn a_read_of_the_impls_of_a_trait_stands_for_its_implements_fact() {
         ItemId::Adt(it) => HirSimplifiedType::Adt(it.into()),
         other => panic!("`{path}` is {other:?}"),
     };
-    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, fixture::test_crate(&db), name, key);
+    let read = |name: &str, key: blaze_query::db::Id| {
+        fact_of_read(&db, fixture::test_crate(&db), name, key)
+    };
     let trait_key = item_key(&db, ItemId::Trait(tr));
     let sorted_keys = |impls: &[AnyImplId]| {
         let mut keys: Vec<_> = impls
@@ -259,9 +263,16 @@ fn a_read_of_the_impls_of_a_trait_stands_for_its_implements_fact() {
     let only = Fact::Implements { trait_: trait_key, self_ty: key::unsimplified() };
     assert_eq!(read("relevant_impls", none.as_id()), Some(only));
     let unsimplified = ImplIndexKey { trait_: trait_key, self_ty: key::unsimplified() };
-    assert_eq!(entry_keys(impls(&db, krate, unsimplified).unwrap()), Vec::new(), "no impl is for it");
+    assert_eq!(
+        entry_keys(impls(&db, krate, unsimplified).unwrap()),
+        Vec::new(),
+        "no impl is for it"
+    );
     assert_eq!(sorted_keys(relevant_impls(&db, none).blanket()), blanket);
-    assert_ne!(value(&db, krate, &only).ok(), value(&db, krate, &implements(&db, tr, &adt("S"))).ok());
+    assert_ne!(
+        value(&db, krate, &only).ok(),
+        value(&db, krate, &implements(&db, tr, &adt("S"))).ok()
+    );
 
     // A key whose page holds another struct stands for nothing.
     assert_eq!(read("relevant_impls", tr.as_id()), None);
@@ -281,7 +292,9 @@ fn a_read_of_specialization_stands_for_its_fact() {
         .collect();
     let blanket = *all.iter().find(|&&it| impl_self_ty(&db, it).is_none()).expect("a blanket");
     let for_s = *all.iter().find(|&&it| impl_self_ty(&db, it).is_some()).expect("`impl Tr for S`");
-    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, fixture::test_crate(&db), name, key);
+    let read = |name: &str, key: blaze_query::db::Id| {
+        fact_of_read(&db, fixture::test_crate(&db), name, key)
+    };
 
     assert_eq!(read("may_specialize", for_s.as_id()), Some(specializes(&db, for_s)));
     let pair = ImplPair::new(&db, for_s, blanket);
@@ -310,7 +323,9 @@ fn the_crate_key_changes_when_the_crate_loads_another() {
     let main_file = files[1].file_id(&db);
     let main = *base_db::all_crates(&db)
         .iter()
-        .find(|it| it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.to_string() == "main"))
+        .find(|it| {
+            it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.to_string() == "main")
+        })
         .expect("the crate `main`");
     let before = Goals.crate_key(&db, Some(main));
     edit(&mut db, main_file, "pub struct M;\npub fn f() {}\n");
@@ -350,7 +365,11 @@ fn a_crate_fact_changes_with_its_dependencies_files_and_cfg_alone() {
     let val = |db: &TestDB| value(db, main, &fact).ok();
     let mut before = val(&db);
     assert!(before.is_some());
-    assert_ne!(before, value(&db, main, &whole_crate(&db, dep)).ok(), "a crate is not its dependency");
+    assert_ne!(
+        before,
+        value(&db, main, &whole_crate(&db, dep)).ok(),
+        "a crate is not its dependency"
+    );
 
     edit(&mut db, other_root, "pub struct O;\npub fn g() {}\n");
     let mut cfg = CfgOptions::default();
@@ -378,7 +397,11 @@ fn a_crate_fact_changes_with_its_dependencies_files_and_cfg_alone() {
     assert_ne!(now, before, "the dependency's cfg changes it");
 
     let (nowhere, elsewhere) = (Fact::Crate(id(8)), Fact::Crate(id(9)));
-    assert_eq!(value(&db, main, &nowhere).ok(), value(&db, main, &elsewhere).ok(), "no crate is absent");
+    assert_eq!(
+        value(&db, main, &nowhere).ok(),
+        value(&db, main, &elsewhere).ok(),
+        "no crate is absent"
+    );
     assert_eq!(val(&db), value(&db, main, &nowhere).ok(), "the old key names no crate");
     assert_ne!(value(&db, main, &nowhere).ok(), now);
 }
@@ -389,12 +412,23 @@ fn a_facts_value_is_the_one_its_parts_read_back_to() {
     let Fixture { imp, .. } = fixture(&db);
     let krate = fixture::test_crate(&db);
     for fact in [Fact::Signature(item_key(&db, ItemId::Impl(imp))), crate::target(&db, krate)] {
-        assert_eq!(Goals.value(&db, Some(krate), fact_ref(&fact)), value(&db, krate, &fact).ok(), "{fact:?}");
+        assert_eq!(
+            Goals.value(&db, Some(krate), fact_ref(&fact)),
+            value(&db, krate, &fact).ok(),
+            "{fact:?}"
+        );
         assert!(Goals.value(&db, Some(krate), fact_ref(&fact)).is_some(), "{fact:?}");
-        assert_eq!(Goals.value(&db, None, fact_ref(&fact)), None, "a goal of no crate is never stored");
+        assert_eq!(
+            Goals.value(&db, None, fact_ref(&fact)),
+            None,
+            "a goal of no crate is never stored"
+        );
     }
     let elsewhere = Fact::Target(id(9));
-    assert_ne!(value(&db, krate, &elsewhere).ok(), value(&db, krate, &crate::target(&db, krate)).ok());
+    assert_ne!(
+        value(&db, krate, &elsewhere).ok(),
+        value(&db, krate, &crate::target(&db, krate)).ok()
+    );
 }
 
 #[test]
@@ -409,7 +443,9 @@ pub type T = u8;
     );
     let ItemId::Function(f) = item(&db, "f") else { panic!("`f` is no fn") };
     let ItemId::Alias(t) = item(&db, "T") else { panic!("`T` is no alias") };
-    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, fixture::test_crate(&db), name, key);
+    let read = |name: &str, key: blaze_query::db::Id| {
+        fact_of_read(&db, fixture::test_crate(&db), name, key)
+    };
     let rpit = read("rpit_hidden_types", f.as_id());
     assert_eq!(rpit, Some(hidden_types(&db, ItemId::Function(f))));
     assert_ne!(rpit, Some(Fact::Signature(item_key(&db, ItemId::Function(f)))));
@@ -457,7 +493,10 @@ impl Tr for u8 { fn f(self) -> impl Copy { self } }
     assert_eq!(fact.kind(), kinds::RPITIT_TYS);
     assert!(Goals.value(&db, Some(krate), fact_ref(&fact)).is_some(), "{fact:?} has a value");
     let signature = Fact::Signature(item_key(&db, ItemId::Function(f)));
-    assert!(Goals.value(&db, Some(krate), fact_ref(&signature)).is_some(), "{signature:?} has a value");
+    assert!(
+        Goals.value(&db, Some(krate), fact_ref(&signature)).is_some(),
+        "{signature:?} has a value"
+    );
 }
 
 #[test]
@@ -481,11 +520,18 @@ fn a_facts_value_is_one_query() {
     let refused = FactRef { kind: kinds::HASHES, subject: id(1), object: FactObject::None };
     assert_eq!(fact_value(&db, fact_ref_key(&db, krate, refused)), None);
     // A fact of which impls a crate sees is keyed by its asker; one asked by no crate is none.
-    let implements = fact_ref(&Fact::Implements { trait_: item_key(&db, ItemId::Trait(tr)), self_ty: key::unsimplified() });
+    let implements = fact_ref(&Fact::Implements {
+        trait_: item_key(&db, ItemId::Trait(tr)),
+        self_ty: key::unsimplified(),
+    });
     let key = fact_ref_key(&db, krate, implements);
     assert_eq!(key.seen_by(&db), Some(krate));
     assert!(fact_value(&db, key).is_some());
-    assert_eq!(fact_value(&db, FactRefKey::new(&db, None, implements)), None, "an `Implements` of no asker");
+    assert_eq!(
+        fact_value(&db, FactRefKey::new(&db, None, implements)),
+        None,
+        "an `Implements` of no asker"
+    );
 }
 
 #[test]
@@ -571,7 +617,10 @@ impl<'x> tr::Tr for &'x A { fn m(&self) {} }
 /// The impls of crate `krate`'s root module.
 fn root_impls(db: &TestDB, krate: base_db::Crate) -> Vec<ImplId> {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
-    def_map.modules(db).flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>()).collect()
+    def_map
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>())
+        .collect()
 }
 
 /// pmwait: a crate's facts about impls and traits cover the crates it loads, never a sibling.
@@ -591,8 +640,12 @@ fn a_crates_facts_are_the_same_whatever_a_crate_it_does_not_load_holds() {
     let fx = fixture::db(SIBLINGS);
     let lib_file = fx.files()[2].file_id(fx.db());
     let mut db = fx.into_db();
-    let (tr, pm, lib, a) =
-        (crate_named(&db, "tr"), crate_named(&db, "pm"), crate_named(&db, "lib"), crate_named(&db, "a"));
+    let (tr, pm, lib, a) = (
+        crate_named(&db, "tr"),
+        crate_named(&db, "pm"),
+        crate_named(&db, "lib"),
+        crate_named(&db, "a"),
+    );
     ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::NotYetBuilt))]);
 
     let trait_ = match hir_def::nameres::crate_def_map(&db, tr)
@@ -617,7 +670,9 @@ fn a_crates_facts_are_the_same_whatever_a_crate_it_does_not_load_holds() {
     let values = |db: &TestDB| {
         facts
             .iter()
-            .map(|fact| value(db, a, fact).unwrap_or_else(|err| panic!("{fact:?}: {}", err.describe(db))))
+            .map(|fact| {
+                value(db, a, fact).unwrap_or_else(|err| panic!("{fact:?}: {}", err.describe(db)))
+            })
             .collect::<Vec<_>>()
     };
 
@@ -642,18 +697,22 @@ fn a_crates_facts_are_the_same_whatever_a_crate_it_does_not_load_holds() {
     assert_eq!(values(&db), pending, "the sibling's proc macros being built is no part of them");
 
     let search = RelevantImplsKey::new(&db, lib, trait_, None);
-    assert_eq!(fact_of_read(&db, lib, "relevant_impls", search.as_id()), Some(Fact::Implements {
-        trait_: trait_key,
-        self_ty: key::unsimplified(),
-    }));
-    assert_eq!(fact_of_read(&db, a, "relevant_impls", search.as_id()), None, "`lib`'s search is not `a`'s");
+    assert_eq!(
+        fact_of_read(&db, lib, "relevant_impls", search.as_id()),
+        Some(Fact::Implements { trait_: trait_key, self_ty: key::unsimplified() })
+    );
+    assert_eq!(
+        fact_of_read(&db, a, "relevant_impls", search.as_id()),
+        None,
+        "`lib`'s search is not `a`'s"
+    );
     // A search of a crate `a` loads (as `specialized_ancestor` searches an impl's own crate)
     // covers crates `a` loads alone: `a`'s fact covers it.
     let loaded = RelevantImplsKey::new(&db, tr, trait_, None);
-    assert_eq!(fact_of_read(&db, a, "relevant_impls", loaded.as_id()), Some(Fact::Implements {
-        trait_: trait_key,
-        self_ty: key::unsimplified(),
-    }));
+    assert_eq!(
+        fact_of_read(&db, a, "relevant_impls", loaded.as_id()),
+        Some(Fact::Implements { trait_: trait_key, self_ty: key::unsimplified() })
+    );
 }
 
 const PENDING_DERIVE: &str = r#"
@@ -682,8 +741,12 @@ fn a_crates_impl_facts_refuse_while_a_crate_it_loads_waits_on_a_derive() {
     use hir_expand::proc_macro::ProcMacros;
 
     let mut db = fixture::db(PENDING_DERIVE).into_db();
-    let (tr, pm, lib, a) =
-        (crate_named(&db, "tr"), crate_named(&db, "pm"), crate_named(&db, "lib"), crate_named(&db, "a"));
+    let (tr, pm, lib, a) = (
+        crate_named(&db, "tr"),
+        crate_named(&db, "pm"),
+        crate_named(&db, "lib"),
+        crate_named(&db, "a"),
+    );
     ProcMacros::give(&mut db, [(pm, Err(ProcMacroLoadingError::NotYetBuilt))]);
     assert!(hir_ty::method_resolution::loaded_crates(&db, a).contains(&lib), "`a` names `lib`");
 
@@ -713,20 +776,31 @@ fn a_crates_impl_facts_refuse_while_a_crate_it_loads_waits_on_a_derive() {
         Fact::Method { self_ty, name: key::name_hash("m") },
     ];
     for fact in &facts {
-        let Err(err) = value(&db, a, fact) else { panic!("{fact:?} of `a` is refused while `pm` is pending") };
+        let Err(err) = value(&db, a, fact) else {
+            panic!("{fact:?} of `a` is refused while `pm` is pending")
+        };
         let said = err.describe(&db);
         assert_eq!((err.of, err.pending), (crate::Unhashed::Crate(a), Some(pm)), "{said}");
         assert!(said.contains("`a` was read before the proc macros of `pm` were built"), "{said}");
-        assert_eq!(Goals.value(&db, Some(a), fact_ref(fact)), None, "a goal of `a` keeps no {fact:?}");
+        assert_eq!(
+            Goals.value(&db, Some(a), fact_ref(fact)),
+            None,
+            "a goal of `a` keeps no {fact:?}"
+        );
     }
-    assert_eq!(crate::macros_built(&db, a).map_err(|it| it.pending), Err(Some(pm)), "a job of `a` waits");
+    assert_eq!(
+        crate::macros_built(&db, a).map_err(|it| it.pending),
+        Err(Some(pm)),
+        "a job of `a` waits"
+    );
     assert_eq!(crate::macros_built(&db, tr), Ok(()), "`tr` loads no proc macro");
     value(&db, a, &Fact::Signature(trait_key))
         .unwrap_or_else(|err| panic!("a signature is no crate's view: {}", err.describe(&db)));
 
     ProcMacros::give(&mut db, [(pm, Ok(Vec::new()))]);
     for fact in &facts {
-        value(&db, a, fact).unwrap_or_else(|err| panic!("{fact:?} once `pm` is built: {}", err.describe(&db)));
+        value(&db, a, fact)
+            .unwrap_or_else(|err| panic!("{fact:?} once `pm` is built: {}", err.describe(&db)));
     }
     assert_eq!(crate::macros_built(&db, a), Ok(()));
 }

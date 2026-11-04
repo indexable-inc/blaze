@@ -142,7 +142,10 @@ fn selected<A: Glue>(
         Ok(sel)
     });
     chosen.map_err(|mut error| {
-        error.gap.get_or_insert(crate::Gap { opcode: func.dfg.insts[inst].opcode(), ty: inst_type(func, inst) });
+        error.gap.get_or_insert(crate::Gap {
+            opcode: func.dfg.insts[inst].opcode(),
+            ty: inst_type(func, inst),
+        });
         error
     })
 }
@@ -168,7 +171,10 @@ fn one<A: Glue>(
         return Err(Error::at(
             inst,
             // alloc: the error's message, once per failed compile.
-            format!("`{opcode}` of {}: no stencil is of it and the glue does not write it", type_name(func, inst)),
+            format!(
+                "`{opcode}` of {}: no stencil is of it and the glue does not write it",
+                type_name(func, inst)
+            ),
         ));
     };
     let info = op.info();
@@ -247,7 +253,10 @@ fn one<A: Glue>(
     };
     if info.traps && sel.trap.is_none() {
         // alloc: the error's message, once per failed compile.
-        return Err(Error::at(inst, format!("the `{}` stencils trap, and `{opcode}` has no trap code", info.name)));
+        return Err(Error::at(
+            inst,
+            format!("the `{}` stencils trap, and `{opcode}` has no trap code", info.name),
+        ));
     }
 
     let dst = if results.is_empty() { Dst::None } else { Dst::Slot };
@@ -257,13 +266,30 @@ fn one<A: Glue>(
             let (imm, wide) = immediate(konst);
             sel.imm = imm;
             let auxes: [u8; 2] = if wide { [1, 0] } else { [0, 1] };
-            auxes.into_iter().map(|aux| Shape { op, ty, aux, srcs: [Src::None; 3], dst }).find(|it| has(library, *it))
+            auxes
+                .into_iter()
+                .map(|aux| Shape { op, ty, aux, srcs: [Src::None; 3], dst })
+                .find(|it| has(library, *it))
         }
-        _ => base(plan, func, library, info, Shape { op, ty, aux, srcs: [Src::None; 3], dst }, sel.args()),
+        _ => base(
+            plan,
+            func,
+            library,
+            info,
+            Shape { op, ty, aux, srcs: [Src::None; 3], dst },
+            sel.args(),
+        ),
     };
     sel.shape = shape.ok_or_else(|| {
         // alloc: the error's message, once per failed compile.
-        Error::at(inst, format!("`{opcode}` of {}: no stencil of `{}` takes its operands", ty.name(), info.name))
+        Error::at(
+            inst,
+            format!(
+                "`{opcode}` of {}: no stencil of `{}` takes its operands",
+                ty.name(),
+                info.name
+            ),
+        )
     })?;
     Ok(sel)
 }
@@ -321,7 +347,13 @@ pub(super) fn immediate(konst: Konst) -> (i64, bool) {
 
 /// Fuses `inst` (a `brif` or `select`) with the `icmp` right before it that only it uses,
 /// when the fused shape exists.
-fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir::Inst, sel: &mut Sel) {
+fn fuse(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    library: &Reader<'_>,
+    inst: ir::Inst,
+    sel: &mut Sel,
+) {
     let op = sel.shape.op;
     if !matches!(op, Op::Brif | Op::Select) {
         return;
@@ -331,7 +363,9 @@ fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir
     if func.layout.prev_inst(inst) != Some(icmp) || plan.uses[cond.as_u32() as usize] != 1 {
         return;
     }
-    let Data::IntCompare { opcode: Opcode::Icmp, cond: cc, .. } = func.dfg.insts[icmp] else { return };
+    let Data::IntCompare { opcode: Opcode::Icmp, cond: cc, .. } = func.dfg.insts[icmp] else {
+        return;
+    };
     if plan.sels[icmp.as_u32() as usize].kind != Kind::Stencil {
         return;
     }
@@ -339,8 +373,13 @@ fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir
     let Some(compared) = ty_of(func.dfg.value_type(a)) else { return };
     let (fused, args, cc) = match op {
         Op::Brif => {
-            let shape =
-                Shape { op: Op::BrIcmp, ty: compared, aux: int_cc(cc) as u8, srcs: [Src::None; 3], dst: Dst::None };
+            let shape = Shape {
+                op: Op::BrIcmp,
+                ty: compared,
+                aux: int_cc(cc) as u8,
+                srcs: [Src::None; 3],
+                dst: Dst::None,
+            };
             (shape, [a, b], cc)
         }
         _ => {
@@ -353,7 +392,13 @@ fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir
                 return;
             };
             let aux = int_cc(cc) as u8 | (compared as u8) << 4;
-            let shape = Shape { op: Op::SelectIcmp, ty: compared, aux, srcs: [Src::None; 3], dst: Dst::Slot };
+            let shape = Shape {
+                op: Op::SelectIcmp,
+                ty: compared,
+                aux,
+                srcs: [Src::None; 3],
+                dst: Dst::Slot,
+            };
             (shape, args, cc)
         }
     };
@@ -376,7 +421,13 @@ fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir
 /// `iadd vmctx, uextend.i64 (ireduce.i32 (iadd p, iconst off))` (either `iadd` in either
 /// operand order; without the inner one `off` is 0), when each of those values has that one
 /// use, each is a stencil's in `inst`'s block, and the fused shape exists.
-fn confine(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir::Inst, sel: &mut Sel) {
+fn confine(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    library: &Reader<'_>,
+    inst: ir::Inst,
+    sel: &mut Sel,
+) {
     let access = sel.shape.op;
     if !confinable(access) || sel.offset != 0 {
         return;
@@ -397,9 +448,10 @@ fn confine(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst:
     let arg = |of: ir::Inst, n: usize| func.dfg.resolve_aliases(func.dfg.inst_args(of)[n]);
     let store = op == Op::StoreConfined;
     let Some(add) = def(sel.args[usize::from(store)], Opcode::Iadd, types::I64) else { return };
-    let Some((vmctx, extend)) = [(0, 1), (1, 0)].into_iter().find_map(|(v, e)| {
-        Some((arg(add, v), def(arg(add, e), Opcode::Uextend, types::I64)?))
-    }) else {
+    let Some((vmctx, extend)) = [(0, 1), (1, 0)]
+        .into_iter()
+        .find_map(|(v, e)| Some((arg(add, v), def(arg(add, e), Opcode::Uextend, types::I64)?)))
+    else {
         return;
     };
     let Some(reduce) = def(arg(extend, 0), Opcode::Ireduce, types::I32) else { return };
@@ -408,9 +460,11 @@ fn confine(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst:
         return;
     }
     let sum = def(wrapped, Opcode::Iadd, types::I64).and_then(|sum| {
-        [(0, 1), (1, 0)].into_iter().find_map(|(p, k)| match plan.konst[arg(sum, k).as_u32() as usize] {
-            Konst::Int(off) => Some((sum, arg(sum, p), off as i32)),
-            _ => None,
+        [(0, 1), (1, 0)].into_iter().find_map(|(p, k)| {
+            match plan.konst[arg(sum, k).as_u32() as usize] {
+                Konst::Int(off) => Some((sum, arg(sum, p), off as i32)),
+                _ => None,
+            }
         })
     });
     let (p, off) = sum.map_or((wrapped, 0), |(_, p, off)| (p, off));
@@ -419,8 +473,11 @@ fn confine(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst:
         1..4096 => &[Disp::Lo12, Disp::Imm32],
         _ => &[Disp::Imm32],
     };
-    let (args, nargs) =
-        if store { ([sel.args[0], p, vmctx], 3) } else { ([p, vmctx, ir::Value::reserved_value()], 2) };
+    let (args, nargs) = if store {
+        ([sel.args[0], p, vmctx], 3)
+    } else {
+        ([p, vmctx, ir::Value::reserved_value()], 2)
+    };
     let Some(shape) = disps.iter().find_map(|&disp| {
         let (op, aux) = Shape::confining(access, disp)?;
         let shape = Shape { op, aux, srcs: [Src::None; 3], ..sel.shape };
@@ -469,7 +526,13 @@ fn negate(
     let fused = Shape { aux: 1, srcs: [Src::None; 3], ..sel.shape };
     let shape = base(plan, func, library, Op::Fma.info(), fused, &args).ok_or_else(|| {
         // alloc: the error's message, once per failed compile.
-        Error::at(inst, format!("`fma` of {} by an `fneg`: no `fmsub` stencil takes its operands", sel.shape.ty.name()))
+        Error::at(
+            inst,
+            format!(
+                "`fma` of {} by an `fneg`: no `fmsub` stencil takes its operands",
+                sel.shape.ty.name()
+            ),
+        )
     })?;
 
     let (n, v) = (negated.as_u32() as usize, y.as_u32() as usize);
@@ -553,7 +616,10 @@ fn little_endian(func: &ir::Function, inst: ir::Inst, flags: ir::MemFlags) -> Re
         Some(ir::Endianness::Big) => Err(Error::at(
             inst,
             // alloc: the error's message, once per failed compile.
-            format!("`{}` of big-endian memory: every stencil is little-endian", func.dfg.insts[inst].opcode()),
+            format!(
+                "`{}` of big-endian memory: every stencil is little-endian",
+                func.dfg.insts[inst].opcode()
+            ),
         )),
         _ => Ok(()),
     }
@@ -576,7 +642,7 @@ fn inst_type(func: &ir::Function, inst: ir::Inst) -> ir::Type {
 fn type_name(func: &ir::Function, inst: ir::Inst) -> String {
     match inst_type(func, inst) {
         types::INVALID => "no type".to_owned(), // alloc: part of an error's message, once per failed compile.
-        ty => ty.to_string(), // alloc: as above.
+        ty => ty.to_string(),                   // alloc: as above.
     }
 }
 

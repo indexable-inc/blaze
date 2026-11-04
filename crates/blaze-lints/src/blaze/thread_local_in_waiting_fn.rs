@@ -75,10 +75,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let krate = def.krate(db);
     let points = hir_ty_suspend::suspend_points(db, krate, def);
     // The call that parks first in the text, for the finding to name.
-    let Some(first) = points
-        .iter()
-        .min_by_key(|it| facts::mir_range(analysis, it.call.span).map_or(u32::MAX, |range| range.start().into()))
-    else {
+    let Some(first) = points.iter().min_by_key(|it| {
+        facts::mir_range(analysis, it.call.span).map_or(u32::MAX, |range| range.start().into())
+    }) else {
         return found;
     };
     let parks = first.path_said(db);
@@ -127,7 +126,12 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 /// Why `callee`, called from a body of `krate` (with `generic` arguments when its call names
 /// types or consts), can be inlined there, as a note says it; `None` when it can't, or when it
 /// is std's, core's or alloc's.
-fn inlinable(db: &Db, callee: FunctionId, krate: base_db::Crate, generic: bool) -> Option<&'static str> {
+fn inlinable(
+    db: &Db,
+    callee: FunctionId,
+    krate: base_db::Crate,
+    generic: bool,
+) -> Option<&'static str> {
     let flags = AttrFlags::query(db, AttrDefId::FunctionId(callee));
     let home = callee.krate(db);
     if flags.contains(AttrFlags::INLINE_NEVER) || home.data(db).origin.is_lang() {
@@ -201,12 +205,19 @@ fn key_said(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<St
             }
             Expr::Path(_) => {
                 let (module, name) = match general_facts::value_of(db, def, body, at)? {
-                    ValueNs::StaticId(it) => (hir::Static::from(it).module(db), hir::Static::from(it).name(db)),
-                    ValueNs::ConstId(it) => (hir::Const::from(it).module(db), hir::Const::from(it).name(db)?),
+                    ValueNs::StaticId(it) => {
+                        (hir::Static::from(it).module(db), hir::Static::from(it).name(db))
+                    }
+                    ValueNs::ConstId(it) => {
+                        (hir::Const::from(it).module(db), hir::Const::from(it).name(db)?)
+                    }
                     _ => return None,
                 };
                 // alloc: as above
-                return Some(format!("the thread-local `{}`", item_path(db, module, name.as_str())));
+                return Some(format!(
+                    "the thread-local `{}`",
+                    item_path(db, module, name.as_str())
+                ));
             }
             _ => return None,
         }

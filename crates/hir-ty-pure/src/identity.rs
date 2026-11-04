@@ -6,7 +6,6 @@
 
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_item_hash::identity::identity;
 use blaze_items::{ItemId, item_key};
@@ -26,6 +25,7 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::{MirBody, Operand, OperandKind, dispatch::Body};
 use hir_ty_share::identity as share;
+use std::alloc::Global;
 
 use crate::{
     models::tag,
@@ -66,13 +66,20 @@ pub(crate) fn of(
 /// What the code of `instance` is: its body's identity, its arguments' identity, and the facts
 /// its monomorphized body reads past its body's identity: each local's type, and each
 /// constant's and static's value. Asked from `env`, worked out in its home (`crate::walk::home_env`).
-pub(crate) fn content(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> &Result<ContentId, String> {
+pub(crate) fn content(
+    db: &Db,
+    env: StoredParamEnvAndCrate,
+    instance: Instance,
+) -> &Result<ContentId, String> {
     content_in(db, crate::walk::home_env(db, &env, &instance), instance)
 }
 
 /// [`content`] in `env`, the instance's home.
 #[blaze_query::tracked(returns(ref))]
-#[expect(clippy::needless_pass_by_value, reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 pub(crate) fn content_in(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -104,19 +111,15 @@ pub(crate) fn content_in(
     let body = match body_of(db, &env, &instance) {
         Some(Ok(body)) => body,
         // alloc: an impure script's reason, once
-        Some(Err(error)) => return Err(format!("has a body that does not lower to MIR: {error:?}")),
+        Some(Err(error)) => {
+            return Err(format!("has a body that does not lower to MIR: {error:?}"));
+        }
         None => return Ok(h.finish()),
     };
     let env = env.as_ref(db);
     let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::Codegen);
-    let mut facts = Facts {
-        db,
-        infcx,
-        env,
-        h,
-        tys: HashSet::new_in(Global),
-        statics: HashSet::new_in(Global),
-    };
+    let mut facts =
+        Facts { db, infcx, env, h, tys: HashSet::new_in(Global), statics: HashSet::new_in(Global) };
     facts.body(body)?;
     Ok(facts.h.finish())
 }
@@ -126,7 +129,9 @@ pub(crate) fn content_in(
 fn closure(db: &Db, h: &mut Hasher, loc: InternedClosure<'_>) -> Result<(), String> {
     let InferBodyId::DefWithBodyId(parent) = loc.owner else {
         // alloc: an impure script's reason, once
-        return Err("has a closure in a constant's expression, whose body has no identity".to_owned());
+        return Err(
+            "has a closure in a constant's expression, whose body has no identity".to_owned()
+        );
     };
     h.id(&body(db, parent)?).update(&ClosureKey::nth(db, loc).to_le_bytes());
     Ok(())
@@ -208,7 +213,12 @@ impl<'db> Facts<'db> {
     }
 
     fn ty_id(&self, ty: Ty<'db>) -> Result<ContentId, String> {
-        share::ty(self.db, ty).map_err(|it| format!("the type `{}` has no identity: {it}", crate::walk::Shown::new(self.db, self.env.krate, ty))) // alloc: an impure script's reason, once
+        share::ty(self.db, ty).map_err(|it| {
+            format!(
+                "the type `{}` has no identity: {it}",
+                crate::walk::Shown::new(self.db, self.env.krate, ty)
+            )
+        }) // alloc: an impure script's reason, once
     }
 
     /// A static by its key and, unless it is foreign, its value.
@@ -221,7 +231,10 @@ impl<'db> Facts<'db> {
             return Ok(());
         }
         let value = self.db.const_eval_static(id).map_err(|error| {
-            format!("reads `{}`, whose value does not evaluate: {error:?}", StaticSignature::of(self.db, id).name.as_str()) // alloc: an impure script's reason, once
+            format!(
+                "reads `{}`, whose value does not evaluate: {error:?}",
+                StaticSignature::of(self.db, id).name.as_str()
+            ) // alloc: an impure script's reason, once
         })?;
         self.allocation(&value)
     }

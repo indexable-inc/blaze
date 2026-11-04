@@ -8,16 +8,18 @@ use hir_def::{
     AdtId, FunctionId, ModuleDefId,
     expr_store::Body,
     nameres::crate_def_map,
-    signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature, UnionSignature},
+    signatures::{
+        EnumSignature, FunctionSignature, StructSignature, TraitSignature, UnionSignature,
+    },
     test_items,
 };
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use hir_ty::{
     db::HirDatabase,
     next_solver::{Ty, TyKind},
 };
 use rustc_type_ir::inherent::IntoKind;
-use hir_expand::fixture;
 
 use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate};
 use crate::{
@@ -88,7 +90,9 @@ fn method(db: &Db, krate: Crate, self_ty: &str, trait_: Option<&str>, name: &str
                 };
                 let of = TraitSignature::of(db, trait_ref.def_id.0).name.as_str() == wanted;
                 let first = || trait_ref.args.iter().nth(1).and_then(|it| it.ty());
-                of && arg.is_none_or(|arg| first().and_then(|it| type_name(db, it)).as_deref() == Some(arg))
+                of && arg.is_none_or(|arg| {
+                    first().and_then(|it| type_name(db, it)).as_deref() == Some(arg)
+                })
             }
             _ => false,
         };
@@ -143,9 +147,15 @@ fn std_functions_have_their_models() {
         assert_eq!(method("File", Some("FromRawFd"), "from_raw_fd"), leaf(Leaf::RawHandle));
         assert_eq!(free(&["process", "exit"]), leaf(Leaf::Exit));
         assert_eq!(method("Path", None, "new"), SAME);
-        assert_eq!(method("Path", None, "join"), Some(Model::Transfer(Transfer::Join { base: 0, rel: 1 })));
+        assert_eq!(
+            method("Path", None, "join"),
+            Some(Model::Transfer(Transfer::Join { base: 0, rel: 1 }))
+        );
         assert_eq!(method("Path", None, "to_path_buf"), SAME);
-        assert_eq!(method("PathBuf", None, "push"), Some(Model::Transfer(Transfer::Push { target: 0, rel: 1 })));
+        assert_eq!(
+            method("PathBuf", None, "push"),
+            Some(Model::Transfer(Transfer::Push { target: 0, rel: 1 }))
+        );
         assert_eq!(method("PathBuf", None, "as_path"), SAME);
         assert_eq!(method("PathBuf", Some("Deref"), "deref"), SAME);
         assert_eq!(method("PathBuf", Some("From"), "from"), SAME);
@@ -172,7 +182,10 @@ fn alloc_and_core_functions_have_their_models() {
         let method = |krate, ty, trait_, name| model_of(&db, method(&db, krate, ty, trait_, name));
         assert_eq!(free(alloc, &["alloc", "__rust_alloc"]), leaf(Leaf::Alloc));
         assert_eq!(free(alloc, &["alloc", "__rust_dealloc"]), leaf(Leaf::Alloc));
-        assert_eq!(free(alloc, &["alloc", "__rust_no_alloc_shim_is_unstable_v2"]), leaf(Leaf::Alloc));
+        assert_eq!(
+            free(alloc, &["alloc", "__rust_no_alloc_shim_is_unstable_v2"]),
+            leaf(Leaf::Alloc)
+        );
         assert_eq!(free(alloc, &["alloc", "__rust_alloc_error_handler"]), leaf(Leaf::Panic));
         assert_eq!(free(alloc, &["shim", "grow_by_attribute"]), leaf(Leaf::Alloc));
         assert_eq!(free(alloc, &["shim", "free_by_link_name"]), leaf(Leaf::Alloc));
@@ -226,11 +239,10 @@ fn strerror_r_is_fixed_error_text() {
             "found inside `format_error`'s body, by its Rust name, whatever it links to"
         );
     });
-    assert_eq!(apply_leaf(Leaf::ErrorText, &[Abs::Unknown, Abs::Unknown]), Applied::Done {
-        effects: Effects::NONE,
-        env: None,
-        ret: Abs::Unknown,
-    });
+    assert_eq!(
+        apply_leaf(Leaf::ErrorText, &[Abs::Unknown, Abs::Unknown]),
+        Applied::Done { effects: Effects::NONE, env: None, ret: Abs::Unknown }
+    );
 }
 
 #[test]
@@ -257,7 +269,11 @@ pub mod option {
     .into_db();
     blaze_query::db::attach(&db, || {
         let core = lang_crate(&db, LangCrateOrigin::Core);
-        for path in [&["result", "unwrap_failed"][..], &["option", "unwrap_failed"], &["option", "expect_failed"]] {
+        for path in [
+            &["result", "unwrap_failed"][..],
+            &["option", "unwrap_failed"],
+            &["option", "expect_failed"],
+        ] {
             assert_eq!(model_of(&db, free(&db, core, path)), leaf(Leaf::Panic), "{path:?}");
         }
     });
@@ -290,7 +306,10 @@ pub mod io {
         assert!(matches!(std.data(&db).origin, CrateOrigin::Local { .. }));
         assert_eq!(model_of(&db, free(&db, std, &["env", "var"])), None);
         assert_eq!(model_of(&db, free(&db, std, &["io", "_print"])), None);
-        assert!(check_resolved(&db, std).len() >= 3, "a crate of no toolchain origin resolves nothing");
+        assert!(
+            check_resolved(&db, std).len() >= 3,
+            "a crate of no toolchain origin resolves nothing"
+        );
     });
 }
 
@@ -325,7 +344,10 @@ fn check_resolved_names_what_the_toolchain_lacks() {
             // Of another platform than the fixture's.
             "<std::os::windows::io::OwnedHandle as Drop>",
         ] {
-            assert!(!missing.contains(&had), "{had} resolves or is not of this platform: {missing:?}");
+            assert!(
+                !missing.contains(&had),
+                "{had} resolves or is not of this platform: {missing:?}"
+            );
         }
     });
 }

@@ -29,7 +29,8 @@ static ONE: Mutex<()> = Mutex::new(());
 
 fn run(name: &str) {
     let _one = ONE.lock();
-    let (_, scenario) = scenarios::ON_THE_SEED.iter().find(|(it, _)| *it == name).expect("a scenario of that name");
+    let (_, scenario) =
+        scenarios::ON_THE_SEED.iter().find(|(it, _)| *it == name).expect("a scenario of that name");
     scenario();
 }
 
@@ -131,7 +132,11 @@ fn a_driven_pools_stall_fails_its_waiting_jobs() {
     let at = Key([0x5a; 32]);
     let failed = Arc::new(Mutex::new(Vec::new()));
     let message = |panic: &(dyn std::any::Any + Send)| {
-        panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned())).unwrap_or_default()
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+            .unwrap_or_default()
     };
     pool.scope(|scope| {
         let failed_ = Arc::clone(&failed);

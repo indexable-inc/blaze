@@ -133,7 +133,8 @@ pub(super) fn perf_only(lint_name: &str, main: &str) -> String {
 
 /// What `blaze::<lint_name>` alone says of `main`, over a minicore of the flags `minicore`.
 pub(super) fn perf_only_with(minicore: &str, lint_name: &str, main: &str) -> String {
-    let fixture = format!("//- minicore: {minicore}\n{CRATES}{MAIN}{}", main.trim_start_matches('\n'));
+    let fixture =
+        format!("//- minicore: {minicore}\n{CRATES}{MAIN}{}", main.trim_start_matches('\n'));
     lint(&fixture, &format!("-A clippy::all --warn=blaze::{lint_name}"))
 }
 

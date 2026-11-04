@@ -43,7 +43,11 @@ fn csr_is_cargos_sorted_and_deduplicated_lists() {
         for node in 0..len {
             for tag in 0..TAGS {
                 let got = &edges.targets[edges.range(NodeId(node as u32), tag..tag + 1)];
-                assert_eq!(got, &expected[node * TAGS + tag][..], "node {node}, tag {tag}, {len} nodes");
+                assert_eq!(
+                    got,
+                    &expected[node * TAGS + tag][..],
+                    "node {node}, tag {tag}, {len} nodes"
+                );
             }
         }
     }

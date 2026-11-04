@@ -45,8 +45,16 @@ fn a_result_that_read_the_same_and_came_out_otherwise_is_the_culprit() {
     assert_eq!(
         stale,
         vec![
-            Stale::UnrecordedRead { query: key(3), incremental: Fingerprint(31), scratch: Fingerprint(30) },
-            Stale::Downstream { query: key(4), incremental: Fingerprint(41), scratch: Fingerprint(40) },
+            Stale::UnrecordedRead {
+                query: key(3),
+                incremental: Fingerprint(31),
+                scratch: Fingerprint(30)
+            },
+            Stale::Downstream {
+                query: key(4),
+                incremental: Fingerprint(41),
+                scratch: Fingerprint(40)
+            },
         ]
     );
     assert!(stale[0].is_culprit() && !stale[1].is_culprit());
@@ -63,7 +71,12 @@ fn a_result_kept_though_what_it_read_changed_is_unverified() {
     let stale = under(&incremental.finish(), &scratch, &[]);
     assert_eq!(
         stale[0],
-        Stale::Unverified { query: key(3), read: key(2), saw: Fingerprint(20), now: Some(Fingerprint(21)) }
+        Stale::Unverified {
+            query: key(3),
+            read: key(2),
+            saw: Fingerprint(20),
+            now: Some(Fingerprint(21))
+        }
     );
     assert!(stale[0].is_culprit());
 }
@@ -95,8 +108,10 @@ fn only_what_the_roots_reach_is_compared() {
     assert_eq!(under(&incremental, &scratch, &[key(4)]), vec![]);
     assert_eq!(under(&incremental, &scratch, &[key(5)]).len(), 1);
     let reached = scratch.reachable(&[key(3)]);
-    let names: Vec<QueryKey> =
-        (0..scratch.keys.len() as u32).filter(|&i| reached.contains(i)).map(|i| scratch.keys[i as usize]).collect();
+    let names: Vec<QueryKey> = (0..scratch.keys.len() as u32)
+        .filter(|&i| reached.contains(i))
+        .map(|i| scratch.keys[i as usize])
+        .collect();
     let mut want = vec![key(1), key(2), key(3)];
     want.sort();
     assert_eq!(names, want);
@@ -196,7 +211,8 @@ fn the_builder_keeps_the_last_insert_and_names_every_read() {
     let two = trace.index(&key(2)).unwrap();
     assert_eq!(trace.result(two), Some(Fingerprint(21)));
     assert!(!trace.ran.contains(two));
-    let read: Vec<(QueryKey, Fingerprint)> = trace.edges(two).map(|(r, s)| (trace.keys[r as usize], s)).collect();
+    let read: Vec<(QueryKey, Fingerprint)> =
+        trace.edges(two).map(|(r, s)| (trace.keys[r as usize], s)).collect();
     assert_eq!(read, vec![(key(1), Fingerprint(11)), (key(3), Fingerprint(30))]);
     assert_eq!(trace.result(trace.index(&key(1)).unwrap()), None);
     assert_eq!(trace.edges_from.len(), trace.keys.len() + 1);
@@ -222,12 +238,20 @@ fn an_exact_encoding_round_trips_every_shape() {
 #[test]
 fn a_lossy_encoding_is_named_with_where_it_lost() {
     let encode = |column: &[u32]| -> Vec<u16> { column.iter().map(|&v| v as u16).collect() };
-    let decode = |packed: &Vec<u16>| -> Result<Vec<u32>, String> { Ok(packed.iter().map(|&v| u32::from(v)).collect()) };
+    let decode = |packed: &Vec<u16>| -> Result<Vec<u32>, String> {
+        Ok(packed.iter().map(|&v| u32::from(v)).collect())
+    };
     let wrong = columns::round_trips(encode, decode, 17).unwrap_err();
     assert!(wrong.starts_with("max of 1:"), "{wrong}");
     let shapes = columns::shapes(3);
-    assert!(shapes.iter().any(|(name, c)| *name == "CSR offsets" && c.windows(2).all(|w| w[0] <= w[1])));
-    assert!(shapes.iter().any(|(name, c)| *name == "strictly increasing" && c.windows(2).all(|w| w[0] < w[1])));
+    assert!(
+        shapes.iter().any(|(name, c)| *name == "CSR offsets" && c.windows(2).all(|w| w[0] <= w[1]))
+    );
+    assert!(
+        shapes
+            .iter()
+            .any(|(name, c)| *name == "strictly increasing" && c.windows(2).all(|w| w[0] < w[1]))
+    );
 }
 
 #[test]
@@ -256,7 +280,8 @@ fn a_frame_of_reference_packing_reads_in_place() {
         min + ((pair >> (bit % 64)) as u64 & ((1u64 << width) - 1)) as u32
     };
     assert_eq!(columns::reads_in_place(encode, get, 5).unwrap(), columns::shapes(5).len());
-    let off_by_one = |packed: &(u32, u32, Vec<u64>), i: usize| get(packed, i).wrapping_add(u32::from(i == 3));
+    let off_by_one =
+        |packed: &(u32, u32, Vec<u64>), i: usize| get(packed, i).wrapping_add(u32::from(i == 3));
     assert!(columns::reads_in_place(encode, off_by_one, 5).unwrap_err().contains("element 3"));
 }
 
@@ -319,15 +344,23 @@ mod model {
         for i in 0..scratch.keys.len() as u32 {
             let Some(theirs) = scratch.result(i).filter(|_| reached.contains(i)) else { continue };
             let query = scratch.keys[i as usize];
-            let Some((j, ours)) = incremental.index(&query).and_then(|j| Some((j, incremental.result(j)?))) else {
+            let Some((j, ours)) =
+                incremental.index(&query).and_then(|j| Some((j, incremental.result(j)?)))
+            else {
                 stale.push(Stale::Absent { query });
                 continue;
             };
             if !incremental.ran.contains(j)
-                && let Some((read, saw)) = incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw))
+                && let Some((read, saw)) =
+                    incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw))
             {
                 let now = incremental.result(read);
-                stale.push(Stale::Unverified { query, read: incremental.keys[read as usize], saw, now });
+                stale.push(Stale::Unverified {
+                    query,
+                    read: incremental.keys[read as usize],
+                    saw,
+                    now,
+                });
                 continue;
             }
             if ours == theirs {
@@ -363,14 +396,19 @@ mod model {
         (work, needless)
     }
 
-    pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(first: &BTreeMap<K, V>, second: &BTreeMap<K, V>) -> Vec<Apart<K, V>> {
+    pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(
+        first: &BTreeMap<K, V>,
+        second: &BTreeMap<K, V>,
+    ) -> Vec<Apart<K, V>> {
         let mut out = Vec::new();
         for (key, value) in first {
             match second.get(key) {
                 None => out.push(Apart::OnlyFirst { key: key.clone(), value: value.clone() }),
-                Some(other) if other != value => {
-                    out.push(Apart::Differ { key: key.clone(), first: value.clone(), second: other.clone() })
-                }
+                Some(other) if other != value => out.push(Apart::Differ {
+                    key: key.clone(),
+                    first: value.clone(),
+                    second: other.clone(),
+                }),
                 Some(_) => {}
             }
         }
@@ -380,7 +418,9 @@ mod model {
             }
         }
         let key_of = |a: &Apart<K, V>| match a {
-            Apart::OnlyFirst { key, .. } | Apart::OnlySecond { key, .. } | Apart::Differ { key, .. } => key.clone(),
+            Apart::OnlyFirst { key, .. }
+            | Apart::OnlySecond { key, .. }
+            | Apart::Differ { key, .. } => key.clone(),
         };
         out.sort_by_key(key_of);
         out
@@ -404,12 +444,19 @@ fn pool(rng: &mut Rng, n: usize) -> Vec<QueryKey> {
 
 /// Rows of a random build over `keys`: some keys inserted twice, edges to keys with and
 /// without results, fingerprints from a small range so equal and different ones both occur.
-fn rows(rng: &mut Rng, keys: &[QueryKey], n: usize) -> Vec<(QueryKey, Fingerprint, Vec<Edge>, bool)> {
+fn rows(
+    rng: &mut Rng,
+    keys: &[QueryKey],
+    n: usize,
+) -> Vec<(QueryKey, Fingerprint, Vec<Edge>, bool)> {
     (0..n)
         .map(|_| {
             let key = keys[rng.below(keys.len() as u64) as usize];
             let edges = (0..rng.below(6))
-                .map(|_| Edge { read: keys[rng.below(keys.len() as u64) as usize], saw: Fingerprint(u128::from(rng.below(4) as u8)) })
+                .map(|_| Edge {
+                    read: keys[rng.below(keys.len() as u64) as usize],
+                    saw: Fingerprint(u128::from(rng.below(4) as u8)),
+                })
                 .collect();
             (key, Fingerprint(u128::from(rng.below(4) as u8)), edges, rng.below(2) == 0)
         })
@@ -450,7 +497,8 @@ fn the_key_table_grows_past_many_keys_sharing_a_slot() {
 fn the_joins_find_what_a_lookup_per_key_found() {
     for seed in 0..200 {
         let mut rng = Rng::new(1000 + seed);
-        let (n_keys, n_before, n_after) = (1 + rng.below(200) as usize, rng.below(300) as usize, rng.below(300) as usize);
+        let (n_keys, n_before, n_after) =
+            (1 + rng.below(200) as usize, rng.below(300) as usize, rng.below(300) as usize);
         let keys = pool(&mut rng, n_keys);
         let before_rows = rows(&mut rng, &keys, n_before);
         // Part of the build before again as it was, so kept, cut-off and needless results occur.
@@ -458,8 +506,13 @@ fn the_joins_find_what_a_lookup_per_key_found() {
         let mut after_rows = before_rows[..kept].to_vec();
         after_rows.extend(rows(&mut rng, &keys, n_after));
         let (before, after) = (built(&before_rows), built(&after_rows));
-        let roots: Vec<QueryKey> = if seed % 4 == 0 { vec![keys[0], keys[keys.len() / 2]] } else { vec![] };
-        assert_eq!(under(&after, &before, &roots), model::under(&after, &before, &roots), "seed {seed}");
+        let roots: Vec<QueryKey> =
+            if seed % 4 == 0 { vec![keys[0], keys[keys.len() / 2]] } else { vec![] };
+        assert_eq!(
+            under(&after, &before, &roots),
+            model::under(&after, &before, &roots),
+            "seed {seed}"
+        );
         assert_eq!(over(&before, &after), model::over(&before, &after), "seed {seed}");
     }
 }

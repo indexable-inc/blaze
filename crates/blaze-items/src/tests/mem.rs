@@ -6,13 +6,15 @@ use std::collections::HashMap;
 
 use blaze_alloc_count::assert_at_most;
 use blaze_ids::{ContentId, bits::Ranked, rng::SplitMix64};
-use hir_ty::next_solver::goal_store::GoalFacts;
 use hir_expand::fixture;
+use hir_ty::next_solver::goal_store::GoalFacts;
 
 use super::{items, single};
 use crate::{
     CodeHash, DeepHash, Fact, FactSet, InterfaceHash, ItemHashes, ItemId, ItemKey, ItemKind,
-    LayoutHash, Unhashable, crate_hashes, facts, goals::Goals, hashes, item_key,
+    LayoutHash, Unhashable, crate_hashes, facts,
+    goals::Goals,
+    hashes, item_key,
     key::{self, KeyIndex, Row},
     signature_hash,
     table::{HashColumns, fact_ref},

@@ -5,8 +5,8 @@ use blaze_core::{
     sim::{Faults, Rng, Sim},
 };
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
+use std::alloc::Global;
 
 use crate::{
     Change, ChangeKind, CommitError, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError, Reader, Ticket,
@@ -45,7 +45,9 @@ fn files(tree: &Tree, root: NodeId) -> BTreeMap<String, Vec<u8>> {
 fn moded(tree: &Tree, root: NodeId) -> BTreeMap<String, (Mode, Vec<u8>)> {
     tree.files(root, Mode::Regular, "")
         .into_iter()
-        .map(|(path, node, mode)| (path, (mode, tree.bytes(node).unwrap().expect("a file").to_vec())))
+        .map(|(path, node, mode)| {
+            (path, (mode, tree.bytes(node).unwrap().expect("a file").to_vec()))
+        })
         .collect()
 }
 
@@ -183,7 +185,10 @@ fn deletes_and_renames_of_directories() {
 fn a_directory_moves_with_its_staged_files_whatever_their_names_sort_as() {
     let mut tree = Tree::new();
     let base = tree
-        .apply(tree.empty(), &[write("d/a-b", "1"), write("d/a/b", "2"), write("d/a.c", "3"), write("d/z", "4")])
+        .apply(
+            tree.empty(),
+            &[write("d/a-b", "1"), write("d/a/b", "2"), write("d/a.c", "3"), write("d/z", "4")],
+        )
         .unwrap();
     // Staged before the move: a new file between the base's, one replaced, one deleted.
     let ops = [
@@ -195,8 +200,9 @@ fn a_directory_moves_with_its_staged_files_whatever_their_names_sort_as() {
         rename("e", "f/g"),
     ];
     let moved = tree.apply(base, &ops).unwrap();
-    let want: BTreeMap<String, Vec<u8>> =
-        [("f/g/a-b", "6"), ("f/g/a/a", "5"), ("f/g/a/b", "2")].map(|(path, it)| (path.into(), it.into())).into();
+    let want: BTreeMap<String, Vec<u8>> = [("f/g/a-b", "6"), ("f/g/a/a", "5"), ("f/g/a/b", "2")]
+        .map(|(path, it)| (path.into(), it.into()))
+        .into();
     assert_eq!(files(&tree, moved), want);
     // Deleting the directory takes every file under it, staged or not.
     let gone = tree.apply(base, &[write("d/a/c", "7"), delete("d"), write("top", "t")]).unwrap();
@@ -487,7 +493,8 @@ fn transactions_match_a_model() {
             (root, model) = (after, next);
             assert_eq!(moded(&vfs.tree, vfs.root(root).unwrap()), model, "seed {seed}");
             for (path, (mode, bytes)) in &model {
-                let read = reader.file(root, path).unwrap().map(|(_, mode, bytes)| (mode, bytes.to_vec()));
+                let read =
+                    reader.file(root, path).unwrap().map(|(_, mode, bytes)| (mode, bytes.to_vec()));
                 assert_eq!(read, Some((*mode, bytes.clone())), "seed {seed}: {path}");
             }
             if step % 2 == 0 {
@@ -719,7 +726,8 @@ fn listing_fixture(seed: u64, n: usize) -> (Vfs, ContentId, Vec<String>, Vec<Str
             break;
         }
         let depth = 1 + rng.below(4);
-        let parts: Vec<&str> = (0..depth).map(|_| PARTS[rng.below(PARTS.len() as u64) as usize]).collect();
+        let parts: Vec<&str> =
+            (0..depth).map(|_| PARTS[rng.below(PARTS.len() as u64) as usize]).collect();
         let path = parts.join("/");
         let clash = files
             .keys()
@@ -780,7 +788,8 @@ fn a_pinned_listing_allocates_nothing() {
     assert!(blaze_alloc_count::installed());
     let (mut vfs, root, dirs, _) = listing_fixture(3, 200);
     let view = vfs.open(View { root }).unwrap();
-    let want: Vec<Vec<(String, bool)>> = dirs.iter().map(|it| vfs.list(view, it).expect("a directory")).collect();
+    let want: Vec<Vec<(String, bool)>> =
+        dirs.iter().map(|it| vfs.list(view, it).expect("a directory")).collect();
     let reader = vfs.reader();
     // The first read registers this thread with the reclaimer; reads after it are measured.
     let _ = reader.pin().list(root, "").map(Iterator::count);
@@ -792,7 +801,9 @@ fn a_pinned_listing_allocates_nothing() {
         }
     });
     let listed = assert_at_most(0, "every directory listed under a pin each", || {
-        dirs.iter().map(|dir| reader.pin().list(root, dir).map_or(0, Iterator::count)).sum::<usize>()
+        dirs.iter()
+            .map(|dir| reader.pin().list(root, dir).map_or(0, Iterator::count))
+            .sum::<usize>()
     });
     assert_eq!(listed, want.iter().map(Vec::len).sum::<usize>());
 }
@@ -807,7 +818,8 @@ fn a_file_looked_up_allocates_nothing() {
     assert!(blaze_alloc_count::installed());
     let (vfs, root, dirs, files) = listing_fixture(5, 200);
     let reader = vfs.reader();
-    let missing: Vec<String> = files.iter().map(|it| format!("{it}/x")).chain(["nope".to_owned()]).collect();
+    let missing: Vec<String> =
+        files.iter().map(|it| format!("{it}/x")).chain(["nope".to_owned()]).collect();
     // The first read registers this thread with the reclaimer; reads after it are measured.
     let _ = reader.pin().file(root, &files[0]);
     assert_at_most(0, "every file looked up under one pin", || {
@@ -823,7 +835,12 @@ fn a_file_looked_up_allocates_nothing() {
     let held = assert_at_most(0, "every file held through the reader", || {
         files
             .iter()
-            .filter(|path| reader.file(root, path).unwrap().is_some_and(|(_, _, bytes)| &*bytes == path.as_bytes()))
+            .filter(|path| {
+                reader
+                    .file(root, path)
+                    .unwrap()
+                    .is_some_and(|(_, _, bytes)| &*bytes == path.as_bytes())
+            })
             .count()
     });
     assert_eq!(held, files.len());
@@ -850,7 +867,8 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
     for path in ["src/lib.rs", "run.sh", "link", "src", "", "nope", "src/lib.rs/x", "a//b", "../x"]
     {
         let file = vfs.read(view, path).unwrap().map(|it| (it.id, it.mode, it.bytes.to_vec()));
-        let read = reader.file(root, path).unwrap().map(|(id, mode, bytes)| (id, mode, bytes.to_vec()));
+        let read =
+            reader.file(root, path).unwrap().map(|(id, mode, bytes)| (id, mode, bytes.to_vec()));
         assert_eq!(read, file, "{path}");
         assert_eq!(pinned_file(&reader, root, path), file, "{path}");
     }
@@ -876,7 +894,8 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
                 scope.spawn(move || {
                     (0..2000).all(|_| {
                         reader
-                            .file(what_if, "src/lib.rs").unwrap()
+                            .file(what_if, "src/lib.rs")
+                            .unwrap()
                             .is_some_and(|it| *it.2 == *b"pub fn a() {}")
                     })
                 })
@@ -1042,7 +1061,8 @@ fn journal_run(seed: u64) {
     let mut effects = Vec::new();
     let mut done = Vec::new();
     // Each head move's sequence number, and the head and files it moved to.
-    let mut moves: HashMap<u64, (String, BTreeMap<String, Vec<u8>>), Global> = HashMap::new_in(Global);
+    let mut moves: HashMap<u64, (String, BTreeMap<String, Vec<u8>>), Global> =
+        HashMap::new_in(Global);
     // Each ticket's head, sequence and whether it removed the head.
     let mut tickets: HashMap<Ticket, (String, u64, bool), Global> = HashMap::new_in(Global);
     // By head: the latest record acknowledged durable, and whether it was a removal.

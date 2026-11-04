@@ -31,11 +31,7 @@ fn ascii(flags: u32) -> bool {
 /// the simple lowercase mapping, or the first character of a special-cased
 /// full mapping (see `UnicodeVersion::to_lower`).
 pub fn lower(c: char, flags: u32) -> char {
-    if ascii(flags) {
-        c.to_ascii_lowercase()
-    } else {
-        unicode_version(flags).to_lower(c)
-    }
+    if ascii(flags) { c.to_ascii_lowercase() } else { unicode_version(flags).to_lower(c) }
 }
 
 /// `_sre.unicode_iscased` / `_sre.ascii_iscased`: whether `c` has a
@@ -149,11 +145,7 @@ pub fn uppers_of(c: char, flags: u32) -> &'static [char] {
 /// The lowercase forms a character must fold to in order to match the
 /// cased literal with lowercase form `l`: `l` itself and its extra cases.
 fn fold_targets(l: char, flags: u32) -> impl Iterator<Item = char> {
-    let extras = if ascii(flags) {
-        &[][..]
-    } else {
-        extra_cases(l)
-    };
+    let extras = if ascii(flags) { &[][..] } else { extra_cases(l) };
     core::iter::once(l).chain(extras.iter().copied())
 }
 

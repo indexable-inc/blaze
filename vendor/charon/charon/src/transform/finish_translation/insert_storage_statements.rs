@@ -120,14 +120,14 @@ impl Transform {
                         | TerminatorKind::UnwindResume
                 ) {
                     let span = block.terminator.span;
-                    block
-                        .statements
-                        .extend(locals_with_missing_storage_deads.iter().rev().map(|local| {
+                    block.statements.extend(locals_with_missing_storage_deads.iter().rev().map(
+                        |local| {
                             ullbc_ast::Statement::new(
                                 span,
                                 ullbc_ast::StatementKind::StorageDead(*local),
                             )
-                        }));
+                        },
+                    ));
                 }
             }
         }
@@ -142,11 +142,8 @@ impl Transform {
         let _ = storage_visitor.visit(body);
 
         let locals_with_missing_storage_lives = storage_visitor.locals_missing_storage_lives();
-        let first_span = if let Some(fst) = body.body.statements.first() {
-            fst.span
-        } else {
-            body.span
-        };
+        let first_span =
+            if let Some(fst) = body.body.statements.first() { fst.span } else { body.span };
         let new_statements = locals_with_missing_storage_lives.iter().map(|local| {
             llbc_ast::Statement::new(first_span, llbc_ast::StatementKind::StorageLive(*local))
         });

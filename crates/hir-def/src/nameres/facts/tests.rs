@@ -22,7 +22,6 @@ use std::{fmt, fmt::Write as _, sync};
 
 use base_db::{Crate, Db, all_crates};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_mem::Tag;
 use either::Either;
 use hir_expand::{
@@ -31,13 +30,14 @@ use hir_expand::{
     fixture,
     name::Name,
     proc_macro::{
-        CustomProcMacroExpander, ProcMacro, ProcMacroCall, ProcMacroExpander,
+        CustomProcMacroExpander, Expanded, ProcMacro, ProcMacroCall, ProcMacroExpander,
         ProcMacroExpansionError, ProcMacroKind,
     },
 };
 use intern::Symbol;
 use la_arena::Idx;
 use span::Edition;
+use std::alloc::Global;
 use syntax::ast;
 
 use crate::{
@@ -58,7 +58,6 @@ use crate::{
     },
     per_ns::Item,
     test_db::TestDB,
-    tt::TopSubtree,
     unstable_features::UnstableFeatures,
     visibility::{Visibility, VisibilityExplicitness},
 };
@@ -95,10 +94,7 @@ fn empty_block_def_map(db: &Db, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
 /// `block`'s def map made again, as `block_def_map` makes it, in a query of its own: the same
 /// inputs give the same map.
 #[blaze_query::tracked(returns(ref))]
-pub(super) fn block_def_map_again<'db>(
-    db: &'db Db,
-    block_id: BlockIdLt<'db>,
-) -> DefMap {
+pub(super) fn block_def_map_again<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
     blaze_mem::frame::task(Tag::Nameres, |frame| {
         let (def_map, tree_id) = empty_block_def_map(db, block_id);
         let krate = def_map.krate;
@@ -357,7 +353,10 @@ impl<'a> Projector<'a> {
             let mut at = id;
             while let Some(parent) = table[at].parent {
                 path.push(at.name(db).unwrap_or_else(|| {
-                    panic!("module {at:?} has a parent and no name in the map of {:?}", def_map.krate)
+                    panic!(
+                        "module {at:?} has a parent and no name in the map of {:?}",
+                        def_map.krate
+                    )
                 }));
                 at = parent;
             }
@@ -376,7 +375,9 @@ impl<'a> Projector<'a> {
 
     fn vis(&self, vis: Visibility) -> CVis {
         match vis {
-            Visibility::Module(module, explicitness) => CVis::Module(self.module(module), explicitness),
+            Visibility::Module(module, explicitness) => {
+                CVis::Module(self.module(module), explicitness)
+            }
             Visibility::PubCrate(krate) => CVis::PubCrate(krate),
             Visibility::Public => CVis::Public,
         }
@@ -595,8 +596,8 @@ impl<'a> Projector<'a> {
         // Imports an exempt name's entry resolved through: their chains are left out too.
         let mut exempt_imports: HashSet<CImport, Global> = HashSet::new_in(Global);
         let column = |exempt_imports: &mut HashSet<CImport, Global>,
-                          name: &Name,
-                          import: Option<CImport>| {
+                      name: &Name,
+                      import: Option<CImport>| {
             if exempt.name(name) {
                 exempt_imports.extend(import);
                 false
@@ -623,9 +624,17 @@ impl<'a> Projector<'a> {
         let mut c_types = Vec::new();
         for (name, item) in types.iter() {
             let import = item.import.map(|it| self.import_or_extern_crate(it));
-            if ambiguous.contains(&(*name, 0)) && matches!(import, Some(CImport::Glob(_))) && !exempt.name(name) {
+            if ambiguous.contains(&(*name, 0))
+                && matches!(import, Some(CImport::Glob(_)))
+                && !exempt.name(name)
+            {
                 let vis = self.vis(item.vis);
-                c_ambiguities.push((*name, CItemInNs::Types(self.def(item.def)), import.expect("a glob"), vis));
+                c_ambiguities.push((
+                    *name,
+                    CItemInNs::Types(self.def(item.def)),
+                    import.expect("a glob"),
+                    vis,
+                ));
                 continue;
             }
             if column(&mut exempt_imports, name, import.clone()) {
@@ -638,9 +647,17 @@ impl<'a> Projector<'a> {
         let mut c_values = Vec::new();
         for (name, item) in values.iter() {
             let import = item.import.map(|it| self.import_or_glob(it));
-            if ambiguous.contains(&(*name, 1)) && matches!(import, Some(CImport::Glob(_))) && !exempt.name(name) {
+            if ambiguous.contains(&(*name, 1))
+                && matches!(import, Some(CImport::Glob(_)))
+                && !exempt.name(name)
+            {
                 let vis = self.vis(item.vis);
-                c_ambiguities.push((*name, CItemInNs::Values(self.def(item.def)), import.expect("a glob"), vis));
+                c_ambiguities.push((
+                    *name,
+                    CItemInNs::Values(self.def(item.def)),
+                    import.expect("a glob"),
+                    vis,
+                ));
                 continue;
             }
             if column(&mut exempt_imports, name, import.clone()) {
@@ -653,9 +670,17 @@ impl<'a> Projector<'a> {
         let mut c_macros = Vec::new();
         for (name, item) in macros.iter() {
             let import = item.import.map(|it| self.import_or_extern_crate(it));
-            if ambiguous.contains(&(*name, 2)) && matches!(import, Some(CImport::Glob(_))) && !exempt.name(name) {
+            if ambiguous.contains(&(*name, 2))
+                && matches!(import, Some(CImport::Glob(_)))
+                && !exempt.name(name)
+            {
                 let vis = self.vis(item.vis);
-                c_ambiguities.push((*name, CItemInNs::Macros(self.makro(item.def)), import.expect("a glob"), vis));
+                c_ambiguities.push((
+                    *name,
+                    CItemInNs::Macros(self.makro(item.def)),
+                    import.expect("a glob"),
+                    vis,
+                ));
                 continue;
             }
             if column(&mut exempt_imports, name, import.clone()) {
@@ -679,7 +704,9 @@ impl<'a> Projector<'a> {
                 impls
                     .iter()
                     .enumerate()
-                    .map(|(at, &it)| (self.impl_(it), trait_impl.contains(at), reservation_impl.contains(at)))
+                    .map(|(at, &it)| {
+                        (self.impl_(it), trait_impl.contains(at), reservation_impl.contains(at))
+                    })
                     .collect(),
             ),
             builtin_derive_impls: sorted(
@@ -734,7 +761,12 @@ impl<'a> Projector<'a> {
                     .iter()
                     .filter(|it| !exempt.name(&it.name))
                     .map(|&ShadowedImport { import, name, item, vis }| {
-                        (self.import_or_extern_crate(import), name, self.item_in_ns(item), self.vis(vis))
+                        (
+                            self.import_or_extern_crate(import),
+                            name,
+                            self.item_in_ns(item),
+                            self.vis(vis),
+                        )
                     })
                     .collect(),
             ),
@@ -885,8 +917,9 @@ pub(in crate::nameres) fn project<'a>(
         records: _,
         data,
     } = def_map;
-    let super::super::Records { diagnostics, diagnostics_by_module, derive_helpers_in_scope, .. } =
-        def_map.records(db);
+    let super::super::Records {
+        diagnostics, diagnostics_by_module, derive_helpers_in_scope, ..
+    } = def_map.records(db);
     let p = Projector::new(db, def_map);
 
     let mut by_module: HashMap<ModuleId, Vec<&DefDiagnosticKind>, Global> = HashMap::new_in(Global);
@@ -924,7 +957,10 @@ pub(in crate::nameres) fn project<'a>(
                 visibility: p.vis(*visibility),
                 parent: parent.map(|it| p.module(it)),
                 children: sorted(
-                    data.children(db).iter().map(|(name, &it)| (name.clone(), p.module(it))).collect(),
+                    data.children(db)
+                        .iter()
+                        .map(|(name, &it)| (name.clone(), p.module(it)))
+                        .collect(),
                 ),
                 scope: p.scope(data.scope(db), exempt),
                 diagnostics: sorted(pushed),
@@ -932,7 +968,10 @@ pub(in crate::nameres) fn project<'a>(
         ));
     }
     modules.sort_by_cached_key(|(key, _)| {
-        (key.path.iter().map(|it| it.as_str().to_owned()).collect::<Vec<_>>(), format!("{:?}", key.origin))
+        (
+            key.path.iter().map(|it| it.as_str().to_owned()).collect::<Vec<_>>(),
+            format!("{:?}", key.origin),
+        )
     });
 
     CDefMap {
@@ -988,7 +1027,10 @@ fn list<T: PartialEq + fmt::Debug>(out: &mut String, at: &str, field: &str, old:
     let extra: Vec<&T> = new.iter().filter(|it| !old.contains(it)).collect();
     _ = writeln!(out, "{at}: `{field}` differs");
     if missing.is_empty() && extra.is_empty() {
-        _ = writeln!(out, "  same entries, other multiplicity or order\n  old: {old:#?}\n  new: {new:#?}");
+        _ = writeln!(
+            out,
+            "  same entries, other multiplicity or order\n  old: {old:#?}\n  new: {new:#?}"
+        );
     } else {
         for it in missing {
             _ = writeln!(out, "  only old: {it:?}");
@@ -1134,14 +1176,17 @@ impl ProcMacroExpander for IdentityWhenValid {
         &self,
         _: &Db,
         ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
-    ) -> Result<TopSubtree, ProcMacroExpansionError> {
+    ) -> Result<Expanded, ProcMacroExpansionError> {
         let (parse, _) = syntax_bridge::token_tree_to_syntax_node(
             subtree.view(),
             syntax_bridge::TopEntryPoint::MacroItems,
             &mut |_| Edition::CURRENT,
         );
         if parse.errors().is_empty() {
-            Ok(subtree.copy())
+            Ok(Expanded::untraced(
+                subtree.copy(),
+                "a test's proc macro, which traces nothing of what it read",
+            ))
         } else {
             Err(ProcMacroExpansionError::Panic(format!(
                 "got invalid macro input: {:?}",
@@ -1251,8 +1296,10 @@ pub(super) fn compare_db(db: &TestDB, name: &str, exempt: &Exempt, out: &mut Str
                     let block = block.to_db(db);
                     let again = block_def_map_again(db, block);
                     assert_handed_over(db, again, name);
-                    let diff =
-                        compare(&project(db, real, None, exempt), &project(db, again, None, exempt));
+                    let diff = compare(
+                        &project(db, real, None, exempt),
+                        &project(db, again, None, exempt),
+                    );
                     if !diff.is_empty() {
                         _ = writeln!(
                             out,

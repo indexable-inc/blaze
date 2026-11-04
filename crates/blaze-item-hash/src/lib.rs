@@ -70,7 +70,12 @@ impl BodyFacts for Bodies {
         keys::def_key(db, body, def)
     }
 
-    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(
+        &self,
+        db: &'db Db,
+        body: DefWithBodyId,
+        key: ContentId,
+    ) -> Option<SolverDefId<'db>> {
         keys::def_of(db, body, key)
     }
 }

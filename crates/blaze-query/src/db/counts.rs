@@ -2,7 +2,13 @@
 //! unchanged without running, how many ran again in a view they had already run in, how many
 //! ran because their value was evicted and asked for again (in any view), and how many values
 //! a budget's pass and an explicit drop let go; and its runs' reads: recorded, kept by the
-//! rows, and the most one run held. Process-wide, as ingredient numbers are.
+//! rows, and the most one run held. For an input, how many times a setter wrote one of its
+//! fields: what a build changed, which names the input behind every run that follows. And
+//! why each run ran, by its [`Cause`]: first runs, a read that changed, an untracked read, a
+//! cycle (an evicted value is `evicted_asked`), so "which kinds reran, and why" is a count
+//! with no per-run record. Process-wide, as ingredient numbers are.
+//!
+//! [`Cause`]: super::Cause
 //!
 //! Each thread counts into a block of its own with a load and a store (no read-modify-write,
 //! no cache line two threads write), found through one thread-local read on the run and
@@ -38,7 +44,27 @@ pub(crate) const DROPPED: usize = 5;
 const READS_RECORDED: usize = 6;
 /// Reads a run's row kept: its distinct reads.
 const READS_KEPT: usize = 7;
-const KINDS: usize = 8;
+/// A setter wrote a field of an input (`super::input`), equal value or not: each write opens a
+/// view, so it is what every run after it traces back to.
+pub(crate) const WRITTEN: usize = 8;
+/// A row ran for the first time ([`Cause::New`]).
+///
+/// [`Cause::New`]: super::Cause::New
+pub(crate) const RAN_NEW: usize = 9;
+/// A row ran because one of its reads changed ([`Cause::Changed`]).
+///
+/// [`Cause::Changed`]: super::Cause::Changed
+pub(crate) const RAN_CHANGED: usize = 10;
+/// A row ran because its last run made an untracked read ([`Cause::Untracked`]).
+///
+/// [`Cause::Untracked`]: super::Cause::Untracked
+pub(crate) const RAN_UNTRACKED: usize = 11;
+/// A row ran for a cycle: a stale provisional row, or a verify that re-entered a cycle
+/// ([`Cause::Cycle`]).
+///
+/// [`Cause::Cycle`]: super::Cause::Cycle
+pub(crate) const RAN_CYCLE: usize = 12;
+const KINDS: usize = 13;
 
 /// The most reads one run of each ingredient held on its thread's edge stack at its end since
 /// the last [`take`], which resets it: a mark, not a sum, so one word an ingredient shared by
@@ -72,12 +98,56 @@ pub struct Counts {
     /// The most entries one of its runs held on its thread's edge stack at once (repeats are
     /// dropped once a run holds `max(4096, 2 x kept)`): what one run cost the stack.
     pub reads_most: u64,
+    /// Of an input: the times a setter wrote one of its fields, equal value or not (each opens
+    /// a view). What a build changed: a no-op build's are the inputs it set anyway.
+    pub written: u64,
+    /// Of `executed`, first runs: a cold build's runs, and on a warm one the rows it never
+    /// had (a restore that lost them shows here).
+    pub ran_new: u64,
+    /// Of `executed`, runs because a read changed since the row last ran: what an edit should
+    /// cause, and nothing else on a no-op build.
+    pub ran_changed: u64,
+    /// Of `executed`, runs because the row's last run made an untracked read
+    /// (`report_untracked_read`): it runs in every view, so a no-op build's runs are these.
+    pub ran_untracked: u64,
+    /// Of `executed`, runs for a cycle: a stale provisional row, or a verify that re-entered
+    /// a cycle. A cycle whose results are never reused runs here on every build.
+    pub ran_cycle: u64,
 }
 
 impl Counts {
     fn of(gained: [u64; KINDS], reads_most: u64) -> Counts {
-        let [executed, verified, reran, evicted_asked, evicted, dropped, reads_recorded, reads_kept] = gained;
-        Counts { executed, verified, reran, evicted_asked, evicted, dropped, reads_recorded, reads_kept, reads_most }
+        let [
+            executed,
+            verified,
+            reran,
+            evicted_asked,
+            evicted,
+            dropped,
+            reads_recorded,
+            reads_kept,
+            written,
+            ran_new,
+            ran_changed,
+            ran_untracked,
+            ran_cycle,
+        ] = gained;
+        Counts {
+            executed,
+            verified,
+            reran,
+            evicted_asked,
+            evicted,
+            dropped,
+            reads_recorded,
+            reads_kept,
+            reads_most,
+            written,
+            ran_new,
+            ran_changed,
+            ran_untracked,
+            ran_cycle,
+        }
     }
 }
 

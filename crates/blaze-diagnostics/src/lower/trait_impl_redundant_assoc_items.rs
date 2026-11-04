@@ -51,7 +51,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplRedundantAssocItems) -> V
     // rustc's `check_trait_item` looks the item's name up among the trait's hygienically, in its
     // namespace and then the other: a trait item of the same text a `macro` names apart is none.
     let named = |value: bool| {
-        trait_items.iter().find(|&&(_, it)| is_value(it) == value && item.implements(db, d.trait_, it)).map(|(_, it)| *it)
+        trait_items
+            .iter()
+            .find(|&&(_, it)| is_value(it) == value && item.implements(db, d.trait_, it))
+            .map(|(_, it)| *it)
     };
     let in_trait = named(is_value(item)).or_else(|| named(!is_value(item)));
     let trait_fact = Fact::Signature(cx.key(ItemId::Trait(d.trait_.into())));
@@ -65,7 +68,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplRedundantAssocItems) -> V
             let mut diag = Diag::error(
                 Some(code),
                 // alloc: the error's text, for an error hir found
-                format!("item `{name}` is an associated {kind}, which doesn't match its trait `{trait_path}`"),
+                format!(
+                    "item `{name}` is an associated {kind}, which doesn't match its trait `{trait_path}`"
+                ),
                 // clone: on the error path, for an error hir found
                 span.clone(),
             );
@@ -77,9 +82,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplRedundantAssocItems) -> V
         }
         None => {
             let (code, what, similar) = match item {
-                hir::AssocItem::Function(_) => ("E0407", "method", "there is an associated function with a similar name"),
-                hir::AssocItem::TypeAlias(_) => ("E0437", "type", "there is an associated type with a similar name"),
-                hir::AssocItem::Const(_) => ("E0438", "const", "there is an associated constant with a similar name"),
+                hir::AssocItem::Function(_) => {
+                    ("E0407", "method", "there is an associated function with a similar name")
+                }
+                hir::AssocItem::TypeAlias(_) => {
+                    ("E0437", "type", "there is an associated type with a similar name")
+                }
+                hir::AssocItem::Const(_) => {
+                    ("E0438", "const", "there is an associated constant with a similar name")
+                }
             };
             let mut diag = Diag::error(
                 Some(code),

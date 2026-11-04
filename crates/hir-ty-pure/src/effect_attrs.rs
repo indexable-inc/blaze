@@ -32,8 +32,8 @@ use hir_ty::{
     next_solver::{ConstKind, DbInterner, GenericArgs, SimplifiedType, SolverDefId, TyKind},
 };
 use hir_ty_mir::mir::{
-    BasicBlock, BasicBlockId, BinOp, InlineAsm, LocalId, MirBody, Operand, OperandKind, ProjectionElem, Rvalue, Statement,
-    StatementKind, TerminatorKind,
+    BasicBlock, BasicBlockId, BinOp, InlineAsm, LocalId, MirBody, Operand, OperandKind,
+    ProjectionElem, Rvalue, Statement, StatementKind, TerminatorKind,
 };
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind as _;
@@ -107,11 +107,15 @@ fn nonblocking_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
 fn says(rule: Rule) -> &'static str {
     match rule {
         Rule::Panic => "may panic or abort",
-        Rule::Overflow => "may panic on an arithmetic overflow, which this profile checks (overflow-checks is on)",
+        Rule::Overflow => {
+            "may panic on an arithmetic overflow, which this profile checks (overflow-checks is on)"
+        }
         Rule::Alloc => "calls the global allocator",
         Rule::Block => "may block the thread",
         Rule::ForeignUnwind => "calls a foreign function whose ABI may unwind",
-        Rule::ForeignUnknown => "calls a foreign function (or runs inline assembly) blaze knows nothing of",
+        Rule::ForeignUnknown => {
+            "calls a foreign function (or runs inline assembly) blaze knows nothing of"
+        }
         Rule::Unchecked => "runs code the check can't see",
         other => other.said(),
     }
@@ -134,7 +138,11 @@ pub(crate) fn assert_rule(body: &MirBody<'_>, block: BasicBlockId) -> Option<Rul
     if condition(data, cond) == Some(*expected) {
         return None;
     }
-    Some(if msg.is_optional_overflow_check() && body.inherits_overflow_checks { Rule::Overflow } else { Rule::Panic })
+    Some(if msg.is_optional_overflow_check() && body.inherits_overflow_checks {
+        Rule::Overflow
+    } else {
+        Rule::Panic
+    })
 }
 
 /// An assert's condition when it is known without running the body.
@@ -144,9 +152,13 @@ fn condition(block: &BasicBlock, cond: &Operand) -> Option<bool> {
     }
     let local = operand_local(cond)?;
     // The last assignment of the local in the block; the condition is never written another way.
-    let (at, rvalue) = block.statements.iter().enumerate().rev().find_map(|(at, statement)| match &statement.kind {
-        StatementKind::Assign(to, rvalue) if to.as_ref().as_local() == Some(local) => Some((at, rvalue)),
-        _ => None,
+    let (at, rvalue) = block.statements.iter().enumerate().rev().find_map(|(at, statement)| {
+        match &statement.kind {
+            StatementKind::Assign(to, rvalue) if to.as_ref().as_local() == Some(local) => {
+                Some((at, rvalue))
+            }
+            _ => None,
+        }
     })?;
     let Rvalue::BinaryOp(op, a, b) = rvalue else { return None };
     // A bounds check compares the index's local (`_3 = const 2_usize` before it, for `a[2]`)
@@ -187,12 +199,16 @@ fn known_bits(statements: &[Statement], operand: &Operand) -> Option<u128> {
                     let Rvalue::Use(value) = rvalue else { return None };
                     return constant_bits(value);
                 }
-                if to.local == local || to.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref)) {
+                if to.local == local
+                    || to.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref))
+                {
                     return None;
                 }
             }
             StatementKind::Deinit(to) if to.local == local => return None,
-            StatementKind::StorageDead(it) | StatementKind::StorageLive(it) if *it == local => return None,
+            StatementKind::StorageDead(it) | StatementKind::StorageLive(it) if *it == local => {
+                return None;
+            }
             StatementKind::InlineAsm(_) => return None,
             _ => {}
         }
@@ -226,10 +242,17 @@ fn constant_bits(operand: &Operand) -> Option<u128> {
 /// of an `Allocator` or `GlobalAlloc` impl, which the walk stops at with that kind:
 /// [`Rule::Alloc`] for a `GlobalAlloc` and for `Global`'s and `System`'s `Allocator`,
 /// [`Rule::AllocIn`] for any other `Allocator` (the module docs say why).
-pub(crate) fn allocator_rule<'db>(db: &'db Db, func: FunctionId, args: GenericArgs<'db>) -> Option<Rule> {
+pub(crate) fn allocator_rule<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: GenericArgs<'db>,
+) -> Option<Rule> {
     let ItemContainerId::ImplId(imp) = func.lookup(db).container else { return None };
     let trait_ = db.impl_trait(imp)?.skip_binder().def_id.0;
-    let core = matches!(HasModule::krate(&trait_, db).data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Core));
+    let core = matches!(
+        HasModule::krate(&trait_, db).data(db).origin,
+        CrateOrigin::Lang(LangCrateOrigin::Core)
+    );
     if !core {
         return None;
     }
@@ -296,7 +319,8 @@ pub(crate) fn foreign_row(symbol: &str) -> Option<EffectSet> {
 
 /// Whether a function of the ABI named `abi` may unwind into its caller.
 fn may_unwind(abi: &str) -> bool {
-    matches!(abi, "Rust" | "rust-call" | "rust-cold" | "rust-preserve-none" | "tail") || abi.ends_with("-unwind")
+    matches!(abi, "Rust" | "rust-call" | "rust-cold" | "rust-preserve-none" | "tail")
+        || abi.ends_with("-unwind")
 }
 
 /// The kinds of an `asm!` block: [`Rule::Foreign`] and [`Rule::ForeignUnknown`] (it may be a
@@ -367,7 +391,12 @@ const ONCE: &str = "waits for another thread's initialization";
 pub(crate) const ROWS: &[Row] = &[
     row("parking_lot_core::park", "parking_lot_core", At::Fn(&["park"]), PARK),
     row("lock_api::Mutex::lock", "lock_api", At::Methods(&["Mutex"], &["lock"]), LOCK),
-    row("lock_api::ReentrantMutex::lock", "lock_api", At::Methods(&["ReentrantMutex"], &["lock"]), LOCK),
+    row(
+        "lock_api::ReentrantMutex::lock",
+        "lock_api",
+        At::Methods(&["ReentrantMutex"], &["lock"]),
+        LOCK,
+    ),
     row(
         "lock_api::RwLock::{read, write, upgradable_read, read_recursive}",
         "lock_api",
@@ -377,10 +406,18 @@ pub(crate) const ROWS: &[Row] = &[
     row(
         "parking_lot::Condvar::wait*",
         "parking_lot",
-        At::Methods(&["Condvar"], &["wait", "wait_for", "wait_until", "wait_while", "wait_while_for", "wait_while_until"]),
+        At::Methods(
+            &["Condvar"],
+            &["wait", "wait_for", "wait_until", "wait_while", "wait_while_for", "wait_while_until"],
+        ),
         CONDVAR,
     ),
-    row("parking_lot::Once::call_once*", "parking_lot", At::Methods(&["Once"], &["call_once", "call_once_force"]), ONCE),
+    row(
+        "parking_lot::Once::call_once*",
+        "parking_lot",
+        At::Methods(&["Once"], &["call_once", "call_once_force"]),
+        ONCE,
+    ),
     row(
         "crossbeam_channel::Receiver::recv*",
         "crossbeam_channel",
@@ -396,7 +433,17 @@ pub(crate) const ROWS: &[Row] = &[
     row(
         "crossbeam_channel::Select::{select, ready}*",
         "crossbeam_channel",
-        At::Methods(&["Select"], &["select", "select_timeout", "select_deadline", "ready", "ready_timeout", "ready_deadline"]),
+        At::Methods(
+            &["Select"],
+            &[
+                "select",
+                "select_timeout",
+                "select_deadline",
+                "ready",
+                "ready_timeout",
+                "ready_deadline",
+            ],
+        ),
         "waits for a channel",
     ),
     row(
@@ -405,7 +452,12 @@ pub(crate) const ROWS: &[Row] = &[
         At::Methods(&["sync", "Parker"], &["park", "park_timeout", "park_deadline"]),
         PARK,
     ),
-    row("crossbeam_utils::sync::WaitGroup::wait", "crossbeam_utils", At::Methods(&["sync", "WaitGroup"], &["wait"]), "waits for the group"),
+    row(
+        "crossbeam_utils::sync::WaitGroup::wait",
+        "crossbeam_utils",
+        At::Methods(&["sync", "WaitGroup"], &["wait"]),
+        "waits for the group",
+    ),
 ];
 
 /// The row of `func`, a function of a registry crate a row of [`ROWS`] names. A crate is known

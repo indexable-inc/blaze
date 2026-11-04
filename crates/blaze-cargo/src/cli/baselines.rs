@@ -32,7 +32,9 @@ pub struct Counted {
 
 impl Counted {
     pub fn add(&mut self, diagnostic: &DiagnosticRef<'_>) {
-        let Some(lint) = diagnostic.code.filter(|it| it.starts_with("clippy::") || it.starts_with("blaze::")) else {
+        let Some(lint) =
+            diagnostic.code.filter(|it| it.starts_with("clippy::") || it.starts_with("blaze::"))
+        else {
             return;
         };
         let at = diagnostic.spans.iter().find(|it| it.primary);
@@ -43,10 +45,16 @@ impl Counted {
             return;
         };
         let krate = say::package_name(unit.package_id);
-        let (file, start, end) = at.map_or((diagnostic.message, 0, 0), |it| (it.file, it.byte_start, it.byte_end));
+        let (file, start, end) =
+            at.map_or((diagnostic.message, 0, 0), |it| (it.file, it.byte_start, it.byte_end));
         // alloc: a finding's key, once per finding of a run
         if self.seen.insert((lint.to_owned(), krate.to_owned(), file.to_owned(), start, end)) {
-            *self.counts.entry(lint.to_owned()).or_default().entry(krate.to_owned()).or_default() += 1;
+            *self
+                .counts
+                .entry(lint.to_owned())
+                .or_default()
+                .entry(krate.to_owned())
+                .or_default() += 1;
         }
     }
 
@@ -54,7 +62,14 @@ impl Counted {
     /// each of `new` started at the run's counts, then all of them checked against the run, or
     /// lowered to it when `bless`. What to say of each, or the error naming every count off its
     /// baseline.
-    pub fn finish(self, root: &Path, dir: &str, target: &str, bless: bool, new: &[String]) -> Result<Vec<String>, String> {
+    pub fn finish(
+        self,
+        root: &Path,
+        dir: &str,
+        target: &str,
+        bless: bool,
+        new: &[String],
+    ) -> Result<Vec<String>, String> {
         if !self.unowned.is_empty() {
             let lines: Vec<String> = self.unowned.iter().map(|it| format!("\n  {it}")).collect();
             return Err(format!(
@@ -75,7 +90,9 @@ impl Counted {
             Some(_) => {}
             None if !baseline::read(&dir).map_err(|it| it.to_string())?.is_empty() => {
                 let file = baseline::TARGET_FILE;
-                return Err(format!("{shown} has baselines and no `{file}` file naming the target they count"));
+                return Err(format!(
+                    "{shown} has baselines and no `{file}` file naming the target they count"
+                ));
             }
             None => {}
         }
@@ -83,14 +100,21 @@ impl Counted {
         for lint in new {
             let known = baseline::lint_of(&baseline::file_name(lint)).is_some_and(|it| it == *lint);
             if !known {
-                return Err(format!("`--new-baseline {lint}`: no clippy or blaze lint blaze has is named so"));
+                return Err(format!(
+                    "`--new-baseline {lint}`: no clippy or blaze lint blaze has is named so"
+                ));
             }
             let path = dir.join(baseline::file_name(lint));
             if path.exists() {
-                return Err(format!("`--new-baseline {lint}`: {} is there already", path.display()));
+                return Err(format!(
+                    "`--new-baseline {lint}`: {} is there already",
+                    path.display()
+                ));
             }
             if self.counts.get(lint).is_none_or(|it| it.values().all(|count| *count == 0)) {
-                return Err(format!("`--new-baseline {lint}`: the run has no finding of it, so set it to `deny` instead"));
+                return Err(format!(
+                    "`--new-baseline {lint}`: the run has no finding of it, so set it to `deny` instead"
+                ));
             }
         }
         for lint in new {
@@ -103,7 +127,8 @@ impl Counted {
         }
         if theirs.is_none() && !new.is_empty() {
             let path = dir.join(baseline::TARGET_FILE);
-            std::fs::write(&path, format!("{target}\n")).map_err(|error| format!("{}: {error}", path.display()))?;
+            std::fs::write(&path, format!("{target}\n"))
+                .map_err(|error| format!("{}: {error}", path.display()))?;
         }
         let off = baseline::check(&dir, &self.counts).map_err(|it| it.to_string())?;
         let (over, under): (Vec<_>, Vec<_>) = off.iter().partition(|(_, off)| off.over());
@@ -127,7 +152,9 @@ impl Counted {
             let blessed = baseline::bless(&dir, &self.counts).map_err(|it| it.to_string())?;
             said.extend(blessed.into_iter().map(|(lint, blessed)| match blessed {
                 Blessed::Lowered => format!("{lint}: baseline lowered to this run's counts"),
-                Blessed::Emptied => format!("{lint}: no finding left, baseline deleted: set the lint to `deny`"),
+                Blessed::Emptied => {
+                    format!("{lint}: no finding left, baseline deleted: set the lint to `deny`")
+                }
             }));
             return Ok(said);
         }
@@ -158,33 +185,70 @@ mod tests {
 
     #[test]
     fn a_baseline_is_started_checked_both_ways_and_lowered() {
-        let root = std::env::temp_dir().join(format!("blaze-clippy-baselines-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("blaze-clippy-baselines-{}", std::process::id()));
         let lint = "clippy::disallowed_types".to_owned();
-        let run = counted(&[("clippy::disallowed_types", "a", 2), ("clippy::disallowed_types", "b", 1)]);
+        let run =
+            counted(&[("clippy::disallowed_types", "a", 2), ("clippy::disallowed_types", "b", 1)]);
         let said = run.finish(&root, "b", T, false, std::slice::from_ref(&lint)).unwrap();
         assert_eq!(said, ["clippy::disallowed_types: baseline started at this run's counts"]);
-        assert_eq!(std::fs::read_to_string(root.join("b/clippy.disallowed_types.txt")).unwrap(), "a\t2\nb\t1\n");
-        assert_eq!(std::fs::read_to_string(root.join("b/TARGET")).unwrap(), "x86_64-unknown-linux-gnu\n");
-        let other = counted(&[]).finish(&root, "b", "aarch64-apple-darwin", false, &[]).unwrap_err();
+        assert_eq!(
+            std::fs::read_to_string(root.join("b/clippy.disallowed_types.txt")).unwrap(),
+            "a\t2\nb\t1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b/TARGET")).unwrap(),
+            "x86_64-unknown-linux-gnu\n"
+        );
+        let other =
+            counted(&[]).finish(&root, "b", "aarch64-apple-darwin", false, &[]).unwrap_err();
         assert!(other.contains("--target x86_64-unknown-linux-gnu"), "{other}");
-        let same = counted(&[("clippy::disallowed_types", "a", 2), ("clippy::disallowed_types", "b", 1)]);
+        let same =
+            counted(&[("clippy::disallowed_types", "a", 2), ("clippy::disallowed_types", "b", 1)]);
         assert_eq!(same.finish(&root, "b", T, false, &[]).unwrap(), Vec::<String>::new());
 
-        let grew = counted(&[("clippy::disallowed_types", "a", 3), ("clippy::disallowed_types", "b", 1)]);
+        let grew =
+            counted(&[("clippy::disallowed_types", "a", 3), ("clippy::disallowed_types", "b", 1)]);
         let grew = grew.finish(&root, "b", T, true, &[]).unwrap_err();
-        assert!(grew.contains("`a`: 3 findings, over the baseline's 2") && grew.contains("nothing was written"), "{grew}");
-        let unbaselined = counted(&[("clippy::disallowed_types", "a", 2), ("clippy::disallowed_types", "b", 1), ("blaze::wall_clock", "c", 1)]);
+        assert!(
+            grew.contains("`a`: 3 findings, over the baseline's 2")
+                && grew.contains("nothing was written"),
+            "{grew}"
+        );
+        let unbaselined = counted(&[
+            ("clippy::disallowed_types", "a", 2),
+            ("clippy::disallowed_types", "b", 1),
+            ("blaze::wall_clock", "c", 1),
+        ]);
         let unbaselined = unbaselined.finish(&root, "b", T, false, &[]).unwrap_err();
-        assert!(unbaselined.contains("blaze::wall_clock: 1 findings, and the lint has no baseline"), "{unbaselined}");
+        assert!(
+            unbaselined.contains("blaze::wall_clock: 1 findings, and the lint has no baseline"),
+            "{unbaselined}"
+        );
 
-        let shrank = counted(&[("clippy::disallowed_types", "a", 1)]).finish(&root, "b", T, false, &[]).unwrap_err();
+        let shrank = counted(&[("clippy::disallowed_types", "a", 1)])
+            .finish(&root, "b", T, false, &[])
+            .unwrap_err();
         assert!(shrank.contains("stale") && shrank.contains("--bless-baselines"), "{shrank}");
-        assert!(shrank.contains("`a`: 1 findings, under the baseline's 2") && shrank.contains("`b`: 0 findings"), "{shrank}");
+        assert!(
+            shrank.contains("`a`: 1 findings, under the baseline's 2")
+                && shrank.contains("`b`: 0 findings"),
+            "{shrank}"
+        );
         let fewer = counted(&[("clippy::disallowed_types", "a", 1)]);
-        assert_eq!(fewer.finish(&root, "b", T, true, &[]).unwrap(), ["clippy::disallowed_types: baseline lowered to this run's counts"]);
-        assert_eq!(std::fs::read_to_string(root.join("b/clippy.disallowed_types.txt")).unwrap(), "a\t1\n");
+        assert_eq!(
+            fewer.finish(&root, "b", T, true, &[]).unwrap(),
+            ["clippy::disallowed_types: baseline lowered to this run's counts"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b/clippy.disallowed_types.txt")).unwrap(),
+            "a\t1\n"
+        );
         let none = counted(&[]).finish(&root, "b", T, true, &[]).unwrap();
-        assert_eq!(none, ["clippy::disallowed_types: no finding left, baseline deleted: set the lint to `deny`"]);
+        assert_eq!(
+            none,
+            ["clippy::disallowed_types: no finding left, baseline deleted: set the lint to `deny`"]
+        );
         assert!(!root.join("b/clippy.disallowed_types.txt").exists());
         std::fs::remove_file(root.join("b/TARGET")).unwrap();
         std::fs::write(root.join("b/blaze.wall_clock.txt"), "a\t1\n").unwrap();
@@ -192,15 +256,25 @@ mod tests {
         assert!(untargeted.contains("no `TARGET` file"), "{untargeted}");
         std::fs::remove_file(root.join("b/blaze.wall_clock.txt")).unwrap();
 
-        let zero = counted(&[]).finish(&root, "b", T, false, std::slice::from_ref(&lint)).unwrap_err();
+        let zero =
+            counted(&[]).finish(&root, "b", T, false, std::slice::from_ref(&lint)).unwrap_err();
         assert!(zero.contains("no finding of it"), "{zero}");
         let run = counted(&[("clippy::disallowed_types", "a", 1)]);
         run.finish(&root, "b", T, false, std::slice::from_ref(&lint)).unwrap();
-        let again = counted(&[("clippy::disallowed_types", "a", 1)]).finish(&root, "b", T, false, std::slice::from_ref(&lint)).unwrap_err();
+        let again = counted(&[("clippy::disallowed_types", "a", 1)])
+            .finish(&root, "b", T, false, std::slice::from_ref(&lint))
+            .unwrap_err();
         assert!(again.contains("is there already"), "{again}");
         let one_wrong = ["blaze::wall_clock".to_owned(), "clippy::no_such_lint".to_owned()];
-        assert!(counted(&[("blaze::wall_clock", "a", 1)]).finish(&root, "b", T, false, &one_wrong).is_err());
-        assert!(!root.join("b/blaze.wall_clock.txt").exists(), "a list with a wrong name writes nothing");
+        assert!(
+            counted(&[("blaze::wall_clock", "a", 1)])
+                .finish(&root, "b", T, false, &one_wrong)
+                .is_err()
+        );
+        assert!(
+            !root.join("b/blaze.wall_clock.txt").exists(),
+            "a list with a wrong name writes nothing"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -210,6 +284,9 @@ mod tests {
         run.unowned.push("blaze::wall_clock at src/a.rs: a clock read".to_owned());
         let root = std::env::temp_dir();
         let error = run.finish(&root, "no-such-baselines", T, false, &[]).unwrap_err();
-        assert!(error.contains("no unit") && error.contains("blaze::wall_clock at src/a.rs"), "{error}");
+        assert!(
+            error.contains("no unit") && error.contains("blaze::wall_clock at src/a.rs"),
+            "{error}"
+        );
     }
 }

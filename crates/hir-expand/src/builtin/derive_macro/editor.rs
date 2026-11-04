@@ -89,9 +89,8 @@ pub(super) fn coerce_pointee_derive<'f>(
     };
     let (editor, adt) = SyntaxEditor::with_ast_node(adt);
     let make = editor.make();
-    let refuse = |error: BuiltinError, at: Span| {
-        ExpandResult::new(empty(frame, span), error.at(at))
-    };
+    let refuse =
+        |error: BuiltinError, at: Span| ExpandResult::new(empty(frame, span), error.at(at));
     // rustc's `CoercePointee` errors are E0802.
     fn pointee_error(message: impl Into<Box<str>>) -> BuiltinError {
         BuiltinError::derive(message).code(802)
@@ -267,11 +266,8 @@ pub(super) fn coerce_pointee_derive<'f>(
                 // Otherwise, duplicate only bounds that mention the pointee.
                 let is_pointee = param_name.text() == pointee_param_name.text();
                 let new_bounds = bounds.bounds().filter_map(|bound| {
-                    let new_bound = substitute_type_bound(
-                        &bound,
-                        pointee_param_name.text(),
-                        ADDED_PARAM,
-                    );
+                    let new_bound =
+                        substitute_type_bound(&bound, pointee_param_name.text(), ADDED_PARAM);
 
                     if is_pointee {
                         return new_bound.or(Some(bound));
@@ -654,7 +650,8 @@ pub(super) fn parse_adt_from_handle(
         }
         ast::Adt::Enum(it) => {
             let mut default_variant = None;
-            for (i, variant) in it.variant_list().into_iter().flat_map(|it| it.variants()).enumerate()
+            for (i, variant) in
+                it.variant_list().into_iter().flat_map(|it| it.variants()).enumerate()
             {
                 if default_variant.is_none()
                     && variant.attrs().any(|it| it.simple_name() == Some("default".into()))
@@ -704,10 +701,14 @@ pub(super) fn parse_adt_from_handle(
                     }
                     to_tt(it.syntax())
                 }
-                None => tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site }),
+                None => {
+                    tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site })
+                }
             };
             let bounds = match &param {
-                ast::TypeOrConstParam::Type(it) => it.type_bound_list().map(|it| to_tt(it.syntax())),
+                ast::TypeOrConstParam::Type(it) => {
+                    it.type_bound_list().map(|it| to_tt(it.syntax()))
+                }
                 ast::TypeOrConstParam::Const(_) => None,
             };
             let const_ty = if let ast::TypeOrConstParam::Const(param) = param {
@@ -760,7 +761,12 @@ pub(super) fn parse_adt_from_handle(
     };
     let name_token = name_to_token(call_site, tm, name)?;
     if let Some(kind) = struct_fields {
-        variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) }); // clone: a copy (symbol and span)
+        variants.push(Variant {
+            name: name_token.clone(),
+            kind,
+            start: 0,
+            end: len_u32(fields.len()),
+        }); // clone: a copy (symbol and span)
     }
     // A `#[blaze::bits]` struct's fields have no address either: copied out as a packed one's.
     let packed = adt

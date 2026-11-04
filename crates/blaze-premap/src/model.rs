@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::NativeKind;
+use std::alloc::Global;
 
 use crate::PremapError;
 use crate::image::View;
@@ -72,7 +72,12 @@ fn tls_align(statics: &[&Static]) -> u64 {
 
 /// Places `functions` and `statics` from `from`, their thread-locals from `tls_from` in the
 /// run's area.
-pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], statics: &[&Static]) -> Layout {
+pub(crate) fn place(
+    from: u64,
+    tls_from: u64,
+    functions: &[&CompiledFunction],
+    statics: &[&Static],
+) -> Layout {
     let mut sites = Vec::new();
     let mut placed = Vec::new();
     let mut code = Vec::new();
@@ -82,14 +87,20 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
         code.extend_from_slice(&function.code);
         placed.push((function.key, addr, function.code.len() as u64));
         for reloc in &function.relocs {
-            sites.push(Site { at: addr + u64::from(reloc.at), kind: reloc.kind, target: reloc.target.clone(), addend: reloc.addend });
+            sites.push(Site {
+                at: addr + u64::from(reloc.at),
+                kind: reloc.kind,
+                target: reloc.target.clone(),
+                addend: reloc.addend,
+            });
         }
     }
 
     let ro_at = (from + code.len() as u64).next_multiple_of(PAGE);
     let mut ro = Vec::new();
     let mut data = HashMap::new_in(Global);
-    let blobs = functions.iter().flat_map(|it| &it.data).chain(statics.iter().flat_map(|it| &it.data));
+    let blobs =
+        functions.iter().flat_map(|it| &it.data).chain(statics.iter().flat_map(|it| &it.data));
     for blob in blobs {
         if data.contains_key(&blob.id) {
             continue;
@@ -99,7 +110,12 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
         ro.extend_from_slice(&blob.bytes);
         data.insert(blob.id, addr);
         for reloc in &blob.relocs {
-            sites.push(Site { at: addr + u64::from(reloc.at), kind: reloc.kind, target: reloc.target.clone(), addend: reloc.addend });
+            sites.push(Site {
+                at: addr + u64::from(reloc.at),
+                kind: reloc.kind,
+                target: reloc.target.clone(),
+                addend: reloc.addend,
+            });
         }
     }
 
@@ -140,7 +156,12 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
             Init::Bytes { bytes, relocs } => {
                 rw.extend_from_slice(bytes);
                 for reloc in relocs {
-                    sites.push(Site { at: addr + u64::from(reloc.at), kind: reloc.kind, target: reloc.target.clone(), addend: reloc.addend });
+                    sites.push(Site {
+                        at: addr + u64::from(reloc.at),
+                        kind: reloc.kind,
+                        target: reloc.target.clone(),
+                        addend: reloc.addend,
+                    });
                 }
                 bytes.len() as u64
             }
@@ -151,9 +172,20 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
         };
         if value.section.as_deref() == Some(".init_array") {
             let tie = InitEntry::tie_of(&value.item, &value.instance);
-            init.push(InitEntry { rank: 65536, order: [u32::MAX; 3], tie, at: addr, count: (size / 8) as u32 });
+            init.push(InitEntry {
+                rank: 65536,
+                order: [u32::MAX; 3],
+                tie,
+                at: addr,
+                count: (size / 8) as u32,
+            });
         }
-        out_statics.push(PlacedStatic { item: value.item, instance: value.instance, at: StaticAt::Addr(addr), size });
+        out_statics.push(PlacedStatic {
+            item: value.item,
+            instance: value.instance,
+            at: StaticAt::Addr(addr),
+            size,
+        });
     }
     let mut cells: Vec<(String, u64, bool)> = Vec::new();
     for site in &sites {
@@ -174,13 +206,26 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
 
     let mut segments = Vec::new();
     let mut end = from;
-    for (addr, bytes, prot) in [(from, code, Prot::Code), (ro_at, ro, Prot::ReadOnly), (rw_at, rw, Prot::Data)] {
+    for (addr, bytes, prot) in
+        [(from, code, Prot::Code), (ro_at, ro, Prot::ReadOnly), (rw_at, rw, Prot::Data)]
+    {
         if !bytes.is_empty() {
             end = addr + bytes.len() as u64;
             segments.push(Segment { addr, size: bytes.len() as u64, prot, bytes });
         }
     }
-    Layout { functions: placed, statics: out_statics, data, cells, sites, segments, tls, init, end, tls_from }
+    Layout {
+        functions: placed,
+        statics: out_statics,
+        data,
+        cells,
+        sites,
+        segments,
+        tls,
+        init,
+        end,
+        tls_from,
+    }
 }
 
 impl Layout {
@@ -190,10 +235,12 @@ impl Layout {
                 self.functions.iter().find(|it| it.0 == *key).map(|it| (it.1, Kind::Function))
             }
             Target::Static { item, instance } => {
-                self.statics.iter().find(|it| it.item == *item && it.instance == *instance).map(|it| match it.at {
-                    StaticAt::Addr(addr) => (addr, Kind::Data),
-                    StaticAt::ThreadLocal(offset) => (offset, Kind::ThreadLocal),
-                })
+                self.statics.iter().find(|it| it.item == *item && it.instance == *instance).map(
+                    |it| match it.at {
+                        StaticAt::Addr(addr) => (addr, Kind::Data),
+                        StaticAt::ThreadLocal(offset) => (offset, Kind::ThreadLocal),
+                    },
+                )
             }
             Target::Data(id) => self.data.get(id).map(|it| (*it, Kind::Data)),
             Target::Extern(name) | Target::Weak(name) => {
@@ -201,7 +248,10 @@ impl Layout {
             }
             // The model places no SanitizerCoverage arrays or tier counter cells: a site reaching
             // one is `apply`'s "reaches no" error.
-            Target::Position(_) | Target::Coverage(_) | Target::Counter(_) | Target::ProfileCounters => None,
+            Target::Position(_)
+            | Target::Coverage(_)
+            | Target::Counter(_)
+            | Target::ProfileCounters => None,
         }
     }
 
@@ -212,11 +262,15 @@ impl Layout {
                 Target::Extern(_) | Target::Weak(_) => self.local(&site.target).map(|it| it.0),
                 target => resolve(target),
             }
-            .ok_or_else(|| PremapError::new(format!("the model link reaches no {:?}", site.target)))?;
+            .ok_or_else(|| {
+                PremapError::new(format!("the model link reaches no {:?}", site.target))
+            })?;
             let value = value.wrapping_add_signed(site.addend);
             let field: Vec<u8> = match site.kind {
                 RelocKind::Abs64 => value.to_le_bytes().to_vec(),
-                RelocKind::PcRel32 => (value.wrapping_sub(site.at + 4) as i32).to_le_bytes().to_vec(),
+                RelocKind::PcRel32 => {
+                    (value.wrapping_sub(site.at + 4) as i32).to_le_bytes().to_vec()
+                }
                 RelocKind::TlsOffset => (value as i32).to_le_bytes().to_vec(),
                 kind => panic!("the model writes no {kind:?}"),
             };
@@ -228,10 +282,15 @@ impl Layout {
     fn names(&self, names: &[&(String, Target)]) -> Result<Vec<(String, Def)>, PremapError> {
         let mut out = Vec::with_capacity(names.len());
         for (name, target) in names {
-            let (value, kind) = self
-                .local(target)
-                .ok_or_else(|| PremapError::new(format!("the model link defines `{name}` as {target:?}, not placed")))?;
-            out.push((name.clone(), Def { value, size: 0, kind, strength: Strength::Strong, order: u32::MAX }));
+            let (value, kind) = self.local(target).ok_or_else(|| {
+                PremapError::new(format!(
+                    "the model link defines `{name}` as {target:?}, not placed"
+                ))
+            })?;
+            out.push((
+                name.clone(),
+                Def { value, size: 0, kind, strength: Strength::Strong, order: u32::MAX },
+            ));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
@@ -251,7 +310,9 @@ fn libraries(natives: &[blaze_link::Native<'_>]) -> Vec<Library> {
     natives
         .iter()
         .filter_map(|it| match it.kind {
-            NativeKind::Shared { as_needed } => Some(Library { name: it.name.to_owned(), order: it.order, as_needed }),
+            NativeKind::Shared { as_needed } => {
+                Some(Library { name: it.name.to_owned(), order: it.order, as_needed })
+            }
             _ => None,
         })
         .collect()
@@ -264,17 +325,23 @@ impl Prelink for Model {
     type Placed = Prelinked;
 
     fn prelink(&self, request: &Request<'_>) -> Result<Prelinked, PremapError> {
-        assert_eq!(request.link.tls_bias, TLS_BIAS, "the model's executable keeps the image's thread-locals at its bias");
+        assert_eq!(
+            request.link.tls_bias, TLS_BIAS,
+            "the model's executable keeps the image's thread-locals at its bias"
+        );
         let mut layout = place(request.link.base, 0, request.link.functions, request.link.statics);
         let names = layout.names(request.link.names)?;
         let local = |target: &Target| layout.local(target).map(|it| it.0);
-        let resolved: Vec<_> = layout.sites.iter().map(|it| (it.target.clone(), local(&it.target))).collect();
+        let resolved: Vec<_> =
+            layout.sites.iter().map(|it| (it.target.clone(), local(&it.target))).collect();
         layout.apply(&|target| resolved.iter().find(|it| it.0 == *target).and_then(|it| it.1))?;
         let mut binds = Vec::new();
         for (name, cell, weak) in layout.cells.clone() {
             match names.iter().find(|it| it.0 == name) {
                 Some((_, def)) => write(&mut layout.segments, cell, &def.value.to_le_bytes()),
-                None => binds.push(Bind { place: cell, name, addend: 0, kind: BindKind::Addr, weak }),
+                None => {
+                    binds.push(Bind { place: cell, name, addend: 0, kind: BindKind::Addr, weak })
+                }
             }
         }
         Ok(Prelinked {
@@ -345,7 +412,12 @@ pub(crate) fn whole(
         .sites
         .iter()
         .chain(&second.sites)
-        .map(|it| (it.target.clone(), first.local(&it.target).or_else(|| second.local(&it.target)).map(|it| it.0)))
+        .map(|it| {
+            (
+                it.target.clone(),
+                first.local(&it.target).or_else(|| second.local(&it.target)).map(|it| it.0),
+            )
+        })
         .collect();
     let resolve = |target: &Target| resolved.iter().find(|it| it.0 == *target).and_then(|it| it.1);
     first.apply(&resolve)?;
@@ -363,7 +435,10 @@ pub(crate) fn whole(
     }
     let mut init: Vec<&InitEntry> = first.init.iter().chain(&second.init).collect();
     init.sort_by_key(|it| it.sort_key());
-    let init = init.iter().flat_map(|it| (0..u64::from(it.count)).map(|n| read(&memory, it.at + n * 8))).collect();
+    let init = init
+        .iter()
+        .flat_map(|it| (0..u64::from(it.count)).map(|n| read(&memory, it.at + n * 8)))
+        .collect();
     let tls = [&first, &second]
         .iter()
         .zip([0, tls_from])
@@ -388,9 +463,13 @@ fn run(layouts: &[&Layout], memory: Memory, init: Vec<u64>, tls: Vec<(u64, u64, 
 }
 
 /// The workspace link against `image`, and the run's start for it.
-pub(crate) fn link_workspace(part: &WorkspacePart<'_>, image: &View<'_>) -> Result<Layout, PremapError> {
+pub(crate) fn link_workspace(
+    part: &WorkspacePart<'_>,
+    image: &View<'_>,
+) -> Result<Layout, PremapError> {
     let tls_from = tls_from(image.tls().as_ref(), tls_align(&part.statics));
-    let mut layout = place(image.end().next_multiple_of(PAGE), tls_from, &part.functions, &part.statics);
+    let mut layout =
+        place(image.end().next_multiple_of(PAGE), tls_from, &part.functions, &part.statics);
     let table = image.table();
     let resolved: Vec<(Target, Option<u64>)> = layout
         .sites
@@ -398,10 +477,15 @@ pub(crate) fn link_workspace(part: &WorkspacePart<'_>, image: &View<'_>) -> Resu
         .map(|it| {
             let outside = match &it.target {
                 Target::Function(key) | Target::Direct(key) => table.get(&SymbolId::function(key)),
-                Target::Static { item, instance } => table.get(&SymbolId::of_static(item, instance)),
+                Target::Static { item, instance } => {
+                    table.get(&SymbolId::of_static(item, instance))
+                }
                 _ => None,
             };
-            (it.target.clone(), layout.local(&it.target).map(|it| it.0).or(outside.map(|it| it.value)))
+            (
+                it.target.clone(),
+                layout.local(&it.target).map(|it| it.0).or(outside.map(|it| it.value)),
+            )
         })
         .collect();
     layout.apply(&|target| resolved.iter().find(|it| it.0 == *target).and_then(|it| it.1))?;
@@ -409,12 +493,18 @@ pub(crate) fn link_workspace(part: &WorkspacePart<'_>, image: &View<'_>) -> Resu
 }
 
 /// The run's start for `image` beside the workspace executable whose names are `names`.
-pub(crate) fn start_of<'v>(image: &View<'v>, names: &[(String, Def)]) -> Result<Start<'v>, PremapError> {
+pub(crate) fn start_of<'v>(
+    image: &View<'v>,
+    names: &[(String, Def)],
+) -> Result<Start<'v>, PremapError> {
     start::plan(image, names)
 }
 
 /// The names the workspace link defines, sorted, as its layout placed them.
-pub(crate) fn workspace_names(layout: &Layout, part: &WorkspacePart<'_>) -> Result<Vec<(String, Def)>, PremapError> {
+pub(crate) fn workspace_names(
+    layout: &Layout,
+    part: &WorkspacePart<'_>,
+) -> Result<Vec<(String, Def)>, PremapError> {
     layout.names(&part.names)
 }
 
@@ -454,11 +544,18 @@ pub(crate) fn split(
     }
     for lookup in &start.lookups {
         let value = library(libraries, lookup.name, lookup.weak)?;
-        poke(&mut memory, lookup.place, if value == 0 { 0 } else { value.wrapping_add_signed(lookup.addend) });
+        poke(
+            &mut memory,
+            lookup.place,
+            if value == 0 { 0 } else { value.wrapping_add_signed(lookup.addend) },
+        );
     }
     let mut pieces: Vec<InitEntry> = image.init().chain(layout.init.iter().copied()).collect();
     pieces.sort_by_key(|it| it.sort_key());
-    let init = pieces.iter().flat_map(|it| (0..u64::from(it.count)).map(|n| read(&memory, it.at + n * 8))).collect();
+    let init = pieces
+        .iter()
+        .flat_map(|it| (0..u64::from(it.count)).map(|n| read(&memory, it.at + n * 8)))
+        .collect();
     let tls = [(image.tls(), 0), (layout.tls, layout.tls_from)]
         .into_iter()
         .filter_map(|(tls, offset)| tls.map(|it| (it.template, it.size, offset)))
@@ -469,10 +566,12 @@ pub(crate) fn split(
     for key in keys.0 {
         let at = match layout.local(&Target::Function(*key)) {
             Some((at, _)) => at,
-            None => table
-                .get(&SymbolId::function(key))
-                .ok_or_else(|| PremapError::new(format!("the split run has no {key:?}")))?
-                .value,
+            None => {
+                table
+                    .get(&SymbolId::function(key))
+                    .ok_or_else(|| PremapError::new(format!("the split run has no {key:?}")))?
+                    .value
+            }
         };
         functions.insert(*key, at);
     }
@@ -480,10 +579,14 @@ pub(crate) fn split(
     for &(item, instance) in keys.1 {
         let at = match layout.local(&Target::Static { item, instance }) {
             Some((at, _)) => at,
-            None => table
-                .get(&SymbolId::of_static(&item, &instance))
-                .ok_or_else(|| PremapError::new(format!("the split run has no static {item:?}")))?
-                .value,
+            None => {
+                table
+                    .get(&SymbolId::of_static(&item, &instance))
+                    .ok_or_else(|| {
+                        PremapError::new(format!("the split run has no static {item:?}"))
+                    })?
+                    .value
+            }
         };
         statics.insert((item, instance), at);
     }

@@ -25,7 +25,8 @@ pub(crate) const WASI: &str = <blaze_wasi::W32 as blaze_wasi::Width>::MODULE;
 /// - `current_dir(into, capacity) -> len`: the directory cargo runs rustc in for the calling
 ///   crate (`Os::current_dir`), which the glue enters before its macro runs, as wasi-libc
 ///   resolves a relative path against its own working directory (`/` until then).
-pub(crate) const BRIDGE_SHIMS: &[&str] = &["dispatch", "reply", "output", "hashmap_random_keys", "env_var", "current_dir"];
+pub(crate) const BRIDGE_SHIMS: &[&str] =
+    &["dispatch", "reply", "output", "hashmap_random_keys", "env_var", "current_dir"];
 
 /// The WASI preview 1 functions std for `wasm32-wasip1` reaches, each `blaze_wasi`'s over the
 /// sandbox's answers in `wasi.rs`.

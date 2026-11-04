@@ -21,8 +21,8 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_profile::{batches::schema_of, schema};
+use std::alloc::Global;
 
 /// The most buckets one request may ask for: eight 8K screens across.
 pub const MAX_BUCKETS: u64 = 1 << 16;
@@ -91,9 +91,15 @@ impl Range {
 pub enum TilesError {
     Range(String),
     /// A batch has no column `column`, or not of a type it can be read as.
-    Column { column: &'static str, found: Option<DataType> },
+    Column {
+        column: &'static str,
+        found: Option<DataType>,
+    },
     /// A column holds a null or a value out of its schema's range.
-    Value { column: &'static str, row: usize },
+    Value {
+        column: &'static str,
+        row: usize,
+    },
     Arrow(ArrowError),
 }
 
@@ -102,9 +108,14 @@ impl std::fmt::Display for TilesError {
         match self {
             TilesError::Range(why) => write!(f, "the tiles' range: {why}"),
             TilesError::Column { column, found: Some(ty) } => {
-                write!(f, "the spans' column `{column}` is {ty}, not an integer or string column tiles read")
+                write!(
+                    f,
+                    "the spans' column `{column}` is {ty}, not an integer or string column tiles read"
+                )
             }
-            TilesError::Column { column, found: None } => write!(f, "the spans have no column `{column}`"),
+            TilesError::Column { column, found: None } => {
+                write!(f, "the spans have no column `{column}`")
+            }
             TilesError::Value { column, row } => {
                 write!(f, "the spans' `{column}` at row {row} is null or out of the schema's range")
             }
@@ -188,7 +199,8 @@ impl Ints<'_> {
 }
 
 fn column<'a>(batch: &'a RecordBatch, name: &'static str) -> Result<&'a ArrayRef, TilesError> {
-    let column = batch.column_by_name(name).ok_or(TilesError::Column { column: name, found: None })?;
+    let column =
+        batch.column_by_name(name).ok_or(TilesError::Column { column: name, found: None })?;
     if column.null_count() > 0 {
         let row = (0..column.len()).find(|&it| column.is_null(it)).unwrap_or(0);
         return Err(TilesError::Value { column: name, row });
@@ -227,11 +239,17 @@ fn names<'a>(batch: &'a RecordBatch) -> Result<Names<'a>, TilesError> {
     Ok(match array.data_type() {
         DataType::Dictionary(key, _) if **key == DataType::UInt32 => {
             let dict = array.as_dictionary::<UInt32Type>();
-            Names::DictU32(&dict.keys().values()[..], dict.values().as_string_opt::<i32>().ok_or_else(wrong)?)
+            Names::DictU32(
+                &dict.keys().values()[..],
+                dict.values().as_string_opt::<i32>().ok_or_else(wrong)?,
+            )
         }
         DataType::Dictionary(key, _) if **key == DataType::Int32 => {
             let dict = array.as_dictionary::<Int32Type>();
-            Names::DictI32(&dict.keys().values()[..], dict.values().as_string_opt::<i32>().ok_or_else(wrong)?)
+            Names::DictI32(
+                &dict.keys().values()[..],
+                dict.values().as_string_opt::<i32>().ok_or_else(wrong)?,
+            )
         }
         DataType::Utf8 => Names::Utf8(array.as_string::<i32>()),
         DataType::LargeUtf8 => Names::Large(array.as_string::<i64>()),
@@ -295,7 +313,11 @@ pub fn tiles(spans: &[RecordBatch], range: Range) -> Result<RecordBatch, TilesEr
 
 /// [`tiles`] with a lane per `lane`: for [`Lane::Job`], the spans have `job` in place of
 /// `thread` and the output is `job_tiles`.
-pub fn tiles_by(spans: &[RecordBatch], range: Range, lane: Lane) -> Result<RecordBatch, TilesError> {
+pub fn tiles_by(
+    spans: &[RecordBatch],
+    range: Range,
+    lane: Lane,
+) -> Result<RecordBatch, TilesError> {
     let mut table = NameTable::default();
     let rows: usize = spans.iter().map(RecordBatch::num_rows).sum();
     // alloc: once a request, the spans of its range
@@ -303,7 +325,8 @@ pub fn tiles_by(spans: &[RecordBatch], range: Range, lane: Lane) -> Result<Recor
     // alloc: once a request, grown to the largest dictionary of a batch
     let mut keyed: Vec<u32> = Vec::new();
     for batch in spans {
-        let (process, lanes, depth) = (ints(batch, "process")?, ints(batch, lane.column())?, ints(batch, "depth")?);
+        let (process, lanes, depth) =
+            (ints(batch, "process")?, ints(batch, lane.column())?, ints(batch, "depth")?);
         let (start, dur, names) = (ints(batch, "start_ns")?, ints(batch, "dur_ns")?, names(batch)?);
         keyed.clear();
         if let Names::DictU32(_, values) | Names::DictI32(_, values) = &names {
@@ -314,19 +337,26 @@ pub fn tiles_by(spans: &[RecordBatch], range: Range, lane: Lane) -> Result<Recor
             let start = start.get(row).ok_or_else(|| at("start_ns"))?;
             let dur = dur.get(row).ok_or_else(|| at("dur_ns"))?.max(0);
             let end = start.saturating_add(dur);
-            let inside = start < range.t1_ns && (end > range.t0_ns || (dur == 0 && start >= range.t0_ns));
+            let inside =
+                start < range.t1_ns && (end > range.t0_ns || (dur == 0 && start >= range.t0_ns));
             if !inside {
                 continue;
             }
-            let process = process.get(row).and_then(|it| u32::try_from(it).ok()).ok_or_else(|| at("process"))?;
+            let process = process
+                .get(row)
+                .and_then(|it| u32::try_from(it).ok())
+                .ok_or_else(|| at("process"))?;
             let of = lanes.get(row).and_then(|it| match lane {
                 Lane::Thread => u32::try_from(it).ok().map(u64::from),
                 Lane::Job => u64::try_from(it).ok(),
             });
             let of = of.ok_or_else(|| at(lane.column()))?;
-            let depth = depth.get(row).and_then(|it| u16::try_from(it).ok()).ok_or_else(|| at("depth"))?;
+            let depth =
+                depth.get(row).and_then(|it| u16::try_from(it).ok()).ok_or_else(|| at("depth"))?;
             let name = match &names {
-                Names::DictU32(keys, values) => dict_name(&mut table, &mut keyed, values, keys[row] as usize),
+                Names::DictU32(keys, values) => {
+                    dict_name(&mut table, &mut keyed, values, keys[row] as usize)
+                }
                 Names::DictI32(keys, values) => {
                     let key = usize::try_from(keys[row]).map_err(|_| at("name"))?;
                     dict_name(&mut table, &mut keyed, values, key)
@@ -356,16 +386,22 @@ pub fn tiles_by(spans: &[RecordBatch], range: Range, lane: Lane) -> Result<Recor
     let mut at = 0;
     while at < kept.len() {
         let track = (kept[at].group, kept[at].depth);
-        let len = kept[at..].iter().position(|it| (it.group, it.depth) != track).unwrap_or(kept.len() - at);
+        let len = kept[at..]
+            .iter()
+            .position(|it| (it.group, it.depth) != track)
+            .unwrap_or(kept.len() - at);
         sweep(&kept[at..at + len], range, &mut open, &mut out);
         at += len;
     }
     let values = StringArray::from(table.names);
-    let name = DictionaryArray::<UInt32Type>::try_new(UInt32Array::from(out.name), Arc::new(values))
-        .map_err(TilesError::Arrow)?;
+    let name =
+        DictionaryArray::<UInt32Type>::try_new(UInt32Array::from(out.name), Arc::new(values))
+            .map_err(TilesError::Arrow)?;
     let lanes: ArrayRef = match lane {
         // alloc: a column of the answer, once a request
-        Lane::Thread => Arc::new(UInt32Array::from_iter_values(out.lane.iter().map(|it| *it as u32))),
+        Lane::Thread => {
+            Arc::new(UInt32Array::from_iter_values(out.lane.iter().map(|it| *it as u32)))
+        }
         // alloc: a column of the answer, once a request
         Lane::Job => Arc::new(UInt64Array::from(out.lane)),
     };
@@ -385,7 +421,12 @@ pub fn tiles_by(spans: &[RecordBatch], range: Range, lane: Lane) -> Result<Recor
 /// The output's number of the name at `key` of a batch's dictionary `values`, looked up once a
 /// key a batch.
 #[inline]
-fn dict_name<'a>(table: &mut NameTable<'a>, keyed: &mut [u32], values: &'a StringArray, key: usize) -> Option<u32> {
+fn dict_name<'a>(
+    table: &mut NameTable<'a>,
+    keyed: &mut [u32],
+    values: &'a StringArray,
+    key: usize,
+) -> Option<u32> {
     let slot = keyed.get_mut(key)?;
     if *slot == u32::MAX {
         if values.is_null(key) {
@@ -450,7 +491,10 @@ mod tests {
     /// A batch of `(process, thread, depth, name, start_ns, dur_ns)`, names as plain strings.
     fn batch(rows: &[(u32, u32, u16, &str, i64, i64)]) -> RecordBatch {
         RecordBatch::try_from_iter([
-            ("process", Arc::new(UInt32Array::from_iter_values(rows.iter().map(|it| it.0))) as ArrayRef),
+            (
+                "process",
+                Arc::new(UInt32Array::from_iter_values(rows.iter().map(|it| it.0))) as ArrayRef,
+            ),
             ("thread", Arc::new(UInt32Array::from_iter_values(rows.iter().map(|it| it.1)))),
             ("depth", Arc::new(UInt16Array::from_iter_values(rows.iter().map(|it| it.2)))),
             ("name", Arc::new(StringArray::from_iter_values(rows.iter().map(|it| it.3)))),
@@ -467,7 +511,8 @@ mod tests {
         let depth = tiles.column(2).as_primitive::<UInt16Type>().values().to_vec();
         let names = tiles.column(7).as_dictionary::<UInt32Type>();
         let values = names.values().as_string::<i32>();
-        let (process, thread, t0, t1, count, busy) = (u32s(0), u32s(1), i64s(3), i64s(4), u32s(5), i64s(6));
+        let (process, thread, t0, t1, count, busy) =
+            (u32s(0), u32s(1), i64s(3), i64s(4), u32s(5), i64s(6));
         (0..tiles.num_rows())
             .map(|i| {
                 let name = values.value(names.keys().value(i) as usize).to_owned();
@@ -507,7 +552,11 @@ mod tests {
 
     #[test]
     fn the_last_bucket_ends_at_the_range_and_an_instant_counts_where_it_is() {
-        let spans = batch(&[(1, 1, 0, "long", 0, 1000), (1, 1, 1, "instant", 22, 0), (1, 1, 1, "at end", 25, 0)]);
+        let spans = batch(&[
+            (1, 1, 0, "long", 0, 1000),
+            (1, 1, 1, "instant", 22, 0),
+            (1, 1, 1, "at end", 25, 0),
+        ]);
         let range = Range::new(0, 25, 10).unwrap();
         assert_eq!(range.buckets(), 3);
         let got = rows(&tiles(&[spans], range).unwrap());
@@ -545,16 +594,30 @@ mod tests {
         .unwrap();
         let plain = batch(&[(3, 4, 0, "second", 20, 20)]);
         let got = rows(&tiles(&[dict, plain], range).unwrap());
-        assert_eq!(got, vec![(3, 4, 0, 0, 50, 2, 30, "second".to_owned()), (3, 4, 0, 50, 100, 1, 30, "first".to_owned())]);
-        let tiles = tiles(&[batch(&[(1, 1, 0, "a", 0, 1)]), batch(&[(1, 1, 0, "a", 2, 1)])], range).unwrap();
-        assert_eq!(tiles.column(7).as_dictionary::<UInt32Type>().values().len(), 1, "a name is in the output once");
+        assert_eq!(
+            got,
+            vec![
+                (3, 4, 0, 0, 50, 2, 30, "second".to_owned()),
+                (3, 4, 0, 50, 100, 1, 30, "first".to_owned())
+            ]
+        );
+        let tiles = tiles(&[batch(&[(1, 1, 0, "a", 0, 1)]), batch(&[(1, 1, 0, "a", 2, 1)])], range)
+            .unwrap();
+        assert_eq!(
+            tiles.column(7).as_dictionary::<UInt32Type>().values().len(),
+            1,
+            "a name is in the output once"
+        );
     }
 
     #[test]
     fn a_missing_or_mistyped_column_is_named() {
         let range = Range::new(0, 10, 1).unwrap();
         let no_depth = batch(&[(1, 1, 0, "a", 0, 1)]).project(&[0, 1, 3, 4, 5]).unwrap();
-        assert!(matches!(tiles(&[no_depth], range), Err(TilesError::Column { column: "depth", found: None })));
+        assert!(matches!(
+            tiles(&[no_depth], range),
+            Err(TilesError::Column { column: "depth", found: None })
+        ));
         let floats = RecordBatch::try_from_iter([
             ("process", Arc::new(arrow_array::Float64Array::from(vec![1.0])) as ArrayRef),
             ("thread", Arc::new(UInt32Array::from(vec![1]))),
@@ -571,7 +634,10 @@ mod tests {
             ["process", "thread", "depth", "name", "start_ns", "dur_ns"].into_iter().zip(columns),
         )
         .unwrap();
-        assert!(matches!(tiles(&[huge], range), Err(TilesError::Value { column: "depth", row: 0 })));
+        assert!(matches!(
+            tiles(&[huge], range),
+            Err(TilesError::Value { column: "depth", row: 0 })
+        ));
     }
 
     /// Random tracks of overlapping, nested, instant and out-of-range spans, against a count of
@@ -592,7 +658,14 @@ mod tests {
                 .map(|i| {
                     let start = t0 - 500 + rng.below(width as u64 + 1_000) as i64;
                     let dur = if rng.one_in(6) { 0 } else { rng.below(width as u64) as i64 };
-                    (1 + rng.below(2) as u32, 10 + rng.below(2) as u32, rng.below(3) as u16, names[i].as_str(), start, dur)
+                    (
+                        1 + rng.below(2) as u32,
+                        10 + rng.below(2) as u32,
+                        rng.below(3) as u16,
+                        names[i].as_str(),
+                        start,
+                        dur,
+                    )
                 })
                 .collect();
             let half = spans.len() / 2;
@@ -606,10 +679,13 @@ mod tests {
                 let (bt0, bt1) = (range.start(b), range.end(b));
                 for &(p, t, d, _, start, dur) in &spans {
                     let (s, e) = (start.max(t0), (start + dur).min(t0 + width));
-                    let inside = start < t0 + width && (start + dur > t0 || (dur == 0 && start >= t0));
-                    if inside && (if e > s { s < bt1 && e > bt0 } else { (bt0..bt1).contains(&s) }) {
+                    let inside =
+                        start < t0 + width && (start + dur > t0 || (dur == 0 && start >= t0));
+                    if inside && (if e > s { s < bt1 && e > bt0 } else { (bt0..bt1).contains(&s) })
+                    {
                         covered_buckets += 1;
-                        let entry = want.entry((p, t, d, bt0)).or_insert((bt1, 0u32, Vec::new(), -1i64));
+                        let entry =
+                            want.entry((p, t, d, bt0)).or_insert((bt1, 0u32, Vec::new(), -1i64));
                         entry.1 += 1;
                         if e > s {
                             entry.2.push((s.max(bt0), e.min(bt1)));
@@ -634,7 +710,11 @@ mod tests {
                 }
                 assert_eq!((bt1, count, busy), (want_t1, want_count, &union), "case {case}");
                 assert!(*busy >= 0 && *busy <= bt1 - bt0, "case {case}: busy within the bucket");
-                assert_eq!(dur_of[name.as_str()], *longest, "case {case}: named for a longest span");
+                assert_eq!(
+                    dur_of[name.as_str()],
+                    *longest,
+                    "case {case}: named for a longest span"
+                );
                 counted += u64::from(*count);
             }
             assert_eq!(counted, covered_buckets, "case {case}: the counts add up");

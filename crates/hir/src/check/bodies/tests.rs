@@ -122,8 +122,10 @@ fn a_check_by_bodies_is_the_collector_walking_each_module_whole() {
         let listed: Vec<DefWithBodyId> = plan.listed().into_iter().rev().collect();
         plan.reached(&listed[..listed.len() / 2]);
         let by_tasks = plan.run(&db, false).pop().unwrap_or_default();
-        let whole: Vec<_> =
-            file_modules(&db, krate).iter().flat_map(|&it| check_module(&db, it, false, &every_body)).collect();
+        let whole: Vec<_> = file_modules(&db, krate)
+            .iter()
+            .flat_map(|&it| check_module(&db, it, false, &every_body))
+            .collect();
         assert_eq!(kinds(&by_tasks), kinds(&whole));
         assert_eq!(format!("{by_tasks:?}"), format!("{whole:?}"));
     });
@@ -189,8 +191,10 @@ fn reached_bodies_are_checked_before_the_others() {
             plan.run(&db, false);
             let ran = plan.ran();
             assert_eq!(ran[..2], [Ran::Body(d), Ran::Body(c)], "{order:?}: {ran:?}");
-            let mut bodies: Vec<DefWithBodyId> =
-                ran.iter().filter_map(|it| if let Ran::Body(it) = it { Some(*it) } else { None }).collect();
+            let mut bodies: Vec<DefWithBodyId> = ran
+                .iter()
+                .filter_map(|it| if let Ran::Body(it) = it { Some(*it) } else { None })
+                .collect();
             assert_eq!(bodies.len(), 4, "each body once: {ran:?}");
             bodies.sort_by_key(|it| [a, b, c, d].iter().position(|that| that == it));
             assert_eq!(bodies, [a, b, c, d]);
@@ -272,8 +276,12 @@ fn every_body_is_claimed_once_with_posters_and_claimers_on_several_threads() {
             });
         }
     });
-    let wrong: Vec<usize> =
-        claims.iter().enumerate().filter(|(_, it)| it.load(Ordering::Relaxed) != 1).map(|(at, _)| at).collect();
+    let wrong: Vec<usize> = claims
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.load(Ordering::Relaxed) != 1)
+        .map(|(at, _)| at)
+        .collect();
     assert!(wrong.is_empty(), "bodies not claimed exactly once: {wrong:?}");
 }
 

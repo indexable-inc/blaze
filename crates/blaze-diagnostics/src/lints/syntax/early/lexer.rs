@@ -24,15 +24,15 @@ mod idents;
 mod keywords;
 mod lex;
 
-use std::borrow::Cow;
 use blaze_hash::hash_map;
+use std::borrow::Cow;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroDefKind;
 use span::{Edition, FileId};
+use std::alloc::Global;
 use syntax::{SyntaxKind, SyntaxNodePtr, TextRange};
 
 use crate::{
@@ -47,10 +47,11 @@ use crate::{
 
 use self::lex::{Lexed, LexedFile};
 
-
 pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Emitted> {
     // alloc: empty, allocates nothing
-    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
+    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else {
+        return Vec::new();
+    };
     // alloc: empty, allocates nothing
     let Some(root) = walk.tree(HirFileId::from(root)) else { return Vec::new() };
     let krate = root.ptr(root.root);
@@ -87,8 +88,12 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Emitted> {
         }
         for &ident in &lexed.idents {
             let symbol = lex::nfc(&text[ident.symbol_range()]);
-            let order = (index as u32, u32::from(ident.range.start()), u32::from(ident.range.end()));
-            gallery.symbols.entry(symbol).or_insert(Entry { order, place: Place::File(source.file, ident.range) });
+            let order =
+                (index as u32, u32::from(ident.range.start()), u32::from(ident.range.end()));
+            gallery
+                .symbols
+                .entry(symbol)
+                .or_insert(Entry { order, place: Place::File(source.file, ident.range) });
         }
     }
     if gathered {
@@ -120,7 +125,8 @@ fn gathers_idents(cx: &Cx<'_, '_>, walk: &Walk<'_>, ascii: &[bool]) -> bool {
         return true;
     }
     walk.trees.iter().any(|tree| {
-        tree.call.is_some_and(|call| matches!(call.loc(cx.db).def.kind, MacroDefKind::ProcMacro(..)))
+        tree.call
+            .is_some_and(|call| matches!(call.loc(cx.db).def.kind, MacroDefKind::ProcMacro(..)))
             && !tree.root.text().is_ascii()
     })
 }
@@ -264,7 +270,13 @@ fn escaped(c: char) -> String {
 
 /// The lint rustc's lexer buffers for `lexed`, of `file` (whose text is `text`), at the crate
 /// root `krate`.
-fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: InFile<SyntaxNodePtr>) -> Emitted {
+fn lexer_lint(
+    cx: &Cx<'_, '_>,
+    file: FileId,
+    text: &str,
+    lexed: Lexed,
+    krate: InFile<SyntaxNodePtr>,
+) -> Emitted {
     let span = |range: TextRange| cx.span_in_file(file, range);
     let mut diag = match lexed {
         Lexed::Comment { range, chars } => {
@@ -284,7 +296,12 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
             }
             // alloc: the lint's text, for a lint found
             let parts = chars.iter().map(|&(_, range)| (span(range), String::new())).collect();
-            diag.suggestion_with_style(parts, REMOVE_THEM, Applicability::MachineApplicable, SuggestionStyle::HideCodeAlways);
+            diag.suggestion_with_style(
+                parts,
+                REMOVE_THEM,
+                Applicability::MachineApplicable,
+                SuggestionStyle::HideCodeAlways,
+            );
             diag
         }
         Lexed::Literal { range, label, chars, inner, doc } => {
@@ -307,7 +324,8 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
             }
             if inner && !chars.is_empty() {
                 // alloc: the lint's text, for a lint found
-                let removed = chars.iter().map(|&(_, range)| (span(range), String::new())).collect();
+                let removed =
+                    chars.iter().map(|&(_, range)| (span(range), String::new())).collect();
                 diag.suggestion_with_style(
                     removed,
                     REMOVE_THEM,
@@ -360,7 +378,11 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
         Lexed::RawPrefix { range } => {
             let at = span(range);
             // clone: a lint's span, for a lint found
-            let mut diag = Diag::lint("rust_2021_prefixes_incompatible_syntax", "prefix `'r` is reserved", at.clone());
+            let mut diag = Diag::lint(
+                "rust_2021_prefixes_incompatible_syntax",
+                "prefix `'r` is reserved",
+                at.clone(),
+            );
             diag.span_label(at, "reserved prefix");
             diag.suggestion(
                 span(TextRange::empty(range.end())),
@@ -381,8 +403,14 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
                     "insert whitespace here to avoid this being parsed as a forbidden token in Rust 2024",
                 ),
             };
-            let mut diag = Diag::lint("rust_2024_guarded_string_incompatible_syntax", message, span(range));
-            diag.suggestion(span(TextRange::empty(space)), help, " ", Applicability::MachineApplicable);
+            let mut diag =
+                Diag::lint("rust_2024_guarded_string_incompatible_syntax", message, span(range));
+            diag.suggestion(
+                span(TextRange::empty(space)),
+                help,
+                " ",
+                Applicability::MachineApplicable,
+            );
             diag
         }
     };
@@ -428,6 +456,9 @@ mod tests {
     #[test]
     fn an_empty_range_is_where_whitespace_goes() {
         let range = TextRange::new(TextSize::from(3), TextSize::from(5));
-        assert_eq!(TextRange::empty(range.end()), TextRange::new(TextSize::from(5), TextSize::from(5)));
+        assert_eq!(
+            TextRange::empty(range.end()),
+            TextRange::new(TextSize::from(5), TextSize::from(5))
+        );
     }
 }

@@ -96,17 +96,25 @@ pub(crate) fn crate_attrs<'db>(cx: &Cx<'_, 'db>) -> Vec<view::Meta<'db>> {
 }
 
 /// Each of [`crate_attrs`] in order, until `each` breaks; nothing gathered.
-fn each_crate_attr<'db, B>(cx: &Cx<'_, 'db>, mut each: impl FnMut(view::Meta<'db>) -> ControlFlow<B>) -> Option<B> {
+fn each_crate_attr<'db, B>(
+    cx: &Cx<'_, 'db>,
+    mut each: impl FnMut(view::Meta<'db>) -> ControlFlow<B>,
+) -> Option<B> {
     let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db)?;
     let tree = cx.vsema.parse(root);
-    let attrs = tree.attrs().chain(hir_def::attrs::cli_crate_attrs(cx.db, cx.krate.into()).map(|it| it.value));
+    let attrs = tree
+        .attrs()
+        .chain(hir_def::attrs::cli_crate_attrs(cx.db, cx.krate.into()).map(|it| it.value));
     hir_expand::attrs::expand_cfg_attr_view(attrs, || cx.krate.cfg(cx.db), |meta, _| each(meta))
 }
 
 /// Whether the crate has the attribute `#![name]` (or `#![name(..)]`, `#![name = ..]`).
 pub(crate) fn has_crate_attr(cx: &Cx<'_, '_>, name: &str) -> bool {
     each_crate_attr(cx, |meta| {
-        let named = meta.path().and_then(|path| path.as_single_name_ref()).is_some_and(|it| it.text() == name)
+        let named = meta
+            .path()
+            .and_then(|path| path.as_single_name_ref())
+            .is_some_and(|it| it.text() == name)
             && !matches!(meta, view::Meta::CfgMeta(_) | view::Meta::CfgAttrMeta(_));
         match named {
             true => ControlFlow::Break(()),

@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::PackageId;
 use semver::Version;
 use serde::Deserialize;
+use std::alloc::Global;
 
 use crate::load::files::{Found, normal_text as normalize, read_dir, read_file};
 
@@ -115,12 +115,7 @@ fn base_name(path: &str) -> &str {
 
 /// cargo's `read_nested_packages`: the package of `dir` and of each `path` dependency it names,
 /// once each. A manifest that does not read is skipped, as cargo skips one in a git source.
-fn read_nested(
-    cx: &mut Cx<'_>,
-    root: &str,
-    dir: &str,
-    walk: &mut Walk,
-) -> Result<(), Cancelled> {
+fn read_nested(cx: &mut Cx<'_>, root: &str, dir: &str, walk: &mut Walk) -> Result<(), Cancelled> {
     if !walk.visited.insert(dir.to_owned()) {
         return Ok(());
     }
@@ -153,7 +148,9 @@ fn read_nested(
     let version = match package.get("version") {
         None => Some(Version::new(0, 0, 0)),
         Some(toml::Value::String(it)) => Version::parse(it).ok(),
-        Some(toml::Value::Table(it)) if it.get("workspace").and_then(toml::Value::as_bool) == Some(true) => {
+        Some(toml::Value::Table(it))
+            if it.get("workspace").and_then(toml::Value::as_bool) == Some(true) =>
+        {
             workspace.as_ref().and_then(|(_, table)| {
                 let version = table.get("workspace")?.get("package")?.get("version")?.as_str()?;
                 Version::parse(version).ok()
@@ -181,9 +178,8 @@ fn read_table(
         Found::Here(bytes) => match String::from_utf8(bytes) {
             Ok(text) => match toml::from_str::<toml::Table>(&text) {
                 Ok(table) => Ok(Some(table)),
-                Err(error) => {
-                    Err(anyhow::Error::new(error).context(format!("failed to parse manifest at `{path}`")))
-                }
+                Err(error) => Err(anyhow::Error::new(error)
+                    .context(format!("failed to parse manifest at `{path}`"))),
             },
             Err(_) => Err(anyhow!("failed to read `{path}`: the file is not UTF-8")),
         },
@@ -246,7 +242,8 @@ fn nested_paths(
         TABLES.iter().filter_map(|it| manifest.get(*it).and_then(toml::Value::as_table)).collect();
     let targets = manifest.get("target").and_then(toml::Value::as_table);
     for target in targets.into_iter().flat_map(|it| it.values()) {
-        tables.extend(TABLES.iter().filter_map(|it| target.get(*it).and_then(toml::Value::as_table)));
+        tables
+            .extend(TABLES.iter().filter_map(|it| target.get(*it).and_then(toml::Value::as_table)));
     }
     let inherited = workspace.and_then(|(at, table)| {
         let deps = table.get("workspace")?.get("dependencies")?.as_table()?;
@@ -318,9 +315,8 @@ pub(crate) fn vendored_package(
             Err(error) => return Ok(Err(error)),
         }
     }
-    let Some(found) = packages
-        .iter()
-        .find(|it| it.name == id.name().as_str() && &it.version == id.version())
+    let Some(found) =
+        packages.iter().find(|it| it.name == id.name().as_str() && &it.version == id.version())
     else {
         return Ok(Err(anyhow!(
             "failed to find package with id: {} v{} ({source})",
@@ -358,7 +354,10 @@ pub(crate) fn vendored_package(
 }
 
 /// A subdirectory of a directory source: a package when it has a `Cargo.toml`.
-fn read_vendored(cx: &mut Cx<'_>, dir: &str) -> Result<anyhow::Result<Option<Vendored>>, Cancelled> {
+fn read_vendored(
+    cx: &mut Cx<'_>,
+    dir: &str,
+) -> Result<anyhow::Result<Option<Vendored>>, Cancelled> {
     let manifest_path = format!("{dir}/Cargo.toml");
     let manifest = match read_table(cx, &manifest_path)? {
         Ok(Some(manifest)) => manifest,
@@ -417,7 +416,8 @@ fn verify(cx: &mut Cx<'_>, package: &Vendored) -> Result<anyhow::Result<()>, Can
             return Ok(Err(anyhow!("No such file or directory (os error 2)")
                 .context(format!("failed to calculate checksum of: {path}"))));
         };
-        let actual: String = blaze_sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        let actual: String =
+            blaze_sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
         if &actual != expected {
             return Ok(Err(anyhow!(
                 "the listed checksum of `{path}` has changed:\nexpected: {expected}\nactual:   \

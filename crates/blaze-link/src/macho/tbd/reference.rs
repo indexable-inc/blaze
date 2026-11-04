@@ -153,13 +153,15 @@ impl Doc {
         let mut listed = Vec::new();
         let mut targets = Vec::new();
         if version == 4 {
-            let list = get(&map, "targets").ok_or_else(|| format!("`{install_name}` has no `targets`"))?;
+            let list =
+                get(&map, "targets").ok_or_else(|| format!("`{install_name}` has no `targets`"))?;
             for target in scalars(list, "targets")? {
                 targets.push(v4_target(target)?);
                 listed.push(target.to_owned());
             }
         } else {
-            let archs = get(&map, "archs").ok_or_else(|| format!("`{install_name}` has no `archs`"))?;
+            let archs =
+                get(&map, "archs").ok_or_else(|| format!("`{install_name}` has no `archs`"))?;
             let platform = get(&map, "platform")
                 .ok_or_else(|| format!("`{install_name}` has no `platform`"))
                 .and_then(|it| scalar(it, "platform"))?;
@@ -191,7 +193,12 @@ impl Doc {
             })
     }
 
-    fn exports(&self, chosen: &str, platform: u32, out: &mut Exports) -> Result<Vec<String>, String> {
+    fn exports(
+        &self,
+        chosen: &str,
+        platform: u32,
+        out: &mut Exports,
+    ) -> Result<Vec<String>, String> {
         let mut libraries = Vec::new();
         if self.version == 4 {
             for key in ["exports", "reexports"] {
@@ -206,8 +213,9 @@ impl Doc {
                     for (key, value) in section {
                         match key.as_str() {
                             "targets" => {}
-                            "libraries" => libraries
-                                .extend(scalars(value, "libraries")?.into_iter().map(str::to_owned)),
+                            "libraries" => libraries.extend(
+                                scalars(value, "libraries")?.into_iter().map(str::to_owned),
+                            ),
                             other => return Err(self.unknown("reexported-libraries", other)),
                         }
                     }
@@ -296,7 +304,10 @@ impl Doc {
                 .iter()
                 .map(|item| match item {
                     Value::Map(map) => Ok(map.as_slice()),
-                    _ => Err(format!("`{}`: an entry of `{key}` is not a mapping", self.install_name)),
+                    _ => Err(format!(
+                        "`{}`: an entry of `{key}` is not a mapping",
+                        self.install_name
+                    )),
                 })
                 .collect(),
             Value::Scalar(it) if it.is_empty() => Ok(Vec::new()),
@@ -333,8 +344,9 @@ impl Doc {
 }
 
 fn v4_target(text: &str) -> Result<Target, String> {
-    let (arch, platform) =
-        text.split_once('-').ok_or_else(|| format!("target `{text}` is not `<arch>-<platform>`"))?;
+    let (arch, platform) = text
+        .split_once('-')
+        .ok_or_else(|| format!("target `{text}` is not `<arch>-<platform>`"))?;
     let platform = PLATFORMS.iter().find(|it| it.0 == platform).map_or(0, |it| it.1);
     Ok(Target { arch: arch.to_owned(), platform })
 }
@@ -574,7 +586,9 @@ impl Block {
             self.at += 1;
             let value = if value.is_empty() {
                 match self.lines.get(self.at) {
-                    Some(next) if next.indent == indent && is_item(&next.text) => self.sequence(indent)?,
+                    Some(next) if next.indent == indent && is_item(&next.text) => {
+                        self.sequence(indent)?
+                    }
                     _ => self.nested(indent)?,
                 }
             } else {

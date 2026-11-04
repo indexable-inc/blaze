@@ -42,22 +42,23 @@ impl Tries<'_> {
     fn spawn(&self) -> Result<Server, String> {
         let mut child = Command::new(self.exe)
             .arg("serve")
-            .args(["--timeout-ms", &self.timeout.as_millis().to_string()])  // alloc: a server's command line, once per server
+            .args(["--timeout-ms", &self.timeout.as_millis().to_string()]) // alloc: a server's command line, once per server
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("{}: {e}", self.exe.display()))?;  // alloc: error message
+            .map_err(|e| format!("{}: {e}", self.exe.display()))?; // alloc: error message
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             _ = child.kill();
-            return Err(format!("{} serve: no pipes", self.exe.display()));  // alloc: error message
+            return Err(format!("{} serve: no pipes", self.exe.display())); // alloc: error message
         };
         Ok(Server { child, stdin, stdout })
     }
 
     fn outcome(&mut self, bytes: &[u8]) -> Result<Outcome, String> {
         self.runs += 1;
-        let len = u32::try_from(bytes.len()).map_err(|_| format!("{} bytes: past what `serve` takes", bytes.len()))?;  // alloc: error message
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| format!("{} bytes: past what `serve` takes", bytes.len()))?; // alloc: error message
         if self.server.is_none() {
             self.server = Some(self.spawn()?);
         }
@@ -78,7 +79,7 @@ impl Tries<'_> {
         // It panicked (and the server ends at the end of its stdin), or it ended the server.
         let Server { mut child, stdin, stdout } = self.server.take().expect("started above");
         drop((stdin, stdout));
-        let status = child.wait().map_err(|e| e.to_string())?;  // alloc: error message
+        let status = child.wait().map_err(|e| e.to_string())?; // alloc: error message
         Ok(if answered {
             Outcome::Failed
         } else if status.code() == Some(TIMED_OUT) {
@@ -104,15 +105,26 @@ impl Drop for Tries<'_> {
     }
 }
 
-pub(crate) fn minimize(input: &Path, out: &Path, budget: Duration, timeout: Duration) -> Result<ExitCode, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;  // alloc: error message
-    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;  // alloc: error message
-    let mut tries =
-        Tries { exe: &exe, timeout, deadline: Instant::now() + budget, runs: 0, server: None, frame: Vec::new() };  // alloc: none until the first frame, then reused
+pub(crate) fn minimize(
+    input: &Path,
+    out: &Path,
+    budget: Duration,
+    timeout: Duration,
+) -> Result<ExitCode, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?; // alloc: error message
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?; // alloc: error message
+    let mut tries = Tries {
+        exe: &exe,
+        timeout,
+        deadline: Instant::now() + budget,
+        runs: 0,
+        server: None,
+        frame: Vec::new(),
+    }; // alloc: none until the first frame, then reused
     let mut best = corpus::read(input)?;
     let wanted = tries.outcome(&best)?;
     if wanted == Outcome::Passed {
-        return Err(format!("{} passes: nothing to minimize", input.display()));  // alloc: error message
+        return Err(format!("{} passes: nothing to minimize", input.display())); // alloc: error message
     }
     let mut chunk = best.len().div_ceil(2).max(1);
     let mut smaller = Vec::with_capacity(best.len());

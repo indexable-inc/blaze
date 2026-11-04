@@ -54,7 +54,11 @@ pub struct SlotName {
 
 impl fmt::Display for SlotName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "slot `{}` of {}, which maintainer `{}` fills", self.what, self.of, self.maintainer)
+        write!(
+            f,
+            "slot `{}` of {}, which maintainer `{}` fills",
+            self.what, self.of, self.maintainer
+        )
     }
 }
 
@@ -110,16 +114,27 @@ impl fmt::Display for SlotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SlotError::Unclaimed { slot } => {
-                write!(f, "{slot} was read before any task claimed it: its reader runs ahead of its maintainer")
+                write!(
+                    f,
+                    "{slot} was read before any task claimed it: its reader runs ahead of its maintainer"
+                )
             }
-            SlotError::Abandoned { slot } => write!(f, "{slot} was given up by the task that claimed it, unfilled"),
+            SlotError::Abandoned { slot } => {
+                write!(f, "{slot} was given up by the task that claimed it, unfilled")
+            }
             SlotError::Busy { slot } => write!(f, "{slot} was claimed while another task holds it"),
             SlotError::ClaimedAgain { slot } => {
-                write!(f, "{slot} was claimed again by the task that holds it: it fills it through its first claim")
+                write!(
+                    f,
+                    "{slot} was claimed again by the task that holds it: it fills it through its first claim"
+                )
             }
             SlotError::Full { slot } => write!(f, "{slot} was claimed once filled"),
             SlotError::ReadByItsFiller { slot } => {
-                write!(f, "{slot} was read by the task that claimed it, before it filled it: its value would depend on itself")
+                write!(
+                    f,
+                    "{slot} was read by the task that claimed it, before it filled it: its value would depend on itself"
+                )
             }
         }
     }
@@ -294,7 +309,10 @@ impl<T> Slot<T> {
     ///
     /// Each names the slot: [`SlotError::Full`] once filled, [`SlotError::Busy`] while another
     /// task holds it, [`SlotError::ClaimedAgain`] when this task holds it already.
-    pub fn claim<'s, D: Database + ?Sized>(&'s self, db: &'s D) -> Result<SlotClaim<'s, T>, SlotError> {
+    pub fn claim<'s, D: Database + ?Sized>(
+        &'s self,
+        db: &'s D,
+    ) -> Result<SlotClaim<'s, T>, SlotError> {
         if self.is_full() {
             return Err(SlotError::Full { slot: self.name.clone() }); // alloc: clone: an error's name, once
         }
@@ -307,7 +325,9 @@ impl<T> Slot<T> {
             // alloc: clone: an error's name, once
             Err(NotHeld::Busy) => return Err(SlotError::Busy { slot: self.name.clone() }),
             // alloc: clone: as above
-            Err(NotHeld::ByThisTask) => return Err(SlotError::ClaimedAgain { slot: self.name.clone() }),
+            Err(NotHeld::ByThisTask) => {
+                return Err(SlotError::ClaimedAgain { slot: self.name.clone() });
+            }
         };
         self.claimer.store(task(), Ordering::Relaxed);
         // Release: the flight is held, and the claimer written, before a reader sees the claim.
@@ -330,7 +350,12 @@ impl<T> Slot<T> {
             }
             // Release, as a claim dropped unfilled stores it: a reader that loads it with
             // acquire reads it before the flight, and nothing holds the flight to wake.
-            match self.claim.compare_exchange_weak(now, ABANDONED, Ordering::Release, Ordering::Acquire) {
+            match self.claim.compare_exchange_weak(
+                now,
+                ABANDONED,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => return true,
                 Err(was) => now = was,
             }

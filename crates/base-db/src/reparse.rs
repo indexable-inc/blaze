@@ -382,11 +382,11 @@ pub(crate) fn common_suffix_scalar(a: &[u8], b: &[u8]) -> usize {
 mod seed_tests {
     use std::cell::Cell;
 
+    use crate::{FileId, FileSet, VfsPath};
     use blaze_query::db::Durability;
     use span::Edition;
     use syntax::SourceFile;
     use triomphe::Arc;
-    use crate::{FileId, FileSet, VfsPath};
 
     use super::{REPARSED, assert_whole};
     use crate::{Db, EditionedFileId, SourceRoot, SourceRootId};
