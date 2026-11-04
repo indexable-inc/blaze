@@ -21,7 +21,7 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 | `harness-ghostty-config/` | reads the user's Ghostty config |
 | `harness-native/` | the macOS app: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders |
 | `harness-native-*` | the app's layers: model, flecs glue, ECS, UI layout/motion/draw/input/text and their `-api` crates, prims (`harness-native-ui-prims/scene/`), scroll physics |
-| `vendor/` | flecs (amalgamation, version in `vendor/flecs/SOURCE.md`) and the hyperion-* crates over it |
+| `vendor/` | the hyperion-* crates over flecs (flecs itself is the indexable-inc/flecs fork, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; `vendor/SOURCE.md`) |
 | `scripts/zig` | fetches the pinned zig through Nix |
 | `scripts/harness` | builds and runs the `harness` binary from this checkout |
 | `mcp/` | the Bun/TypeScript kernel the daemon runs (`mcp/src/mcp.ts`; `bun install` in `mcp/`), with its smoke scripts in `mcp/scripts/` |

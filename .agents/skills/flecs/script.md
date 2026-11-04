@@ -157,7 +157,7 @@ template Button {
 
 ## Trying syntax
 
-To check a claim, run it through the vendored 4.2 build: a C file that calls `ecs_script(world, { .filename = argv[1] })`
-and prints `EcsScript.error`, built with `cc -Icrates/harness/vendor/flecs t.c crates/harness/vendor/flecs/flecs.c`
-(seconds on the Mac). For the site, compile against flecs-opinionated's `vendor/flecs/distr` with
+To check a claim, run it through harness's 4.2 build: a C file that calls `ecs_script(world, { .filename = argv[1] })`
+and prints `EcsScript.error`, built with `cc -I$F t.c $F/flecs.c`, where `$F` is the `distr` directory of a checkout of
+indexable-inc/flecs at the rev in `crates/harness/vendor/hyperion-flecs-c/Cargo.toml` (seconds on the Mac). For the site, compile against flecs-opinionated's `vendor/flecs/distr` with
 `-DFLECS_CUSTOM_BUILD -DFLECS_SCRIPT -DFLECS_PREFAB -DFLECS_LOG`, or run `site/flecs/flecs-doc.wasm`.

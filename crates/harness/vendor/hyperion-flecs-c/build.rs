@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let flecs = root.join("../flecs");
+    let flecs = PathBuf::from(flecs_distr::DIR);
     let target = env::var("TARGET").expect("TARGET");
     let mut b = cc::Build::new();
     b.file(flecs.join("flecs.c"))
@@ -78,7 +78,7 @@ fn main() {
         b.flag_if_supported("-fno-sanitize=undefined");
     }
     b.compile("denflecs");
-    for p in ["../flecs/flecs.c", "../flecs/flecs.h", "csrc", "wasm-libc"] {
+    for p in ["csrc", "wasm-libc"] {
         println!("cargo:rerun-if-changed={}", root.join(p).display());
     }
     println!("cargo:rerun-if-env-changed=CC_wasm32_unknown_unknown");

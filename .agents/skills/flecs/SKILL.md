@@ -8,7 +8,7 @@ description: "Flecs reference, current to v4.2.0: which Flecs each part of blaze
 General Flecs first, then the site. Building native UI out of Flecs (the harness app, `crates/harness`) is the
 `flecs-ui` skill; it uses the language described here. Script language reference: `script.md`.
 
-Sources, in order of trust: the vendored v4.2.0 `crates/harness/vendor/flecs/flecs.{h,c}`, the upstream v4.2.0 docs
+Sources, in order of trust: harness's v4.2.0 `distr/flecs.{h,c}` (the indexable-inc/flecs fork at the rev in `crates/harness/vendor/hyperion-flecs-c/Cargo.toml`; after a build, cargo's checkout of it is under `~/.cargo/git/checkouts/flecs-*`), the upstream v4.2.0 docs
 (`docs/FlecsScript.md`, `ComponentTraits.md`, `HierarchiesManual.md`, `Systems.md` at tag v4.2.0; flecs.dev serves
 master), then blog posts never. The "needs 4.2" marks here and in `script.md` were checked on 2026-11-03 by running
 small scripts through each build listed below.
@@ -17,7 +17,7 @@ small scripts through each build listed below.
 
 | Runtime | Flecs | Pinned in |
 | --- | --- | --- |
-| harness native app | v4.2.0 (fork `indexable-inc/flecs`, branch `indexable/v4.2`) | `crates/harness/vendor/flecs/SOURCE.md` |
+| harness native app | v4.2.0 (fork `indexable-inc/flecs`, branch `indexable/v4.2`) | `flecs-distr` rev in `crates/harness/vendor/hyperion-flecs-c/Cargo.toml` |
 | site build (`site-snapshot.wasm`) | upstream master `785ea7c` (2026-10-15, 90 commits before v4.2.0); its header says 4.1.6. Addons: SCRIPT, PREFAB, LOG only | flecs-opinionated rev in `site/renderer/Cargo.toml` |
 | site type checker (`flecs-doc.wasm`) | `v4.1.6-665-gce3b06a6e`; accepted and rejected the same scripts as `785ea7c` | `site/flecs/FLECS_VERSION` |
 
