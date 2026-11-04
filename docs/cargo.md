@@ -895,7 +895,10 @@ daemon refuses one another user owns or others may write to;
 
 A project pins blaze, not Rust: each release of blaze builds with the Rust it ships, and
 `rust-toolchain` files are not read ([toolchain.md](toolchain.md)). `blaze pin` writes the
-version of the blaze it is into the workspace's root `Cargo.toml`:
+version of the blaze it is into the workspace's root `Cargo.toml` (`blaze pin 0.YYYYMMDD.N`
+writes that release's, fetched and checked first, or `blaze pin canary` a channel's; blaze says
+on every command while the pin is behind the newest release, and `blaze update` never moves
+it: [install.md](install.md#updates)):
 
     [workspace.metadata.blaze]
     version = "0.20261027.0"

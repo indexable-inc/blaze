@@ -54,9 +54,54 @@ the newest canary is promoted the two channels name the same release.
 Each channel also has a pointer, for what reads a channel without GitHub's API (a workspace
 pinned to `"stable"` or `"canary"`): the assets `stable` and `canary` of the release `channels`,
 each the channel's version and a newline,
-`https://github.com/indexable-inc/blaze/releases/download/channels/stable`. release.yaml moves
-`canary` when it has published a release, and promote.yaml moves `stable` when it makes a
-release stable and *Latest* (`.github/scripts/promote.py pointer`).
+`https://github.com/indexable-inc/blaze/releases/download/channels/stable`. Each channel's
+pointer names its newest release that is not yanked. The job `metadata` (`.github/scripts/promote.py
+metadata`) sets both pointers and writes latest.json (below) from the releases as they are: in
+release.yaml after it published a release, in promote.yaml after it made one stable, and in
+yank.yaml. The three jobs share the concurrency group `release-metadata`, so one runs at a time and
+the last one to run writes what the releases say then; a job the group cancels while it waits
+behind a newer one loses nothing.
+
+## latest.json
+
+What every blaze daemon reads every five minutes to tell its user about newer and yanked
+releases ([install.md](install.md#updates)): `https://ix.dev/blaze/latest.json`, an object in
+the R2 bucket `blaze-releases` that the site's worker serves (`site/worker/index.ts`) with its
+ETag (a request with a matching `If-None-Match` gets a `304`) and `Cache-Control: public,
+max-age=60`. It is static, so no daemon spends GitHub's API limit (60 requests an hour per
+address, shared by every machine behind it):
+
+    {
+     "canary": {"notes": "<the first 12 lines of its notes>", "url": "https://github.com/indexable-inc/blaze/releases/tag/v0.20261104.3", "version": "0.20261104.3"},
+     "schema": 1,
+     "stable": {"notes": "...", "url": "...", "version": "0.20261104.0"},
+     "yanked": {"0.20261101.0": "miscompiles drops (#1234)"}
+    }
+
+Each channel's entry is its newest release that is not yanked; a yanked release counts only on
+its own first line of notes, `blaze-yanked: <reason>`. The job `metadata` (above) writes it from
+the releases (the same bytes for the same releases), and `wrangler r2 object put`
+(cloudflare/wrangler-action) puts it. The token it puts it with is the secret
+`CLOUDFLARE_R2_API_TOKEN`, an R2 API token with Object Read & Write on the bucket
+`blaze-releases` alone, apart from the site's deploy token; it reaches wrangler-action only,
+never promote.py. A run without it fails that job, after the release and the pointers, so
+neither is held back. The archives stay on GitHub's releases.
+
+## Yanking a release
+
+A release found broken after it was published is yanked, not deleted (a pin to it still
+fetches it):
+
+    gh workflow run yank.yaml -f tag=v0.20261101.0 -f reason="miscompiles drops (#1234)"
+
+yank.yaml (`promote.py yank`) makes `blaze-yanked: <reason>` the first line of the release's
+notes, the one place a yank is kept (the same words further down yank nothing), and then its
+job `metadata` moves each channel's pointer to the channel's newest release that is not yanked
+and writes latest.json again. From each daemon's next check
+(five minutes at most) every blaze that runs it, pinned or not, says so on every command, CI
+too, with the reason and what moves off it (`blaze update`, or `blaze pin <version>`).
+`blaze update` and `"auto"` never install a yanked release. `-f reason=` (empty) takes the yank
+back.
 
 A release older than this scheme (`v0.20261027.0`, the `nightly` build of 2026-10-20) was
 published as a full release and counts as stable.

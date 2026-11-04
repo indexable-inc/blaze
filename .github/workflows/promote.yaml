@@ -356,6 +356,8 @@ jobs:
     permissions:
       contents: write
       issues: write
+    outputs:
+      promoted: ${{ steps.promote.outcome == 'success' }}
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.release.outputs.tag }}
@@ -367,6 +369,7 @@ jobs:
         with:
           path: results
       - name: promote ${{ env.TAG }}
+        id: promote
         if: needs.smoke.result == 'success' && needs.apps.result == 'success' && needs.train.result == 'success' && needs.main-tests.result == 'success' && inputs.promote
         run: |
           jq -n --arg tag "$TAG" --arg run "$RUN" '{tag: $tag, run: $run, bench: "results"}' > "$RUNNER_TEMP/promote.json"
@@ -387,3 +390,44 @@ jobs:
             '{tag: $tag, run: $run, results: "results", needs: $needs}' > "$RUNNER_TEMP/issue.json"
           python3 -I .github/scripts/promote.py issue "$RUNNER_TEMP/issue.json" | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
+
+  # Stable moved: the stable pointer and latest.json (docs/release.md, "latest.json") say so.
+  metadata:
+    name: pointers and latest.json
+    needs: verdict
+    if: always() && needs.verdict.outputs.promoted == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
+    # latest.json from the releases as they are when it runs, so the last one to run is right. A
+    # run the group cancels while it waits behind a newer one loses nothing.
+    concurrency:
+      group: release-metadata
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # Only GH_TOKEN: the Cloudflare token reaches no script, only wrangler-action below.
+      - name: pointers and latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash # -eo pipefail: a failing promote.py fails the step through the tee
+        run: python3 -I .github/scripts/promote.py metadata '{"out": "latest.json"}' | tee -a "$GITHUB_STEP_SUMMARY"
+      # The token R2 takes latest.json with: Object Read & Write on the bucket blaze-releases
+      # alone (docs/release.md, "latest.json"). Checked here, after the pointers moved, so a
+      # missing secret fails the run without holding a release back.
+      - name: the R2 token is set
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::latest.json is not published: the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
+            exit 1
+          fi
+      - name: Publish latest.json
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: r2 object put blaze-releases/latest.json --file=latest.json --content-type=application/json --cache-control=public,max-age=60 --remote

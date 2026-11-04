@@ -1,6 +1,7 @@
 //! The program `blaze`: blaze's cargo, its client and its daemon ([`blaze_cargo::cli`]), and
 //! what runs before it ([`main`]): the sandbox launcher, the stand-ins a build script runs, and
-//! the release of blaze a workspace pins (`pin.rs`, `versions.rs`).
+//! the release of blaze a workspace pins (`pin.rs`, `versions.rs`), and blaze's own updates
+//! (`update.rs`).
 
 #![expect(
     clippy::print_stdout,
@@ -16,6 +17,7 @@ mod heaps;
 mod huge;
 mod pin;
 mod program;
+mod update;
 mod versions;
 
 pub use program::main;

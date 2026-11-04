@@ -863,10 +863,12 @@ dependencies = [
  "ix-prof",
  "libmimalloc-sys",
  "parking_lot",
+ "serde_json",
  "stdx",
  "tar",
  "toml",
  "toml_edit",
+ "tracing",
  "url",
 ]
 
