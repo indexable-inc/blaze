@@ -3,12 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>harness</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.18.0/lib/addon-webgl.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<link rel="stylesheet" href="/vendor/xterm.css">
 <style>
   :root { color-scheme: dark; --bg: #1c1c1c; --fg: #d8d8d8; --muted: #888; --sel: #2d3a4a; --line: #333; }
   body { margin: 0; display: flex; height: 100vh; background: var(--bg); color: var(--fg); font: 13px ui-monospace, Menlo, monospace; }
@@ -38,10 +33,17 @@
   <div id="tree"></div>
 </div>
 <div id="main">
-  <div id="bar"><span id="title" class="muted">no session selected</span><button onclick="kill()">kill</button></div>
+  <div id="bar"><span id="title" class="muted">no session selected</span><span id="renderer" class="muted" style="flex:none"></span><button onclick="kill()">kill</button></div>
   <div id="term"><div id="empty">pick a session</div></div>
 </div>
-<script>
+<script type="module">
+import { Terminal } from '/vendor/xterm.mjs';
+import { WebgpuAddon } from '/vendor/addon-webgpu.mjs';
+import { WebglAddon } from '/vendor/addon-webgl.mjs';
+import { FitAddon } from '/vendor/addon-fit.mjs';
+import { Unicode11Addon } from '/vendor/addon-unicode11.mjs';
+import { WebLinksAddon } from '/vendor/addon-web-links.mjs';
+let renderer = 'dom';
 let sessions = [], current = null, ws = null, term = null, fitter = null;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
@@ -71,13 +73,13 @@ function open_(id) {
     theme: { background: '#1c1c1c', foreground: '#d8d8d8' }, scrollback: 10000, allowProposedApi: true,
     cursorBlink: true, macOptionIsMeta: true, drawBoldTextInBrightColors: false, minimumContrastRatio: 1,
   });
-  fitter = new FitAddon.FitAddon();
+  fitter = new FitAddon();
   term.loadAddon(fitter);
-  term.loadAddon(new Unicode11Addon.Unicode11Addon());
+  term.loadAddon(new Unicode11Addon());
   term.unicode.activeVersion = '11';
-  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.loadAddon(new WebLinksAddon());
   term.open($('term'));
-  try { term.loadAddon(new WebglAddon.WebglAddon()); } catch (e) { console.warn('webgl unavailable, using DOM renderer', e); }
+  useGpu(term);
   location.hash = String(id);
   ws = new WebSocket(`ws://${location.host}/ws/${id}`);
   ws.binaryType = 'arraybuffer';
@@ -92,6 +94,21 @@ function open_(id) {
   term.focus();
   refresh();
 }
+// WebGPU first (experimental xterm.js addon); WebGL if WebGPU can't start or the device is lost.
+async function useGpu(t) {
+  const webgl = () => { try { t.loadAddon(new WebglAddon()); renderer = 'webgl'; } catch { renderer = 'dom'; } showRenderer(); };
+  if (!navigator.gpu) return webgl();
+  try {
+    const gpu = new WebgpuAddon();
+    t.loadAddon(gpu);
+    gpu.onDeviceLoss?.(() => { if (t === term) webgl(); });
+    await gpu.ready;
+    renderer = 'webgpu';
+    showRenderer();
+  } catch (e) { console.warn('webgpu failed, falling back to webgl', e); webgl(); }
+}
+function showRenderer() { $('renderer').textContent = renderer; }
+
 // The browser is the primary client: the session's PTY follows this window's size.
 function fit() {
   if (!term || !fitter) return;
@@ -108,6 +125,7 @@ async function spawn(kind) {
 async function kill() { if (current !== null && confirm(`kill #${current}?`)) await fetch(`/api/sessions/${current}/kill`, { method: 'POST' }); refresh(); }
 refresh().then(() => { const id = Number(location.hash.slice(1)); if (location.hash && sessions.some((s) => s.id === id)) open_(id); });
 setInterval(refresh, 1500);
+Object.assign(window, { open_, spawn, kill });
 </script>
 </body>
 </html>

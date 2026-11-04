@@ -14,6 +14,7 @@ pub struct Launch {
 
 pub struct Ctx<'a> {
     pub session: u64,
+    pub cwd: &'a str,
     pub sock: &'a std::path::Path,
     pub user_args: &'a [String],
     pub prompt: Option<&'a str>,
@@ -105,6 +106,13 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         std::os::unix::fs::symlink(&auth_src, &auth_dst)?;
     }
     let toml_str = |s: &str| serde_json::to_string(s).unwrap(); // JSON strings are valid TOML basic strings
+    // Pre-trust the session's directory so Codex doesn't stop on its folder-trust prompt.
+    let config = home.join("config.toml");
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    let header = format!("[projects.{}]", toml_str(ctx.cwd));
+    if !existing.contains(&header) {
+        std::fs::write(&config, format!("{existing}\n{header}\ntrust_level = \"trusted\"\n"))?;
+    }
     let env_table = mcp_env(ctx).iter().map(|(k, v)| format!("{k}={}", toml_str(v))).collect::<Vec<_>>().join(",");
     let args_list = mcp_args().iter().map(|a| toml_str(a)).collect::<Vec<_>>().join(",");
     let mut args: Vec<String> = vec![

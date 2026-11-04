@@ -14,6 +14,7 @@ use tokio::sync::broadcast;
 pub async fn serve(d: Arc<Daemon>, listener: tokio::net::TcpListener) {
     let app = Router::new()
         .route("/", get(|| async { Html(include_str!("web/index.html")) }))
+        .route("/vendor/{file}", get(vendor))
         .route("/api/sessions", get(sessions))
         .route("/api/spawn", post(spawn))
         .route("/api/sessions/{id}/kill", post(kill))
@@ -22,6 +23,21 @@ pub async fn serve(d: Arc<Daemon>, listener: tokio::net::TcpListener) {
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("web server stopped: {e}");
     }
+}
+
+/// xterm.js and addons, vendored and built from the xterm.js WebGPU branch (see web/vendor/SOURCE).
+async fn vendor(Path(file): Path<String>) -> impl IntoResponse {
+    let (body, mime): (&'static [u8], &str) = match file.as_str() {
+        "xterm.mjs" => (include_bytes!("web/vendor/xterm.mjs"), "text/javascript"),
+        "xterm.css" => (include_bytes!("web/vendor/xterm.css"), "text/css"),
+        "addon-webgpu.mjs" => (include_bytes!("web/vendor/addon-webgpu.mjs"), "text/javascript"),
+        "addon-webgl.mjs" => (include_bytes!("web/vendor/addon-webgl.mjs"), "text/javascript"),
+        "addon-fit.mjs" => (include_bytes!("web/vendor/addon-fit.mjs"), "text/javascript"),
+        "addon-unicode11.mjs" => (include_bytes!("web/vendor/addon-unicode11.mjs"), "text/javascript"),
+        "addon-web-links.mjs" => (include_bytes!("web/vendor/addon-web-links.mjs"), "text/javascript"),
+        _ => return (axum::http::StatusCode::NOT_FOUND, [("content-type", "text/plain")], &b"not found"[..]).into_response(),
+    };
+    (axum::http::StatusCode::OK, [("content-type", mime)], body).into_response()
 }
 
 async fn sessions(State(d): State<Arc<Daemon>>) -> impl IntoResponse {
