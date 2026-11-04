@@ -11,6 +11,7 @@ fn pane_prefab(kind: Option<PaneKind>) -> &'static str {
     match kind {
         Some(PaneKind::Run) => "hn.RunPane",
         Some(PaneKind::Group) => "hn.GroupPane",
+        Some(PaneKind::Archive) => "hn.ArchivePane",
         _ => "hn.TermPane",
     }
 }
@@ -96,6 +97,10 @@ impl App {
                 if pe.has(PaneFocus::id()) {
                     n.add(PaneFocus::id());
                 }
+                // Where its back affordance went comes along.
+                if let Some(b) = pe.target(crate::pane::Back::id(), 0) {
+                    n.add((crate::pane::Back::id(), *b.id()));
+                }
                 model::show(w, n.id(), shown);
                 let mut order = Vec::new();
                 main.entity().each_child(|c| order.push(*c.id()));
@@ -125,6 +130,7 @@ impl App {
             match shown.map(|e| (e, model::pane_kind(w.entity_from_id(e)))) {
                 Some((e, PaneKind::Run)) => self.fill_run_pane(pane, e),
                 Some((e, PaneKind::Group)) => self.fill_group_pane(pane, e),
+                Some((_, PaneKind::Archive)) => self.fill_archive_pane(pane),
                 _ => {}
             }
         }
@@ -772,6 +778,9 @@ impl App {
             }
             return;
         }
+        if self.archive_key(k) {
+            return;
+        }
         if self.tree_key(k) {
             return;
         }
@@ -808,6 +817,9 @@ impl App {
         if let Some(p) = self.palette.as_mut() {
             p.query.push_str(text);
             p.at = 0;
+            return;
+        }
+        if self.archive_text(text) {
             return;
         }
         self.typed();
@@ -864,6 +876,9 @@ impl App {
                 p.query.push_str(text.lines().next().unwrap_or(""));
             }
             self.poke();
+            return;
+        }
+        if self.archive_text(text) {
             return;
         }
         let Some(t) = self.focused_term() else { return };

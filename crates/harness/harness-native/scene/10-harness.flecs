@@ -17,6 +17,13 @@ prefab hn.TitleBar : ui.Row {
   Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
   Padding: {l: 0, r: 16, t: 0, b: 0}
+  // Back to the Archive (after an object was opened from it; cmd+[ too). Zero wide while there is nowhere to go back to.
+  back : ui.Symbol {
+    Pressable
+    Action: {name: "nav:back"}
+    Fill: $tone_term_muted
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+  }
   title : ui.Words {
     Fill: $tone_term_ink
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 1}
@@ -66,21 +73,11 @@ prefab hn.Selection : ui.Node {
   Motion: {omega: $pill_omega, zeta: $pill_zeta}
 }
 
-// The hairline over the Archive, pinned to the sidebar's bottom.
-prefab hn.ArchiveRule : ui.Divider {}
-
-// The Archive's objects (cmd+W'd), shown over the archive row while it is unfolded: hn.ObjRow each, by key.
-prefab hn.ArchiveList : ui.Column {
-  Clip
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 280}}
-  Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
-}
-
-// The archive row at the sidebar's bottom: an archive box, "Archive", how many objects it holds and a disclosure
-// chevron (on hover or while open, turning a quarter on a spring); pressed to fold or unfold the list over it.
+// The archive row at the sidebar's bottom: an archive box, "Archive", how many objects it holds and a chevron on hover;
+// pressed, the Archive pane (hn.ArchivePane) takes the main card.
 prefab hn.ArchiveRow : ui.Row {
   Pressable
-  Action: {name: "archive:toggle"}
+  Action: {name: "archive:open"}
   Fill: $tone_clear
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
@@ -372,6 +369,140 @@ prefab hn.PaneRow : ui.Row {
   }
 }
 
+// The Archive (src/app/archive.rs): everything out of the live tree. A title and count, a search line (typed into while
+// the pane has the keyboard), the filter chips, then a scrolling list by day (Today, Yesterday, This week, Older):
+// sessions with their runs folded under them, runs, and at its foot the next page of older runs from the daemon.
+prefab hn.ArchivePane : hn.Pane {
+  head : ui.Column {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 18, r: 18, t: 14, b: 6}
+    top : ui.Row {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 22, min: 0, max: 0}}
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      title : ui.Line, Strong {
+        TextStyle: {size: $size_title, line: 20, role: 0, bold: 1}
+      }
+      count : ui.Line, Faint {
+        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      }
+    }
+    search : ui.Row, Wash {
+      Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $field_h, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 0, b: 0}
+      icon : ui.Symbol, Faint {
+        Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+      }
+      text : ui.Lead, Muted {
+        TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+      }
+    }
+    chips : ui.List {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    }
+  }
+  list : ui.Scroll {
+    Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 10, r: 10, t: 0, b: 12}
+  }
+}
+
+// A filter chip over the Archive's list (All, Sessions, Runs, Failed): lit (the selection's pill tone, strong ink) when on.
+prefab hn.Chip : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $chip_radius, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chip_h, min: 0, max: 0}}
+  Padding: {l: 10, r: 10, t: 0, b: 0}
+  label : ui.Line, Muted {
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0, weight: $weight_row}
+  }
+}
+
+// A day's heading in the Archive's list.
+prefab hn.ArchSection : ui.Row {
+  Flex: {axis: Row, gap: 0, align: End, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $section_h, min: 0, max: 0}}
+  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 5}
+  label : ui.Line, Faint {
+    TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
+  }
+}
+
+// An archived session or run: indent, a disclosure (a session with runs under it), its kind's icon (a run's dot tinted by
+// how it went), its name or command on one line, where it ran (a run's session) or how many runs it holds, then its
+// status badge, how long it ran and when, in columns. Pressed, it opens in the main card (back returns here).
+prefab hn.ArchRow : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: 2, r: $row_pad, t: 0, b: 0}
+  indent : ui.Node {
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  disclose : hn.Disclosure {}
+  glyph : ui.Symbol {
+    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
+  }
+  name : ui.Lead, Ink {
+    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
+  }
+  under : ui.Lead, Faint {
+    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+  }
+  spacer : ui.Spacer {}
+  status : hn.Badge {}
+  took : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+    Size: {w: {kind: Fixed, value: $arch_took_w, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+    text : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  time : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+    Size: {w: {kind: Fixed, value: $arch_time_w, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
+    text : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+}
+
+// The Archive list's foot: the next page of older runs (pressed, or on its own once it scrolls into view).
+prefab hn.ArchMore : ui.Row {
+  Pressable
+  Action: {name: "arch:more"}
+  Fill: $tone_clear
+  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  label : ui.Line, Muted {
+    TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
+  }
+}
+
+// The Archive's list when nothing is in it (or nothing matches).
+prefab hn.ArchNote : ui.Row {
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 72, min: 0, max: 0}}
+  label : ui.Line, Faint {
+    TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+  }
+}
+
 // The command palette (cmd+K): a card near the top of the window over everything.
 prefab hn.Palette : ui.Column {
   Layer: {level: Overlay}
@@ -442,6 +573,7 @@ prefab hn.Theme {
   selected { Fill: $tone_select }
   clear { Fill: $tone_clear }
   accent { Fill: $tone_accent }
+  strong { Fill: $tone_ink_1 }
   muted { Fill: $tone_ink_3 }
   faint { Fill: $tone_ink_4 }
   // The cute touch: a small warm colour per kind on its icon.
@@ -451,6 +583,10 @@ prefab hn.Theme {
   kind_shell { Fill: $tone_kind_shell }
   // Offscreen shots' stand-in for the vibrancy (src/shot.rs).
   shot_ground { Fill: $tone_shot_ground }
+  // How long after it ended a finished run with no session leaves the tree for the Archive (seconds, as a width).
+  archive_after {
+    Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
   // A tree level's indent, and a failure badge's padding while it shows.
   indent {
     Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}

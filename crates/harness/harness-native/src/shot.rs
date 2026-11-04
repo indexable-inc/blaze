@@ -29,7 +29,9 @@ pub fn run(path: &str) -> Result<(), String> {
     }
     // A session id, a run (`r12`) or one of its stages (`r12.0`), or a group of runs by its key (`g:repl:<id>`, `g:other`).
     if let Ok(s) = std::env::var("HARNESS_NATIVE_SHOT_SELECT") {
-        if let Some(key) = s.strip_prefix("g:") {
+        if s == "archive" {
+            app.select_archive_later();
+        } else if let Some(key) = s.strip_prefix("g:") {
             app.select_group(key);
         } else if let Some(run) = s.strip_prefix('r') {
             let (n, k) = run.split_once('.').map_or((run, None), |(n, k)| (n, k.parse().ok()));
@@ -63,6 +65,9 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut hover = std::env::var("HARNESS_NATIVE_SHOT_HOVER").ok().map(|s| nums(&s)).filter(|v| v.len() == 3);
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session).
+    // HARNESS_NATIVE_SHOT_TYPE `text,t`: `text` typed at t seconds, into this offscreen app only (the palette's query
+    // when it is open, the Archive's search when it has the keyboard).
+    let mut typed = std::env::var("HARNESS_NATIVE_SHOT_TYPE").ok().and_then(|s| s.rsplit_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
     let mut key = std::env::var("HARNESS_NATIVE_SHOT_KEY").ok().and_then(|s| s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?))));
     // HARNESS_NATIVE_SHOT_WHEEL `x,y,dy,t`: a trackpad swipe of `dy` points (negative: toward the end) over (x, y) from t
     // seconds: a began, changed events over 8 frames, an ended.
@@ -90,6 +95,9 @@ pub fn run(path: &str) -> Result<(), String> {
             if *n > 9 {
                 wheel = None;
             }
+        }
+        if let Some((text, _)) = typed.take_if(|k| t >= k.1) {
+            app.commit_text(&text);
         }
         if let Some((k, _)) = key.take_if(|k| t >= k.1) {
             app.shortcut(&k, 0, crate::app::KeyMods { cmd: true, ..Default::default() });

@@ -21,6 +21,11 @@ use harness_vt::{MouseFormat, MouseTracking};
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct PaneNode;
 
+/// `(Back, view)` on a pane node: what its back affordance (cmd+[, the title bar's chevron) returns it to (the Archive,
+/// after an object was opened from it). Exclusive; it goes when the pane shows something else.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Back;
+
 /// The pane that follows the selection and takes keys (one).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct PaneFocus;
@@ -208,6 +213,7 @@ pub fn register(world: &World) {
     // The scene puts these tags on hn.Pane and hn.Terminal.
     world.component::<PaneNode>().writable();
     world.component::<PaneFocus>();
+    world.component::<Back>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<TermNode>().writable();
     world.component::<TermFocus>();
     world.component::<TermGrid>();

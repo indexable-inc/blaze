@@ -47,7 +47,8 @@ pub enum RunReq {
         repl: Option<String>,
     },
     RunStatus { id: String },
-    Runs { session: Option<u64>, limit: Option<usize> },
+    /// The newest runs (of `session`), up to `limit`; with `before`, only runs numbered below it (the next page back).
+    Runs { session: Option<u64>, limit: Option<usize>, before: Option<u64> },
     /// stage: None reads the caller-visible streams (out = "final" stdout, err = final.err).
     RunRead {
         id: String,
@@ -625,15 +626,19 @@ fn descendants(root: u32) -> Vec<Value> {
     out
 }
 
-fn list(session: Option<u64>, limit: usize) -> Result<Value> {
+/// Each run's meta as `status` gives it; a REPL's run (no session) also gets `owner`, the session its REPL's cells
+/// were posted under, when the index knows one.
+fn list(session: Option<u64>, limit: usize, before: Option<u64>) -> Result<Value> {
     let mut ids: Vec<u64> = std::fs::read_dir(dir())
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.strip_prefix('r')?.parse().ok())
+        .filter(|&n: &u64| before.is_none_or(|b| n < b))
         .collect();
     ids.sort_unstable_by(|a, b| b.cmp(a));
     let mut out = vec![];
+    let mut owners: BTreeMap<String, Option<u64>> = BTreeMap::new();
     for n in ids {
         if out.len() >= limit {
             break;
@@ -642,6 +647,13 @@ fn list(session: Option<u64>, limit: usize) -> Result<Value> {
         let Ok(m) = status(&id, false) else { continue };
         if session.is_some() && m["session"].as_u64() != session {
             continue;
+        }
+        let mut m = m;
+        if m["session"].is_null()
+            && let Some(repl) = m["repl"].as_str().map(str::to_owned)
+        {
+            let owner = *owners.entry(repl.clone()).or_insert_with(|| crate::db::repl_owner(&repl));
+            m["owner"] = json!(owner);
         }
         out.push(m);
     }
@@ -885,7 +897,7 @@ pub fn handle(req: RunReq) -> Result<Value> {
         }
         RunReq::RunStdin { id, data, close } => write_stdin(&id, data.as_deref(), close),
         RunReq::RunStatus { id } => status(&id, true),
-        RunReq::Runs { session, limit } => list(session, limit.unwrap_or(50)),
+        RunReq::Runs { session, limit, before } => list(session, limit.unwrap_or(50), before),
         RunReq::RunRead { id, stage, stream, offset, max_bytes, wait_ms } => {
             read(&id, stage, &stream, offset, max_bytes.unwrap_or(1 << 20).min(16 << 20), wait_ms.min(60_000))
         }

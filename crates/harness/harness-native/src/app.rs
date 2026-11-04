@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 mod panes;
 mod fold;
 mod sidebar;
+mod archive;
 pub use sidebar::Wheel;
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -52,6 +53,8 @@ pub use crate::term::Mods as KeyMods;
 enum Do {
     New(&'static str),
     Select(u64),
+    /// An archived object: opened with the way back to the Archive.
+    Archived(u64),
     Kill,
     Zoom(i32),
 }
@@ -67,8 +70,7 @@ struct Ids {
     device: u64,
     /// `hn.Main`: the row of pane nodes.
     main: u64,
-    /// The Archive pinned to the sidebar's bottom: its list of objects and its row.
-    archive_list: u64,
+    /// The Archive's row pinned to the sidebar's bottom (pressed, the Archive pane opens).
     archive_row: u64,
     palette: Option<u64>,
     /// The title-bar strip's root (`hn.TitleBar`), its label and the muted words after it.
@@ -143,10 +145,12 @@ pub struct App {
     restore: Option<Option<u64>>,
     /// What was last written to native.json.
     saved: Option<Option<u64>>,
-    /// Session ids in the Archive (native.json `archived`); the world's `Archived` tags follow them.
-    archive: BTreeSet<u64>,
-    /// Whether the Archive's list shows.
-    archive_open: bool,
+    /// Objects cmd+W'd (native.json `closed`, by key: `s14`, `r12`); the world's `Closed` tags follow them.
+    closed: BTreeSet<String>,
+    /// Objects kept in the tree whatever the rule says (native.json `pinned`); the world's `Pinned` tags follow them.
+    pinned: BTreeSet<String>,
+    /// Open the Archive once the daemon's first list is in (the shot's `HARNESS_NATIVE_SHOT_SELECT=archive`).
+    pending_archive: bool,
     /// The ids the daemon no longer lists were dropped (once, on its first list).
     pruned: bool,
     /// Remember the selected object in native.json (not for the offscreen shot).
@@ -229,6 +233,7 @@ impl App {
         model::register(&world);
         crate::pane::register(&world);
         crate::look::register(&world);
+        archive::register(&world);
         world.component::<HoverLift>().writable();
         world.component::<Bump>();
         let app = world.entity_named(APP);
@@ -245,6 +250,8 @@ impl App {
             }
         }
         let w = world.world_ref();
+        // The rule's delay for a finished run with no session, from the scene's token (seconds).
+        world.set(model::ArchiveAfter { ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64 });
         harness_native_ui_layout::install(w);
         harness_native_ui_input::install(w);
         harness_native_ui_motion::install(w);
@@ -279,8 +286,6 @@ impl App {
             set_side_width(side.entity(), w);
         }
         let tree = side.child("hn.Tree");
-        side.child("hn.ArchiveRule");
-        let archive_list = side.child("hn.ArchiveList");
         let archive_row = side.child("hn.ArchiveRow");
         archive_row.set(HoverAmt::default());
         for name in ["icon", "count"] {
@@ -293,7 +298,7 @@ impl App {
         let bar = View::root(w, "hn.TitleBar");
         let bar_title = bar.part("title").map_or(0, View::id);
         let bar_sub = bar.part("sub").map_or(0, View::id);
-        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), archive_list: archive_list.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title, bar_sub };
+        let ids = Ids { tree: tree.id(), device: device.id(), main: main.id(), archive_row: archive_row.id(), palette: None, bar: bar.id(), bar_title, bar_sub };
         let mut fonts = Fonts::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut fonts, TERM_SIZE, 2.0);
         Ok(Self {
@@ -322,9 +327,12 @@ impl App {
             spawned: Arc::default(),
             restore: Some(crate::prefs::get("selected").and_then(|v| v.as_u64())),
             saved: None,
-            // The older `trashed` key, read once (the next save writes `archived` and drops it).
-            archive: crate::prefs::ids("archived").or_else(|| crate::prefs::ids("trashed")).unwrap_or_default(),
-            archive_open: false,
+            // The older `archived` (or `trashed`) session ids, read once (the next save writes `closed` and drops them).
+            closed: crate::prefs::keys("closed")
+                .or_else(|| crate::prefs::ids("archived").or_else(|| crate::prefs::ids("trashed")).map(|ids| ids.into_iter().map(|i| format!("s{i}")).collect()))
+                .unwrap_or_default(),
+            pinned: crate::prefs::keys("pinned").unwrap_or_default(),
+            pending_archive: false,
             pruned: false,
             persist: true,
             focused: true,
@@ -452,9 +460,13 @@ impl App {
             self.reset_focused_term();
             self.pressed.clear();
             model::select(self.world.world_ref(), e);
-            // The focused pane follows the selection.
+            // The focused pane follows the selection (and forgets where its back went).
             if let Some(p) = self.focused_pane() {
                 model::show(self.world.world_ref(), p, e);
+                let pe = self.world.entity_from_id(p);
+                if pe.target(crate::pane::Back::id(), 0).is_some() {
+                    pe.remove((crate::pane::Back::id(), flecs::Wildcard::ID));
+                }
             }
         }
         self.poke();
@@ -469,7 +481,7 @@ impl App {
         self.read_folds();
         let w = self.world.world_ref();
         let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
-        self.sync_archive_tags(up);
+        self.sync_marks(up);
         let w = self.world.world_ref();
         let rows = model::tree(w);
         // Once the daemon's first list is in: the object selected when the app last ran, if it is still there.
@@ -490,6 +502,10 @@ impl App {
                 model::select(w, Some(e));
                 *self.spawned.lock().unwrap() = None;
             }
+        }
+        if self.pending_archive && self.restore.is_none() {
+            self.pending_archive = false;
+            model::select(w, Some(model::archive_view(w)));
         }
         if let Some(key) = self.pending_group.clone() {
             let mut found = None;
@@ -674,6 +690,10 @@ impl App {
                         let cmd = name.split_whitespace().collect::<Vec<_>>().join(" ");
                         (format!("{id}  {cmd}"), join(vec![self.run_cwd(e), self.run_state(e)]))
                     }
+                    (None, model::PaneKind::Archive) => {
+                        let n = model::archived(w).len();
+                        (name, format!("{n} archived"))
+                    }
                     (None, model::PaneKind::Group) => {
                         let n = model::run_count(w, e);
                         (name, format!("{n} run{}", if n == 1 { "" } else { "s" }))
@@ -703,6 +723,18 @@ impl App {
             }
             f
         };
+        // The back chevron, while the focused pane has somewhere to go back to.
+        if let Some(b) = View::of(w.entity_from_id(self.ids.bar)).part("back") {
+            let on = self.back_target().is_some();
+            b.icon(if on { archive::BACK_ICON } else { "" });
+            let box_w = if on { crate::look::width(w, "indent") } else { 0.0 };
+            if let Some(mut sz) = b.entity().try_cloned::<&Size>()
+                && sz.w.value != box_w
+            {
+                sz.w = Sizing::fixed(box_w);
+                b.set(sz);
+            }
+        }
         for (id, text, part) in [(self.ids.bar_title, clip_text(&title, 80), "title"), (self.ids.bar_sub, clip_text(&sub, 90), "sub")] {
             if id != 0 {
                 let v = View::of(w.entity_from_id(id)).text(&text);
@@ -723,50 +755,61 @@ impl App {
         }
     }
 
-    /// Keep the objects' `Archived` tags in step with the persisted ids; on the daemon's first list, drop the
-    /// ids it no longer lists.
-    fn sync_archive_tags(&mut self, up: bool) {
+    /// An object's key across launches: its session (`s14`) or its run (`r12`); None for a stage or anything else.
+    fn key_of(&self, e: u64) -> Option<String> {
+        let o = self.world.entity_from_id(e);
+        if let Some(ob) = o.try_cloned::<&model::Object>() {
+            return Some(format!("s{}", ob.id));
+        }
+        o.try_cloned::<&model::Run>().map(|r| format!("r{}", r.n))
+    }
+
+    /// Keep the objects' `Closed` and `Pinned` tags in step with the kept keys (the model's `ArchiveRule` reads them);
+    /// on the daemon's first list, drop the keys of objects it no longer has.
+    fn sync_marks(&mut self, up: bool) {
         let w = self.world.world_ref();
-        let mut listed = BTreeSet::new();
-        let mut objs = Vec::new();
-        self.world.new_query::<&model::Object>().each_entity(|e, o| {
-            listed.insert(o.id);
-            objs.push((*e.id(), o.id));
-        });
-        for (e, sid) in objs {
-            let e = w.entity_from_id(e);
-            let on = self.archive.contains(&sid);
-            if e.has(model::Archived::id()) != on {
-                if on {
-                    e.add(model::Archived::id());
-                } else {
-                    e.remove(model::Archived::id());
+        let mut objs: Vec<(u64, String)> = Vec::new();
+        self.world.new_query::<&model::Object>().each_entity(|e, o| objs.push((*e.id(), format!("s{}", o.id))));
+        self.world.new_query::<&model::Run>().each_entity(|e, r| objs.push((*e.id(), format!("r{}", r.n))));
+        for (e, key) in &objs {
+            let e = w.entity_from_id(*e);
+            for (on, tag) in [(self.closed.contains(key), *w.component_id::<model::Closed>()), (self.pinned.contains(key), *w.component_id::<model::Pinned>())] {
+                if e.has(tag) != on {
+                    if on {
+                        e.add(tag);
+                    } else {
+                        e.remove(tag);
+                    }
                 }
             }
         }
-        // The link reports Up only after the list it got is in the world.
+        // The link reports Up only after the list and the runs it got are in the world.
         if up && !self.pruned {
             self.pruned = true;
-            let n = self.archive.len();
-            self.archive.retain(|s| listed.contains(s));
-            if n != self.archive.len() {
-                self.save_archive();
+            let known: BTreeSet<String> = objs.into_iter().map(|(_, k)| k).collect();
+            let n = self.closed.len() + self.pinned.len();
+            self.closed.retain(|k| known.contains(k));
+            self.pinned.retain(|k| known.contains(k));
+            if n != self.closed.len() + self.pinned.len() {
+                self.save_marks();
             }
         }
     }
 
-    /// Write the Archive's ids to native.json (dropping the older Trash's keys).
-    fn save_archive(&self) {
+    /// Write the closed and pinned keys to native.json (dropping the older Archive's and Trash's keys).
+    fn save_marks(&self) {
         if self.persist {
-            crate::prefs::set("archived", serde_json::json!(self.archive));
-            crate::prefs::remove(&["trashed", "hidden"]);
+            crate::prefs::set("closed", serde_json::json!(self.closed));
+            crate::prefs::set("pinned", serde_json::json!(self.pinned));
+            crate::prefs::remove(&["archived", "trashed", "hidden"]);
         }
     }
 
-    /// The Archive at the sidebar's bottom: its row (icon, count, chevron) and, unfolded, one row per archived object.
+    /// The Archive's row at the sidebar's bottom: its icon, how many objects it holds and a chevron on hover; lit while
+    /// the Archive, or an object opened from it, is selected.
     fn sync_archive(&mut self) {
         let w = self.world.world_ref();
-        let items = model::archived(w);
+        let n = model::archived(w).len();
         let sel = self.selected();
         let row = View::of(w.entity_from_id(self.ids.archive_row));
         if let Some(p) = row.part("icon") {
@@ -776,42 +819,27 @@ impl App {
             p.text("Archive");
         }
         if let Some(p) = row.part("count") {
-            p.text(&if items.is_empty() { String::new() } else { items.len().to_string() });
+            p.text(&if n == 0 { String::new() } else { n.to_string() });
         }
         if let Some(p) = row.part("chevron") {
             p.icon(crate::look::CHEVRON);
-            crate::look::disclose(p.entity(), self.archive_open);
-            crate::look::hover_show(p.entity(), row.id(), self.archive_open);
+            crate::look::hover_show(p.entity(), row.id(), false);
         }
         let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
-        let looks = RowLooks::of(w, clear);
-        // An archived object that is selected while the list is folded lights the archive row.
-        set_if(row, if !self.archive_open && sel.is_some_and(|s| items.contains(&s)) { chosen } else { clear });
-        let list = View::of(w.entity_from_id(self.ids.archive_list));
-        // Newest first, nearest the archive row.
-        let shown: Vec<(String, u64)> = if self.archive_open { items.iter().rev().map(|&e| (format!("t{e}"), e)).collect() } else { Vec::new() };
-        let me = &*self;
-        for_each(list, "hn.ObjRow", shown, |row, e, new| {
-            if new {
-                row.set(HoverAmt::default());
-            }
-            row.action(&format!("select:{e}"));
-            set_if(row, if sel == Some(e) { chosen } else { clear });
-            let o = w.entity_from_id(e);
-            if let Some(p) = row.part("name") {
-                p.text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
-            }
-            looks.session(me, row, e, String::new());
-        });
+        let lit = sel.is_some_and(|s| s == model::archive_view(w) || w.entity_from_id(s).has(model::Archived::id()));
+        set_if(row, if lit { chosen } else { clear });
     }
 
-    /// Put object `e` in the Archive (it was killed with cmd+W or a Kill): the archive row's icon bounces and its count
-    /// pulses.
+    /// Close object `e` (cmd+W, a Kill): it goes to the Archive whatever the rule says (and loses its pin); the archive
+    /// row's icon bounces and its count pulses.
     fn archive_object(&mut self, e: u64) {
-        let Some(sid) = self.session_of(e) else { return };
-        if self.archive.insert(sid) {
-            self.world.entity_from_id(e).add(model::Archived::id());
-            self.save_archive();
+        let Some(key) = self.key_of(e) else { return };
+        let pinned = self.pinned.remove(&key);
+        if self.closed.insert(key) || pinned {
+            let o = self.world.entity_from_id(e);
+            o.add(model::Closed::id());
+            o.remove(model::Pinned::id());
+            self.save_marks();
             self.kick_archive();
         }
     }
@@ -830,14 +858,41 @@ impl App {
         self.poke();
     }
 
-    /// Take object `e` back out of the Archive into the tree.
+    /// Take object `e` back out of the Archive into the tree (right-click, Unarchive): no longer closed, and kept there
+    /// so the rule does not take it straight back.
     pub fn unarchive(&mut self, e: u64) {
-        let Some(sid) = self.session_of(e) else { return };
-        if self.archive.remove(&sid) {
-            self.world.entity_from_id(e).remove(model::Archived::id());
-            self.save_archive();
-        }
+        let Some(key) = self.key_of(e) else { return };
+        self.closed.remove(&key);
+        self.pinned.insert(key);
+        let o = self.world.entity_from_id(e);
+        o.remove(model::Closed::id());
+        o.add(model::Pinned::id());
+        self.save_marks();
         self.poke();
+    }
+
+    /// Keep object `e` in the tree whatever the rule says (right-click, Keep in Tree), or stop.
+    pub fn toggle_pin(&mut self, e: u64) {
+        let Some(key) = self.key_of(e) else { return };
+        let o = self.world.entity_from_id(e);
+        if self.pinned.remove(&key) {
+            o.remove(model::Pinned::id());
+        } else {
+            self.pinned.insert(key);
+            o.add(model::Pinned::id());
+        }
+        self.save_marks();
+        self.poke();
+    }
+
+    /// Whether `e` is kept in the tree ("Keep in Tree").
+    pub fn is_pinned(&self, e: u64) -> bool {
+        self.world.entity_from_id(e).has(model::Pinned::id())
+    }
+
+    /// Whether `e` can be closed, pinned or unarchived: a session or a run.
+    pub fn is_object(&self, e: u64) -> bool {
+        self.key_of(e).is_some()
     }
 
     /// Whether `e` is in the Archive.
@@ -850,15 +905,18 @@ impl App {
         let (x, y) = (x / self.zoom(), y / self.zoom());
         let w = self.world.world_ref();
         let mut hit = None;
-        // The Archive first: the tree clips its rows that run under it.
-        for list in [self.ids.archive_list, self.ids.tree] {
+        let lists = [self.archive_list().unwrap_or(0), self.ids.tree];
+        for list in lists.into_iter().filter(|&l| l != 0) {
             let l = w.entity_from_id(list);
             if !l.try_cloned::<&Laid>().is_some_and(|r| r.contains(x, y)) {
                 continue;
             }
             l.each_child(|c| {
                 if hit.is_none() && c.try_cloned::<&Laid>().is_some_and(|l| l.contains(x, y)) {
-                    hit = c.try_cloned::<&Action>().and_then(|a| a.name.as_str().strip_prefix("select:").and_then(|s| s.parse::<u64>().ok()));
+                    hit = c.try_cloned::<&Action>().and_then(|a| {
+                        let n = a.name.as_str();
+                        n.strip_prefix("select:").or_else(|| n.strip_prefix("arch:open:")).and_then(|s| s.parse::<u64>().ok())
+                    });
                 }
             });
         }
@@ -874,6 +932,11 @@ impl App {
             self.kill();
         } else if let Some(sid) = self.session_of(e) {
             self.link.kill(sid);
+            self.archive_object(e);
+        } else if let Some((n, None)) = self.run_of(e) {
+            if self.status_of(e) == "running" {
+                self.link.kill_run(n);
+            }
             self.archive_object(e);
         }
         self.poke();
@@ -893,6 +956,18 @@ impl App {
             let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
             let hint = if i < 9 { format!("\u{2318}{}", i + 1) } else { String::new() };
             out.push((format!("obj{e}"), kind_glyph(model::kind_name(o)), name, hint, Do::Select(e)));
+        }
+        // The Archive, then what is in it (newest first; a run by its id and command).
+        let view = model::archive_view(w);
+        out.push(("archive".into(), "\u{2630}", "Open Archive".into(), String::new(), Do::Select(view)));
+        for e in model::archived(w).into_iter().rev() {
+            let o = w.entity_from_id(e);
+            let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+            let name = match self.run_of(e) {
+                Some((n, _)) => format!("r{n}  {name}"),
+                None => name,
+            };
+            out.push((format!("arc{e}"), kind_glyph(model::kind_name(o)), name, "archived".into(), Do::Archived(e)));
         }
         out.push(("kill".into(), "\u{2715}", "Kill current object".into(), "\u{2318}W".into(), Do::Kill));
         out.push(("zoom-in".into(), "+", "Zoom in".into(), "\u{2318}=".into(), Do::Zoom(1)));
@@ -1195,8 +1270,18 @@ impl App {
                 }
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
                 model::toggle_fold(self.world.world_ref(), p);
-            } else if a == "archive:toggle" {
-                self.archive_open = !self.archive_open;
+            } else if a == "archive:open" {
+                self.open_archive();
+            } else if a == "nav:back" {
+                self.go_back();
+            } else if let Some(e) = a.strip_prefix("arch:open:").and_then(|s| s.parse().ok()) {
+                self.open_from_archive(e);
+            } else if let Some(e) = a.strip_prefix("arch:fold:").and_then(|s| s.parse().ok()) {
+                self.toggle_archive_open(e);
+            } else if let Some(i) = a.strip_prefix("arch:chip:").and_then(|s| s.parse().ok()) {
+                self.set_archive_chip(i);
+            } else if a == "arch:more" {
+                self.request_older();
             } else if a == "pal:close" {
                 self.palette = None;
             } else if let Some(i) = a.strip_prefix("pal:").and_then(|s| s.parse::<usize>().ok()) {
@@ -1212,6 +1297,7 @@ impl App {
         match d {
             Do::New(kind) => self.spawn(kind),
             Do::Select(e) => self.select(Some(e)),
+            Do::Archived(e) => self.open_from_archive(e),
             Do::Kill => self.kill(),
             Do::Zoom(by) => self.step_zoom(by),
         }
@@ -1394,7 +1480,12 @@ impl App {
         match (k.as_str(), m.shift) {
             ("a", false) => self.select_all(),
             ("]", _) | ("}", _) => self.step_object(1),
-            ("[", _) | ("{", _) => self.step_object(-1),
+            ("[", _) | ("{", _) => {
+                // Back to the Archive after opening something from it; else the previous object.
+                if !self.go_back() {
+                    self.step_object(-1);
+                }
+            }
             ("t" | "n", false) => self.spawn("claude"),
             ("t" | "n", true) => self.spawn("codex"),
             ("w", false) => self.kill(),
@@ -1467,6 +1558,16 @@ impl App {
 
     fn kill(&mut self) {
         let Some(e) = self.selected() else { return };
+        if let Some((n, None)) = self.run_of(e) {
+            // A run: killed while it runs, and closed; its session (if any) takes its place.
+            if self.status_of(e) == "running" {
+                self.link.kill_run(n);
+            }
+            let up = self.world.entity_from_id(e).parent().filter(|p| p.has(model::Object::id())).map(|p| *p.id());
+            self.archive_object(e);
+            self.select(up);
+            return;
+        }
         let Some(sid) = self.session_of(e) else { return };
         // The next object takes its place.
         let objs = self.objects();
@@ -1489,6 +1590,11 @@ impl App {
     /// Select the group of runs keyed `key` once the runs make it (the shot's `HARNESS_NATIVE_SHOT_SELECT=g:repl:<id>`).
     pub fn select_group(&mut self, key: &str) {
         self.pending_group = Some(key.to_owned());
+    }
+
+    /// Open the Archive once the daemon's first list is in (the shot's `HARNESS_NATIVE_SHOT_SELECT=archive`).
+    pub fn select_archive_later(&mut self) {
+        self.pending_archive = true;
     }
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
