@@ -755,7 +755,8 @@ impl<T> Clone for BoxedGenerator<'_, T> {
     }
 }
 
-impl<T> Generator<T> for BoxedGenerator<'_, T> {
+// blaze: name the lifetime for the stage-0 compiler's `Self: 'b` check (#1678).
+impl<'a, T> Generator<T> for BoxedGenerator<'a, T> {
     fn label(&self) -> u64 {
         self.inner.label()
     }
@@ -824,7 +825,8 @@ impl<T> Generator<T> for BoxedPrintableGenerator<'_, T> {
     }
 }
 
-impl<T> PrintableGenerator<T> for BoxedPrintableGenerator<'_, T> {
+// blaze: as for `BoxedGenerator::boxed`, keep the stage-0 lifetime explicit (#1678).
+impl<'a, T> PrintableGenerator<T> for BoxedPrintableGenerator<'a, T> {
     fn do_draw_and_print(&self, tc: &TestCase, printer: &mut PrettyPrinter) -> T {
         self.inner.do_draw_and_print(tc, printer)
     }
