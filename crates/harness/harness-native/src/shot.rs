@@ -12,6 +12,7 @@ pub fn run(path: &str) -> Result<(), String> {
     let (w, h) = (1280.0_f32, 800.0_f32);
     let mut renderer = Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
     let mut app = App::new(Arc::new(|| {}))?;
+    app.persist = false;
     if std::env::var_os("HARNESS_NATIVE_SHOT_PALETTE").is_some() {
         app.open_palette();
     }
