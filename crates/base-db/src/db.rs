@@ -476,6 +476,23 @@ impl Db {
         Some(self.files.included_source(self, krate, &path, durability, root.is_library))
     }
 
+    /// The file outside the VFS that a module declaration (`mod m;`) in `krate` names at `path`
+    /// relative to its anchor, read from disk as rustc reads every module's file: a `#[path]`
+    /// module outside every loaded source root, or a module of such a file. Made as `include!`
+    /// makes its file ([`Db::included_source`]): the read is an input `krate` is noted as
+    /// having read ([`crate::Files::included_by`], which its keys cover) and the caller reads
+    /// it, so a file that appears, goes or is edited reruns it once whoever owns the database
+    /// reads the disk again ([`Db::reload_included_files`]). Its own one-file source root is
+    /// the anchor its own modules resolve from. `None` when there is no module file to parse
+    /// there: the anchor has no path on disk, the read fails (no file there), the bytes are not
+    /// UTF-8, or the file ID it would have is taken by a file of the view; the declaration is
+    /// then an unresolved module, an error naming the paths looked for.
+    pub fn module_source(&self, krate: Crate, path: AnchoredPath<'_>) -> Option<FileId> {
+        let (file, source) = self.included_source(krate, path)?;
+        std::str::from_utf8(file.bytes(self)?).ok()?;
+        source.ok()
+    }
+
     /// The path [`Db::included_file`] reads, as rustc writes it in an error: the anchor's
     /// directory joined with `path`, not normalized.
     pub fn included_path(&self, path: AnchoredPath<'_>) -> Option<AbsPathBuf> {
@@ -485,10 +502,11 @@ impl Db {
         Some(anchor.parent()?.join(path.path))
     }
 
-    /// Notes that a module declaration in `krate` names a file [`Db::resolve_path`] has
-    /// nothing for: one outside its package, which the VFS does not load until it is asked to
-    /// (`include!` reads such a file itself: [`Db::included_source`]). An anchor with no
-    /// path on disk has no file next to it to load, so nothing is noted.
+    /// Notes that `krate` names a file [`Db::resolve_path`] has nothing for, for whoever owns
+    /// the VFS to load: a frozen def map's file that is not loaded. A module declaration reads
+    /// such a file itself ([`Db::module_source`]), as `include!` does
+    /// ([`Db::included_source`]). An anchor with no path on disk has no file next to it to
+    /// load, so nothing is noted.
     pub fn include_source(&self, path: AnchoredPath<'_>, krate: Crate) {
         let root_id = self.file_source_root(path.anchor).source_root_id(self);
         let root = self.source_root(root_id);

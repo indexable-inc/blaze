@@ -136,8 +136,10 @@ fn postlink(optimization: Optimization) -> Option<&'static str> {
     }
 }
 
-fn llvm(e: inkwell::support::LLVMString) -> Unhandled {
-    Unhandled::Llvm(e.to_string_lossy().into_owned())
+impl From<inkwell::support::LLVMString> for Unhandled {
+    fn from(e: inkwell::support::LLVMString) -> Self {
+        Unhandled::Llvm(e.to_string_lossy().into_owned())
+    }
 }
 
 /// Runs `passes` over `module` through the passes kept for `machine`; `vectorize` as rustc
@@ -240,7 +242,7 @@ pub(crate) fn prelink(
             told_functions(context, &module, wants, pointer)?;
             // The builder of the line table goes before the module is changed or let go of.
             let lined = lines.inspect(Debug::finish).is_some();
-            tally.time(Phase::Verify, || module.verify()).map_err(llvm)?;
+            tally.time(Phase::Verify, || module.verify())?;
             let renamed = pgo
                 .map(|(wanted, name)| pgo::instrumented(context, &module, function, wanted, name));
             if let Some(passes) = prelink_passes(optimization) {
@@ -411,7 +413,7 @@ fn told_functions<'ctx>(
 fn read_only(context: &Context) -> Result<u64, Unhandled> {
     let text = "declare void @read() memory(read)\n\0";
     let source = MemoryBuffer::create_from_memory_range_copy(text.as_bytes(), "memory");
-    let parsed = context.create_module_from_ir(source).map_err(llvm)?;
+    let parsed = context.create_module_from_ir(source)?;
     let function = parsed.get_function("read").ok_or(Unhandled::Shape("no `memory(read)`"))?;
     let memory = function.get_enum_attribute(AttributeLoc::Function, attribute_kind("memory"));
     memory.map(|it| it.get_enum_value()).ok_or(Unhandled::Shape("no `memory(read)`"))
@@ -635,7 +637,10 @@ fn optimistic<'ctx>(
         }
     }
     run(&module, "cgscc(function-attrs)", machine, false)?;
-    Ok(attrs_of(function))
+    let attrs = attrs_of(function);
+    // Spent here: what it was told to assume need not be true.
+    drop(module);
+    Ok(attrs)
 }
 
 /// Compiles the function of `own`, a module [`prelink`] made, with `imports` linked in as
@@ -674,8 +679,8 @@ pub(crate) fn compile(
         told_constants(context, &module, &readonly, pointer);
         tally.time(Phase::Lower, || {
             let source = MemoryBuffer::create_from_memory_range(own, "own");
-            let parsed = context.create_module_from_ir(source).map_err(llvm)?;
-            module.link_in_module(parsed).map_err(llvm)?;
+            let parsed = context.create_module_from_ir(source)?;
+            module.link_in_module(parsed)?;
             link(context, &module, imports, Linkage::AvailableExternally)?;
             if !imports.is_empty() {
                 agree_calls(context, &module)?;
@@ -690,7 +695,7 @@ pub(crate) fn compile(
             function.as_global_value().set_name(INNER);
             wrap(context, &module, function, None)?;
         }
-        tally.time(Phase::Verify, || module.verify()).map_err(llvm)?;
+        tally.time(Phase::Verify, || module.verify())?;
         let passes = || {
             if let Some(passes) = postlink(optimization) {
                 run(&module, passes, machine, true)?;
@@ -733,12 +738,12 @@ pub(crate) fn compile(
         let counted = profiled.map(|name| pgo::counted(&module, name)).transpose()?;
         let object = tally
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))
-            .map_err(llvm)?;
+            ?;
         let own = (OWN, signature);
         if let Some(counted) = counted {
             let covered = sanitize.coverage.is_on();
             let (code, coverage, bytes) = tally.time(Phase::Read, || {
-                emitted::read_profiled(object.as_slice(), own, wants, covered)
+                emitted::read_profiled(object.as_slice(), &own, wants, covered)
             })?;
             if u64::from(bytes) != u64::from(counted.counters) * 8 {
                 return Err(Unhandled::Shape("PGO counters of another size than the record says"));
@@ -747,7 +752,7 @@ pub(crate) fn compile(
         }
         if sanitize.coverage.is_on() {
             let (code, coverage) =
-                tally.time(Phase::Read, || emitted::read_covered(object.as_slice(), own, wants))?;
+                tally.time(Phase::Read, || emitted::read_covered(object.as_slice(), &own, wants))?;
             return Ok((code, coverage, None, found));
         }
         let mut codes =

@@ -117,8 +117,54 @@ pub fn root() -> anyhow::Result<PathBuf> {
 }
 
 /// Where every daemon of this machine, whatever its `BLAZE_HOME`, keeps what they share:
-/// `blaze` in the user's cache directory (`XDG_CACHE_HOME`, or `~/.cache`).
+/// `blaze` in the user's cache directory (`XDG_CACHE_HOME`, or `~/.cache`), when that is on
+/// the file system of blaze's root ([`root`]); else `shared` under the root. What is placed
+/// there is cloned from the daemon's store, and a clone does not cross file systems (blaze
+/// never copies instead), so daemons share it only within one file system.
 pub fn machine() -> anyhow::Result<PathBuf> {
+    let dir = user_shared()?;
+    let root = root()?;
+    if same_file_system(&dir, &root)? { Ok(dir) } else { Ok(root.join("shared")) }
+}
+
+/// Whether `a` and `b` are on one file system, each judged by the nearest of it and its
+/// ancestors that exists (a directory not made yet is made on its parent's).
+#[cfg(unix)]
+fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let device = |path: &Path| -> anyhow::Result<u64> {
+        let mut at = path;
+        loop {
+            match std::fs::metadata(at) {
+                Ok(it) => return Ok(it.dev()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    at = at.parent().with_context(|| {
+                        format!("no ancestor of {} exists to say its file system", path.display())
+                    })?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("the file system of {}", at.display()));
+                }
+            }
+        }
+    };
+    Ok(device(a)? == device(b)?)
+}
+
+/// Whether `a` and `b`, both absolute, are on one volume: the same drive or share prefix
+/// (ReFS clones within a volume alone).
+#[cfg(not(unix))]
+fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
+    let prefix = |path: &Path| match path.components().next() {
+        Some(std::path::Component::Prefix(it)) => Ok(it.as_os_str().to_ascii_uppercase()),
+        _ => Err(anyhow::anyhow!("{} names no volume to say its file system", path.display())),
+    };
+    Ok(prefix(a)? == prefix(b)?)
+}
+
+/// `blaze` in the user's cache directory (`XDG_CACHE_HOME`, or `~/.cache`), absolute.
+fn user_shared() -> anyhow::Result<PathBuf> {
     let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
         Some(caches) => PathBuf::from(caches).join("blaze"),
         None => {

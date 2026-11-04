@@ -1065,7 +1065,7 @@ impl Files {
         Some(self.included.get(at).file)
     }
 
-    /// Notes a file a module declaration names that the VFS has not: whoever
+    /// Notes a file a frozen def map names that the VFS has not: whoever
     /// owns the VFS puts it in the source root, see [`Files::included_sources`].
     pub fn include_source(&self, path: &AbsPath, root: SourceRootId, krate: Crate) {
         let (at, _) = self.included_sources.insert(

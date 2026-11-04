@@ -315,11 +315,12 @@ pub(crate) fn waits_of(sched: &Scheduler, member: u32) -> super::Waits {
 #[allow(unsafe_code)]
 pub(crate) fn job_in_graph() -> Option<(JobId, Scheduler)> {
     match HERE.get() {
-        // SAFETY: `here` was stored by the fiber running this code, on this thread, and its
-        // scheduler outlives the job's run.
-        Some(here) => {
-            (here.job != UNREGISTERED).then(|| (here.job, unsafe { &*here.sched }.clone()))
-        } // clone: a reference count
+        Some(here) => (here.job != UNREGISTERED).then(|| {
+            // SAFETY: `here` was stored by the fiber running this code, on this thread, and its
+            // scheduler outlives the job's run.
+            let sched = unsafe { &*here.sched };
+            (here.job, sched.clone()) // clone: a reference count
+        }),
         // A thread whose locals are going (a pool dropped as its thread ends) is in the graph
         // no more: its client left it as it went.
         None => CLIENT

@@ -334,7 +334,7 @@ store:
         let signature = cranelift_codegen::ir::Signature::new(isa.default_call_conv());
         let (code, covered) = super::super::emitted::read_covered(
             object.as_slice(),
-            (OWN, signature.clone()),
+            &(OWN, signature.clone()),
             &mut wants,
         )
         .unwrap();

@@ -15,8 +15,8 @@ use triomphe::Arc;
 use crate::{
     BuiltDependency, ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
     CrateType, CrateTypes, CrateWorkspaceData, Db, DependencyBuilder, EditionedFileId, Env,
-    FileText, SourceRoot, SourceRootId, TargetKind, ViewChange, ViewError, ViewFile, ViewRoot,
-    all_crates_content, cfg_options_content,
+    FileText, SourceRoot, SourceRootId, TargetKind, Trigger, ViewChange, ViewError, ViewFile,
+    ViewRoot, all_crates_content, cfg_options_content,
     reparse::{
         REPARSED, TextEdit, assert_whole, common_prefix, common_prefix_scalar, common_suffix,
         common_suffix_scalar,
@@ -1384,6 +1384,81 @@ fn a_path_module_outside_its_package_resolves_and_its_edit_reruns_the_reader() {
     put_root(&mut db, 2, &[(moved, "/ws/shared/m.rs", "pub fn g() {}")]);
     assert_eq!(shared_module(&db, anchor), Some((moved.index(), 13)));
     assert_eq!(shared_module_runs(), runs + 4);
+}
+
+thread_local! {
+    static DISK_MODULE_RUNS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// What a `#[path = "../../shared/m.rs"] mod m;` in the root of `krate` reads when no source
+/// root has that file: the file read from disk and its text's length, as a def map would.
+#[blaze_query::tracked(returns(copy))]
+fn disk_module(db: &Db, krate: Crate) -> Option<(u32, u32)> {
+    DISK_MODULE_RUNS.with(|it| it.set(it.get() + 1));
+    let anchor = krate.data(db).root_file_id;
+    let path = AnchoredPath { anchor, path: "../../shared/m.rs" };
+    let file = db.resolve_path(path).or_else(|| db.module_source(krate, path))?;
+    Some((file.index(), db.file_text(file).text(db).len() as u32))
+}
+
+fn disk_module_runs() -> usize {
+    DISK_MODULE_RUNS.with(Cell::get)
+}
+
+/// A module file outside every source root (crates/blaze-inproc-rt's `#[path]` into
+/// library/) is read from disk as rustc reads it, noted as the crate's read, and its own
+/// modules resolve beside it; an edit of it, or its removal, reruns the reader once the disk
+/// is read again.
+#[test]
+fn a_module_file_outside_every_source_root_is_read_from_disk_and_its_edit_reruns_the_reader() {
+    let dir = std::env::temp_dir().join(format!("blaze-base-db-module-{}", std::process::id()));
+    let dir = AbsPathBuf::assert_utf8(dir);
+    let (src, shared) = (dir.join("member/src"), dir.join("shared"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&shared).unwrap();
+    let (m, n) = (shared.join("m.rs"), shared.join("n.rs"));
+    std::fs::write(&m, "pub fn f() {}").unwrap();
+    std::fs::write(&n, "").unwrap();
+
+    let mut db = Db::for_tests();
+    let lib = FileId::from_raw(0);
+    db.set_file_text_with_durability(lib, "", Durability::LOW);
+    db.set_file_source_root_with_durability(lib, SourceRootId(0), Durability::MEDIUM);
+    let mut set = FileSet::default();
+    set.insert(lib, VfsPath::from(src.join("lib.rs")));
+    let root = Arc::new(SourceRoot::new_local(set));
+    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
+    let mut graph = CrateGraphBuilder::default();
+    let krate = add(&mut graph, lib, CfgOptions::default(), Env::default());
+    let krate = graph.set_in_db(&mut db)[&krate];
+
+    let path = AnchoredPath { anchor: lib, path: "../../shared/m.rs" };
+    assert_eq!(db.resolve_path(path), None, "no source root has it");
+    let runs = disk_module_runs();
+    let (file, len) = disk_module(&db, krate).unwrap();
+    assert_eq!(len, 13);
+    assert_eq!(disk_module(&db, krate), Some((file, len)));
+    assert_eq!(disk_module_runs(), runs + 1);
+    let read: Vec<_> = db.files().included_by(&db, krate).into_iter().map(|it| it.0).collect();
+    assert!(read.contains(&m), "the crate's keys cover what it read: {read:?}");
+
+    // Its own `mod n;` resolves beside it, from its own one-file source root.
+    let file = FileId::from_raw(file);
+    let nested = db.module_source(krate, AnchoredPath { anchor: file, path: "n.rs" }).unwrap();
+    assert_eq!(db.path_for_file(nested), Some(&VfsPath::from(n.clone())));
+
+    // An edit on disk, read again: the reader runs again and reads the new text.
+    std::fs::write(&m, "pub fn f() { 1 }").unwrap();
+    assert!(db.reload_included_files(Trigger::named("a test's edit")).contains(&m));
+    assert_eq!(disk_module(&db, krate), Some((file.index(), 16)));
+    assert_eq!(disk_module_runs(), runs + 2);
+
+    // Gone from disk: no module file, never the old text.
+    std::fs::remove_file(&m).unwrap();
+    assert!(db.reload_included_files(Trigger::named("a test's removal")).contains(&m));
+    assert_eq!(disk_module(&db, krate), None);
+    assert_eq!(disk_module_runs(), runs + 3);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

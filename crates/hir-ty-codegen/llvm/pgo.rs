@@ -390,7 +390,7 @@ store:
         let signature = cranelift_codegen::ir::Signature::new(isa.default_call_conv());
         let (code, _, bytes) = super::super::emitted::read_profiled(
             object.as_slice(),
-            (OWN, signature.clone()),
+            &(OWN, signature.clone()),
             &mut wants,
             false,
         )
