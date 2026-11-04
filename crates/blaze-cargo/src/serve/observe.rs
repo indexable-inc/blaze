@@ -517,6 +517,10 @@ pub fn keep_history(
 #[derive(Debug)]
 pub enum Claim {
     Owned { dir: PathBuf, holder: Option<u32> },
+    /// The owner file stayed held past [`history::RECOVERY_WAIT`] though the pid it names is
+    /// not alive: a reader writing a dead daemon's last rows ([`history::recover_dead`]) that
+    /// took far longer than it should, or is stuck.
+    Recovering { dir: PathBuf, waited: Duration },
     Io { path: PathBuf, doing: &'static str, error: std::io::Error },
 }
 
@@ -538,6 +542,14 @@ impl std::fmt::Display for Claim {
                     ", holding {OWNER}): two daemons over one history would give builds the same id"
                 )
             }
+            Claim::Recovering { dir, waited } => write!(
+                f,
+                "the profile history {} stayed held ({OWNER}) for {waited:?} by a reader writing a \
+                 dead daemon's last rows, and no live blaze serve: a daemon waits at most \
+                 {:?} for that before it starts",
+                dir.display(),
+                history::RECOVERY_WAIT
+            ),
             Claim::Io { path, doing, error } => write!(f, "{doing} {}: {error}", path.display()),
         }
     }
@@ -553,7 +565,9 @@ struct Owner {
 
 /// This process's claim on the history in `dir`, for as long as the [`Owner`] lives: an
 /// exclusive lock on its [`OWNER`] file, with the pid written in it for the next claimant to
-/// name.
+/// name. A lock held while the pid in the file is not alive is a reader writing a dead
+/// daemon's last rows ([`history::recover_dead`], which writes no pid): waited for, at most
+/// [`history::RECOVERY_WAIT`]. One held by a live pid is another daemon: refused at once.
 fn claim(dir: &Path) -> Result<Owner, Claim> {
     let io = |path: &Path, doing| {
         let path = path.to_path_buf(); // alloc: error path
@@ -568,13 +582,45 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
         .truncate(false)
         .open(&path)
         .map_err(io(&path, "opening the profile history's owner file"))?;
-    let mut file = match stdx::file_lock::Locked::try_lock(file) {
-        Ok(Ok(file)) => file,
-        Ok(Err(_held)) => {
-            let holder = fs::read_to_string(&path).ok().and_then(|it| it.trim().parse().ok());
-            return Err(Claim::Owned { dir: dir.to_path_buf(), holder });
-        }
+    let held = match stdx::file_lock::Locked::try_lock(file) {
+        Ok(Ok(file)) => Ok(file),
+        Ok(Err(held)) => Err(held),
         Err(error) => return Err(io(&path, "locking the profile history's owner file")(error)),
+    };
+    let mut file = match held {
+        Ok(file) => file,
+        Err(held) => {
+            let holder: Option<u32> =
+                fs::read_to_string(&path).ok().and_then(|it| it.trim().parse().ok());
+            if holder.is_some_and(history::alive) {
+                return Err(Claim::Owned { dir: dir.to_path_buf(), holder });
+            }
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "waits on the profile history's owner lock, held by a reader recovering a dead daemon's rows",
+                dir = %dir.display(),
+                dead = ?holder,
+            )
+            .entered();
+            let started = Instant::now();
+            match history::lock_within(held, history::RECOVERY_WAIT) {
+                Ok(Ok(file)) => file,
+                Ok(Err(_held)) => {
+                    // A live daemon may have taken it and let go meanwhile; the pid now in
+                    // the file says which refusal this is.
+                    let holder: Option<u32> =
+                        fs::read_to_string(&path).ok().and_then(|it| it.trim().parse().ok());
+                    if holder.is_some_and(history::alive) {
+                        return Err(Claim::Owned { dir: dir.to_path_buf(), holder });
+                    }
+                    let waited = started.elapsed();
+                    return Err(Claim::Recovering { dir: dir.to_path_buf(), waited });
+                }
+                Err(error) => {
+                    return Err(io(&path, "locking the profile history's owner file")(error));
+                }
+            }
+        }
     };
     use std::io::Write as _;
     file.set_len(0).map_err(io(&path, "writing the profile history's owner file"))?;
@@ -608,6 +654,7 @@ fn keep(
                     tracing::error!("{error}");
                     _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
                 }
+                tell_failed(&mut history, failed);
                 flushed_at = Instant::now();
                 continue;
             }
@@ -710,9 +757,20 @@ fn keep(
             tracing::error!("{error}");
             _ = failed.send(error.to_string()); // alloc: error path, a flush that failed
         }
+        tell_failed(&mut history, failed);
         if last {
             return;
         }
+    }
+}
+
+/// Logs and tells the daemon each error of the history's last flush that came after its rows
+/// were committed (a merge, the cap, a reap, a table's file that failed while the others were
+/// listed: [`History::take_failed`]): the flush itself said `Ok`, its seq durable.
+fn tell_failed(history: &mut History, failed: &Sender<String>) {
+    for error in history.take_failed() {
+        tracing::error!("{error}");
+        _ = failed.send(error.to_string()); // alloc: error path, a flush step that failed
     }
 }
 
