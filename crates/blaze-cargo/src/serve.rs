@@ -830,8 +830,12 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
     let (profiling, keeper) = observe::keep_history(&paths.state, duckdb).map_err(|why| anyhow::anyhow!(why))?;
     // Fixed for the daemon's life before any job: a build's tasks only read it.
-    let sysroot = crate::toolchain::sysroot()
-        .with_context(|| format!("blaze's toolchain ({}) is not on this machine: `blaze toolchain` installs it", crate::toolchain::name()))?;
+    let sysroot = crate::toolchain::sysroot().with_context(|| {
+        // alloc: once, on the error that stops the daemon from starting
+        let at = crate::toolchain::own::Release::ours().and_then(|it| it.dir());
+        let at = at.map_or_else(|| "on this machine".to_owned(), |it| format!("at {}", it.display()));
+        format!("blaze's toolchain ({}) is not whole {at}: `blaze toolchain` installs it", crate::toolchain::name())
+    })?;
     tracing::info!(sysroot = %sysroot.display(), "blaze's toolchain");
     // Which blaze this is, for clients to compare: no stored value is keyed by it.
     let build = build_of(&paths.launcher)?;

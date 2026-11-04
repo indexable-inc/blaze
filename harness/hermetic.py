@@ -322,6 +322,12 @@ def main():
             code, out, err = run(cmd, ws, env, "--why", "--json")
             if code == 0 and "[blaze]" in err and out.strip():
                 break
+            # A command line blaze refuses is refused the same way every time: no daemon is
+            # waited for. v2's `blaze test` takes cargo's flags, `--reached` and `--ub*`, and has
+            # no `--why` or `--json` (docs/harness.md), so this is what the harness meets today.
+            if "unexpected argument" in err:
+                raise SystemExit(f"`blaze test --why --json` was refused: v2's blaze has no `--why` "
+                                 f"(the hermetic report this harness checks):\n{err[-2000:]}")
             if time.monotonic() > deadline:
                 raise SystemExit(f"never served by the daemon:\n{err[-3000:]}")
             time.sleep(0.5)

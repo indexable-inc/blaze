@@ -49,7 +49,7 @@ with `"write_locks": true` has blaze resolve it and writes it there. A workspace
 `report.md` say so per project, with the copy's BLAKE3 both before the edit and as built.
 
 For each project, `jobs` at a time, the longest first, each with a daemon home of its own
-(its `toolchains` linked to the machine's, as `BLAZE_HOME` moves them too):
+(which reads the machine's toolchain, `~/.blaze/toolchains`, as every `BLAZE_HOME` does):
 
 | Step | What it does and records |
 |---|---|
@@ -184,7 +184,9 @@ longest first), so adding a harness adds a part rather than lengthening one; a f
 with no `FAST` line is an error, and so is a `FAST` or `CORE` line that names no harness. Each
 harness runs with a `BLAZE_HOME` of its own under `/tmp/rj-ci-*`, so its daemon's state and store (`<home>/v2`) are its own, and its daemon is stopped
 afterwards, so no two harnesses of a job share a daemon or a socket (on a runner `XDG_RUNTIME_DIR` would otherwise give every
-harness `/run/user/1001/blaze`). `live_e2e.py` and `live_types.py` take a
+harness `/run/user/1001/blaze`). The toolchain is in no home: every home reads the machine's
+(`~/.blaze/toolchains`), which `ci.py` has `blaze toolchain` download once before a part's first
+harness. `live_e2e.py` and `live_types.py` take a
 home of their own when run by hand too.
 
 A part runs all of its harnesses even when one fails, then names the ones that failed and how

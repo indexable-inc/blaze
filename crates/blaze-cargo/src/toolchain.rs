@@ -100,8 +100,8 @@ pub fn ensure() -> Result<Chosen, String> {
     };
     let Some(dir) = release.dir() else {
         return Err(format!(
-            "blaze builds with Rust {ours} and keeps it in .blaze in your home directory, and there is no home \
-             directory: `BLAZE_HOME` names where to keep it"
+            "blaze builds with Rust {ours} and keeps it in .blaze/toolchains in your home directory, for \
+             every BLAZE_HOME, and no home directory is set (HOME, or USERPROFILE on Windows)"
         ));
     };
     own::fetch(&release, &dir)?;
