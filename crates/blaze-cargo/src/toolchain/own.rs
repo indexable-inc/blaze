@@ -235,7 +235,7 @@ fn fetch_from(
         release.version,
         release.megabytes()
     );
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     // A span in the client's flight recorder, which the client's rows take to the history.
     let _span = tracing::info_span!(target: "blaze", "toolchain download", toolchain = release.version, bytes = release.bytes()).entered();
     let downloads = parent.join(format!(".{name}.download"));
