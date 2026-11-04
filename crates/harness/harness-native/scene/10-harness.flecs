@@ -131,6 +131,20 @@ prefab hn.DeviceRow : ui.Row {
   }
 }
 
+// A tree row's disclosure, Finder's: a chevron left of the row's icon that folds what is under the row, its hit target
+// the full slot (wider and taller than the glyph). The host gives it the chevron and the press only when the row has
+// rows under it (src/app/fold.rs); else it is an empty slot that keeps the icons in line.
+prefab hn.Disclosure : ui.Row {
+  Pressable
+  Action: {name: ""}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  icon : ui.Symbol, Faint {
+    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+  }
+}
+
 // A session: indent, its kind's icon in the kind's colour, its name (13 medium), and on the right its shortcut (on
 // hover), a failure's badge and a running dot.
 prefab hn.ObjRow : ui.Row {
@@ -146,6 +160,7 @@ prefab hn.ObjRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Symbol {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
@@ -175,6 +190,7 @@ prefab hn.RunRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Symbol, Faint {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
@@ -202,6 +218,7 @@ prefab hn.GroupRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Symbol, Muted {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
@@ -211,9 +228,6 @@ prefab hn.GroupRow : ui.Row {
   spacer : ui.Spacer {}
   meta : ui.Line, Faint {
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-  }
-  chevron : ui.Symbol, Faint {
-    Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
   }
 }
 
@@ -231,6 +245,7 @@ prefab hn.MoreRow : ui.Row {
   indent : ui.Node {
     Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
+  disclose : hn.Disclosure {}
   glyph : ui.Node {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
@@ -437,6 +452,8 @@ prefab hn.Theme {
   pill { Motion: {omega: $pill_omega, zeta: $pill_zeta} }
   sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
   lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
+  // A tree row folding in or away (its height and opacity).
+  tree_fold { Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta} }
   // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it), how far
   // an edge with more beyond it fades, and the overlay knob shown while it moves.
   tree_scroll {

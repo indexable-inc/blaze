@@ -769,6 +769,15 @@ GlyphV glyph_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer
     o.clip = g.clip;
     o.fade = g.fade.xy;
     float2 pt = g.rect.xy + c * g.rect.zw + float2(0, rise);
+    // A turned bitmap (a disclosure chevron): its corners turned about its middle, clockwise (y down).
+    if (g.clip.z != 0.0)
+    {
+        float2 m = g.rect.xy + g.rect.zw * 0.5 + float2(0, rise);
+        float2 d = pt - m;
+        float sn = sin(g.clip.z);
+        float cs = cos(g.clip.z);
+        pt = m + float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+    }
     o.pos = float4(to_ndc(pt, frame.view), 0, 1);
     o.uv = lerp(g.uv.xy, g.uv.zw, c);
     o.y = pt.y;

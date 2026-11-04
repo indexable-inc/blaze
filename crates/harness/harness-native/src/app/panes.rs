@@ -545,6 +545,7 @@ impl App {
     pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
         self.set_pointer(x, y);
         self.poke();
+        self.press = (clicks, m);
         // On the sidebar's right edge: drag it wider or narrower.
         if b == Button::Left && self.palette.is_none() && self.side_open && let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) {
             if (self.pointer.x - (l.x + l.w)).abs() <= SIDE_GRAB && self.pointer.y >= l.y && self.pointer.y <= l.y + l.h {
@@ -559,8 +560,9 @@ impl App {
         if self.palette.is_some() {
             return;
         }
-        // A press in another pane focuses it (the selection follows what it shows).
+        // A press in another pane focuses it (the selection follows what it shows), and takes the keyboard from the tree.
         if let Some(p) = self.pane_at() {
+            self.tree_focus = false;
             self.focus_pane(p);
         }
         let Some(t) = self.term_at() else { return };
@@ -768,6 +770,9 @@ impl App {
             if k.action != KeyAction::Release {
                 self.palette_key(k.code, k.text);
             }
+            return;
+        }
+        if self.tree_key(k) {
             return;
         }
         let Some(t) = self.focused_term() else { return };

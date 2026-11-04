@@ -29,6 +29,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 mod panes;
+mod fold;
 mod sidebar;
 pub use sidebar::Wheel;
 
@@ -161,6 +162,12 @@ pub struct App {
     pill: crate::look::Pill,
     /// The sidebar tree's scroll (src/app/sidebar.rs).
     tree: sidebar::TreeScroll,
+    /// The sidebar tree's rows across frames, for folding rows in and away (src/app/fold.rs).
+    fold: fold::TreeFold,
+    /// The tree has the keyboard (a tree row was pressed): arrows move in it until a pane is pressed or another key typed.
+    tree_focus: bool,
+    /// The last press's click count and modifiers (a double click on a row folds it, Option folds its siblings too).
+    press: (isize, KeyMods),
     /// The sidebar's fold (cmd+S): open or not, and its spring (0 folded away to 1 open); the traffic lights fade with it.
     side_open: bool,
     side_x: harness_native_api::spring::Spring,
@@ -255,7 +262,8 @@ impl App {
         });
         world.system_named::<&mut HoverAmt>("Hover").each_iter(move |it, row, h| {
             let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
-            let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| t.id() == e.id());
+            // On it, or on a part of it that takes the pointer itself (a row's disclosure chevron).
+            let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| std::iter::successors(Some(t), |n| n.parent()).take(4).any(|n| n.id() == e.id()));
             if settle(&mut h.spring, f32::from(u8::from(on)), Tune { omega: 34.0, zeta: 1.0 }, dt) {
                 moving(&w);
             }
@@ -328,6 +336,9 @@ impl App {
             dark: true,
             pill: crate::look::Pill::default(),
             tree: sidebar::TreeScroll::default(),
+            fold: fold::TreeFold::default(),
+            tree_focus: false,
+            press: (0, KeyMods::default()),
             side_open: true,
             side_x: harness_native_api::spring::Spring::at(1.0),
             corner_x: harness_native_api::spring::Spring::at(0.0),
@@ -457,6 +468,8 @@ impl App {
     /// Keep the view's nodes in step with the model: the device row, one row per object, the main card's header, the
     /// palette.
     fn sync_view(&mut self) {
+        // Folds kept in native.json land on objects before their rows are read.
+        self.read_folds();
         let w = self.world.world_ref();
         let up = w.lookup(model::LOCAL).target(model::Link::id(), 0).is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
         self.sync_archive_tags(up);
@@ -555,6 +568,8 @@ impl App {
                 model::Row::More { parent, .. } => (format!("more{parent}"), "hn.MoreRow", r),
             })
             .collect();
+        // Rows that left the list stay while they fold away.
+        let info = self.fold.merge(info, w);
         let me = &*self;
         // Names to clip to their row's room once the loop is done (the typesetter needs `self` mutably).
         let indent = |row: View<'_>, depth: usize| {
@@ -574,6 +589,7 @@ impl App {
                 model::Row::More { parent, hidden, depth, unfolded } => {
                     row.action(&format!("fold:{parent}"));
                     indent(row, depth);
+                    fold::disclosure(row, None);
                     if let Some(p) = row.part("name") {
                         p.text(&if unfolded { "Show fewer".to_owned() } else { format!("Show {hidden} more") });
                     }
@@ -587,7 +603,7 @@ impl App {
                 row.action(&format!("group:{e}"));
                 set_if(row, if sel == Some(e) { chosen } else { clear });
                 indent(row, depth);
-                let open = !o.has(model::Collapsed::id());
+                fold::disclosure(row, Some(o));
                 if let Some(p) = row.part("glyph") {
                     p.icon(crate::look::GROUP_ICON);
                 }
@@ -597,14 +613,10 @@ impl App {
                 if let Some(p) = row.part("meta") {
                     p.text(&model::run_count(w, e).to_string());
                 }
-                if let Some(p) = row.part("chevron") {
-                    p.icon(crate::look::CHEVRON);
-                    crate::look::disclose(p.entity(), open);
-                    crate::look::hover_show(p.entity(), row.id(), open);
-                }
                 return;
             }
             row.action(&format!("select:{e}"));
+            fold::disclosure(row, Some(o));
             set_if(row, if sel == Some(e) { chosen } else { clear });
             indent(row, depth);
             let run = me.run_of(e);
@@ -636,6 +648,7 @@ impl App {
                 crate::look::hover_show(p.entity(), row.id(), failed || matches!(status, "lost" | "pending" | "skipped"));
             }
         });
+        self.fold.animate(self.world.entity_from_id(self.ids.tree), crate::look::tune(self.world.world_ref(), "tree_fold"));
         self.sync_panes();
         self.sync_title();
         self.sync_archive();
@@ -956,6 +969,7 @@ impl App {
         self.pill.dt = dt;
         self.step_sidebar(dt);
         self.lay_chrome(z);
+        self.step_fold();
         self.step_tree_scroll(dt);
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
@@ -1163,7 +1177,16 @@ impl App {
         for a in acts {
             self.poke();
             if let Some(e) = a.strip_prefix("select:").and_then(|s| s.parse().ok()) {
+                // A double click on a row with rows under it folds or unfolds it too.
+                let again = self.press.0 >= 2 && self.selected() == Some(e);
                 self.select(Some(e));
+                self.tree_focus = true;
+                if again && fold::has_kids(self.world.entity_from_id(e)) {
+                    self.toggle_fold_of(e, self.press.1.alt);
+                }
+            } else if let Some(e) = a.strip_prefix("toggle:").or_else(|| a.strip_prefix("collapse:")).and_then(|s| s.parse().ok()) {
+                self.tree_focus = true;
+                self.toggle_fold_of(e, self.press.1.alt);
             } else if let Some(g) = a.strip_prefix("group:").and_then(|s| s.parse().ok()) {
                 if self.selected() == Some(g) {
                     model::toggle_collapse(self.world.world_ref(), g);
