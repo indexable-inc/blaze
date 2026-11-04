@@ -4,9 +4,12 @@
 //!   files (`Cx::file`) or another root's (`Cx::file_at`). [`LoadFile`] and [`LoadDir`] are one
 //!   query per path, so a mount added for a fetched source reruns them alone and cuts off.
 //! - A path under no mount is never read: it is [`Found::Unmounted`], which the load turns into
-//!   a fetch or an error naming it. Outside every mount only the files the client sent are
-//!   (`Invocation::files`), and a file of a directory above the view or the cwd, or of
-//!   `$CARGO_HOME`, that it did not send is absent.
+//!   a fetch: a registry's or git's by what names it, any other a
+//!   [`crate::query::FetchKind::Local`] the daemon reads from the disk where it is (a `path`
+//!   dependency outside the checkout), mounts as a root keyed by its bytes, and asks again.
+//!   Outside every mount only the files the client sent are (`Invocation::files`), and a file
+//!   of a directory above the view or the cwd, or of `$CARGO_HOME`, that it did not send is
+//!   absent.
 //! - blaze-manifest reads through a [`Snap`], which [`read_through`] makes over the step's
 //!   `Cx`: each file is asked of the database when blaze-manifest asks for it, once, and its
 //!   bytes are lent from where the database keeps them. A TOML file is read as its
@@ -32,7 +35,8 @@ use std::alloc::Global;
 use super::config::ConfigOf;
 use super::invocation::Invocation;
 use super::key_id;
-use crate::query::{Cbor, LoadError, Mount, Origin, Versioned, producer};
+use super::Unread;
+use crate::query::{Cbor, Fetch, FetchKind, Mount, Origin, Versioned, producer};
 
 /// What a path is.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -945,8 +949,11 @@ pub(crate) struct Reader<'r, 'db> {
     dirs: RefCell<HashMap<String, Found<Vec<(&'db str, bool)>>, Global>>,
     /// A read was cancelled: every read after it is too, without asking.
     cancelled: Cell<bool>,
-    /// The least path read that is under no mount.
-    unmounted: RefCell<Option<String>>,
+    /// Every path read that is under no mount, in the order read, each with whether it was
+    /// only asked whether it is there ([`Snap::kind`]), never read.
+    unmounted: RefCell<Vec<(String, bool)>>,
+    /// A [`Snap::kind`] is asking: what it finds under no mount is a probe.
+    probing: Cell<bool>,
 }
 
 impl<'r, 'db> Reader<'r, 'db> {
@@ -970,7 +977,9 @@ impl<'r, 'db> Reader<'r, 'db> {
             keyed: RefCell::new(PathKey { path: String::new(), config: config.clone() }),
             dirs: RefCell::new(HashMap::new_in(Global)),
             cancelled: Cell::new(false),
-            unmounted: RefCell::new(None),
+            // alloc: none until a path is under no mount.
+            unmounted: RefCell::new(Vec::new()),
+            probing: Cell::new(false),
         }
     }
 
@@ -992,10 +1001,13 @@ impl<'r, 'db> Reader<'r, 'db> {
     }
 
     fn saw_unmounted(&self, path: &str) {
+        let probe = self.probing.get();
         let mut unmounted = self.unmounted.borrow_mut();
-        if unmounted.as_deref().is_none_or(|it| path < it) {
-            // alloc: the path an error names, once.
-            *unmounted = Some(path.to_owned());
+        match unmounted.iter_mut().find(|(it, _)| it == path) {
+            // Read for its contents as well as probed: read.
+            Some((_, probed)) => *probed &= probe,
+            // alloc: a path the daemon is asked to mount, once each.
+            None => unmounted.push((path.to_owned(), probe)),
         }
     }
 
@@ -1130,6 +1142,33 @@ fn unmounted(path: &str) -> std::io::Error {
 }
 
 impl Snap<'_, '_> {
+    /// [`Files::kind`], with what it finds under no mount a probe.
+    fn kind_of(&self, path: &Path) -> Option<FileKind> {
+        let path = normal_ref(path)?;
+        if let Some((parent, name)) = path.rsplit_once('/') {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            // The parent's listing only saves the reads below: a parent under no mount (the
+            // home directory above a known `$CARGO_HOME`) is no error of the load's.
+            let listed = self.0.listing(parent, false, |found| match found {
+                Found::Here(names) => Some(names.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| match names[at].1 {
+                    true => FileKind::Dir,
+                    false => FileKind::File,
+                })),
+                Found::Absent | Found::Unmounted => None,
+            })?;
+            if let Some(kind) = listed {
+                return kind;
+            }
+        }
+        if self.0.dir(&path, |found| matches!(found, Found::Here(_)))? {
+            return Some(FileKind::Dir);
+        }
+        match self.0.file(&path)? {
+            Found::Here(_) => Some(FileKind::File),
+            Found::Absent | Found::Unmounted => None,
+        }
+    }
+
     /// The manifest at `path` read as it is and parsed as blaze-manifest's own `manifest`
     /// does: what gives the error of one that is not there or does not parse, its line and
     /// column the file's, not its canonical form's.
@@ -1177,33 +1216,10 @@ impl Files for Snap<'_, '_> {
     /// asking whether it is there; a path its parent's names don't answer for (a mount's own
     /// directory) is asked of itself. A listing is sorted by name.
     fn kind(&self, path: &Path) -> Option<FileKind> {
-        let path = normal_ref(path)?;
-        if let Some((parent, name)) = path.rsplit_once('/') {
-            let parent = if parent.is_empty() { "/" } else { parent };
-            // The parent's listing only saves the reads below: a parent under no mount (the
-            // home directory above a known `$CARGO_HOME`) is no error of the load's.
-            let listed = self.0.listing(parent, false, |found| match found {
-                Found::Here(names) => {
-                    Some(names.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| {
-                        match names[at].1 {
-                            true => FileKind::Dir,
-                            false => FileKind::File,
-                        }
-                    }))
-                }
-                Found::Absent | Found::Unmounted => None,
-            })?;
-            if let Some(kind) = listed {
-                return kind;
-            }
-        }
-        if self.0.dir(&path, |found| matches!(found, Found::Here(_)))? {
-            return Some(FileKind::Dir);
-        }
-        match self.0.file(&path)? {
-            Found::Here(_) => Some(FileKind::File),
-            Found::Absent | Found::Unmounted => None,
-        }
+        let probing = self.0.probing.replace(true);
+        let kind = self.kind_of(path);
+        self.0.probing.set(probing);
+        kind
     }
 
     fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool)>> {
@@ -1230,24 +1246,34 @@ impl Files for Snap<'_, '_> {
     }
 }
 
-/// Runs `step` once over a [`Snap`] of `cx`, reading through `config`'s mounts. A path it read
-/// that is under no mount makes its answer the error naming the least such path; a read
-/// cancelled while it ran cancels it, whatever it answered.
+/// Runs `step` once over a [`Snap`] of `cx`, reading through `config`'s mounts. The paths it
+/// read that are under no mount make its answer [`Unread::Needs`] of each, sorted, as a
+/// [`FetchKind::Local`]: the daemon reads them from the disk, mounts them and asks again. A
+/// read cancelled while it ran cancels it, whatever it answered.
 pub(crate) fn read_through<'db, R>(
     cx: &mut Cx<'db>,
     config: &ConfigOf,
     step: impl FnOnce(Snap<'_, 'db>) -> Result<R, Cancelled>,
-) -> Result<Result<R, LoadError>, Cancelled> {
+) -> Result<Result<R, Unread>, Cancelled> {
     let reader = Reader::new(cx, config);
     let answer = step(Snap(&reader));
     if reader.cancelled.get() {
         return Err(Cancelled);
     }
     let answer = answer?;
-    Ok(match reader.unmounted.take() {
-        Some(path) => Err(super::unmounted_error(&path)),
-        None => Ok(answer),
-    })
+    let mut unmounted = reader.unmounted.take();
+    if unmounted.is_empty() {
+        return Ok(Ok(answer));
+    }
+    unmounted.sort_unstable();
+    Ok(Err(Unread::Needs(unmounted.into_iter().map(|(path, probe)| local_fetch(path, probe)).collect())))
+}
+
+/// The fetch of a path under no mount: read from the disk where it is ([`FetchKind::Local`]),
+/// `probe` when it was only asked whether it is there.
+pub(crate) fn local_fetch(path: String, probe: bool) -> Fetch {
+    // clone: the path names the fetch, its place and where it is read from.
+    Fetch { what: path.clone(), url: format!("file://{path}"), kind: FetchKind::Local { probe }, at: path }
 }
 
 #[cfg(test)]

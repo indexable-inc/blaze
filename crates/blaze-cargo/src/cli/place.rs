@@ -88,10 +88,21 @@ pub fn root(manifest: &Path) -> PathBuf {
     blaze_api::client::checkout(manifest.parent().unwrap_or(manifest))
 }
 
+/// Where a command run in `cwd` runs, every path of it canonical: symlinks resolved once,
+/// here, at the boundary (`/tmp` is `/private/tmp` on macOS), so the view, the watch of the
+/// checkout (whose file system events name canonical paths) and every path the daemon's load
+/// derives from them agree on one form of each directory.
 pub fn find(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result<Place, String> {
-    let manifest = manifest(cwd, manifest_path, script)?;
+    let cwd = std::fs::canonicalize(cwd).map_err(|error| format!("resolving the current directory `{}`: {error}", cwd.display()))?;
+    let found = manifest(&cwd, manifest_path, script)?;
+    let manifest = match (found.parent(), found.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map_err(|error| format!("resolving the directory of the manifest `{}`: {error}", found.display()))?
+            .join(name),
+        _ => found,
+    };
     let root = root(&manifest);
-    Ok(Place { cwd: cwd.to_owned(), manifest, root })
+    Ok(Place { cwd, manifest, root })
 }
 
 /// The files of cargo's configuration outside the checkout, which the view does not have:

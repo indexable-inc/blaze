@@ -8,7 +8,8 @@
 //! - Every file is read by its absolute path as cargo names it: under a mount of the view
 //!   through `Cx::file`, under a mount of another root (a registry or git package, the standard
 //!   library) through `Cx::file_at`, each an edge. A path under no mount is never read: the load
-//!   fails naming it.
+//!   asks the daemon to mount it ([`FetchKind::Local`], read from the disk where it is) and is
+//!   asked again.
 //! - The daemon asks one query per build, [`Plan`]: the units to build ([`Planned::Ready`]),
 //!   the sources to fetch and mount first ([`Planned::Needs`]), or cargo's error.
 //! - The standard library is one more crate graph loaded the same way, from its own root
@@ -415,6 +416,19 @@ pub enum FetchKind {
     IndexFile,
     /// A git repository's tree at `commit`: a directory.
     Git { commit: String },
+    /// A path outside the view and every source, read from the disk where it is: what a
+    /// `path` dependency outside the checkout is, or a manifest above one that its workspace
+    /// search looks for. `at` is the path the load read. Its files are a root keyed by their
+    /// bytes, as a fetched source's are. The daemon mounts:
+    ///
+    /// - a directory at `at`: the whole tree under it (a root `target/` and every `.git` left
+    ///   out, as a checkout's view leaves them);
+    /// - a `Cargo.toml` at `at` read for its contents (`probe` false): the whole tree of its
+    ///   directory, the package's;
+    /// - any other file at `at`, or a `Cargo.toml` only asked whether it is there (`probe`
+    ///   true, the workspace search above a package): that file alone;
+    /// - nothing at `at`: `at` as absent.
+    Local { probe: bool },
 }
 
 /// What cargo says when it can't: its message with its causes (`error: ...`, then

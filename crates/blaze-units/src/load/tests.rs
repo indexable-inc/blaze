@@ -941,21 +941,15 @@ impl Query for Step {
         use blaze_manifest::files::Files;
         let asked = cx.get::<Asking>(&())?.get().unwrap_or_else(|error| panic!("{}", error.what));
         let library = cx.get::<super::files::Mounts>(&())?.get(&asked.library);
-        let spec =
-            super::view_spec(&asked, library).unwrap_or_else(|error| panic!("{}", error.what));
-        let read = cx
-            .get::<WorkspaceQuery>(&spec.workspace)?
-            .get()
-            .unwrap_or_else(|error| panic!("{}", error.what));
+        let spec = super::view_spec(&asked, library).unwrap_or_else(|error| panic!("{}", error.what));
+        let read = cx.get::<WorkspaceQuery>(&spec.workspace)?.get().unwrap_or_else(|unread| panic!("{unread:?}"));
         let lock = std::path::PathBuf::from(format!("{WS}/Cargo.lock"));
-        let outcome =
-            super::manifest::in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
-                let lent = matches!(ctx.files().read(&lock), Ok(std::borrow::Cow::Borrowed(_)));
-                let resolved =
-                    super::resolve::resolved(ctx, ws, &spec, |_| Ok(super::Staged::Done(())))?;
-                Ok(Stepped { lent, resolved: matches!(resolved, super::Staged::Done(())) })
-            })?;
-        Ok(crate::query::Cbor(outcome.unwrap_or_else(|error| panic!("{}", error.what))))
+        let outcome = super::manifest::in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
+            let lent = matches!(ctx.files().read(&lock), Ok(std::borrow::Cow::Borrowed(_)));
+            let resolved = super::resolve::resolved(ctx, ws, &spec, |_| Ok(super::Staged::Done(())))?;
+            Ok(Stepped { lent, resolved: matches!(resolved, super::Staged::Done(())) })
+        })?;
+        Ok(crate::query::Cbor(outcome.unwrap_or_else(|unread| panic!("{unread:?}"))))
     }
 }
 

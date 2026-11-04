@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::config::{ConfigChain, ConfigOf, ConfigRead};
 use super::files::{Found, PathKey, Snap, TomlFile, lent, read_through};
 use super::invocation::Asking;
-use super::key_id;
-use super::load_error;
+use super::{Unread, key_id, load_error};
 use crate::query::{Cbor, LoadError, Versioned, producer};
 
 /// A manifest as its [`ManifestQuery`] parsed it.
@@ -162,8 +161,8 @@ pub(crate) struct WorkspaceRead {
     pub warnings: Vec<String>,
 }
 
-impl Versioned for Result<WorkspaceRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 3");
+impl Versioned for Result<WorkspaceRead, Unread> {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 4");
 }
 
 pub(crate) struct WorkspaceQuery;
@@ -171,21 +170,18 @@ pub(crate) struct WorkspaceQuery;
 impl Query for WorkspaceQuery {
     const KIND: QueryKind = QueryKind(0x6017);
     const NAME: &'static str = "cargo workspace";
-    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 3");
+    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 4");
     type Key = WorkspaceKey;
-    type Value = Cbor<Result<WorkspaceRead, LoadError>>;
+    type Value = Cbor<Result<WorkspaceRead, Unread>>;
 
     fn input(key: &WorkspaceKey) -> ContentId {
         key_id("blaze v2 cargo workspace key 2", key)
     }
 
-    fn execute(
-        cx: &mut Cx<'_>,
-        key: &WorkspaceKey,
-    ) -> Result<Cbor<Result<WorkspaceRead, LoadError>>, Cancelled> {
+    fn execute(cx: &mut Cx<'_>, key: &WorkspaceKey) -> Result<Cbor<Result<WorkspaceRead, Unread>>, Cancelled> {
         let config = match cx.get::<ConfigChain>(&key.config)?.get() {
             Ok(config) => config,
-            Err(error) => return Ok(Cbor(Err(error))),
+            Err(unread) => return Ok(Cbor(Err(unread))),
         };
         let manifest_path = match (&key.manifest, &key.config) {
             (Some(path), _) => Some(path.clone()),
@@ -194,14 +190,12 @@ impl Query for WorkspaceQuery {
                     true => it,
                     false => format!("{}/{it}", asked.cwd),
                 }),
-                Err(error) => return Ok(Cbor(Err(error))),
+                Err(error) => return Ok(Cbor(Err(Unread::Failed(error)))),
             },
             (None, ConfigOf::Fixed { .. }) => None,
         };
-        let found = read_through(cx, &key.config, |files| {
-            Ok(read_workspace(&config, files, manifest_path.as_deref()))
-        })?;
-        Ok(Cbor(found.and_then(|it| it)))
+        let found = read_through(cx, &key.config, |files| Ok(read_workspace(&config, files, manifest_path.as_deref())))?;
+        Ok(Cbor(found.and_then(|it| it.map_err(Unread::Failed))))
     }
 }
 
@@ -301,11 +295,8 @@ pub(crate) fn in_workspace<'db, R>(
     cx: &mut Cx<'db>,
     read: &WorkspaceRead,
     config_of: &ConfigOf,
-    then: impl for<'r, 'a> FnOnce(
-        &'a Context<Snap<'r, 'db>>,
-        &'a Workspace<'a, Snap<'r, 'db>>,
-    ) -> Result<R, Cancelled>,
-) -> Result<Result<R, LoadError>, Cancelled> {
+    then: impl for<'r, 'a> FnOnce(&'a Context<Snap<'r, 'db>>, &'a Workspace<'a, Snap<'r, 'db>>) -> Result<R, Cancelled>,
+) -> Result<Result<R, Unread>, Cancelled> {
     let answer = read_through(cx, config_of, |files| {
         let config = match super::config::build(&read.config, files) {
             Ok(config) => config,
@@ -319,7 +310,7 @@ pub(crate) fn in_workspace<'db, R>(
         };
         then(&ctx, &ws).map(Ok)
     })?;
-    Ok(answer.and_then(|it| it))
+    Ok(answer.and_then(|it| it.map_err(Unread::Failed)))
 }
 
 #[cfg(test)]

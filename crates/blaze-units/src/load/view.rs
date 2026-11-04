@@ -104,7 +104,8 @@ pub fn resolve_view<'db, R>(
     };
     let read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
         Ok(read) => read,
-        Err(error) => return Ok(Resolving::Failed(error)),
+        Err(super::Unread::Failed(error)) => return Ok(Resolving::Failed(error)),
+        Err(super::Unread::Needs(fetches)) => return Ok(Resolving::Needs(fetches)),
     };
     let outcome = in_workspace(cx, &read, &spec.workspace.config, |ctx, ws| {
         super::resolve::resolved(ctx, ws, &spec, |resolved| {
@@ -139,8 +140,8 @@ pub fn resolve_view<'db, R>(
     })?;
     Ok(match outcome {
         Ok(Staged::Done(it)) => Resolving::Done(it),
-        Ok(Staged::Needs(fetches)) => Resolving::Needs(fetches),
-        Ok(Staged::Failed(error)) | Err(error) => Resolving::Failed(error),
+        Ok(Staged::Needs(fetches)) | Err(super::Unread::Needs(fetches)) => Resolving::Needs(fetches),
+        Ok(Staged::Failed(error)) | Err(super::Unread::Failed(error)) => Resolving::Failed(error),
     })
 }
 
