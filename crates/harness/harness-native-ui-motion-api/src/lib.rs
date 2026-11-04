@@ -50,9 +50,14 @@ pub struct Target(pub f32);
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct MatchedGeometry {
     pub id: ScriptString,
+    /// From rest, a move of more than this many of its own heights (rows, for a selection pill) lands at once instead
+    /// of sliding; mid-slide it never does. 0: always slides.
+    pub jump: f32,
 }
 
-/// The springs of one `MatchedGeometry` id (on `ui_matched::<id>`): the drawn frame chasing its node's `Laid`.
+/// The springs of one `MatchedGeometry` id (on `ui_matched::<id>`): the drawn frame chasing its node's `Laid`, in its
+/// scroll content's space (the `Laid` plus every scrolling ancestor's `ScrollState`), so a scroll under a slide carries
+/// the frame with its rows instead of fighting it.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Matched {
     pub x: Spring,
@@ -61,6 +66,13 @@ pub struct Matched {
     pub h: Spring,
     pub owner: u64,
     pub started: bool,
+    /// Still sliding as of the last frame (a far move then retargets the slide instead of landing).
+    pub moving: bool,
+    /// Where it was last sent (content space): a frame whose newest node is not laid out yet keeps sliding there.
+    pub gx: f32,
+    pub gy: f32,
+    pub gw: f32,
+    pub gh: f32,
 }
 
 /// Where a node is drawn this frame when that is not its `Laid` (a `MatchedGeometry` mid-slide), window points. Its

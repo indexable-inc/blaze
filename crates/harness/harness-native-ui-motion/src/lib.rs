@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use harness_native_api::{Clock, moving, settle};
 use harness_native_flecs::prelude::*;
-use harness_native_ui_layout_api::{Collapse, Flex, FlexAxis, Padding, Size, Sizing};
+use harness_native_ui_layout_api::{Collapse, Flex, FlexAxis, Padding, ScrollState, Size, Sizing};
 use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_motion_api::{
     Animate, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Reveal, Shown, ShownWhen, SizeTween, Target, Transition,
@@ -96,6 +96,45 @@ fn ease<T: Tween>(cur: T, tw: Option<(T, T, T, Spring)>, tune: Option<Tune>, dt:
     ((from, to, shown, t), (shown != cur).then_some(shown), going)
 }
 
+/// How far `e`'s scrolling ancestors have moved it (the sum of their `ScrollState`s): its content-space frame is its
+/// `Laid` plus this.
+fn scrolled(e: EntityView<'_>) -> (f32, f32) {
+    let (mut x, mut y) = (0.0, 0.0);
+    let mut at = e.parent();
+    while let Some(p) = at {
+        if let Some(s) = p.try_cloned::<&ScrollState>() {
+            x += s.x;
+            y += s.y;
+        }
+        at = p.parent();
+    }
+    (x, y)
+}
+
+/// One frame of a matched id's springs toward `to` (content space); whether it still moves. A slide retargets from where
+/// it is drawn and how fast it goes. From rest (not moving last frame), a move of more than `jump` of its heights lands
+/// at once; mid-slide it never does. With no tune (or on its first frame) it lands.
+fn chase(st: &mut Matched, to: Laid, tune: Option<Tune>, jump: f32, dt: f32) -> bool {
+    let rows = |a: f32, b: f32| ((a - b).abs() / to.h.max(1.0)).floor();
+    let far = jump > 0.0 && !st.moving && (rows(to.y, st.y.x) > jump || rows(to.x, st.x.x) > jump);
+    let still = match tune.filter(|_| st.started && !far) {
+        Some(tune) => {
+            let mut still = false;
+            for (s, v) in [(&mut st.x, to.x), (&mut st.y, to.y), (&mut st.w, to.w), (&mut st.h, to.h)] {
+                still |= settle(s, v, tune, dt);
+            }
+            still
+        }
+        None => {
+            (st.x, st.y, st.w, st.h) = (Spring::at(to.x), Spring::at(to.y), Spring::at(to.w), Spring::at(to.h));
+            st.started = true;
+            false
+        }
+    };
+    st.moving = still;
+    still
+}
+
 /// Install systems in the module scope; deleting that scope removes all callbacks before unloading.
 pub fn install(world: WorldRef<'_>) {
     // Scene springs: toward the host's Target when it set one, else 1 while the app is in any (ShownWhen, state).
@@ -175,39 +214,40 @@ pub fn install(world: WorldRef<'_>) {
         }
     });
 
-    // Matched geometry: per id, the drawn frame springs to where the newest live node with that id is laid out.
+    // Matched geometry: per id, the drawn frame springs to where the newest live node with that id is laid out, in its
+    // scroll content's space (see `Matched`).
     world.system_named::<&Clock>("Matched").each_iter(|it, _, _| {
         let (w, dt) = (it.world(), it.delta_time());
-        let mut by: HashMap<String, (u64, Laid)> = HashMap::new();
-        w.new_query::<(&MatchedGeometry, &Laid)>().each_entity(|e, (m, l)| {
+        // Per id, its newest live node and that node's Laid (None: made this frame, layout has not reached it yet).
+        let mut by: HashMap<String, (u64, Option<Laid>, f32)> = HashMap::new();
+        w.new_query::<&MatchedGeometry>().each_entity(|e, m| {
             if e.has(Leaving::id()) || e.has(Hidden::id()) {
                 return;
             }
             let k = m.id.as_str().to_owned();
-            if by.get(&k).is_none_or(|(id, _)| *e.id() > *id) {
-                by.insert(k, (*e.id(), *l));
+            if by.get(&k).is_none_or(|(id, _, _)| *e.id() > *id) {
+                by.insert(k, (*e.id(), e.try_cloned::<&Laid>(), m.jump));
             }
         });
         let mut still = false;
-        for (k, (owner, l)) in by {
+        for (k, (owner, l, jump)) in by {
             let name: String = k.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
             let holder = w.entity_named(&format!("ui_matched::{name}"));
             let o = w.entity_from_id(owner);
+            let (sx, sy) = scrolled(o);
             let mut st = holder.try_cloned::<&Matched>().unwrap_or_default();
-            let tune = tune_of(w, o, "matched");
-            match tune.filter(|_| st.started) {
-                Some(tune) => {
-                    for (s, v) in [(&mut st.x, l.x), (&mut st.y, l.y), (&mut st.w, l.w), (&mut st.h, l.h)] {
-                        still |= settle(s, v, tune, dt);
-                    }
-                }
-                None => {
-                    st = Matched { x: Spring::at(l.x), y: Spring::at(l.y), w: Spring::at(l.w), h: Spring::at(l.h), owner, started: true };
-                }
-            }
+            // Not laid out yet: drawn where the slide is, going on toward where it was last sent (a new selection's pill,
+            // made this frame, neither lands on its row for a frame nor loses one of the slide).
+            let to = match l {
+                Some(l) => Laid { x: l.x + sx, y: l.y + sy, ..l },
+                None if st.started => Laid { x: st.gx, y: st.gy, w: st.gw, h: st.gh },
+                None => continue,
+            };
+            (st.gx, st.gy, st.gw, st.gh) = (to.x, to.y, to.w, to.h);
+            still |= chase(&mut st, to, tune_of(w, o, "matched"), jump, dt);
             st.owner = owner;
             holder.set(st);
-            let d = Drawn { x: st.x.x, y: st.y.x, w: st.w.x.max(0.0), h: st.h.x.max(0.0) };
+            let d = Drawn { x: st.x.x - sx, y: st.y.x - sy, w: st.w.x.max(0.0), h: st.h.x.max(0.0) };
             if o.try_cloned::<&Drawn>() != Some(d) {
                 o.set(d);
             }
@@ -270,6 +310,36 @@ harness_native_api::module!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rapid presses: each retarget keeps the slide's position and velocity (no restart, no instant land mid-flight), so
+    /// the drawn y moves one way only; from rest, 3 rows slides and 5 rows lands at once.
+    #[test]
+    fn matched_retargets_mid_slide_and_lands_far_from_rest() {
+        let tune = Some(Tune { omega: 32.0, zeta: 0.86 });
+        let row = |i: f32| Laid { x: 0.0, y: i * 30.0, w: 200.0, h: 28.0 };
+        let mut st = Matched::default();
+        assert!(!chase(&mut st, row(0.0), tune, 3.0, 1.0 / 60.0));
+        let mut last = st.y.x;
+        for k in 1..=8 {
+            for _ in 0..3 {
+                chase(&mut st, row(k as f32), tune, 3.0, 1.0 / 60.0);
+                assert!(st.y.x >= last - 1e-3, "press {k}: {} after {last}", st.y.x);
+                assert!(st.y.x - last < 30.0, "a jump of {}", st.y.x - last);
+                last = st.y.x;
+            }
+        }
+        for _ in 0..240 {
+            chase(&mut st, row(8.0), tune, 3.0, 1.0 / 60.0);
+        }
+        assert!(!st.moving);
+        chase(&mut st, row(5.0), tune, 3.0, 1.0 / 60.0);
+        assert!(st.moving && st.y.x > row(5.0).y);
+        for _ in 0..240 {
+            chase(&mut st, row(5.0), tune, 3.0, 1.0 / 60.0);
+        }
+        chase(&mut st, row(0.0), tune, 3.0, 1.0 / 60.0);
+        assert!(!st.moving && st.y.x == 0.0);
+    }
 
     /// A width written mid-way is a new target: the eased value starts from where it was, reaches the target, and a
     /// target rewritten with the same value does not restart it.

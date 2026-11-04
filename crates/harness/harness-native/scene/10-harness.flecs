@@ -67,7 +67,7 @@ prefab hn.Tree : ui.Scroll {
 // springs from where the last one was drawn.
 prefab hn.Selection : ui.Node {
   Background
-  MatchedGeometry: {id: "hn.selection"}
+  MatchedGeometry: {id: "hn.selection", jump: $pill_jump_rows}
   Fill: $tone_select
   Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
   Motion: {omega: $pill_omega, zeta: $pill_zeta}

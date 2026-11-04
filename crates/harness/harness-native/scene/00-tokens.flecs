@@ -49,6 +49,8 @@ export const turn_omega = 30
 export const turn_zeta = 0.78
 export const pill_omega = 32
 export const pill_zeta = 0.86
+// From rest, a selection move of more than this many rows lands at once (mid-slide it always slides on).
+export const pill_jump_rows = 3
 export const sidebar_omega = 24
 // The tree's scroll: the glide to the selected row, the margin it leaves inside an edge, the edge fade, the knob's width.
 export const tree_glide_omega = 22
