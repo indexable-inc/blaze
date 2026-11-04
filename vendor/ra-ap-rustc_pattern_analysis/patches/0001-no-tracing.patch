@@ -1,0 +1,163 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e2bbf0d..bd03267 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -64,18 +64,3 @@ package = "ra-ap-rustc_index"
+ [dependencies.smallvec]
+ version = "1.8.1"
+ features = ["union"]
+-
+-[dependencies.tracing]
+-version = "0.1"
+-
+-[dev-dependencies.tracing-subscriber]
+-version = "0.3.3"
+-features = [
+-    "fmt",
+-    "env-filter",
+-    "ansi",
+-]
+-default-features = false
+-
+-[dev-dependencies.tracing-tree]
+-version = "0.4.1"
+diff --git a/src/lints.rs b/src/lints.rs
+index 647e4e0..21b2230 100644
+--- a/src/lints.rs
++++ b/src/lints.rs
+@@ -1,6 +1,5 @@
+ use rustc_lint_defs::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
+ use rustc_span::ErrorGuaranteed;
+-use tracing::instrument;
+ 
+ use crate::MatchArm;
+ use crate::constructor::Constructor;
+@@ -12,7 +11,6 @@ use crate::rustc::{RevealedTy, RustcPatCtxt, WitnessPat};
+ 
+ /// Traverse the patterns to collect any variants of a non_exhaustive enum that fail to be mentioned
+ /// in a given column.
+-#[instrument(level = "debug", skip(cx), ret)]
+ fn collect_nonexhaustive_missing_variants<'p, 'tcx>(
+     cx: &RustcPatCtxt<'p, 'tcx>,
+     column: &PatternColumn<'p, RustcPatCtxt<'p, 'tcx>>,
+diff --git a/src/usefulness.rs b/src/usefulness.rs
+index 1f19bfd..dd1285b 100644
+--- a/src/usefulness.rs
++++ b/src/usefulness.rs
+@@ -713,7 +713,6 @@ use std::fmt;
+ use rustc_hash::{FxHashMap, FxHashSet};
+ use rustc_index::bit_set::DenseBitSet;
+ use smallvec::{SmallVec, smallvec};
+-use tracing::{debug, instrument};
+ 
+ use self::PlaceValidity::*;
+ use crate::constructor::{Constructor, ConstructorSet, IntRange};
+@@ -929,7 +928,6 @@ impl<Cx: PatCx> PlaceInfo<Cx> {
+     where
+         Cx: 'a,
+     {
+-        debug!(?self.ty);
+         if self.private_uninhabited {
+             // Skip the whole column
+             return Ok((smallvec![Constructor::PrivateUninhabited], vec![]));
+@@ -941,7 +939,6 @@ impl<Cx: PatCx> PlaceInfo<Cx> {
+         }
+ 
+         let ctors_for_ty = cx.ctors_for_ty(&self.ty)?;
+-        debug!(?ctors_for_ty);
+ 
+         // We treat match scrutinees of type `!` or `EmptyEnum` differently.
+         let is_toplevel_exception =
+@@ -961,7 +958,6 @@ impl<Cx: PatCx> PlaceInfo<Cx> {
+ 
+         // Analyze the constructors present in this column.
+         let mut split_set = ctors_for_ty.split(ctors);
+-        debug!(?split_set);
+         let all_missing = split_set.present.is_empty();
+ 
+         // Build the set of constructors we will specialize with. It must cover the whole type, so
+@@ -1694,7 +1690,6 @@ fn collect_non_contiguous_range_endpoints<'p, Cx: PatCx>(
+ /// - unspecialization, where we lift the results from the previous step into results for this step
+ ///     (using `apply_constructor` and by updating `row.useful` for each parent row).
+ /// This is all explained at the top of the file.
+-#[instrument(level = "debug", skip(mcx), ret)]
+ fn compute_exhaustiveness_and_usefulness<'a, 'p, Cx: PatCx>(
+     mcx: &mut UsefulnessCtxt<'a, 'p, Cx>,
+     matrix: &mut Matrix<'p, Cx>,
+@@ -1738,7 +1733,6 @@ fn compute_exhaustiveness_and_usefulness<'a, 'p, Cx: PatCx>(
+     let mut ret = WitnessMatrix::empty();
+     for ctor in split_ctors {
+         // Dig into rows that match `ctor`.
+-        debug!("specialize({:?})", ctor);
+         // `ctor` is *irrelevant* if there's another constructor in `split_ctors` that matches
+         // strictly fewer rows. In that case we can sometimes skip it. See the top of the file for
+         // details.
+@@ -1823,7 +1817,6 @@ pub struct UsefulnessReport<'p, Cx: PatCx> {
+ }
+ 
+ /// Computes whether a match is exhaustive and which of its arms are useful.
+-#[instrument(skip(tycx, arms), level = "debug")]
+ pub fn compute_match_usefulness<'p, Cx: PatCx>(
+     tycx: &Cx,
+     arms: &[MatchArm<'p, Cx>],
+@@ -1850,7 +1843,6 @@ pub fn compute_match_usefulness<'p, Cx: PatCx>(
+         .iter()
+         .copied()
+         .map(|arm| {
+-            debug!(?arm);
+             let usefulness = cx.branch_usefulness.get(&arm.pat.uid).unwrap();
+             let usefulness = if let Some(explanation) = usefulness.is_redundant() {
+                 Usefulness::Redundant(explanation)
+@@ -1870,7 +1862,6 @@ pub fn compute_match_usefulness<'p, Cx: PatCx>(
+                 });
+                 Usefulness::Useful(redundant_subpats)
+             };
+-            debug!(?usefulness);
+             (arm, usefulness)
+         })
+         .collect();
+diff --git a/tests/common/mod.rs b/tests/common/mod.rs
+index 94f2a12..a5d3d96 100644
+--- a/tests/common/mod.rs
++++ b/tests/common/mod.rs
+@@ -6,23 +6,6 @@ use rustc_pattern_analysis::pat::DeconstructedPat;
+ use rustc_pattern_analysis::usefulness::{PlaceValidity, UsefulnessReport};
+ use rustc_pattern_analysis::{MatchArm, PatCx, PrivateUninhabitedField};
+ 
+-/// Sets up `tracing` for easier debugging. Tries to look like the `rustc` setup.
+-fn init_tracing() {
+-    use tracing_subscriber::Layer;
+-    use tracing_subscriber::layer::SubscriberExt;
+-    use tracing_subscriber::util::SubscriberInitExt;
+-    let _ = tracing_tree::HierarchicalLayer::default()
+-        .with_writer(std::io::stderr)
+-        .with_ansi(true)
+-        .with_targets(true)
+-        .with_indent_amount(2)
+-        .with_subscriber(
+-            tracing_subscriber::Registry::default()
+-                .with(tracing_subscriber::EnvFilter::from_default_env()),
+-        )
+-        .try_init();
+-}
+-
+ pub(super) const UNIT: Ty = Ty::Tuple(&[]);
+ pub(super) const NEVER: Ty = Ty::Enum(&[]);
+ 
+@@ -141,7 +124,7 @@ impl Ty {
+     }
+ }
+ 
+-/// Compute usefulness in our simple context (and set up tracing for easier debugging).
++/// Compute usefulness in our simple context.
+ pub(super) fn compute_match_usefulness<'p>(
+     arms: &[MatchArm<'p, Cx>],
+     ty: Ty,
+@@ -149,7 +132,6 @@ pub(super) fn compute_match_usefulness<'p>(
+     complexity_limit: usize,
+     exhaustive_witnesses: bool,
+ ) -> Result<UsefulnessReport<'p, Cx>, ()> {
+-    init_tracing();
+     rustc_pattern_analysis::usefulness::compute_match_usefulness(
+         &Cx { exhaustive_witnesses },
+         arms,

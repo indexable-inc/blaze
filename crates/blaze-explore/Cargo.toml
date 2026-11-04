@@ -33,8 +33,10 @@ rcgen.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-wtransport.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+# The WebTransport server (and the tests' client): blaze-http's sans-IO HTTP/3 core and its
+# tokio driver.
+blaze-http = { workspace = true, features = ["tokio"] }
 
 [dev-dependencies]
 blaze-rng.workspace = true

@@ -223,6 +223,9 @@ files are, what they hold, the DuckDB queries that answer each question and the 
 - A test that fails before and passes after: the real crate's own tests for a bug found in
   it, a unit test beside the code for one small enough to state, a step in the relevant edit
   harness for a daemon bug ([harness.md](harness.md#adding-a-test)).
+- For concurrent, durable, crash-recovering, billing or data-deleting code: a Hegel
+  deterministic simulation test whose oracle checks the invariant, with a planted bug it
+  catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
   you did not run. CI's merge gate is the build and the unit tests on Linux x86-64, and
   `blaze check --workspace` with the released blaze on Linux x86-64 and macOS, with astlog's
@@ -248,17 +251,15 @@ files are, what they hold, the DuckDB queries that answer each question and the 
 When you report what you did, separate what you ran from what you inferred. The reports
 under `docs/reports/` do this and it is the reason they can be used.
 
-### Property tests
+### Tests
 
-A property test (a rule over generated inputs, with the failing case shrunk) uses Hegel:
-`hegeltest.workspace = true` under `[dev-dependencies]`, imported as `hegel`, and
-`#[hegel::test]` on a `fn(tc: hegel::TestCase)` that draws from `hegel::generators`. The
-engine is linked as a Rust crate ([vendor/hegeltest/SOURCE.md](../vendor/hegeltest/SOURCE.md)).
-Keep the default case count to seconds per crate (`#[hegel::test(test_cases = N)]`, 256 by
-default from `hegel.toml`) and run longer with `HEGEL_TEST_CASES`. Hegel applies that only
-to tests that set no count, so a test with its own count that is worth a long run reads it
-itself (`run_cases` in `crates/blaze-cas/src/tests/model_check.rs`). Fuzzing (`crates/blaze-fuzz`, `fuzz/`) is for parsers of hostile bytes.
-Never proptest, quickcheck, arbitrary or bolero.
+How blaze tests its own code is the `testing` skill
+([.agents/skills/testing/SKILL.md](../.agents/skills/testing/SKILL.md)), the one home for it:
+which tests to write and how few, property tests with Hegel (vendor/hegeltest, imported as
+`hegel`; never proptest, quickcheck, arbitrary or bolero), deterministic simulation tests on
+`blaze_core::sim::Sim` and their oracles, and testing a causal claim. Concurrent, durable,
+crash-recovering, billing and data-deleting code is proven by a deterministic simulation test,
+not by a code review (rule `dst-not-review`).
 
 ## Documents
 
