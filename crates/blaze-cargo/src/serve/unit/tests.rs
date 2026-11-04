@@ -2741,7 +2741,11 @@ fn a_span_with_no_target_written_in_blaze_cargo_reaches_the_flight_ring() {
 /// the same `event_id`. The daemon's watchdog line ("no unit's step ended") is such a `warn!`.
 #[test]
 fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
-    use arrow_array::{Array as _, cast::AsArray as _, types::{Int64Type, UInt32Type, UInt64Type}};
+    use arrow_array::{
+        Array as _,
+        cast::AsArray as _,
+        types::{Int64Type, UInt32Type, UInt64Type},
+    };
 
     const MESSAGE: &str = "a blaze-cargo warn with no target of its own";
     blaze_profile::install();
@@ -2755,8 +2759,15 @@ fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
         batch.column_by_name(name).unwrap_or_else(|| panic!("the events table has `{name}`"))
     };
     let messages = column("message").as_string::<i32>();
-    let rows: Vec<usize> = (0..batch.num_rows()).filter(|&row| messages.is_valid(row) && messages.value(row) == MESSAGE).collect();
-    assert_eq!(rows.len(), 1, "the warn is one row of the events table, its message alone: {:?}", read.events);
+    let rows: Vec<usize> = (0..batch.num_rows())
+        .filter(|&row| messages.is_valid(row) && messages.value(row) == MESSAGE)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the warn is one row of the events table, its message alone: {:?}",
+        read.events
+    );
     let row = rows[0];
     let text = |name: &str| {
         let dict = column(name).as_dictionary::<UInt32Type>();
@@ -2764,11 +2775,22 @@ fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
     };
     assert_eq!(text("level"), "WARN");
     assert_eq!(text("target"), module_path!());
-    assert!(text("name").starts_with("event "), "an event's name is its callsite: {}", text("name"));
-    assert!(column("job").is_null(row) && column("span_id").is_null(row), "a thread of no pool, in no span");
+    assert!(
+        text("name").starts_with("event "),
+        "an event's name is its callsite: {}",
+        text("name")
+    );
+    assert!(
+        column("job").is_null(row) && column("span_id").is_null(row),
+        "a thread of no pool, in no span"
+    );
     let id = column("event_id").as_primitive::<UInt64Type>().value(row);
-    let fields = blaze_profile::batches::event_fields(&read.fields, blaze_profile::batches::Process::this()).unwrap();
-    let field = |name: &str| fields.column_by_name(name).unwrap_or_else(|| panic!("the event_fields table has `{name}`"));
+    let fields =
+        blaze_profile::batches::event_fields(&read.fields, blaze_profile::batches::Process::this())
+            .unwrap();
+    let field = |name: &str| {
+        fields.column_by_name(name).unwrap_or_else(|| panic!("the event_fields table has `{name}`"))
+    };
     let ids = field("event_id").as_primitive::<UInt64Type>();
     let of: Vec<usize> = (0..fields.num_rows()).filter(|&at| ids.value(at) == id).collect();
     let [at] = of[..] else { panic!("the warn has one field row: {:?}", read.fields) };
@@ -2777,5 +2799,9 @@ fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
         dict.values().as_string::<i32>().value(dict.keys().value(at) as usize).to_owned()
     };
     assert_eq!((dict("key"), dict("kind")), ("steps".to_owned(), "i64".to_owned()));
-    assert_eq!(field("value_i64").as_primitive::<Int64Type>().value(at), 3, "its value typed, not text");
+    assert_eq!(
+        field("value_i64").as_primitive::<Int64Type>().value(at),
+        3,
+        "its value typed, not text"
+    );
 }

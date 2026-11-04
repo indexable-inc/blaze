@@ -24,8 +24,8 @@
 use std::{fmt::Write as _, sync::Arc, time::Duration};
 
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, RecordBatch, UInt32Array, builder::StringBuilder, cast::AsArray,
-    types::UInt32Type,
+    Array, ArrayRef, DictionaryArray, RecordBatch, UInt32Array, builder::StringBuilder,
+    cast::AsArray, types::UInt32Type,
 };
 use arrow_buffer::Buffer;
 use arrow_ipc::{
@@ -213,7 +213,12 @@ impl Dict {
 
     /// `column`, a dictionary column of `table`, keyed onto this dictionary, adding the values
     /// it names first.
-    fn keyed(&mut self, column: &ArrayRef, table: &'static Table, name: &str) -> Result<ArrayRef, ArrowError> {
+    fn keyed(
+        &mut self,
+        column: &ArrayRef,
+        table: &'static Table,
+        name: &str,
+    ) -> Result<ArrayRef, ArrowError> {
         let wrong = || {
             // alloc: an error, once
             ArrowError::SchemaError(format!(
@@ -268,9 +273,10 @@ impl Dict {
 fn nested_dictionary(ty: &DataType) -> bool {
     match ty {
         DataType::Dictionary(..) => true,
-        DataType::List(it) | DataType::LargeList(it) | DataType::FixedSizeList(it, _) | DataType::Map(it, _) => {
-            nested_dictionary(it.data_type())
-        }
+        DataType::List(it)
+        | DataType::LargeList(it)
+        | DataType::FixedSizeList(it, _)
+        | DataType::Map(it, _) => nested_dictionary(it.data_type()),
         DataType::Struct(fields) => fields.iter().any(|it| nested_dictionary(it.data_type())),
         _ => false,
     }
@@ -285,7 +291,9 @@ impl Stream {
         let mut dicts = Vec::new();
         for (at, field) in schema.fields().iter().enumerate() {
             match field.data_type() {
-                DataType::Dictionary(key, value) if **key == DataType::UInt32 && **value == DataType::Utf8 => {
+                DataType::Dictionary(key, value)
+                    if **key == DataType::UInt32 && **value == DataType::Utf8 =>
+                {
                     dicts.push((at, Dict::new()));
                 }
                 ty if nested_dictionary(ty) => {
@@ -306,7 +314,12 @@ impl Stream {
 
     /// `batch` with each dictionary column keyed onto the stream's dictionaries, encoded into
     /// `into`.
-    fn encode(&mut self, table: &'static Table, batch: &RecordBatch, into: &mut Vec<u8>) -> Result<(), ArrowError> {
+    fn encode(
+        &mut self,
+        table: &'static Table,
+        batch: &RecordBatch,
+        into: &mut Vec<u8>,
+    ) -> Result<(), ArrowError> {
         if *batch.schema_ref() != self.schema {
             // alloc: an error, once
             return Err(ArrowError::SchemaError(format!(
@@ -415,7 +428,10 @@ impl Decoder {
 
     fn error(&self, what: impl std::fmt::Display) -> ArrowError {
         // alloc: an error, once
-        ArrowError::IpcError(format!("the live `{}` stream (stream {}): {what}", self.table.name, self.streams))
+        ArrowError::IpcError(format!(
+            "the live `{}` stream (stream {}): {what}",
+            self.table.name, self.streams
+        ))
     }
 
     /// The batches of a frame's bytes of this table, into `into` (cleared first). The bytes
@@ -453,7 +469,9 @@ impl Decoder {
                 Ok(None) if buffer.is_empty() => {}
                 Ok(None) => {
                     // alloc: an error, once
-                    decoded = Err(ArrowError::IpcError("the decoder took no bytes and gave no batch".to_owned()));
+                    decoded = Err(ArrowError::IpcError(
+                        "the decoder took no bytes and gave no batch".to_owned(),
+                    ));
                     break;
                 }
                 Err(why) => {
@@ -867,7 +885,8 @@ mod tests {
         assert_eq!(back.schema(), sent.schema());
         assert_eq!(back.num_rows(), sent.num_rows());
         let schema = sent.schema();
-        for ((back, sent), field) in back.columns().iter().zip(sent.columns()).zip(schema.fields()) {
+        for ((back, sent), field) in back.columns().iter().zip(sent.columns()).zip(schema.fields())
+        {
             let name = field.name();
             match sent.data_type() {
                 DataType::Dictionary(..) => assert_eq!(resolved(back), resolved(sent), "{name}"),
@@ -882,8 +901,13 @@ mod tests {
         End,
         Schema,
         /// A dictionary's values: all of them, or a delta of the new ones.
-        Dictionary { delta: bool, values: i64 },
-        Batch { rows: i64 },
+        Dictionary {
+            delta: bool,
+            values: i64,
+        },
+        Batch {
+            rows: i64,
+        },
     }
 
     fn messages(mut bytes: &[u8]) -> Vec<Message> {
@@ -901,7 +925,10 @@ mod tests {
                 arrow_ipc::MessageHeader::Schema => Message::Schema,
                 arrow_ipc::MessageHeader::DictionaryBatch => {
                     let dict = message.header_as_dictionary_batch().unwrap();
-                    Message::Dictionary { delta: dict.isDelta(), values: dict.data().unwrap().length() }
+                    Message::Dictionary {
+                        delta: dict.isDelta(),
+                        values: dict.data().unwrap().length(),
+                    }
                 }
                 arrow_ipc::MessageHeader::RecordBatch => {
                     Message::Batch { rows: message.header_as_record_batch().unwrap().length() }
@@ -958,11 +985,24 @@ mod tests {
         assert_eq!(sent[0].first(), Some(&Message::Schema), "{:?}", sent[0]);
         assert!(dictionaries(&sent[0]).iter().all(|(delta, _)| !delta), "{:?}", sent[0]);
         // thread_name, name, target and crate: 1 + 2 + 2 + 1.
-        assert_eq!(dictionaries(&sent[0]).iter().map(|(_, it)| it).sum::<i64>(), 6, "{:?}", sent[0]);
-        assert_eq!(sent[1], [Message::Batch { rows: 2 }], "nothing but the batch when no name is new");
+        assert_eq!(
+            dictionaries(&sent[0]).iter().map(|(_, it)| it).sum::<i64>(),
+            6,
+            "{:?}",
+            sent[0]
+        );
+        assert_eq!(
+            sent[1],
+            [Message::Batch { rows: 2 }],
+            "nothing but the batch when no name is new"
+        );
         assert!(sent[2].is_empty());
         assert_eq!(dictionaries(&sent[3]), [(true, 1), (true, 1)], "{:?}", sent[3]);
-        assert!(!sent[3].contains(&Message::Schema) && !sent[3].contains(&Message::End), "{:?}", sent[3]);
+        assert!(
+            !sent[3].contains(&Message::Schema) && !sent[3].contains(&Message::End),
+            "{:?}",
+            sent[3]
+        );
         assert_eq!((encoder.streams(), decoder.streams()), (1, 1));
 
         let mut again = Encoder::new(&schema::OPEN);
@@ -996,7 +1036,10 @@ mod tests {
         assert!(bytes.starts_with(&END), "a reset starts with the end of the last stream");
         let reset = messages(&bytes);
         assert_eq!(reset[..2], [Message::End, Message::Schema], "{reset:?}");
-        assert!(dictionaries(&reset).iter().all(|(delta, _)| !delta), "fresh dictionaries: {reset:?}");
+        assert!(
+            dictionaries(&reset).iter().all(|(delta, _)| !delta),
+            "fresh dictionaries: {reset:?}"
+        );
         // worker 4; build, infer_query; blaze, hir_ty; app.
         assert_eq!(dictionaries(&reset).iter().map(|(_, it)| it).sum::<i64>(), 6, "{reset:?}");
         decoder.decode(&bytes, &mut back).unwrap();
@@ -1114,7 +1157,11 @@ mod tests {
         let mut decoder = Decoder::new(&schema::SPANS);
         let mut batches = Vec::new();
         let mut count = |frame: &Frame| -> usize {
-            assert_eq!(frame.spans.is_empty(), frame.spans_rows == 0, "bytes exactly when there are rows");
+            assert_eq!(
+                frame.spans.is_empty(),
+                frame.spans_rows == 0,
+                "bytes exactly when there are rows"
+            );
             decoder.decode(&frame.spans, &mut batches).unwrap();
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), frame.spans_rows);
             batches

@@ -113,14 +113,27 @@ fn put(path: &Path, bytes: &[u8], doing: &'static str) -> Result<(), TimeError> 
     })
 }
 
-pub(crate) fn query(source: &Source<'_>, sql: &str, doing: &'static str) -> Result<Vec<RecordBatch>, TimeError> {
-    sql::run(&sql::Query { duckdb: source.duckdb, history: source.history, scope: sql::Scope::All, sql })
-        .map_err(|error| TimeError::Sql { doing, error })
+pub(crate) fn query(
+    source: &Source<'_>,
+    sql: &str,
+    doing: &'static str,
+) -> Result<Vec<RecordBatch>, TimeError> {
+    sql::run(&sql::Query {
+        duckdb: source.duckdb,
+        history: source.history,
+        scope: sql::Scope::All,
+        sql,
+    })
+    .map_err(|error| TimeError::Sql { doing, error })
 }
 
 /// Each of `sqls` in one DuckDB ([`sql::run_all`]) over every file: their answers, in order,
 /// one for each.
-pub(crate) fn query_many(source: &Source<'_>, sqls: &[&str], doing: &'static str) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
+pub(crate) fn query_many(
+    source: &Source<'_>,
+    sqls: &[&str],
+    doing: &'static str,
+) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
     query_many_in(source, sql::Scope::All, sqls, doing)
 }
 
@@ -132,7 +145,8 @@ pub(crate) fn query_many_in(
     sqls: &[&str],
     doing: &'static str,
 ) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
-    let answers = sql::run_all(source.duckdb, source.history, scope, sqls).map_err(|error| TimeError::Sql { doing, error })?;
+    let answers = sql::run_all(source.duckdb, source.history, scope, sqls)
+        .map_err(|error| TimeError::Sql { doing, error })?;
     if answers.len() != sqls.len() {
         return Err(TimeError::BadColumn {
             table: "answers",
@@ -203,7 +217,12 @@ pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> 
     let mut seen = None;
     for batch in &batches {
         const T: &str = "builds";
-        let (ids, started, dur, process) = (uints(batch, T, "build")?, ints(batch, T, "started_ns")?, ints(batch, T, "dur_ns")?, ints(batch, T, "process")?);
+        let (ids, started, dur, process) = (
+            uints(batch, T, "build")?,
+            ints(batch, T, "started_ns")?,
+            ints(batch, T, "dur_ns")?,
+            ints(batch, T, "process")?,
+        );
         let outcome = texts(batch, T, "outcome")?;
         for row in 0..batch.num_rows() {
             let Some(id) = get(ids, row, |it, row| it.value(row)) else { continue };
@@ -213,11 +232,17 @@ pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> 
             }
             seen = Some(id);
             let start = get(started, row, |it, row| it.value(row));
-            let pid = get(process, row, |it, row| it.value(row)).and_then(|it| u32::try_from(it).ok());
+            let pid =
+                get(process, row, |it, row| it.value(row)).and_then(|it| u32::try_from(it).ok());
             if let (Some(start), Some(dur)) = (start, get(dur, row, |it, row| it.value(row))) {
                 // A crashed build ran to the last row its daemon's postmortem read back.
-                let crashed = get(outcome, row, |it, row| it.value(row)) == Some(history::Outcome::Crashed.name());
-                return Ok(Pick { build: id, row: Some((start, dur)), died: pid.filter(|_| crashed) });
+                let crashed = get(outcome, row, |it, row| it.value(row))
+                    == Some(history::Outcome::Crashed.name());
+                return Ok(Pick {
+                    build: id,
+                    row: Some((start, dur)),
+                    died: pid.filter(|_| crashed),
+                });
             }
             match (start, pid) {
                 (Some(start), Some(pid)) if !history::writes(source.history, pid) => {
@@ -538,12 +563,19 @@ pub fn rows(source: &Source<'_>, pick: Pick) -> Result<Rows, TimeError> {
          CAST(core AS BIGINT) AS core, CAST(wait_kind AS VARCHAR) AS wait_kind, CAST(wait_value AS UBIGINT) AS wait_value, \
          CAST(by_job AS UBIGINT) AS by_job, CAST(since_ns AS BIGINT) AS since_ns, CAST(began_as AS UBIGINT) AS began_as, \
          CAST(queued_ns AS BIGINT) AS queued_ns, CAST(cpu_ns AS BIGINT) AS cpu_ns FROM {}",
-        of_build("switches", build, SWITCHES_SINCE_2, window.as_ref().map(|(t0, t1, of)| format!("t_ns BETWEEN {t0} AND {t1}{of}")))
+        of_build(
+            "switches",
+            build,
+            SWITCHES_SINCE_2,
+            window.as_ref().map(|(t0, t1, of)| format!("t_ns BETWEEN {t0} AND {t1}{of}"))
+        )
     );
     // alloc: a query, once a report
     let events_of = format!(
         "events WHERE build_id = {build}{}",
-        window.as_ref().map_or(String::new(), |(t0, t1, of)| format!(" OR (build_id IS NULL AND t_ns BETWEEN {t0} AND {t1}{of})"))
+        window.as_ref().map_or(String::new(), |(t0, t1, of)| format!(
+            " OR (build_id IS NULL AND t_ns BETWEEN {t0} AND {t1}{of})"
+        ))
     );
     // alloc: a query, once a report
     let events_sql = format!(
@@ -566,7 +598,12 @@ pub fn rows(source: &Source<'_>, pick: Pick) -> Result<Rows, TimeError> {
     // the views are made once ([`sql::run_all`]). The spans wait on the count's floor.
     let [switches_rows, cut_rows, events_rows, fields_rows] = query_all(
         source,
-        [switches_sql.as_str(), cut_sql(&of_spans).as_str(), events_sql.as_str(), fields_sql.as_str()],
+        [
+            switches_sql.as_str(),
+            cut_sql(&of_spans).as_str(),
+            events_sql.as_str(),
+            fields_sql.as_str(),
+        ],
         "reading the build's switches, events and their fields, and counting its spans by duration",
     )?;
     let switches = switches(&switches_rows)?;
@@ -930,8 +967,7 @@ fn build_process(source: &Source<'_>, build: u64) -> Result<Option<u32>, TimeErr
 /// The columns schema version 2 added, and typed span columns added since (appended, so they
 /// kept the version), as typed nulls: a history of older files has none of them, and a query
 /// naming a column no file has fails to bind. `switches.cpu_ns` came after (2026-11-04).
-const SWITCHES_SINCE_2: &str =
-    "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns, NULL::BIGINT AS cpu_ns";
+const SWITCHES_SINCE_2: &str = "NULL::UBIGINT AS by_job, NULL::BIGINT AS since_ns, NULL::UBIGINT AS began_as, NULL::BIGINT AS queued_ns, NULL::BIGINT AS cpu_ns";
 /// And `spans.folded_ns`, which version 3 added: a file of an older version folded nothing
 /// ([`crate::schema::VERSION`]), so its null reads as 0.
 const SPANS_SINCE_2: &str =
@@ -1020,10 +1056,18 @@ fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
     // alloc: the build's switches, once a report
     let mut out = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
     for batch in batches {
-        let (process, thread, t_ns, event) = (ints(batch, T, "process")?, ints(batch, T, "thread")?, ints(batch, T, "t_ns")?, texts(batch, T, "event")?);
-        let (job, fiber, core) = (uints(batch, T, "job")?, ints(batch, T, "fiber")?, ints(batch, T, "core")?);
-        let (wait_kind, wait_value) = (texts(batch, T, "wait_kind")?, uints(batch, T, "wait_value")?);
-        let (by_job, since_ns, began_as) = (uints(batch, T, "by_job")?, ints(batch, T, "since_ns")?, uints(batch, T, "began_as")?);
+        let (process, thread, t_ns, event) = (
+            ints(batch, T, "process")?,
+            ints(batch, T, "thread")?,
+            ints(batch, T, "t_ns")?,
+            texts(batch, T, "event")?,
+        );
+        let (job, fiber, core) =
+            (uints(batch, T, "job")?, ints(batch, T, "fiber")?, ints(batch, T, "core")?);
+        let (wait_kind, wait_value) =
+            (texts(batch, T, "wait_kind")?, uints(batch, T, "wait_value")?);
+        let (by_job, since_ns, began_as) =
+            (uints(batch, T, "by_job")?, ints(batch, T, "since_ns")?, uints(batch, T, "began_as")?);
         let (queued_ns, cpu_ns) = (ints(batch, T, "queued_ns")?, ints(batch, T, "cpu_ns")?);
         for row in 0..batch.num_rows() {
             let name = get(event, row, |it, row| it.value(row)).ok_or(TimeError::BadColumn {
@@ -1128,9 +1172,23 @@ fn events(batches: &[RecordBatch], fields: &[RecordBatch]) -> Result<Vec<EventIn
     let text = |it: &StringArray, row: usize| get(it, row, |it, row| it.value(row).to_owned());
     let mut fields_of = event_fields(fields)?;
     for batch in batches {
-        let (process, thread, t_ns, job) = (ints(batch, T, "process")?, ints(batch, T, "thread")?, ints(batch, T, "t_ns")?, uints(batch, T, "job")?);
-        let (level, target, name, message) = (texts(batch, T, "level")?, texts(batch, T, "target")?, texts(batch, T, "name")?, texts(batch, T, "message")?);
-        let (span_id, build_id, event_id) = (uints(batch, T, "span_id")?, uints(batch, T, "build_id")?, uints(batch, T, "event_id")?);
+        let (process, thread, t_ns, job) = (
+            ints(batch, T, "process")?,
+            ints(batch, T, "thread")?,
+            ints(batch, T, "t_ns")?,
+            uints(batch, T, "job")?,
+        );
+        let (level, target, name, message) = (
+            texts(batch, T, "level")?,
+            texts(batch, T, "target")?,
+            texts(batch, T, "name")?,
+            texts(batch, T, "message")?,
+        );
+        let (span_id, build_id, event_id) = (
+            uints(batch, T, "span_id")?,
+            uints(batch, T, "build_id")?,
+            uints(batch, T, "event_id")?,
+        );
         let null = |column: &'static str| TimeError::BadColumn { table: T, column, why: "is null" };
         for row in 0..batch.num_rows() {
             let process = u32_at(process, row, T, "process")?;
@@ -1147,7 +1205,9 @@ fn events(batches: &[RecordBatch], fields: &[RecordBatch]) -> Result<Vec<EventIn
                 message: text(message, row),
                 span: get(span_id, row, |it, row| it.value(row)),
                 event_id: event_id.unwrap_or(0),
-                fields: event_id.and_then(|id| fields_of.remove(&(process, id))).unwrap_or_default(),
+                fields: event_id
+                    .and_then(|id| fields_of.remove(&(process, id)))
+                    .unwrap_or_default(),
             });
         }
     }
@@ -1157,35 +1217,60 @@ fn events(batches: &[RecordBatch], fields: &[RecordBatch]) -> Result<Vec<EventIn
 /// The rows of `event_fields` in `batches`, by process and event, each event's in order.
 fn event_fields(
     batches: &[RecordBatch],
-) -> Result<blaze_hash::HashMap<(u32, u64), Vec<(String, crate::logs::Value)>, std::alloc::Global>, TimeError> {
+) -> Result<
+    blaze_hash::HashMap<(u32, u64), Vec<(String, crate::logs::Value)>, std::alloc::Global>,
+    TimeError,
+> {
     use crate::logs::Value;
     const T: &str = "event_fields";
     // alloc: the build's event fields, once a report
     let mut out = blaze_hash::HashMap::new_in(std::alloc::Global);
     for batch in batches {
-        let (process, event_id, key, kind) = (ints(batch, T, "process")?, uints(batch, T, "event_id")?, texts(batch, T, "key")?, texts(batch, T, "kind")?);
-        let (value_i64, value_u64, value_str) = (ints(batch, T, "value_i64")?, uints(batch, T, "value_u64")?, texts(batch, T, "value_str")?);
-        let value_f64 = array(batch, T, "value_f64")?.as_primitive_opt::<Float64Type>().ok_or(TimeError::BadColumn {
-            table: T,
-            column: "value_f64",
-            why: "is not a DOUBLE",
-        })?;
-        let value_bool = array(batch, T, "value_bool")?.as_boolean_opt().ok_or(TimeError::BadColumn {
-            table: T,
-            column: "value_bool",
-            why: "is not a BOOLEAN",
-        })?;
+        let (process, event_id, key, kind) = (
+            ints(batch, T, "process")?,
+            uints(batch, T, "event_id")?,
+            texts(batch, T, "key")?,
+            texts(batch, T, "kind")?,
+        );
+        let (value_i64, value_u64, value_str) = (
+            ints(batch, T, "value_i64")?,
+            uints(batch, T, "value_u64")?,
+            texts(batch, T, "value_str")?,
+        );
+        let value_f64 = array(batch, T, "value_f64")?.as_primitive_opt::<Float64Type>().ok_or(
+            TimeError::BadColumn { table: T, column: "value_f64", why: "is not a DOUBLE" },
+        )?;
+        let value_bool =
+            array(batch, T, "value_bool")?.as_boolean_opt().ok_or(TimeError::BadColumn {
+                table: T,
+                column: "value_bool",
+                why: "is not a BOOLEAN",
+            })?;
         let null = |column: &'static str| TimeError::BadColumn { table: T, column, why: "is null" };
         for row in 0..batch.num_rows() {
             let process = u32_at(process, row, T, "process")?;
             let id = get(event_id, row, |it, row| it.value(row)).ok_or(null("event_id"))?;
             let value = match get(kind, row, |it, row| it.value(row)).ok_or(null("kind"))? {
-                "i64" => Value::I64(get(value_i64, row, |it, row| it.value(row)).ok_or(null("value_i64"))?),
-                "u64" => Value::U64(get(value_u64, row, |it, row| it.value(row)).ok_or(null("value_u64"))?),
-                "f64" => Value::F64(get(value_f64, row, |it, row| it.value(row)).ok_or(null("value_f64"))?),
-                "bool" => Value::Bool(get(value_bool, row, |it, row| it.value(row)).ok_or(null("value_bool"))?),
+                "i64" => Value::I64(
+                    get(value_i64, row, |it, row| it.value(row)).ok_or(null("value_i64"))?,
+                ),
+                "u64" => Value::U64(
+                    get(value_u64, row, |it, row| it.value(row)).ok_or(null("value_u64"))?,
+                ),
+                "f64" => Value::F64(
+                    get(value_f64, row, |it, row| it.value(row)).ok_or(null("value_f64"))?,
+                ),
+                "bool" => Value::Bool(
+                    get(value_bool, row, |it, row| it.value(row)).ok_or(null("value_bool"))?,
+                ),
                 "str" => Value::Str(get(value_str, row, |it, row| it.value(row).to_owned())),
-                _ => return Err(TimeError::BadColumn { table: T, column: "kind", why: "is no kind of value: i64, u64, f64, bool or str" }),
+                _ => {
+                    return Err(TimeError::BadColumn {
+                        table: T,
+                        column: "kind",
+                        why: "is no kind of value: i64, u64, f64, bool or str",
+                    });
+                }
             };
             // alloc: a field's key, once a field a report
             let key = get(key, row, |it, row| it.value(row).to_owned()).ok_or(null("key"))?;

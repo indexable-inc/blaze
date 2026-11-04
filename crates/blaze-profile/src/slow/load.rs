@@ -5,9 +5,8 @@
 use arrow_array::RecordBatch;
 
 use super::{
-    BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, PanicFacts, QueryCount, Recorder, Report, STACKS, SpanKind, SpanStack,
-    ThreadCpu, ThreadName,
-    analyse,
+    BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, PanicFacts, QueryCount,
+    Recorder, Report, STACKS, SpanKind, SpanStack, ThreadCpu, ThreadName, analyse,
 };
 use crate::time::{
     TimeError,
@@ -83,9 +82,14 @@ const PANIC_FRAMES: usize = 8;
 
 /// The panics of `build`, and the fatal signal of `died`, the daemon that died in it, if any:
 /// its `panics` rows, oldest first.
-fn panics(source: &Source<'_>, build: u64, died: Option<u32>) -> Result<Vec<PanicFacts>, TimeError> {
+fn panics(
+    source: &Source<'_>,
+    build: u64,
+    died: Option<u32>,
+) -> Result<Vec<PanicFacts>, TimeError> {
     // alloc: a condition, once a report
-    let of_died = died.map_or(String::new(), |it| format!(" OR (kind = 'signal' AND process = {it})"));
+    let of_died =
+        died.map_or(String::new(), |it| format!(" OR (kind = 'signal' AND process = {it})"));
     // The stack as one text, its frames a line each, outermost first.
     // alloc: a query, once a report
     let sql = format!(
@@ -100,7 +104,8 @@ fn panics(source: &Source<'_>, build: u64, died: Option<u32>) -> Result<Vec<Pani
     for (batch, row) in rows(&batches) {
         const T: &str = "panics";
         // alloc: a report's lines
-        let stack: Vec<String> = text(batch, T, "stack", row)?.unwrap_or_default().lines().map(str::to_owned).collect();
+        let stack: Vec<String> =
+            text(batch, T, "stack", row)?.unwrap_or_default().lines().map(str::to_owned).collect();
         out.push(PanicFacts {
             kind: text(batch, T, "kind", row)?.unwrap_or_default(),
             caught: int(batch, T, "caught", row)?.is_some_and(|it| it != 0),
@@ -109,7 +114,10 @@ fn panics(source: &Source<'_>, build: u64, died: Option<u32>) -> Result<Vec<Pani
             thread: text(batch, T, "thread_name", row)?,
             signal: text(batch, T, "signal", row)?,
             // alloc: a report's lines
-            top: crate::panics::top_frames(&stack, PANIC_FRAMES).into_iter().map(str::to_owned).collect(),
+            top: crate::panics::top_frames(&stack, PANIC_FRAMES)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
         });
     }
     Ok(out)
@@ -194,7 +202,9 @@ pub fn facts(
 fn span_stacks_sql(build: u64, window: Option<(i64, i64)>, of: &str, spans: &str) -> String {
     let which = match window {
         // alloc: a condition, once a report
-        Some((t0, t1)) => format!("(build_id = {build} OR (build_id IS NULL AND t_ns >= {t0} AND t_ns < {t1}{of}))"),
+        Some((t0, t1)) => format!(
+            "(build_id = {build} OR (build_id IS NULL AND t_ns >= {t0} AND t_ns < {t1}{of}))"
+        ),
         // alloc: a condition, once a report
         None => format!("build_id = {build}"),
     };
@@ -227,7 +237,11 @@ fn span_stacks(batches: &[RecordBatch]) -> Result<Vec<SpanStack>, TimeError> {
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
         const T: &str = "samples";
-        let (Some(name), Some(frames)) = (text(batch, T, "name", row)?, text(batch, T, "frames", row)?) else { continue };
+        let (Some(name), Some(frames)) =
+            (text(batch, T, "name", row)?, text(batch, T, "frames", row)?)
+        else {
+            continue;
+        };
         out.push(SpanStack {
             name,
             on_cpu: int(batch, T, "on_cpu", row)? != Some(0),
@@ -237,7 +251,11 @@ fn span_stacks(batches: &[RecordBatch]) -> Result<Vec<SpanStack>, TimeError> {
         });
     }
     out.sort_by(|a, b| {
-        a.name.cmp(&b.name).then(b.on_cpu.cmp(&a.on_cpu)).then(b.samples.cmp(&a.samples)).then_with(|| a.frames.cmp(&b.frames))
+        a.name
+            .cmp(&b.name)
+            .then(b.on_cpu.cmp(&a.on_cpu))
+            .then(b.samples.cmp(&a.samples))
+            .then_with(|| a.frames.cmp(&b.frames))
     });
     Ok(out)
 }

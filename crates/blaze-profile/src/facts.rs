@@ -300,8 +300,10 @@ pub fn take_processes(into: &mut Vec<ProcessRow>) {
 
 /// The `processes` rows of `rows`, all reaped by the process `pid`.
 pub fn processes(rows: &[ProcessRow], pid: u32) -> Result<RecordBatch, ArrowError> {
-    let int = |of: fn(&ProcessRow) -> Option<i64>| column(Int64Array::from_iter(rows.iter().map(of)));
-    let count = |of: fn(&ProcessRow) -> Option<u64>| column(UInt64Array::from_iter(rows.iter().map(of)));
+    let int =
+        |of: fn(&ProcessRow) -> Option<i64>| column(Int64Array::from_iter(rows.iter().map(of)));
+    let count =
+        |of: fn(&ProcessRow) -> Option<u64>| column(UInt64Array::from_iter(rows.iter().map(of)));
     let word = |it: Option<i32>| it.map(|it| it as u32);
     // alloc: a batch's columns, once a flush
     let columns: Vec<ArrayRef> = vec![

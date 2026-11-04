@@ -9,16 +9,20 @@ use std::{
 };
 
 use arrow_array::{
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, RecordBatch,
+    StringArray, UInt16Array, UInt32Array, UInt64Array,
     builder::{ListBuilder, StringDictionaryBuilder, UInt64Builder},
-    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array,
-    UInt32Array, UInt64Array, types::UInt32Type,
+    types::UInt32Type,
 };
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::{
-    flight::{self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
+    flight::{
+        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, Read, SpanRow, SwitchRow,
+        ThreadNow, WaitedOn,
+    },
     sampler::Sample,
     schema::{self, Table},
     span,
@@ -284,7 +288,8 @@ pub(crate) fn samples(
         // clone: an `Arc` of the schema's field, once a batch
         item.clone()
     };
-    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(list_field("stack"));
+    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new())
+        .with_field(list_field("stack"));
     let mut pcs = ListBuilder::new(UInt64Builder::new()).with_field(list_field("stack_pcs"));
     for sample in samples {
         let stack = &sample.pcs[..usize::from(sample.depth)];
@@ -351,7 +356,9 @@ pub(crate) fn images(
         column(StringArray::from_iter_values(images.iter().map(|it| it.path.as_str()))),
         column(StringArray::from_iter(images.iter().map(|it| it.build_id.as_deref()))),
         column(StringArray::from_iter(images.iter().map(|it| it.blake3.as_deref().ok()))),
-        column(StringArray::from_iter(images.iter().map(|it| it.blake3.as_ref().err().map(String::as_str)))),
+        column(StringArray::from_iter(
+            images.iter().map(|it| it.blake3.as_ref().err().map(String::as_str)),
+        )),
         column(UInt64Array::from_iter_values(images.iter().map(|it| it.base))),
         column(UInt64Array::from_iter_values(images.iter().map(|it| it.size))),
         column(UInt64Array::from_iter_values(images.iter().map(|it| it.slide))),
@@ -413,7 +420,9 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
     );
     for row in events {
         let meta = flight::site_text(row.site);
-        thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
+        thread_keys.push(threads.key(u64::from(row.thread_name), || {
+            flight::name(row.thread_name).unwrap_or_else(|| "?".into())
+        }));
         level_keys.push(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level)));
         target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
         name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
@@ -504,12 +513,18 @@ pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, Ar
         (Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in folds {
         let meta = flight::site_text(row.site);
-        thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or_else(|| "?".into())));
+        thread_keys.push(threads.key(u64::from(row.thread_name), || {
+            flight::name(row.thread_name).unwrap_or_else(|| "?".into())
+        }));
         name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
         target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
         let parent = (row.parent_site != 0).then(|| flight::site_text(row.parent_site));
-        parent_keys.push(parent.map(|meta| parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name))));
-        parent_target_keys.push(parent.map(|meta| parent_targets.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.target))));
+        parent_keys.push(parent.map(|meta| {
+            parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name))
+        }));
+        parent_target_keys.push(parent.map(|meta| {
+            parent_targets.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.target))
+        }));
     }
     // alloc: a batch's list of columns, once a read
     let columns: Vec<ArrayRef> = vec![
@@ -597,11 +612,14 @@ mod tests {
         // Innermost first: 0x10 is where the thread was, 0x21 and 0x31 return addresses.
         pcs[..3].copy_from_slice(&[0x10, 0x21, 0x31]);
         let sample = Sample { at: now, tid: 12, depth: 3, pcs, span: 41, build: 9, on_cpu: false };
-        let frames: HashMap<u64, Vec<String>, Global> =
-            [(0x10, &["typeck", "typeck::inlined"][..]), (0x20, &["build"][..]), (0x30, &["main"][..])]
-                .into_iter()
-                .map(|(pc, it)| (pc, it.iter().map(|it| (*it).to_owned()).collect()))
-                .collect();
+        let frames: HashMap<u64, Vec<String>, Global> = [
+            (0x10, &["typeck", "typeck::inlined"][..]),
+            (0x20, &["build"][..]),
+            (0x30, &["main"][..]),
+        ]
+        .into_iter()
+        .map(|(pc, it)| (pc, it.iter().map(|it| (*it).to_owned()).collect()))
+        .collect();
         let process = Process { pid: 7, name: "blaze serve", commit: None };
         let batch = samples(&[sample], &frames, (now, 1_000), process).unwrap();
         assert_eq!(batch.num_rows(), 1);
@@ -609,10 +627,14 @@ mod tests {
         let stack = column("stack").as_list::<i32>().value(0);
         let named = stack.as_dictionary::<UInt32Type>();
         let values = named.values().as_string::<i32>();
-        let named: Vec<&str> = named.keys().values().iter().map(|it| values.value(*it as usize)).collect();
+        let named: Vec<&str> =
+            named.keys().values().iter().map(|it| values.value(*it as usize)).collect();
         assert_eq!(named, ["main", "build", "typeck", "typeck::inlined"]);
         let raw = column("stack_pcs").as_list::<i32>().value(0);
-        assert_eq!(raw.as_primitive::<arrow_array::types::UInt64Type>().values().as_ref(), [0x31, 0x21, 0x10]);
+        assert_eq!(
+            raw.as_primitive::<arrow_array::types::UInt64Type>().values().as_ref(),
+            [0x31, 0x21, 0x10]
+        );
         assert_eq!(column("span_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 41);
         assert_eq!(column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 9);
         let cpu = column("cpu").as_dictionary::<UInt32Type>();
@@ -625,7 +647,15 @@ mod tests {
     #[test]
     fn a_sample_outside_any_span_has_no_span_or_build() {
         let now = Instant::now();
-        let sample = Sample { at: now, tid: 1, depth: 0, pcs: [0; crate::sampler::DEPTH], span: 0, build: 0, on_cpu: true };
+        let sample = Sample {
+            at: now,
+            tid: 1,
+            depth: 0,
+            pcs: [0; crate::sampler::DEPTH],
+            span: 0,
+            build: 0,
+            on_cpu: true,
+        };
         let process = Process { pid: 7, name: "blaze serve", commit: None };
         let batch = samples(&[sample], &HashMap::new_in(Global), (now, 1_000), process).unwrap();
         assert!(batch.column(schema::SAMPLES.column("span_id").unwrap()).is_null(0));

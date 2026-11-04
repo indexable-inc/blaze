@@ -28,11 +28,14 @@ pub(crate) fn lookup(i: usize, pc: u64) -> u64 {
 /// The frames of each address `stacks` hold (each innermost first), by the address it is
 /// looked up at ([`lookup`]): its function and those inlined into it, outermost first. Every
 /// address gets at least one name, `[code in no image]` at worst.
-pub(crate) fn frames<'a>(stacks: impl Iterator<Item = &'a [u64]>) -> HashMap<u64, Vec<String>, Global> {
+pub(crate) fn frames<'a>(
+    stacks: impl Iterator<Item = &'a [u64]>,
+) -> HashMap<u64, Vec<String>, Global> {
     #[cfg(test)]
     ASKED.with(|it| it.set(it.get() + 1));
     // alloc: a flush's addresses, once a flush
-    let mut at: Vec<u64> = stacks.flat_map(|stack| stack.iter().enumerate().map(|(i, pc)| lookup(i, *pc))).collect();
+    let mut at: Vec<u64> =
+        stacks.flat_map(|stack| stack.iter().enumerate().map(|(i, pc)| lookup(i, *pc))).collect();
     at.sort_unstable();
     at.dedup();
     let mut frames = HashMap::new_in(Global);

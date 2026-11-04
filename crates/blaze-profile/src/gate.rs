@@ -204,7 +204,12 @@ impl Verdict {
         // alloc: a verdict's summary, once a verdict
         let none = |it: &[&str]| if it.is_empty() { "none".to_owned() } else { it.join(", ") };
         // alloc: a verdict's summary, once a verdict
-        format!("build {}: failed: {}; could not run: {}", self.build, none(&failed), none(&unchecked))
+        format!(
+            "build {}: failed: {}; could not run: {}",
+            self.build,
+            none(&failed),
+            none(&unchecked)
+        )
     }
 }
 
@@ -246,9 +251,15 @@ pub enum GateError {
     Sql(SqlError),
     /// The history has no `builds` row of an ended build for the build asked for (`None`: for
     /// any build).
-    NoBuild { history: PathBuf, build: Option<u64> },
+    NoBuild {
+        history: PathBuf,
+        build: Option<u64>,
+    },
     /// The build's summary had no row, or did not write.
-    Summary { path: PathBuf, why: String },
+    Summary {
+        path: PathBuf,
+        why: String,
+    },
 }
 
 impl fmt::Display for GateError {
@@ -307,7 +318,9 @@ impl Build {
         let Build { build, t0, t1, .. } = *self;
         let of = self.of();
         // alloc: a condition, once a check
-        format!("(build_id = {build} OR (build_id IS NULL AND start_ns >= {t0} AND start_ns < {t1}{of}))")
+        format!(
+            "(build_id = {build} OR (build_id IS NULL AND start_ns >= {t0} AND start_ns < {t1}{of}))"
+        )
     }
 
     /// The build's folded spans, chosen alike by when the first began.
@@ -315,7 +328,9 @@ impl Build {
         let Build { build, t0, t1, .. } = *self;
         let of = self.of();
         // alloc: a condition, once a check
-        format!("(build_id = {build} OR (build_id IS NULL AND from_ns >= {t0} AND from_ns < {t1}{of}))")
+        format!(
+            "(build_id = {build} OR (build_id IS NULL AND from_ns >= {t0} AND from_ns < {t1}{of}))"
+        )
     }
 
     /// The pool workers of the build: the threads that ran or idled jobs in its window, as
@@ -324,7 +339,9 @@ impl Build {
         let Build { t0, t1, .. } = *self;
         let of = self.of();
         // alloc: a query's part, once a check
-        format!("(SELECT DISTINCT process, thread FROM switches WHERE t_ns BETWEEN {t0} AND {t1} AND event <> 'ready'{of})")
+        format!(
+            "(SELECT DISTINCT process, thread FROM switches WHERE t_ns BETWEEN {t0} AND {t1} AND event <> 'ready'{of})"
+        )
     }
 }
 
@@ -336,13 +353,15 @@ pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdic
     // The SQL checks in one DuckDB: the views are made once (`sql::run_all`).
     let asks = sql_checks(&it);
     // alloc: the checks' queries, once a verdict
-    let sqls: Vec<&str> = asks.iter().flat_map(|(_, sqls, _)| sqls.iter().map(String::as_str)).collect();
+    let sqls: Vec<&str> =
+        asks.iter().flat_map(|(_, sqls, _)| sqls.iter().map(String::as_str)).collect();
     let mut replies = answers(duckdb, history, &sqls).into_iter();
     // alloc: a verdict's checks, once a verdict
     let mut checks = Vec::with_capacity(CheckName::ALL.len());
     for (name, sqls, judge) in asks {
         // alloc: a check's answers, once a check
-        let mine: Vec<Result<Vec<RecordBatch>, String>> = replies.by_ref().take(sqls.len()).collect();
+        let mine: Vec<Result<Vec<RecordBatch>, String>> =
+            replies.by_ref().take(sqls.len()).collect();
         // alloc: a check's answers, once a check
         let answered: Result<Vec<Vec<RecordBatch>>, String> = mine.into_iter().collect();
         checks.push(match answered {
@@ -379,7 +398,9 @@ fn build(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Build, Gat
          FROM builds WHERE {which} AND dur_ns IS NOT NULL ORDER BY build_id DESC, started_ns DESC LIMIT 1"
     );
     let row = sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql: &sql })?;
-    let (Some(build), Some(t0), Some(dur)) = (first_i64(&row, 0), first_i64(&row, 1), first_i64(&row, 2)) else {
+    let (Some(build), Some(t0), Some(dur)) =
+        (first_i64(&row, 0), first_i64(&row, 1), first_i64(&row, 2))
+    else {
         // alloc: an error, once a verdict
         return Err(GateError::NoBuild { history: history.to_owned(), build: asked });
     };
@@ -408,7 +429,12 @@ fn sql_checks(it: &Build) -> Vec<(CheckName, Vec<String>, Judge)> {
     let raw = views::find("raw_blocks").and_then(|it| views::render(it, &args));
     let view = |name: &str, it: Result<String, ViewError>| {
         // alloc: a query, once a verdict; a broken view is a query DuckDB refuses, naming it
-        it.unwrap_or_else(|error| format!("SELECT error('the view {name} would not render: {}')", quoted(&error.to_string())))
+        it.unwrap_or_else(|error| {
+            format!(
+                "SELECT error('the view {name} would not render: {}')",
+                quoted(&error.to_string())
+            )
+        })
     };
     let slack = CLOCK_SLACK_NS;
     // A child and its parent, by (process, span_id), over the parent's whole process.
@@ -454,7 +480,11 @@ fn sql_checks(it: &Build) -> Vec<(CheckName, Vec<String>, Judge)> {
             )],
             waits_say_what as Judge,
         ),
-        (CheckName::RowsLost, vec![slow::load::recorder_sql(build, t0, t1, &of)], rows_lost as Judge),
+        (
+            CheckName::RowsLost,
+            vec![slow::load::recorder_sql(build, t0, t1, &of)],
+            rows_lost as Judge,
+        ),
         (
             CheckName::SamplesInSpans,
             vec![format!(
@@ -529,7 +559,10 @@ fn answers(duckdb: &Path, history: &Path, sqls: &[&str]) -> Vec<Result<Vec<Recor
         Err(_) => sqls
             .iter()
             // alloc: an error, once a check
-            .map(|&sql| sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql }).map_err(|error| first_line(&error.to_string())))
+            .map(|&sql| {
+                sql::run(&Query { duckdb, history, scope: sql::Scope::All, sql })
+                    .map_err(|error| first_line(&error.to_string()))
+            })
             // alloc: the checks' answers, once a verdict
             .collect(),
     }
@@ -537,7 +570,8 @@ fn answers(duckdb: &Path, history: &Path, sqls: &[&str]) -> Vec<Result<Vec<Recor
 
 fn workers_covered(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
     let rows = &answers[0];
-    let (threads, names, seconds, pcts) = (i64s(rows, 0)?, strings(rows, 1)?, f64s(rows, 2)?, f64s(rows, 3)?);
+    let (threads, names, seconds, pcts) =
+        (i64s(rows, 0)?, strings(rows, 1)?, f64s(rows, 2)?, f64s(rows, 3)?);
     let name = CheckName::WorkersCovered;
     let Some(&worst) = pcts.first() else {
         return Ok(Check::unchecked(name, "the build has no pool worker's switches"));
@@ -549,7 +583,10 @@ fn workers_covered(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, Str
         .take(SHOWN_MAX)
         .map(|&i| {
             // alloc: a failure's line, once a failure
-            format!("worker {} ({}) was inside no span for {:.2} s, {:.2}% of the build", threads[i], names[i], seconds[i], pcts[i])
+            format!(
+                "worker {} ({}) was inside no span for {:.2} s, {:.2}% of the build",
+                threads[i], names[i], seconds[i], pcts[i]
+            )
         })
         // alloc: a check's lines, once a check
         .collect();
@@ -564,16 +601,23 @@ fn workers_covered(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, Str
 }
 
 fn blocks_in_waits(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
-    let (threads, at, frames) = (i64s(&answers[0], 0)?, i64s(&answers[0], 1)?, strings(&answers[0], 2)?);
-    let (off, samples) = (first_i64(&answers[1], 0).unwrap_or(0), first_i64(&answers[1], 1).unwrap_or(0));
+    let (threads, at, frames) =
+        (i64s(&answers[0], 0)?, i64s(&answers[0], 1)?, strings(&answers[0], 2)?);
+    let (off, samples) =
+        (first_i64(&answers[1], 0).unwrap_or(0), first_i64(&answers[1], 1).unwrap_or(0));
     let name = CheckName::BlocksInWaits;
     if samples == 0 {
-        return Ok(Check::unchecked(name, "the build has no CPU samples (was the sampler on? `blaze debug dump` says its state)"));
+        return Ok(Check::unchecked(
+            name,
+            "the build has no CPU samples (was the sampler on? `blaze debug dump` says its state)",
+        ));
     }
     if threads.is_empty() && off == 0 {
         return Ok(Check::unchecked(
             name,
-            format_args!("none of the build's {samples} CPU samples is of a blocked thread (cpu = 'off'), so no block was seen to judge"),
+            format_args!(
+                "none of the build's {samples} CPU samples is of a blocked thread (cpu = 'off'), so no block was seen to judge"
+            ),
         ));
     }
     let detail = (0..threads.len())
@@ -585,19 +629,27 @@ fn blocks_in_waits(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, Str
     let many = if threads.len() as u64 >= NAMED_MAX { " or more" } else { "" };
     let outcome = if threads.is_empty() { Outcome::Passed } else { Outcome::Failed };
     // alloc: a check's line, once a check
-    let said = format!("{}{many} samples of a worker blocked outside every wait span, of {off} off-CPU samples", threads.len());
+    let said = format!(
+        "{}{many} samples of a worker blocked outside every wait span, of {off} off-CPU samples",
+        threads.len()
+    );
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
 fn waits_say_what(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
-    let (waits, unsaid) = (first_i64(&answers[0], 0).unwrap_or(0), first_i64(&answers[0], 1).unwrap_or(0));
+    let (waits, unsaid) =
+        (first_i64(&answers[0], 0).unwrap_or(0), first_i64(&answers[0], 1).unwrap_or(0));
     let name = CheckName::WaitsSayWhat;
     if waits == 0 {
         return Ok(Check::unchecked(name, "the build has no wait span"));
     }
     let outcome = if unsaid == 0 { Outcome::Passed } else { Outcome::Failed };
     // alloc: a check's line, once a check
-    Ok(Check::new(name, outcome, format!("{unsaid} of {waits} wait spans say nothing of what they await")))
+    Ok(Check::new(
+        name,
+        outcome,
+        format!("{unsaid} of {waits} wait spans say nothing of what they await"),
+    ))
 }
 
 fn rows_lost(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
@@ -631,7 +683,9 @@ fn samples_in_spans(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, St
     let pct = 100.0 * tied as f64 / samples as f64;
     let outcome = if pct >= SAMPLES_IN_SPANS_MIN_PCT { Outcome::Passed } else { Outcome::Failed };
     // alloc: a check's line, once a check
-    let said = format!("{pct:.2}% of {samples} worker samples name a span open as they were taken (at least {SAMPLES_IN_SPANS_MIN_PCT}%)");
+    let said = format!(
+        "{pct:.2}% of {samples} worker samples name a span open as they were taken (at least {SAMPLES_IN_SPANS_MIN_PCT}%)"
+    );
     // alloc: a check's lines, once a check
     let detail = vec![
         // alloc: a line, once a check
@@ -649,9 +703,13 @@ fn children_in_parents(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check,
     let (children, orphans, over) = (at(0), at(1), at(2));
     let name = CheckName::ChildrenInParents;
     if children == orphans {
-        return Ok(Check::unchecked(name, format_args!("none of the build's {children} child spans has its parent's row")));
+        return Ok(Check::unchecked(
+            name,
+            format_args!("none of the build's {children} child spans has its parent's row"),
+        ));
     }
-    let (names, parents, overs) = (strings(&answers[1], 0)?, strings(&answers[1], 1)?, i64s(&answers[1], 2)?);
+    let (names, parents, overs) =
+        (strings(&answers[1], 0)?, strings(&answers[1], 1)?, i64s(&answers[1], 2)?);
     // alloc: a check's lines, once a check
     let mut detail: Vec<String> = (0..names.len())
         // alloc: a failure's line, once a failure
@@ -659,11 +717,16 @@ fn children_in_parents(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check,
         .collect();
     if orphans > 0 {
         // alloc: a line, once a check
-        detail.push(format!("{orphans} children whose parent has no row (folded, lost or still open) not checked"));
+        detail.push(format!(
+            "{orphans} children whose parent has no row (folded, lost or still open) not checked"
+        ));
     }
     let outcome = if over == 0 { Outcome::Passed } else { Outcome::Failed };
     // alloc: a check's line, once a check
-    let said = format!("{over} of {} child spans outside their parent by more than {CLOCK_SLACK_NS} ns", children - orphans);
+    let said = format!(
+        "{over} of {} child spans outside their parent by more than {CLOCK_SLACK_NS} ns",
+        children - orphans
+    );
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
@@ -673,7 +736,8 @@ fn self_cpu_in_duration(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check
     if counted == 0 {
         return Ok(Check::unchecked(name, "no span of the build counts its CPU"));
     }
-    let (names, cpu, dur) = (strings(&answers[1], 0)?, i64s(&answers[1], 1)?, i64s(&answers[1], 2)?);
+    let (names, cpu, dur) =
+        (strings(&answers[1], 0)?, i64s(&answers[1], 1)?, i64s(&answers[1], 2)?);
     let detail = (0..names.len())
         .take(SHOWN_MAX)
         // alloc: a failure's line, once a failure
@@ -682,7 +746,10 @@ fn self_cpu_in_duration(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check
         .collect();
     let outcome = if names.is_empty() { Outcome::Passed } else { Outcome::Failed };
     // alloc: a check's line, once a check
-    let said = format!("{} of {counted} counted spans have self CPU below 0 or above their duration", names.len());
+    let said = format!(
+        "{} of {counted} counted spans have self CPU below 0 or above their duration",
+        names.len()
+    );
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
@@ -723,7 +790,8 @@ fn slow_deterministic(duckdb: &Path, history: &Path, build: u64) -> Check {
     let name = CheckName::SlowDeterministic;
     let source = Source { duckdb, history };
     let once = || -> Result<String, String> {
-        let report = slow::load::run(&source, Some(build)).map_err(|error| first_line(&error.to_string()))?;
+        let report = slow::load::run(&source, Some(build))
+            .map_err(|error| first_line(&error.to_string()))?;
         // The bytes `blaze slow --json` prints.
         // alloc: a report's JSON, twice a verdict
         Ok(serde_json::to_string(&report).map_err(|error| error.to_string())? + "\n")
@@ -731,16 +799,26 @@ fn slow_deterministic(duckdb: &Path, history: &Path, build: u64) -> Check {
     let (first, second) = match (once(), once()) {
         (Ok(first), Ok(second)) => (first, second),
         // alloc: an error, once a verdict
-        (Err(why), _) | (_, Err(why)) => return Check::unchecked(name, format_args!("`blaze slow --json`: {why}")),
+        (Err(why), _) | (_, Err(why)) => {
+            return Check::unchecked(name, format_args!("`blaze slow --json`: {why}"));
+        }
     };
     match first_difference(&first, &second) {
         // alloc: a check's line, once a verdict
-        None => Check::new(name, Outcome::Passed, format!("`blaze slow --json` gave the same {} bytes twice", first.len())),
+        None => Check::new(
+            name,
+            Outcome::Passed,
+            format!("`blaze slow --json` gave the same {} bytes twice", first.len()),
+        ),
         Some(at) => Check::new(
             name,
             Outcome::Failed,
             // alloc: a check's line, once a verdict
-            format!("`blaze slow --json` differs between two runs from byte {at} of {} and {}", first.len(), second.len()),
+            format!(
+                "`blaze slow --json` differs between two runs from byte {at} of {} and {}",
+                first.len(),
+                second.len()
+            ),
         )
         // alloc: a check's lines, once a verdict
         .with(vec![around(&first, at), around(&second, at)]),
@@ -773,7 +851,8 @@ fn around(text: &str, at: usize) -> String {
 
 /// The history's files of `build`, by table: their names and paths, in name order.
 fn files_of(history: &Path, build: u64) -> Result<Vec<(Name, PathBuf)>, String> {
-    let entries = fs::read_dir(history).map_err(|error| format!("listing {}: {error}", history.display()))?;
+    let entries =
+        fs::read_dir(history).map_err(|error| format!("listing {}: {error}", history.display()))?;
     // alloc: a build's files, once a check
     let mut files = Vec::new();
     for entry in entries {
@@ -790,7 +869,8 @@ fn files_of(history: &Path, build: u64) -> Result<Vec<(Name, PathBuf)>, String> 
 
 /// A Parquet file's footer row count and the value of its [`history::MERGED_ROWS`] key.
 fn footer(path: &Path) -> Result<(i64, Option<String>), String> {
-    let file = fs::File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
+    let file =
+        fs::File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
     let metadata = ParquetMetaDataReader::new()
         .with_page_index_policy(PageIndexPolicy::Skip)
         .parse_and_finish(&file)
@@ -824,24 +904,34 @@ fn merged_rows_match(history: &Path, build: u64) -> Check {
         };
         keyed += 1;
         // alloc: a file's name, once a merged file
-        let file = path.file_name().map_or_else(|| path.display().to_string(), |it| it.to_string_lossy().into_owned());
+        let file = path
+            .file_name()
+            .map_or_else(|| path.display().to_string(), |it| it.to_string_lossy().into_owned());
         match said.parse::<i64>() {
             Ok(merged) if merged == rows => {}
             // alloc: a failure's line, once a failure
             Ok(merged) => wrong.push(format!("{file} holds {rows} rows; its merge read {merged}")),
             // alloc: a failure's line, once a failure
-            Err(_) => wrong.push(format!("{file} says {} = {said:?}, not a count", history::MERGED_ROWS)),
+            Err(_) => {
+                wrong.push(format!("{file} says {} = {said:?}, not a count", history::MERGED_ROWS))
+            }
         }
     }
     if keyed == 0 {
         return Check::unchecked(
             name,
-            format_args!("the build has no merged file that says its merge's rows ({unkeyed} merged files without {})", history::MERGED_ROWS),
+            format_args!(
+                "the build has no merged file that says its merge's rows ({unkeyed} merged files without {})",
+                history::MERGED_ROWS
+            ),
         );
     }
     let outcome = if wrong.is_empty() { Outcome::Passed } else { Outcome::Failed };
     // alloc: a check's line, once a check
-    let said = format!("{} of {keyed} merged files hold other than the rows their merge read; {unkeyed} say nothing", wrong.len());
+    let said = format!(
+        "{} of {keyed} merged files hold other than the rows their merge read; {unkeyed} say nothing",
+        wrong.len()
+    );
     wrong.truncate(SHOWN_MAX);
     Check::new(name, outcome, said).with(wrong)
 }
@@ -873,14 +963,16 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
     let (mut wrong, mut sqls, mut tables) = (Vec::new(), Vec::new(), Vec::new());
     for table in 0..schema::TABLES.len() {
         // alloc: a table's inputs, once a table
-        let mut inputs: Vec<PathBuf> = files.iter().filter(|(it, _)| it.table == table).map(|(_, it)| it.clone()).collect();
+        let mut inputs: Vec<PathBuf> =
+            files.iter().filter(|(it, _)| it.table == table).map(|(_, it)| it.clone()).collect();
         let Some(first) = inputs.first().cloned() else { continue };
         if inputs.len() == 1 {
             inputs.push(first);
         }
         // alloc: a path, once a table
         let output = out.join(format!("merged.{}.parquet", schema::TABLES[table].name));
-        history::concat(&output, &inputs, writer.properties(table)).map_err(|error| error.to_string())?;
+        history::concat(&output, &inputs, writer.properties(table))
+            .map_err(|error| error.to_string())?;
         let mut read = 0;
         for input in &inputs {
             read += footer(input)?.0;
@@ -889,10 +981,18 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
         let table_name = schema::TABLES[table].name;
         if rows != read || said.as_deref() != Some(read.to_string().as_str()) {
             // alloc: a failure's line, once a failure
-            wrong.push(format!("{table_name}: {} inputs hold {read} rows; their merge {rows}, and says {said:?}", inputs.len()));
+            wrong.push(format!(
+                "{table_name}: {} inputs hold {read} rows; their merge {rows}, and says {said:?}",
+                inputs.len()
+            ));
         }
         // alloc: a query's part, once an input
-        let hash = |path: &Path| format!("SELECT sum(hash(x)) AS h FROM read_parquet('{}') x", quoted(&path.display().to_string()));
+        let hash = |path: &Path| {
+            format!(
+                "SELECT sum(hash(x)) AS h FROM read_parquet('{}') x",
+                quoted(&path.display().to_string())
+            )
+        };
         // alloc: a query's part, once a table
         let ins: Vec<String> = inputs.iter().map(|it| hash(it.as_path())).collect();
         // alloc: a query, once a table
@@ -907,7 +1007,8 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
     }
     // alloc: the queries, once a check
     let asked: Vec<&str> = sqls.iter().map(String::as_str).collect();
-    let answers = sql::run_all(duckdb, &empty, sql::Scope::All, &asked).map_err(|error| first_line(&error.to_string()))?;
+    let answers = sql::run_all(duckdb, &empty, sql::Scope::All, &asked)
+        .map_err(|error| first_line(&error.to_string()))?;
     for ((table, read), answer) in tables.iter().zip(&answers) {
         let rows = first_i64(answer, 0).unwrap_or(-1);
         let (merged, inputs) = (nullable(answer, 1), nullable(answer, 2));
@@ -918,7 +1019,8 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
     }
     let outcome = if wrong.is_empty() { Outcome::Passed } else { Outcome::Failed };
     // alloc: a check's line, once a check
-    let said = format!("{} of {} tables' merges differ from their inputs", wrong.len(), tables.len());
+    let said =
+        format!("{} of {} tables' merges differ from their inputs", wrong.len(), tables.len());
     wrong.truncate(SHOWN_MAX);
     Ok(Check::new(name, outcome, said).with(wrong))
 }
@@ -957,7 +1059,8 @@ pub fn summary(duckdb: &Path, history: &Path, build: i64, out: &Path) -> Result<
         return Err(fail(format!("build {build} has no row in build_summary")));
     };
     let file = fs::File::create(out).map_err(|error| fail(error.to_string()))?;
-    let mut writer = ArrowWriter::try_new(file, first.schema(), None).map_err(|error| fail(error.to_string()))?;
+    let mut writer = ArrowWriter::try_new(file, first.schema(), None)
+        .map_err(|error| fail(error.to_string()))?;
     for batch in &batches {
         writer.write(batch).map_err(|error| fail(error.to_string()))?;
     }
@@ -981,7 +1084,9 @@ fn i64s(batches: &[RecordBatch], at: usize) -> Result<Vec<i64>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
-        let column = column(batch, at)?.as_primitive_opt::<Int64Type>().ok_or_else(|| wrong_type(batch, at, "BIGINT"))?;
+        let column = column(batch, at)?
+            .as_primitive_opt::<Int64Type>()
+            .ok_or_else(|| wrong_type(batch, at, "BIGINT"))?;
         out.extend(column.iter().map(Option::unwrap_or_default));
     }
     Ok(out)
@@ -991,7 +1096,9 @@ fn f64s(batches: &[RecordBatch], at: usize) -> Result<Vec<f64>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
-        let column = column(batch, at)?.as_primitive_opt::<Float64Type>().ok_or_else(|| wrong_type(batch, at, "DOUBLE"))?;
+        let column = column(batch, at)?
+            .as_primitive_opt::<Float64Type>()
+            .ok_or_else(|| wrong_type(batch, at, "DOUBLE"))?;
         out.extend(column.iter().map(Option::unwrap_or_default));
     }
     Ok(out)
@@ -1001,7 +1108,9 @@ fn strings(batches: &[RecordBatch], at: usize) -> Result<Vec<String>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
-        let column = column(batch, at)?.as_string_opt::<i32>().ok_or_else(|| wrong_type(batch, at, "VARCHAR"))?;
+        let column = column(batch, at)?
+            .as_string_opt::<i32>()
+            .ok_or_else(|| wrong_type(batch, at, "VARCHAR"))?;
         // alloc: a check's answer
         out.extend(column.iter().map(|it| it.unwrap_or("?").to_owned()));
     }
@@ -1012,13 +1121,21 @@ fn column(batch: &RecordBatch, at: usize) -> Result<&dyn Array, String> {
     match at < batch.num_columns() {
         true => Ok(batch.column(at).as_ref()),
         // alloc: an error, a bug in the gate's SQL
-        false => Err(format!("the gate's query answered {} columns, not {}", batch.num_columns(), at + 1)),
+        false => Err(format!(
+            "the gate's query answered {} columns, not {}",
+            batch.num_columns(),
+            at + 1
+        )),
     }
 }
 
 fn wrong_type(batch: &RecordBatch, at: usize, wanted: &str) -> String {
     // alloc: an error, a bug in the gate's SQL
-    format!("the gate's query answered column {} as {}, not {wanted}", batch.schema().field(at).name(), batch.column(at).data_type())
+    format!(
+        "the gate's query answered column {} as {}, not {wanted}",
+        batch.schema().field(at).name(),
+        batch.column(at).data_type()
+    )
 }
 
 /// Row 0's column `at`, a `BIGINT` or null.
@@ -1049,23 +1166,49 @@ mod tests {
     use super::*;
 
     fn verdict(checks: Vec<Check>) -> Verdict {
-        Verdict { version: VERDICT_VERSION, build: 24, tree: Some("9f2c".into()), blaze: None, process: Some(7), checks }
+        Verdict {
+            version: VERDICT_VERSION,
+            build: 24,
+            tree: Some("9f2c".into()),
+            blaze: None,
+            process: Some(7),
+            checks,
+        }
     }
 
     #[test]
     fn a_verdict_says_each_check_and_lists_what_could_not_run() {
-        let failed = Check::new(CheckName::WorkersCovered, Outcome::Failed, "1 of 8 workers".into())
-            .with(vec!["worker 7 (blaze-work-3) was inside no span for 77.00 s, 28.10% of the build".into()]);
-        let unchecked = Check::unchecked(CheckName::CpuMatchesProcess, "the build's row has no `daemon_user_ns`");
+        let failed =
+            Check::new(CheckName::WorkersCovered, Outcome::Failed, "1 of 8 workers".into()).with(
+                vec![
+                    "worker 7 (blaze-work-3) was inside no span for 77.00 s, 28.10% of the build"
+                        .into(),
+                ],
+            );
+        let unchecked = Check::unchecked(
+            CheckName::CpuMatchesProcess,
+            "the build's row has no `daemon_user_ns`",
+        );
         let passed = Check::new(CheckName::RowsLost, Outcome::Passed, "0 lost".into());
         let it = verdict(vec![failed, unchecked, passed]);
         assert!(!it.passed());
         let said = it.to_string();
-        assert!(said.starts_with("build 24 (tree 9f2c, blaze not recorded): 1 passed, 1 failed, 1 could not run"), "{said}");
-        assert!(said.contains("FAIL workers_covered: 1 of 8 workers\n       worker 7 (blaze-work-3)"), "{said}");
+        assert!(
+            said.starts_with(
+                "build 24 (tree 9f2c, blaze not recorded): 1 passed, 1 failed, 1 could not run"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("FAIL workers_covered: 1 of 8 workers\n       worker 7 (blaze-work-3)"),
+            "{said}"
+        );
         assert!(said.contains("---- cpu_matches_process: could not run:"), "{said}");
         assert!(said.ends_with("could not run: cpu_matches_process\n"), "{said}");
-        assert_eq!(it.summary(), "build 24: failed: workers_covered; could not run: cpu_matches_process");
+        assert_eq!(
+            it.summary(),
+            "build 24: failed: workers_covered; could not run: cpu_matches_process"
+        );
         let json = serde_json::to_value(&it).unwrap();
         assert_eq!(json["checks"][1]["outcome"], "unchecked");
         assert_eq!(json["checks"][1]["name"], "cpu_matches_process");
@@ -1075,7 +1218,8 @@ mod tests {
     fn a_check_that_could_not_run_fails_the_verdict() {
         let it = verdict(vec![Check::unchecked(CheckName::MergesExact, "the build has no file")]);
         assert!(!it.passed(), "a check that did not run is never read as clean");
-        let clean = verdict(vec![Check::new(CheckName::RowsLost, Outcome::Passed, "0 lost".into())]);
+        let clean =
+            verdict(vec![Check::new(CheckName::RowsLost, Outcome::Passed, "0 lost".into())]);
         assert!(clean.passed());
     }
 
@@ -1083,7 +1227,10 @@ mod tests {
     fn check_names_are_their_json() {
         for name in CheckName::ALL {
             assert_eq!(serde_json::to_value(name).unwrap(), Value::from(name.name()));
-            assert_eq!(serde_json::from_value::<CheckName>(Value::from(name.name())).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<CheckName>(Value::from(name.name())).unwrap(),
+                name
+            );
         }
     }
 
@@ -1118,7 +1265,12 @@ mod tests {
         for name in FIXTURED {
             let dir = fixtures().join(name.name());
             let builds = dir.join("1-00000001.builds.parquet");
-            assert!(builds.is_file(), "{} has no fixture at {}: run fixtures/gate/make.py", name, builds.display());
+            assert!(
+                builds.is_file(),
+                "{} has no fixture at {}: run fixtures/gate/make.py",
+                name,
+                builds.display()
+            );
         }
     }
 
@@ -1126,7 +1278,9 @@ mod tests {
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn each_fixture_fails_its_own_check() {
-        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let duckdb = PathBuf::from(
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+        );
         for name in FIXTURED {
             let scratch = Scratch::new().unwrap();
             for entry in fs::read_dir(fixtures().join(name.name())).unwrap() {
@@ -1135,9 +1289,14 @@ mod tests {
                     fs::copy(&path, scratch.0.join(path.file_name().unwrap())).unwrap();
                 }
             }
-            let verdict = check(&duckdb, &scratch.0, None).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let verdict =
+                check(&duckdb, &scratch.0, None).unwrap_or_else(|error| panic!("{name}: {error}"));
             let it = verdict.check(name).unwrap();
-            assert_eq!(it.outcome, Outcome::Failed, "{name}'s fixture does not fail it:\n{verdict}");
+            assert_eq!(
+                it.outcome,
+                Outcome::Failed,
+                "{name}'s fixture does not fail it:\n{verdict}"
+            );
         }
     }
 
@@ -1148,7 +1307,9 @@ mod tests {
     #[test]
     #[ignore = "needs a profiled self-build and the pinned DuckDB: BLAZE_PROFILE_FIXTURE=<state>/profile BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn a_profiled_self_build_passes_the_gate() {
-        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let duckdb = PathBuf::from(
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+        );
         let history = PathBuf::from(
             std::env::var_os("BLAZE_PROFILE_FIXTURE")
                 .expect("BLAZE_PROFILE_FIXTURE names a profiled build's history"),

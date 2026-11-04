@@ -72,7 +72,12 @@ pub fn text(report: &Report, top: usize) -> String {
         }
         for (side, stacks) in [("on the CPU", &it.stacks.on_cpu), ("blocked", &it.stacks.off_cpu)] {
             for stack in stacks {
-                _ = writeln!(out, "    - sampled {side} inside it {}x: {}", stack.samples, innermost(stack));
+                _ = writeln!(
+                    out,
+                    "    - sampled {side} inside it {}x: {}",
+                    stack.samples,
+                    innermost(stack)
+                );
             }
         }
         _ = writeln!(out, "    fix: {}", it.fix.says());
@@ -168,8 +173,8 @@ fn panics_text(panics: &[PanicFacts], top: usize, out: &mut String) {
         let what = match (it.kind.as_str(), &it.signal) {
             ("signal", Some(signal)) => format!("the daemon died of {signal}"), // alloc: a line
             ("signal", None) => "the daemon died of a fatal signal".to_owned(), // alloc: a line
-            (_, _) if it.caught => "panicked, failing its job".to_owned(), // alloc: a line
-            (_, _) => "panicked, caught by no job".to_owned(), // alloc: a line
+            (_, _) if it.caught => "panicked, failing its job".to_owned(),      // alloc: a line
+            (_, _) => "panicked, caught by no job".to_owned(),                  // alloc: a line
         };
         _ = write!(out, "    {what}");
         if let Some(at) = &it.location {
@@ -231,7 +236,11 @@ fn recorder(r: &super::Recorder) -> String {
         )
     };
     let said = match (r.folded_spans, r.folded_ns) {
-        (Some(n), Some(ns)) if n > 0 => format!("{lost}; summed {n} spans under {:?} into `folded` ({})", crate::flight::FOLD_BELOW, super::s(ns)),
+        (Some(n), Some(ns)) if n > 0 => format!(
+            "{lost}; summed {n} spans under {:?} into `folded` ({})",
+            crate::flight::FOLD_BELOW,
+            super::s(ns)
+        ),
         _ => lost,
     };
     // alloc: a line
@@ -247,7 +256,9 @@ fn recorder_cost(r: &super::Recorder) -> String {
             ns / spans,
             reads.unwrap_or(0)
         ),
-        (Some(ns), _, reads) => format!("cost {} over no spans ({} thread-CPU reads)", super::s(ns), reads.unwrap_or(0)),
+        (Some(ns), _, reads) => {
+            format!("cost {} over no spans ({} thread-CPU reads)", super::s(ns), reads.unwrap_or(0))
+        }
         (None, ..) => "this record has no cost counters".to_owned(),
     }
 }

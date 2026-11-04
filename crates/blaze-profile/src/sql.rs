@@ -185,7 +185,8 @@ pub fn run(query: &Query<'_>) -> Result<Vec<RecordBatch>, SqlError> {
 /// explorer does when the page cancels a query.
 pub fn run_with(query: &Query<'_>, stop: &Stop) -> Result<Vec<RecordBatch>, SqlError> {
     let mut scratch = Scratch::new()?;
-    let answer = run_in(&scratch.dir, query.duckdb, &[query.sql], query.history, query.scope, stop).map(only);
+    let answer = run_in(&scratch.dir, query.duckdb, &[query.sql], query.history, query.scope, stop)
+        .map(only);
     scratch.keep = answer.as_ref().is_err_and(|it| !matches!(it, SqlError::Stopped));
     answer
 }
@@ -195,7 +196,12 @@ pub fn run_with(query: &Query<'_>, stop: &Stop) -> Result<Vec<RecordBatch>, SqlE
 /// footer of every file they read (17 CPU-seconds and 0.7 GB over the 6,000 files of one home
 /// with [`Scope::All`], 2026-11-04; a build's files with [`Scope::Build`]), so a reader with
 /// several queries that do not hang on each other's answers asks them together.
-pub fn run_all(duckdb: &Path, history: &Path, scope: Scope, sqls: &[&str]) -> Result<Vec<Vec<RecordBatch>>, SqlError> {
+pub fn run_all(
+    duckdb: &Path,
+    history: &Path,
+    scope: Scope,
+    sqls: &[&str],
+) -> Result<Vec<Vec<RecordBatch>>, SqlError> {
     if sqls.is_empty() {
         // alloc: nothing, no query asked
         return Ok(Vec::new());
@@ -391,7 +397,8 @@ fn run_in(
     let pin = Pin::take(history).map_err(SqlError::History)?;
     let script_path = scratch.join("query.sql");
     let init = scratch.join("init.sql");
-    fs::write(&script_path, script(sqls, history, pin.manifest(), scope, scratch)?).map_err(io_error(&script_path, "writing"))?;
+    fs::write(&script_path, script(sqls, history, pin.manifest(), scope, scratch)?)
+        .map_err(io_error(&script_path, "writing"))?;
     // An empty init file, so the user's ~/.duckdbrc does not change what the query means.
     fs::write(&init, b"").map_err(io_error(&init, "writing"))?;
     let stdin = fs::File::open(&script_path).map_err(io_error(&script_path, "opening"))?;
@@ -493,9 +500,23 @@ mod tests {
     #[test]
     fn the_script_installs_nothing_and_copies_one_query_out() {
         let mut listed = manifest::Manifest::new();
-        let entry = manifest::Entry { version: schema::VERSION, rows: 1, builds: Some([1, 1]), t_ns: None, boot: None, pid: None };
+        let entry = manifest::Entry {
+            version: schema::VERSION,
+            rows: 1,
+            builds: Some([1, 1]),
+            t_ns: None,
+            boot: None,
+            pid: None,
+        };
         listed.insert("1-00000001.spans.parquet", entry).unwrap();
-        let script = script(&["SELECT 1 ;\n", "SELECT 2"], Path::new("/h"), &listed, Scope::All, Path::new("/tmp/it's")).unwrap();
+        let script = script(
+            &["SELECT 1 ;\n", "SELECT 2"],
+            Path::new("/h"),
+            &listed,
+            Scope::All,
+            Path::new("/tmp/it's"),
+        )
+        .unwrap();
         assert!(script.starts_with("SET autoinstall_known_extensions = false;"));
         assert!(script.contains("SET threads = 8;\nSET memory_limit = '4GB';\nSET temp_directory = '/tmp/it''s/spill';\n"), "{script}");
         assert!(script.contains("read_parquet(['/h/schema.spans.parquet', '/h/1-00000001.spans.parquet'], union_by_name = true)"));
@@ -586,7 +607,13 @@ mod tests {
     fn a_query_over_a_history_older_than_a_table_writes_its_schema_file_first() {
         let dir = old_history("old");
         let fake = silent_duckdb(&dir);
-        let error = run(&Query { duckdb: &fake, history: &dir, scope: Scope::All, sql: "SELECT count(*) FROM events" }).unwrap_err();
+        let error = run(&Query {
+            duckdb: &fake,
+            history: &dir,
+            scope: Scope::All,
+            sql: "SELECT count(*) FROM events",
+        })
+        .unwrap_err();
         assert!(matches!(error, SqlError::Duckdb { .. }), "the query reached DuckDB: {error}");
         for table in schema::TABLES {
             assert!(dir.join(format!("schema.{}.parquet", table.name)).exists(), "{}", table.name);
@@ -604,7 +631,9 @@ mod tests {
         fs::create_dir(dir.join(format!(".schema.events.parquet.{}.tmp", std::process::id())))
             .unwrap();
         let fake = silent_duckdb(&dir);
-        let error = run(&Query { duckdb: &fake, history: &dir, scope: Scope::All, sql: "SELECT 1" }).unwrap_err();
+        let error =
+            run(&Query { duckdb: &fake, history: &dir, scope: Scope::All, sql: "SELECT 1" })
+                .unwrap_err();
         match &error {
             SqlError::History(HistoryError::SchemasMissing { dir: named, tables, .. }) => {
                 assert_eq!(named, &dir);
@@ -630,15 +659,26 @@ mod tests {
         let dir = old_history("newer");
         for table in ["events", "query_counts"] {
             let sql = format!("SELECT count(*) AS n FROM {table}");
-            let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql }).unwrap_or_else(|error| panic!("{table}: {error}"));
-            assert_eq!(batches[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0), 0, "{table}");
+            let batches =
+                run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
+                    .unwrap_or_else(|error| panic!("{table}: {error}"));
+            assert_eq!(
+                batches[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0),
+                0,
+                "{table}"
+            );
         }
         _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_duckdb_not_named_by_an_absolute_path_is_an_error() {
-        let query = Query { duckdb: Path::new("duckdb"), history: Path::new("/nowhere"), scope: Scope::All, sql: "SELECT 1" };
+        let query = Query {
+            duckdb: Path::new("duckdb"),
+            history: Path::new("/nowhere"),
+            scope: Scope::All,
+            sql: "SELECT 1",
+        };
         let error = run(&query).unwrap_err();
         assert!(matches!(error, SqlError::NoDuckdb { .. }), "{error}");
         assert!(error.to_string().contains("never looked up on PATH"));
@@ -695,7 +735,8 @@ mod tests {
         history.flush(Some(77)).unwrap();
 
         let count = |sql: &str| {
-            let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql }).unwrap_or_else(|error| panic!("{error}"));
+            let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql })
+                .unwrap_or_else(|error| panic!("{error}"));
             batches[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0)
         };
         assert!(
@@ -728,9 +769,18 @@ mod tests {
         assert_eq!(count(&deepest), 2, "the job that went deepest ranks first");
 
         assert!(count("SELECT count(*) AS n FROM counters WHERE name = 'pool queued'") >= 1);
-        let one = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::Build(77), sql: "SELECT count(*) AS n FROM builds WHERE build_id = 77" })
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(one[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0), 1, "a build's scope reads its files");
+        let one = run(&Query {
+            duckdb: &duckdb,
+            history: &dir,
+            scope: Scope::Build(77),
+            sql: "SELECT count(*) AS n FROM builds WHERE build_id = 77",
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            one[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0),
+            1,
+            "a build's scope reads its files"
+        );
 
         for view in views::VIEWS {
             let mut args = Map::new();
@@ -739,8 +789,9 @@ mod tests {
             args.insert("later".into(), Value::from("feedbeef"));
             args.retain(|key, _| view.args.iter().any(|it| it.name == key));
             let sql = views::render(view, &args).unwrap();
-            let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
-                .unwrap_or_else(|error| panic!("the view {} runs: {error}", view.name));
+            let batches =
+                run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
+                    .unwrap_or_else(|error| panic!("the view {} runs: {error}", view.name));
             assert!(
                 batches
                     .iter()
@@ -753,10 +804,18 @@ mod tests {
             // alloc: a query, once a view
             let sql = format!("SELECT count(*) AS n FROM {}", view.name);
             run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
-                .unwrap_or_else(|error| panic!("`FROM {}` reads the view as a table: {error}", view.name));
+                .unwrap_or_else(|error| {
+                    panic!("`FROM {}` reads the view as a table: {error}", view.name)
+                });
         }
 
-        let error = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: "SELECT no_such_column FROM spans" }).unwrap_err();
+        let error = run(&Query {
+            duckdb: &duckdb,
+            history: &dir,
+            scope: Scope::All,
+            sql: "SELECT no_such_column FROM spans",
+        })
+        .unwrap_err();
         match &error {
             SqlError::Duckdb { message, script, .. } => {
                 assert!(message.contains("no_such_column"), "DuckDB's own message: {message}");
@@ -807,7 +866,8 @@ mod tests {
             "SELECT CAST(step AS BIGINT) AS step, CAST(lane AS VARCHAR) AS lane, CAST(what AS VARCHAR) AS what, \
              CAST(from_ns AS BIGINT) AS from_ns, CAST(to_ns AS BIGINT) AS to_ns, CAST(path_pct AS DOUBLE) AS pct FROM ({path})"
         );
-        let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql }).unwrap_or_else(|error| panic!("{error}"));
+        let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
+            .unwrap_or_else(|error| panic!("{error}"));
         let mut steps = Vec::new();
         for batch in &batches {
             let int = |at: usize| {
@@ -880,7 +940,8 @@ mod tests {
         let sql = format!(
             "SELECT CAST(thread AS BIGINT) AS thread, CAST(uncovered_pct AS DOUBLE) AS pct FROM ({uncovered}) ORDER BY thread"
         );
-        let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql }).unwrap_or_else(|error| panic!("{error}"));
+        let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
+            .unwrap_or_else(|error| panic!("{error}"));
         let mut workers = Vec::new();
         for batch in &batches {
             let thread = batch.column(0).as_primitive::<arrow_array::types::Int64Type>().clone();

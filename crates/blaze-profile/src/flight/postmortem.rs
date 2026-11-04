@@ -56,7 +56,10 @@ use std::{
     fs::{self, File},
     io::{self, Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
-    sync::{OnceLock, atomic::{AtomicU64, Ordering}},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use blaze_hash::HashMap;
@@ -65,8 +68,8 @@ use std::alloc::Global;
 use stdx::file_lock::Locked;
 
 use super::{
-    CAP, KEPT, NAMES, Owner, Read, RINGS, SHARDS, SITES, SLOTS, Store, Sym, TAKEN, WORDS, clock, decode,
-    lock, span,
+    CAP, KEPT, NAMES, Owner, RINGS, Read, SHARDS, SITES, SLOTS, Store, Sym, TAKEN, WORDS, clock,
+    decode, lock, span,
 };
 
 // --- Layout -----------------------------------------------------------------------------
@@ -174,11 +177,13 @@ const fn fnv_word(hash: u64, word: u64) -> u64 {
 /// refused, not misread.
 pub(crate) const ROWS_FINGERPRINT: u64 = {
     use super::{
-        ALLOCS_BITS, BYTES_MAX, COL_WORDS, CPU_COL, CPU_READ, CPU_ROW, CPU_VALID, CpuWhy, DEPTH_BITS, EPOCHS, EVENT_FIELDS_ROW, EVENT_ROW, FIBER_STACK_ROW, FIELD_SLOT_BITS,
-        FIELD_SLOT_SHIFT, FieldValue, FOLD_ALLOCS, FOLD_CPU,
-        FOLD_PARENT_SHIFT, FOLD_ROOT, FOLD_ROW, FOLD_SPANS_MAX, FOLD_SPANS_SHIFT, FOLDED_COL, FOLDED_TICKS_COL,
-        KIND_MARK, KIND_PLOT, KIND_SPAN, NO_COL, OWNERS_KEPT, Plot, QUEUED_LOW_SHIFT, RING_BITS, SITE_BITS, SLOT_BITS,
-        SHARE_SHIFT, SPAN_COLS_ROW, SPAN_COPIED_ROW, STORE_HEAD, SWITCH_ROW, Switched, THREAD_COL, UNCOUNTED, WaitedOn,
+        ALLOCS_BITS, BYTES_MAX, COL_WORDS, CPU_COL, CPU_READ, CPU_ROW, CPU_VALID, CpuWhy,
+        DEPTH_BITS, EPOCHS, EVENT_FIELDS_ROW, EVENT_ROW, FIBER_STACK_ROW, FIELD_SLOT_BITS,
+        FIELD_SLOT_SHIFT, FOLD_ALLOCS, FOLD_CPU, FOLD_PARENT_SHIFT, FOLD_ROOT, FOLD_ROW,
+        FOLD_SPANS_MAX, FOLD_SPANS_SHIFT, FOLDED_COL, FOLDED_TICKS_COL, FieldValue, KIND_MARK,
+        KIND_PLOT, KIND_SPAN, NO_COL, OWNERS_KEPT, Plot, QUEUED_LOW_SHIFT, RING_BITS, SHARE_SHIFT,
+        SITE_BITS, SLOT_BITS, SPAN_COLS_ROW, SPAN_COPIED_ROW, STORE_HEAD, SWITCH_ROW, Switched,
+        THREAD_COL, UNCOUNTED, WaitedOn,
     };
     use crate::time::cpu::{SHARE_BITS, SHARE_COUNTED, SHARE_ONE};
     let mut hash = 0xcbf2_9ce4_8422_2325;
@@ -269,7 +274,14 @@ pub(crate) const ROWS_FINGERPRINT: u64 = {
         hash = fnv(hash, Switched::ALL[at].name().as_bytes());
         at += 1;
     }
-    let waits = [WaitedOn::Job, WaitedOn::Key, WaitedOn::Counter, WaitedOn::Until, WaitedOn::Moved, WaitedOn::Nothing];
+    let waits = [
+        WaitedOn::Job,
+        WaitedOn::Key,
+        WaitedOn::Counter,
+        WaitedOn::Until,
+        WaitedOn::Moved,
+        WaitedOn::Nothing,
+    ];
     let mut at = 0;
     while at < waits.len() {
         hash = fnv_word(hash, waits[at] as u64);
@@ -310,20 +322,41 @@ fn pid_of(name: &str) -> Option<u32> {
 /// Why the recorder's rows could not be kept past a crash, or a dead process's read back.
 #[derive(Debug)]
 pub enum PostmortemError {
-    Io { path: PathBuf, doing: &'static str, error: io::Error },
+    Io {
+        path: PathBuf,
+        doing: &'static str,
+        error: io::Error,
+    },
     /// The file at `path` is not of this layout: its `what` is `found`, this blaze reads
     /// `expected`. Refused, never skipped.
-    Refused { path: PathBuf, what: &'static str, found: u64, expected: u64 },
+    Refused {
+        path: PathBuf,
+        what: &'static str,
+        found: u64,
+        expected: u64,
+    },
     /// A part of the file at `path` does not decode: a length past its room, a clock never
     /// written beside rings that were.
-    Torn { path: PathBuf, what: &'static str },
+    Torn {
+        path: PathBuf,
+        what: &'static str,
+    },
     /// This system can't keep the rows past a crash.
-    Unsupported { path: PathBuf, why: &'static str },
+    Unsupported {
+        path: PathBuf,
+        why: &'static str,
+    },
     /// More than `most` of `what` at once: those past it are not kept past a crash (a write),
     /// or not read back (a read).
-    Full { path: PathBuf, what: &'static str, most: usize },
+    Full {
+        path: PathBuf,
+        what: &'static str,
+        most: usize,
+    },
     /// The recorder is persisted already, to `path`: once a process.
-    AlreadyPersisted { path: PathBuf },
+    AlreadyPersisted {
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for PostmortemError {
@@ -346,7 +379,11 @@ impl std::fmt::Display for PostmortemError {
                 path.display()
             ),
             PostmortemError::Unsupported { path, why } => {
-                write!(f, "the flight recorder's rows can't be kept past a crash in {}: {why}", path.display())
+                write!(
+                    f,
+                    "the flight recorder's rows can't be kept past a crash in {}: {why}",
+                    path.display()
+                )
             }
             PostmortemError::Full { path, what, most } => write!(
                 f,
@@ -354,7 +391,11 @@ impl std::fmt::Display for PostmortemError {
                 path.display()
             ),
             PostmortemError::AlreadyPersisted { path } => {
-                write!(f, "the flight recorder is persisted already, to {}: once a process", path.display())
+                write!(
+                    f,
+                    "the flight recorder is persisted already, to {}: once a process",
+                    path.display()
+                )
             }
         }
     }
@@ -429,7 +470,10 @@ impl Mapping {
         {
             let page = sys::page_size();
             if page == 0 || PAGE % page != 0 {
-                return Err(PostmortemError::Unsupported { path, why: "the system's page size does not divide 64 KiB" });
+                return Err(PostmortemError::Unsupported {
+                    path,
+                    why: "the system's page size does not divide 64 KiB",
+                });
             }
             fs::create_dir_all(dir).map_err(io_error(dir, "making the history's directory"))?;
             let file = fs::OpenOptions::new()
@@ -450,10 +494,15 @@ impl Mapping {
             // on a page a ring writes later, and never a ring left on the heap.
             if let Err(error) = sys::reserve(&file, 0, FILE_BYTES) {
                 _ = fs::remove_file(&path);
-                return Err(io_error(&path, "reserving the disk of every ring's store (about 532 MiB) for")(error));
+                return Err(io_error(
+                    &path,
+                    "reserving the disk of every ring's store (about 532 MiB) for",
+                )(error));
             }
-            let fixed = sys::map(&file, 0, RINGS_AT).map_err(io_error(&path, "mapping the fixed part of"))?;
-            let stores = sys::map(&file, RINGS_AT as u64, STORES_BYTES).map_err(io_error(&path, "mapping the rings' stores of"))?;
+            let fixed = sys::map(&file, 0, RINGS_AT)
+                .map_err(io_error(&path, "mapping the fixed part of"))?;
+            let stores = sys::map(&file, RINGS_AT as u64, STORES_BYTES)
+                .map_err(io_error(&path, "mapping the rings' stores of"))?;
             let mapping = Mapping {
                 path,
                 file,
@@ -510,7 +559,9 @@ impl Mapping {
         assert!(at + bytes.len() <= RINGS_AT, "bytes of the fixed part");
         // SAFETY: the range is in the fixed part (checked above); the caller holds the lock of
         // the part it writes, so no other thread writes these bytes, and none reads them.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.fixed.as_ptr().add(at), bytes.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.fixed.as_ptr().add(at), bytes.len())
+        };
     }
 
     /// Notes the clock's base: in the slot not in use, then flips to it.
@@ -539,7 +590,8 @@ impl Mapping {
         // aligned and `STORE_BYTES` a multiple of 8, a `Store`'s alignment at most 8), of bytes
         // the file reserved as zeros; the mapping is never unmapped, all-zero is a valid `Store`
         // (atomics and integers), and `given` hands each one to one ring alone.
-        let store: &'static Store = unsafe { &*self.stores.as_ptr().add(*given * STORE_BYTES).cast::<Store>() };
+        let store: &'static Store =
+            unsafe { &*self.stores.as_ptr().add(*given * STORE_BYTES).cast::<Store>() };
         store.number.store(u64::from(number), Ordering::Relaxed);
         *given += 1;
         self.word(H_RINGS).store(*given as u64, Ordering::Release);
@@ -613,7 +665,8 @@ impl Mapping {
         let workspace = cut(build.workspace, BUILD_WORKSPACE_MAX).0;
         let command = cut(build.command, BUILD_COMMAND_MAX).0;
         self.at(base + 8).store(build.started_ns as u64, Ordering::Relaxed);
-        self.at(base + 16).store(build.started_unix_ns.unwrap_or(i64::MIN) as u64, Ordering::Relaxed);
+        self.at(base + 16)
+            .store(build.started_unix_ns.unwrap_or(i64::MIN) as u64, Ordering::Relaxed);
         let lens = commit.len() as u64
             | u64::from(has_commit) << 8
             | (workspace.len() as u64) << 16
@@ -678,7 +731,8 @@ mod sys {
 
     /// Maps `len` bytes of `file` from `at`, shared, to read and write.
     pub(super) fn map(file: &File, at: u64, len: usize) -> io::Result<NonNull<u8>> {
-        let offset = libc::off_t::try_from(at).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let offset =
+            libc::off_t::try_from(at).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: a fresh mapping at an address the kernel picks: it aliases no Rust object.
         // The file is open to read and write, and `at` is a multiple of the page (the caller's
         // layout is in 64 KiB parts, which the page divides).
@@ -695,7 +749,8 @@ mod sys {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        NonNull::new(base.cast::<u8>()).ok_or_else(|| io::Error::from(io::ErrorKind::AddrNotAvailable))
+        NonNull::new(base.cast::<u8>())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::AddrNotAvailable))
     }
 
     /// Reserves `from..to` of `file` on disk, and makes the file that long: a page of a shared
@@ -704,7 +759,10 @@ mod sys {
     #[cfg(target_os = "linux")]
     pub(super) fn reserve(file: &File, from: u64, to: u64) -> io::Result<()> {
         let invalid = |_| io::Error::from(io::ErrorKind::InvalidInput);
-        let (offset, len) = (libc::off_t::try_from(from).map_err(invalid)?, libc::off_t::try_from(to - from).map_err(invalid)?);
+        let (offset, len) = (
+            libc::off_t::try_from(from).map_err(invalid)?,
+            libc::off_t::try_from(to - from).map_err(invalid)?,
+        );
         // SAFETY: `posix_fallocate` on an open file descriptor; it returns its error.
         let failed = unsafe { libc::posix_fallocate(file.as_raw_fd(), offset, len) };
         match failed {
@@ -715,7 +773,8 @@ mod sys {
 
     #[cfg(target_vendor = "apple")]
     pub(super) fn reserve(file: &File, from: u64, to: u64) -> io::Result<()> {
-        let len = libc::off_t::try_from(to - from).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let len = libc::off_t::try_from(to - from)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let mut store = libc::fstore_t {
             fst_flags: libc::F_ALLOCATECONTIG,
             fst_posmode: libc::F_PEOFPOSMODE,
@@ -725,11 +784,17 @@ mod sys {
         };
         // SAFETY: `F_PREALLOCATE` reads and writes the `fstore_t` given, which lives across the
         // call.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store)) } == -1 {
+        if unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store))
+        } == -1
+        {
             // No contiguous run that long: any run.
             store.fst_flags = libc::F_ALLOCATEALL;
             // SAFETY: as above.
-            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store)) } == -1 {
+            if unsafe {
+                libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store))
+            } == -1
+            {
                 return Err(io::Error::last_os_error());
             }
         }
@@ -738,7 +803,10 @@ mod sys {
 
     #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     pub(super) fn reserve(_file: &File, _from: u64, _to: u64) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "reserving a file's disk is written for Linux and macOS only"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reserving a file's disk is written for Linux and macOS only",
+        ))
     }
 }
 
@@ -826,7 +894,12 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
         let _taken = lock(&TAKEN);
         for (at, site) in SITES.iter().enumerate() {
             if let Some(site) = site.get() {
-                mapping.site(at as u16 + 1, site.meta.name(), site.meta.target(), site.meta.level().as_str());
+                mapping.site(
+                    at as u16 + 1,
+                    site.meta.name(),
+                    site.meta.target(),
+                    site.meta.level().as_str(),
+                );
             }
         }
     }
@@ -918,7 +991,9 @@ pub fn dead(dir: &Path) -> Result<Vec<Found>, PostmortemError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(io_error(dir, "listing the history's directory for mappings")(error)),
+        Err(error) => {
+            return Err(io_error(dir, "listing the history's directory for mappings")(error));
+        }
     };
     // alloc: once a postmortem, a file a dead process
     let mut named = Vec::new();
@@ -1082,14 +1157,21 @@ impl Found {
             return Err(self.refuse("length", len, needed));
         }
         let text = |at: usize, len_at: usize, max: usize| -> Result<String, PostmortemError> {
-            let len = usize::try_from(h(len_at)).ok().filter(|it| *it <= max).ok_or_else(|| self.torn("the header's text"))?;
+            let len = usize::try_from(h(len_at))
+                .ok()
+                .filter(|it| *it <= max)
+                .ok_or_else(|| self.torn("the header's text"))?;
             let bytes = &header[at * 8..at * 8 + len];
             Ok(String::from_utf8_lossy(bytes).into_owned())
         };
         recovered.blaze = text(H_BLAZE, H_BLAZE_LEN, BLAZE_MAX)?;
         recovered.process = text(H_PROCESS, H_PROCESS_LEN, PROCESS_MAX)?;
         let clock_at = (h(H_CLOCK_AT) & 1) as usize;
-        let line = [h(H_CLOCK + clock_at * 3), h(H_CLOCK + clock_at * 3 + 1), h(H_CLOCK + clock_at * 3 + 2)];
+        let line = [
+            h(H_CLOCK + clock_at * 3),
+            h(H_CLOCK + clock_at * 3 + 1),
+            h(H_CLOCK + clock_at * 3 + 2),
+        ];
         if rings != 0 && line[2] == 0 {
             return Err(self.torn("the clock's base"));
         }
@@ -1102,13 +1184,19 @@ impl Found {
         recovered.builds = self.builds()?;
         let mut read = Read::default();
         for ring in 0..rings as usize {
-            let store = self.bytes(RINGS_AT + ring * STORE_BYTES, std::mem::size_of::<Store>(), "reading a ring's store of")?;
+            let store = self.bytes(
+                RINGS_AT + ring * STORE_BYTES,
+                std::mem::size_of::<Store>(),
+                "reading a ring's store of",
+            )?;
             let field = |offset: usize| word(&store, offset);
             let head = field(std::mem::offset_of!(Store, head));
             let flushed = field(std::mem::offset_of!(Store, flushed));
-            let number = u16::try_from(field(std::mem::offset_of!(Store, number))).map_err(|_| self.torn("a ring's number"))?;
+            let number = u16::try_from(field(std::mem::offset_of!(Store, number)))
+                .map_err(|_| self.torn("a ring's number"))?;
             let owners_at = std::mem::offset_of!(Store, owners);
-            let owners_len = usize::try_from(field(std::mem::offset_of!(Store, owners_len))).unwrap_or(usize::MAX);
+            let owners_len = usize::try_from(field(std::mem::offset_of!(Store, owners_len)))
+                .unwrap_or(usize::MAX);
             if owners_len > super::OWNERS_KEPT {
                 return Err(self.torn("a ring's owners"));
             }
@@ -1130,7 +1218,14 @@ impl Found {
                     recovered.unowned += 1;
                     continue;
                 };
-                decode(&mut read, (by.tid, by.name), super::event_id(number, i), &row, &scale, counting_copies);
+                decode(
+                    &mut read,
+                    (by.tid, by.name),
+                    super::event_id(number, i),
+                    &row,
+                    &scale,
+                    counting_copies,
+                );
             }
             // A span whose CPU waited on a boundary row the process died before writing reads
             // as not counted, as a live read's at the end of a ring.
@@ -1161,7 +1256,8 @@ impl Found {
             if head == 0 {
                 continue;
             }
-            let bytes = self.bytes(LOGS_AT + log * LOG_BYTES, LOG_BYTES, "reading a name log of")?;
+            let bytes =
+                self.bytes(LOGS_AT + log * LOG_BYTES, LOG_BYTES, "reading a name log of")?;
             let at = |offset: u64| (offset % LOG_BYTES as u64) as usize;
             let read = |from: u64, len: usize| -> Vec<u8> {
                 // alloc: a name, once a postmortem
@@ -1207,13 +1303,20 @@ impl Found {
                 sites.push(None);
                 continue;
             }
-            let (name_len, target_len) = ((record & 0xffff) as usize, (record >> 16 & 0xffff) as usize);
-            let level = LEVELS.get((record >> 48 & 0x7) as usize).copied().ok_or_else(|| self.torn("a callsite's level"))?;
+            let (name_len, target_len) =
+                ((record & 0xffff) as usize, (record >> 16 & 0xffff) as usize);
+            let level = LEVELS
+                .get((record >> 48 & 0x7) as usize)
+                .copied()
+                .ok_or_else(|| self.torn("a callsite's level"))?;
             if name_len + target_len > SITE_TEXT {
                 return Err(self.torn("a callsite's record"));
             }
             let name = String::from_utf8_lossy(&bytes[base + 8..base + 8 + name_len]).into_owned();
-            let target = String::from_utf8_lossy(&bytes[base + 8 + name_len..base + 8 + name_len + target_len]).into_owned();
+            let target = String::from_utf8_lossy(
+                &bytes[base + 8 + name_len..base + 8 + name_len + target_len],
+            )
+            .into_owned();
             sites.push(Some((name, target, level)));
         }
         Ok(sites)
@@ -1231,12 +1334,21 @@ impl Found {
                 continue;
             }
             let lens = word(&bytes, base + 24);
-            let (commit_len, workspace_len, command_len) =
-                ((lens & 0xff) as usize, (lens >> 16 & 0xffff) as usize, (lens >> 32 & 0xffff) as usize);
-            if commit_len > BUILD_COMMIT_MAX || workspace_len > BUILD_WORKSPACE_MAX || command_len > BUILD_COMMAND_MAX {
+            let (commit_len, workspace_len, command_len) = (
+                (lens & 0xff) as usize,
+                (lens >> 16 & 0xffff) as usize,
+                (lens >> 32 & 0xffff) as usize,
+            );
+            if commit_len > BUILD_COMMIT_MAX
+                || workspace_len > BUILD_WORKSPACE_MAX
+                || command_len > BUILD_COMMAND_MAX
+            {
                 return Err(self.torn("a running build's record"));
             }
-            let text = |from: usize, len: usize| String::from_utf8_lossy(&bytes[base + 32 + from..base + 32 + from + len]).into_owned();
+            let text = |from: usize, len: usize| {
+                String::from_utf8_lossy(&bytes[base + 32 + from..base + 32 + from + len])
+                    .into_owned()
+            };
             let unix = word(&bytes, base + 16) as i64;
             builds.push(DeadBuild {
                 build_id,
@@ -1295,10 +1407,11 @@ impl Found {
                 return new;
             }
             let new = match sites.get(usize::from(old) - 1).and_then(Option::as_ref) {
-                Some((name, target, level)) => super::foreign_site(name, target, level).unwrap_or_else(|| {
-                    sites_failed = true;
-                    0
-                }),
+                Some((name, target, level)) => super::foreign_site(name, target, level)
+                    .unwrap_or_else(|| {
+                        sites_failed = true;
+                        0
+                    }),
                 None => {
                     sites_lost += 1;
                     0
@@ -1342,7 +1455,11 @@ impl Found {
         recovered.sites_lost = sites_lost;
         if let Some(most) = failed {
             // alloc: an error
-            return Err(PostmortemError::Full { path: self.path.clone(), what: "names in one dead process's rows", most });
+            return Err(PostmortemError::Full {
+                path: self.path.clone(),
+                what: "names in one dead process's rows",
+                most,
+            });
         }
         if sites_failed {
             return Err(PostmortemError::Full {
@@ -1369,7 +1486,8 @@ mod tests {
     };
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-postmortem-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-postmortem-{name}-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1381,7 +1499,9 @@ mod tests {
 
     /// A span of build 7 at site `site`, ticks from `t0`.
     fn span_row(t0: u64, i: u64, site: u16, krate: Sym) -> [u64; WORDS] {
-        let what = KIND_SPAN << 62 | u64::from(site) << (62 - SITE_BITS) | 2 << (62 - SITE_BITS - DEPTH_BITS);
+        let what = KIND_SPAN << 62
+            | u64::from(site) << (62 - SITE_BITS)
+            | 2 << (62 - SITE_BITS - DEPTH_BITS);
         [t0 + i * 10 + 5, t0 + i * 10, 100 + i, 0, what, u64::from(krate) << 32, 7 << 32, 0]
     }
 
@@ -1402,31 +1522,34 @@ mod tests {
         mapping.log_name(SHARDS, worker, "worker 1");
         mapping.log_name(3, serde, "serde");
         mapping.site(9, "compile", "blaze::unit", "INFO");
-        mapping.build_started(&RunningBuild {
-            build_id: 7,
-            started_ns: 500,
-            started_unix_ns: Some(1_700_000_000_000_000_000),
-            commit: Some("abc123"),
-            workspace: "/w",
-            command: "build --release",
-        })
-        .unwrap();
-        mapping.build_started(&RunningBuild {
-            build_id: 6,
-            started_ns: 400,
-            started_unix_ns: None,
-            commit: None,
-            workspace: "/w",
-            command: "check",
-        })
-        .unwrap();
+        mapping
+            .build_started(&RunningBuild {
+                build_id: 7,
+                started_ns: 500,
+                started_unix_ns: Some(1_700_000_000_000_000_000),
+                commit: Some("abc123"),
+                workspace: "/w",
+                command: "build --release",
+            })
+            .unwrap();
+        mapping
+            .build_started(&RunningBuild {
+                build_id: 6,
+                started_ns: 400,
+                started_unix_ns: None,
+                commit: None,
+                workspace: "/w",
+                command: "check",
+            })
+            .unwrap();
         mapping.build_ended(6);
         let store = mapping.store(1).unwrap();
         let ring = Ring::with_store(1, store);
         store.mirror(&[Owner { from: 0, tid: 42, name: worker }]);
         let t0 = clock::ticks();
-        let rows: Vec<[u64; WORDS]> =
-            (0..40).map(|i| if i % 2 == 0 { span_row(t0, i, 9, serde) } else { plot_row(t0, i) }).collect();
+        let rows: Vec<[u64; WORDS]> = (0..40)
+            .map(|i| if i % 2 == 0 { span_row(t0, i, 9, serde) } else { plot_row(t0, i) })
+            .collect();
         for row in &rows {
             ring.put(*row);
         }
@@ -1449,7 +1572,14 @@ mod tests {
         );
         expected.ring_begins();
         for (i, row) in rows.iter().enumerate().skip(25) {
-            decode(&mut expected, (42, worker), super::super::event_id(1, i as u64), row, &line, false);
+            decode(
+                &mut expected,
+                (42, worker),
+                super::super::event_id(1, i as u64),
+                row,
+                &line,
+                false,
+            );
         }
         expected.ring_ends();
 
@@ -1457,15 +1587,25 @@ mod tests {
         assert_eq!(found.len(), 1, "the one file of a dead process");
         assert_eq!(found[0].pid(), DEAD);
         let recovered = found[0].read().unwrap();
-        assert_eq!((recovered.process.as_str(), recovered.blaze.as_str()), ("blaze serve", "c0ffee"));
+        assert_eq!(
+            (recovered.process.as_str(), recovered.blaze.as_str()),
+            ("blaze serve", "c0ffee")
+        );
         assert_eq!((recovered.unowned, recovered.names_lost, recovered.sites_lost), (0, 0, 0));
         assert_eq!(recovered.read.spans.len(), expected.spans.len());
-        assert_eq!(recovered.read.counters, expected.counters, "counters hold no name: equal as written");
+        assert_eq!(
+            recovered.read.counters, expected.counters,
+            "counters hold no name: equal as written"
+        );
         for (got, want) in recovered.read.spans.iter().zip(&expected.spans) {
-            assert_eq!(site_text(got.site).map(|it| (it.name, it.target, it.level)), Some(("compile", "blaze::unit", "INFO")));
+            assert_eq!(
+                site_text(got.site).map(|it| (it.name, it.target, it.level)),
+                Some(("compile", "blaze::unit", "INFO"))
+            );
             assert_eq!(name(got.thread_name).as_deref(), Some("worker 1"));
             assert_eq!(name(got.krate).as_deref(), Some("serde"));
-            let renamed = SpanRow { site: got.site, thread_name: got.thread_name, krate: got.krate, ..*want };
+            let renamed =
+                SpanRow { site: got.site, thread_name: got.thread_name, krate: got.krate, ..*want };
             assert_eq!(*got, renamed, "every other column as the process wrote it");
         }
         assert_eq!(
@@ -1480,7 +1620,12 @@ mod tests {
             }],
             "the build still running, not the one that ended"
         );
-        let last = expected.spans.iter().map(|it| it.start_ns + it.dur_ns).chain(expected.counters.iter().map(|it| it.t_ns)).max();
+        let last = expected
+            .spans
+            .iter()
+            .map(|it| it.start_ns + it.dur_ns)
+            .chain(expected.counters.iter().map(|it| it.t_ns))
+            .max();
         assert_eq!(Some(recovered.last_ns), last);
         let thread_name = recovered.read.spans[0].thread_name;
         drop(recovered);
@@ -1508,11 +1653,17 @@ mod tests {
         let refused = found[0].read().err().expect("refused");
         match &refused {
             PostmortemError::Refused { path: named, what, found, expected } => {
-                assert_eq!((named, *what, *found, *expected), (&path, "layout", LAYOUT + 1, LAYOUT));
+                assert_eq!(
+                    (named, *what, *found, *expected),
+                    (&path, "layout", LAYOUT + 1, LAYOUT)
+                );
             }
             other => panic!("refused as another layout, not {other:?}"),
         }
-        assert!(refused.to_string().contains(&path.display().to_string()), "the error names the file: {refused}");
+        assert!(
+            refused.to_string().contains(&path.display().to_string()),
+            "the error names the file: {refused}"
+        );
         drop(found);
         assert!(path.exists(), "a refused file stays");
         _ = fs::remove_dir_all(&dir);

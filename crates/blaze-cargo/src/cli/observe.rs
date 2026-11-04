@@ -39,7 +39,8 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE]";
-const EXPLAIN_USAGE: &str = "blaze explain RULE | PACKAGE [--json] | VIEW [NAME=VALUE ...] [--json]";
+const EXPLAIN_USAGE: &str =
+    "blaze explain RULE | PACKAGE [--json] | VIEW [NAME=VALUE ...] [--json]";
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
 
@@ -342,10 +343,15 @@ fn gate(words: Vec<OsString>) -> Result<(), Refusal> {
     let (mut build, mut dir, mut json, mut summary) = (None, None, false, None);
     let mut words = texts(words)?.into_iter();
     while let Some(word) = words.next() {
-        let mut next = |what: &str| words.next().ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes {what}")));
+        let mut next = |what: &str| {
+            words.next().ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes {what}")))
+        };
         match word.as_str() {
             "--build" => {
-                build = Some(next("a build id")?.parse::<u64>().map_err(|_| Refusal::Usage(format!("{USAGE}: `--build` takes a build id")))?);
+                build =
+                    Some(next("a build id")?.parse::<u64>().map_err(|_| {
+                        Refusal::Usage(format!("{USAGE}: `--build` takes a build id"))
+                    })?);
             }
             "--history" => dir = Some(PathBuf::from(next("a history's directory")?)),
             "--summary" => summary = Some(PathBuf::from(next("a Parquet file to write")?)),
@@ -362,16 +368,24 @@ fn gate(words: Vec<OsString>) -> Result<(), Refusal> {
         }
         None => history_source()?,
     };
-    let verdict = blaze_profile::gate::check(&duckdb, &dir, build).map_err(|error| error.to_string())?;
+    let verdict =
+        blaze_profile::gate::check(&duckdb, &dir, build).map_err(|error| error.to_string())?;
     let text = match json {
-        true => serde_json::to_string(&verdict).map_err(|error| format!("the gate's verdict as JSON: {error}"))? + "\n",
+        true => {
+            serde_json::to_string(&verdict)
+                .map_err(|error| format!("the gate's verdict as JSON: {error}"))?
+                + "\n"
+        }
         false => verdict.to_string(),
     };
     let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes()).and_then(|()| out.flush()).map_err(|error| Refusal::Failed(format!("stdout: {error}")))?;
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|error| Refusal::Failed(format!("stdout: {error}")))?;
     // After the verdict is printed, so a summary that fails to write never hides it.
     if let Some(out) = summary {
-        blaze_profile::gate::summary(&duckdb, &dir, verdict.build, &out).map_err(|error| error.to_string())?;
+        blaze_profile::gate::summary(&duckdb, &dir, verdict.build, &out)
+            .map_err(|error| error.to_string())?;
     }
     match verdict.passed() {
         true => Ok(()),
@@ -497,7 +511,9 @@ fn watch() -> Result<(), Refusal> {
     let mut tables: [Vec<RecordBatch>; 3] = Default::default();
     ask(Request::Live, Start::Never, |response| {
         let ResponseRef::Live(frame) = response else { return Ok(()) };
-        for ((decoder, bytes), batches) in decoders.iter_mut().zip([frame.spans, frame.counters, frame.open]).zip(&mut tables) {
+        for ((decoder, bytes), batches) in
+            decoders.iter_mut().zip([frame.spans, frame.counters, frame.open]).zip(&mut tables)
+        {
             decoder.decode(bytes, batches).map_err(|error| format!("the live feed: {error}"))?;
         }
         let [spans, counters, open] = &tables;
@@ -528,8 +544,12 @@ fn query(words: Vec<OsString>) -> Result<(), Refusal> {
     for word in texts(words)? {
         match word.as_str() {
             "--json" => shape = Shape::Json,
-            flag if flag.starts_with("--") => return Err(Refusal::Usage(format!("{DEBUG_USAGE}, not `{flag}`"))),
-            _ if sql.is_some() => return Err(Refusal::Usage(format!("{DEBUG_USAGE}: one query, quoted"))),
+            flag if flag.starts_with("--") => {
+                return Err(Refusal::Usage(format!("{DEBUG_USAGE}, not `{flag}`")));
+            }
+            _ if sql.is_some() => {
+                return Err(Refusal::Usage(format!("{DEBUG_USAGE}: one query, quoted")));
+            }
             _ => sql = Some(word),
         }
     }
@@ -704,7 +724,11 @@ pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
             Ok(())
         })
         .map_err(|error| format!("the daemon (pid {pid}) writes the profile history {}, and asking it to flush failed: {error}", dir.display()))?;
-        let seq = flushed.ok_or_else(|| format!("the daemon (pid {pid}) answered the ask to flush the profile history with no flush"))?;
+        let seq = flushed.ok_or_else(|| {
+            format!(
+                "the daemon (pid {pid}) answered the ask to flush the profile history with no flush"
+            )
+        })?;
         let manifest = history::manifest::read(&dir).map_err(|error| error.to_string())?;
         if manifest.flushed() < seq {
             return Err(Refusal::Failed(format!(

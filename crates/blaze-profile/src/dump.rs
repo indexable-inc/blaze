@@ -55,7 +55,12 @@ pub(crate) struct Sampled {
 
 /// The Chrome trace event format: complete events, with names for the processes and threads.
 /// Key `blaze` has the window's start and length, the samples folded and what the sampler was.
-pub(crate) fn chrome(out: &mut dyn std::io::Write, parts: &[Part], start: u64, end: u64) -> std::io::Result<()> {
+pub(crate) fn chrome(
+    out: &mut dyn std::io::Write,
+    parts: &[Part],
+    start: u64,
+    end: u64,
+) -> std::io::Result<()> {
     use serde_json::json;
     let mut first = true;
     let mut put = |out: &mut dyn std::io::Write, event: serde_json::Value| {

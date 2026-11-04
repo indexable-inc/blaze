@@ -122,7 +122,11 @@ Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 fn sent_client_rows(err: &mut impl Write, color: bool) {
     let said = match client_rows::send() {
         Ok(None) => return,
-        Ok(Some(path)) => format!("{}: the build's trace (ui.perfetto.dev): {}\n", client_rows::PROFILE, path.display()),
+        Ok(Some(path)) => format!(
+            "{}: the build's trace (ui.perfetto.dev): {}\n",
+            client_rows::PROFILE,
+            path.display()
+        ),
         Err(why) => say::warning(&why, color),
     };
     _ = err.write_all(said.as_bytes());

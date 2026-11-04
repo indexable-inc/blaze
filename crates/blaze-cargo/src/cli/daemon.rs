@@ -1279,7 +1279,13 @@ mod refusals {
         let log = PathBuf::from("/b/v2/serve.log");
         let (pid, said) = last_start(OVERFLOWED).unwrap();
         let said: Vec<String> = said.into_iter().map(str::to_owned).collect();
-        let died = Died { log: log.clone(), ended: Some((pid, Ended::Reaped(Reaped::Signal(libc::SIGABRT)))), said, inside: Ok(None), crash: Ok(None) };
+        let died = Died {
+            log: log.clone(),
+            ended: Some((pid, Ended::Reaped(Reaped::Signal(libc::SIGABRT)))),
+            said,
+            inside: Ok(None),
+            crash: Ok(None),
+        };
         let text = died.to_string();
         assert!(
             text.starts_with(&format!(
@@ -1307,11 +1313,39 @@ mod refusals {
                 }],
             }],
         };
-        let killed = Died { log: log.clone(), ended: Some((7, Ended::Gone)), said: Vec::new(), inside: Ok(Some(inside)), crash: Ok(None) }.to_string();
-        assert!(killed.contains("\n  blaze-work-3 (tid 9): wait, awaiting the macro server, run by task 12 (3.0 s)"), "{killed}");
-        assert!(killed.starts_with("the daemon (`blaze serve`, pid 7) is gone; its log /b/v2/serve.log says nothing"), "{killed}");
+        let killed = Died {
+            log: log.clone(),
+            ended: Some((7, Ended::Gone)),
+            said: Vec::new(),
+            inside: Ok(Some(inside)),
+            crash: Ok(None),
+        }
+        .to_string();
+        assert!(
+            killed.contains(
+                "\n  blaze-work-3 (tid 9): wait, awaiting the macro server, run by task 12 (3.0 s)"
+            ),
+            "{killed}"
+        );
+        assert!(
+            killed.starts_with(
+                "the daemon (`blaze serve`, pid 7) is gone; its log /b/v2/serve.log says nothing"
+            ),
+            "{killed}"
+        );
         assert!(killed.contains("SIGKILL"), "{killed}");
-        let running = Died { log, ended: Some((7, Ended::Running)), said: Vec::new(), inside: Ok(None), crash: Ok(None) }.to_string();
-        assert!(running.contains("still runs: it hung up on this request alone") && !running.contains("SIGKILL"), "{running}");
+        let running = Died {
+            log,
+            ended: Some((7, Ended::Running)),
+            said: Vec::new(),
+            inside: Ok(None),
+            crash: Ok(None),
+        }
+        .to_string();
+        assert!(
+            running.contains("still runs: it hung up on this request alone")
+                && !running.contains("SIGKILL"),
+            "{running}"
+        );
     }
 }

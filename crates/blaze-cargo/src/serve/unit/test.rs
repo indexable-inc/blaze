@@ -655,7 +655,11 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
 /// The history's row of a test the queue finished, `suite`'s: none for one not run. Its build
 /// id is its job's, given as the job ends ([`crate::serve::work::RunPuts::test_runs`]). A binary
 /// run whole is one row, named as its binary.
-fn test_run_row(job: &Job, suite: &Suited, done: &Finished) -> Option<blaze_profile::facts::TestRunRow> {
+fn test_run_row(
+    job: &Job,
+    suite: &Suited,
+    done: &Finished,
+) -> Option<blaze_profile::facts::TestRunRow> {
     use blaze_profile::facts::TestOutcome as Ran;
     use blaze_usercode::test::Failure;
     let outcome = match &done.outcome {
@@ -665,7 +669,8 @@ fn test_run_row(job: &Job, suite: &Suited, done: &Finished) -> Option<blaze_prof
         Outcome::Failed(Failure::Signal(_) | Failure::Lost(_)) => Ran::Crashed,
         Outcome::NotRun => return None,
     };
-    let krate = job.unit(suite.unit).ok().and_then(|unit| job.package(unit).ok()).map(|it| it.name.clone()); // clone: the package's name, once per test
+    let krate =
+        job.unit(suite.unit).ok().and_then(|unit| job.package(unit).ok()).map(|it| it.name.clone()); // clone: the package's name, once per test
     Some(blaze_profile::facts::TestRunRow {
         build_id: 0,
         test: done.test.clone().unwrap_or_else(|| suite.name.clone()), // clone: the history's copy, once per test

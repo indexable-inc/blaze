@@ -50,7 +50,8 @@ pub fn send() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let request = rows(build)?;
-    observe::ask(request, Start::Never, |_| Ok(())).map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
+    observe::ask(request, Start::Never, |_| Ok(()))
+        .map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
     let Some(dir) = std::env::var_os(PROFILE).filter(|it| !it.is_empty()) else { return Ok(None) };
     export(build, Path::new(&dir)).map(Some)
 }
@@ -60,7 +61,8 @@ pub fn send() -> Result<Option<PathBuf>, String> {
 fn rows(build: u64) -> Result<Request, String> {
     let ended_ns = clock::mono_ns();
     let started_ns = clock::Scale::now().mono(clock::origin().0);
-    let tagged = u32::try_from(build).map_err(|_| format!("build {build} is past the recorder's 32-bit build ids"))?;
+    let tagged = u32::try_from(build)
+        .map_err(|_| format!("build {build} is past the recorder's 32-bit build ids"))?;
     let mut read = Read::default();
     flight::read(&mut Cursor::default(), &mut read);
     read.spans.iter_mut().for_each(|it| it.build = tagged);
@@ -78,12 +80,18 @@ fn rows(build: u64) -> Result<Request, String> {
 }
 
 /// `batch`, build `build`'s client rows of `table`, as an Arrow IPC stream: none for no rows.
-fn encoded<E: std::fmt::Display>(build: u64, table: &str, batch: Result<arrow_array::RecordBatch, E>) -> Result<Vec<u8>, String> {
-    let batch = batch.map_err(|error| format!("making build {build}'s client {table} rows: {error}"))?;
+fn encoded<E: std::fmt::Display>(
+    build: u64,
+    table: &str,
+    batch: Result<arrow_array::RecordBatch, E>,
+) -> Result<Vec<u8>, String> {
+    let batch =
+        batch.map_err(|error| format!("making build {build}'s client {table} rows: {error}"))?;
     // alloc: the request's bytes, once a client
     let mut bytes = Vec::new();
     if batch.num_rows() > 0 {
-        live::encode(&batch, &mut bytes).map_err(|error| format!("encoding build {build}'s client {table} rows: {error}"))?;
+        live::encode(&batch, &mut bytes)
+            .map_err(|error| format!("encoding build {build}'s client {table} rows: {error}"))?;
     }
     Ok(bytes)
 }
@@ -93,9 +101,12 @@ fn encoded<E: std::fmt::Display>(build: u64, table: &str, batch: Result<arrow_ar
 fn export(build: u64, dir: &Path) -> Result<PathBuf, String> {
     let (duckdb, history) = observe::history_paths().map_err(|why| format!("{PROFILE}: {why}"))?;
     let source = load::Source { duckdb: &duckdb, history: &history };
-    let trace = load::trace_of(&source, build).map_err(|error| format!("{PROFILE}: build {build}'s trace: {error}"))?;
-    std::fs::create_dir_all(dir).map_err(|error| format!("{PROFILE}: making {}: {error}", dir.display()))?;
+    let trace = load::trace_of(&source, build)
+        .map_err(|error| format!("{PROFILE}: build {build}'s trace: {error}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("{PROFILE}: making {}: {error}", dir.display()))?;
     let path = dir.join("trace.json");
-    std::fs::write(&path, trace).map_err(|error| format!("{PROFILE}: writing {}: {error}", path.display()))?;
+    std::fs::write(&path, trace)
+        .map_err(|error| format!("{PROFILE}: writing {}: {error}", path.display()))?;
     Ok(path)
 }

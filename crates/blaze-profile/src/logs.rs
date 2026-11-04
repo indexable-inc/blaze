@@ -46,7 +46,8 @@ pub fn keeps_event_named(target: &str, name: &str, level: &str) -> bool {
 /// (`target: "blaze::store"`), written to opt in. A module path's own target (`blaze_fmt::...`)
 /// is not: a `blaze*` crate's `debug!` calls in hot paths cost no ring row unless they ask.
 pub fn blaze_debug(target: &str) -> bool {
-    target == crate::TARGET || target.strip_prefix(crate::TARGET).is_some_and(|rest| rest.starts_with("::"))
+    target == crate::TARGET
+        || target.strip_prefix(crate::TARGET).is_some_and(|rest| rest.starts_with("::"))
 }
 
 /// The variable that says what the history writes of DEBUG events ([`Policy`]).
@@ -80,7 +81,9 @@ impl Policy {
             Ok(value) => Policy::parse(Some(&value)),
             Err(std::env::VarError::NotPresent) => Ok(Policy::Info),
             // alloc: an error
-            Err(std::env::VarError::NotUnicode(value)) => Err(PolicyError { value: value.to_string_lossy().into_owned() }),
+            Err(std::env::VarError::NotUnicode(value)) => {
+                Err(PolicyError { value: value.to_string_lossy().into_owned() })
+            }
         }
     }
 }
@@ -187,8 +190,12 @@ impl Hold {
             return;
         }
         // alloc: once a sort that reads an error, at most a build an error
-        let errors: Vec<u32> =
-            read.events.iter().filter(|it| it.build != 0 && level(it.site) == Some(tracing::Level::ERROR)).map(|it| it.build).collect();
+        let errors: Vec<u32> = read
+            .events
+            .iter()
+            .filter(|it| it.build != 0 && level(it.site) == Some(tracing::Level::ERROR))
+            .map(|it| it.build)
+            .collect();
         for build in errors {
             self.trouble(build);
         }
@@ -332,7 +339,8 @@ impl Value {
         match self {
             Value::I64(it) => (*it).into(),
             Value::U64(it) => (*it).into(),
-            Value::F64(it) => serde_json::Number::from_f64(*it).map_or(serde_json::Value::Null, serde_json::Value::Number),
+            Value::F64(it) => serde_json::Number::from_f64(*it)
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
             Value::Bool(it) => (*it).into(),
             // clone: a field's text, once a field a trace
             Value::Str(it) => it.clone().map_or(serde_json::Value::Null, serde_json::Value::String),
@@ -390,7 +398,9 @@ pub fn fields_text(fields: &[(String, Value)]) -> String {
 mod tests {
     use std::time::Duration;
 
-    use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{
+        Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    };
 
     use super::*;
     use crate::{batches, flight};
@@ -399,7 +409,8 @@ mod tests {
     fn mine(tid: u32) -> Read {
         let mut read = Read::default();
         flight::window(Duration::from_secs(60), &mut read);
-        let ids: BTreeSet<u64> = read.events.iter().filter(|it| it.thread == tid).map(|it| it.event_id).collect();
+        let ids: BTreeSet<u64> =
+            read.events.iter().filter(|it| it.thread == tid).map(|it| it.event_id).collect();
         read.events.retain(|it| ids.contains(&it.event_id));
         read.fields.retain(|it| ids.contains(&it.event_id));
         read
@@ -426,10 +437,15 @@ mod tests {
         .join()
         .expect("the test's thread");
         let [event] = read.events.as_slice() else { panic!("one event: {:?}", read.events) };
-        assert_eq!(flight::name(event.message).as_deref(), Some("typed fields"), "the message alone");
+        assert_eq!(
+            flight::name(event.message).as_deref(),
+            Some("typed fields"),
+            "the message alone"
+        );
         assert_eq!(read.fields.len(), 6, "a row a field other than the message: {:?}", read.fields);
         assert!(read.fields.iter().all(|it| it.event_id == event.event_id && it.build == 0x7a11));
-        let batch = batches::event_fields(&read.fields, batches::Process::this()).expect("a batch of event_fields");
+        let batch = batches::event_fields(&read.fields, batches::Process::this())
+            .expect("a batch of event_fields");
         let keys = strings(batch.column_by_name("key").expect("key").as_ref());
         assert_eq!(keys, ["n", "count", "ratio", "ok", "label", "shown"]);
         let kinds = strings(batch.column_by_name("kind").expect("kind").as_ref());
@@ -446,7 +462,8 @@ mod tests {
         assert_eq!((texts.value(4), texts.value(5), texts.null_count()), ("x", "[1, 2]", 4));
         let ordinals: Vec<u16> = read.fields.iter().map(|it| it.ordinal).collect();
         assert_eq!(ordinals, [0, 1, 2, 3, 4, 5]);
-        let events = batches::events(&read.events, batches::Process::this()).expect("a batch of events");
+        let events =
+            batches::events(&read.events, batches::Process::this()).expect("a batch of events");
         let ids = column::<UInt64Array>(&events, "event_id");
         assert_eq!(ids.value(0), event.event_id, "events and event_fields name the event alike");
     }
@@ -458,7 +475,10 @@ mod tests {
             .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
             .expect("a dictionary column");
         let values = dict.values().as_any().downcast_ref::<StringArray>().expect("of strings");
-        dict.keys().iter().map(|key| values.value(key.expect("a key") as usize).to_owned()).collect()
+        dict.keys()
+            .iter()
+            .map(|key| values.value(key.expect("a key") as usize).to_owned())
+            .collect()
     }
 
     #[test]
@@ -477,21 +497,40 @@ mod tests {
         })
         .join()
         .expect("the test's thread");
-        assert_eq!(read.events.len(), 4, "the opted-in debug and the info events of each build: {:?}", read.events);
+        assert_eq!(
+            read.events.len(),
+            4,
+            "the opted-in debug and the info events of each build: {:?}",
+            read.events
+        );
         let mut hold = Hold::new(Policy::Info);
         hold.sort(&mut read);
-        let builds = |read: &Read| read.events.iter().map(|it| (it.build, level(it.site))).collect::<Vec<_>>();
-        assert_eq!(builds(&read), [(ok, Some(tracing::Level::INFO)), (failed, Some(tracing::Level::INFO))], "debug rows held");
+        let builds = |read: &Read| {
+            read.events.iter().map(|it| (it.build, level(it.site))).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            builds(&read),
+            [(ok, Some(tracing::Level::INFO)), (failed, Some(tracing::Level::INFO))],
+            "debug rows held"
+        );
         assert_eq!(read.fields.len(), 2, "the info events' fields");
         assert_eq!(hold.held(), 4, "two debug events and their fields");
         hold.ended(ok, false);
         hold.ended(failed, true);
         let mut next = Read::default();
         hold.sort(&mut next);
-        assert_eq!(builds(&next), [(failed, Some(tracing::Level::DEBUG))], "the failed build's debug row alone");
+        assert_eq!(
+            builds(&next),
+            [(failed, Some(tracing::Level::DEBUG))],
+            "the failed build's debug row alone"
+        );
         let [field] = next.fields.as_slice() else { panic!("its field: {:?}", next.fields) };
         assert_eq!((field.event_id, field.value), (next.events[0].event_id, FieldValue::U64(1)));
-        assert_eq!((hold.held(), hold.dropped()), (0, 2), "the ok build's debug row and its field dropped");
+        assert_eq!(
+            (hold.held(), hold.dropped()),
+            (0, 2),
+            "the ok build's debug row and its field dropped"
+        );
         let mut again = Read::default();
         hold.sort(&mut again);
         assert_eq!(again.rows(), 0, "a sort writes what it released once");

@@ -233,12 +233,22 @@ pub enum ViewError {
     },
     /// `$<name>` in the view's SQL, or `@<name>` in the prelude, that names no argument or
     /// table: a bug in the SQL files.
-    Undeclared { view: &'static str, name: String },
+    Undeclared {
+        view: &'static str,
+        name: String,
+    },
     /// A directory a file's path can't be said in of.
-    BadPath { path: String, why: &'static str },
+    BadPath {
+        path: String,
+        why: &'static str,
+    },
     /// A file the manifest lists whose schema's version this blaze can't read as its own
     /// ([`schema::readable`]).
-    Version { file: String, version: u32, why: &'static str },
+    Version {
+        file: String,
+        version: u32,
+        why: &'static str,
+    },
 }
 
 impl ViewError {
@@ -246,8 +256,12 @@ impl ViewError {
     pub fn kind(&self) -> &'static str {
         match self {
             ViewError::NoSuchView { .. } => "no_such_view",
-            ViewError::UnknownArg { .. } | ViewError::MissingArg { .. } | ViewError::BadArg { .. } => "bad_args",
-            ViewError::Undeclared { .. } | ViewError::BadPath { .. } | ViewError::Version { .. } => "sql",
+            ViewError::UnknownArg { .. }
+            | ViewError::MissingArg { .. }
+            | ViewError::BadArg { .. } => "bad_args",
+            ViewError::Undeclared { .. }
+            | ViewError::BadPath { .. }
+            | ViewError::Version { .. } => "sql",
         }
     }
 }
@@ -291,7 +305,11 @@ impl fmt::Display for ViewError {
             }
             ViewError::BadPath { path, why } => write!(f, "the directory {path} {why}"),
             ViewError::Version { file, version, why } => {
-                write!(f, "the history's file {file} is of schema version {version}, and this blaze's is {}: {why}", schema::VERSION)
+                write!(
+                    f,
+                    "the history's file {file} is of schema version {version}, and this blaze's is {}: {why}",
+                    schema::VERSION
+                )
             }
         }
     }
@@ -438,7 +456,10 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
     if path.contains(['*', '?', '[', ']', '{', '}']) {
         // DuckDB expands these in a path to `read_parquet` even with no glob meant.
         // alloc: an error, once a request
-        return Err(ViewError::BadPath { path: path.to_owned(), why: "has a character DuckDB's globs expand" });
+        return Err(ViewError::BadPath {
+            path: path.to_owned(),
+            why: "has a character DuckDB's globs expand",
+        });
     }
     let dir = path.trim_end_matches('/');
     // alloc: the prelude, once a query
@@ -650,7 +671,12 @@ mod tests {
         let mut manifest = Manifest::new();
         manifest.insert("1-00000001.spans.parquet", entry(Some([1, 1]), Some([100, 200]))).unwrap();
         // 20 s on: past build 1's window, its end and a flush.
-        manifest.insert("2-00000002.spans.parquet", entry(Some([2, 2]), Some([20_000_000_000, 21_000_000_000]))).unwrap();
+        manifest
+            .insert(
+                "2-00000002.spans.parquet",
+                entry(Some([2, 2]), Some([20_000_000_000, 21_000_000_000])),
+            )
+            .unwrap();
         // No build's rows, in build 1's window: a build-1 reader reads it.
         manifest.insert("0-00000003.samples.parquet", entry(None, Some([150, 160]))).unwrap();
         let sql = prelude(Path::new("/state/it's profile/"), &manifest, Scope::All).unwrap();
@@ -664,13 +690,19 @@ mod tests {
         assert!(one.contains("read_parquet(['/p/schema.spans.parquet', '/p/1-00000001.spans.parquet'], union_by_name = true)"), "{one}");
         assert!(one.contains("read_parquet(['/p/schema.samples.parquet', '/p/0-00000003.samples.parquet'], union_by_name = true)"));
         let two = prelude(Path::new("/p"), &manifest, Scope::Build(2)).unwrap();
-        assert!(two.contains("read_parquet(['/p/schema.samples.parquet'], union_by_name = true)"), "outside build 2's window");
+        assert!(
+            two.contains("read_parquet(['/p/schema.samples.parquet'], union_by_name = true)"),
+            "outside build 2's window"
+        );
         let error = prelude(Path::new("/tmp/a*b"), &manifest, Scope::All).unwrap_err();
         assert!(matches!(error, ViewError::BadPath { .. }), "{error:?}");
         let mut old = Manifest::new();
         old.insert("1-00000001.spans.parquet", Entry { version: 1, ..entry(None, None) }).unwrap();
         let error = prelude(Path::new("/p"), &old, Scope::All).unwrap_err();
-        assert!(matches!(&error, ViewError::Version { file, version: 1, .. } if file == "/p/1-00000001.spans.parquet"), "{error:?}");
+        assert!(
+            matches!(&error, ViewError::Version { file, version: 1, .. } if file == "/p/1-00000001.spans.parquet"),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -684,12 +716,65 @@ mod tests {
 
     /// DuckDB's words the SQL files use: keywords, types and named parameters.
     const KEYWORDS: &[&str] = &[
-        "all", "and", "any", "as", "asc", "asof", "between", "by", "case", "cast", "create", "desc",
-        "distinct", "double", "else", "end", "exists", "filter", "first", "from", "group",
-        "having", "in", "is", "join", "last", "left", "like", "limit", "not", "null", "nulls",
-        "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
-        "then", "union", "union_by_name", "using", "view", "when", "where", "with", "true",
-        "false", "rows", "unbounded", "preceding", "bigint", "cross", "ubigint", "varchar", "full",
+        "all",
+        "and",
+        "any",
+        "as",
+        "asc",
+        "asof",
+        "between",
+        "by",
+        "case",
+        "cast",
+        "create",
+        "desc",
+        "distinct",
+        "double",
+        "else",
+        "end",
+        "exists",
+        "filter",
+        "first",
+        "from",
+        "group",
+        "having",
+        "in",
+        "is",
+        "join",
+        "last",
+        "left",
+        "like",
+        "limit",
+        "not",
+        "null",
+        "nulls",
+        "on",
+        "or",
+        "order",
+        "over",
+        "partition",
+        "qualify",
+        "recursive",
+        "replace",
+        "select",
+        "then",
+        "union",
+        "union_by_name",
+        "using",
+        "view",
+        "when",
+        "where",
+        "with",
+        "true",
+        "false",
+        "rows",
+        "unbounded",
+        "preceding",
+        "bigint",
+        "cross",
+        "ubigint",
+        "varchar",
+        "full",
         "hugeint",
     ];
     /// DuckDB's functions the SQL files call.

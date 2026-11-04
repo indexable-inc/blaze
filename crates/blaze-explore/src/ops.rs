@@ -2,12 +2,7 @@
 //! header and at most one table. Everything here may wait (DuckDB runs as a process, Flecs
 //! answers on its own thread), so the server calls it on tokio's blocking pool.
 
-use std::{
-    fmt,
-    path::PathBuf,
-    sync::Arc,
-    time::Instant,
-};
+use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -188,7 +183,13 @@ fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, Wi
         return Err(WireError::new(Kind::Sql, message).with("query", sql));
     };
     (cx.history.flush.0)().map_err(|why| {
-        WireError::new(Kind::Flush, format!("the history was not flushed before the query, so it would miss recent rows: {why}")).with("query", sql)
+        WireError::new(
+            Kind::Flush,
+            format!(
+                "the history was not flushed before the query, so it would miss recent rows: {why}"
+            ),
+        )
+        .with("query", sql)
     })?;
     let query = sql::Query { duckdb, history: &cx.history.dir, scope: sql::Scope::All, sql };
     sql::run_with(&query, stop).map_err(|error| {
@@ -318,7 +319,14 @@ mod tests {
     }
 
     fn cx() -> Context {
-        Context { history: History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: Flush::new(|| Ok(0)) }, world: None }
+        Context {
+            history: History {
+                duckdb: None,
+                dir: PathBuf::from("/nowhere"),
+                flush: Flush::new(|| Ok(0)),
+            },
+            world: None,
+        }
     }
 
     #[test]

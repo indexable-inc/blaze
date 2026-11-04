@@ -66,7 +66,8 @@ pub fn name(pc: u64) -> Option<String> {
     let map = &maps[at].0;
     let offset = pc.checked_sub(map.start).filter(|it| *it < map.len)?;
     let i = map.functions.partition_point(|it| it.offset <= offset).checked_sub(1);
-    let function = i.map(|i| &map.functions[i]).filter(|it| offset < it.offset.saturating_add(it.len));
+    let function =
+        i.map(|i| &map.functions[i]).filter(|it| offset < it.offset.saturating_add(it.len));
     // alloc: a frame's name, once an address a flush
     Some(match function {
         Some(Function { name: Some(name), .. }) => format!("{name} [wasm]"),
@@ -101,7 +102,10 @@ mod tests {
         );
         assert_eq!(name(start + 0x110).as_deref(), Some("m::expand [wasm]"));
         assert_eq!(name(start + 0x10).as_deref(), Some("wasm function 1 of wasm module m"));
-        assert_eq!(name(start + 0x50).as_deref(), Some("code of wasm module m outside its functions"));
+        assert_eq!(
+            name(start + 0x50).as_deref(),
+            Some("code of wasm module m outside its functions")
+        );
         assert_eq!(name(start + 0x300), None);
         assert_eq!(name(start - 1), None);
     }

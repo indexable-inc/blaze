@@ -37,7 +37,11 @@ const MOST: usize = 256;
 /// (masked to [`ADDRESS`]) until `push` says stop, `read` gives no record at an address (its
 /// two words: the caller's frame pointer, the return address), a record is misaligned, the
 /// next record is not above this one, or [`MOST`] records were read.
-pub(crate) fn walk(fp: u64, read: &mut dyn FnMut(u64) -> Option<[u64; 2]>, push: &mut dyn FnMut(u64) -> bool) {
+pub(crate) fn walk(
+    fp: u64,
+    read: &mut dyn FnMut(u64) -> Option<[u64; 2]>,
+    push: &mut dyn FnMut(u64) -> bool,
+) {
     let mut fp = fp & ADDRESS;
     for _ in 0..MOST {
         if fp == 0 || fp % ALIGN != 0 {
@@ -80,14 +84,18 @@ pub(crate) fn frame_pointer() -> u64 {
     {
         let fp: u64;
         // SAFETY: reads a register; no memory, no stack, no flags.
-        unsafe { std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        unsafe {
+            std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
+        };
         fp
     }
     #[cfg(target_arch = "x86_64")]
     {
         let fp: u64;
         // SAFETY: as above.
-        unsafe { std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags)) };
+        unsafe {
+            std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags))
+        };
         fp
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -199,10 +207,9 @@ mod tests {
         let (depth, pcs) = a_caller_to_find();
         assert!(depth >= 2, "{depth} frames");
         let frames = crate::symbols::frames(std::iter::once(&pcs[..depth]));
-        let found = pcs[..depth]
-            .iter()
-            .enumerate()
-            .any(|(i, pc)| frames[&crate::symbols::lookup(i, *pc)].iter().any(|it| it.contains("a_caller_to_find")));
+        let found = pcs[..depth].iter().enumerate().any(|(i, pc)| {
+            frames[&crate::symbols::lookup(i, *pc)].iter().any(|it| it.contains("a_caller_to_find"))
+        });
         assert!(found, "{frames:?}");
     }
 

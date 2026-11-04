@@ -49,7 +49,10 @@ pub enum ReadingError {
         error: arrow_schema::ArrowError,
     },
     /// A column of an `open` file is missing or of another type.
-    Column { path: PathBuf, column: &'static str },
+    Column {
+        path: PathBuf,
+        column: &'static str,
+    },
     /// The history could not be pinned and its manifest read ([`Pin`]).
     History(HistoryError),
 }
@@ -76,7 +79,9 @@ impl fmt::Display for ReadingError {
             ReadingError::Pin(error) => {
                 write!(f, "pinning the history to read its last open spans: {error}")
             }
-            ReadingError::History(error) => write!(f, "pinning the history to read its last open spans: {error}"),
+            ReadingError::History(error) => {
+                write!(f, "pinning the history to read its last open spans: {error}")
+            }
         }
     }
 }

@@ -103,7 +103,9 @@ pub enum ResponseRef<'a> {
         trace: &'a [u8],
     },
     Live(#[serde(borrow)] LiveFrameRef<'a>),
-    Flushed { seq: u64 },
+    Flushed {
+        seq: u64,
+    },
     Hot(Hot),
     Collected {
         report: &'a str,

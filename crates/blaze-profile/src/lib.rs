@@ -47,8 +47,8 @@ pub mod sampler;
 pub mod schema;
 pub mod slow;
 pub mod span;
-mod stack;
 pub mod sql;
+mod stack;
 mod symbols;
 pub mod time;
 pub mod views;
@@ -403,7 +403,6 @@ pub(crate) fn command() -> String {
     }
     line
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -203,7 +203,11 @@ pub struct SiteText {
 #[inline]
 pub fn site_text(site: u16) -> Option<SiteText> {
     match usize::from(site).checked_sub(FOREIGN_FROM) {
-        None => meta(site).map(|it| SiteText { name: it.name(), target: it.target(), level: it.level().as_str() }),
+        None => meta(site).map(|it| SiteText {
+            name: it.name(),
+            target: it.target(),
+            level: it.level().as_str(),
+        }),
         Some(at) => FOREIGN.get(at)?.get().copied(),
     }
 }
@@ -220,7 +224,8 @@ const _: () = assert!(FOREIGN_FROM + FOREIGN_MAX <= u16::MAX as usize, "a foreig
 static FOREIGN: [OnceLock<SiteText>; FOREIGN_MAX] = [const { OnceLock::new() }; FOREIGN_MAX];
 /// The [`FOREIGN`] slots of each hash of a text ([`foreign_key`]), and how many are taken.
 // alloc: none until a postmortem names a site; grows to the distinct sites of dead processes
-static FOREIGN_BY_TEXT: Mutex<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> = Mutex::new((0, None));
+static FOREIGN_BY_TEXT: Mutex<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> =
+    Mutex::new((0, None));
 
 fn foreign_key(name: &str, target: &str, level: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -244,7 +249,8 @@ pub(crate) fn foreign_site(name: &str, target: &str, level: &str) -> Option<u16>
     let (taken, by_text) = &mut *guard;
     let bucket = by_text.get_or_insert_with(|| HashMap::new_in(Global)).entry(key).or_default();
     let same = |site: &u16| {
-        site_text(*site).is_some_and(|it| it.name == name && it.target == target && it.level == level)
+        site_text(*site)
+            .is_some_and(|it| it.name == name && it.target == target && it.level == level)
     };
     if let Some(&site) = bucket.iter().find(|it| same(it)) {
         return Some(site);
@@ -1190,7 +1196,8 @@ pub(crate) struct Logged {
 }
 
 impl Logged {
-    const EMPTY: Logged = Logged { message: 0, fields: [(0, FieldValue::Bool(false)); EVENT_FIELDS], len: 0 };
+    const EMPTY: Logged =
+        Logged { message: 0, fields: [(0, FieldValue::Bool(false)); EVENT_FIELDS], len: 0 };
 
     /// Its fields other than its message, in the order it recorded them: each one's index in
     /// its callsite's fields and its value.
@@ -1304,14 +1311,16 @@ pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
     };
     let now = clock::ticks();
     let what = KIND_PLOT << 62 | u64::from(site) << 8 | EVENT_ROW;
-    let index = ring.put([now, running.job, span, 0, what, u64::from(logged.message), u64::from(build), 0]);
+    let index =
+        ring.put([now, running.job, span, 0, what, u64::from(logged.message), u64::from(build), 0]);
     let id = event_id(ring.number, index);
     for chunk in logged.fields().chunks(COL_WORDS.len()) {
         let mut row = [now, 0, 0, id, 0, 0, 0, 0];
         let mut slots = 0;
         for (place, &(index, value)) in chunk.iter().enumerate() {
             row[COL_WORDS[place]] = value.word();
-            slots |= (u64::from(index) << 3 | value.kind()) << (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32);
+            slots |= (u64::from(index) << 3 | value.kind())
+                << (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32);
         }
         row[4] = KIND_PLOT << 62 | slots | EVENT_FIELDS_ROW;
         ring.put(row);
@@ -1544,14 +1553,17 @@ fn boundary_in(ring: &Ring, why: CpuWhy, folds: Option<&mut Folds>) {
     let cpu = read();
     let after = clock::ticks();
     let at = before.wrapping_add(after.wrapping_sub(before) / 2);
-    let (from_ticks, from_cpu) = (ring.stretch_ticks.load(Ordering::Relaxed), ring.stretch_cpu.load(Ordering::Relaxed));
+    let (from_ticks, from_cpu) =
+        (ring.stretch_ticks.load(Ordering::Relaxed), ring.stretch_cpu.load(Ordering::Relaxed));
     let rate = match cpu {
-        Some(cpu) if from_cpu != NO_CPU => {
-            Rate::between(Reading { ticks: from_ticks, cpu_ns: from_cpu }, Reading { ticks: at, cpu_ns: cpu })
-        }
+        Some(cpu) if from_cpu != NO_CPU => Rate::between(
+            Reading { ticks: from_ticks, cpu_ns: from_cpu },
+            Reading { ticks: at, cpu_ns: cpu },
+        ),
         _ => None,
     };
-    let valid = if rate.is_some() { CPU_VALID } else { 0 } | if cpu.is_some() { CPU_READ } else { 0 };
+    let valid =
+        if rate.is_some() { CPU_VALID } else { 0 } | if cpu.is_some() { CPU_READ } else { 0 };
     let build = u64::from(BUILD.try_with(Cell::get).unwrap_or(0));
     let what = KIND_PLOT << 62 | valid | (why as u64) << 8 | CPU_ROW;
     ring.put([at, cpu.unwrap_or(0), from_ticks, from_cpu, what, 0, build, 0]);
@@ -1575,7 +1587,10 @@ fn boundary_in(ring: &Ring, why: CpuWhy, folds: Option<&mut Folds>) {
     // The read is the recorder's time, no span's.
     let end = clock::ticks();
     counted_from(ring, end);
-    ring.cost.store(ring.cost.load(Ordering::Relaxed).saturating_add(end.wrapping_sub(before)), Ordering::Relaxed);
+    ring.cost.store(
+        ring.cost.load(Ordering::Relaxed).saturating_add(end.wrapping_sub(before)),
+        Ordering::Relaxed,
+    );
     ring.cpu_reads.store(ring.cpu_reads.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
 }
 
@@ -1589,7 +1604,8 @@ fn cpu_leave(ring: &Ring) {
     }
     let now = clock::ticks();
     let rate_ticks = ring.rate_ticks.load(Ordering::Relaxed);
-    let fresh = now.wrapping_sub(ring.stretch_ticks.load(Ordering::Relaxed)) < CPU_SLIVER_TICKS.load(Ordering::Relaxed);
+    let fresh = now.wrapping_sub(ring.stretch_ticks.load(Ordering::Relaxed))
+        < CPU_SLIVER_TICKS.load(Ordering::Relaxed);
     if fresh && rate_ticks != 0 {
         accrue(ring, now);
         let last = Reading { ticks: rate_ticks, cpu_ns: ring.rate_cpu.load(Ordering::Relaxed) };
@@ -1675,7 +1691,16 @@ const _: () =
 const UNCOUNTED: u64 = 1;
 
 const _: () = {
-    let bytes = [FIBER_STACK_ROW, SPAN_COPIED_ROW, SWITCH_ROW, EVENT_ROW, EVENT_FIELDS_ROW, SPAN_COLS_ROW, FOLD_ROW, CPU_ROW];
+    let bytes = [
+        FIBER_STACK_ROW,
+        SPAN_COPIED_ROW,
+        SWITCH_ROW,
+        EVENT_ROW,
+        EVENT_FIELDS_ROW,
+        SPAN_COLS_ROW,
+        FOLD_ROW,
+        CPU_ROW,
+    ];
     let mut i = 0;
     while i < bytes.len() {
         assert!(bytes[i] as usize >= Plot::ALL.len(), "a row's plot byte is no plot's");
@@ -1831,8 +1856,12 @@ pub(crate) struct Store {
     words: [AtomicU64; WORDS * CAP],
 }
 
-const _: () = assert!(std::mem::offset_of!(Store, words) == STORE_HEAD, "a store's rows start at STORE_HEAD");
-const _: () = assert!(std::mem::align_of::<Store>() <= 8, "a store is placed at any 8-byte boundary of a mapping");
+const _: () =
+    assert!(std::mem::offset_of!(Store, words) == STORE_HEAD, "a store's rows start at STORE_HEAD");
+const _: () = assert!(
+    std::mem::align_of::<Store>() <= 8,
+    "a store is placed at any 8-byte boundary of a mapping"
+);
 
 impl Store {
     /// A store on the heap, all zero: a page of its rows is committed only once rows reach
@@ -2388,7 +2417,10 @@ fn began(site: u16, parent: Option<u64>, said: &Said) -> u64 {
     // A wait opening cuts the thread's CPU stretch: what it waits through (blocked or parked)
     // is a stretch of its own, never the work before it's.
     let counts = counting();
-    if counts && Some(site) == <span::Wait as span::Span>::site() && stretch_age(ring) >= CPU_SLIVER_TICKS.load(Ordering::Relaxed) {
+    if counts
+        && Some(site) == <span::Wait as span::Span>::site()
+        && stretch_age(ring) >= CPU_SLIVER_TICKS.load(Ordering::Relaxed)
+    {
         boundary(ring, CpuWhy::Wait);
     }
     let depth = ring.depth.load(Ordering::Relaxed);
@@ -2578,7 +2610,10 @@ pub(crate) fn entered(id: u64) {
     if counts {
         now = clock::ticks();
         // The first span after a gap in none: the gap (blocked or not) is a stretch of its own.
-        if depth == 0 && now.wrapping_sub(ring.idle_since.load(Ordering::Relaxed)) >= CPU_GAP_TICKS.load(Ordering::Relaxed) {
+        if depth == 0
+            && now.wrapping_sub(ring.idle_since.load(Ordering::Relaxed))
+                >= CPU_GAP_TICKS.load(Ordering::Relaxed)
+        {
             boundary(ring, CpuWhy::Gap);
             now = clock::ticks();
         }
@@ -2889,8 +2924,18 @@ struct Fold {
     uncounted: bool,
 }
 
-const NO_FOLD: Fold =
-    Fold { key: 0, first: 0, last: 0, spans: 0, ticks: 0, max: 0, cpu: None, allocs: None, pending: 0, uncounted: false };
+const NO_FOLD: Fold = Fold {
+    key: 0,
+    first: 0,
+    last: 0,
+    spans: 0,
+    ticks: 0,
+    max: 0,
+    cpu: None,
+    allocs: None,
+    pending: 0,
+    uncounted: false,
+};
 
 /// Slots a thread folds into, by key. On build 24 a thread held at most 55 keys (a parent's
 /// name and a name) in a [`FOLD_AGE`], 27 at the 99th percentile; a key looks in
@@ -2929,7 +2974,16 @@ fn fold_key(site: u16, parent_site: u16, root: bool, build: u32) -> u64 {
 /// sum on this thread: `cpu` its self CPU so far (`None`: not counted) and `pending` its ticks
 /// of the stretch now, `allocs` as its row would have it, plus one (0: not counted).
 #[allow(clippy::too_many_arguments)]
-fn folded(ring: &Ring, opened: &Opened, parent_site: u16, now: u64, cpu: Option<u64>, pending: u64, allocs: u64, bytes: u64) {
+fn folded(
+    ring: &Ring,
+    opened: &Opened,
+    parent_site: u16,
+    now: u64,
+    cpu: Option<u64>,
+    pending: u64,
+    allocs: u64,
+    bytes: u64,
+) {
     let key = fold_key(opened.site, parent_site, opened.depth == 0, opened.build);
     let home = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize % FOLD_SLOTS;
     _ = FOLDS.try_with(|folds| {
@@ -2997,7 +3051,8 @@ fn put_fold_settled(ring: &Ring, folds: &mut Folds, at: usize) {
 /// Writes `fold`'s row to `ring` and empties it. Ticks still waiting for a rate (a boundary
 /// that could not reach the sums) leave its CPU not counted.
 fn put_fold(ring: &Ring, fold: &mut Fold) {
-    let Fold { key, first, last, spans, ticks, max, cpu, allocs, pending, uncounted } = std::mem::replace(fold, NO_FOLD);
+    let Fold { key, first, last, spans, ticks, max, cpu, allocs, pending, uncounted } =
+        std::mem::replace(fold, NO_FOLD);
     if key == 0 {
         return;
     }
@@ -3404,7 +3459,11 @@ pub fn flushed(cursor: &Cursor, at_ns: i64) {
 /// history has not written yet outlive a crash: the next history to open there writes them
 /// ([`postmortem`]). `blaze` and `process` are what the history names this process's builds
 /// and rows with. Once a process; a ring held by a thread moves to the file as it next writes.
-pub fn persist(dir: &std::path::Path, blaze: &str, process: &str) -> Result<(), postmortem::PostmortemError> {
+pub fn persist(
+    dir: &std::path::Path,
+    blaze: &str,
+    process: &str,
+) -> Result<(), postmortem::PostmortemError> {
     postmortem::persist(dir, blaze, process)
 }
 
@@ -3470,8 +3529,12 @@ fn take(into: &mut Read, mut taking: Taking<'_>) {
                 into.skipped += head.saturating_sub(CAP as u64).saturating_sub(from);
                 // The rows from the first span waiting for a rate that no boundary read gives
                 // are the next read's, unless its thread has been silent past `HOLD_MAX`.
-                let after = scratch.iter().rposition(|(_, row)| is_cpu_row(row)).map_or(0, |it| it + 1);
-                if let Some(first) = scratch[after..].iter().position(|(_, row)| waits_for_rate(row)).map(|it| after + it)
+                let after =
+                    scratch.iter().rposition(|(_, row)| is_cpu_row(row)).map_or(0, |it| it + 1);
+                if let Some(first) = scratch[after..]
+                    .iter()
+                    .position(|(_, row)| waits_for_rate(row))
+                    .map(|it| after + it)
                     && now.wrapping_sub(scratch[first].1[0]) < hold
                 {
                     cursor.next[at] = scratch[first].0;
@@ -3486,7 +3549,14 @@ fn take(into: &mut Read, mut taking: Taking<'_>) {
         into.ring_begins();
         for &(i, row) in &scratch[..end.unwrap_or(scratch.len())] {
             let Some(by) = Ring::owner(&owners, i) else { continue };
-            decode(into, (by.tid, by.name), event_id(ring.number, i), &row, &scale, counting_copies);
+            decode(
+                into,
+                (by.tid, by.name),
+                event_id(ring.number, i),
+                &row,
+                &scale,
+                counting_copies,
+            );
         }
         into.ring_ends();
     }
@@ -3531,17 +3601,25 @@ impl Read {
 /// ([`postmortem`]). A ring's rows are decoded in order between [`Read::ring_begins`] and
 /// [`Read::ring_ends`]: a span's CPU share waits for the ring's next boundary row
 /// ([`CPU_ROW`]), and a span none follows reads as not counted.
-fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &clock::Scale, counting_copies: bool) {
+fn decode(
+    into: &mut Read,
+    by: (u32, Sym),
+    id: u64,
+    row: &[u64; WORDS],
+    scale: &clock::Scale,
+    counting_copies: bool,
+) {
     let (tid, thread_name) = by;
     match row[4] >> 62 {
         KIND_SPAN => {
             let allocs = row[4] & ALLOCS_MAX;
             // Its CPU: what its last stretch's share waits for is resolved at the ring's next
             // boundary row; a `CPU_COL` adds the stretches it outlived.
-            let (self_cpu_ns, pending) = match cpu::share_of(row[7] >> SHARE_SHIFT, row[0].wrapping_sub(row[1])) {
-                cpu::Share::Uncounted => (None, 0),
-                cpu::Share::Counted { pending } => (Some(0), pending),
-            };
+            let (self_cpu_ns, pending) =
+                match cpu::share_of(row[7] >> SHARE_SHIFT, row[0].wrapping_sub(row[1])) {
+                    cpu::Share::Uncounted => (None, 0),
+                    cpu::Share::Counted { pending } => (Some(0), pending),
+                };
             if pending > 0 {
                 into.waiting.push((into.spans.len(), pending));
             }
@@ -3557,7 +3635,8 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
                 site: (row[4] >> (62 - SITE_BITS) & ((1 << SITE_BITS) - 1)) as u16,
                 start_ns: scale.mono(row[1]),
                 dur_ns: scale.ns(row[0].wrapping_sub(row[1])) as i64,
-                alloc: (allocs != 0).then(|| Allocated { bytes: row[7] & BYTES_MAX, count: allocs - 1 }),
+                alloc: (allocs != 0)
+                    .then(|| Allocated { bytes: row[7] & BYTES_MAX, count: allocs - 1 }),
                 copied: counting_copies.then_some(FrameCopied::default()),
                 krate: (row[5] >> 32) as u32,
                 function: row[5] as u32,
@@ -3570,7 +3649,8 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
         }
         KIND_PLOT if row[4] & 0xff == SWITCH_ROW => {
             let Some(event) = Switched::of(row[4] >> 8 & 0xff) else { return };
-            let queued = (row[4] >> QUEUED_LOW_SHIFT & ((1 << QUEUED_LOW_BITS) - 1)) | (row[6] >> 32) << QUEUED_LOW_BITS;
+            let queued = (row[4] >> QUEUED_LOW_SHIFT & ((1 << QUEUED_LOW_BITS) - 1))
+                | (row[6] >> 32) << QUEUED_LOW_BITS;
             into.switches.push(SwitchRow {
                 build: row[6] as u32,
                 thread: tid,
@@ -3591,11 +3671,19 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
         }
         KIND_PLOT if row[4] & 0xff == CPU_ROW => {
             let rate = (row[4] & CPU_VALID != 0)
-                .then(|| Rate::between(Reading { ticks: row[2], cpu_ns: row[3] }, Reading { ticks: row[0], cpu_ns: row[1] }))
+                .then(|| {
+                    Rate::between(
+                        Reading { ticks: row[2], cpu_ns: row[3] },
+                        Reading { ticks: row[0], cpu_ns: row[1] },
+                    )
+                })
                 .flatten();
             for &(at, pending) in &into.waiting {
                 if let Some(span) = into.spans.get_mut(at) {
-                    span.self_cpu_ns = span.self_cpu_ns.zip(rate).map(|(known, rate)| known + rate.cpu_of(pending));
+                    span.self_cpu_ns = span
+                        .self_cpu_ns
+                        .zip(rate)
+                        .map(|(known, rate)| known + rate.cpu_of(pending));
                 }
             }
             into.waiting.clear();
@@ -3624,11 +3712,21 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
             // last, unless the ring wrote over that row first.
             let Some(event) = into.events.last().filter(|it| it.event_id == row[3]) else { return };
             let (build, t_ns, site) = (event.build, event.t_ns, event.site);
-            let mut ordinal = into.fields.iter().rev().take_while(|it| it.event_id == row[3]).count() as u16;
+            let mut ordinal =
+                into.fields.iter().rev().take_while(|it| it.event_id == row[3]).count() as u16;
             for (place, &word) in COL_WORDS.iter().enumerate() {
-                let slot = row[4] >> (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32) & ((1 << FIELD_SLOT_BITS) - 1);
+                let slot = row[4] >> (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32)
+                    & ((1 << FIELD_SLOT_BITS) - 1);
                 let Some(value) = FieldValue::of(slot & 0b111, row[word]) else { continue };
-                into.fields.push(FieldRow { build, t_ns, event_id: row[3], site, index: (slot >> 3) as u8, ordinal, value });
+                into.fields.push(FieldRow {
+                    build,
+                    t_ns,
+                    event_id: row[3],
+                    site,
+                    index: (slot >> 3) as u8,
+                    ordinal,
+                    value,
+                });
                 ordinal += 1;
             }
         }
@@ -3638,7 +3736,8 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
             if let Some(span) = into.spans.last_mut()
                 && span.span_id == row[3]
             {
-                span.copied = (row[5] & UNCOUNTED == 0).then_some(FrameCopied { copies: row[1], bytes: row[2] });
+                span.copied = (row[5] & UNCOUNTED == 0)
+                    .then_some(FrameCopied { copies: row[1], bytes: row[2] });
             }
         }
         KIND_PLOT if row[4] & 0xff == SPAN_COLS_ROW => {
@@ -3662,7 +3761,9 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
                             span.thread_name = row[word] as Sym;
                         }
                         col => {
-                            if let Some(typed) = usize::try_from(col).ok().and_then(|it| span.typed.get_mut(it)) {
+                            if let Some(typed) =
+                                usize::try_from(col).ok().and_then(|it| span.typed.get_mut(it))
+                            {
                                 *typed = row[word];
                             }
                         }
@@ -3683,7 +3784,8 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
             dur_ns: scale.ns(row[2]) as i64,
             max_dur_ns: scale.ns(row[3]) as i64,
             self_cpu_ns: (row[4] & FOLD_CPU != 0).then_some(row[5]),
-            alloc: (row[4] & FOLD_ALLOCS != 0).then(|| Allocated { bytes: row[7], count: row[6] & 0xffff_ffff }),
+            alloc: (row[4] & FOLD_ALLOCS != 0)
+                .then(|| Allocated { bytes: row[7], count: row[6] & 0xffff_ffff }),
         }),
         KIND_PLOT if row[4] & 0xff == FIBER_STACK_ROW => {
             let fiber = Some(((row[4] >> 8) as u32, row[7]));
@@ -3695,7 +3797,13 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
                     (Plot::FiberStackTouched, row[3]),
                     (Plot::FiberStackGrown, row[5]),
                 ]
-                .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber }),
+                .map(|(plot, value)| CounterRow {
+                    build,
+                    plot,
+                    t_ns,
+                    value,
+                    fiber,
+                }),
             );
         }
         KIND_PLOT => {
@@ -3708,7 +3816,9 @@ fn decode(into: &mut Read, by: (u32, Sym), id: u64, row: &[u64; WORDS], scale: &
                 fiber: None,
             });
         }
-        KIND_MARK => into.ends.push(BuildEnd { build: row[1], t_ns: scale.mono(row[0]), thread: tid }),
+        KIND_MARK => {
+            into.ends.push(BuildEnd { build: row[1], t_ns: scale.mono(row[0]), thread: tid })
+        }
         _ => {}
     }
 }
@@ -5179,7 +5289,8 @@ mod tests {
     }
 
     #[test]
-    fn a_spans_self_cpu_is_its_own_while_innermost_less_the_spans_under_it_and_what_ran_while_it_parked() {
+    fn a_spans_self_cpu_is_its_own_while_innermost_less_the_spans_under_it_and_what_ran_while_it_parked()
+     {
         crate::install();
         // Both tests that count CPU give the same reader; a process takes the first.
         _ = count_cpu(test_cpu);
@@ -5227,7 +5338,11 @@ mod tests {
         let mut read = Read::default();
         window(Duration::from_secs(60), &mut read);
         near(row_named(&read, "cpu inner").self_cpu_ns, 20, "cpu inner");
-        near(row_named(&read, "cpu outer").self_cpu_ns, 10, "cpu outer, less the 20 of the span under it");
+        near(
+            row_named(&read, "cpu outer").self_cpu_ns,
+            10,
+            "cpu outer, less the 20 of the span under it",
+        );
         near(row_named(&read, "cpu other job").self_cpu_ns, 100, "cpu other job");
         near(row_named(&read, "cpu held under").self_cpu_ns, 2, "cpu held under");
         near(
@@ -5235,8 +5350,13 @@ mod tests {
             11,
             "a held span counts its two entered steps' 7 and 4, less the 2 under it, never the 80 between",
         );
-        let parked = read.spans.iter().find(|it| it.span_id == parked).expect("the parked span is a row");
-        near(parked.self_cpu_ns, 8, "5 before it parked and 3 after it resumed on another thread, never the other job's 100");
+        let parked =
+            read.spans.iter().find(|it| it.span_id == parked).expect("the parked span is a row");
+        near(
+            parked.self_cpu_ns,
+            8,
+            "5 before it parked and 3 after it resumed on another thread, never the other job's 100",
+        );
     }
 
     /// A span whose CPU waits for its thread's next boundary is not read from a cursor before
@@ -5269,12 +5389,19 @@ mod tests {
         let mut after = Read::default();
         self::read(&mut cursor, &mut after);
         let named = |read: &Read| -> Vec<SpanRow> {
-            read.spans.iter().filter(|it| meta(it.site).map(|it| it.name()) == Some("cpu waits inner")).copied().collect()
+            read.spans
+                .iter()
+                .filter(|it| meta(it.site).map(|it| it.name()) == Some("cpu waits inner"))
+                .copied()
+                .collect()
         };
         let (before, after) = (named(&before), named(&after));
         assert_eq!(before.len() + after.len(), 1, "read once: {before:?} then {after:?}");
         for span in before.iter().chain(&after) {
-            assert!(span.self_cpu_ns.is_some(), "a cursor never reads a counted span before its rate: {span:?}");
+            assert!(
+                span.self_cpu_ns.is_some(),
+                "a cursor never reads a counted span before its rate: {span:?}"
+            );
         }
     }
 }

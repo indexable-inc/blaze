@@ -885,11 +885,13 @@ pub(crate) fn engine(
     tracing::info!(target: "blaze", "{cores}");
     let threads = cores.budget.get();
     // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
-    let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
+    let duckdb =
+        observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
     // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
     // a value that names no level stops the daemon, naming it.
     let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;
-    let (profiling, keeper) = observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?;
+    let (profiling, keeper) =
+        observe::keep_history(&paths.state, duckdb, events).map_err(|why| anyhow::anyhow!(why))?;
     // Fixed for the daemon's life before any job: a build's tasks only read it.
     let sysroot = crate::toolchain::sysroot().with_context(|| {
         format!(

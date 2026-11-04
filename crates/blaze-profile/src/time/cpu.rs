@@ -126,7 +126,8 @@ pub fn share_word(pending: u64, dur: u64) -> u64 {
     }
     // A span is innermost only while it is open; a counter read out of order is clamped.
     let dur = dur.max(pending);
-    let share = (u128::from(pending) * u128::from(SHARE_ONE) + u128::from(dur / 2)) / u128::from(dur);
+    let share =
+        (u128::from(pending) * u128::from(SHARE_ONE) + u128::from(dur / 2)) / u128::from(dur);
     SHARE_FIRST + share as u64
 }
 
@@ -146,7 +147,8 @@ pub fn share_of(word: u64, dur: u64) -> Share {
         SHARE_COUNTED => Share::Counted { pending: 0 },
         _ => {
             let parts = (word - SHARE_FIRST).min(SHARE_ONE);
-            let pending = (u128::from(parts) * u128::from(dur) + u128::from(SHARE_ONE / 2)) / u128::from(SHARE_ONE);
+            let pending = (u128::from(parts) * u128::from(dur) + u128::from(SHARE_ONE / 2))
+                / u128::from(SHARE_ONE);
             Share::Counted { pending: pending as u64 }
         }
     }
@@ -163,17 +165,30 @@ mod tests {
         let dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(1 << 50));
         let pending = tc.draw(gs::integers::<u64>().max_value(dur));
         let word = share_word(pending, dur);
-        assert!(word != 0 && word < 1 << SHARE_BITS, "{word} is a counted share of {SHARE_BITS} bits");
-        let Share::Counted { pending: read } = share_of(word, dur) else { panic!("{word} reads as counted") };
-        assert!(read.abs_diff(pending) <= dur / SHARE_ONE + 1, "{pending} of {dur} read back as {read}");
+        assert!(
+            word != 0 && word < 1 << SHARE_BITS,
+            "{word} is a counted share of {SHARE_BITS} bits"
+        );
+        let Share::Counted { pending: read } = share_of(word, dur) else {
+            panic!("{word} reads as counted")
+        };
+        assert!(
+            read.abs_diff(pending) <= dur / SHARE_ONE + 1,
+            "{pending} of {dur} read back as {read}"
+        );
     }
 
     #[hegel::test(test_cases = 300)]
     fn a_stretchs_rate_gives_its_whole_cpu_to_its_whole_wall(tc: TestCase) {
-        let from = Reading { ticks: tc.draw(gs::integers::<u64>().max_value(1 << 60)), cpu_ns: tc.draw(gs::integers::<u64>().max_value(1 << 60)) };
+        let from = Reading {
+            ticks: tc.draw(gs::integers::<u64>().max_value(1 << 60)),
+            cpu_ns: tc.draw(gs::integers::<u64>().max_value(1 << 60)),
+        };
         let wall = tc.draw(gs::integers::<u64>().min_value(1).max_value(1 << 40));
         let cpu = tc.draw(gs::integers::<u64>().max_value(1 << 40));
-        let rate = Rate::between(from, Reading { ticks: from.ticks + wall, cpu_ns: from.cpu_ns + cpu }).expect("a stretch");
+        let rate =
+            Rate::between(from, Reading { ticks: from.ticks + wall, cpu_ns: from.cpu_ns + cpu })
+                .expect("a stretch");
         assert_eq!(rate.cpu_of(wall), cpu);
         let part = tc.draw(gs::integers::<u64>().max_value(wall));
         assert!(rate.cpu_of(part) <= cpu, "a part of the stretch has at most its CPU");
@@ -298,7 +313,11 @@ mod tests {
         let (spans, stretches) = run(line);
         for span in &spans {
             let derived = span.derived.expect("the last boundary resolves every span");
-            let off: u64 = span.per_stretch.iter().map(|&(s, ticks)| ticks.min(stretches[s].0 - stretches[s].1)).sum();
+            let off: u64 = span
+                .per_stretch
+                .iter()
+                .map(|&(s, ticks)| ticks.min(stretches[s].0 - stretches[s].1))
+                .sum();
             let rounding = span.per_stretch.len() as u64 + (span.end - span.start) / SHARE_ONE + 1;
             assert!(
                 derived.abs_diff(span.exact) <= off + rounding,

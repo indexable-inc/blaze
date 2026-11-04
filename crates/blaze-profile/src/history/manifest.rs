@@ -47,7 +47,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow_array::{RecordBatch, cast::AsArray, types::{Int64Type, UInt64Type}};
+use arrow_array::{
+    RecordBatch,
+    cast::AsArray,
+    types::{Int64Type, UInt64Type},
+};
 use parquet::file::{
     metadata::{ParquetMetaData, ParquetMetaDataReader},
     statistics::Statistics,
@@ -153,14 +157,17 @@ impl Entry {
     /// `version` given is [`ManifestError::Unversioned`].
     pub(crate) fn of_footer(path: &Path, version: Option<u32>) -> Result<Entry, HistoryError> {
         let file = fs::File::open(path).map_err(io_error(path, "opening to read its footer"))?;
-        let metadata = ParquetMetaDataReader::new().parse_and_finish(&file).map_err(|error| HistoryError::Io {
-            // alloc: an error
-            path: path.to_owned(),
-            doing: "reading its footer",
-            error: io::Error::other(error),
+        let metadata = ParquetMetaDataReader::new().parse_and_finish(&file).map_err(|error| {
+            HistoryError::Io {
+                // alloc: an error
+                path: path.to_owned(),
+                doing: "reading its footer",
+                error: io::Error::other(error),
+            }
         })?;
         // alloc: an error
-        let unversioned = || HistoryError::Manifest { path: path.to_owned(), why: ManifestError::Unversioned };
+        let unversioned =
+            || HistoryError::Manifest { path: path.to_owned(), why: ManifestError::Unversioned };
         let version = match footer_version(&metadata) {
             Some(it) => it,
             None => version.ok_or_else(unversioned)?,
@@ -174,17 +181,25 @@ impl Entry {
             pid: None,
         };
         let schema = metadata.file_metadata().schema_descr();
-        let column = |name: &str| (0..schema.num_columns()).find(|&at| schema.column(at).path().string() == name);
+        let column = |name: &str| {
+            (0..schema.num_columns()).find(|&at| schema.column(at).path().string() == name)
+        };
         for group in metadata.row_groups() {
             if group.num_rows() == 0 {
                 continue;
             }
             if let Some(at) = column("build_id") {
                 entry.builds = match group.column(at).statistics() {
-                    Some(Statistics::Int64(it)) if it.null_count_opt() == Some(group.num_rows() as u64) => entry.builds,
+                    Some(Statistics::Int64(it))
+                        if it.null_count_opt() == Some(group.num_rows() as u64) =>
+                    {
+                        entry.builds
+                    }
                     // A `UBIGINT`, stored as INT64: build ids are far below 2^63.
                     Some(Statistics::Int64(it)) => match (it.min_opt(), it.max_opt()) {
-                        (Some(&low), Some(&high)) => Some(widen(entry.builds, low as u64, high as u64)),
+                        (Some(&low), Some(&high)) => {
+                            Some(widen(entry.builds, low as u64, high as u64))
+                        }
                         _ => Some([0, u64::MAX]),
                     },
                     _ => Some([0, u64::MAX]),
@@ -193,7 +208,11 @@ impl Entry {
             for name in INSTANTS {
                 let Some(at) = column(name) else { continue };
                 entry.t_ns = match group.column(at).statistics() {
-                    Some(Statistics::Int64(it)) if it.null_count_opt() == Some(group.num_rows() as u64) => entry.t_ns,
+                    Some(Statistics::Int64(it))
+                        if it.null_count_opt() == Some(group.num_rows() as u64) =>
+                    {
+                        entry.t_ns
+                    }
                     Some(Statistics::Int64(it)) => match (it.min_opt(), it.max_opt()) {
                         (Some(&low), Some(&high)) => Some(widen(entry.t_ns, low, high)),
                         _ => Some([i64::MIN, i64::MAX]),
@@ -248,7 +267,9 @@ fn footer_version(metadata: &ParquetMetaData) -> Option<u32> {
     if let Some(value) = own.and_then(|it| it.value.as_deref()) {
         return value.parse().ok();
     }
-    let arrow = parquet::arrow::parquet_to_arrow_schema(file.schema_descr(), file.key_value_metadata()).ok()?;
+    let arrow =
+        parquet::arrow::parquet_to_arrow_schema(file.schema_descr(), file.key_value_metadata())
+            .ok()?;
     arrow.metadata().get("blaze.schema")?.parse().ok()
 }
 
@@ -269,9 +290,14 @@ pub enum ManifestError {
     Format(u32),
     /// An entry that is no file a manifest lists: not a plain name, not of the table it is
     /// listed under, or (of a table this blaze knows) of no form blaze writes.
-    Entry { table: String, file: String },
+    Entry {
+        table: String,
+        file: String,
+    },
     /// A file it lists is not in the directory: something but the history deleted it.
-    Missing { file: String },
+    Missing {
+        file: String,
+    },
     /// Another process held its lock past [`LOCK_WAIT`].
     Locked,
     /// A file whose footer says no `blaze.schema`: no blaze writer wrote it.
@@ -287,13 +313,22 @@ impl fmt::Display for ManifestError {
             ManifestError::Format(format) => {
                 write!(f, "it is of format {format}, and this blaze reads format {FORMAT}")
             }
-            ManifestError::Entry { table, file } => write!(f, "it lists `{file}` under the table {table}, which is no file of that table blaze lists"),
+            ManifestError::Entry { table, file } => write!(
+                f,
+                "it lists `{file}` under the table {table}, which is no file of that table blaze lists"
+            ),
             ManifestError::Missing { file } => write!(
                 f,
                 "it lists `{file}`, which is not in the directory: something other than the history deleted it, and its rows are gone (delete the directory to start a history afresh)"
             ),
-            ManifestError::Locked => write!(f, "another process held its lock ({LOCK}) for over {LOCK_WAIT:?}, far past one commit"),
-            ManifestError::Unversioned => write!(f, "its footer says no `blaze.schema` version: no blaze writer wrote it, so no reader can say what its rows mean (delete it, or the directory)"),
+            ManifestError::Locked => write!(
+                f,
+                "another process held its lock ({LOCK}) for over {LOCK_WAIT:?}, far past one commit"
+            ),
+            ManifestError::Unversioned => write!(
+                f,
+                "its footer says no `blaze.schema` version: no blaze writer wrote it, so no reader can say what its rows mean (delete it, or the directory)"
+            ),
             ManifestError::Retired(why) => write!(f, "what it says is retired can't be: {why}"),
         }
     }
@@ -309,7 +344,12 @@ impl Manifest {
     /// A manifest listing nothing.
     pub fn new() -> Manifest {
         // alloc: none until a file is listed
-        Manifest { format: FORMAT, flushed: 0, tables: BTreeMap::new(), retired: Retired::default() }
+        Manifest {
+            format: FORMAT,
+            flushed: 0,
+            tables: BTreeMap::new(),
+            retired: Retired::default(),
+        }
     }
 
     /// The number of the last flush the history committed.
@@ -348,7 +388,11 @@ impl Manifest {
     }
 
     /// The files of `table` a reader of `scope` reads.
-    pub fn scoped<'a>(&'a self, table: &str, scope: Scope) -> impl Iterator<Item = (&'a str, &'a Entry)> + 'a {
+    pub fn scoped<'a>(
+        &'a self,
+        table: &str,
+        scope: Scope,
+    ) -> impl Iterator<Item = (&'a str, &'a Entry)> + 'a {
         let window = match scope {
             Scope::All => None,
             Scope::Build(build) => Some((build, self.window_of(build))),
@@ -448,9 +492,13 @@ impl Manifest {
             return Err(ManifestError::Format(manifest.format));
         }
         manifest.retired.check().map_err(ManifestError::Retired)?;
-        if let Some((name, _)) = manifest.retired.files.iter().find(|(it, _)| manifest.contains(it)) {
+        if let Some((name, _)) = manifest.retired.files.iter().find(|(it, _)| manifest.contains(it))
+        {
             // clone: an error
-            return Err(ManifestError::Entry { table: table_of(name).unwrap_or("of none").to_owned(), file: name.clone() });
+            return Err(ManifestError::Entry {
+                table: table_of(name).unwrap_or("of none").to_owned(),
+                file: name.clone(),
+            });
         }
         for (table, files) in &manifest.tables {
             let known = schema::TABLES.iter().any(|it| it.name == table.as_str());
@@ -488,8 +536,9 @@ fn holds(entry: &Entry, build: u64, window: &[(Option<&str>, [i64; 2])]) -> bool
 /// The table a file's name `<stem>.<table>.parquet` says, whether or not this blaze knows it.
 fn table_of(name: &str) -> Option<&str> {
     let (_, table) = name.strip_suffix(".parquet")?.split_once('.')?;
-    (!table.is_empty() && table.bytes().all(|it| it.is_ascii_lowercase() || it.is_ascii_digit() || it == b'_'))
-        .then_some(table)
+    (!table.is_empty()
+        && table.bytes().all(|it| it.is_ascii_lowercase() || it.is_ascii_digit() || it == b'_'))
+    .then_some(table)
 }
 
 /// The table of `name` when it is a file a manifest lists: a flush's or a merge's, or one of
@@ -502,7 +551,8 @@ pub fn listable(name: &str) -> Option<&'static schema::Table> {
     }
     let (stem, table) = name.strip_suffix(".parquet")?.split_once('.')?;
     let run = stem.strip_prefix("perf-")?;
-    let table = [&schema::PERF_RUNS, &schema::PERF_FUNCTIONS].into_iter().find(|it| it.name == table)?;
+    let table =
+        [&schema::PERF_RUNS, &schema::PERF_FUNCTIONS].into_iter().find(|it| it.name == table)?;
     perf::rows::is_run(run).then_some(table)
 }
 
@@ -546,7 +596,9 @@ pub fn read(dir: &Path) -> Result<Manifest, HistoryError> {
     let path = dir.join(FILE);
     match fs::read(&path) {
         Ok(bytes) => Manifest::decode(&bytes).map_err(|why| HistoryError::Manifest { path, why }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => adopted(dir).map(|(manifest, _)| manifest),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            adopted(dir).map(|(manifest, _)| manifest)
+        }
         Err(error) => Err(io_error(&path, "reading the manifest")(error)),
     }
 }
@@ -575,18 +627,23 @@ fn adopted(dir: &Path) -> Result<(Manifest, Vec<String>), HistoryError> {
             Kind::Listable => names.push(name.to_owned()),
             Kind::Unclassified => {
                 // alloc: an error
-                return Err(HistoryError::Unclassified { dir: dir.to_owned(), file: name.to_owned() });
+                return Err(HistoryError::Unclassified {
+                    dir: dir.to_owned(),
+                    file: name.to_owned(),
+                });
             }
             Kind::Schema | Kind::Hidden | Kind::Other => {}
         }
     }
     names.sort_unstable();
     // alloc: once a history is adopted
-    let parsed: Vec<(usize, Name)> = names.iter().enumerate().filter_map(|(at, it)| Some((at, Name::parse(it)?))).collect();
+    let parsed: Vec<(usize, Name)> =
+        names.iter().enumerate().filter_map(|(at, it)| Some((at, Name::parse(it)?))).collect();
     // alloc: once a history is adopted
     let named: Vec<Name> = parsed.iter().map(|it| it.1).collect();
     // alloc: once a history is adopted
-    let gone: BTreeSet<usize> = super::compact::superseded(&named).into_iter().map(|at| parsed[at].0).collect();
+    let gone: BTreeSet<usize> =
+        super::compact::superseded(&named).into_iter().map(|at| parsed[at].0).collect();
     let mut manifest = Manifest::new();
     // alloc: once a history is adopted
     let mut superseded = Vec::new();
@@ -599,7 +656,9 @@ fn adopted(dir: &Path) -> Result<(Manifest, Vec<String>), HistoryError> {
             manifest.flush_committed(named.last);
         }
         let entry = Entry::of_footer(&dir.join(&name), None)?;
-        manifest.insert(&name, entry).map_err(|why| HistoryError::Manifest { path: dir.join(FILE), why })?;
+        manifest
+            .insert(&name, entry)
+            .map_err(|why| HistoryError::Manifest { path: dir.join(FILE), why })?;
     }
     Ok((manifest, superseded))
 }
@@ -624,7 +683,8 @@ pub(crate) fn hold(dir: &Path) -> Result<Held, HistoryError> {
     let (manifest, adopting) = match fs::read(&path) {
         Ok(bytes) => {
             // clone: an error
-            let manifest = Manifest::decode(&bytes).map_err(|why| HistoryError::Manifest { path: path.clone(), why })?;
+            let manifest = Manifest::decode(&bytes)
+                .map_err(|why| HistoryError::Manifest { path: path.clone(), why })?;
             (manifest, false)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -634,7 +694,12 @@ pub(crate) fn hold(dir: &Path) -> Result<Held, HistoryError> {
                 match fs::remove_file(&file) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(io_error(&file, "deleting a file a merged file holds the rows of")(error)),
+                    Err(error) => {
+                        return Err(io_error(
+                            &file,
+                            "deleting a file a merged file holds the rows of",
+                        )(error));
+                    }
                 }
             }
             (manifest, true)
@@ -662,7 +727,9 @@ impl Held {
     /// Lists the file `name` of the history's directory, with its entry.
     pub(crate) fn add(&mut self, name: &str, entry: Entry) -> Result<(), HistoryError> {
         // clone: an error
-        self.manifest.insert(name, entry).map_err(|why| HistoryError::Manifest { path: self.path.clone(), why })
+        self.manifest
+            .insert(name, entry)
+            .map_err(|why| HistoryError::Manifest { path: self.path.clone(), why })
     }
 
     /// Unlists each of `names` and retires it ([`Manifest::retire`]): deleted once no pin holds
@@ -686,7 +753,10 @@ impl Held {
             return Ok(());
         }
         // clone: an error
-        let bytes = self.manifest.encode().map_err(|why| HistoryError::Manifest { path: self.path.clone(), why })?;
+        let bytes = self
+            .manifest
+            .encode()
+            .map_err(|why| HistoryError::Manifest { path: self.path.clone(), why })?;
         put(&self.path, &bytes)?;
         // clone: the manifest, once a commit
         self.written = self.manifest.clone();
@@ -696,7 +766,10 @@ impl Held {
 
 /// The exclusive lock of `dir`'s manifest, waiting at most [`LOCK_WAIT`] for another process
 /// to let go of it.
-#[allow(clippy::disallowed_methods, reason = "a bounded wait on another process's lock, which has no wake to park on")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a bounded wait on another process's lock, which has no wake to park on"
+)]
 fn lock(dir: &Path) -> Result<Locked, HistoryError> {
     let path = dir.join(LOCK);
     let file = fs::OpenOptions::new()

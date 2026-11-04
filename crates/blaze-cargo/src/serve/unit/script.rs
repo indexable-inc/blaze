@@ -1573,7 +1573,14 @@ impl ScriptRun {
                 self.puts.misses.push(miss);
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
                 label_run(self.tag, &start.unit.package.descr());
-                self.state = State::Running { start, run: None, began, cancelled: false, quiet: None, stuck: None };
+                self.state = State::Running {
+                    start,
+                    run: None,
+                    began,
+                    cancelled: false,
+                    quiet: None,
+                    stuck: None,
+                };
                 None
             }
             How::Sandboxed(prepared) => {

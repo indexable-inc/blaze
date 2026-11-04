@@ -105,7 +105,8 @@ impl Table {
         use object::{Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
         PARSES.fetch_add(1, Ordering::Relaxed);
         let data = map(open)?;
-        let object = object::File::parse(data).map_err(|error| format!("parsing {}: {error}", path.display()))?;
+        let object = object::File::parse(data)
+            .map_err(|error| format!("parsing {}: {error}", path.display()))?;
         // Where a name lies in the mapping: object hands out slices of it.
         let place = |name: &[u8]| -> Option<(u32, u32)> {
             let at = (name.as_ptr() as usize).checked_sub(data.as_ptr() as usize)?;
@@ -589,14 +590,19 @@ fn static_dwarf_of(data: &'static [u8]) -> Option<addr2line::Context<StaticReade
     if !object.section_by_name(".debug_info").is_some_and(|s| s.size() > 0) {
         return None;
     }
-    let endian = if object.is_little_endian() { gimli::RunTimeEndian::Little } else { gimli::RunTimeEndian::Big };
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
     let dwarf = gimli::Dwarf::load(|id: gimli::SectionId| -> Result<StaticReader, gimli::Error> {
-        let bytes: &'static [u8] = match object.section_by_name(id.name()).map(|it| it.uncompressed_data()) {
-            Some(Ok(std::borrow::Cow::Borrowed(it))) => it,
-            // alloc: a compressed section's bytes, once a process, kept as the mapping is
-            Some(Ok(std::borrow::Cow::Owned(it))) => it.leak(),
-            _ => &[],
-        };
+        let bytes: &'static [u8] =
+            match object.section_by_name(id.name()).map(|it| it.uncompressed_data()) {
+                Some(Ok(std::borrow::Cow::Borrowed(it))) => it,
+                // alloc: a compressed section's bytes, once a process, kept as the mapping is
+                Some(Ok(std::borrow::Cow::Owned(it))) => it.leak(),
+                _ => &[],
+            };
         Ok(gimli::EndianSlice::new(bytes, endian))
     })
     .ok()?;
@@ -678,7 +684,9 @@ fn function_frames(pc: u64, slide: Option<u64>, base: Option<u64>) -> Vec<String
     }
     match found {
         Some((at, _, Some(name), _)) if Some(at) != base => vec![demangle(&name)],
-        Some((_, Some(file), _, _)) => vec![format!("[{}]", file.rsplit('/').next().unwrap_or(&file))],
+        Some((_, Some(file), _, _)) => {
+            vec![format!("[{}]", file.rsplit('/').next().unwrap_or(&file))]
+        }
         _ => vec![NO_IMAGE.to_owned()],
     }
 }
@@ -864,7 +872,10 @@ mod tests {
     fn a_return_address_names_its_function_and_the_function_it_was_inlined_into() {
         let at = a_caller_of_it(0) - 1;
         let frames = functions(&[at]).remove(&at).unwrap();
-        assert!(frames.iter().all(|it| !it.contains("+0x")), "frames are named by function, never by offset: {frames:?}");
+        assert!(
+            frames.iter().all(|it| !it.contains("+0x")),
+            "frames are named by function, never by offset: {frames:?}"
+        );
         let inner = frames.last().unwrap();
         if names_kind() == "dwarf" {
             // Inlined or not, the address is in `an_inlined_function`: the innermost frame,
@@ -876,7 +887,10 @@ mod tests {
         } else {
             // No DWARF: one frame, the function the symbol names (the caller when inlined).
             assert_eq!(frames.len(), 1, "{frames:?}");
-            assert!(inner.contains("an_inlined_function") || inner.contains("a_caller_of_it"), "{frames:?}");
+            assert!(
+                inner.contains("an_inlined_function") || inner.contains("a_caller_of_it"),
+                "{frames:?}"
+            );
         }
     }
 

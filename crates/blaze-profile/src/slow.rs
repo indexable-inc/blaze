@@ -574,7 +574,8 @@ fn attach_stacks(findings: &mut [Finding], stacks: &[SpanStack]) {
     for finding in findings {
         let at = stacks.partition_point(|it| it.name.as_str() < finding.subject.as_str());
         for it in stacks[at..].iter().take_while(|it| it.name == finding.subject) {
-            let side = if it.on_cpu { &mut finding.stacks.on_cpu } else { &mut finding.stacks.off_cpu };
+            let side =
+                if it.on_cpu { &mut finding.stacks.on_cpu } else { &mut finding.stacks.off_cpu };
             if side.len() < STACKS {
                 // clone: a stack, once a finding it is attached to
                 side.push(StackSeen { frames: it.frames.clone(), samples: it.samples });
@@ -1455,8 +1456,12 @@ impl<'a> Ctx<'a> {
                         pct(cpu, os)
                     ));
                     match cpu * 2 < os {
-                        true => "the OS saw CPU no span counted: find the threads or jobs whose spans don't fill `self_cpu_ns` (a span closed on another job's clock, a thread with no ring)",
-                        false => "the spans count most of what the OS saw: the rest of the switches' running time is starvation (see starved workers), not CPU",
+                        true => {
+                            "the OS saw CPU no span counted: find the threads or jobs whose spans don't fill `self_cpu_ns` (a span closed on another job's clock, a thread with no ring)"
+                        }
+                        false => {
+                            "the spans count most of what the OS saw: the rest of the switches' running time is starvation (see starved workers), not CPU"
+                        }
                     }
                 }
                 _ => {
@@ -1468,7 +1473,10 @@ impl<'a> Ctx<'a> {
                 kind: BlindKind::CpuGap,
                 hidden_ns: (running - cpu).max(0),
                 subject: "self_cpu_ns".to_owned(),
-                title: format!("workers ran {} that no span counted CPU for", s((running - cpu).max(0))),
+                title: format!(
+                    "workers ran {} that no span counted CPU for",
+                    s((running - cpu).max(0))
+                ),
                 evidence,
                 fix: fix.to_owned(),
             });

@@ -127,13 +127,18 @@ impl<const W: usize> Text<W> {
         let (kept, len) = self.copy(&mut bytes);
         match (len, text) {
             (None, None) => true,
-            (Some(len), Some(text)) => len == text.len() as u64 && text.as_bytes().get(..kept) == Some(&bytes[..kept]),
+            (Some(len), Some(text)) => {
+                len == text.len() as u64 && text.as_bytes().get(..kept) == Some(&bytes[..kept])
+            }
             _ => false,
         }
     }
 }
 
-const _: () = assert!(MESSAGE_BYTES <= 1024 && LOCATION_BYTES <= 1024, "Text::text reads through a 1 KiB buffer");
+const _: () = assert!(
+    MESSAGE_BYTES <= 1024 && LOCATION_BYTES <= 1024,
+    "Text::text reads through a 1 KiB buffer"
+);
 
 /// One panic, as its hook wrote it.
 struct Slot {
@@ -230,7 +235,10 @@ fn raised(message: Option<&str>, location: Option<&std::panic::Location<'_>>) {
     slot.message.put(message.map(str::as_bytes));
     let mut at = Cut { bytes: [0; LOCATION_BYTES], len: 0 };
     if let Some(location) = location {
-        _ = std::fmt::Write::write_fmt(&mut at, format_args!("{}:{}:{}", location.file(), location.line(), location.column()));
+        _ = std::fmt::Write::write_fmt(
+            &mut at,
+            format_args!("{}:{}:{}", location.file(), location.line(), location.column()),
+        );
     }
     slot.location.put(location.map(|_| &at.bytes[..at.len]));
     let mut name = [0u8; NAME_BYTES];
@@ -301,7 +309,9 @@ pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
     #[cfg(unix)]
     {
         // SAFETY: `out` is live and its length is passed; see above.
-        let named = unsafe { libc::pthread_getname_np(libc::pthread_self(), out.as_mut_ptr().cast(), out.len()) } == 0;
+        let named = unsafe {
+            libc::pthread_getname_np(libc::pthread_self(), out.as_mut_ptr().cast(), out.len())
+        } == 0;
         if !named {
             return 0;
         }
@@ -335,7 +345,10 @@ pub fn claim(message: Option<&str>) -> Option<String> {
             continue;
         }
         // alloc: a panic caught, once
-        return Some(format!("{location} on thread {}", if thread.is_empty() { "<unnamed>" } else { &thread }));
+        return Some(format!(
+            "{location} on thread {}",
+            if thread.is_empty() { "<unnamed>" } else { &thread }
+        ));
     }
     None
 }
@@ -343,11 +356,16 @@ pub fn claim(message: Option<&str>) -> Option<String> {
 /// The newest whole panic of the thread `tid`: its message into `message` and its location into
 /// `location`, with how many bytes of each (0 for none); `None` when the ring has none of it.
 /// Atomics only, no lock, no allocation: a fatal signal's handler calls it (`crate::crash`).
-pub(crate) fn last_of_thread(tid: u64, message: &mut [u8], location: &mut [u8]) -> Option<(usize, usize)> {
+pub(crate) fn last_of_thread(
+    tid: u64,
+    message: &mut [u8],
+    location: &mut [u8],
+) -> Option<(usize, usize)> {
     let next = NEXT.load(Ordering::Acquire);
     for n in (next.saturating_sub(KEPT as u64)..next).rev() {
         let slot = &SLOTS[(n % KEPT as u64) as usize];
-        if slot.seq.load(Ordering::Acquire) != 2 * n + 2 || slot.tid.load(Ordering::Relaxed) != tid {
+        if slot.seq.load(Ordering::Acquire) != 2 * n + 2 || slot.tid.load(Ordering::Relaxed) != tid
+        {
             continue;
         }
         let (said, _) = slot.message.copy(message);
@@ -528,14 +546,17 @@ fn dict<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 fn list_field(name: &str) -> std::sync::Arc<arrow_schema::Field> {
     let schema = batches::schema_of(&schema::PANICS);
     let at = schema::PANICS.column(name).unwrap_or_else(|| unreachable!("panics has a {name}"));
-    let DataType::List(field) = schema.field(at).data_type() else { unreachable!("{name} is a list (arrow.rs)") };
+    let DataType::List(field) = schema.field(at).data_type() else {
+        unreachable!("{name} is a list (arrow.rs)")
+    };
     // clone: an `Arc` of the schema's field, once a batch
     field.clone()
 }
 
 /// A [`schema::Type::Stack`] column of `stacks`.
 fn names_column<'a>(name: &str, stacks: impl Iterator<Item = &'a [String]>) -> ArrayRef {
-    let mut out = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(list_field(name));
+    let mut out =
+        ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(list_field(name));
     for stack in stacks {
         for frame in stack {
             out.values().append_value(frame);
@@ -591,7 +612,11 @@ pub fn top_frames(stack: &[String], top: usize) -> Vec<&str> {
     ];
     const LOOKED: usize = 24;
     let inner: Vec<&str> = stack.iter().rev().map(String::as_str).collect(); // alloc: a report's lines
-    let past = inner.iter().take(LOOKED).rposition(|frame| ENTRY.iter().any(|it| frame.contains(it))).map_or(0, |at| at + 1);
+    let past = inner
+        .iter()
+        .take(LOOKED)
+        .rposition(|frame| ENTRY.iter().any(|it| frame.contains(it)))
+        .map_or(0, |at| at + 1);
     // alloc: a report's lines
     inner[past..].iter().take(top).copied().collect()
 }
@@ -621,14 +646,26 @@ mod tests {
         let mut raised = Vec::new();
         since(&mut next, &mut raised);
         let rows = rows(&raised);
-        let ours: Vec<&PanicRow> = rows.iter().filter(|it| it.message.as_deref() == Some(text.as_str())).collect();
+        let ours: Vec<&PanicRow> =
+            rows.iter().filter(|it| it.message.as_deref() == Some(text.as_str())).collect();
         let [row] = &ours[..] else { panic!("one row of the panic: {ours:?}") };
         assert_eq!(row.kind, Kind::Panic);
         assert!(row.caught);
-        assert!(row.location.as_deref().is_some_and(|it| it.contains("src/panics.rs:")), "{:?}", row.location);
-        assert!(row.stack.len() >= row.stack_pcs.len(), "a frame of the unwind is one name or more");
+        assert!(
+            row.location.as_deref().is_some_and(|it| it.contains("src/panics.rs:")),
+            "{:?}",
+            row.location
+        );
+        assert!(
+            row.stack.len() >= row.stack_pcs.len(),
+            "a frame of the unwind is one name or more"
+        );
         assert!(row.stack.iter().any(|it| it.contains("panics_in_a_job")), "{:#?}", row.stack);
-        assert!(row.stack.iter().all(|it| !it.contains("+0x")), "named by function: {:#?}", row.stack);
+        assert!(
+            row.stack.iter().all(|it| !it.contains("+0x")),
+            "named by function: {:#?}",
+            row.stack
+        );
         assert_eq!(row.process, std::process::id());
         let batch = batch(&rows).unwrap();
         assert_eq!(batch.num_rows(), rows.len());

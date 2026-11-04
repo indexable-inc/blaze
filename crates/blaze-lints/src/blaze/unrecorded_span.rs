@@ -211,7 +211,8 @@ fn dropped_event<'t>(level: Option<&str>, args: &[Arg<'t>], krate: &str) -> Opti
     let level = written??;
     let target_text = target.map_or(krate, |it: ast::Token<'t>| unquoted(it.text()));
     // Below the recorder's level (DEBUG, or a level not written) is that level's choice.
-    let kept = !blaze_profile::keeps_level(level) || blaze_profile::logs::keeps_event_named(target_text, name, level);
+    let kept = !blaze_profile::keeps_level(level)
+        || blaze_profile::logs::keeps_event_named(target_text, name, level);
     (!kept).then_some(Dropped { target, what: "event" })
 }
 

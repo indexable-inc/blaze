@@ -64,12 +64,24 @@ fn a_reader_racing_a_merge_reads_each_row_once_and_no_file_goes_from_under_it() 
                     2 => pin = Some(Some(read.1.generation)),
                     _ => {
                         for file in &read.0 {
-                            assert!(disk.contains(file), "order {order:09b}: {file} was deleted under the reader");
+                            assert!(
+                                disk.contains(file),
+                                "order {order:09b}: {file} was deleted under the reader"
+                            );
                         }
-                        let mut rows: Vec<u64> =
-                            read.0.iter().filter_map(|it| Name::parse(it)).flat_map(|it| it.first..=it.last).collect();
+                        let mut rows: Vec<u64> = read
+                            .0
+                            .iter()
+                            .filter_map(|it| Name::parse(it))
+                            .flat_map(|it| it.first..=it.last)
+                            .collect();
                         rows.sort_unstable();
-                        assert_eq!(rows, [1, 2, 3], "order {order:09b}: the reader read {:?}", read.0);
+                        assert_eq!(
+                            rows,
+                            [1, 2, 3],
+                            "order {order:09b}: the reader read {:?}",
+                            read.0
+                        );
                     }
                 }
                 reader += 1;

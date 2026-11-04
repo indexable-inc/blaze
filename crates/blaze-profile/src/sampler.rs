@@ -199,13 +199,13 @@ fn run(_hz: u32) -> Result<&'static str, Unsampled> {
     )))
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) use linux::Thread;
 /// What a thread's ring holds for the sampler, under the lock the thread takes to leave, so no
 /// thread is stopped or signalled once it is gone: on macOS its port and stack, on Linux its
 /// slot and alternate signal stack.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use macos::Thread;
-#[cfg(target_os = "linux")]
-pub(crate) use linux::Thread;
 
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 #[derive(Default)]
@@ -273,7 +273,11 @@ pub(crate) fn taken(since: Instant, epoch: &Epoch) -> (Vec<Sampled>, String) {
                 .iter()
                 .enumerate()
                 .flat_map(|(i, pc)| {
-                    frames.get(&crate::symbols::lookup(i, *pc)).into_iter().flat_map(|it| it.iter().rev()).cloned()
+                    frames
+                        .get(&crate::symbols::lookup(i, *pc))
+                        .into_iter()
+                        .flat_map(|it| it.iter().rev())
+                        .cloned()
                 })
                 // alloc: a dump, on demand
                 .collect(),

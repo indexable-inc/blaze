@@ -188,7 +188,12 @@ impl Scale {
     /// meaningless (an `Instant` is of one process), so only [`Scale::mono`], [`Scale::ns`] and
     /// [`Scale::ticks_in`] are read of it.
     pub(crate) fn of_line([ticks, mono, ns_per_tick]: [u64; 3]) -> Scale {
-        Scale { ticks, at: Instant::now(), mono: mono as i64, ns_per_tick: f64::from_bits(ns_per_tick) }
+        Scale {
+            ticks,
+            at: Instant::now(),
+            mono: mono as i64,
+            ns_per_tick: f64::from_bits(ns_per_tick),
+        }
     }
 }
 
@@ -254,7 +259,13 @@ fn read_boot() -> Option<String> {
     let mut len = buf.len();
     // SAFETY: the name is NUL-terminated, `buf` is `len` bytes to write, and no new value is set.
     let read = unsafe {
-        libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if read != 0 || len == 0 || len > buf.len() {
         return None;

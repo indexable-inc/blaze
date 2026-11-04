@@ -663,7 +663,11 @@ mod tests {
     use super::*;
 
     fn explorer() -> Explorer {
-        let history = History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: crate::Flush::new(|| Ok(0)) };
+        let history = History {
+            duckdb: None,
+            dir: PathBuf::from("/nowhere"),
+            flush: crate::Flush::new(|| Ok(0)),
+        };
         start(Config { history, world: None, dev_origin: false, daemon: "test" }).unwrap()
     }
 
@@ -808,7 +812,10 @@ mod tests {
             };
             let mut batches = Vec::new();
             live::Decoder::new(table).decode(&body[4 + head_len..], &mut batches).unwrap();
-            assert_eq!(batches.iter().map(|it| it.num_rows() as u64).sum::<u64>(), header["rows"].as_u64().unwrap());
+            assert_eq!(
+                batches.iter().map(|it| it.num_rows() as u64).sum::<u64>(),
+                header["rows"].as_u64().unwrap()
+            );
 
             let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
             let wrong = if token.starts_with('0') {
@@ -828,8 +835,13 @@ mod tests {
 
     #[test]
     fn a_session_from_the_dev_server_is_taken_only_when_asked() {
-        let history = History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: crate::Flush::new(|| Ok(0)) };
-        let explorer = start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
+        let history = History {
+            duckdb: None,
+            dir: PathBuf::from("/nowhere"),
+            flush: crate::Flush::new(|| Ok(0)),
+        };
+        let explorer =
+            start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let client = client(&explorer);

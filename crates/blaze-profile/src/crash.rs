@@ -101,19 +101,41 @@ pub fn file_name(pid: u32) -> String {
 /// Why a crash file was not made or not read: each names the file and what refused it.
 #[derive(Debug)]
 pub enum CrashError {
-    Io { path: PathBuf, doing: &'static str, error: io::Error },
+    Io {
+        path: PathBuf,
+        doing: &'static str,
+        error: io::Error,
+    },
     /// Not a crash record: too short, or no [`MAGIC`].
-    NotARecord { path: PathBuf, bytes: usize },
+    NotARecord {
+        path: PathBuf,
+        bytes: usize,
+    },
     /// A record of another layout: its offsets mean something else, so nothing of it is read.
-    Layout { path: PathBuf, version: u32, size: u32 },
+    Layout {
+        path: PathBuf,
+        version: u32,
+        size: u32,
+    },
     /// The process that wrote it could not hash its executable, so which binary's symbols name
     /// its addresses is not known.
-    Unidentified { path: PathBuf, pid: u32 },
+    Unidentified {
+        path: PathBuf,
+        pid: u32,
+    },
     /// It was written by another blaze executable: this one's symbols would name its addresses
     /// wrongly.
-    OtherBlaze { path: PathBuf, pid: u32, theirs: String, ours: String },
+    OtherBlaze {
+        path: PathBuf,
+        pid: u32,
+        theirs: String,
+        ours: String,
+    },
     /// This executable could not be hashed, so no record can be checked against it.
-    OursUnhashed { path: PathBuf, error: io::Error },
+    OursUnhashed {
+        path: PathBuf,
+        error: io::Error,
+    },
     /// No crash record on this system (no POSIX signals).
     Unsupported,
 }
@@ -121,9 +143,15 @@ pub enum CrashError {
 impl fmt::Display for CrashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CrashError::Io { path, doing, error } => write!(f, "the crash record {}: {doing}: {error}", path.display()),
+            CrashError::Io { path, doing, error } => {
+                write!(f, "the crash record {}: {doing}: {error}", path.display())
+            }
             CrashError::NotARecord { path, bytes } => {
-                write!(f, "the crash record {} is no crash record: {bytes} bytes, of {SIZE} starting with {MAGIC:?}", path.display())
+                write!(
+                    f,
+                    "the crash record {} is no crash record: {bytes} bytes, of {SIZE} starting with {MAGIC:?}",
+                    path.display()
+                )
             }
             CrashError::Layout { path, version, size } => write!(
                 f,
@@ -148,7 +176,9 @@ impl fmt::Display for CrashError {
                 "the crash record {} can't be checked against this blaze, whose executable could not be hashed: {error}",
                 path.display()
             ),
-            CrashError::Unsupported => write!(f, "this system has no POSIX signals, so blaze keeps no crash record"),
+            CrashError::Unsupported => {
+                write!(f, "this system has no POSIX signals, so blaze keeps no crash record")
+            }
         }
     }
 }
@@ -230,7 +260,8 @@ impl Crash {
             t_ns: self.t_ns,
             kind: Kind::Signal,
             job: None,
-            span_id: (self.span != 0 && self.span != crate::flight::UNRECORDED).then_some(self.span),
+            span_id: (self.span != 0 && self.span != crate::flight::UNRECORDED)
+                .then_some(self.span),
             message: Some(message),
             // clone: a row of a crash
             location: self.panic.as_ref().map(|(_, at)| at.clone()).filter(|it| !it.is_empty()),
@@ -352,7 +383,8 @@ pub fn of_process(dir: &Path, pid: u32) -> Result<Option<PanicRow>, CrashError> 
         Err(error) => return Err(CrashError::Io { path, doing: "reading", error }),
     };
     // alloc: an error
-    let ours = crate::identity::binary_hash().map_err(|error| CrashError::OursUnhashed { path: path.clone(), error })?;
+    let ours = crate::identity::binary_hash()
+        .map_err(|error| CrashError::OursUnhashed { path: path.clone(), error })?;
     Ok(read(&path, &bytes, &ours)?.map(|crash| crash.row()))
 }
 
@@ -379,7 +411,13 @@ impl Recovered {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(CrashError::Io { path, doing: "deleting a recovered crash record", error }),
+                Err(error) => {
+                    return Err(CrashError::Io {
+                        path,
+                        doing: "deleting a recovered crash record",
+                        error,
+                    });
+                }
             }
         }
         Ok(())
@@ -393,14 +431,22 @@ pub fn recover(dir: &Path) -> Recovered {
         Ok(it) => it,
         Err(error) => {
             // alloc: an error
-            out.refused.push(CrashError::Io { path: dir.to_owned(), doing: "listing the history's crash records", error });
+            out.refused.push(CrashError::Io {
+                path: dir.to_owned(),
+                doing: "listing the history's crash records",
+                error,
+            });
             return out;
         }
     };
     let mut ours = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|it| it.strip_prefix("crash.")).and_then(|it| it.parse::<u32>().ok()) else {
+        let Some(pid) = name
+            .to_str()
+            .and_then(|it| it.strip_prefix("crash."))
+            .and_then(|it| it.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid == std::process::id() || crate::history::alive(pid) {
@@ -426,7 +472,11 @@ pub fn recover(dir: &Path) -> Recovered {
         match read(&path, &bytes, &hash) {
             Ok(None) => {
                 if let Err(error) = fs::remove_file(&path) {
-                    out.refused.push(CrashError::Io { path, doing: "deleting a crash record with nothing recorded", error });
+                    out.refused.push(CrashError::Io {
+                        path,
+                        doing: "deleting a crash record with nothing recorded",
+                        error,
+                    });
                 }
             }
             Ok(Some(crash)) => {
@@ -439,7 +489,11 @@ pub fn recover(dir: &Path) -> Recovered {
             Err(refused) => {
                 let aside = dir.join(format!("{}.refused", file_name(pid)));
                 if let Err(error) = fs::rename(&path, &aside) {
-                    out.refused.push(CrashError::Io { path, doing: "setting aside a refused crash record", error });
+                    out.refused.push(CrashError::Io {
+                        path,
+                        doing: "setting aside a refused crash record",
+                        error,
+                    });
                 }
                 out.refused.push(refused);
             }
@@ -515,7 +569,11 @@ impl Page {
     /// id and name). Only the first fault of a process is recorded; each word the walk adds is
     /// counted as it is written, so a fault inside the walk leaves what came before.
     fn record(self, fault: &Fault) {
-        if self.state().compare_exchange(ARMED, WRITING, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        if self
+            .state()
+            .compare_exchange(ARMED, WRITING, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
         let tid = crate::sampler::os_tid();
@@ -565,7 +623,8 @@ impl Page {
             self.put_u64(BUILD_AT, u64::from(crate::flight::build_of(innermost)));
             let message = std::slice::from_raw_parts_mut(self.0.add(MESSAGE_AT), MESSAGE_BYTES);
             let location = std::slice::from_raw_parts_mut(self.0.add(LOCATION_AT), LOCATION_BYTES);
-            let (said, at) = crate::panics::last_of_thread(tid, message, location).unwrap_or((0, 0));
+            let (said, at) =
+                crate::panics::last_of_thread(tid, message, location).unwrap_or((0, 0));
             self.put_u64(MESSAGE_LEN_AT, said as u64);
             self.put_u64(LOCATION_LEN_AT, at as u64);
         }
@@ -602,14 +661,30 @@ pub fn arm(dir: &Path) -> Result<PathBuf, CrashError> {
     }
     crate::stack::ready();
     // alloc: an error
-    let error = |doing: &'static str| move |error: io::Error| CrashError::Io { path: dir.join(file_name(pid)), doing, error };
-    let hash = crate::identity::binary_hash().map_err(|error| CrashError::OursUnhashed { path: path.clone(), error })?;
-    let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).map_err(error("making"))?;
+    let error = |doing: &'static str| {
+        move |error: io::Error| CrashError::Io { path: dir.join(file_name(pid)), doing, error }
+    };
+    let hash = crate::identity::binary_hash()
+        .map_err(|error| CrashError::OursUnhashed { path: path.clone(), error })?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(error("making"))?;
     file.set_len(SIZE as u64).map_err(error("sizing"))?;
     // SAFETY: a new shared mapping of the `SIZE` bytes the file was just given, readable and
     // writable; it outlives the descriptor, which closes as `file` drops.
     let at = unsafe {
-        libc::mmap(std::ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0)
+        libc::mmap(
+            std::ptr::null_mut(),
+            SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
     };
     if at == libc::MAP_FAILED {
         return Err(error("mapping")(io::Error::last_os_error()));
@@ -618,9 +693,17 @@ pub fn arm(dir: &Path) -> Result<PathBuf, CrashError> {
     // SAFETY: the mapping is `SIZE` writable bytes, never unmapped, and no handler has it yet
     // (it is published below).
     unsafe {
-        page.header(pid, &hash, ix_prof::symbols::own_slide().unwrap_or(0), ix_prof::symbols::own_load_base().unwrap_or(0))
+        page.header(
+            pid,
+            &hash,
+            ix_prof::symbols::own_slide().unwrap_or(0),
+            ix_prof::symbols::own_load_base().unwrap_or(0),
+        )
     };
-    if PAGE.compare_exchange(std::ptr::null_mut(), page.0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if PAGE
+        .compare_exchange(std::ptr::null_mut(), page.0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         // Another thread armed first: this mapping is let go, its file is the same path.
         // SAFETY: the mapping made above, never published, unmapped once.
         unsafe { libc::munmap(at, SIZE) };
@@ -635,12 +718,14 @@ pub fn arm(_dir: &Path) -> Result<PathBuf, CrashError> {
 
 /// The signals the handler records.
 #[cfg(unix)]
-const FATAL: [libc::c_int; 5] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT];
+const FATAL: [libc::c_int; 5] =
+    [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT];
 
 /// Each of [`FATAL`]'s handler and flags before [`install`]: atomics, as the handler reads them.
 #[cfg(unix)]
-static BEFORE: [(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicI32); 5] =
-    [const { (std::sync::atomic::AtomicUsize::new(libc::SIG_DFL), std::sync::atomic::AtomicI32::new(0)) }; 5];
+static BEFORE: [(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicI32); 5] = [const {
+    (std::sync::atomic::AtomicUsize::new(libc::SIG_DFL), std::sync::atomic::AtomicI32::new(0))
+}; 5];
 
 /// Puts the recording handler on each of [`FATAL`], before whatever was there (which it hands
 /// each signal to after recording), and gives the calling thread an alternate signal stack if it
@@ -665,12 +750,14 @@ pub fn install() {
             BEFORE[at].1.store(old.sa_flags, Ordering::Release);
             // SAFETY: as for `old`.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction =
-                on_fatal as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as libc::sighandler_t;
+            action.sa_sigaction = on_fatal
+                as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+                as libc::sighandler_t;
             // On the alternate stack: a stack overflow leaves no room on the thread's own. Reset
             // as it is entered and not blocked in it, so the handler before (or the default)
             // ends the process with the same signal when it raises it again.
-            action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESETHAND | libc::SA_NODEFER;
+            action.sa_flags =
+                libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESETHAND | libc::SA_NODEFER;
             // SAFETY: `action.sa_mask` is a live `sigset_t` of this frame for the call to fill.
             unsafe { libc::sigemptyset(&mut action.sa_mask) };
             // SAFETY: `action` is live and whole. `on_fatal` only writes the mapped page through
@@ -694,14 +781,23 @@ fn altstack() {
     // SAFETY: `stack_t` is a pointer, a size and flags; zeroed is a valid value to fill.
     let mut old: libc::stack_t = unsafe { std::mem::zeroed() };
     // SAFETY: `old` is live for the call to fill; a null new stack changes nothing.
-    if unsafe { libc::sigaltstack(std::ptr::null(), &mut old) } != 0 || old.ss_flags & libc::SS_DISABLE == 0 {
+    if unsafe { libc::sigaltstack(std::ptr::null(), &mut old) } != 0
+        || old.ss_flags & libc::SS_DISABLE == 0
+    {
         return;
     }
     const BYTES: usize = 64 << 10;
     // SAFETY: a new private anonymous mapping, never unmapped: the thread's signal stack for the
     // process's life.
     let at = unsafe {
-        libc::mmap(std::ptr::null_mut(), BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+        libc::mmap(
+            std::ptr::null_mut(),
+            BYTES,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
     };
     if at == libc::MAP_FAILED {
         return;
@@ -713,7 +809,11 @@ fn altstack() {
 
 /// The handler: records the fault when armed, then hands it on.
 #[cfg(unix)]
-extern "C" fn on_fatal(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+extern "C" fn on_fatal(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
     let page = PAGE.load(Ordering::Acquire);
     // SAFETY: the kernel passes an `SA_SIGINFO` handler a live `siginfo_t` and `ucontext_t`.
     let fault = unsafe { fault_of(signal, info, context) };
@@ -721,7 +821,8 @@ extern "C" fn on_fatal(signal: libc::c_int, info: *mut libc::siginfo_t, context:
         Page(page).record(&fault);
     }
     let Some(at) = FATAL.iter().position(|it| *it == signal) else { return };
-    let (handler, flags) = (BEFORE[at].0.load(Ordering::Acquire), BEFORE[at].1.load(Ordering::Acquire));
+    let (handler, flags) =
+        (BEFORE[at].0.load(Ordering::Acquire), BEFORE[at].1.load(Ordering::Acquire));
     if handler == libc::SIG_DFL || handler == libc::SIG_IGN {
         // `SA_RESETHAND` made the action the default as this handler was entered, and
         // `SA_NODEFER` left the signal unblocked, so raising it again ends the process with it
@@ -751,7 +852,11 @@ extern "C" fn on_fatal(signal: libc::c_int, info: *mut libc::siginfo_t, context:
 ///
 /// `info` and `context` are the live arguments of an `SA_SIGINFO` handler (either may be null).
 #[cfg(unix)]
-unsafe fn fault_of(signal: libc::c_int, info: *const libc::siginfo_t, context: *const libc::c_void) -> Fault {
+unsafe fn fault_of(
+    signal: libc::c_int,
+    info: *const libc::siginfo_t,
+    context: *const libc::c_void,
+) -> Fault {
     let (code, addr) = match info.is_null() {
         true => (0, 0),
         false => {
@@ -869,18 +974,38 @@ mod tests {
     /// through the handler's own code.
     fn page_in(path: &Path, pid: u32) -> Page {
         use std::os::fd::AsRawFd as _;
-        let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path).unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
         file.set_len(SIZE as u64).unwrap();
         // SAFETY: as in `arm`: a shared mapping of the file's `SIZE` bytes, kept for the test
         // process's life.
         let at = unsafe {
-            libc::mmap(std::ptr::null_mut(), SIZE, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
         };
         assert_ne!(at, libc::MAP_FAILED);
         let page = Page(at.cast());
         let hash = crate::identity::binary_hash().unwrap();
         // SAFETY: the mapping above, no handler has it.
-        unsafe { page.header(pid, &hash, ix_prof::symbols::own_slide().unwrap(), ix_prof::symbols::own_load_base().unwrap()) };
+        unsafe {
+            page.header(
+                pid,
+                &hash,
+                ix_prof::symbols::own_slide().unwrap(),
+                ix_prof::symbols::own_load_base().unwrap(),
+            )
+        };
         page
     }
 
@@ -915,17 +1040,35 @@ mod tests {
         assert_eq!(row.signal, Some("SIGSEGV"));
         assert_eq!(row.fault_addr, Some(0x10));
         assert!(!row.caught);
-        assert!(row.message.as_deref().is_some_and(|it| it.contains("SIGSEGV") && it.contains("0x10")), "{:?}", row.message);
-        assert!(row.stack.len() >= row.stack_pcs.len(), "a frame of the unwind is one name or more");
-        assert!(row.stack.iter().all(|it| !it.contains("+0x")), "named by function: {:#?}", row.stack);
+        assert!(
+            row.message.as_deref().is_some_and(|it| it.contains("SIGSEGV") && it.contains("0x10")),
+            "{:?}",
+            row.message
+        );
+        assert!(
+            row.stack.len() >= row.stack_pcs.len(),
+            "a frame of the unwind is one name or more"
+        );
+        assert!(
+            row.stack.iter().all(|it| !it.contains("+0x")),
+            "named by function: {:#?}",
+            row.stack
+        );
         assert!(row.stack.last().is_some_and(|it| it.contains("faults_here")), "{:#?}", row.stack);
-        assert!(row.stack.iter().any(|it| it.contains("a_crash_file_round_trips_through_recovery")), "{:#?}", row.stack);
+        assert!(
+            row.stack.iter().any(|it| it.contains("a_crash_file_round_trips_through_recovery")),
+            "{:#?}",
+            row.stack
+        );
         assert_eq!(row.boot, None);
         let [(pid, image)] = &recovered.images[..] else { panic!("one image of the crash") };
         assert_eq!(*pid, GONE);
         assert_eq!(image.blake3.as_deref(), Ok(crate::identity::binary().unwrap().as_str()));
         let inner = *row.stack_pcs.last().unwrap();
-        assert!(inner >= image.base && inner - image.base < image.size, "the faulting pc is in the image's code");
+        assert!(
+            inner >= image.base && inner - image.base < image.size,
+            "the faulting pc is in the image's code"
+        );
         let batch = crate::panics::batch(&recovered.rows).unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert!(path.exists(), "kept until its row is written");
@@ -965,7 +1108,10 @@ mod tests {
         assert!(read(&path, &bytes, &ours).unwrap().is_some());
         bytes[LAYOUT_AT..LAYOUT_AT + 4].copy_from_slice(&(LAYOUT + 1).to_le_bytes());
         let refused = read(&path, &bytes, &ours).unwrap_err();
-        assert!(matches!(refused, CrashError::Layout { version, .. } if version == LAYOUT + 1), "{refused}");
+        assert!(
+            matches!(refused, CrashError::Layout { version, .. } if version == LAYOUT + 1),
+            "{refused}"
+        );
         assert!(refused.to_string().contains(&path.display().to_string()));
         bytes[LAYOUT_AT..LAYOUT_AT + 4].copy_from_slice(&LAYOUT.to_le_bytes());
         let mut other = ours;
@@ -979,7 +1125,11 @@ mod tests {
         fs::write(&path, &on_disk).unwrap();
         let recovered = recover(&dir);
         assert!(recovered.rows.is_empty());
-        assert!(matches!(recovered.refused[..], [CrashError::Layout { .. }]), "{:?}", recovered.refused);
+        assert!(
+            matches!(recovered.refused[..], [CrashError::Layout { .. }]),
+            "{:?}",
+            recovered.refused
+        );
         assert!(!path.exists() && dir.join(format!("{}.refused", file_name(GONE))).exists());
     }
 }

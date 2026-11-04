@@ -796,7 +796,9 @@ pub enum Response {
     Live(LiveFrame),
     /// [`Request::Flush`]'s answer: the number of the flush that committed, which the
     /// history's manifest says from then on (`Manifest::flushed`).
-    Flushed { seq: u64 },
+    Flushed {
+        seq: u64,
+    },
     /// [`Request::Hot`]'s answer.
     Hot(Hot),
     /// [`Request::Gc`]'s answer: the run's report as `blaze cache gc` prints it (its line, each

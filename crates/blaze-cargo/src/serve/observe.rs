@@ -231,7 +231,9 @@ impl Doing {
                     history::FLUSH_ROWS
                 )
             }
-            Some(Step::FlushingAsked) => "flushing the profile history for a reader that asked".to_owned(),
+            Some(Step::FlushingAsked) => {
+                "flushing the profile history for a reader that asked".to_owned()
+            }
             None => format!("in step {}, which this blaze does not know", it >> 56),
         }
     }
@@ -282,7 +284,10 @@ enum ToHistory {
     FlushFor(Sender<Result<u64, String>>),
     /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
     /// written at once and `to` answered once it is ([`Told::ClientWritten`]).
-    Client { to: RequestRef, rows: history::ClientRows },
+    Client {
+        to: RequestRef,
+        rows: history::ClientRows,
+    },
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
@@ -470,7 +475,7 @@ pub fn keep_history(
                     // what this one had not flushed. One that can't be kept is said, not fatal.
                     if let Err(error) = history.persist_recorder() {
                         tracing::warn!("{error}");
-                        _ = failed_to.send(error.to_string());  // alloc: error path, once a daemon
+                        _ = failed_to.send(error.to_string()); // alloc: error path, once a daemon
                     }
                     // Every child the drivers reap from now on is a `processes` row of the
                     // history's next flush: installed only where a history takes them.
@@ -646,7 +651,10 @@ fn keep(
                 _ = told.send(Told::ClientWritten { to, written });
                 (flushed, false)
             }
-            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance }, query_counts })) => {
+            Ok(ToHistory::Ended(Finished {
+                ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
+                query_counts,
+            })) => {
                 let build = row.build_id;
                 let ended_well = matches!(row.outcome, history::Outcome::Ok);
                 // Before the ledger takes the misses: their keys' parts, which it drops.
@@ -850,7 +858,7 @@ impl Observe {
             profiling,
             #[cfg(feature = "native")]
             explorer: None,
-            live: Vec::new(),    // alloc: none until a subscriber
+            live: Vec::new(),     // alloc: none until a subscriber
             flushing: Vec::new(), // alloc: none until a reader asks
             next_frame: Duration::ZERO,
             history_error: None,
@@ -989,7 +997,7 @@ impl Observe {
                 history: blaze_explore::History {
                     // clone: two paths, once an explorer
                     duckdb: profiling.duckdb.clone(),
-                    dir: profiling.dir.clone(),  // clone: once an explorer
+                    dir: profiling.dir.clone(), // clone: once an explorer
                     flush: explorer_flush(profiling),
                 },
                 world: None,
@@ -1035,11 +1043,19 @@ impl Observe {
     /// past [`FLUSH_WAIT`] naming what the thread is doing.
     pub fn flush(&mut self, to: RequestRef, now: Duration, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
-            return fail(out, to, ApiError::new(NO_PROFILING, Some("a read of the profile history".to_owned())));  // alloc: error path
+            return fail(
+                out,
+                to,
+                ApiError::new(NO_PROFILING, Some("a read of the profile history".to_owned())),
+            ); // alloc: error path
         };
         if self.history_gone || profiling.ended.send(ToHistory::Flush(to)).is_err() {
             let what = "the profile history's thread (`blaze-history`) ended, so nothing flushes what the daemon recorded since its last flush";
-            return fail(out, to, ApiError::new(what, Some("a read of the profile history".to_owned())));  // alloc: error path
+            return fail(
+                out,
+                to,
+                ApiError::new(what, Some("a read of the profile history".to_owned())),
+            ); // alloc: error path
         }
         self.flushing.push(Flushing { to, until: now + FLUSH_WAIT });
     }
@@ -1081,14 +1097,25 @@ impl Observe {
                     }
                     Ok(Told::Flushed { to, seq }) => {
                         // Gone or past its deadline: answered already, or to nobody.
-                        let Some(at) = self.flushing.iter().position(|it| it.to == to) else { continue };
+                        let Some(at) = self.flushing.iter().position(|it| it.to == to) else {
+                            continue;
+                        };
                         self.flushing.remove(at);
                         match seq {
                             Ok(seq) => answer(out, to, Response::Flushed { seq }),
-                            Err(why) => fail(out, to, ApiError::new(why, Some("a read of the profile history".to_owned()))),  // alloc: error path
+                            Err(why) => fail(
+                                out,
+                                to,
+                                ApiError::new(
+                                    why,
+                                    Some("a read of the profile history".to_owned()),
+                                ),
+                            ), // alloc: error path
                         }
                     }
-                    Ok(Told::ClientWritten { to, written: Ok(()) }) => out.push(Reply { to, response: Response::Done { ok: true } }),
+                    Ok(Told::ClientWritten { to, written: Ok(()) }) => {
+                        out.push(Reply { to, response: Response::Done { ok: true } })
+                    }
                     Ok(Told::ClientWritten { to, written: Err(why) }) => {
                         fail(out, to, ApiError::new(why, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
                     }
@@ -1436,9 +1463,14 @@ mod tests {
         let (told_to, told) = crossbeam_channel::unbounded();
         keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default());
         assert_eq!(failed.try_recv().ok(), None);
-        let Ok(Told::Flushed { to: asker, seq: Ok(seq) }) = told.try_recv() else { panic!("the flush was told") };
+        let Ok(Told::Flushed { to: asker, seq: Ok(seq) }) = told.try_recv() else {
+            panic!("the flush was told")
+        };
         assert_eq!(asker, to(4, 9));
-        assert!(history::manifest::read(dir.path()).unwrap().flushed() >= seq, "the manifest says the flush told");
+        assert!(
+            history::manifest::read(dir.path()).unwrap().flushed() >= seq,
+            "the manifest says the flush told"
+        );
     }
 
     /// A flush the history's thread never answers fails at its deadline, naming what the
@@ -1446,7 +1478,8 @@ mod tests {
     #[test]
     fn a_flush_past_its_deadline_fails_naming_the_history_thread() {
         let dir = tempfile::tempdir().unwrap();
-        let (profiling, _keeper) = keep_history(dir.path(), None, blaze_profile::logs::Policy::default()).unwrap();
+        let (profiling, _keeper) =
+            keep_history(dir.path(), None, blaze_profile::logs::Policy::default()).unwrap();
         let mut observe = Observe::new(Some(profiling));
         let mut out = Vec::new();
         let at = Duration::from_secs(1);
@@ -1455,7 +1488,10 @@ mod tests {
         observe.flushing[0].until = at;
         observe.tick(at, |_| false, &mut out);
         let failed = out.iter().any(|it| matches!(&it.response, Response::Error(error) if error.what.contains("blaze-history")));
-        assert!(failed || out.iter().any(|it| matches!(it.response, Response::Flushed { .. })), "{out:?}");
+        assert!(
+            failed || out.iter().any(|it| matches!(it.response, Response::Flushed { .. })),
+            "{out:?}"
+        );
     }
 
     /// Build `build` of the workspace `/w` ending well, with nothing computed again.
@@ -1477,7 +1513,14 @@ mod tests {
             client_ns: None,
             daemon_cpu_ns: None,
         };
-        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new(), test_runs: Vec::new(), provenance: Vec::new() }
+        Ended {
+            row,
+            links: Vec::new(),
+            crate_deps: Vec::new(),
+            misses: Vec::new(),
+            test_runs: Vec::new(),
+            provenance: Vec::new(),
+        }
     }
 
     fn explained(build: u64) -> Told {

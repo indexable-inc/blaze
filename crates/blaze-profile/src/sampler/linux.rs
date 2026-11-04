@@ -140,7 +140,8 @@ impl Thread {
     /// On the thread itself, as it takes a ring.
     pub(crate) fn enter(&mut self, tid: u64) {
         // alloc: once a ring, kept for the process's life as the ring is
-        let slot: &'static Slot = *self.slot.get_or_insert_with(|| &*Box::leak(Box::new(Slot::new())));
+        let slot: &'static Slot =
+            *self.slot.get_or_insert_with(|| &*Box::leak(Box::new(Slot::new())));
         // A request to the thread that held the ring before is never answered: drop it.
         let asked = slot.asked.load(Ordering::Relaxed);
         slot.done.store(asked, Ordering::Relaxed);
@@ -171,8 +172,14 @@ impl Thread {
             // exit disables the alternate stack before thread-locals end, so most threads
             // find it disabled already, and its own stack freed: never put back).
             let back = match before {
-                Some((sp, size, flags)) => libc::stack_t { ss_sp: sp as *mut libc::c_void, ss_size: size, ss_flags: flags },
-                None => libc::stack_t { ss_sp: std::ptr::null_mut(), ss_size: 0, ss_flags: libc::SS_DISABLE },
+                Some((sp, size, flags)) => {
+                    libc::stack_t { ss_sp: sp as *mut libc::c_void, ss_size: size, ss_flags: flags }
+                }
+                None => libc::stack_t {
+                    ss_sp: std::ptr::null_mut(),
+                    ss_size: 0,
+                    ss_flags: libc::SS_DISABLE,
+                },
             };
             // SAFETY: sets this thread's alternate stack to the one it had (still mapped: it
             // was current until ours replaced it, and its owner frees it only after disabling
@@ -221,7 +228,8 @@ impl Thread {
         // SAFETY: the first page of the mapping just made: a guard below the stack, which
         // grows down, so an overflow faults instead of writing past it.
         unsafe { libc::mprotect(map, page, libc::PROT_NONE) };
-        let stack = libc::stack_t { ss_sp: map.wrapping_byte_add(page), ss_size: ALT_STACK, ss_flags: 0 };
+        let stack =
+            libc::stack_t { ss_sp: map.wrapping_byte_add(page), ss_size: ALT_STACK, ss_flags: 0 };
         // SAFETY: the stack is the mapping's `ALT_STACK` bytes past its guard, mapped until
         // `leave` unmaps it after taking it back.
         if unsafe { libc::sigaltstack(&stack, std::ptr::null_mut()) } != 0 {
@@ -230,8 +238,11 @@ impl Thread {
             return false;
         }
         self.own_stack = Some((map as usize, len));
-        self.before =
-            (now.ss_flags & libc::SS_DISABLE == 0).then_some((now.ss_sp as usize, now.ss_size, now.ss_flags));
+        self.before = (now.ss_flags & libc::SS_DISABLE == 0).then_some((
+            now.ss_sp as usize,
+            now.ss_size,
+            now.ss_flags,
+        ));
         true
     }
 }
@@ -289,7 +300,8 @@ pub(super) fn check() -> Result<(), Unsampled> {
     }
     // SAFETY: as above, an all-zero `sigaction` is valid; it is filled below.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = on_signal as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as usize;
+    action.sa_sigaction =
+        on_signal as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as usize;
     action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
     // SAFETY: `sa_mask` is the action's set, emptied in place.
     unsafe { libc::sigemptyset(&mut action.sa_mask) };
@@ -313,7 +325,8 @@ fn read_words(at: u64, out: &mut [u64]) -> bool {
     let remote = libc::iovec { iov_base: at as *mut libc::c_void, iov_len: bytes };
     // SAFETY: `local` is `out`, writable for `bytes`; `remote` names memory of this process
     // the kernel reads with its own checks, failing with `EFAULT` instead of faulting.
-    let read = unsafe { libc::process_vm_readv(PID.load(Ordering::Relaxed), &local, 1, &remote, 1, 0) };
+    let read =
+        unsafe { libc::process_vm_readv(PID.load(Ordering::Relaxed), &local, 1, &remote, 1, 0) };
     read == bytes as isize
 }
 
@@ -331,7 +344,8 @@ impl Window {
         let base = sp & !4095;
         let mut window = Window { base, len: 0, words: [0; WINDOW / 8] };
         let local = libc::iovec { iov_base: window.words.as_mut_ptr().cast(), iov_len: WINDOW };
-        let mut remote = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 4096 }; WINDOW_PAGES];
+        let mut remote =
+            [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 4096 }; WINDOW_PAGES];
         for (i, it) in remote.iter_mut().enumerate() {
             it.iov_base = (base + 4096 * i as u64) as *mut libc::c_void;
         }
@@ -340,7 +354,14 @@ impl Window {
         // mapped ends the copy there (a remote piece is never split), so the result is the
         // bytes up to it.
         let read = unsafe {
-            libc::process_vm_readv(PID.load(Ordering::Relaxed), &local, 1, remote.as_ptr(), WINDOW_PAGES as _, 0)
+            libc::process_vm_readv(
+                PID.load(Ordering::Relaxed),
+                &local,
+                1,
+                remote.as_ptr(),
+                WINDOW_PAGES as _,
+                0,
+            )
         };
         window.len = u64::try_from(read).unwrap_or(0);
         window
@@ -386,7 +407,13 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64, u64) {
 /// PC, then the return address of each frame record from the frame pointer up, by the one
 /// walker ([`crate::stack::walk`]), each record at or above the stack pointer. Every record is
 /// read through `read`, which fails instead of faulting. The count.
-fn walk(pc: u64, fp: u64, sp: u64, read: impl Fn(u64) -> Option<[u64; 2]>, pcs: &mut [u64; DEPTH]) -> usize {
+fn walk(
+    pc: u64,
+    fp: u64,
+    sp: u64,
+    read: impl Fn(u64) -> Option<[u64; 2]>,
+    pcs: &mut [u64; DEPTH],
+) -> usize {
     let mut depth = 0;
     let mut push = |pc: u64| {
         let pc = pc & crate::stack::ADDRESS;
@@ -408,7 +435,11 @@ fn walk(pc: u64, fp: u64, sp: u64, read: impl Fn(u64) -> Option<[u64; 2]>, pcs: 
 /// allocation or lock; atomics, its thread-local slot pointer, the interrupted registers,
 /// memory read through the kernel ([`read_words`], [`Window`]) and `clock_gettime`, which
 /// POSIX lists as safe. `errno` is put back as it was.
-extern "C" fn on_signal(_signal: libc::c_int, _info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+extern "C" fn on_signal(
+    _signal: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
     // SAFETY: the calling thread's `errno`, a thread-local the C library keeps for it.
     let errno = unsafe { *libc::__errno_location() };
     let slot = SLOT.with(std::cell::Cell::get);
@@ -474,7 +505,9 @@ impl Clock {
     }
 
     fn instant(&self, ns: u64) -> Instant {
-        self.now.checked_sub(Duration::from_nanos(self.now_ns.saturating_sub(ns))).unwrap_or(self.now)
+        self.now
+            .checked_sub(Duration::from_nanos(self.now_ns.saturating_sub(ns)))
+            .unwrap_or(self.now)
     }
 }
 
@@ -482,7 +515,8 @@ impl Clock {
 /// dropped and counted.
 fn collect(slot: &Slot, clock: &Clock) -> Option<Sample> {
     let done = slot.done.load(Ordering::Acquire);
-    if done != slot.asked.load(Ordering::Relaxed) || done == slot.collected.load(Ordering::Relaxed) {
+    if done != slot.asked.load(Ordering::Relaxed) || done == slot.collected.load(Ordering::Relaxed)
+    {
         return None;
     }
     slot.collected.store(done, Ordering::Relaxed);
@@ -565,7 +599,8 @@ pub(super) fn run(hz: u32) {
             }
             let asked = slot.asked.load(Ordering::Relaxed);
             if asked != slot.done.load(Ordering::Acquire) {
-                if clock.now_ns.saturating_sub(slot.asked_ns.load(Ordering::Relaxed)) < ASK_AGAIN_NS {
+                if clock.now_ns.saturating_sub(slot.asked_ns.load(Ordering::Relaxed)) < ASK_AGAIN_NS
+                {
                     continue;
                 }
                 ASKED_AGAIN.fetch_add(1, Ordering::Relaxed);
@@ -592,7 +627,10 @@ pub(super) fn run(hz: u32) {
             batch.clear();
             kept = Instant::now();
         }
-        #[allow(clippy::disallowed_methods, reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the sampler thread's own timer, a driver's: no pool thread or job waits here"
+        )]
         std::thread::sleep(every.saturating_sub(started.elapsed()));
     }
 }
@@ -622,11 +660,16 @@ mod tests {
     /// go up the stack, one below the stack pointer, and one it cannot read.
     #[test]
     fn a_walk_follows_frame_records_up_the_stack_and_stops_where_they_do() {
-        let records: [(u64, [u64; 2]); 3] = [(0x1000, [0x1020, 0xa1]), (0x1020, [0x1040, 0xa2]), (0x1040, [0x1030, 0xa3])];
+        let records: [(u64, [u64; 2]); 3] =
+            [(0x1000, [0x1020, 0xa1]), (0x1020, [0x1040, 0xa2]), (0x1040, [0x1030, 0xa3])];
         let read = |at: u64| records.iter().find(|it| it.0 == at).map(|it| it.1);
         let mut pcs = [0; DEPTH];
         let depth = walk(0xa0, 0x1000, 0x0f00, read, &mut pcs);
-        assert_eq!(&pcs[..depth], &[0xa0, 0xa1, 0xa2, 0xa3], "the last record points down the stack");
+        assert_eq!(
+            &pcs[..depth],
+            &[0xa0, 0xa1, 0xa2, 0xa3],
+            "the last record points down the stack"
+        );
         let depth = walk(0xa0, 0x1000, 0x1010, read, &mut pcs);
         assert_eq!(&pcs[..depth], &[0xa0], "a frame pointer below the stack pointer is no record");
         let depth = walk(0xa0, 0x2000, 0x0f00, read, &mut pcs);

@@ -2351,7 +2351,14 @@ impl<S: Steps> Job<S> {
             Stage::Units(build) => super::observe::provenance_rows(build_id, build.writer.ran()),
             _ => Vec::new(),
         };
-        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses, test_runs, provenance }
+        Ended {
+            row: self.row(request, stats, outcome),
+            links,
+            crate_deps,
+            misses,
+            test_runs,
+            provenance,
+        }
     }
 
     /// The value its stage waited on, if node `node` gave it.
@@ -2817,10 +2824,10 @@ impl<S: Steps> Jobs<S> {
             stats: RequestStats::default(),
             fresh: 0,
             compiled: 0,
-            served: Vec::new(), // alloc: none; a build fills it once
-            links: Vec::new(),  // alloc: none until a unit links
-            linked: Vec::new(), // alloc: none until a unit links
-            misses: Vec::new(), // alloc: none until a unit misses
+            served: Vec::new(),    // alloc: none; a build fills it once
+            links: Vec::new(),     // alloc: none until a unit links
+            linked: Vec::new(),    // alloc: none until a unit links
+            misses: Vec::new(),    // alloc: none until a unit misses
             test_runs: Vec::new(), // alloc: none until a test runs
             opened_cpu: None,
             opened_ns: 0,

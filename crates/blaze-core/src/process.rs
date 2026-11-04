@@ -346,7 +346,16 @@ pub(crate) fn start(
         stdin: spawned.stdin,
         stdout: spawned.stdout,
         stderr: spawned.stderr,
-        finish: Finish { command, confine, scratch, limit, listed, spawned: began, sandbox, executed },
+        finish: Finish {
+            command,
+            confine,
+            scratch,
+            limit,
+            listed,
+            spawned: began,
+            sandbox,
+            executed,
+        },
     })
 }
 
@@ -380,10 +389,14 @@ impl Finish {
         // Before the reap, which unlists it: the spawn effect that waits for it, whose label
         // says what it was.
         let label = match crate::reaped::observed() {
-            true => CHILDREN.lock().iter().find(|it| it.run == self.listed.run).and_then(|it| match it.waiter {
-                Waiter::Effect(tag) => Some(tag),
-                Waiter::Starter(_) | Waiter::Abandoned => None,
-            }),
+            true => {
+                CHILDREN.lock().iter().find(|it| it.run == self.listed.run).and_then(|it| match it
+                    .waiter
+                {
+                    Waiter::Effect(tag) => Some(tag),
+                    Waiter::Starter(_) | Waiter::Abandoned => None,
+                })
+            }
             false => None,
         }
         .and_then(crate::reaped::take);

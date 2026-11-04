@@ -185,7 +185,11 @@ pub fn runs(dir: &Path) -> Result<Vec<RunRow>, String> {
     // alloc: once a listing, the runs files
     let mut files: Vec<std::path::PathBuf> = manifest
         .files(schema::PERF_RUNS.name)
-        .filter(|name| name.strip_prefix("perf-").and_then(|it| it.split_once('.')).is_some_and(|(run, _)| is_run(run)))
+        .filter(|name| {
+            name.strip_prefix("perf-")
+                .and_then(|it| it.split_once('.'))
+                .is_some_and(|(run, _)| is_run(run))
+        })
         .map(|name| dir.join(name))
         .collect();
     files.sort_unstable();

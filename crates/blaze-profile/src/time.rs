@@ -67,8 +67,29 @@ pub struct SwitchIn {
 
 impl SwitchIn {
     /// A row of `event` and nothing past the switch's own columns.
-    pub fn of(process: u32, thread: u32, t_ns: i64, event: Event, job: u64, fiber: u32, core: u32) -> SwitchIn {
-        SwitchIn { process, thread, t_ns, event, job, fiber, core, by: None, since_ns: None, began_as: None, queued_ns: None, cpu_ns: None }
+    pub fn of(
+        process: u32,
+        thread: u32,
+        t_ns: i64,
+        event: Event,
+        job: u64,
+        fiber: u32,
+        core: u32,
+    ) -> SwitchIn {
+        SwitchIn {
+            process,
+            thread,
+            t_ns,
+            event,
+            job,
+            fiber,
+            core,
+            by: None,
+            since_ns: None,
+            began_as: None,
+            queued_ns: None,
+            cpu_ns: None,
+        }
     }
 }
 
@@ -417,11 +438,17 @@ impl Input {
             });
         }
         // alloc: the dump's fields by event, once a dump
-        let mut fields: HashMap<u64, Vec<(String, crate::logs::Value)>, Global> = HashMap::new_in(Global);
+        let mut fields: HashMap<u64, Vec<(String, crate::logs::Value)>, Global> =
+            HashMap::new_in(Global);
         for it in &read.fields {
-            let key = flight::meta(it.site).and_then(|meta| meta.fields().iter().nth(usize::from(it.index))).map_or("?", |it| it.name());
+            let key = flight::meta(it.site)
+                .and_then(|meta| meta.fields().iter().nth(usize::from(it.index)))
+                .map_or("?", |it| it.name());
             // alloc: a field, once a field a dump
-            fields.entry(it.event_id).or_default().push((key.to_owned(), crate::logs::Value::of(it.value)));
+            fields
+                .entry(it.event_id)
+                .or_default()
+                .push((key.to_owned(), crate::logs::Value::of(it.value)));
         }
         let events = read
             .events
@@ -484,7 +511,11 @@ pub enum TimeError {
     /// The rows of a daemon that died could not be read back from its flight recorder's
     /// mapping, or written into the history ([`crate::history::recover_dead`]).
     Postmortem(crate::history::HistoryError),
-    Io { path: std::path::PathBuf, doing: &'static str, error: std::io::Error },
+    Io {
+        path: std::path::PathBuf,
+        doing: &'static str,
+        error: std::io::Error,
+    },
     /// The rows of build `build` come from more than one process: each daemon numbered a build
     /// so in one history. Read as one build, their workers and windows would be summed.
     ManyProcesses {
@@ -529,10 +560,18 @@ impl fmt::Display for TimeError {
                 write!(f, "the column {table}.{column} {why}")
             }
             TimeError::Sql { doing, error } => write!(f, "{doing}: {error}"),
-            TimeError::Arrow { table, error } => write!(f, "making the rows of the derived table {table}: {error}"),
-            TimeError::History(error) => write!(f, "writing a derived table into the history: {error}"),
-            TimeError::Postmortem(error) => write!(f, "reading back the last rows of a daemon that died: {error}"),
-            TimeError::Io { path, doing, error } => write!(f, "{doing} {}: {error}", path.display()),
+            TimeError::Arrow { table, error } => {
+                write!(f, "making the rows of the derived table {table}: {error}")
+            }
+            TimeError::History(error) => {
+                write!(f, "writing a derived table into the history: {error}")
+            }
+            TimeError::Postmortem(error) => {
+                write!(f, "reading back the last rows of a daemon that died: {error}")
+            }
+            TimeError::Io { path, doing, error } => {
+                write!(f, "{doing} {}: {error}", path.display())
+            }
             TimeError::ManyProcesses { build, processes } => {
                 write!(
                     f,

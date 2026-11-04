@@ -69,9 +69,13 @@ pub fn readable(version: u32) -> Result<(), &'static str> {
         return Ok(());
     }
     if version > VERSION {
-        return Err("it is of a newer schema than this blaze reads: read it with the blaze that wrote it");
+        return Err(
+            "it is of a newer schema than this blaze reads: read it with the blaze that wrote it",
+        );
     }
-    Err("it is of a schema this blaze has no upgrade from: its rows mean something no reader can say (version 1 named jobs without their generation); delete it, or the history")
+    Err(
+        "it is of a schema this blaze has no upgrade from: its rows mean something no reader can say (version 1 named jobs without their generation); delete it, or the history",
+    )
 }
 
 /// The name of the clock the `*_ns` instants count on, as `hello` says it.
@@ -329,7 +333,11 @@ pub const EVENTS: Table = Table {
             "the job running on the thread, as `switches.job` names it (its `began_as` before it joined the graph); null on no job",
         ),
         col("level", Type::Dict, "ERROR, WARN, INFO or DEBUG"),
-        col("target", Type::Dict, "its tracing target: the module path it was written in, unless it names one"),
+        col(
+            "target",
+            Type::Dict,
+            "its tracing target: the module path it was written in, unless it names one",
+        ),
         col("name", Type::Dict, "its callsite, as tracing names it: `event <file>:<line>`"),
         opt(
             "message",
@@ -355,7 +363,11 @@ pub const EVENT_FIELDS: Table = Table {
         BUILD_ID,
         PROCESS,
         col("event_id", Type::U64, "the event, as `events.event_id` names it in its process"),
-        col("ordinal", Type::U16, "the field's place among its event's fields, in the order the event recorded them, from 0"),
+        col(
+            "ordinal",
+            Type::U16,
+            "the field's place among its event's fields, in the order the event recorded them, from 0",
+        ),
         col("key", Type::Dict, "the field's name, as its callsite writes it"),
         col(
             "kind",
@@ -366,7 +378,11 @@ pub const EVENT_FIELDS: Table = Table {
         opt("value_u64", Type::U64, "for kind u64: an unsigned integer (a u128 that fits)"),
         opt("value_f64", Type::F64, "for kind f64: a float"),
         opt("value_bool", Type::Bool, "for kind bool"),
-        opt("value_str", Type::Utf8, "for kind str: its text; null when the text was let go before a reader read it"),
+        opt(
+            "value_str",
+            Type::Utf8,
+            "for kind str: its text; null when the text was let go before a reader read it",
+        ),
     ],
 };
 
@@ -428,7 +444,11 @@ pub const BUILDS: Table = Table {
         col("started_ns", Type::I64, "when the daemon took it"),
         opt("dur_ns", Type::I64, "how long it ran; null while it runs"),
         opt("started_unix_ns", Type::I64, "when it was taken, on the wall clock"),
-        col("outcome", Type::Dict, "ok, failed, cancelled, stalled, running or crashed (its daemon died while it ran; written by the postmortem of the daemon's flight recorder)"),
+        col(
+            "outcome",
+            Type::Dict,
+            "ok, failed, cancelled, stalled, running or crashed (its daemon died while it ran; written by the postmortem of the daemon's flight recorder)",
+        ),
         opt("hits", Type::U64, "nodes the memo settled without running them"),
         opt("misses", Type::U64, "nodes that ran their task"),
         opt("joined", Type::U64, "nodes that took a task another node ran"),
@@ -458,7 +478,11 @@ pub const BUILDS: Table = Table {
             Type::I64,
             "the daemon process's user CPU over the build, from getrusage(RUSAGE_SELF) at its start and end: what the OS saw the daemon spend, set beside the spans' `self_cpu_ns` sum to show CPU no span covers. Process-wide, so of two builds that overlap each has the other's share; null while it runs",
         ),
-        opt("daemon_system_ns", Type::I64, "the daemon process's system CPU over the build, as `daemon_user_ns`"),
+        opt(
+            "daemon_system_ns",
+            Type::I64,
+            "the daemon process's system CPU over the build, as `daemon_user_ns`",
+        ),
     ],
 };
 
@@ -617,13 +641,37 @@ pub const IMAGES: Table = Table {
         ),
         col("seen_ns", Type::I64, "when it was written"),
         col("path", Type::Utf8, "the file it was loaded from"),
-        opt("build_id", Type::Utf8, "its GNU build id (Linux) or Mach-O UUID (macOS), hex; null when it has none"),
-        opt("blake3", Type::Utf8, "the BLAKE3 of its file, hex; null when it was not hashed, `unhashed` says why"),
-        opt("unhashed", Type::Utf8, "why `blake3` is null: the file is gone, changed (its build id no longer matches) or not on disk (macOS's shared cache)"),
+        opt(
+            "build_id",
+            Type::Utf8,
+            "its GNU build id (Linux) or Mach-O UUID (macOS), hex; null when it has none",
+        ),
+        opt(
+            "blake3",
+            Type::Utf8,
+            "the BLAKE3 of its file, hex; null when it was not hashed, `unhashed` says why",
+        ),
+        opt(
+            "unhashed",
+            Type::Utf8,
+            "why `blake3` is null: the file is gone, changed (its build id no longer matches) or not on disk (macOS's shared cache)",
+        ),
         col("base", Type::U64, "the address its code starts at in the process"),
-        col("size", Type::U64, "the bytes of code from `base`: an address in [base, base + size) is in it"),
-        col("slide", Type::U64, "how far it was loaded from the addresses its file gives: a file address is an address less this"),
-        col("names", Type::Dict, "how blaze named its frames: dwarf (functions and inlined ones), symbols (no DWARF), exports (a shared library's exported symbols) or none"),
+        col(
+            "size",
+            Type::U64,
+            "the bytes of code from `base`: an address in [base, base + size) is in it",
+        ),
+        col(
+            "slide",
+            Type::U64,
+            "how far it was loaded from the addresses its file gives: a file address is an address less this",
+        ),
+        col(
+            "names",
+            Type::Dict,
+            "how blaze named its frames: dwarf (functions and inlined ones), symbols (no DWARF), exports (a shared library's exported symbols) or none",
+        ),
     ],
 };
 
@@ -1110,15 +1158,31 @@ pub const PANICS: Table = Table {
         THREAD,
         THREAD_NAME,
         col("t_ns", Type::I64, "when it was raised"),
-        col("kind", Type::Dict, "panic, or signal (a fatal signal, recovered from the process's crash file after it died)"),
-        opt("job", Type::U64, "the job running on the thread, as `switches.job` names it; null on no job and for a signal"),
-        opt("span_id", Type::U64, "the innermost span its thread was inside, as `spans.span_id`; null outside any"),
+        col(
+            "kind",
+            Type::Dict,
+            "panic, or signal (a fatal signal, recovered from the process's crash file after it died)",
+        ),
+        opt(
+            "job",
+            Type::U64,
+            "the job running on the thread, as `switches.job` names it; null on no job and for a signal",
+        ),
+        opt(
+            "span_id",
+            Type::U64,
+            "the innermost span its thread was inside, as `spans.span_id`; null outside any",
+        ),
         opt(
             "message",
             Type::Utf8,
             "a panic's text (cut at 1 KiB, ending in `...`), null for a payload that is no text; for a signal its name and what it means, then the thread's last panic when it had one (an abort after a panic)",
         ),
-        opt("location", Type::Utf8, "a panic's `file:line:column`; for a signal, the location of the thread's last panic, if any"),
+        opt(
+            "location",
+            Type::Utf8,
+            "a panic's `file:line:column`; for a signal, the location of the thread's last panic, if any",
+        ),
         col(
             "stack",
             Type::Stack,
@@ -1134,9 +1198,21 @@ pub const PANICS: Table = Table {
             Type::U32,
             "1 when a job's boundary catches it (a plane task's or a pool job's on its fiber), so only that job failed and the daemon kept serving; 0 for a panic nothing catches (the thread ends) and for a signal",
         ),
-        col("open_spans", Type::Stack, "the names of the spans its thread was inside, outermost first (the first 16)"),
-        opt("signal", Type::Dict, "for a signal: its name (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT); null for a panic"),
-        opt("fault_addr", Type::U64, "for a signal: the address it is about (`si_addr`: the faulting access for SIGSEGV and SIGBUS); null for a panic"),
+        col(
+            "open_spans",
+            Type::Stack,
+            "the names of the spans its thread was inside, outermost first (the first 16)",
+        ),
+        opt(
+            "signal",
+            Type::Dict,
+            "for a signal: its name (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT); null for a panic",
+        ),
+        opt(
+            "fault_addr",
+            Type::U64,
+            "for a signal: the address it is about (`si_addr`: the faulting access for SIGSEGV and SIGBUS); null for a panic",
+        ),
         opt(
             "boot",
             Type::Dict,
@@ -1155,14 +1231,26 @@ pub const PROCESSES: Table = Table {
         BUILD_ID,
         PROCESS,
         col("pid", Type::U32, "the child's process id"),
-        col("kind", Type::Dict, "what it was: build_script, test, run, proc_macro_host, linker, wrapper, or unlabelled for a spawn no caller named"),
+        col(
+            "kind",
+            Type::Dict,
+            "what it was: build_script, test, run, proc_macro_host, linker, wrapper, or unlabelled for a spawn no caller named",
+        ),
         opt("unit", Type::Utf8, "the unit or test binary it ran for, as the spawner names it"),
         col("program", Type::Utf8, "the program it ran, as given to spawn"),
         opt("parent_span", Type::U64, "the span it was spawned inside, as `spans.span_id`"),
         col("spawned_ns", Type::I64, "when blaze asked for it"),
-        opt("exec_ns", Type::I64, "when the spawn call returned, the child having exec'd (vfork and posix_spawn return after exec)"),
+        opt(
+            "exec_ns",
+            Type::I64,
+            "when the spawn call returned, the child having exec'd (vfork and posix_spawn return after exec)",
+        ),
         col("exited_ns", Type::I64, "when blaze reaped it"),
-        opt("sandbox_ns", Type::I64, "how long making its sandbox took, before the spawn; null for a child run with none"),
+        opt(
+            "sandbox_ns",
+            Type::I64,
+            "how long making its sandbox took, before the spawn; null for a child run with none",
+        ),
         col("user_ns", Type::I64, "its user CPU"),
         col("system_ns", Type::I64, "its system CPU"),
         opt("peak_rss", Type::U64, "its peak resident set, in bytes"),

@@ -72,7 +72,8 @@ pub fn boot() -> Option<&'static str> {
 /// is not the image loaded (its build id differs: replaced since).
 pub fn blake3(image: &Image) -> Result<String, String> {
     // alloc: once a process
-    static HASHED: Mutex<BTreeMap<(u64, String), Result<String, String>>> = Mutex::new(BTreeMap::new());
+    static HASHED: Mutex<BTreeMap<(u64, String), Result<String, String>>> =
+        Mutex::new(BTreeMap::new());
     let key = (image.base, image.path.clone());
     if let Some(it) = HASHED.lock().get(&key) {
         return it.clone();
@@ -87,15 +88,29 @@ pub fn blake3(image: &Image) -> Result<String, String> {
 #[cfg(unix)]
 fn hash_file(image: &Image, open: &std::path::Path) -> Result<String, String> {
     use std::os::fd::AsRawFd;
-    let file = std::fs::File::open(open).map_err(|error| format!("opening {}: {error}", open.display()))?;
-    let len = file.metadata().map_err(|error| format!("reading the size of {}: {error}", open.display()))?.len();
-    let len = usize::try_from(len).map_err(|_| format!("{} is past the address space", open.display()))?;
+    let file = std::fs::File::open(open)
+        .map_err(|error| format!("opening {}: {error}", open.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("reading the size of {}: {error}", open.display()))?
+        .len();
+    let len = usize::try_from(len)
+        .map_err(|_| format!("{} is past the address space", open.display()))?;
     if len == 0 {
         return Err(format!("{} is empty", open.display()));
     }
     // SAFETY: a new read-only private mapping of `len` bytes of a file opened above, unmapped
     // below before anything it lends out outlives it.
-    let at = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+    let at = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
     if at == libc::MAP_FAILED {
         return Err(format!("mapping {}: {}", open.display(), std::io::Error::last_os_error()));
     }
@@ -110,7 +125,10 @@ fn hash_file(image: &Image, open: &std::path::Path) -> Result<String, String> {
                 "the file at {} is not the image loaded: its build id is {got}, the image's {want} (replaced since it was loaded)",
                 open.display()
             )),
-            None => Err(format!("the file at {} has no build id, the image loaded has {want}", open.display())),
+            None => Err(format!(
+                "the file at {} has no build id, the image loaded has {want}",
+                open.display()
+            )),
         },
         None => Ok(()),
     };
@@ -141,7 +159,11 @@ mod platform {
     const NT_GNU_BUILD_ID: u32 = 3;
 
     pub(super) fn loaded() -> Vec<Image> {
-        unsafe extern "C" fn each(info: *mut libc::dl_phdr_info, _size: libc::size_t, out: *mut libc::c_void) -> libc::c_int {
+        unsafe extern "C" fn each(
+            info: *mut libc::dl_phdr_info,
+            _size: libc::size_t,
+            out: *mut libc::c_void,
+        ) -> libc::c_int {
             // SAFETY: the loader gives a valid entry for the length of the call, and `out` is
             // the `Vec<Image>` `loaded` passed, alive and not otherwise borrowed for the call.
             let (info, out) = unsafe { (&*info, &mut *out.cast::<Vec<Image>>()) };
@@ -190,27 +212,34 @@ mod platform {
             loads.iter().any(|&(from, to)| from <= start && end <= to).then_some(())?;
             // SAFETY: `[start, end)` lies inside a `PT_LOAD` segment of the object, mapped
             // readable while it is loaded, which it is for the call.
-            let notes = unsafe { std::slice::from_raw_parts(start as *const u8, it.p_memsz as usize) };
+            let notes =
+                unsafe { std::slice::from_raw_parts(start as *const u8, it.p_memsz as usize) };
             gnu_build_id(notes, if it.p_align == 8 { 8 } else { 4 })
         });
         // SAFETY: the loader's NUL-terminated name of the object, or null.
-        let name = (!info.dlpi_name.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(info.dlpi_name) });
+        let name = (!info.dlpi_name.is_null())
+            .then(|| unsafe { std::ffi::CStr::from_ptr(info.dlpi_name) });
         let name = name.map(|it| it.to_string_lossy().into_owned()).filter(|it| !it.is_empty());
         let main = first && name.is_none();
         let path = match name {
             Some(it) => it,
-            None => std::env::current_exe().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default(),
+            None => std::env::current_exe()
+                .map(|it| it.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         };
         Some(Image { path, build_id, base: low, size: high - low, slide: bias, main })
     }
 
     /// The GNU build id among ELF notes `notes`, each aligned to `align`.
     pub(super) fn gnu_build_id(notes: &[u8], align: usize) -> Option<String> {
-        let word = |at: usize| -> Option<u32> { Some(u32::from_ne_bytes(notes.get(at..at + 4)?.try_into().ok()?)) };
+        let word = |at: usize| -> Option<u32> {
+            Some(u32::from_ne_bytes(notes.get(at..at + 4)?.try_into().ok()?))
+        };
         let pad = |n: usize| n.div_ceil(align) * align;
         let mut at = 0;
         while at + 12 <= notes.len() {
-            let (name_len, desc_len, kind) = (word(at)? as usize, word(at + 4)? as usize, word(at + 8)?);
+            let (name_len, desc_len, kind) =
+                (word(at)? as usize, word(at + 4)? as usize, word(at + 8)?);
             let name_at = at + 12;
             let desc_at = name_at + pad(name_len);
             let name = notes.get(name_at..name_at + name_len)?;
@@ -230,10 +259,17 @@ mod platform {
 
     pub(super) fn hash(image: &Image) -> Result<String, String> {
         if image.path.is_empty() || !image.path.starts_with('/') {
-            return Err(format!("`{}` names no file (the kernel's vDSO, or a loader with no path)", image.path));
+            return Err(format!(
+                "`{}` names no file (the kernel's vDSO, or a loader with no path)",
+                image.path
+            ));
         }
         // The executable's own inode, whatever its path holds now.
-        let open = if image.main { std::path::Path::new("/proc/self/exe") } else { std::path::Path::new(&image.path) };
+        let open = if image.main {
+            std::path::Path::new("/proc/self/exe")
+        } else {
+            std::path::Path::new(&image.path)
+        };
         super::hash_file(image, open)
     }
 }
@@ -262,7 +298,8 @@ mod platform {
             // SAFETY: as above; a NUL-terminated path dyld keeps while the image is loaded.
             let name = unsafe { libc::_dyld_get_image_name(i) };
             // SAFETY: as above, checked for null.
-            let path = (!name.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned());
+            let path = (!name.is_null())
+                .then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned());
             // SAFETY: `header` is the loaded image's Mach-O header, mapped while it is loaded.
             if let Some((base, size, uuid)) = unsafe { read(header.cast()) } {
                 out.push(Image {
@@ -308,7 +345,10 @@ mod platform {
                 if name.starts_with(b"__TEXT\0") {
                     // SAFETY: as above, `vmaddr` and `vmsize` at 24 and 32 of the command.
                     let (addr, len) = unsafe {
-                        (header.add(at + 24).cast::<u64>().read_unaligned(), header.add(at + 32).cast::<u64>().read_unaligned())
+                        (
+                            header.add(at + 24).cast::<u64>().read_unaligned(),
+                            header.add(at + 32).cast::<u64>().read_unaligned(),
+                        )
                     };
                     text = Some((addr, len));
                 }
@@ -329,7 +369,13 @@ mod platform {
         // SAFETY: a NUL-terminated name, a buffer of `len` bytes to fill and its length to
         // update; no new value.
         let got = unsafe {
-            libc::sysctlbyname(c"kern.bootsessionuuid".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
         };
         if got != 0 {
             return None;
@@ -383,7 +429,10 @@ mod tests {
     fn the_executable_is_an_image_holding_its_own_code_with_a_build_id_and_a_hash() {
         let pc = here();
         let images = loaded();
-        let own = images.iter().find(|it| it.contains(pc)).unwrap_or_else(|| panic!("no image holds {pc:#x}: {images:#?}"));
+        let own = images
+            .iter()
+            .find(|it| it.contains(pc))
+            .unwrap_or_else(|| panic!("no image holds {pc:#x}: {images:#?}"));
         assert!(own.main, "{own:?}");
         assert!(own.build_id.is_some(), "the executable has a build id or UUID: {own:?}");
         let hash = blake3(own).unwrap_or_else(|why| panic!("{why}"));
@@ -395,7 +444,9 @@ mod tests {
     #[test]
     fn a_gnu_build_id_note_is_read_past_other_notes() {
         let mut notes = Vec::new();
-        for (name, kind, desc) in [(&b"Go\0\0"[..], 4u32, &[1u8, 2, 3][..]), (&b"GNU\0"[..], 3, &[0xab, 0xcd][..])] {
+        for (name, kind, desc) in
+            [(&b"Go\0\0"[..], 4u32, &[1u8, 2, 3][..]), (&b"GNU\0"[..], 3, &[0xab, 0xcd][..])]
+        {
             notes.extend_from_slice(&(name.len() as u32).to_ne_bytes());
             notes.extend_from_slice(&(desc.len() as u32).to_ne_bytes());
             notes.extend_from_slice(&kind.to_ne_bytes());

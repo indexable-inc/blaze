@@ -10,8 +10,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use super::{DEPTH, Sample, Unsampled, keep};
 
-pub(super) const HOW: &str =
-    "each thread that records spans, running or blocked inside a span, stopped (thread_suspend) and its frame pointers walked";
+pub(super) const HOW: &str = "each thread that records spans, running or blocked inside a span, stopped (thread_suspend) and its frame pointers walked";
 
 /// How often the samples taken are kept.
 const KEEP_EVERY: Duration = Duration::from_millis(100);
