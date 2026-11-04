@@ -1034,10 +1034,16 @@ holds an exclusive lock on (`flight/postmortem.rs`):
 Recording is unchanged: a thread writes its own store with the same atomics, with no system
 call and no allocation, and no row holds an address. Rings made before the history persisted
 move into the file, each by its own thread as it next writes (a ring no thread holds moves at
-once). The file's disk is reserved before it is mapped (`posix_fallocate` on Linux,
-`F_PREALLOCATE` on macOS), so a full disk is an error at persist time, not a SIGBUS later: about
-19 MiB, and 2 MiB more a ring. On Windows the history says it can't persist and records as
-before.
+once). The file is reserved whole as it is made: its fixed part (about 19.3 MiB) and a store
+for each of the first 256 rings (`MAPPED_RINGS`; each 2 MiB of rows and a 4 KiB head, about
+532 MiB in all), with `posix_fallocate` on Linux and `F_PREALLOCATE` on macOS, so a full disk
+is an error at persist time naming the file and why, never a SIGBUS later. A ring past persist
+takes its store with no system call. There is no heap fallback: a process with more than 256
+rings as it persists refuses to persist (the error names the file), and after it persists a
+thread past the 256th gets no ring (its spans count as ringless) and the next flush reports the
+store as full. The map and the crash records (`crash.<pid>`) count against the history's cap
+(4 GiB), so the files the history keeps plus them stay under it, the newest build excepted. On
+Windows the history says it can't persist and records as before.
 
 Each flush marks in every store the row it wrote to. A history that opens (and `blaze slow`
 with no daemon) takes every `flight-*.map` whose lock no one holds, so of a process that died:
@@ -1046,7 +1052,10 @@ answers it; the file stays until a blaze that reads it does, or it is deleted), 
 past each store's flushed row with the decoder the live reads use, gives their names and sites
 numbers of its own, writes them as files of the dead process, writes a `crashed` row for each
 build it was running, and deletes the file. The blaze hash is kept but not checked: the file
-describes itself, so a blaze rebuilt after a crash reads it.
+describes itself (its layout's version and the fingerprint of every constant decoding rests
+on, the event fields' too), so a blaze rebuilt after a crash, the usual case when the crash is
+being fixed, reads it; a check of the hash would refuse exactly those files, and the
+fingerprint already refuses every one this blaze would misread.
 
 ## The live feed
 

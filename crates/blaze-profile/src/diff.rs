@@ -524,6 +524,8 @@ errors gone:
                 joined: None,
                 tree: None,
                 blaze: None,
+                client_ns: None,
+                daemon_cpu_ns: None,
             };
             history.build_ended(row);
             if build == 82 {

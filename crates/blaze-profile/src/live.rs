@@ -31,7 +31,7 @@ use arrow_buffer::Buffer;
 use arrow_ipc::{
     CompressionType,
     reader::{StreamDecoder, StreamReader},
-    writer::{DictionaryHandling, IpcWriteOptions, StreamEncoder},
+    writer::{DictionaryHandling, IpcWriteOptions, StreamEncoder, StreamWriter},
 };
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 use blaze_hash::HashMap;
@@ -468,7 +468,18 @@ impl Decoder {
     }
 }
 
-/// The batches of one whole Arrow IPC stream (an answer: `views`, `blaze debug sql --live`),
+/// `batch` as one whole Arrow IPC stream, zstd-compressed, into `into` (cleared first): what
+/// [`decode`] reads (a client's rows, `Request::ClientRows`), not the live feed's stream
+/// ([`Encoder`]).
+pub fn encode(batch: &RecordBatch, into: &mut Vec<u8>) -> Result<(), ArrowError> {
+    into.clear();
+    let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
+    let mut writer = StreamWriter::try_new_with_options(&mut *into, batch.schema_ref(), options)?;
+    writer.write(batch)?;
+    writer.finish()
+}
+
+/// The batches of one whole Arrow IPC stream (an answer: `views`; a client's rows, [`encode`]),
 /// not the live feed's, which is one stream across frames ([`Decoder`]).
 pub fn decode(bytes: &[u8]) -> Result<Vec<RecordBatch>, ArrowError> {
     // alloc: an answer's batches, on the client, once an answer

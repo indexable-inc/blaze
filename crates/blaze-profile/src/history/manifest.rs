@@ -482,7 +482,8 @@ pub(crate) enum Kind {
     Schema,
     /// A hidden file: one being written, or one a crash left half written.
     Hidden,
-    /// Not Parquet: the owner's lock, the manifest and its lock, `blaze why`'s ledger.
+    /// Not Parquet: the owner's lock, the manifest and its lock, `blaze why`'s ledger, the
+    /// flight recorder's map (`flight-<pid>.map`) and the crash records (`crash.<pid>`).
     Other,
     /// Parquet of no form blaze writes here.
     Unclassified,

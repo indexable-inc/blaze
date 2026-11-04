@@ -184,6 +184,8 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
         joined: None,
         tree: None,
         blaze: None,
+        client_ns: None,
+        daemon_cpu_ns: None,
     });
     let entered = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {

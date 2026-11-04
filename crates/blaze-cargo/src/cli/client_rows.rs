@@ -83,7 +83,7 @@ fn encoded<E: std::fmt::Display>(build: u64, table: &str, batch: Result<arrow_ar
     // alloc: the request's bytes, once a client
     let mut bytes = Vec::new();
     if batch.num_rows() > 0 {
-        live::ipc(&batch, &mut bytes).map_err(|error| format!("encoding build {build}'s client {table} rows: {error}"))?;
+        live::encode(&batch, &mut bytes).map_err(|error| format!("encoding build {build}'s client {table} rows: {error}"))?;
     }
     Ok(bytes)
 }

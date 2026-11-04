@@ -66,6 +66,9 @@ pub enum Kind {
     Encode,
     /// The page stopped the request: DuckDB was killed before it answered.
     Cancelled,
+    /// The daemon could not flush the history before the query (`ops::Flush`), so the query
+    /// was not run: it would have missed the rows recorded since the last flush.
+    Flush,
 }
 
 impl Kind {
@@ -83,6 +86,7 @@ impl Kind {
             Kind::Overloaded => "overloaded",
             Kind::Encode => "encode",
             Kind::Cancelled => "cancelled",
+            Kind::Flush => "flush",
         }
     }
 }

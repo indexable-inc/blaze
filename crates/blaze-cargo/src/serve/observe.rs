@@ -259,6 +259,9 @@ enum ToHistory {
     /// before the ask is drained by this flush, so a reader that reads the manifest it
     /// committed reads them.
     Flush(RequestRef),
+    /// Flush now for the explorer's next query, and send the flush's number (or why it failed)
+    /// to the explorer's thread that waits for it ([`explorer_flush`]).
+    FlushFor(Sender<Result<u64, String>>),
     /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
     /// written at once and `to` answered once it is ([`Told::ClientWritten`]).
     Client { to: RequestRef, rows: history::ClientRows },
@@ -487,6 +490,17 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 _ = told.send(Told::Flushed { to, seq });
                 (flushed, false)
             }
+            Ok(ToHistory::FlushFor(reply)) => {
+                doing.set(Step::FlushingAsked, 0);
+                let flushed = history.flush(None);
+                let seq = match &flushed {
+                    Ok(it) => Ok(it.seq),
+                    // alloc: error path, a flush that failed
+                    Err(error) => Err(format!("the profile history's flush failed: {error}")),
+                };
+                _ = reply.send(seq);
+                (flushed, false)
+            }
             Ok(ToHistory::Started(row)) => {
                 doing.set(Step::Flushing, row.build_id);
                 history.build_started(row);
@@ -636,6 +650,58 @@ struct Asked {
     until: Duration,
 }
 
+/// The explorer's flush before each query (decision 3: a query reads every row recorded
+/// before it was asked, as a CLI reader's [`blaze_api::Request::Flush`] does): asks the
+/// history's thread to flush ([`ToHistory::FlushFor`]) and waits for the flush's number, at
+/// most [`FLUSH_WAIT`], on the explorer's own blocking thread, never the loop. Past the wait,
+/// or with the history's thread gone, an error names what the thread is doing.
+///
+/// Queries that wait together share one flush: a query takes a ticket as it asks, and a flush
+/// that took a later ticket as it began drained every row recorded before the ask, so its
+/// number answers the query too. A page that asks for many tiles at once costs one flush, not
+/// one each.
+#[cfg(feature = "native")]
+fn explorer_flush(profiling: &Profiling) -> blaze_explore::Flush {
+    // clone: the history's sender and its step, once an explorer
+    let (ended, doing) = (profiling.ended.clone(), Arc::clone(&profiling.doing));
+    let tickets = AtomicU64::new(0);
+    // The last flush done for the explorer: the ticket it took as it began, and its number.
+    let last: parking_lot::Mutex<Option<(u64, u64)>> = parking_lot::Mutex::new(None);
+    blaze_explore::Flush::new(move || {
+        let asked = tickets.fetch_add(1, Ordering::SeqCst);
+        let _span = tracing::info_span!(target: "blaze", "wait for the profile history's flush for the explorer", asked).entered();
+        let mut last = last.lock();
+        if let Some((began, seq)) = *last
+            && began > asked
+        {
+            return Ok(seq);
+        }
+        let began = tickets.fetch_add(1, Ordering::SeqCst);
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        if ended.send(ToHistory::FlushFor(reply)).is_err() {
+            // alloc: error path
+            return Err("the profile history's thread (`blaze-history`) ended, so nothing flushes what the daemon recorded since its last flush".to_owned());
+        }
+        let seq = match answer.recv_timeout(FLUSH_WAIT) {
+            Ok(seq) => seq?,
+            // alloc: error path
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "the profile history's flush for the explorer took over {}s: its thread is {}",
+                    FLUSH_WAIT.as_secs(),
+                    doing.said()
+                ));
+            }
+            // alloc: error path
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("the profile history's thread (`blaze-history`) ended before it flushed for the explorer".to_owned());
+            }
+        };
+        *last = Some((began, seq));
+        Ok(seq)
+    })
+}
+
 impl Observe {
     pub fn new(profiling: Option<Profiling>) -> Observe {
         let answers = Answers::new(profiling.is_some());
@@ -751,6 +817,7 @@ impl Observe {
                     // clone: two paths, once an explorer
                     duckdb: profiling.duckdb.clone(),
                     dir: profiling.dir.clone(),  // clone: once an explorer
+                    flush: explorer_flush(profiling),
                 },
                 world: None,
                 dev_origin: dev,

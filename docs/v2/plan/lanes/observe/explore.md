@@ -141,7 +141,12 @@ so a build that doesn't exist answers `no_such_build`, not zero rows.
 **Error kinds:** `unknown_op`, `bad_args`, `bad_token`, `unauthenticated`, `sql`
 (DuckDB's message and the query in the detail), `no_such_build`, `no_such_view`, `no_world`,
 `world` (Flecs answered something other than 200 JSON), `overloaded`, `encode` (Arrow
-refused a result), and `cancelled` (the request was stopped and DuckDB killed).
+refused a result), `cancelled` (the request was stopped and DuckDB killed), and `flush` (the
+daemon could not flush the history before the query, so it was not run).
+
+Every query first has the daemon flush the history (the flush a CLI reader asks for with
+`Request::Flush`), so it reads every row recorded before it was asked; queries waiting at once
+share one flush.
 
 **Limits:** 16 requests in flight per session, a 17th is answered `overloaded`. A request is at
 most 1 MiB and must arrive whole within 10 s.

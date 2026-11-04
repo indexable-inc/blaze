@@ -614,7 +614,7 @@ mod tests {
     use super::*;
 
     fn explorer() -> Explorer {
-        let history = History { duckdb: None, dir: PathBuf::from("/nowhere") };
+        let history = History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: crate::Flush::new(|| Ok(0)) };
         start(Config { history, world: None, dev_origin: false, daemon: "test" }).unwrap()
     }
 
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn a_session_from_the_dev_server_is_taken_only_when_asked() {
-        let history = History { duckdb: None, dir: PathBuf::from("/nowhere") };
+        let history = History { duckdb: None, dir: PathBuf::from("/nowhere"), flush: crate::Flush::new(|| Ok(0)) };
         let explorer = start(Config { history, world: None, dev_origin: true, daemon: "test" }).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {

@@ -637,6 +637,8 @@ mod tests {
             joined: Some(0),
             tree: None,
             blaze: None,
+            client_ns: None,
+            daemon_cpu_ns: None,
         });
         history.flush(Some(77)).unwrap();
 

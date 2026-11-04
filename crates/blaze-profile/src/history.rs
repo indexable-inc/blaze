@@ -50,7 +50,8 @@
 //! What a reader sees is what the history committed: rows the drain took and no flush has
 //! written yet are in no file. A reader that asks for everything recorded so far asks the
 //! daemon that writes the history to flush first (`blaze_api::Request::Flush`, which every
-//! CLI reader of the history sends before it reads: blaze-cargo's `cli::observe`), and the
+//! CLI reader of the history sends before it reads: blaze-cargo's `cli::observe`; the explorer
+//! has the daemon flush before each query the same way), and the
 //! flush's number it answers is in the manifest it then reads ([`Manifest::flushed`]): every
 //! row recorded before the ask is in exactly one listed file, with no window of the rings
 //! beside them to overlap the files.
@@ -2001,6 +2002,8 @@ fn write_recovered(dir: &Path, writer: &mut Writer, seq: u64, recovered: &flight
             tree: None,
             // clone: a hash, once a build
             blaze: (!recovered.blaze.is_empty()).then(|| recovered.blaze.clone()),
+            client_ns: None,
+            daemon_cpu_ns: None,
         })
         .collect();
     let tables: [(&'static Table, RecordBatch); 7] = [
@@ -2193,7 +2196,7 @@ mod tests {
         let span = client_span(81);
         let spans = batches::spans(&[span], Process { pid: 9, name: "client", commit: None }).unwrap();
         let mut bytes = Vec::new();
-        crate::live::ipc(&spans, &mut bytes).unwrap();
+        crate::live::encode(&spans, &mut bytes).unwrap();
         history
             .client_rows(ClientRows { build: 81, started_ns: 500, ended_ns: 90_000, spans: bytes, ..ClientRows::default() })
             .unwrap();
@@ -2206,7 +2209,7 @@ mod tests {
 
         let mut other = Vec::new();
         let span = client_span(82);
-        crate::live::ipc(&batches::spans(&[span], Process { pid: 9, name: "client", commit: None }).unwrap(), &mut other).unwrap();
+        crate::live::encode(&batches::spans(&[span], Process { pid: 9, name: "client", commit: None }).unwrap(), &mut other).unwrap();
         let refused = history.client_rows(ClientRows { build: 81, spans: other, ..ClientRows::default() });
         assert!(matches!(refused, Err(HistoryError::Client { build: 81, table: "spans", .. })), "{refused:?}");
         _ = fs::remove_dir_all(&dir);
