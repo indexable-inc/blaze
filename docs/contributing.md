@@ -395,7 +395,9 @@ no zlib, zstd, libxml2 or terminfo, on the release's runners (Ubuntu 22.04 for a
 macOS 13 as the deployment target, the static CRT on Windows). For a target `llvm.json` has no
 archive for, run the workflow for it and add the `targets` entry its summary prints. To move the pin, change
 `ref`, `commit` and `version` in `llvm.json`, run the workflow, and write the `targets` its
-summary prints (`llvm.py pin`). LLVM's own release archives do not do: the macOS ones hold
+summary prints (`llvm.py pin`), then write the new LLVM's CPU aliases (`apple-m1` of `apple-a14`, which
+`-C target-cpu` takes and `rustc --print target-cpus` leaves out) with
+`uv run --frozen python tools/llvm_cpus.py '{"write": true}'`. LLVM's own release archives do not do: the macOS ones hold
 bitcode, and the Linux ones need zlib, zstd and libxml2.
 
 ### The stencil pin

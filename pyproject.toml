@@ -46,6 +46,7 @@ include = [
   "tools/astlog/scan.py",
   "tools/devirt/*.py",
   "tools/layout",
+  "tools/llvm_cpus.py",
   "tools/similar",
   "tools/typed-input",
   "tools/v2",
@@ -80,6 +81,7 @@ include = [
   "tools/astlog/scan.py",
   "tools/devirt",
   "tools/layout",
+  "tools/llvm_cpus.py",
   "tools/typed-input",
   "tools/v2",
 ]
