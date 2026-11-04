@@ -11,7 +11,6 @@ mod literal;
 
 use base_db::Crate;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     AdtId, EnumId, HasModule as _,
     hir::{BinaryOp, CmpOp, Expr, ExprId, Literal, Ordering, Pat, PatId, UnaryOp},
@@ -20,6 +19,7 @@ use hir_def::{
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
 use intern::Symbol;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
+use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _};
 
 use super::util::{self, Solver};
@@ -113,7 +113,10 @@ impl TypeLimits {
 
     fn is_non_null(&mut self, b: &BodyCx<'_, '_, '_>, adt: AdtId) -> bool {
         let name = self.names.non_null;
-        *self.non_null.entry(adt).or_insert_with(|| util::diagnostic_item(b.db(), adt.into()) == Some(name))
+        *self
+            .non_null
+            .entry(adt)
+            .or_insert_with(|| util::diagnostic_item(b.db(), adt.into()) == Some(name))
     }
 }
 
@@ -241,7 +244,9 @@ impl LatePass for TypeLimits {
                 };
                 let may_overflow = match self.pat_lits.contains(&Some(expr)) {
                     true => literal::pat_may_overflow(b, expr, lit, self.pointer_bits),
-                    false => literal::may_overflow(b, expr, lit, negation.is_some(), self.pointer_bits),
+                    false => {
+                        literal::may_overflow(b, expr, lit, negation.is_some(), self.pointer_bits)
+                    }
                 };
                 if may_overflow {
                     literal::lint_literal(b, expr, negation, out);
@@ -255,8 +260,14 @@ impl LatePass for TypeLimits {
             Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(op)) } => {
                 let op = Cmp::of(op);
                 if !check_limits(b, op, lhs, rhs) {
-                    let (Some(at), Some(span)) = (b.expr_node(expr), util::span(b, expr)) else { return };
-                    let diag = Diag::lint("unused_comparisons", "comparison is useless due to type limits", span);
+                    let (Some(at), Some(span)) = (b.expr_node(expr), util::span(b, expr)) else {
+                        return;
+                    };
+                    let diag = Diag::lint(
+                        "unused_comparisons",
+                        "comparison is useless due to type limits",
+                        span,
+                    );
                     out.push(b.lint(diag, Phase::Late, at));
                     return;
                 }
@@ -285,7 +296,9 @@ impl LatePass for TypeLimits {
                     return;
                 }
                 let Some(def) = util::method_fn(b, expr) else { return };
-                let Some(cmpop) = util::fn_item(b.db(), def).and_then(|it| self.cmpop(it)) else { return };
+                let Some(cmpop) = util::fn_item(b.db(), def).and_then(|it| self.cmpop(it)) else {
+                    return;
+                };
                 self.pointers(b, expr, operand, cmpop, receiver, arg, out);
             }
             _ => {}
@@ -378,11 +391,20 @@ impl TypeLimits {
     }
 
     /// rustc's `lint_nan`.
-    fn lint_nan(&self, b: &BodyCx<'_, '_, '_>, e: ExprId, op: Cmp, l: ExprId, r: ExprId) -> Option<Found> {
+    fn lint_nan(
+        &self,
+        b: &BodyCx<'_, '_, '_>,
+        e: ExprId,
+        op: Cmp,
+        l: ExprId,
+        r: ExprId,
+    ) -> Option<Found> {
         let nan = match op {
             Cmp::Eq | Cmp::Ne if self.is_nan(b, l) => Nan::EqLeft,
             Cmp::Eq | Cmp::Ne if self.is_nan(b, r) => Nan::EqRight,
-            Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge if self.is_nan(b, l) || self.is_nan(b, r) => Nan::Ord,
+            Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge if self.is_nan(b, l) || self.is_nan(b, r) => {
+                Nan::Ord
+            }
             _ => return None,
         };
         const LINT: &str = "invalid_nan_comparisons";
@@ -396,9 +418,9 @@ impl TypeLimits {
         let mut diag =
             // clone: a span, for the invalid_nan_comparisons lint
             Diag::lint(LINT, "incorrect NaN comparison, NaN cannot be directly compared to itself", e_span.clone());
-        let spans = util::span(b, l)
-            .zip(util::span(b, r))
-            .and_then(|(l, r)| Some((util::ancestor_inside(&l, &e_span)?, util::ancestor_inside(&r, &e_span)?)));
+        let spans = util::span(b, l).zip(util::span(b, r)).and_then(|(l, r)| {
+            Some((util::ancestor_inside(&l, &e_span)?, util::ancestor_inside(&r, &e_span)?))
+        });
         let Some((l_span, r_span)) = spans else {
             diag.help(HELP);
             return Some(b.lint(diag, Phase::Late, at));
@@ -418,7 +440,12 @@ impl TypeLimits {
         parts.push((operand.shrink_to_hi(), ".is_nan()".to_owned()));
         // alloc: the invalid_nan_comparisons lint's text
         parts.push((removed, String::new()));
-        diag.suggestion_with_style(parts, HELP, Applicability::MachineApplicable, SuggestionStyle::ShowAlways);
+        diag.suggestion_with_style(
+            parts,
+            HELP,
+            Applicability::MachineApplicable,
+            SuggestionStyle::ShowAlways,
+        );
         Some(b.lint(diag, Phase::Late, at))
     }
 }
@@ -439,7 +466,8 @@ impl TypeLimits {
             _ => return None,
         };
         let solver = solver.get_or_insert_with(|| Solver::of(b));
-        (!solver.is_sized(pointee)).then(|| (refs, modifiers, matches!(pointee.kind(), TyKind::Dynamic(..))))
+        (!solver.is_sized(pointee))
+            .then(|| (refs, modifiers, matches!(pointee.kind(), TyKind::Dynamic(..))))
     }
 
     /// rustc's `lint_wide_pointer`.
@@ -452,8 +480,7 @@ impl TypeLimits {
         r: ExprId,
     ) -> Option<Found> {
         const LINT: &str = "ambiguous_wide_pointer_comparisons";
-        const MESSAGE: &str =
-            "ambiguous wide pointer comparison, the comparison includes metadata which may not be expected";
+        const MESSAGE: &str = "ambiguous wide pointer comparison, the comparison includes metadata which may not be expected";
         let mut solver = None;
         let l = util::peel_borrows(b, l);
         let r = util::peel_borrows(b, r);
@@ -463,25 +490,33 @@ impl TypeLimits {
         let at = b.expr_node(e)?;
         // clone: a span, for the ambiguous_wide_pointer_comparisons lint
         let mut diag = Diag::lint(LINT, MESSAGE, e_span.clone());
-        let spans = util::span(b, l)
-            .zip(util::span(b, r))
-            .and_then(|(l, r)| Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?)));
+        let spans = util::span(b, l).zip(util::span(b, r)).and_then(|(l, r)| {
+            Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?))
+        });
         let Some((l_span, r_span)) = spans else {
             diag.help("use explicit `std::ptr::eq` method to compare metadata and addresses");
-            diag.help("use `std::ptr::addr_eq` or untyped pointers to only compare their addresses");
+            diag.help(
+                "use `std::ptr::addr_eq` or untyped pointers to only compare their addresses",
+            );
             return Some(b.lint(diag, Phase::Late, at));
         };
         let ne = if cmpop == ComparisonOp::BinOp(Cmp::Ne) { "!" } else { "" };
         let is_eq_ne = matches!(cmpop, ComparisonOp::BinOp(Cmp::Eq | Cmp::Ne));
         let is_dyn_comparison = l_dyn && r_dyn;
-        let via_method_call = matches!(b.store().expr(e), Expr::MethodCall { .. } | Expr::Call { .. });
+        let via_method_call =
+            matches!(b.store().expr(e), Expr::MethodCall { .. } | Expr::Call { .. });
         let left = until(&e_span.shrink_to_lo(), &l_span.shrink_to_lo());
         let middle = until(&l_span.shrink_to_hi(), &r_span.shrink_to_lo());
         let right = until(&r_span.shrink_to_hi(), &e_span.shrink_to_hi());
         let deref_left = "*".repeat(l_refs);
         let deref_right = "*".repeat(r_refs);
         let verbose = |diag: &mut Diag, message: &str, parts: Vec<(Span, String)>| {
-            diag.suggestion_with_style(parts, message, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+            diag.suggestion_with_style(
+                parts,
+                message,
+                Applicability::MaybeIncorrect,
+                SuggestionStyle::ShowAlways,
+            );
         };
         let eq_parts = |function: &str| {
             // alloc: the ambiguous_wide_pointer_comparisons lint's text
@@ -501,7 +536,11 @@ impl TypeLimits {
                 eq_parts("addr_eq"),
             );
             if !is_dyn_comparison {
-                verbose(&mut diag, "use explicit `std::ptr::eq` method to compare metadata and addresses", eq_parts("eq"));
+                verbose(
+                    &mut diag,
+                    "use explicit `std::ptr::eq` method to compare metadata and addresses",
+                    eq_parts("eq"),
+                );
             }
         } else {
             let paren_left = if l_refs != 0 { ")" } else { "" };
@@ -530,7 +569,9 @@ impl TypeLimits {
                     (
                         e_span.shrink_to_lo(),
                         // alloc: the ambiguous_wide_pointer_comparisons lint's text
-                        format!(r#"{{ #[expect(ambiguous_wide_pointer_comparisons, reason = "...")] {open}"#),
+                        format!(
+                            r#"{{ #[expect(ambiguous_wide_pointer_comparisons, reason = "...")] {open}"#
+                        ),
                     ),
                     // alloc: the ambiguous_wide_pointer_comparisons lint's text
                     (e_span.shrink_to_hi(), format!("{close} }}")),
@@ -557,7 +598,9 @@ impl TypeLimits {
         let (r_ty, r_refs) = peel_refs(util::ty(b, r));
         if !(is_fn(l_ty) && is_fn(r_ty)) {
             let some_fn = |ty: Ty<'db>| match ty.as_adt() {
-                Some((adt, args)) => self.option.is_some_and(|it| AdtId::from(it) == adt) && is_fn(args.type_at(0)),
+                Some((adt, args)) => {
+                    self.option.is_some_and(|it| AdtId::from(it) == adt) && is_fn(args.type_at(0))
+                }
                 None => false,
             };
             if !(some_fn(l_ty) && some_fn(r_ty)) {
@@ -582,9 +625,9 @@ impl TypeLimits {
             return Some(b.lint(warn(), Phase::Late, at));
         }
         let is_eq_ne = matches!(cmpop, ComparisonOp::BinOp(Cmp::Eq | Cmp::Ne));
-        let spans = util::span(b, l)
-            .zip(util::span(b, r))
-            .and_then(|(l, r)| Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?)));
+        let spans = util::span(b, l).zip(util::span(b, r)).and_then(|(l, r)| {
+            Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?))
+        });
         let (true, Some((l_span, r_span))) = (is_eq_ne, spans) else {
             return Some(b.lint(warn(), Phase::Late, at));
         };

@@ -33,7 +33,7 @@ use hir_ty::{
 };
 
 use crate::{
-    cx::{Arm, Cx, VariantIdx, Witness, Pat},
+    cx::{Arm, Cx, Pat, VariantIdx, Witness},
     lower::Lowerer,
     visit::known_valid_scrutinee,
 };
@@ -119,7 +119,8 @@ pub(crate) fn catch_alls<'db>(
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::typeck_for_body(interner, def.into()));
     // With what the body's `for const` loops assume of their binders, as inference had it.
-    let env = hir_ty::comptime_env::body_env(&infcx, infer, db.trait_environment(def.generic_def(db)));
+    let env =
+        hir_ty::comptime_env::body_env(&infcx, infer, db.trait_environment(def.generic_def(db)));
     let features = UnstableFeatures::query(db, krate);
     let cx = Cx {
         db,
@@ -145,7 +146,10 @@ pub(crate) fn catch_alls<'db>(
     let mut at = 0;
     while at < candidates.len() {
         let match_expr = candidates[at].match_expr;
-        let end = candidates[at..].iter().position(|it| it.match_expr != match_expr).map_or(candidates.len(), |it| at + it);
+        let end = candidates[at..]
+            .iter()
+            .position(|it| it.match_expr != match_expr)
+            .map_or(candidates.len(), |it| at + it);
         let group = &candidates[at..end];
         at = end;
         let Expr::Match { arms, .. } = body.expr(match_expr) else { continue };
@@ -208,10 +212,8 @@ fn check_match<'a, 'db>(
         }
         covered.sort_unstable();
         covered.dedup();
-        let variants = covered
-            .into_iter()
-            .map(|idx| VariantIdx(idx).id(cx.db, candidate.enum_))
-            .collect(); // alloc: the answer's variants
+        let variants =
+            covered.into_iter().map(|idx| VariantIdx(idx).id(cx.db, candidate.enum_)).collect(); // alloc: the answer's variants
         found.push(CatchAll {
             match_expr: candidate.match_expr,
             arm_pat: arms[i].pat,
@@ -270,7 +272,9 @@ fn meet<'a, 'db>(
     }
     // A slice's fields are indexed by its kind (`[a, .., z]` against `[a, b, c]`), which this
     // walk doesn't line up: a catch-all in it may take any variant.
-    if matches!(pat.ctor(), Constructor::Slice(_)) || matches!(witness.ctor(), Constructor::Slice(_)) {
+    if matches!(pat.ctor(), Constructor::Slice(_))
+        || matches!(witness.ctor(), Constructor::Slice(_))
+    {
         take_all_under(cx, pat, target, out);
         return true;
     }
@@ -297,7 +301,12 @@ fn ctors_meet<'a, 'db>(pat: &Constructor<Cx<'a, 'db>>, witness: &Constructor<Cx<
 }
 
 /// Every variant for the catch-all `target`, where it is inside `pat`.
-fn take_all_under<'a, 'db>(cx: &Cx<'a, 'db>, pat: &Pat<'a, 'db>, target: PatId, out: &mut Vec<u32>) {
+fn take_all_under<'a, 'db>(
+    cx: &Cx<'a, 'db>,
+    pat: &Pat<'a, 'db>,
+    target: PatId,
+    out: &mut Vec<u32>,
+) {
     pat.walk(&mut |inner| {
         if matches!(inner.ctor(), Constructor::Wildcard) && *inner.data() == target {
             every_variant(cx, *inner.ty(), out);

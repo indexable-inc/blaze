@@ -50,7 +50,9 @@ pub(crate) fn component(domain: &'static str, members: &[Member<'_>]) -> Vec<Con
         h.update(&(callees.len() as u32).to_le_bytes());
         for callee in callees {
             match (*callee, place) {
-                (Ref::Internal(at), Some(place)) => h.update(&[0]).update(&place[at as usize].to_le_bytes()),
+                (Ref::Internal(at), Some(place)) => {
+                    h.update(&[0]).update(&place[at as usize].to_le_bytes())
+                }
                 (Ref::Internal(_), None) => h.update(&[0]),
                 (Ref::External(id), _) => h.update(&[1]).id(&id),
             };
@@ -73,7 +75,13 @@ pub(crate) fn component(domain: &'static str, members: &[Member<'_>]) -> Vec<Con
         for (at, &member) in order.iter().enumerate() {
             place[member as usize] = at as u32;
         }
-        let whole = hash_whole(domain, order.iter().map(|&at| &members[at as usize]), members.len(), &place, edges);
+        let whole = hash_whole(
+            domain,
+            order.iter().map(|&at| &members[at as usize]),
+            members.len(),
+            &place,
+            edges,
+        );
         // alloc: as `local`
         return place.iter().map(|&place| member_id(domain, &whole, place)).collect();
     };
@@ -150,9 +158,12 @@ pub(crate) fn identity<'g, G: Graph<'g>>(
         let callees = local
             .callees
             .iter()
-            .map(|callee| graph.id(callee).map(Ref::External).map_err(|error| graph.through(node, error)))
+            .map(|callee| {
+                graph.id(callee).map(Ref::External).map_err(|error| graph.through(node, error))
+            })
             .collect::<Result<Vec<Ref>, G::Error>>()?;
-        let member = Member { content: local.content, name: ContentId::default(), callees: &callees };
+        let member =
+            Member { content: local.content, name: ContentId::default(), callees: &callees };
         return Ok(component(domain, &[member])[0]);
     }
     let members = component_of(graph, node, local, fuel)?;
@@ -246,7 +257,8 @@ fn component_of<'g, G: Graph<'g>>(
             parent.low = parent.low.min(low);
         }
         if low == v {
-            let from = stack.iter().rposition(|&it| it == v).expect("a component's root is on the stack");
+            let from =
+                stack.iter().rposition(|&it| it == v).expect("a component's root is on the stack");
             let members = stack.split_off(from); // alloc: one component
             for &member in &members {
                 visits[member as usize].on_stack = false;

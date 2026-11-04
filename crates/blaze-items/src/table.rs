@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_ids::{ContentId, bits::Ranked};
 use blaze_mem::{Frame, Tag, frame};
 use blaze_query::QueryKind;
@@ -165,7 +165,8 @@ fn dense<T>(count: usize, values: impl Iterator<Item = T>) -> Box<[T]> {
 pub fn crate_hashes(db: &Db, krate: Crate) -> HashColumns {
     frame::task(Tag::Other, |frame| {
         let items = crate_items_by_key(db, krate);
-        let mut rows: Vec<(ItemKey, ItemHashes), &Frame> = Vec::with_capacity_in(items.len(), frame);
+        let mut rows: Vec<(ItemKey, ItemHashes), &Frame> =
+            Vec::with_capacity_in(items.len(), frame);
         let mut unhashable: Vec<(ItemKey, Unhashable), &Frame> = Vec::new_in(frame);
         for &(key, id) in items.iter() {
             match hash::hashes(db, id) {
@@ -334,8 +335,9 @@ impl FromIterator<Fact> for FactSet {
                 ids.len() < NO_OBJECT as usize,
                 "blaze-items: more than u32::MAX ids in a fact set"
             );
-            let at =
-                |id: ContentId| ids.binary_search(&id).expect("every id is in the dictionary") as u32;
+            let at = |id: ContentId| {
+                ids.binary_search(&id).expect("every id is in the dictionary") as u32
+            };
             // Positions in a sorted dictionary order as the ids do, so sorting the encoded rows
             // sorts the facts by content.
             rows.sort_unstable();

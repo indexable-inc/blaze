@@ -48,7 +48,12 @@ Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease
 plan) is a synchronous state machine that reads time only from an injected clock
 (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and
 deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a
-transcript with no real clock.
+transcript with no real clock. Protocol code is a core too: an HTTP client or server, TLS (through
+rustls's own byte-in/byte-out `Connection`, never `tokio-rustls`), the daemon's wire protocol, a
+remote-cache or registry client. Its interface is bytes in, bytes and events out, so any IO backend
+can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no change to
+the core. A dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util,
+reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped.
 
 ## every-wait-says-what (rule 15)
 

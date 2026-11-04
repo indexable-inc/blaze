@@ -108,11 +108,8 @@ pub(crate) fn init_panic_hook() {
                 .location()
                 .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
                 .unwrap_or_else(|| "<unknown>".to_string());
-            let backtrace = if CAPTURE_BACKTRACE.get() {
-                Backtrace::capture()
-            } else {
-                Backtrace::disabled()
-            };
+            let backtrace =
+                if CAPTURE_BACKTRACE.get() { Backtrace::capture() } else { Backtrace::disabled() };
 
             LAST_PANIC_INFO
                 .with(|l| *l.borrow_mut() = Some((thread_name, thread_id, location, backtrace)));
@@ -144,32 +141,17 @@ fn filter_short_backtrace(backtrace_str: &str) -> String {
     for (i, line) in lines.iter().enumerate() {
         if line.contains("__rust_end_short_backtrace") {
             for (j, next_line) in lines.iter().enumerate().skip(i + 1) {
-                if next_line
-                    .trim_start()
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit())
-                {
+                if next_line.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     start_idx = j;
                     break;
                 }
             }
         }
         if line.contains("__rust_begin_short_backtrace") {
-            for (j, prev_line) in lines
-                .iter()
-                .enumerate()
-                .take(i + 1)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
+            for (j, prev_line) in
+                lines.iter().enumerate().take(i + 1).collect::<Vec<_>>().into_iter().rev()
             {
-                if prev_line
-                    .trim_start()
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit())
-                {
+                if prev_line.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     end_idx = j;
                     break;
                 }
@@ -214,12 +196,7 @@ fn filter_short_backtrace(backtrace_str: &str) -> String {
 /// counterexample; fixing that needs cross-thread capture, which is
 /// deferred until there is structured concurrency support to hang it on.
 pub(crate) fn unknown_panic_info() -> (String, String, String, Backtrace) {
-    (
-        "<unknown>".to_string(),
-        "?".to_string(),
-        "<unknown>".to_string(),
-        Backtrace::disabled(),
-    )
+    ("<unknown>".to_string(), "?".to_string(), "<unknown>".to_string(), Backtrace::disabled())
 }
 
 /// Extract a string message from a panic payload. Pre-N1 this was duplicated
@@ -285,11 +262,7 @@ pub(crate) fn run_test_case(
     verbosity: Verbosity,
     output: &RunOutput,
     case_sink: Option<crate::test_case::OutputSink>,
-) -> (
-    TestCaseResult,
-    Option<Box<dyn std::any::Any + Send>>,
-    Option<String>,
-) {
+) -> (TestCaseResult, Option<Box<dyn std::any::Any + Send>>, Option<String>) {
     let verbose = matches!(verbosity, Verbosity::Verbose | Verbosity::Debug);
     let quiet = verbosity == Verbosity::Quiet;
     let stamped = !is_final && c_tc.should_capture();
@@ -301,11 +274,8 @@ pub(crate) fn run_test_case(
     take_panic_info();
 
     let c_tc = Arc::new(c_tc);
-    let tc = TestCase::new(
-        Arc::clone(&c_tc),
-        should_emit,
-        case_sink.or_else(|| output.sink().cloned()),
-    );
+    let tc =
+        TestCase::new(Arc::clone(&c_tc), should_emit, case_sink.or_else(|| output.sink().cloned()));
     let reporter = tc.reporter();
     let result = with_test_context(|| catch_unwind(AssertUnwindSafe(|| test_fn(tc))));
     reporter.emit_rendered_output();
@@ -348,9 +318,8 @@ pub(crate) fn run_test_case(
                 }
                 None
             };
-            let failure = TestCaseResult::Interesting(Failure {
-                origin: format!("Panic at {}", location),
-            });
+            let failure =
+                TestCaseResult::Interesting(Failure { origin: format!("Panic at {}", location) });
             (failure, Some(e), captured)
         }
     };
@@ -378,14 +347,11 @@ fn report_outcome(handle: &CTestCase, result: &TestCaseResult) {
         TestCaseResult::Valid => (Status::HEGEL_STATUS_VALID, None),
         TestCaseResult::Invalid => (Status::HEGEL_STATUS_INVALID, None),
         TestCaseResult::Overrun => (Status::HEGEL_STATUS_OVERRUN, None),
-        TestCaseResult::Interesting(failure) => (
-            Status::HEGEL_STATUS_INTERESTING,
-            Some(failure.origin.as_str()),
-        ),
+        TestCaseResult::Interesting(failure) => {
+            (Status::HEGEL_STATUS_INTERESTING, Some(failure.origin.as_str()))
+        }
     };
-    handle
-        .mark_complete(status, origin)
-        .unwrap_or_else(|rc| crate::test_case::raise_for_rc(rc));
+    handle.mark_complete(status, origin).unwrap_or_else(|rc| crate::test_case::raise_for_rc(rc));
 }
 
 /// Print a per-test-case line describing why this test case stopped.
@@ -412,17 +378,12 @@ fn render_diagnostic(
     backtrace: &Backtrace,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "thread '{}' ({}) panicked at {}:\n",
-        thread_name, thread_id, location
-    ));
+    out.push_str(&format!("thread '{}' ({}) panicked at {}:\n", thread_name, thread_id, location));
     out.push_str(msg);
     out.push('\n');
     // nocov start
     if backtrace.status() == BacktraceStatus::Captured {
-        let is_full = std::env::var("RUST_BACKTRACE")
-            .map(|v| v == "full")
-            .unwrap_or(false);
+        let is_full = std::env::var("RUST_BACKTRACE").map(|v| v == "full").unwrap_or(false);
         let formatted = format_backtrace(backtrace, is_full);
         out.push_str(&format!("stack backtrace:\n{}\n", formatted));
         if !is_full {
@@ -553,26 +514,12 @@ pub(crate) fn drive<F>(
             Ok(run) => run,
             Err(message) => panic!("{message}"), // nocov
         };
-        drive_run(
-            &run,
-            || run.next_test_case(),
-            &mut test_fn,
-            settings,
-            &output,
-            None,
-        );
+        drive_run(&run, || run.next_test_case(), &mut test_fn, settings, &output, None);
         return;
     };
     let run = RunHandle::start_external(&c_settings, output.sink())
         .unwrap_or_else(|message| panic!("{message}"));
-    drive_run(
-        &run,
-        || next_external_case(&run, source),
-        &mut test_fn,
-        settings,
-        &output,
-        None,
-    );
+    drive_run(&run, || next_external_case(&run, source), &mut test_fn, settings, &output, None);
 }
 
 /// The next test case of a run under external generation, answering each
@@ -625,10 +572,7 @@ fn drive_run<F: FnMut(TestCase)>(
                 if let Some(live) = &live {
                     live.line(line);
                 }
-                buffer
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(line.to_string());
+                buffer.lock().unwrap_or_else(|e| e.into_inner()).push(line.to_string());
             }))
         };
         let (tc_result, payload, diagnostic) =
@@ -665,9 +609,7 @@ fn drive_run<F: FnMut(TestCase)>(
             let count = result.failure_count();
             let multiple = count > 1;
             if multiple && !quiet {
-                output.line(&format!(
-                    "Property-based test failed with {count} distinct failures."
-                ));
+                output.line(&format!("Property-based test failed with {count} distinct failures."));
             }
             let mut last_payload: Option<Box<dyn std::any::Any + Send>> = None;
             for index in 0..count {

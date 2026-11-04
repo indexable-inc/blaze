@@ -106,7 +106,10 @@ pub(crate) fn imports(
             FuncTarget::Symbol(symbol) if symbol == RANDOM_KEYS => {
                 let ty = WasmSignature::of(&request.sig, address).map_err(|what| {
                     // alloc: an error
-                    format!("{} calls std's `{RANDOM_KEYS}`, whose signature has no wasm type: {what}", owner())
+                    format!(
+                        "{} calls std's `{RANDOM_KEYS}`, whose signature has no wasm type: {what}",
+                        owner()
+                    )
                 })?;
                 if ty.params != [address.wasm()] || !ty.results.is_empty() {
                     // alloc: an error
@@ -125,10 +128,14 @@ pub(crate) fn imports(
             FuncTarget::Instance(instance, _) => {
                 let InstanceDef::Fn(func) = instance.def else { continue };
                 let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else { continue };
-                let (Some(name), Some((module, field))) = (link_name_for(db, target, func), crate::wasm_import(db, func))
+                let (Some(name), Some((module, field))) =
+                    (link_name_for(db, target, func), crate::wasm_import(db, func))
                 else {
                     // alloc: an error
-                    return Err(format!("{} names a function of an `extern` block with no link name", owner()));
+                    return Err(format!(
+                        "{} names a function of an `extern` block with no link name",
+                        owner()
+                    ));
                 };
                 // alloc: the import's module, which it keeps
                 (name, module.unwrap_or_else(|| ENV.to_owned()), field)
@@ -186,7 +193,8 @@ pub(crate) fn with_header(code: Vec<u8>, header: &Header) -> Result<(Vec<u8>, u3
 /// (`Abs4`), each a padded LEB of five bytes; on wasm64 an `i64.const` of either (`Abs8`), a
 /// padded LEB of ten. A function is a request's or the body a fold's thunk calls.
 pub(crate) fn reloc_kind(kind: Reloc, name: RelocName) -> Result<RelocKind, String> {
-    let function = matches!(name, RelocName::Func(_) | RelocName::User { namespace: BODY, index: 0 });
+    let function =
+        matches!(name, RelocName::Func(_) | RelocName::User { namespace: BODY, index: 0 });
     match name {
         _ if function && kind == CALL => Ok(RelocKind::WasmFunction),
         _ if function && kind == Reloc::Abs4 => Ok(RelocKind::WasmTable),
@@ -194,7 +202,9 @@ pub(crate) fn reloc_kind(kind: Reloc, name: RelocName) -> Result<RelocKind, Stri
         RelocName::Data(_) if kind == Reloc::Abs4 => Ok(RelocKind::WasmMemory),
         RelocName::Data(_) if kind == Reloc::Abs8 => Ok(RelocKind::WasmMemory64),
         // alloc: an error
-        _ => Err(format!("a {kind:?} relocation at {name:?} in wasm code, which `wasm::lower` makes none of")),
+        _ => Err(format!(
+            "a {kind:?} relocation at {name:?} in wasm code, which `wasm::lower` makes none of"
+        )),
     }
 }
 
@@ -226,7 +236,11 @@ pub mod random { pub fn hashmap_random_keys() -> (u64, u64) { (1, 2) } }
         )
         .into_db();
         assert_eq!(bridged(&db, function(&db, std_crate(&db), RANDOM_KEYS)), Some(RANDOM_KEYS));
-        assert_eq!(bridged(&db, function(&db, fixture::test_crate(&db), RANDOM_KEYS)), None, "a crate of its own");
+        assert_eq!(
+            bridged(&db, function(&db, fixture::test_crate(&db), RANDOM_KEYS)),
+            None,
+            "a crate of its own"
+        );
     }
 
     #[test]

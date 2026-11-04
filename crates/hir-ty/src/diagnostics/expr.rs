@@ -4,7 +4,6 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, EnumVariantId, HasModule, ItemContainerId,
@@ -17,6 +16,7 @@ use hir_def::{
 };
 use intern::sym;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
+use std::alloc::Global;
 use syntax::{AstNode, ast};
 
 use crate::{
@@ -62,7 +62,8 @@ impl<'db> BodyValidationDiagnostic<'db> {
         owner: DefWithBodyId,
         validate_lints: bool,
     ) -> Vec<BodyValidationDiagnostic<'db>> {
-        let _p = tracing::info_span!(target: "blaze", "BodyValidationDiagnostic::collect").entered();
+        let _p =
+            tracing::info_span!(target: "blaze", "BodyValidationDiagnostic::collect").entered();
         let infer = InferenceResult::of(db, owner);
         let body = Body::of(db, owner);
         let env = db.trait_environment(owner.generic_def(db));
@@ -112,9 +113,8 @@ impl<'db> ExprValidator<'db> {
         }
 
         for (id, expr) in body.exprs() {
-            let missing = record_literal_missing_fields(db, body, self.infer, id, expr).or_else(|| {
-                Some((record_literal_spread_only(self.infer, id, expr)?, Vec::new()))
-            });
+            let missing = record_literal_missing_fields(db, body, self.infer, id, expr)
+                .or_else(|| Some((record_literal_spread_only(self.infer, id, expr)?, Vec::new())));
             if let Some((variant, missed_fields)) = missing {
                 self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
                     record: Either::Left(id),

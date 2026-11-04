@@ -216,25 +216,13 @@ pub(crate) enum ProfileError {
 impl core::fmt::Display for ProfileError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ProfileError::Config {
-                path,
-                line: 0,
-                message,
-            } => {
+            ProfileError::Config { path, line: 0, message } => {
                 write!(f, "{path}: {message}")
             }
-            ProfileError::Config {
-                path,
-                line,
-                message,
-            } => {
+            ProfileError::Config { path, line, message } => {
                 write!(f, "{path}:{line}: {message}")
             }
-            ProfileError::UnknownProfile {
-                name,
-                source,
-                known,
-            } => {
+            ProfileError::UnknownProfile { name, source, known } => {
                 write!(f, "unknown settings profile {name:?}")?;
                 if let Some(source) = source {
                     write!(f, " (named by {source})")?;
@@ -275,10 +263,7 @@ impl core::fmt::Display for ProfileError {
 /// Whether `name` is usable as a profile name, both for registration and
 /// for `hegel.toml` section names.
 pub(crate) fn is_valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The deltas of the three shipped profiles.
@@ -348,9 +333,7 @@ pub(crate) fn register(name: &str, settings: &Settings) -> Result<(), ProfileErr
 pub(crate) fn set_default_profile(name: Option<&str>) -> Result<(), ProfileError> {
     if let Some(name) = name {
         if name == DEFAULT {
-            return Err(ProfileError::CircularDefault {
-                source: "hegel_set_default_profile",
-            });
+            return Err(ProfileError::CircularDefault { source: "hegel_set_default_profile" });
         }
         if !is_valid_name(name) {
             return Err(ProfileError::InvalidName(name.to_owned()));
@@ -616,15 +599,9 @@ fn settings_for_from(
     let candidates = Candidates::gather(config, overridden, &env);
     validate(config, registry, &candidates)?;
     let base = Settings::base(crate::antithesis::antithesis_env_var_set_from(&env));
-    let mut settings = resolve(
-        name.unwrap_or(DEFAULT),
-        config,
-        registry,
-        &base,
-        &candidates,
-    )?
-    .with_env_overrides_from(&env)
-    .map_err(ProfileError::Environment)?;
+    let mut settings = resolve(name.unwrap_or(DEFAULT), config, registry, &base, &candidates)?
+        .with_env_overrides_from(&env)
+        .map_err(ProfileError::Environment)?;
     settings.config_path = config.path.clone();
     Ok(settings)
 }

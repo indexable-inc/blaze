@@ -64,9 +64,9 @@ pub use compare::{
     compare_impl_method_signature, compare_proc_macro_signature, trait_signature_in_impl,
 };
 pub use outlives::{Inferred, unrigid};
-pub use refine::{ImplTraitRefinement, RefinementKind, Undercapture, impl_trait_refinement};
-pub use persist::{WfDiagnosticRef, WfResultRef, WfRow};
 use outlives::{Known, Needs, Wfcx};
+pub use persist::{WfDiagnosticRef, WfResultRef, WfRow};
+pub use refine::{ImplTraitRefinement, RefinementKind, Undercapture, impl_trait_refinement};
 
 /// Where an error is: rustc's span of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
@@ -740,9 +740,7 @@ fn push_new(
     message: std::fmt::Arguments<'_>,
     site: Site,
 ) {
-    if found
-        .iter()
-        .any(|it| it.code == code && it.site == site && formats_to(&it.message, message))
+    if found.iter().any(|it| it.code == code && it.site == site && formats_to(&it.message, message))
     {
         return;
     }

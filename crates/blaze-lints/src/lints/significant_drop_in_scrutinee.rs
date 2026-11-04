@@ -73,7 +73,9 @@ fn lets(condition: ast::Expr<'_>) -> Vec<ast::LetExpr<'_>> {
         match it {
             ast::Expr::LetExpr(it) => out.push(it),
             ast::Expr::ParenExpr(it) => stack.extend(it.expr()),
-            ast::Expr::BinExpr(it) if it.op_kind() == Some(ast::BinaryOp::LogicOp(ast::LogicOp::And)) => {
+            ast::Expr::BinExpr(it)
+                if it.op_kind() == Some(ast::BinaryOp::LogicOp(ast::LogicOp::And)) =>
+            {
                 stack.extend(it.rhs());
                 stack.extend(it.lhs());
             }
@@ -85,7 +87,13 @@ fn lets(condition: ast::Expr<'_>) -> Vec<ast::LetExpr<'_>> {
 
 /// Lints the guards made as temporaries in `scrutinee`, of `construct` (a `what`); `fixable`
 /// when the construct's value is the scrutinee's alone, not one `let` of a chain.
-fn check<'t>(cx: &mut Cx<'_, 't>, construct: ast::Node<'t>, what: &str, scrutinee: ast::Expr<'t>, fixable: bool) {
+fn check<'t>(
+    cx: &mut Cx<'_, 't>,
+    construct: ast::Node<'t>,
+    what: &str,
+    scrutinee: ast::Expr<'t>,
+    fixable: bool,
+) {
     if !cx.is_written(scrutinee.syntax()) {
         return;
     }
@@ -99,12 +107,15 @@ fn check<'t>(cx: &mut Cx<'_, 't>, construct: ast::Node<'t>, what: &str, scrutine
             continue;
         }
         stack.extend(node.children());
-        if !matches!(node.kind(), K::CALL_EXPR | K::METHOD_CALL_EXPR) || node == scrutinee.syntax() {
+        if !matches!(node.kind(), K::CALL_EXPR | K::METHOD_CALL_EXPR) || node == scrutinee.syntax()
+        {
             continue;
         }
         let Some(call) = ast::Expr::cast(node) else { continue };
         let Some(ty) = cx.ty(call) else { continue };
-        if ty.as_adt().and_then(|adt| guards.kind(db, adt)) != Some(Kind::Lock) || !in_place(cx, call, scrutinee) {
+        if ty.as_adt().and_then(|adt| guards.kind(db, adt)) != Some(Kind::Lock)
+            || !in_place(cx, call, scrutinee)
+        {
             continue;
         }
         let Some(range) = cx.range(node) else { continue };
@@ -129,7 +140,9 @@ fn check<'t>(cx: &mut Cx<'_, 't>, construct: ast::Node<'t>, what: &str, scrutine
         diagnostic.note("a temporary of a scrutinee lives until the end of the whole expression");
         match &fix {
             Some(parts) => {
-                diagnostic.note("with the fix the arms run without the lock: check that they don't need it");
+                diagnostic.note(
+                    "with the fix the arms run without the lock: check that they don't need it",
+                );
                 diagnostic.multipart_suggestion(
                     "bind the value first, so the guard drops at the end of that statement",
                     parts.clone(), // clone: one per guard of the scrutinee, a few
@@ -155,9 +168,9 @@ fn in_place<'t>(cx: &Cx<'_, 't>, call: ast::Expr<'t>, scrutinee: ast::Expr<'t>) 
     if outer.syntax() == scrutinee.syntax() {
         return false;
     }
-    let adjusted = cx
-        .adjustments(outer)
-        .is_some_and(|it| it.iter().any(|it| matches!(it.kind, hir::Adjust::Deref(_) | hir::Adjust::Borrow(_))));
+    let adjusted = cx.adjustments(outer).is_some_and(|it| {
+        it.iter().any(|it| matches!(it.kind, hir::Adjust::Deref(_) | hir::Adjust::Borrow(_)))
+    });
     if adjusted {
         return true;
     }
@@ -175,7 +188,11 @@ fn in_place<'t>(cx: &Cx<'_, 't>, call: ast::Expr<'t>, scrutinee: ast::Expr<'t>) 
 /// The fix: `let value = <scrutinee>;` before the statement `construct` is, and `value` for
 /// the scrutinee. `None` when the construct is no statement or block value, or the value may
 /// hold a borrow of the guard.
-fn fix<'t>(cx: &Cx<'_, 't>, construct: ast::Node<'t>, scrutinee: ast::Expr<'t>) -> Option<Vec<(crate::diag::Span, String)>> {
+fn fix<'t>(
+    cx: &Cx<'_, 't>,
+    construct: ast::Node<'t>,
+    scrutinee: ast::Expr<'t>,
+) -> Option<Vec<(crate::diag::Span, String)>> {
     let ty = cx.ty(scrutinee)?;
     let plain = |it: &hir::Type<'_>| it.is_scalar() || it.is_unit();
     if !(plain(&ty) || ty.is_tuple() && ty.tuple_fields(cx.db()).iter().all(plain)) {
@@ -194,7 +211,10 @@ fn fix<'t>(cx: &Cx<'_, 't>, construct: ast::Node<'t>, scrutinee: ast::Expr<'t>) 
     let indent = indentation(cx.text(), at);
     // alloc: the fix's two parts
     Some(vec![
-        (cx.span(TextRange::empty(at.start())), format!("let value = {};\n{indent}", cx.snippet(range))),
+        (
+            cx.span(TextRange::empty(at.start())),
+            format!("let value = {};\n{indent}", cx.snippet(range)),
+        ),
         (cx.span(range), "value".to_owned()), // alloc: as the parts
     ])
 }
@@ -235,10 +255,23 @@ pub fn while_let(m: &Mutex<Vec<u32>>) {
             found.contains("made by `m.lock().unwrap()` holds the lock until this `match` ends, through all its arms, in `matched`"),
             "{found}"
         );
-        assert!(found.contains("until this `if let` ends, through all its arms, in `if_let`"), "{found}");
-        assert!(found.contains("until this `while let` ends, through all its arms, in `while_let`"), "{found}");
-        assert!(found.contains("let value = m.lock().unwrap().len();"), "the `match` of a count is fixed:\n{found}");
-        assert_eq!(found.matches("let value =").count(), 1, "a value borrowing the guard is not fixed:\n{found}");
+        assert!(
+            found.contains("until this `if let` ends, through all its arms, in `if_let`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("until this `while let` ends, through all its arms, in `while_let`"),
+            "{found}"
+        );
+        assert!(
+            found.contains("let value = m.lock().unwrap().len();"),
+            "the `match` of a count is fixed:\n{found}"
+        );
+        assert_eq!(
+            found.matches("let value =").count(),
+            1,
+            "a value borrowing the guard is not fixed:\n{found}"
+        );
     }
 
     /// Bound to a `let` first, matched on itself, made in a closure, or handed on by value:
@@ -290,7 +323,10 @@ item! {
 "#,
         );
         assert_eq!(found.matches(FOUND).count(), 2, "{found}");
-        assert!(found.contains("made by `m.lock()` holds the lock until this `match` ends"), "{found}");
+        assert!(
+            found.contains("made by `m.lock()` holds the lock until this `match` ends"),
+            "{found}"
+        );
         assert!(found.contains("in `parked`"), "{found}");
         assert!(found.contains("in `handed`"), "{found}");
     }

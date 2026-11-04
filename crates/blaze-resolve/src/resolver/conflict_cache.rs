@@ -150,7 +150,10 @@ pub(super) struct ConflictCache {
 
 impl ConflictCache {
     pub(super) fn new() -> ConflictCache {
-        ConflictCache { con_from_dep: HashMap::new_in(Global), dep_from_pid: HashMap::new_in(Global) }
+        ConflictCache {
+            con_from_dep: HashMap::new_in(Global),
+            dep_from_pid: HashMap::new_in(Global),
+        }
     }
     pub(super) fn find(
         &self,

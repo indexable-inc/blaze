@@ -29,12 +29,12 @@ use super::{
     mark::{Live, Liveness},
     seed::Crate,
 };
-use stdx::list::Join;
 use crate::{
     lints::registry::Level,
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
+use stdx::list::Join;
 
 /// rustc's `check_mod_deathness` of every module.
 pub(super) fn report(k: &Crate<'_, '_, '_>, liveness: &Liveness) -> Vec<Found> {
@@ -47,8 +47,14 @@ pub(super) fn report(k: &Crate<'_, '_, '_>, liveness: &Liveness) -> Vec<Found> {
             Report { k, lint: Lint::PubInBinary, live: pre, found: &mut found, dead: &mut dead }
                 .module(module, unused_pub);
         }
-        Report { k, lint: Lint::DeadCode, live: &liveness.last, found: &mut found, dead: &mut dead }
-            .module(module, |_| true);
+        Report {
+            k,
+            lint: Lint::DeadCode,
+            live: &liveness.last,
+            found: &mut found,
+            dead: &mut dead,
+        }
+        .module(module, |_| true);
     }
     found
 }
@@ -98,7 +104,9 @@ impl Report<'_, '_, '_, '_> {
                 continue;
             }
             let d = &defs[item];
-            if d.kind == (Kind::Impl { of_trait: false }) || (d.kind == Kind::Trait && self.live.contains(item)) {
+            if d.kind == (Kind::Impl { of_trait: false })
+                || (d.kind == Kind::Trait && self.live.contains(item))
+            {
                 self.dead.clear();
                 for &child in defs.children(item) {
                     if !self.is_live_code(child) {
@@ -128,7 +136,8 @@ impl Report<'_, '_, '_, '_> {
                     }
                     let fields = defs.children(variant);
                     let positional = fields.first().is_some_and(|&it| defs[it].is_positional());
-                    let report_on = if positional { ReportOn::TupleField } else { ReportOn::NamedField };
+                    let report_on =
+                        if positional { ReportOn::TupleField } else { ReportOn::NamedField };
                     self.dead.clear();
                     for &field in fields {
                         if self.should_warn_about_field(field) {
@@ -241,7 +250,8 @@ impl Report<'_, '_, '_, '_> {
         let Some(first) = dead_codes.first() else { return };
         let Some(at) = defs[first.def].node else { return };
         // alloc: the edge from here on: a lint that fires, its spans, text and notes.
-        let spans: Vec<Span> = dead_codes.iter().filter_map(|it| self.ident_or_def_span(it.def)).collect();
+        let spans: Vec<Span> =
+            dead_codes.iter().filter_map(|it| self.ident_or_def_span(it.def)).collect();
         if spans.len() != dead_codes.len() {
             return;
         }
@@ -253,8 +263,14 @@ impl Report<'_, '_, '_, '_> {
         let names = || dead_codes.iter().map(|it| name(k, it.def));
         let message = match (num > 6, num) {
             (true, _) => format!("multiple {descr}s are never {participle}"), // alloc: the edge
-            (false, 1) => format!("{descr} {} is never {participle}", stdx::list::list(names(), Join::And, true)), // alloc: the edge
-            (false, _) => format!("{descr}s {} are never {participle}", stdx::list::list(names(), Join::And, true)), // alloc: the edge
+            (false, 1) => format!(
+                "{descr} {} is never {participle}",
+                stdx::list::list(names(), Join::And, true)
+            ), // alloc: the edge
+            (false, _) => format!(
+                "{descr}s {} are never {participle}",
+                stdx::list::list(names(), Join::And, true)
+            ), // alloc: the edge
         };
         let mut diag = Diag::lint(self.lint.name(), message, spans[0].clone()); // clone: the edge
         for span in &spans[1..] {
@@ -270,7 +286,10 @@ impl Report<'_, '_, '_, '_> {
                 let tuple_fields: &[DefIdx] = match parent {
                     Some(parent)
                         if defs[parent].kind == Kind::Struct
-                            && defs.children(parent).first().is_some_and(|&it| defs[it].is_positional()) =>
+                            && defs
+                                .children(parent)
+                                .first()
+                                .is_some_and(|&it| defs[it].is_positional()) =>
                     {
                         defs.children(parent)
                     }
@@ -400,4 +419,3 @@ impl Report<'_, '_, '_, '_> {
 fn name<'k>(k: &'k Crate<'_, '_, '_>, def: DefIdx) -> &'k str {
     k.defs[def].name.as_ref().map_or("", |it| it.as_str())
 }
-

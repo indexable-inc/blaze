@@ -227,9 +227,15 @@ pub enum RestoreError {
     Corrupt(Corrupt),
     /// The section's bytes are not a table of this kind: `what` failed at byte `at` of the
     /// section (the root's for its counts and shape, else the column entry's).
-    Invalid { section: SectionId, what: &'static str, at: u64 },
+    Invalid {
+        section: SectionId,
+        what: &'static str,
+        at: u64,
+    },
     /// Values were interned in this process before the restore, under IDs the image may hold.
-    Started { section: SectionId },
+    Started {
+        section: SectionId,
+    },
 }
 
 impl From<Corrupt> for RestoreError {
@@ -353,7 +359,9 @@ impl Table {
         for id in 1..first {
             let bytes = (table.shape.static_bytes)(id);
             // A value compiled in twice is the first.
-            table.records.intern(table.overlay.hash(bytes), bytes, || (id, (table.shape.key)(bytes)));
+            table
+                .records
+                .intern(table.overlay.hash(bytes), bytes, || (id, (table.shape.key)(bytes)));
         }
         table
     }
@@ -368,10 +376,15 @@ impl Table {
         jobs: Jobs<'_>,
     ) -> Result<Table, RestoreError> {
         let groups = section.groups as usize;
-        in_chunks(jobs, groups, CHUNK_GROUPS, |at| image.check(section, at.start as u32..at.end as u32))?;
+        in_chunks(jobs, groups, CHUNK_GROUPS, |at| {
+            image.check(section, at.start as u32..at.end as u32)
+        })?;
         let root = *image.value::<Root>(section, 0)?;
         let invalid = |(what, at)| RestoreError::Invalid { section: section.id, what, at };
-        if root.statics != shape.statics || root.first != shape.statics + 1 || root.align as usize != shape.align {
+        if root.statics != shape.statics
+            || root.first != shape.statics + 1
+            || root.align as usize != shape.align
+        {
             return Err(invalid(("a table of another shape", 0)));
         }
         let end = root.first.checked_add(root.count).filter(|&end| end < u32::MAX);
@@ -385,7 +398,11 @@ impl Table {
             end,
             starts: image.slice::<u32>(section, root.starts, count + 1)?,
             keys: image.slice::<u64>(section, root.keys, count)?,
-            live: BitSlice::from_words(image.slice::<u64>(section, root.live, count.div_ceil(64))?),
+            live: BitSlice::from_words(image.slice::<u64>(
+                section,
+                root.live,
+                count.div_ceil(64),
+            )?),
             ctrl: image.slice::<u64>(section, root.ctrl, groups)?,
             ids: image.slice::<u32>(section, root.ids, groups * GROUP as u64)?,
             free: image.slice::<u32>(section, root.free, u64::from(root.frees))?,
@@ -455,17 +472,24 @@ impl Table {
                 // `end <= len` here, not only through the order of every later start: the UTF-8
                 // check below slices the bytes before a later chunk has been checked.
                 if end < start || end > base.bytes.len() {
-                    return Err(("a value's bytes out of order or past the values", start_at(index + 1)));
+                    return Err((
+                        "a value's bytes out of order or past the values",
+                        start_at(index + 1),
+                    ));
                 }
                 if !start.is_multiple_of(align) || !(end - start).is_multiple_of(self.shape.size) {
                     return Err(("a value's bytes misaligned", start_at(index + 1)));
                 }
                 match base.is_live(index) {
-                    true if self.shape.text && std::str::from_utf8(&base.bytes[start..end]).is_err() => {
+                    true if self.shape.text
+                        && std::str::from_utf8(&base.bytes[start..end]).is_err() =>
+                    {
                         return Err(("a value that is not UTF-8", root.bytes + start as u64));
                     }
                     true => {}
-                    false if end != start => return Err(("bytes for a free ID", start_at(index + 1))),
+                    false if end != start => {
+                        return Err(("bytes for a free ID", start_at(index + 1)));
+                    }
                     false => {}
                 }
             }
@@ -477,7 +501,10 @@ impl Table {
                 let in_range = id >= self.first && id < base.end;
                 let ascending = at == 0 || base.free[at - 1] < id;
                 if !in_range || !ascending || base.is_live((id - self.first) as usize) {
-                    return Err(("a free ID that is live, repeated or out of range", root.free + 4 * at as u64));
+                    return Err((
+                        "a free ID that is live, repeated or out of range",
+                        root.free + 4 * at as u64,
+                    ));
                 }
             }
             Ok(())
@@ -487,10 +514,16 @@ impl Table {
         let full = AtomicUsize::new(0);
         let (groups, chunk) = (base.ctrl.len(), CHUNK / GROUP);
         let refused = refused_run(groups);
-        let too_long = |first: usize| ("a run of full index groups longer than half full allows", root.ctrl + 8 * first as u64);
+        let too_long = |first: usize| {
+            (
+                "a run of full index groups longer than half full allows",
+                root.ctrl + 8 * first as u64,
+            )
+        };
         // Each chunk's full groups at its start and at its end, for the runs across chunks.
         // alloc: two words a chunk of the index, once a restore
-        let edges: Vec<[AtomicUsize; 2]> = (0..groups.div_ceil(chunk)).map(|_| Default::default()).collect();
+        let edges: Vec<[AtomicUsize; 2]> =
+            (0..groups.div_ceil(chunk)).map(|_| Default::default()).collect();
         in_chunks(jobs, groups, chunk, |range| {
             let mut here = 0;
             let (mut run, mut lead) = (0, None);
@@ -513,9 +546,14 @@ impl Table {
                     let slot = group * GROUP + byte;
                     let id = base.ids[slot];
                     let known = (1..self.first).contains(&id)
-                        || (id >= self.first && id < base.end && base.is_live((id - self.first) as usize));
+                        || (id >= self.first
+                            && id < base.end
+                            && base.is_live((id - self.first) as usize));
                     if tag & 0x80 == 0 || !known {
-                        return Err(("an index slot that names no value", root.ids + 4 * slot as u64));
+                        return Err((
+                            "an index slot that names no value",
+                            root.ids + 4 * slot as u64,
+                        ));
                     }
                     here += 1;
                 }
@@ -528,7 +566,10 @@ impl Table {
         })?;
         let full = full.into_inner();
         if full * 2 > base.ids.len() || (self.first > 1 && full == 0) {
-            return Err(("an index more than half full, or without the compiled-in values", root.ctrl));
+            return Err((
+                "an index more than half full, or without the compiled-in values",
+                root.ctrl,
+            ));
         }
         // The runs across chunks, walked twice round so the one through the last group into the
         // first is whole: at most half full, some group has an empty slot and ends every run.
@@ -549,18 +590,25 @@ impl Table {
             }
         }
         // The index is placed by its key: a key it was not placed by finds almost none of these.
-        let misplaced = || ("an index whose key does not find its values", std::mem::offset_of!(Root, key0) as u64);
+        let misplaced = || {
+            ("an index whose key does not find its values", std::mem::offset_of!(Root, key0) as u64)
+        };
         if self.first > 1 {
             let statics = (self.first - 1) as usize;
             in_chunks(jobs, statics, LOOKUPS, |ids| {
-                let found = ids.into_iter().all(|at| self.base_find((self.shape.static_bytes)(at as u32 + 1)).is_some());
+                let found = ids
+                    .into_iter()
+                    .all(|at| self.base_find((self.shape.static_bytes)(at as u32 + 1)).is_some());
                 found.then_some(()).ok_or_else(misplaced)
             })?;
         } else {
             in_chunks(jobs, count, LOOKUPS, |indices| {
-                let found = indices
-                    .filter(|&index| base.is_live(index))
-                    .all(|index| self.base_find(&base.bytes[base.starts[index] as usize..base.starts[index + 1] as usize]).is_some());
+                let found = indices.filter(|&index| base.is_live(index)).all(|index| {
+                    self.base_find(
+                        &base.bytes[base.starts[index] as usize..base.starts[index + 1] as usize],
+                    )
+                    .is_some()
+                });
                 found.then_some(()).ok_or_else(misplaced)
             })?;
         }
@@ -578,7 +626,8 @@ impl Table {
 
     /// The ID of `bytes`, if it has one.
     pub(crate) fn find(&self, bytes: &[u8]) -> Option<u32> {
-        self.base_find(bytes).or_else(|| self.records.find(self.overlay.hash(bytes), bytes).map(Record::id))
+        self.base_find(bytes)
+            .or_else(|| self.records.find(self.overlay.hash(bytes), bytes).map(Record::id))
     }
 
     fn take_id(&self) -> u32 {
@@ -705,7 +754,12 @@ impl Table {
                 probes::count();
                 Ctrl::<GROUP>(ctrl[at])
             };
-            if dedupe && swiss::find(hash, tag, groups, word, |at| (self.get(ids[at.index()]) == Some(value)).then_some(())).is_some() {
+            if dedupe
+                && swiss::find(hash, tag, groups, word, |at| {
+                    (self.get(ids[at.index()]) == Some(value)).then_some(())
+                })
+                .is_some()
+            {
                 return;
             }
             let at = swiss::vacant(hash, groups, |at| {

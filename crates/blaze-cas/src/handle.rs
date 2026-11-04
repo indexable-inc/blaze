@@ -37,7 +37,9 @@ impl Handle {
         match given {
             None => Ok(installed),
             // alloc: the error of a second store in one process
-            Some(_) => Err(format!("the process has a store already, under {}", installed.root.display())),
+            Some(_) => {
+                Err(format!("the process has a store already, under {}", installed.root.display()))
+            }
         }
     }
 
@@ -52,7 +54,11 @@ impl Handle {
     }
 
     /// `with` of the value of `key`, verified, read in place while `with` runs.
-    pub fn read<R>(&self, key: &Key, with: impl FnOnce(Entry<'_>) -> R) -> Result<Option<R>, Corrupt> {
+    pub fn read<R>(
+        &self,
+        key: &Key,
+        with: impl FnOnce(Entry<'_>) -> R,
+    ) -> Result<Option<R>, Corrupt> {
         let guard = enter();
         Ok(self.reader.get(&guard, key)?.map(with))
     }

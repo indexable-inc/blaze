@@ -43,7 +43,10 @@ mod rustc {
             for j in 1..=b.len() {
                 let b_idx = j - 1;
                 let substitution_cost = usize::from(a[a_idx] != b[b_idx]);
-                current[j] = cmp::min(prev[j] + 1, cmp::min(current[j - 1] + 1, prev[j - 1] + substitution_cost));
+                current[j] = cmp::min(
+                    prev[j] + 1,
+                    cmp::min(current[j - 1] + 1, prev[j - 1] + substitution_cost),
+                );
                 if i > 1 && j > 1 && a[a_idx] == b[b_idx - 1] && a[a_idx - 1] == b[b_idx] {
                     current[j] = cmp::min(current[j], prev_prev[j - 2] + 1);
                 }
@@ -114,7 +117,9 @@ mod rustc {
             return best;
         }
         let sorted = sort_by_words(lookup);
-        candidates.iter().fold(None, |found, it| if sort_by_words(it) == sorted { Some(*it) } else { found })
+        candidates
+            .iter()
+            .fold(None, |found, it| if sort_by_words(it) == sorted { Some(*it) } else { found })
     }
 
     fn sort_by_words(name: &str) -> Vec<&str> {
@@ -128,7 +133,11 @@ fn best<'a>(candidates: &[&'a str], lookup: &str, dist: Option<usize>) -> Option
     find_best_match_for_name(candidates, lookup, dist).copied()
 }
 
-fn best_with_substrings<'a>(candidates: &[&'a str], lookup: &str, dist: Option<usize>) -> Option<&'a str> {
+fn best_with_substrings<'a>(
+    candidates: &[&'a str],
+    lookup: &str,
+    dist: Option<usize>,
+) -> Option<&'a str> {
     find_best_match_for_name_with_substrings(candidates, lookup, dist).copied()
 }
 
@@ -169,7 +178,8 @@ fn the_name_rustc_suggests() {
 fn best_match_prefers_case_then_distance_then_words() {
     struct Named(&'static str);
     let candidates = [Named("MAGIC_TEST"), Named("FOO_BAR")];
-    let pick = |s: &str| find_best_match_for_name_by(&candidates, |it| it.0, s, None).map(|it| it.0);
+    let pick =
+        |s: &str| find_best_match_for_name_by(&candidates, |it| it.0, s, None).map(|it| it.0);
     assert_eq!(pick("magic_test"), Some("MAGIC_TEST"));
     assert_eq!(pick("MAGIC_TES"), Some("MAGIC_TEST"));
     assert_eq!(pick("BAR_FOO"), Some("FOO_BAR"));
@@ -239,7 +249,10 @@ fn substring_score_is_rustcs(tc: TestCase) {
     let a = tc.draw(name());
     let b = tc.draw(name());
     let limit = tc.draw(gs::integers::<usize>().max_value(5));
-    assert_eq!(edit_distance_with_substrings(&a, &b, limit), rustc::edit_distance_with_substrings(&a, &b, limit));
+    assert_eq!(
+        edit_distance_with_substrings(&a, &b, limit),
+        rustc::edit_distance_with_substrings(&a, &b, limit)
+    );
 }
 
 #[hegel::test]

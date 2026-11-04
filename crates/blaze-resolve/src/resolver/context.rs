@@ -6,10 +6,10 @@ use crate::graph::Graph;
 use crate::interning::InternedString;
 use crate::persistent;
 use crate::resolver::HashMap;
-use std::alloc::Global;
 use crate::resolver::HashSet;
 use crate::{Dependency, PackageId, Registry, Summary};
 use anyhow::format_err;
+use std::alloc::Global;
 use std::collections::BTreeSet;
 use tracing::debug;
 

@@ -81,26 +81,14 @@ fn parses_inline_and_dotted_forms() {
     let config = parse("profiles.x = { test_cases = 3 }\n").unwrap();
     assert_eq!(
         config.profiles,
-        vec![(
-            "x".to_owned(),
-            ProfileDelta {
-                test_cases: Some(3),
-                ..ProfileDelta::default()
-            }
-        )]
+        vec![("x".to_owned(), ProfileDelta { test_cases: Some(3), ..ProfileDelta::default() })]
     );
 }
 
 #[test]
 fn parses_integer_forms() {
-    assert_eq!(
-        parse_one("[profiles.x]\nseed = 0x10\n").seed,
-        Some(Some(16))
-    );
-    assert_eq!(
-        parse_one("[profiles.x]\ntest_cases = 1_000\n").test_cases,
-        Some(1000)
-    );
+    assert_eq!(parse_one("[profiles.x]\nseed = 0x10\n").seed, Some(Some(16)));
+    assert_eq!(parse_one("[profiles.x]\ntest_cases = 1_000\n").test_cases, Some(1000));
 }
 
 #[test]
@@ -160,10 +148,7 @@ fn rejects_seed_strings_other_than_none() {
 fn parses_a_top_level_default_entry() {
     let config = parse("default = \"nightly\"\n[profiles.nightly]\ntest_cases = 5\n").unwrap();
     assert_eq!(config.default.as_deref(), Some("nightly"));
-    assert_eq!(
-        parse("default = \"ci\"\n").unwrap().default.as_deref(),
-        Some("ci")
-    );
+    assert_eq!(parse("default = \"ci\"\n").unwrap().default.as_deref(), Some("ci"));
 }
 
 #[test]
@@ -183,15 +168,8 @@ fn rejects_a_default_entry_naming_the_default_alias() {
 
 #[test]
 fn rejects_invalid_default_entry_values() {
-    assert!(
-        parse_err("default = \"bad name\"\n")
-            .message
-            .starts_with("invalid profile name")
-    );
-    assert_eq!(
-        parse_err("default = 5\n").message,
-        "`default` expects a string, got an integer"
-    );
+    assert!(parse_err("default = \"bad name\"\n").message.starts_with("invalid profile name"));
+    assert_eq!(parse_err("default = 5\n").message, "`default` expects a string, got an integer");
 }
 
 #[test]
@@ -240,10 +218,7 @@ fn parses_remaining_health_check_names() {
     );
     assert_eq!(
         delta.suppress_health_check,
-        Some(vec![
-            HealthCheck::TestCasesTooLarge,
-            HealthCheck::LargeInitialTestCase
-        ])
+        Some(vec![HealthCheck::TestCasesTooLarge, HealthCheck::LargeInitialTestCase])
     );
 }
 
@@ -265,10 +240,7 @@ fn parses_comments_everywhere() {
 #[test]
 fn parses_string_escapes() {
     let delta = parse_one("[profiles.x]\ndatabase = \"a\\\\b\\\"c\\nd\\te\"\n");
-    assert_eq!(
-        delta.database,
-        Some(Database::Path("a\\b\"c\nd\te".to_owned()))
-    );
+    assert_eq!(delta.database, Some(Database::Path("a\\b\"c\nd\te".to_owned())));
 }
 
 #[test]
@@ -293,10 +265,7 @@ fn rejects_a_profiles_entry_that_is_not_a_table() {
     );
     let e = parse_err("[profiles]\nx = \"y\"\n");
     assert_eq!(e.line, 2);
-    assert_eq!(
-        e.message,
-        "`profiles.x` expects a table of settings, got a string"
-    );
+    assert_eq!(e.message, "`profiles.x` expects a table of settings, got a string");
 }
 
 #[test]
@@ -351,10 +320,7 @@ fn allows_the_same_key_in_different_sections() {
 fn rejects_non_string_array_elements() {
     let e = parse_err("[profiles.x]\nphases = [\n  \"reuse\",\n  1,\n]\n");
     assert_eq!(e.line, 4);
-    assert_eq!(
-        e.message,
-        "elements of `phases` must be strings, got an integer"
-    );
+    assert_eq!(e.message, "elements of `phases` must be strings, got an integer");
 }
 
 #[test]
@@ -405,9 +371,7 @@ fn rejects_out_of_range_integers() {
             .starts_with("`test_cases` must be between 1 and")
     );
     assert!(
-        parse_err("[profiles.x]\nseed = -1\n")
-            .message
-            .starts_with("`seed` must be between 0 and")
+        parse_err("[profiles.x]\nseed = -1\n").message.starts_with("`seed` must be between 0 and")
     );
     assert!(
         parse_err("[profiles.x]\ntest_cases = 18446744073709551616\n")
@@ -630,12 +594,7 @@ fn config_var_naming_an_unreadable_file_is_an_error() {
 #[test]
 fn an_empty_config_var_falls_back_to_discovery() {
     assert_eq!(
-        load_from(
-            Some(String::new()),
-            Some("/a".to_owned()),
-            |_| false,
-            |_| { None }
-        ),
+        load_from(Some(String::new()), Some("/a".to_owned()), |_| false, |_| { None }),
         Ok(ConfigFile::default())
     );
 }

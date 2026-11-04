@@ -41,8 +41,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, stmt: ast::LetStmt<'t>) {
     }
     let Some(range) = cx.range(stmt.syntax()) else { return };
     let span = cx.span(range);
-    let message =
-        format!("`let _ =` drops the future of `{}` without running it", cx.source_of(init.syntax()));
+    let message = format!(
+        "`let _ =` drops the future of `{}` without running it",
+        cx.source_of(init.syntax())
+    );
     cx.lint(LINT, stmt.syntax(), span, message)
         .help("`.await` it or hand it to the scheduler; if never running it is the point, `drop(..)` it by name and say why");
 }

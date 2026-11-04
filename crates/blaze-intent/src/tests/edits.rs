@@ -75,11 +75,15 @@ fn diff(before: &str, after: &str) -> BTreeSet<(String, &'static str)> {
     fn own(node: Node<'_>) -> String {
         let mut text = node.text().to_owned();
         let start = usize::from(node.text_range().start());
-        let mut members: Vec<Node<'_>> = path::members(node).filter(|it| path::is_top(*it)).collect();
+        let mut members: Vec<Node<'_>> =
+            path::members(node).filter(|it| path::is_top(*it)).collect();
         members.sort_unstable_by_key(|it| std::cmp::Reverse(it.text_range().start()));
         for member in members {
             let range = member.text_range();
-            text.replace_range(usize::from(range.start()) - start..usize::from(range.end()) - start, "\u{0}");
+            text.replace_range(
+                usize::from(range.start()) - start..usize::from(range.end()) - start,
+                "\u{0}",
+            );
         }
         text
     }
@@ -134,7 +138,8 @@ fn check(edits: &[Edit], after: &str) -> Vec<(String, How)> {
     let mut file = Working::parsed(FILE, Edition::CURRENT, BASE);
     let mut touches: Vec<Touch> = Vec::new();
     for edit in edits {
-        edit::apply(&mut file, 0, edit, &mut touches).unwrap_or_else(|error| panic!("{edit:?}: {error}"));
+        edit::apply(&mut file, 0, edit, &mut touches)
+            .unwrap_or_else(|error| panic!("{edit:?}: {error}"));
     }
     assert_eq!(file.bytes(), after);
     assert_fresh(&file.parse, after);
@@ -145,7 +150,8 @@ fn check(edits: &[Edit], after: &str) -> Vec<(String, How)> {
     let mine: BTreeSet<(String, &'static str)> =
         touches.iter().map(|it| (edit::path_at(&file, &it.at), class(it.how))).collect();
     assert_eq!(mine, diff(BASE, after), "the items touched are those a whole-file diff finds");
-    let mut named: Vec<(String, How)> = touches.iter().map(|it| (edit::path_at(&file, &it.at), it.how)).collect();
+    let mut named: Vec<(String, How)> =
+        touches.iter().map(|it| (edit::path_at(&file, &it.at), it.how)).collect();
     named.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
     named.dedup();
     named
@@ -169,7 +175,10 @@ fn named(path: &str, how: How) -> (String, How) {
 
 #[test]
 fn replace_body() {
-    let edit = Edit::ReplaceBody { body: "{\n        P { x: 1, y: 2 }\n    }".to_owned(), item: target("<P>::new") };
+    let edit = Edit::ReplaceBody {
+        body: "{\n        P { x: 1, y: 2 }\n    }".to_owned(),
+        item: target("<P>::new"),
+    };
     let after = swap(BASE, "P { x: 0, y: 0 }", "P { x: 1, y: 2 }");
     assert_eq!(check(&[edit], &after), [named("<P>::new", How::Body)]);
 }
@@ -183,11 +192,16 @@ fn replace_body_of_a_fn_with_none_gives_it_one() {
 
 #[test]
 fn replace_signature() {
-    let edit = Edit::ReplaceSignature { item: target("last"), signature: "pub(crate) fn last(x: u8)".to_owned() };
+    let edit = Edit::ReplaceSignature {
+        item: target("last"),
+        signature: "pub(crate) fn last(x: u8)".to_owned(),
+    };
     let after = swap(BASE, "fn last() {}", "pub(crate) fn last(x: u8) {}");
     assert_eq!(check(&[edit], &after), [named("last", How::Signature)]);
-    let edit =
-        Edit::ReplaceSignature { item: target("<P>::new"), signature: "pub fn new(x: u32) -> P".to_owned() };
+    let edit = Edit::ReplaceSignature {
+        item: target("<P>::new"),
+        signature: "pub fn new(x: u32) -> P".to_owned(),
+    };
     let after = swap(BASE, "pub fn new() -> P", "pub fn new(x: u32) -> P");
     assert_eq!(check(&[edit], &after), [named("<P>::new", How::Signature)]);
 }
@@ -235,20 +249,40 @@ fn remove_field_keeps_the_list_style() {
 
 #[test]
 fn add_item_in_the_file_a_module_an_impl_and_an_empty_module() {
-    let edit = Edit::AddItem { file: FILE.to_owned(), into: None, text: "fn added() {}".to_owned() };
+    let edit =
+        Edit::AddItem { file: FILE.to_owned(), into: None, text: "fn added() {}".to_owned() };
     let after = swap(BASE, "fn last() {}\n", "fn last() {}\n\nfn added() {}\n");
     assert_eq!(check(&[edit], &after), [named("", How::Scope), named("added", How::Added)]);
 
-    let edit =
-        Edit::AddItem { file: FILE.to_owned(), into: Some("m".to_owned()), text: "fn more() {\n    1\n}".to_owned() };
-    let after = swap(BASE, "    pub fn inner() {}\n", "    pub fn inner() {}\n\n    fn more() {\n        1\n    }\n");
+    let edit = Edit::AddItem {
+        file: FILE.to_owned(),
+        into: Some("m".to_owned()),
+        text: "fn more() {\n    1\n}".to_owned(),
+    };
+    let after = swap(
+        BASE,
+        "    pub fn inner() {}\n",
+        "    pub fn inner() {}\n\n    fn more() {\n        1\n    }\n",
+    );
     assert_eq!(check(&[edit], &after), [named("m", How::Scope), named("m::more", How::Added)]);
 
-    let edit = Edit::AddItem { file: FILE.to_owned(), into: Some("<P>".to_owned()), text: "fn two() {}".to_owned() };
-    let after = swap(BASE, "        P { x: 0, y: 0 }\n    }\n", "        P { x: 0, y: 0 }\n    }\n\n    fn two() {}\n");
+    let edit = Edit::AddItem {
+        file: FILE.to_owned(),
+        into: Some("<P>".to_owned()),
+        text: "fn two() {}".to_owned(),
+    };
+    let after = swap(
+        BASE,
+        "        P { x: 0, y: 0 }\n    }\n",
+        "        P { x: 0, y: 0 }\n    }\n\n    fn two() {}\n",
+    );
     assert_eq!(check(&[edit], &after), [named("<P>", How::Scope), named("<P>::two", How::Added)]);
 
-    let edit = Edit::AddItem { file: FILE.to_owned(), into: Some("empty".to_owned()), text: "fn e() {}".to_owned() };
+    let edit = Edit::AddItem {
+        file: FILE.to_owned(),
+        into: Some("empty".to_owned()),
+        text: "fn e() {}".to_owned(),
+    };
     let after = swap(BASE, "mod empty {}", "mod empty {\n    fn e() {}\n}");
     assert_eq!(check(&[edit], &after), [named("empty", How::Scope), named("empty::e", How::Added)]);
 }
@@ -268,8 +302,13 @@ fn add_use_after_the_uses_or_before_the_first_item() {
     let edit = Edit::AddUse { file: FILE.to_owned(), into: None, path: "std::io".to_owned() };
     let after = swap(BASE, "use std::fmt;\n", "use std::fmt;\nuse std::io;\n");
     assert_eq!(check(&[edit], &after), [named("", How::Scope)]);
-    let edit = Edit::AddUse { file: FILE.to_owned(), into: Some("m".to_owned()), path: "super::P".to_owned() };
-    let after = swap(BASE, "mod m {\n    pub fn inner", "mod m {\n    use super::P;\n\n    pub fn inner");
+    let edit = Edit::AddUse {
+        file: FILE.to_owned(),
+        into: Some("m".to_owned()),
+        path: "super::P".to_owned(),
+    };
+    let after =
+        swap(BASE, "mod m {\n    pub fn inner", "mod m {\n    use super::P;\n\n    pub fn inner");
     assert_eq!(check(&[edit], &after), [named("m", How::Scope)]);
 }
 
@@ -277,7 +316,10 @@ fn add_use_after_the_uses_or_before_the_first_item() {
 fn edits_in_a_row_name_items_as_the_file_was() {
     let edits = [
         Edit::AddField { field: "pub z: u8".to_owned(), strukt: target("P") },
-        Edit::ReplaceBody { body: "{\n        P { x: 1, y: 2, z: 3 }\n    }".to_owned(), item: target("<P>::new") },
+        Edit::ReplaceBody {
+            body: "{\n        P { x: 1, y: 2, z: 3 }\n    }".to_owned(),
+            item: target("<P>::new"),
+        },
         Edit::RemoveItem { item: target("last") },
     ];
     let after = swap(BASE, "    y: u32,\n}", "    y: u32,\n    pub z: u8,\n}");
@@ -300,7 +342,8 @@ fn an_edit_names_what_it_cant_do() {
     assert!(error.contains("is a field, and the edit takes a fn"), "{error}");
     let error = fails(&[Edit::ReplaceBody { body: "1".to_owned(), item: target("last") }]);
     assert!(error.contains("no block"), "{error}");
-    let error = fails(&[Edit::AddUse { file: FILE.to_owned(), into: None, path: "std::fmt".to_owned() }]);
+    let error =
+        fails(&[Edit::AddUse { file: FILE.to_owned(), into: None, path: "std::fmt".to_owned() }]);
     assert!(error.contains("is there already"), "{error}");
     let error = fails(&[Edit::AddField { field: "u8".to_owned(), strukt: target("P") }]);
     assert!(error.contains("is a tuple field"), "{error}");
@@ -309,6 +352,10 @@ fn an_edit_names_what_it_cant_do() {
         Edit::ReplaceBody { body: "{ 1 }".to_owned(), item: target("added") },
     ]);
     assert!(error.contains("was added by an earlier edit"), "{error}");
-    let error = fails(&[Edit::AddUse { file: FILE.to_owned(), into: Some("<P>".to_owned()), path: "x".to_owned() }]);
+    let error = fails(&[Edit::AddUse {
+        file: FILE.to_owned(),
+        into: Some("<P>".to_owned()),
+        path: "x".to_owned(),
+    }]);
     assert!(error.contains("a use goes in a module"), "{error}");
 }

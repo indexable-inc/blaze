@@ -19,7 +19,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic) -> Vec<Found> 
         // alloc: the error's text, for an error hir found
         hir::Unplaced::TailCall(message) => format!("{message}"),
         // alloc: the error's text, for an error hir found
-        hir::Unplaced::MissingUnsafe { reason, lint } => format!("{reason:?} ({lint:?}) needs `unsafe`"),
+        hir::Unplaced::MissingUnsafe { reason, lint } => {
+            format!("{reason:?} ({lint:?}) needs `unsafe`")
+        }
         hir::Unplaced::Borrowck { code, message } | hir::Unplaced::ConstCheck { code, message } => {
             // alloc: the error's text, for an error hir found
             format!("{code}: {message}")
@@ -27,7 +29,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnplacedDiagnostic) -> Vec<Found> 
     };
     // alloc: the error's text, for an error hir found
     let mut diag = Diag::error(None, format!("blaze: {what}"), span);
-    diag.note("blaze could not place this error more precisely: it is in code with no syntax of its own");
+    diag.note(
+        "blaze could not place this error more precisely: it is in code with no syntax of its own",
+    );
     // alloc: the error found
     vec![Found::new(diag, Phase::Bodies)]
 }

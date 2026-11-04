@@ -2,6 +2,11 @@
 //! is the owner's, which its closures, coroutines and `const { .. }` blocks share, so each node
 //! is decoded once for all of them, not once per table and again per body.
 
+use crate::{
+    bitset::{BitSet, bits},
+    mem::{self, FMap, FVec, Frame},
+    regions::{Annotation, spells_generics},
+};
 use hir_def::{
     expr_store::ExpressionStore,
     hir::{BindingId, Expr, ExprId, Pat, PatId, Statement},
@@ -9,11 +14,6 @@ use hir_def::{
 use hir_ty::{
     InferenceResult,
     next_solver::{DbInterner, Region, RegionExt as _, Ty},
-};
-use crate::{
-    bitset::{BitSet, bits},
-    mem::{self, FMap, FVec, Frame},
-    regions::{Annotation, spells_generics},
 };
 
 #[cfg(test)]
@@ -121,8 +121,7 @@ impl<'f, 'db> Scan<'f, 'db> {
         for (id, expr) in store.exprs() {
             match expr {
                 Expr::Match { expr: scrutinee, arms } => {
-                    if arms.is_empty()
-                        || arms.iter().any(|arm| !irrefutable(store, infer, arm.pat))
+                    if arms.is_empty() || arms.iter().any(|arm| !irrefutable(store, infer, arm.pat))
                     {
                         matched.insert(raw(id));
                         matched.insert(raw(scrutinee));
@@ -185,8 +184,7 @@ impl<'f, 'db> Scan<'f, 'db> {
                             Statement::Let { pat, type_ref, initializer, .. } => {
                                 let whole = store.pat(pat);
                                 if let Some(init) = initializer {
-                                    let simple =
-                                        matches!(whole, Pat::Bind { subpat: None, .. });
+                                    let simple = matches!(whole, Pat::Bind { subpat: None, .. });
                                     let scrutinee = if simple { None } else { Some(init) };
                                     store.walk_bindings_in_pat(pat, |binding| {
                                         scrutinees.insert(binding, scrutinee);

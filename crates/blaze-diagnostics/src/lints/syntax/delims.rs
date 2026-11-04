@@ -262,7 +262,9 @@ impl<'db> Check<'_, '_, 'db> {
                 }
             }
             SyntaxKind::VARIANT => {
-                if let Some(e) = ast::Variant::cast(node).and_then(|it| it.const_arg()).and_then(|it| it.expr()) {
+                if let Some(e) =
+                    ast::Variant::cast(node).and_then(|it| it.const_arg()).and_then(|it| it.expr())
+                {
                     self.braces_value(e, file, &Site::of(Ctx::AnonConst), at);
                 }
             }
@@ -307,7 +309,11 @@ impl<'db> Check<'_, '_, 'db> {
                 if let Some(cond) = it.condition().map(peel_parens)
                     && matches!(cond, ast::Expr::LetExpr(_))
                 {
-                    let site = Site { followed_by_block: true, is_kw: true, ..Site::of(Ctx::LetScrutineeExpr) };
+                    let site = Site {
+                        followed_by_block: true,
+                        is_kw: true,
+                        ..Site::of(Ctx::LetScrutineeExpr)
+                    };
                     self.parens_value(cond, file, &site, at);
                     return;
                 }
@@ -360,17 +366,35 @@ impl<'db> Check<'_, '_, 'db> {
                     .or_else(|| it.while_token().map(|it| it.text_range().start()));
                 let left = start.map(|it| it + TextSize::from(5));
                 let right = it.loop_body().map(|it| it.syntax().text_range().start());
-                (cond, Site { ctx: Ctx::WhileCond, followed_by_block: true, left, right, is_kw: true })
+                (
+                    cond,
+                    Site { ctx: Ctx::WhileCond, followed_by_block: true, left, right, is_kw: true },
+                )
             }
             ast::Expr::ForExpr(it) => {
                 let Some(iter) = it.iterable() else { return };
                 let right = it.loop_body().map(|it| it.syntax().text_range().start());
-                (iter, Site { ctx: Ctx::ForIterExpr, followed_by_block: true, left: None, right, is_kw: true })
+                (
+                    iter,
+                    Site {
+                        ctx: Ctx::ForIterExpr,
+                        followed_by_block: true,
+                        left: None,
+                        right,
+                        is_kw: true,
+                    },
+                )
             }
             ast::Expr::MatchExpr(it) if lint.in_pattern_matching() => {
                 let Some(head) = it.expr() else { return };
                 let left = it.match_token().map(|it| it.text_range().start() + TextSize::from(5));
-                let site = Site { ctx: Ctx::MatchScrutineeExpr, followed_by_block: true, left, right: None, is_kw: true };
+                let site = Site {
+                    ctx: Ctx::MatchScrutineeExpr,
+                    followed_by_block: true,
+                    left,
+                    right: None,
+                    is_kw: true,
+                };
                 (head, site)
             }
             ast::Expr::ReturnExpr(it) => {
@@ -393,7 +417,9 @@ impl<'db> Check<'_, '_, 'db> {
                 let Some(index) = it.index() else { return };
                 (index, Site::of(Ctx::IndexExpr))
             }
-            ast::Expr::BinExpr(it) if matches!(it.op_kind(), Some(ast::BinaryOp::Assignment { .. })) => {
+            ast::Expr::BinExpr(it)
+                if matches!(it.op_kind(), Some(ast::BinaryOp::Assignment { .. })) =>
+            {
                 let Some(rhs) = it.rhs() else { return };
                 (rhs, Site::of(Ctx::AssignedValue))
             }
@@ -468,7 +494,9 @@ impl<'db> Check<'_, '_, 'db> {
                     && let Some(inner) = it.expr()
                 {
                     let inner = expanded_in(self.cx, paren.file_id, inner);
-                    if self.ctxt(paren.file_id, it.syntax()) != self.ctxt(inner.file_id, inner.value.syntax()) {
+                    if self.ctxt(paren.file_id, it.syntax())
+                        != self.ctxt(inner.file_id, inner.value.syntax())
+                    {
                         return;
                     }
                 }
@@ -495,7 +523,10 @@ impl<'db> Check<'_, '_, 'db> {
 
     /// `UnusedParens::check_unused_delims_expr`.
     fn parens_value(&mut self, value: ast::Expr<'db>, file: HirFileId, site: &Site, at: At) {
-        if !matches!(value, ast::Expr::ParenExpr(_) | ast::Expr::LetExpr(_) | ast::Expr::MacroExpr(_)) {
+        if !matches!(
+            value,
+            ast::Expr::ParenExpr(_) | ast::Expr::LetExpr(_) | ast::Expr::MacroExpr(_)
+        ) {
             return;
         }
         let site_file = file;
@@ -505,14 +536,21 @@ impl<'db> Check<'_, '_, 'db> {
                 let Some(inner) = paren.expr() else { return };
                 let inner = expanded(self.cx, inner);
                 let unused = !(site.ctx == Ctx::LetScrutineeExpr && precedence::is_lazy(inner))
-                    && !(matches!(site.ctx, Ctx::ReturnValue | Ctx::BreakValue) && precedence::is_assign(inner))
+                    && !(matches!(site.ctx, Ctx::ReturnValue | Ctx::BreakValue)
+                        && precedence::is_assign(inner))
                     && !has_outer_attrs(paren.syntax())
                     && !self.from_expansion(file, paren.syntax())
-                    && !precedence::delims_necessary(self.cx, inner, site.ctx, site.followed_by_block);
+                    && !precedence::delims_necessary(
+                        self.cx,
+                        inner,
+                        site.ctx,
+                        site.followed_by_block,
+                    );
                 if !unused {
                     return;
                 }
-                let Some(delimited) = self.delimited(file, paren.syntax(), SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)
+                let Some(delimited) =
+                    self.delimited(file, paren.syntax(), SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)
                 else {
                     return;
                 };
@@ -520,7 +558,10 @@ impl<'db> Check<'_, '_, 'db> {
             }
             ast::Expr::LetExpr(it) => {
                 if let Some(scrutinee) = it.expr() {
-                    let site = Site { followed_by_block: site.followed_by_block, ..Site::of(Ctx::LetScrutineeExpr) };
+                    let site = Site {
+                        followed_by_block: site.followed_by_block,
+                        ..Site::of(Ctx::LetScrutineeExpr)
+                    };
                     self.parens_value(scrutinee, file, &site, at);
                 }
             }
@@ -531,13 +572,18 @@ impl<'db> Check<'_, '_, 'db> {
     /// `UnusedBraces::check_unused_delims_expr`: a block of one expression, unlabelled and not
     /// `unsafe`, on one line.
     fn braces_value(&mut self, value: ast::Expr<'db>, file: HirFileId, site: &Site, at: At) {
-        if !matches!(value, ast::Expr::BlockExpr(_) | ast::Expr::LetExpr(_) | ast::Expr::MacroExpr(_)) {
+        if !matches!(
+            value,
+            ast::Expr::BlockExpr(_) | ast::Expr::LetExpr(_) | ast::Expr::MacroExpr(_)
+        ) {
             return;
         }
         let site_file = file;
         let InFile { file_id: file, value } = self.expand(file, value);
         match value {
-            ast::Expr::BlockExpr(block) if site.ctx != Ctx::ClosureBody && precedence::is_plain_block(block) => {
+            ast::Expr::BlockExpr(block)
+                if site.ctx != Ctx::ClosureBody && precedence::is_plain_block(block) =>
+            {
                 let Some(list) = block.stmt_list() else { return };
                 if has_attrs(block.syntax())
                     || has_attrs(list.syntax())
@@ -550,11 +596,17 @@ impl<'db> Check<'_, '_, 'db> {
                 if (site.ctx == Ctx::AnonConst
                     && !(matches!(expr.value, ast::Expr::Literal(_))
                         && !self.from_expansion(expr.file_id, expr.value.syntax())))
-                    || precedence::delims_necessary(self.cx, expr.value, site.ctx, site.followed_by_block)
+                    || precedence::delims_necessary(
+                        self.cx,
+                        expr.value,
+                        site.ctx,
+                        site.followed_by_block,
+                    )
                 {
                     return;
                 }
-                let Some(delimited) = self.delimited(file, list.syntax(), SyntaxKind::L_CURLY, SyntaxKind::R_CURLY)
+                let Some(delimited) =
+                    self.delimited(file, list.syntax(), SyntaxKind::L_CURLY, SyntaxKind::R_CURLY)
                 else {
                     return;
                 };
@@ -565,7 +617,10 @@ impl<'db> Check<'_, '_, 'db> {
             }
             ast::Expr::LetExpr(it) => {
                 if let Some(scrutinee) = it.expr() {
-                    let site = Site { followed_by_block: site.followed_by_block, ..Site::of(Ctx::LetScrutineeExpr) };
+                    let site = Site {
+                        followed_by_block: site.followed_by_block,
+                        ..Site::of(Ctx::LetScrutineeExpr)
+                    };
                     self.braces_value(scrutinee, file, &site, at);
                 }
             }
@@ -588,8 +643,13 @@ impl<'db> Check<'_, '_, 'db> {
 
     /// The one statement of a block of `file` when it is an expression with no `;` (rustc's
     /// `[StmtKind::Expr(expr)]`), as rustc sees it: a statement macro's expansion in place.
-    fn single_expr(&self, file: HirFileId, list: ast::StmtList<'db>) -> Option<InFile<ast::Expr<'db>>> {
-        let empty_stmt = list.syntax().children_with_tokens().any(|it| it.kind() == SyntaxKind::SEMICOLON);
+    fn single_expr(
+        &self,
+        file: HirFileId,
+        list: ast::StmtList<'db>,
+    ) -> Option<InFile<ast::Expr<'db>>> {
+        let empty_stmt =
+            list.syntax().children_with_tokens().any(|it| it.kind() == SyntaxKind::SEMICOLON);
         if empty_stmt || list.statements().any(|it| self.kept(file, it.syntax())) {
             return None;
         }
@@ -705,10 +765,16 @@ impl<'db> Check<'_, '_, 'db> {
             // Kept for readability wherever they are, as in `&(a..=b)`.
             ast::Pat::RangePat(_) => return,
             ast::Pat::OrPat(_) if avoid_or => return,
-            ast::Pat::IdentPat(it) if avoid_mut && it.mut_token().is_some() && it.ref_token().is_none() => return,
+            ast::Pat::IdentPat(it)
+                if avoid_mut && it.mut_token().is_some() && it.ref_token().is_none() =>
+            {
+                return;
+            }
             _ => {}
         }
-        let Some(delimited) = self.delimited(file, paren.syntax(), SyntaxKind::L_PAREN, SyntaxKind::R_PAREN) else {
+        let Some(delimited) =
+            self.delimited(file, paren.syntax(), SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)
+        else {
             return;
         };
         self.emit(Lint::Parens, delimited, "pattern", keep_space, false, at);
@@ -724,8 +790,12 @@ impl<'db> Check<'_, '_, 'db> {
                     return;
                 }
                 let unused = match expanded_ty(self.cx, inner) {
-                    ast::Type::ImplTraitType(it) => self.bounds_unused(file, paren, it.type_bound_list()),
-                    ast::Type::DynTraitType(it) => self.bounds_unused(file, paren, it.type_bound_list()),
+                    ast::Type::ImplTraitType(it) => {
+                        self.bounds_unused(file, paren, it.type_bound_list())
+                    }
+                    ast::Type::DynTraitType(it) => {
+                        self.bounds_unused(file, paren, it.type_bound_list())
+                    }
                     ast::Type::ForType(it) if matches!(it.ty(), Some(ast::Type::FnPtrType(_))) => {
                         let no_params = it
                             .for_binder()
@@ -738,7 +808,8 @@ impl<'db> Check<'_, '_, 'db> {
                 if !unused {
                     return;
                 }
-                let Some(delimited) = self.delimited(file, paren.syntax(), SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)
+                let Some(delimited) =
+                    self.delimited(file, paren.syntax(), SyntaxKind::L_PAREN, SyntaxKind::R_PAREN)
                 else {
                     return;
                 };
@@ -750,7 +821,9 @@ impl<'db> Check<'_, '_, 'db> {
                 }
             }
             ast::Type::DynTraitType(it) => self.paren_bounds(it.type_bound_list(), file, true, at),
-            ast::Type::ImplTraitType(it) => self.paren_bounds(it.type_bound_list(), file, false, at),
+            ast::Type::ImplTraitType(it) => {
+                self.paren_bounds(it.type_bound_list(), file, false, at)
+            }
             _ => {}
         }
     }
@@ -766,7 +839,12 @@ impl<'db> Check<'_, '_, 'db> {
 
     /// Whether the parentheses `paren` around a trait object or `impl Trait` of `bounds` are
     /// not needed where it is.
-    fn bounds_unused(&self, file: HirFileId, paren: ast::ParenType<'db>, bounds: Option<ast::TypeBoundList<'db>>) -> bool {
+    fn bounds_unused(
+        &self,
+        file: HirFileId,
+        paren: ast::ParenType<'db>,
+        bounds: Option<ast::TypeBoundList<'db>>,
+    ) -> bool {
         match self.no_bounds(InFile::new(file, paren.syntax())) {
             Some(NoBounds::None) => false,
             Some(NoBounds::OneBound) => bounds.is_none_or(|it| it.bounds().nth(1).is_none()),
@@ -805,7 +883,8 @@ impl<'db> Check<'_, '_, 'db> {
         let bound = ast::TypeBound::cast(bound)?;
         let list = ast::TypeBoundList::cast(bound.syntax().parent()?)?;
         let owner = list.syntax().parent()?;
-        if !ast::DynTraitType::can_cast(owner.kind()) && !ast::ImplTraitType::can_cast(owner.kind()) {
+        if !ast::DynTraitType::can_cast(owner.kind()) && !ast::ImplTraitType::can_cast(owner.kind())
+        {
             return None;
         }
         match list.bounds().last() == Some(bound) {
@@ -818,9 +897,9 @@ impl<'db> Check<'_, '_, 'db> {
     /// no `for<..>` of its own, where `(for<'a> fn(&'a u8)): Trait` needs them.
     fn with_self_ty_parens(&self, file: HirFileId, paren: ast::ParenType<'db>) -> bool {
         let node = self.stand_in(InFile::new(file, paren.syntax())).value;
-        node.parent()
-            .and_then(ast::WherePred::cast)
-            .is_some_and(|pred| pred.for_binder().is_none() && pred.ty().is_some_and(|it| it.syntax() == node))
+        node.parent().and_then(ast::WherePred::cast).is_some_and(|pred| {
+            pred.for_binder().is_none() && pred.ty().is_some_and(|it| it.syntax() == node)
+        })
     }
 
     /// rustc's `parens_in_cast_in_lt`: `1 as (i32) < 2` is `1 as i32<2..` without them.
@@ -832,7 +911,9 @@ impl<'db> Check<'_, '_, 'db> {
         }
         let mut current = self.stand_in(InFile::new(node.file_id, cast.syntax()));
         loop {
-            let Some(bin) = current.value.parent().and_then(ast::BinExpr::cast) else { return false };
+            let Some(bin) = current.value.parent().and_then(ast::BinExpr::cast) else {
+                return false;
+            };
             let Some(op) = bin.op_kind() else { return false };
             if matches!(op, ast::BinaryOp::Assignment { .. }) {
                 return false;
@@ -840,8 +921,10 @@ impl<'db> Check<'_, '_, 'db> {
             if bin.lhs().is_some_and(|it| it.syntax() == current.value) {
                 return matches!(
                     op,
-                    ast::BinaryOp::CmpOp(ast::CmpOp::Ord { ordering: ast::Ordering::Less, strict: true })
-                        | ast::BinaryOp::ArithOp(ast::ArithOp::Shl)
+                    ast::BinaryOp::CmpOp(ast::CmpOp::Ord {
+                        ordering: ast::Ordering::Less,
+                        strict: true
+                    }) | ast::BinaryOp::ArithOp(ast::ArithOp::Shl)
                 );
             }
             // clone: a cursor's refcount (no allocation), only for a cast to a parenthesized type
@@ -852,7 +935,13 @@ impl<'db> Check<'_, '_, 'db> {
     /// The parenthesized bounds of a trait object or `impl Trait` that need no parentheses:
     /// not a `Fn` bound with a return type before another, nor, in 2015, a first bound of a
     /// path from the root (`dyn (::a::B)`, where `dyn::a::B` is a path).
-    fn paren_bounds(&mut self, list: Option<ast::TypeBoundList<'db>>, file: HirFileId, is_dyn: bool, at: At) {
+    fn paren_bounds(
+        &mut self,
+        list: Option<ast::TypeBoundList<'db>>,
+        file: HirFileId,
+        is_dyn: bool,
+        at: At,
+    ) {
         let Some(list) = list else { return };
         let mut bounds = list.bounds().enumerate().peekable();
         while let Some((i, bound)) = bounds.next() {
@@ -868,7 +957,10 @@ impl<'db> Check<'_, '_, 'db> {
                 && i == 0
                 && self.cx.edition == Edition::Edition2015
                 && path.first_segment().is_some_and(|it| it.coloncolon_token().is_some());
-            if (!is_last && fn_with_explicit_ret_ty) || dyn2015_exception || self.from_expansion(file, bound.syntax()) {
+            if (!is_last && fn_with_explicit_ret_ty)
+                || dyn2015_exception
+                || self.from_expansion(file, bound.syntax())
+            {
                 continue;
             }
             let span = self.cx.span(InFile::new(file, bound.syntax().text_range()));
@@ -876,7 +968,14 @@ impl<'db> Check<'_, '_, 'db> {
                 continue;
             }
             let spans = Some((span.with_hi(span.lo + 1), span.with_lo(span.hi - 1)));
-            self.emit(Lint::Parens, Delimited { value: span, spans }, "type", (false, false), false, at);
+            self.emit(
+                Lint::Parens,
+                Delimited { value: span, spans },
+                "type",
+                (false, false),
+                false,
+                at,
+            );
         }
     }
 
@@ -898,7 +997,9 @@ impl<'db> Check<'_, '_, 'db> {
             // alloc: the lint's text, for a lint found
             "*".to_owned() // alloc: the name in an emitted diagnostic
         } else {
-            let Some(name_ref) = only.path().and_then(|it| it.segment()).and_then(|it| it.name_ref()) else {
+            let Some(name_ref) =
+                only.path().and_then(|it| it.segment()).and_then(|it| it.name_ref())
+            else {
                 return;
             };
             if name_ref.self_token().is_some() {
@@ -907,14 +1008,20 @@ impl<'db> Check<'_, '_, 'db> {
             match only.rename() {
                 // alloc: the lint's text, for a lint found
                 // alloc: the name in an emitted diagnostic
-                Some(rename) => rename.name().map_or_else(|| "_".to_owned(), |it| self.ident(it.text())),
+                Some(rename) => {
+                    rename.name().map_or_else(|| "_".to_owned(), |it| self.ident(it.text()))
+                }
                 None => self.ident(name_ref.text()),
             }
         };
         let span = self.cx.span(InFile::new(file, crate::cx::item_range_view(item.syntax())));
         // alloc: the lint's text, for a lint found
         // alloc: an emitted diagnostic's message
-        let mut diag = Diag::lint("unused_import_braces", format!("braces around {name} is unnecessary"), span);
+        let mut diag = Diag::lint(
+            "unused_import_braces",
+            format!("braces around {name} is unnecessary"),
+            span,
+        );
         super::source_fact(self.cx, &mut diag, at);
         self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Early, at));
     }
@@ -923,14 +1030,23 @@ impl<'db> Check<'_, '_, 'db> {
     fn ident(&self, text: &str) -> String {
         match text.strip_prefix("r#") {
             // alloc: the lint's text, for a lint found
-            Some(name) if !syntax::utils::is_raw_identifier(name, self.cx.edition) => name.to_owned(), // alloc: emitted
+            Some(name) if !syntax::utils::is_raw_identifier(name, self.cx.edition) => {
+                name.to_owned()
+            } // alloc: emitted
             _ => text.to_owned(), // alloc: the name in an emitted diagnostic
         }
     }
 
     /// `emit_unused_delims_expr`: whether to keep a space where the keyword before the value
     /// or the block after it touches it; `site`'s offsets are of `site_file`.
-    fn emit_value(&mut self, lint: Lint, delimited: Delimited, site: &Site, site_file: HirFileId, at: At) {
+    fn emit_value(
+        &mut self,
+        lint: Lint,
+        delimited: Delimited,
+        site: &Site,
+        site_file: HirFileId,
+        at: At,
+    ) {
         let value = &delimited.value;
         let span = |pos: TextSize| self.cx.span(InFile::new(site_file, TextRange::empty(pos)));
         let keep_space = (
@@ -942,7 +1058,15 @@ impl<'db> Check<'_, '_, 'db> {
 
     /// `emit_unused_delims`: the lint on both delimiters, and their removal, with a space where
     /// what was around them would otherwise run together.
-    fn emit(&mut self, lint: Lint, delimited: Delimited, item: &str, keep_space: (bool, bool), is_kw: bool, at: At) {
+    fn emit(
+        &mut self,
+        lint: Lint,
+        delimited: Delimited,
+        item: &str,
+        keep_space: (bool, bool),
+        is_kw: bool,
+        at: At,
+    ) {
         // alloc: the lint's text, for a lint found
         let message = format!("unnecessary {} around {item}", lint.delims()); // alloc: an emitted diagnostic's message
         let mut diag = match &delimited.spans {
@@ -967,7 +1091,9 @@ impl<'db> Check<'_, '_, 'db> {
                 true => " ",
                 false => "",
             };
-            let hi_replace = match (keep_space.1 && !after.starts_with(' ')) || after.starts_with(char::is_alphanumeric) {
+            let hi_replace = match (keep_space.1 && !after.starts_with(' '))
+                || after.starts_with(char::is_alphanumeric)
+            {
                 true => " ",
                 false => "",
             };
@@ -989,7 +1115,13 @@ impl<'db> Check<'_, '_, 'db> {
     /// the parser's recovery leaves it, or nothing is between them. One pass over the node's
     /// children: the first `open`, the last `close` after it, and the first and last element
     /// that is not trivia between them.
-    fn delimited(&self, file: HirFileId, node: ast::Node<'_>, open: SyntaxKind, close: SyntaxKind) -> Option<Delimited> {
+    fn delimited(
+        &self,
+        file: HirFileId,
+        node: ast::Node<'_>,
+        open: SyntaxKind,
+        close: SyntaxKind,
+    ) -> Option<Delimited> {
         let mut open_at: Option<TextSize> = None;
         let mut first: Option<TextSize> = None;
         let mut last: Option<TextSize> = None;
@@ -1054,8 +1186,12 @@ impl<'db> Check<'_, '_, 'db> {
             return it;
         }
         let it = match e {
-            ast::Expr::CallExpr(it) => it.expr().is_some_and(|it| self.from_expansion(file, it.syntax())),
-            ast::Expr::MethodCallExpr(it) => it.name_ref().is_some_and(|it| self.from_expansion(file, it.syntax())),
+            ast::Expr::CallExpr(it) => {
+                it.expr().is_some_and(|it| self.from_expansion(file, it.syntax()))
+            }
+            ast::Expr::MethodCallExpr(it) => {
+                it.name_ref().is_some_and(|it| self.from_expansion(file, it.syntax()))
+            }
             _ => false,
         };
         self.call.callee_from_expansion = Some(it);
@@ -1108,7 +1244,11 @@ impl<'db> Check<'_, '_, 'db> {
 }
 
 /// [`expanded`] of `e` of `file`, with the file of what it expands to.
-fn expanded_in<'db>(cx: &Cx<'_, 'db>, file: HirFileId, e: ast::Expr<'db>) -> InFile<ast::Expr<'db>> {
+fn expanded_in<'db>(
+    cx: &Cx<'_, 'db>,
+    file: HirFileId,
+    e: ast::Expr<'db>,
+) -> InFile<ast::Expr<'db>> {
     let (expansion, e) = peel(cx, e);
     InFile::new(expansion.unwrap_or(file), e)
 }
@@ -1125,7 +1265,9 @@ fn peel<'db>(cx: &Cx<'_, 'db>, e: ast::Expr<'db>) -> (Option<HirFileId>, ast::Ex
     let mut file = None;
     for _ in 0..MACRO_DEPTH {
         let ast::Expr::MacroExpr(call) = e else { break };
-        let Some(root) = call.macro_call().and_then(|it| cx.vsema.expand_macro_call(it)) else { break };
+        let Some(root) = call.macro_call().and_then(|it| cx.vsema.expand_macro_call(it)) else {
+            break;
+        };
         let next = match ast::MacroStmts::cast(root.value) {
             Some(stmts) if stmts.statements().next().is_none() => stmts.expr(),
             Some(_) => None,
@@ -1139,11 +1281,17 @@ fn peel<'db>(cx: &Cx<'_, 'db>, e: ast::Expr<'db>) -> (Option<HirFileId>, ast::Ex
 }
 
 /// [`expanded_pat`] of `pat` of `file`, with the file of what it expands to.
-fn expanded_pat_in<'db>(cx: &Cx<'_, 'db>, file: HirFileId, pat: ast::Pat<'db>) -> InFile<ast::Pat<'db>> {
+fn expanded_pat_in<'db>(
+    cx: &Cx<'_, 'db>,
+    file: HirFileId,
+    pat: ast::Pat<'db>,
+) -> InFile<ast::Pat<'db>> {
     let mut pat = InFile::new(file, pat);
     for _ in 0..MACRO_DEPTH {
         let ast::Pat::MacroPat(call) = pat.value else { break };
-        let Some(root) = call.macro_call().and_then(|it| cx.vsema.expand_macro_call(it)) else { break };
+        let Some(root) = call.macro_call().and_then(|it| cx.vsema.expand_macro_call(it)) else {
+            break;
+        };
         let Some(next) = ast::Pat::cast(root.value) else { break };
         pat = InFile::new(root.file_id, next);
     }
@@ -1155,8 +1303,10 @@ fn expanded_pat<'db>(cx: &Cx<'_, 'db>, pat: ast::Pat<'db>) -> ast::Pat<'db> {
     let mut pat = pat;
     for _ in 0..MACRO_DEPTH {
         let ast::Pat::MacroPat(call) = pat else { break };
-        let Some(next) =
-            call.macro_call().and_then(|it| cx.vsema.expand_macro_call(it)).and_then(|it| ast::Pat::cast(it.value))
+        let Some(next) = call
+            .macro_call()
+            .and_then(|it| cx.vsema.expand_macro_call(it))
+            .and_then(|it| ast::Pat::cast(it.value))
         else {
             break;
         };
@@ -1170,8 +1320,10 @@ pub(super) fn expanded_ty<'db>(cx: &Cx<'_, 'db>, ty: ast::Type<'db>) -> ast::Typ
     let mut ty = ty;
     for _ in 0..MACRO_DEPTH {
         let ast::Type::MacroType(call) = ty else { break };
-        let Some(next) =
-            call.macro_call().and_then(|it| cx.vsema.expand_macro_call(it)).and_then(|it| ast::Type::cast(it.value))
+        let Some(next) = call
+            .macro_call()
+            .and_then(|it| cx.vsema.expand_macro_call(it))
+            .and_then(|it| ast::Type::cast(it.value))
         else {
             break;
         };
@@ -1246,9 +1398,11 @@ mod tests {
                 assert!(walk.trees.iter().map(|it| it.nodes.len()).sum::<usize>() > fns * 10);
                 // The first run settles the lint levels it asks for.
                 assert!(lints(cx, walk).is_empty());
-                let found = blaze_alloc_count::assert_at_most(0, &format!("delims on, {fns} functions"), || {
-                    lints(cx, walk)
-                });
+                let found = blaze_alloc_count::assert_at_most(
+                    0,
+                    &format!("delims on, {fns} functions"),
+                    || lints(cx, walk),
+                );
                 assert!(found.is_empty());
             });
         }
@@ -1279,7 +1433,8 @@ pub fn f(x: t!()) -> u8 {
             let walk = cx.walk();
             let (mut expanded, mut not) = (0, 0);
             for tree in &walk.trees {
-                for node in tree.root.descendants().filter(|it| it.kind() == SyntaxKind::MACRO_CALL) {
+                for node in tree.root.descendants().filter(|it| it.kind() == SyntaxKind::MACRO_CALL)
+                {
                     let call = ast::MacroCall::cast(node).expect("checked by kind");
                     let at = (tree.file, node.text_range());
                     let views = cx.vsema.expand_macro_call(call);
@@ -1288,11 +1443,19 @@ pub fn f(x: t!()) -> u8 {
                         not += 1;
                         continue;
                     };
-                    let file = expansion.file_id.macro_file().expect("an expansion is a macro's file");
+                    let file =
+                        expansion.file_id.macro_file().expect("an expansion is a macro's file");
                     let called = file.loc(cx.db).to_node_view(cx.db);
-                    assert_eq!((called.file_id, called.value.kind(), called.value.text_range()), (tree.file, node.kind(), node.text_range()));
+                    assert_eq!(
+                        (called.file_id, called.value.kind(), called.value.text_range()),
+                        (tree.file, node.kind(), node.text_range())
+                    );
                     let root = cx.root(expansion.file_id);
-                    assert_eq!((expansion.value.kind(), expansion.value.text_range()), (root.kind(), root.text_range()), "{at:?}");
+                    assert_eq!(
+                        (expansion.value.kind(), expansion.value.text_range()),
+                        (root.kind(), root.text_range()),
+                        "{at:?}"
+                    );
                     assert!(expansion.value.parent().is_none(), "{at:?}");
                     expanded += 1;
                 }

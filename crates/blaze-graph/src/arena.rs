@@ -3,20 +3,28 @@
 //!
 //! [`Counting`] is the daemon's global allocator: it counts the bytes the process holds
 //! ([`held`]), by the blaze-mem tag whose task allocated them ([`Holders`]:
-//! `blaze_mem::tag::Counters::heap`), and, per thread, the bytes the task the thread runs now
-//! holds, so [`measure`] says what a task held at most through the global allocator; what it held in its frame
-//! ([`blaze_mem::frame::task`]) is [`blaze_mem::frame::measure`]'s, and the frames' cap is
-//! [`blaze_mem::frame::Cap`]. [`machine_budget`] is the memory the plane may grant: the
-//! machine's limit, less what others use in blaze's own cgroup and a margin.
+//! `blaze_mem::tag::Counters::heap`), and by the task whose work allocated them: each task the
+//! plane or the exec scheduler runs opens an [`account`], and every byte its work allocates
+//! or frees through the global allocator, on its own job and on every job of a pool scope it
+//! opens (`crate::pool::Scope::submit`, which `crate::par` is built on), wherever those jobs
+//! run and resume, is charged to it. An account's peak is what that task held at most, its
+//! fan-out included, never a sample of the whole process: two tasks running side by side are
+//! each charged their own bytes, not each other's (coord predict, 2026-11-04: a peak read
+//! process-wide while sixteen tasks ran was learned as one task's 121.59 GB). What a task held
+//! in its frames ([`blaze_mem::frame::task`]) is [`blaze_mem::frame::measure`]'s, and the
+//! frames' cap is [`blaze_mem::frame::Cap`]. [`machine_budget`] is the memory the plane may
+//! grant: the machine's limit, less what others use in blaze's own cgroup and a margin.
 
 use std::{
     cell::Cell,
     fmt, io,
+    num::NonZeroUsize,
     path::Path,
-    sync::atomic::{AtomicI64, Ordering},
+    sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 
 use blaze_mem::Tag;
+use crossbeam_queue::SegQueue;
 
 use crate::Budget;
 
@@ -34,16 +42,17 @@ struct Total(AtomicI64);
 /// but for less than [`BATCH`] per thread not yet added.
 static HELD: Total = Total(AtomicI64::new(0));
 
-/// The most [`HELD`] was since [`high_water_from_now`] last began a watch: what a task that ran
-/// alone held at most on every thread, its own and those it handed work to.
-static HIGH: Total = Total(AtomicI64::new(0));
-
 /// A thread's counts, in one block so an allocation reaches its thread-local storage once.
 struct Local {
     /// The bytes this thread allocated less those it freed, through [`Counting`].
     net: Cell<i64>,
-    /// The most `net` was since the innermost [`measure`] on this thread began.
-    peak: Cell<i64>,
+    /// The account the job on this thread charges ([`Account`]'s id; 0 for none): carried with
+    /// the job across its waits ([`take_account`], [`put_account`]), so it is the job's, never
+    /// the thread's.
+    account: Cell<usize>,
+    /// What this thread allocated less what it freed for `account` since it last charged it:
+    /// charged at [`ACCOUNT_BATCH`], and whenever the thread's account changes.
+    charged: Cell<i64>,
     /// What `net` moved since it was last added to [`HELD`].
     unflushed: Cell<i64>,
     /// How far `unflushed` may go before it is added: 0 until the flush at the thread's exit is
@@ -78,7 +87,8 @@ thread_local! {
     static LOCAL: Local = const {
         Local {
             net: Cell::new(0),
-            peak: Cell::new(0),
+            account: Cell::new(0),
+            charged: Cell::new(0),
             unflushed: Cell::new(0),
             batch: Cell::new(0),
             armed: Cell::new(false),
@@ -125,17 +135,15 @@ fn exit_flush(local: &Local) -> i64 {
 
 #[cfg_attr(not(test), allow(unused_variables))]
 fn add(local: &Local, bytes: i64) {
-    let now = HELD.0.fetch_add(bytes, Ordering::Relaxed).wrapping_add(bytes);
-    if bytes > 0 {
-        HIGH.0.fetch_max(now, Ordering::Relaxed);
-    }
+    HELD.0.fetch_add(bytes, Ordering::Relaxed);
     #[cfg(test)]
     local.flushed.set(local.flushed.get().wrapping_add(bytes));
 }
 
 /// Per allocation: one thread-local block, four adds and three well-predicted branches; the
-/// atomic adds are in [`flush`] and [`fold`], once per [`BATCH`] bytes of drift. `holder` is
-/// the tag whose task allocated the bytes ([`Holders`]).
+/// atomic adds are in [`flush`], [`fold`] and [`charge`], once per [`BATCH`] (or
+/// [`ACCOUNT_BATCH`]) bytes of drift. `holder` is the tag whose task allocated the bytes
+/// ([`Holders`]).
 ///
 /// [`LOCAL`]'s other reader, not inlined for the same reason as [`with_local`], and reading it
 /// itself so that `holder` and `delta` arrive in registers: through `with_local`'s closure they
@@ -144,10 +152,15 @@ fn add(local: &Local, bytes: i64) {
 #[inline(never)]
 fn count(holder: Option<Tag>, delta: i64) {
     LOCAL.with(|local| {
-        let net = local.net.get().wrapping_add(delta);
-        local.net.set(net);
-        if net > local.peak.get() {
-            local.peak.set(net);
+        local.net.set(local.net.get().wrapping_add(delta));
+        let account = local.account.get();
+        if account != 0 {
+            let charged = local.charged.get().wrapping_add(delta);
+            if charged.unsigned_abs() < ACCOUNT_BATCH.unsigned_abs() {
+                local.charged.set(charged);
+            } else {
+                charge(local, account, charged);
+            }
         }
         let batch = local.batch.get().unsigned_abs();
         let moved = &local.holders[slot(holder)];
@@ -192,8 +205,9 @@ fn flush(local: &Local, unflushed: i64) {
 /// write on an allocation but once per [`BATCH`] bytes a thread's count moves.
 ///
 /// A byte freed on another thread than the one that allocated it counts against the thread
-/// that frees it: [`measure`] sees what a task's thread allocated and freed, exactly; [`held`]
-/// is within [`BATCH`] per other thread of what the process holds.
+/// that frees it, and against the [`account`] of the work that frees it: an account's peak is
+/// within [`ACCOUNT_BATCH`] per thread charging it of what its work held; [`held`] is within
+/// [`BATCH`] per other thread of what the process holds.
 ///
 /// Where `A` keeps blocks by tag ([`Holders::BY_TAG`]), each allocation is made for the tag of
 /// the task running on the thread (`blaze_mem::frame::running_tag`), and its free, on any
@@ -247,7 +261,13 @@ mod global {
         /// # Safety
         ///
         /// [`GlobalAlloc::realloc`]'s contract.
-        unsafe fn realloc_for(&self, into: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8;
+        unsafe fn realloc_for(
+            &self,
+            into: Option<Tag>,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8;
     }
 
     /// std's allocator keeps no blocks apart: its bytes are counted, not named.
@@ -268,7 +288,13 @@ mod global {
             None
         }
 
-        unsafe fn realloc_for(&self, _: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe fn realloc_for(
+            &self,
+            _: Option<Tag>,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8 {
             // SAFETY: the caller upholds `realloc`'s contract for `ptr`, `layout` and `new_size`.
             unsafe { self.realloc(ptr, layout, new_size) }
         }
@@ -362,28 +388,295 @@ mod global {
     }
 }
 
-/// Runs `f` and says the most bytes it held at once above what its thread held when it began,
-/// what it freed counted against what it allocated. Measures nest: an inner one's peak is part
-/// of the outer one's. 0 when [`Counting`] is not the global allocator.
-pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
-    struct Restore {
-        outer: i64,
+/// How far a thread's bytes for its account may move before they are charged to it: the
+/// account's peak is exact to this much per thread charging it, and an allocation in an
+/// account costs a thread-local add and no atomic but once per this many bytes.
+const ACCOUNT_BATCH: i64 = 64 << 10;
+
+/// The slots of the first segment of [`SEGMENTS`]; segment `k` holds `FIRST_SLOTS << k`.
+const FIRST_SLOTS: usize = 256;
+
+/// The low bits of an [`Account`]'s word: its slot's index plus one. Wide enough that the
+/// slots of every index would take more memory than the address space gives (64-byte slots:
+/// 2^40 of them are 64 TiB; on a 32-bit target 2^27 are 8 GiB), so the table runs out of
+/// memory, as any allocation does, before it runs out of indices: it never fills. The rest of
+/// the word is the generation's low bits (24, or 5 on a 32-bit target).
+const INDEX_BITS: u32 = if usize::BITS == 64 { 40 } else { 27 };
+
+/// One segment pointer per doubling: enough for every index [`INDEX_BITS`] can name.
+const SEGMENT_COUNT: usize = usize::BITS as usize;
+
+/// An account's slot in [`SEGMENTS`].
+#[repr(align(64))]
+struct Slot {
+    /// Even while the slot is free, odd while an account holds it; moved on at each open and
+    /// close, so the id of an account that closed never matches the slot again (but for a
+    /// generation that wraps the word's room for it).
+    generation: AtomicU32,
+    /// How many accounts enclose it: a charge walks this many parents at most.
+    depth: AtomicU32,
+    /// The id of the account it was opened inside, which every charge to it is charged to too;
+    /// 0 for none.
+    parent: AtomicUsize,
+    /// What its work allocated less what it freed, as charged.
+    net: AtomicI64,
+    /// The most `net` was.
+    peak: AtomicI64,
+}
+
+/// Every account's slot, in segments that double, each made the first time an index in it is
+/// opened and never freed: a slot's address is fixed for the process's life, so the allocator's
+/// charges reach it with an acquire load and no lock. A segment is taken from the system
+/// allocator, zeroed (a zeroed [`Slot`] is a free one), outside [`Counting`]: making one charges
+/// no account and never reenters a charge.
+static SEGMENTS: [AtomicPtr<Slot>; SEGMENT_COUNT] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; SEGMENT_COUNT];
+
+/// The slots closed accounts freed, for the next open: the table grows only to the most
+/// accounts open at once.
+static FREE_SLOTS: SegQueue<usize> = SegQueue::new();
+
+/// How many slots were ever taken: the next index when none is free.
+static MADE_SLOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// The segment of slot `index` and its place there.
+fn segment_of(index: usize) -> (usize, usize) {
+    let run = index / FIRST_SLOTS + 1;
+    let segment = (usize::BITS - 1 - run.leading_zeros()) as usize;
+    (segment, index - FIRST_SLOTS * ((1 << segment) - 1))
+}
+
+/// The layout of segment `segment`. One past the address space is the process out of
+/// memory, as its allocation would be (`handle_alloc_error`): never reached before the
+/// segments below it took the memory there is.
+fn segment_layout(segment: usize) -> std::alloc::Layout {
+    let slots = FIRST_SLOTS.checked_shl(segment as u32).unwrap_or(usize::MAX);
+    std::alloc::Layout::array::<Slot>(slots)
+        .unwrap_or_else(|_| std::alloc::handle_alloc_error(std::alloc::Layout::new::<Slot>()))
+}
+
+/// Slot `index`, if its segment was made.
+// unsafe: the account table's segments are raw allocations shared lock-free (see SAFETY below).
+#[allow(unsafe_code)]
+fn slot_at(index: usize) -> Option<&'static Slot> {
+    let (segment, at) = segment_of(index);
+    let base = SEGMENTS.get(segment)?.load(Ordering::Acquire);
+    if base.is_null() {
+        return None;
     }
-    impl Drop for Restore {
-        // On a panic too: the outer measure still sees what `f` held.
+    // SAFETY: a non-null segment pointer is a zeroed allocation of `FIRST_SLOTS << segment`
+    // slots (`make_segment`), published with release and never freed or moved; `at` is below
+    // that count by `segment_of`, and every field of a slot is an atomic.
+    Some(unsafe { &*base.add(at) })
+}
+
+/// Slot `index`, making its segment if no open made it yet. A segment the system cannot give
+/// is the process out of memory, as for any allocation (`handle_alloc_error`).
+#[allow(unsafe_code)]
+fn make_slot(index: usize) -> &'static Slot {
+    if let Some(slot) = slot_at(index) {
+        return slot;
+    }
+    let (segment, at) = segment_of(index);
+    let layout = segment_layout(segment);
+    // SAFETY: `layout` has a non-zero size (a slot is 64 bytes, a segment holds at least one).
+    let made = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
+        .cast::<Slot>();
+    if made.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    let base = match SEGMENTS[segment].compare_exchange(
+        std::ptr::null_mut(),
+        made,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => made,
+        Err(theirs) => {
+            // Another open made it first: ours was never published.
+            // SAFETY: `made` came from `System` with `layout` just above and nothing else saw it.
+            unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, made.cast(), layout) };
+            theirs
+        }
+    };
+    // SAFETY: as in `slot_at`: `base` is the published segment, `at` below its count.
+    unsafe { &*base.add(at) }
+}
+
+/// A task's memory account: what the work of one task allocated less what it freed through
+/// [`Counting`], on its own job and on every job a pool scope of it ran, wherever each ran and
+/// resumed, and the most that was ([`account`]). A word: its slot and that slot's generation
+/// while it holds it (as many of the generation's bits as the word has room for), 0 for none,
+/// so a job's closure carries it for nothing and a stale one charges nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Account(usize);
+
+impl Account {
+    /// No account: work charged to it is charged to none.
+    pub const NONE: Account = Account(0);
+
+    fn of(index: usize, generation: u32) -> Account {
+        Account(((generation as usize) << INDEX_BITS) | (index + 1))
+    }
+
+    /// Its slot's index; `None` for none.
+    fn index(self) -> Option<usize> {
+        (self.0 & ((1 << INDEX_BITS) - 1)).checked_sub(1)
+    }
+
+    /// Its slot, if that slot holds it still.
+    fn slot(self) -> Option<&'static Slot> {
+        let slot = slot_at(self.index()?)?;
+        let generation = slot.generation.load(Ordering::Acquire) as usize;
+        (generation & (usize::MAX >> INDEX_BITS) == self.0 >> INDEX_BITS).then_some(slot)
+    }
+}
+
+/// Charges `moved` bytes to `account` and to every account it was opened inside, raising each
+/// one's peak. Atomics only: it runs inside the allocator, and as a job parks. An account that
+/// closed (its slot's generation moved on) is charged nothing, and neither is any above it.
+/// Bounded by the account's depth: each parent is one shallower, so the walk ends there.
+fn charge_to(account: Account, moved: i64) {
+    let Some(mut slot) = account.slot() else { return };
+    let depth = slot.depth.load(Ordering::Relaxed);
+    for _ in 0..=depth {
+        let net = slot.net.fetch_add(moved, Ordering::Relaxed).wrapping_add(moved);
+        if moved > 0 {
+            slot.peak.fetch_max(net, Ordering::Relaxed);
+        }
+        let Some(parent) = Account(slot.parent.load(Ordering::Relaxed)).slot() else { return };
+        slot = parent;
+    }
+}
+
+/// [`count`]'s charge, once a thread's bytes for its account moved [`ACCOUNT_BATCH`].
+#[cold]
+#[inline(never)]
+fn charge(local: &Local, account: usize, moved: i64) {
+    local.charged.set(0);
+    charge_to(Account(account), moved);
+}
+
+/// Charges what this thread moved for its account since it last charged it, then makes
+/// `account` the thread's (the job's on it). The account it had.
+#[inline(never)]
+fn switch(account: Account) -> Account {
+    with_local(|local| {
+        let moved = local.charged.replace(0);
+        let was = Account(local.account.replace(account.0));
+        if moved != 0 {
+            charge_to(was, moved);
+        }
+        was
+    })
+}
+
+/// Opens an account inside `parent` (or none) in a free slot, or a new one when none is free.
+/// It never fails and never waits: the table grows to the most accounts open at once
+/// ([`SEGMENTS`]), and accounts nest as deep as the work does.
+fn open(parent: Account) -> Account {
+    let depth =
+        parent.slot().map_or(0, |slot| slot.depth.load(Ordering::Relaxed).saturating_add(1));
+    let index = FREE_SLOTS.pop().unwrap_or_else(|| MADE_SLOTS.fetch_add(1, Ordering::Relaxed));
+    let slot = make_slot(index);
+    slot.net.store(0, Ordering::Relaxed);
+    slot.peak.store(0, Ordering::Relaxed);
+    slot.depth.store(depth, Ordering::Relaxed);
+    slot.parent.store(parent.0, Ordering::Relaxed);
+    // The slot is this open's alone (popped or new): even to odd, published with its fields.
+    let held = slot.generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    Account::of(index, held)
+}
+
+/// Closes `account`, freeing its slot: its peak, what its work held at most.
+fn close(account: Account) -> u64 {
+    let (Some(slot), Some(index)) = (account.slot(), account.index()) else { return 0 };
+    let peak = slot.peak.load(Ordering::Relaxed);
+    slot.generation.fetch_add(1, Ordering::Release);
+    // alloc: a free slot's place in the queue, a block per 31 frees (crossbeam), reused
+    FREE_SLOTS.push(index);
+    u64::try_from(peak).unwrap_or(0)
+}
+
+/// What `account`'s work held at most so far, as charged.
+fn peak_of(account: Account) -> u64 {
+    account.slot().map_or(0, |slot| u64::try_from(slot.peak.load(Ordering::Relaxed)).unwrap_or(0))
+}
+
+/// Runs `f` in a new account, inside the job's account if it has one, and says the most bytes
+/// its work held at once through [`Counting`]: what it allocated less what it freed, on this
+/// job and on every job a pool scope of `f` ran ([`charged_to`]), wherever each ran and
+/// resumed. Never what other tasks held meanwhile, on any thread: two tasks running side by
+/// side are each charged their own bytes. Accounts nest: an inner one's bytes are charged to
+/// the outer one too. 0 when [`Counting`] is not the global allocator.
+///
+/// A byte freed counts against the account of the work that frees it, whoever allocated it: a
+/// task that drops a value an earlier task made (a memo it replaces) holds less, and its peak
+/// is the most above where it began, never below 0. A byte its work allocated and left behind
+/// (a memo it made) is held at its end, and counts toward its peak.
+pub fn account<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    struct Open {
+        account: Account,
+        outer: Account,
+    }
+    impl Drop for Open {
+        // On a panic too: the slot is freed, and the job charges its outer account again.
         fn drop(&mut self) {
-            with_local(|local| local.peak.set(self.outer.max(local.peak.get())));
+            switch(self.outer);
+            close(self.account);
         }
     }
-    let (base, outer) = with_local(|local| {
-        let base = local.net.get();
-        (base, local.peak.replace(base))
-    });
-    let restore = Restore { outer };
+    let outer = current();
+    let account = open(outer);
+    switch(account);
+    let open = Open { account, outer };
     let result = f();
-    let peak = with_local(|local| local.peak.get());
-    drop(restore);
-    (result, u64::try_from(peak.saturating_sub(base)).unwrap_or(0))
+    // What this thread moved for it, charged before its peak is read; every job of its scopes
+    // charged its own as it ended (`charged_to`).
+    switch(account);
+    let peak = peak_of(account);
+    drop(open);
+    (result, peak)
+}
+
+/// The account the job on this thread charges: what a pool scope's job is charged to
+/// (`crate::pool::Scope::submit`), so a task's fan-out is the task's.
+#[inline(never)]
+pub fn current() -> Account {
+    with_local(|local| Account(local.account.get()))
+}
+
+/// Runs `f` charging `account` (none: [`Account::NONE`]), then gives the job back the account
+/// it had, every byte `f` moved charged first: a pool scope's job, charged to the account of
+/// the work that opened the scope, which outlives it (the scope waits for its jobs).
+pub fn charged_to<R>(account: Account, f: impl FnOnce() -> R) -> R {
+    struct Back(Account);
+    impl Drop for Back {
+        // On a panic too.
+        fn drop(&mut self) {
+            switch(self.0);
+        }
+    }
+    if account == Account::NONE && current() == Account::NONE {
+        return f();
+    }
+    let _back = Back(switch(account));
+    f()
+}
+
+/// Moves the account of the job that parks on this thread off it, charging what the thread
+/// moved for it first (`blaze_graph::sched::fiber::Carried`'s `take`): `None` when the job has
+/// none.
+#[inline(never)]
+pub fn take_account() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(switch(Account::NONE).0)
+}
+
+/// Puts the account [`take_account`] moved off a thread onto this one, which charges none: from
+/// here the job's bytes on this thread are charged to it.
+#[inline(never)]
+pub fn put_account(account: NonZeroUsize) {
+    switch(Account(account.get()));
 }
 
 /// The bytes the process holds now through [`Counting`]; 0 when it is not the global
@@ -392,22 +685,6 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
 pub fn held() -> u64 {
     let own = with_local(|local| local.unflushed.get());
     u64::try_from(HELD.0.load(Ordering::Relaxed).wrapping_add(own)).unwrap_or(0)
-}
-
-/// Begins a watch of the most the process holds: [`high_water`] from now on is at least what
-/// it holds now. What it holds now. One watch at a time: the plane's task that runs alone
-/// begins it, and nothing else does.
-pub fn high_water_from_now() -> u64 {
-    let now = held();
-    HIGH.0.store(i64::try_from(now).unwrap_or(i64::MAX), Ordering::Relaxed);
-    now
-}
-
-/// The most the process held through [`Counting`] since [`high_water_from_now`], within
-/// [`BATCH`] per thread: what the threads add to [`HELD`], which a thread does once per
-/// [`BATCH`] of drift, so a watch costs an allocation nothing.
-pub fn high_water() -> u64 {
-    u64::try_from(HIGH.0.load(Ordering::Relaxed)).unwrap_or(0).max(held())
 }
 
 /// The process's footprint: as the system counts it where the daemon says how to read it
@@ -847,7 +1124,11 @@ fn least(
     match bytes.checked_sub(others).and_then(|it| it.checked_sub(margin)) {
         Some(left) if left > 0 => {
             // alloc: the budget's name, once per daemon start
-            Ok(Budget { bytes: left, from: format!("{from}, {}, less {taken}", gb(bytes)), kept_back: bytes - left })
+            Ok(Budget {
+                bytes: left,
+                from: format!("{from}, {}, less {taken}", gb(bytes)),
+                kept_back: bytes - left,
+            })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -890,7 +1171,13 @@ mod tests {
             None
         }
 
-        unsafe fn realloc_for(&self, _: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe fn realloc_for(
+            &self,
+            _: Option<Tag>,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8 {
             // SAFETY: the caller upholds `realloc`'s contract.
             unsafe { self.realloc(ptr, layout, new_size) }
         }
@@ -965,7 +1252,13 @@ mod tests {
 
             /// Every realloc here moves the block, as a large one does under mimalloc: it is
             /// labelled `into`'s.
-            unsafe fn realloc_for(&self, into: Option<Tag>, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe fn realloc_for(
+                &self,
+                into: Option<Tag>,
+                ptr: *mut u8,
+                layout: Layout,
+                new_size: usize,
+            ) -> *mut u8 {
                 // SAFETY: std's block, grown whole, label and all; the new label's byte is in it.
                 unsafe {
                     let block = System.realloc(ptr.sub(LABEL), labelled(layout), new_size + LABEL);
@@ -1009,7 +1302,8 @@ mod tests {
         assert_eq!(heap(Tag::Fuzz), fuzz + 8 * MB as u64);
         // Grown, and moved, in a task of another tag: the grower's now, all of it.
         // SAFETY: `block` is live, made with `small`.
-        let block = blaze_mem::frame::task(Tag::Api, |_| unsafe { TAGGED.realloc(block, small, 12 * MB) });
+        let block =
+            blaze_mem::frame::task(Tag::Api, |_| unsafe { TAGGED.realloc(block, small, 12 * MB) });
         assert_eq!(heap(Tag::Fuzz), fuzz, "a block that moves leaves its maker");
         assert_eq!(heap(Tag::Api), api + 12 * MB as u64, "and is the grower's");
         let sent = Sent(block);
@@ -1032,8 +1326,8 @@ mod tests {
     const MB: usize = 1 << 20;
 
     #[test]
-    fn a_measure_says_what_its_work_held_at_most() {
-        let (held, peak) = measure(|| {
+    fn an_account_says_what_its_work_held_at_most() {
+        let (held, peak) = account(|| {
             let big = std::hint::black_box(vec![1u8; 4 * MB]);
             drop(big);
             std::hint::black_box(vec![2u8; MB])
@@ -1043,7 +1337,7 @@ mod tests {
         assert_eq!(held.len(), MB);
         // What was held before it and freed in it lowers what it holds.
         let before = std::hint::black_box(vec![3u8; 4 * MB]);
-        let ((), peak) = measure(|| {
+        let ((), peak) = account(|| {
             drop(before);
             let again = vec![4u8; MB];
             std::hint::black_box(&again);
@@ -1052,19 +1346,19 @@ mod tests {
     }
 
     #[test]
-    fn measures_nest() {
-        let ((inner, after), outer) = measure(|| {
-            let (_, inner) = measure(|| std::hint::black_box(vec![1u8; 8 * MB]).len());
-            let (_, after) = measure(|| std::hint::black_box(vec![1u8; MB]).len());
+    fn accounts_nest_and_a_panic_closes_its_own() {
+        let ((inner, after), outer) = account(|| {
+            let (_, inner) = account(|| std::hint::black_box(vec![1u8; 8 * MB]).len());
+            let (_, after) = account(|| std::hint::black_box(vec![1u8; MB]).len());
             (inner, after)
         });
         assert!(inner >= 8 * MB as u64, "{inner}");
         assert!(after >= MB as u64 && after < 2 * MB as u64, "{after}");
         assert!(outer >= inner, "{outer} < {inner}");
-        // A panic inside a measure leaves the outer one whole.
-        let ((), outer) = measure(|| {
+        // A panic inside an account leaves the outer one whole, charging it again.
+        let ((), outer) = account(|| {
             let caught = std::panic::catch_unwind(|| {
-                measure(|| {
+                account(|| {
                     let big = std::hint::black_box(vec![1u8; 6 * MB]);
                     if !big.is_empty() {
                         panic!("on purpose");
@@ -1072,8 +1366,128 @@ mod tests {
                 })
             });
             assert!(caught.is_err());
+            let after = std::hint::black_box(vec![1u8; 7 * MB]);
+            drop(after);
         });
-        assert!(outer >= 6 * MB as u64, "{outer}");
+        assert!(
+            outer >= 7 * MB as u64,
+            "the outer account charged nothing after the panic: {outer}"
+        );
+        assert_eq!(current(), Account::NONE, "every account closed");
+    }
+
+    /// Opening and closing many more accounts than a segment holds: each close frees its slot,
+    /// and an account that closed is charged nothing however its slot is reused.
+    #[test]
+    fn a_closed_accounts_slot_is_reused_and_its_id_charges_nothing() {
+        let (stale, _) = account(current);
+        for _ in 0..8 * FIRST_SLOTS {
+            let ((), _) = account(|| ());
+        }
+        let ((), peak) = account(|| {
+            charged_to(stale, || drop(std::hint::black_box(vec![1u8; 4 * MB])));
+        });
+        assert!(peak < MB as u64, "a closed account's bytes reached a live one: {peak}");
+    }
+
+    /// Accounts open at once past any fixed count, nested past any fixed depth: the table
+    /// grows and every one is charged, never a panic (the table of 4096 slots and 64 levels
+    /// before it failed the task that opened one more). A byte 2000 deep is its every
+    /// enclosing account's.
+    #[test]
+    fn accounts_open_past_any_fixed_table_and_depth() {
+        fn nest(left: usize) -> u64 {
+            let ((), peak) = account(|| {
+                if left == 0 {
+                    drop(std::hint::black_box(vec![1u8; 2 * MB]));
+                } else {
+                    let inner = nest(left - 1);
+                    assert!(inner >= 2 * MB as u64, "{left} levels up saw {inner}");
+                }
+            });
+            peak
+        }
+        let deepest = 4 * FIRST_SLOTS + 7;
+        let peak = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || nest(deepest))
+            .and_then(|it| it.join().map_err(|_| io::Error::other("the nested accounts panicked")))
+            .unwrap();
+        assert!(peak >= 2 * MB as u64, "the outermost of {deepest} saw {peak}");
+        assert!(
+            MADE_SLOTS.load(Ordering::Relaxed) > deepest,
+            "every level held its own slot at once"
+        );
+        assert!(slot_at(deepest).is_some(), "a later segment was made");
+        assert_eq!(segment_of(0), (0, 0));
+        assert_eq!(segment_of(FIRST_SLOTS - 1), (0, FIRST_SLOTS - 1));
+        assert_eq!(segment_of(FIRST_SLOTS), (1, 0));
+        assert_eq!(segment_of(3 * FIRST_SLOTS), (2, 0));
+    }
+
+    /// A task's work handed to other threads is the task's ([`charged_to`], as a pool scope's
+    /// jobs are): four threads holding 32 MB at once are a peak of 128 MB, and what threads
+    /// outside the account hold meanwhile is none of it. Before accounts, the task's own thread
+    /// saw none of its fan-out, and a watch of the whole process saw everyone's.
+    #[test]
+    fn an_account_counts_its_fan_out_and_nothing_beside_it() {
+        let together = std::sync::Barrier::new(5);
+        let ((), peak) = account(|| {
+            let task = current();
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        charged_to(task, || {
+                            let held = std::hint::black_box(vec![1u8; 32 * MB]);
+                            together.wait();
+                            together.wait();
+                            drop(held);
+                        });
+                    });
+                }
+                // Another task's thread, beside it: not charged.
+                scope.spawn(|| {
+                    let other = std::hint::black_box(vec![2u8; 64 * MB]);
+                    together.wait();
+                    together.wait();
+                    drop(other);
+                });
+            });
+        });
+        assert!(peak >= 128 * MB as u64, "the fan-out unseen: {peak}");
+        assert!(peak < 129 * MB as u64, "another thread's bytes charged to the task: {peak}");
+    }
+
+    /// A job that waits in an account and resumes on another thread charges on from where it
+    /// parked: neither what that thread held before it came nor what the first thread did
+    /// meanwhile is the job's.
+    #[test]
+    fn an_account_carried_to_another_thread_charges_only_its_job() {
+        let ((), peak) = account(|| {
+            drop(std::hint::black_box(vec![1u8; 2 * MB]));
+            let carried = take_account().expect("an account is open");
+            let back = std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        // The thread's own: held before the job came and freed after it left.
+                        let before = std::hint::black_box(vec![2u8; 64 * MB]);
+                        put_account(carried);
+                        drop(std::hint::black_box(vec![3u8; 3 * MB]));
+                        let back = take_account().expect("still open");
+                        drop(before);
+                        back
+                    })
+                    .join()
+                    .expect("the thread the job resumed on")
+            });
+            // The first thread's own, while the job was away.
+            let meanwhile = std::hint::black_box(vec![4u8; 32 * MB]);
+            put_account(back);
+            drop(meanwhile);
+        });
+        assert!(peak >= 3 * MB as u64, "the job's own 3 MB unseen: {peak}");
+        assert!(peak < 4 * MB as u64, "another thread's bytes counted as the job's: {peak}");
+        assert!(take_account().is_none(), "every account closed");
     }
 
     #[test]
@@ -1081,30 +1495,6 @@ mod tests {
         let big = vec![1u8; 32 * MB];
         assert!(held() >= 32 * MB as u64, "{}", held());
         std::hint::black_box(&big);
-    }
-
-    /// A watch sees the most every thread held at once, the threads a task hands its work to
-    /// as well as its own, though they freed it before the watch is read: what [`measure`] on
-    /// the task's thread misses. Other tests allocate and free meanwhile, so it asks for a
-    /// quarter of what the threads held together.
-    #[test]
-    fn a_watch_sees_what_every_thread_held_at_most() {
-        let start = high_water_from_now();
-        let together = std::sync::Barrier::new(4);
-        let ((), own) = measure(|| {
-            std::thread::scope(|scope| {
-                for _ in 0..4 {
-                    scope.spawn(|| {
-                        let held = std::hint::black_box(vec![1u8; 32 * MB]);
-                        together.wait();
-                        drop(held);
-                    });
-                }
-            });
-        });
-        let most = high_water().saturating_sub(start);
-        assert!(own < 32 * MB as u64, "the task's own thread held {own}");
-        assert!(most >= 32 * MB as u64, "the watch saw {most}");
     }
 
     /// What blaze holds counts the pages `blaze_mem` maps itself, which the global allocator
@@ -1426,11 +1816,7 @@ mod tests {
         assert!(why.contains("vm.max_memory_mib of `lots`"), "{why}");
         let tree = Tree::new(
             "bad-iomem",
-            &[
-                ("proc/meminfo", GROWN),
-                ("proc/iomem", "garbage\n"),
-                ("proc/self/cgroup", "0::/\n"),
-            ],
+            &[("proc/meminfo", GROWN), ("proc/iomem", "garbage\n"), ("proc/self/cgroup", "0::/\n")],
         );
         assert!(linux_limits(&tree.0).unwrap_err().to_string().contains("a line `garbage`"));
     }
@@ -1445,14 +1831,24 @@ mod tests {
         let told = Some((1 << 30, "BLAZE_DAEMON_MEMORY_GB=1".to_owned()));
         match machine_budget(1 << 20, told) {
             Ok(budget) => {
-                assert!(budget.from.starts_with("BLAZE_DAEMON_MEMORY_GB=1, 1.00 GB"), "{}", budget.from);
+                assert!(
+                    budget.from.starts_with("BLAZE_DAEMON_MEMORY_GB=1, 1.00 GB"),
+                    "{}",
+                    budget.from
+                );
                 assert!(budget.bytes < 1 << 30, "{}", budget.bytes);
             }
-            Err(error) => assert!(error.to_string().contains("of BLAZE_DAEMON_MEMORY_GB=1"), "{error}"),
+            Err(error) => {
+                assert!(error.to_string().contains("of BLAZE_DAEMON_MEMORY_GB=1"), "{error}")
+            }
         }
         let over = Some((u64::MAX / 2, "blaze serve --memory-gb".to_owned()));
         let budget = machine_budget(1 << 20, over).unwrap();
-        assert!(!budget.from.contains("--memory-gb"), "the machine's is the least: {}", budget.from);
+        assert!(
+            !budget.from.contains("--memory-gb"),
+            "the machine's is the least: {}",
+            budget.from
+        );
     }
 
     #[test]

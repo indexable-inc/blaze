@@ -62,7 +62,10 @@ impl<T> RangeMap<T> {
         };
         let end = range.end();
         assert!(end <= self.size(), "iterating beyond the bounds of this RangeMap");
-        slice.iter().take_while(move |elem| elem.start < end).map(|elem| (elem.start..elem.end, &elem.data))
+        slice
+            .iter()
+            .take_while(move |elem| elem.start < end)
+            .map(|elem| (elem.start..elem.end, &elem.data))
     }
 
     /// Splits the element at `index` so the second part starts at `split_offset`; whether it had

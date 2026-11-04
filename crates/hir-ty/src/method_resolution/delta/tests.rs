@@ -16,7 +16,6 @@ use std::fmt::Write as _;
 use base_db::{Crate, Db, Maintained, all_crates};
 use blaze_dbsp::Work;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::Tag;
 use hir_def::{
     BuiltinDeriveImplId, ImplId, ModuleDefId, ModuleId, TraitId,
@@ -27,6 +26,7 @@ use hir_def::{
 use hir_expand::{fixture, name::Name};
 use smallvec::SmallVec;
 use span::FileId;
+use std::alloc::Global;
 
 use super::{
     head::{Head, try_head},
@@ -165,7 +165,8 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
     );
     let lang = lang_items(db, krate);
     let mut by_trait: HashMap<TraitId, TraitExpected, Global> = HashMap::new_in(Global);
-    let mut by_head: HashMap<Head, (Vec<(ModuleId, ImplId)>, Vec<ModuleId>), Global> = HashMap::new_in(Global);
+    let mut by_head: HashMap<Head, (Vec<(ModuleId, ImplId)>, Vec<ModuleId>), Global> =
+        HashMap::new_in(Global);
     let mut body_modules = Vec::new();
     for (module, _) in crate_def_map(db, krate).modules(db) {
         for &trait_ in trait_bodies(db, module).traits.iter() {
@@ -223,8 +224,7 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
         let rows = slice.rows(db);
         let mut expected = by_head.remove(&head).unwrap_or_default();
         expected.1.sort_unstable();
-        let mut impls: Vec<_> =
-            rows.impls.iter().map(|(module, imp, _)| (*module, *imp)).collect();
+        let mut impls: Vec<_> = rows.impls.iter().map(|(module, imp, _)| (*module, *imp)).collect();
         impls.sort_by_key(|&(module, _)| module_rank(db, module));
         if (impls, rows.bodies.to_vec()) != expected {
             _ = writeln!(failures, "{what}: the slice of {head:?} differs from scratch");

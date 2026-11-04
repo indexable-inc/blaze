@@ -40,10 +40,8 @@ pub type Element<'t> = syntax_tree::view::Element<'t, RustLanguage>;
 pub type Children<'t> = syntax_tree::view::Children<'t, RustLanguage>;
 pub type ChildrenWithTokens<'t> = syntax_tree::view::ChildrenWithTokens<'t, RustLanguage>;
 pub type Descendants<'t> = syntax_tree::view::Descendants<'t, RustLanguage>;
-pub type DescendantsWithTokens<'t> =
-    syntax_tree::view::DescendantsWithTokens<'t, RustLanguage>;
-pub type DescendantsWithRanges<'t> =
-    syntax_tree::view::DescendantsWithRanges<'t, RustLanguage>;
+pub type DescendantsWithTokens<'t> = syntax_tree::view::DescendantsWithTokens<'t, RustLanguage>;
+pub type DescendantsWithRanges<'t> = syntax_tree::view::DescendantsWithRanges<'t, RustLanguage>;
 pub type Preorder<'t> = syntax_tree::view::Preorder<'t, RustLanguage>;
 pub type PreorderWithTokens<'t> = syntax_tree::view::PreorderWithTokens<'t, RustLanguage>;
 
@@ -321,7 +319,10 @@ pub fn try_to_node<'t>(ptr: SyntaxNodePtr, root: Node<'t>) -> Option<Node<'t>> {
 impl<N: crate::AstNode + Typed> AstPtr<N> {
     /// An `AstPtr` to the node a view stands for.
     #[inline]
-    #[allow(clippy::needless_pass_by_value, reason = "a view is a copied handle, taken as views are passed everywhere")]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "a view is a copied handle, taken as views are passed everywhere"
+    )]
     pub fn of<'t>(node: N::Of<'t>) -> AstPtr<N> {
         let syntax = <N::Of<'t> as AstNode<'t>>::syntax(&node);
         AstPtr::try_from_raw(ptr(syntax)).expect("a view casts to its handle type")

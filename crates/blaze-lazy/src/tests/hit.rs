@@ -21,7 +21,11 @@ pub(super) fn target_of(n: u32) -> u64 {
     0x50_0000 + u64::from(n) * 0x40
 }
 
-pub(super) fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runner<C, Addresses, Mail>, Arc<Mailbox>) {
+pub(super) fn start<C: Compiler>(
+    count: u32,
+    compiler: C,
+    workers: u32,
+) -> (Runner<C, Addresses, Mail>, Arc<Mailbox>) {
     let functions: Vec<Function> = (0..count).map(function).collect();
     let mail = Arc::new(Mailbox::default());
     let runner = Runner::start(
@@ -53,7 +57,10 @@ fn a_lone_hit_is_answered_before_the_frame_returns_and_never_compiled() {
         assert!(mail.has(0, seq), "the hit for {lazy} answered on the reading thread");
         let (kind, body) = mail.wait(0, seq);
         assert_eq!(kind, READY_KIND);
-        assert_eq!(Frame::decode(&body).unwrap(), Frame::Ready { request: u64::from(seq), lazy, target: target_of(lazy) });
+        assert_eq!(
+            Frame::decode(&body).unwrap(),
+            Frame::Ready { request: u64::from(seq), lazy, target: target_of(lazy) }
+        );
         assert_eq!(runner.target(&key(lazy)), Some(target_of(lazy)));
     }
     let closed = runner.close();
@@ -115,9 +122,14 @@ fn a_probe_that_panics_fails_the_function_naming_it_and_stops_the_run() {
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 1)).unwrap();
     let (kind, body) = mail.wait(0, 1);
     assert_eq!(kind, FAILED_KIND);
-    let Frame::Failed { lazy, why, .. } = Frame::decode(&body).unwrap() else { panic!("not a failure") };
+    let Frame::Failed { lazy, why, .. } = Frame::decode(&body).unwrap() else {
+        panic!("not a failure")
+    };
     assert_eq!(lazy, 1);
-    assert!(why.contains("the compiler panicked: boom") && why.contains("on its first call"), "{why}");
+    assert!(
+        why.contains("the compiler panicked: boom") && why.contains("on its first call"),
+        "{why}"
+    );
     assert_eq!(mail.stops().len(), 1);
     assert!(compiler.seen.lock().is_empty());
     assert_eq!(runner.close().failures.len(), 1);

@@ -42,13 +42,17 @@ fn no_flags_is_the_targets_baseline() {
 /// unchanged (an edit to the CLI) is the same toolchain: its id reads no executable.
 #[test]
 fn another_code_generator_is_another_toolchain() {
-    assert!(NIGHTLY.starts_with("nightly-") && !NIGHTLY.contains(char::is_whitespace), "{NIGHTLY:?}");
+    assert!(
+        NIGHTLY.starts_with("nightly-") && !NIGHTLY.contains(char::is_whitespace),
+        "{NIGHTLY:?}"
+    );
     let this = of(LINUX, &[]).unwrap();
     assert_eq!(this.id, id_of(&CODE, &fixture_target_data(LINUX)));
     let mut other = CODE;
     other.0.0[0] ^= 1;
     let flags: [String; 0] = [];
-    let elsewhere = toolchain_for(&other, LINUX, &fixture_target_data(LINUX), &flags, Runs::Elsewhere).unwrap();
+    let elsewhere =
+        toolchain_for(&other, LINUX, &fixture_target_data(LINUX), &flags, Runs::Elsewhere).unwrap();
     assert_ne!(elsewhere.id, this.id);
     assert_eq!(Toolchain { id: this.id, ..elsewhere }, this, "the code is the id alone");
 }
@@ -60,14 +64,22 @@ fn another_code_generator_is_another_toolchain() {
 #[test]
 fn another_data_layout_is_another_toolchain() {
     let flags: [String; 0] = [];
-    let this = toolchain_for(&CODE, LINUX, &fixture_target_data(LINUX), &flags, Runs::Elsewhere).unwrap();
+    let this =
+        toolchain_for(&CODE, LINUX, &fixture_target_data(LINUX), &flags, Runs::Elsewhere).unwrap();
     let mut other = fixture_target_data(LINUX);
-    other.data_layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into();
+    other.data_layout =
+        "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128".into();
     let relaid = toolchain_for(&CODE, LINUX, &other, &flags, Runs::Elsewhere).unwrap();
     assert_ne!(relaid.id, this.id, "the data layout is in the toolchain's id");
     assert_eq!(Toolchain { id: this.id, ..relaid }, this, "the layout is the id alone");
-    let why = toolchain_for(&CODE, LINUX, &fixture_target_data("aarch64-unknown-linux-gnu"), &flags, Runs::Elsewhere)
-        .unwrap_err();
+    let why = toolchain_for(
+        &CODE,
+        LINUX,
+        &fixture_target_data("aarch64-unknown-linux-gnu"),
+        &flags,
+        Runs::Elsewhere,
+    )
+    .unwrap_err();
     assert!(why.contains(LINUX) && why.contains("aarch64-unknown-linux-gnu"), "{why}");
 }
 
@@ -79,7 +91,11 @@ fn the_code_identity_is_handed_over_once() {
     let code = CodegenCode(ContentId([9; 32]));
     match code_or_unset() {
         None => {
-            assert!(toolchain(LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere).unwrap_err().contains("BLAZE_CODEGEN_CODE"));
+            assert!(
+                toolchain(LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere)
+                    .unwrap_err()
+                    .contains("BLAZE_CODEGEN_CODE")
+            );
             set_code(code).unwrap();
         }
         Some(it) => assert_eq!(it, code),
@@ -88,8 +104,14 @@ fn the_code_identity_is_handed_over_once() {
     let mut other = code;
     other.0.0[1] ^= 1;
     let refused = set_code(other).unwrap_err();
-    assert!(refused.contains(&format!("{:x}", code.0)) && refused.contains(&format!("{:x}", other.0)), "{refused}");
-    assert_eq!(toolchain(LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere).unwrap().id, id_of(&code, &fixture_target_data(LINUX)));
+    assert!(
+        refused.contains(&format!("{:x}", code.0)) && refused.contains(&format!("{:x}", other.0)),
+        "{refused}"
+    );
+    assert_eq!(
+        toolchain(LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere).unwrap().id,
+        id_of(&code, &fixture_target_data(LINUX))
+    );
 }
 
 fn code_or_unset() -> Option<CodegenCode> {
@@ -103,7 +125,10 @@ fn a_feature_turns_on_what_it_implies_and_off_what_implies_it() {
     let off = of(LINUX, &["-Ctarget-feature=+avx2", "-Ctarget-feature=-avx"]).unwrap();
     assert_eq!(off.features, ["+sse3", "+sse4.1", "+sse4.2", "+ssse3"]);
     let listed = of(LINUX, &["--codegen", "target-feature=+fma,+bmi2"]).unwrap();
-    assert!(listed.features.contains(&"+fma".to_owned()) && listed.features.contains(&"+bmi2".to_owned()));
+    assert!(
+        listed.features.contains(&"+fma".to_owned())
+            && listed.features.contains(&"+bmi2".to_owned())
+    );
 }
 
 #[test]
@@ -120,8 +145,18 @@ fn a_microarchitecture_level_is_its_features() {
 #[test]
 fn flags_of_the_link_and_of_reports_are_not_the_codes() {
     let flags = [
-        "-C", "link-arg=-fuse-ld=lld", "--cfg", "tokio_unstable", "-Dwarnings", "-Ccodegen-units=1",
-        "-C", "lto=off", "-Ctarget-feature=+crt-static", "-L", "-Cnot-a-flag", "-Zshare-generics",
+        "-C",
+        "link-arg=-fuse-ld=lld",
+        "--cfg",
+        "tokio_unstable",
+        "-Dwarnings",
+        "-Ccodegen-units=1",
+        "-C",
+        "lto=off",
+        "-Ctarget-feature=+crt-static",
+        "-L",
+        "-Cnot-a-flag",
+        "-Zshare-generics",
     ];
     assert_eq!(of(LINUX, &flags).unwrap(), of(LINUX, &[]).unwrap());
 }
@@ -146,14 +181,21 @@ fn a_flag_that_changes_code_and_is_not_read_is_an_error_naming_it() {
         let error = of(LINUX, flags).unwrap_err();
         assert!(error.contains(named), "{flags:?}: {error}");
     }
-    assert!(of(LINUX, &["-C", "passes=sancov-module", "-C", "llvm-args=-sanitizer-coverage-level=3"]).is_ok());
+    assert!(
+        of(LINUX, &["-C", "passes=sancov-module", "-C", "llvm-args=-sanitizer-coverage-level=3"])
+            .is_ok()
+    );
 }
 
 #[test]
 fn frame_pointers_are_the_flags_or_the_targets() {
     assert!(of(LINUX, &["--codegen", "force_frame_pointers=yes"]).unwrap().frame_pointers);
     assert!(of(LINUX, &["-Cforce-frame-pointers"]).unwrap().frame_pointers);
-    assert!(!of(LINUX, &["-Cforce-frame-pointers=yes", "-Cforce-frame-pointers=no"]).unwrap().frame_pointers);
+    assert!(
+        !of(LINUX, &["-Cforce-frame-pointers=yes", "-Cforce-frame-pointers=no"])
+            .unwrap()
+            .frame_pointers
+    );
     // Apple's frame records are its code's own (`Target::llvm_frame_pointer`), not forced.
     let apple = of("aarch64-apple-darwin", &["-Cforce-frame-pointers=no"]).unwrap();
     assert!(!apple.frame_pointers, "only the flags force every frame pointer");
@@ -167,7 +209,10 @@ fn the_relocation_model_is_the_flags_or_the_targets() {
     let windows = "x86_64-pc-windows-msvc";
     assert_eq!(of(windows, &[]).unwrap().relocation, Relocation::Static);
     assert_eq!(of(windows, &["-C", "relocation-model=pic"]).unwrap().relocation, Relocation::Pic);
-    assert_eq!(of(LINUX, &["-C", "relocation-model=static"]).unwrap().relocation, Relocation::Static);
+    assert_eq!(
+        of(LINUX, &["-C", "relocation-model=static"]).unwrap().relocation,
+        Relocation::Static
+    );
     assert_eq!(of(LINUX, &["-C", "relocation-model=default"]).unwrap().relocation, Relocation::Pic);
 }
 
@@ -176,7 +221,10 @@ fn aarch64_features_are_past_its_baseline() {
     let apple = of("aarch64-apple-darwin", &["-C", "target-feature=-lse,+dotprod"]).unwrap();
     assert_eq!(apple.features, ["+dotprod", "-lse"]);
     let linux = of("aarch64-unknown-linux-gnu", &["-C", "target-feature=+lse"]).unwrap();
-    assert_eq!((linux.cpu.as_str(), linux.features.as_slice()), ("generic", &["+lse".to_owned()][..]));
+    assert_eq!(
+        (linux.cpu.as_str(), linux.features.as_slice()),
+        ("generic", &["+lse".to_owned()][..])
+    );
     let error = of("aarch64-unknown-linux-gnu", &["-C", "target-feature=+paca"]).unwrap_err();
     assert!(error.contains("pacg"), "{error}");
 }
@@ -205,8 +253,14 @@ fn here_is_the_hosts_features_on_the_baseline_cpu() {
     assert_eq!(here.features, native.features, "the features `native` gives");
     assert!(here.features.iter().all(|it| it.starts_with('+')), "{:?}", here.features);
     assert!(here.features.is_sorted());
-    assert_eq!(here.cpu, elsewhere.cpu, "the baseline CPU's name, as rustc without `-C target-cpu`");
-    assert_eq!((&here.target, &here.arch, &here.id), (&elsewhere.target, &elsewhere.arch, &elsewhere.id));
+    assert_eq!(
+        here.cpu, elsewhere.cpu,
+        "the baseline CPU's name, as rustc without `-C target-cpu`"
+    );
+    assert_eq!(
+        (&here.target, &here.arch, &here.id),
+        (&elsewhere.target, &elsewhere.arch, &elsewhere.id)
+    );
     assert_eq!(here.cpu, Target::of(Target::host()).unwrap().cpu());
 }
 
@@ -218,7 +272,9 @@ fn elsewhere_is_the_baseline() {
     let elsewhere = of(Target::host(), &[]).unwrap();
     assert!(elsewhere.features.is_empty(), "{:?}", elsewhere.features);
     assert!(!elsewhere.frame_pointers, "no flag forces them, on Apple's targets too");
-    for other in [LINUX, "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+    for other in
+        [LINUX, "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+    {
         assert!(of(other, &[]).unwrap().features.is_empty(), "{other}");
     }
 }
@@ -253,7 +309,11 @@ fn the_flags_win_over_where_it_runs() {
     }
     if x86 {
         // Off with what implies it: `avx2`, `fma`, `f16c` and the AVX-512s.
-        assert!(!turned_off.features.iter().any(|it| it.starts_with("+avx")), "{:?}", turned_off.features);
+        assert!(
+            !turned_off.features.iter().any(|it| it.starts_with("+avx")),
+            "{:?}",
+            turned_off.features
+        );
         let level = here(&["-C", "target-cpu=x86-64-v2"]).unwrap();
         assert_eq!(level, of(host, &["-C", "target-cpu=x86-64-v2"]).unwrap());
         assert!(!level.features.contains(&"+avx".to_owned()), "the level's, not the host's");
@@ -272,13 +332,18 @@ fn an_unknown_triple_is_an_error() {
 #[test]
 fn the_versions_are_the_ones_blaze_is_built_with() {
     let lock = include_str!("../../../../Cargo.lock");
-    let at = lock.find("name = \"cranelift-codegen\"\nversion = \"").expect("cranelift-codegen in Cargo.lock");
+    let at = lock
+        .find("name = \"cranelift-codegen\"\nversion = \"")
+        .expect("cranelift-codegen in Cargo.lock");
     let version = lock[at..].split('"').nth(3).expect("its version");
     assert_eq!(version, CRANELIFT);
     match llvm() {
         Some(llvm) => {
             assert!(cfg!(feature = "llvm"));
-            assert!(llvm.starts_with("23.") && llvm.split(' ').nth(1).is_some_and(|it| it.len() == 40), "{llvm}");
+            assert!(
+                llvm.starts_with("23.") && llvm.split(' ').nth(1).is_some_and(|it| it.len() == 40),
+                "{llvm}"
+            );
         }
         None => assert!(!cfg!(feature = "llvm")),
     }
@@ -299,9 +364,17 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
     workspace.write("crates/front/src/lib.rs", "pub fn lower() { /* another front end */ }\n");
     let codegen_edited = workspace.code();
 
-    let stored = blaze_codegen::InstanceKey(ContentId::of("blaze v2 toolchain test instance", b"main"));
+    let stored =
+        blaze_codegen::InstanceKey(ContentId::of("blaze v2 toolchain test instance", b"main"));
     let key = |code: [u8; 32]| {
-        let toolchain = toolchain_for(&CodegenCode(ContentId(code)), LINUX, &fixture_target_data(LINUX), &[], Runs::Elsewhere).unwrap();
+        let toolchain = toolchain_for(
+            &CodegenCode(ContentId(code)),
+            LINUX,
+            &fixture_target_data(LINUX),
+            &[],
+            Runs::Elsewhere,
+        )
+        .unwrap();
         let spec = Spec {
             toolchain,
             backend: blaze_codegen::Backend::Stencil,
@@ -323,10 +396,19 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
     };
     // Rule 22: one key for one code, whenever it is worked out.
     assert_eq!(key(built), key(built));
-    assert_eq!(key(cli_edited), key(built), "a blaze rebuilt with only its CLI edited keys templates alike");
-    assert_ne!(key(codegen_edited), key(built), "a blaze whose code generator changed keys templates apart");
+    assert_eq!(
+        key(cli_edited),
+        key(built),
+        "a blaze rebuilt with only its CLI edited keys templates alike"
+    );
+    assert_ne!(
+        key(codegen_edited),
+        key(built),
+        "a blaze whose code generator changed keys templates apart"
+    );
 
-    let root = std::env::temp_dir().join(format!("blaze-codegen-code-restart-store-{}", std::process::id()));
+    let root = std::env::temp_dir()
+        .join(format!("blaze-codegen-code-restart-store-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let template = b"the bytes of one dev template".to_vec();
@@ -336,7 +418,11 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
         driven.flush().unwrap();
     }
     let mut driven = blaze_cas::Driven::open(&root).unwrap();
-    let got = driven.store().get(&key(cli_edited)).unwrap().expect("the store came back without the template the last blaze build kept");
+    let got = driven
+        .store()
+        .get(&key(cli_edited))
+        .unwrap()
+        .expect("the store came back without the template the last blaze build kept");
     assert_eq!(got.bytes, template.as_slice());
     assert!(driven.store().get(&key(codegen_edited)).unwrap().is_none());
     drop(driven);

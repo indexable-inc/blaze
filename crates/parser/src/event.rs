@@ -173,10 +173,7 @@ pub(crate) fn lend_events(tokens: usize) -> scratch::Lent<Events> {
 
 /// Generate the syntax tree with the control of events. `errors` is the
 /// side table of error messages built up alongside the `events` stream.
-pub(super) fn process(
-    mut events: scratch::Lent<Events>,
-    errors: Vec<Cow<'static, str>>,
-) -> Output {
+pub(super) fn process(mut events: scratch::Lent<Events>, errors: Vec<Cow<'static, str>>) -> Output {
     scratch::with::<ForwardParents, _>(|forward_parents| {
         process_with(&mut events, errors, forward_parents)
     })

@@ -139,7 +139,11 @@ fn made() -> [Case; CONTEXTS] {
             rustc_bootstrap: Some("1".into()),
         },
         Case {
-            package: package("has-dashes", Some("1.77"), vec![target("has-dashes", "lib", "lib"), target("foo", "bin", "bin")]),
+            package: package(
+                "has-dashes",
+                Some("1.77"),
+                vec![target("has-dashes", "lib", "lib"), target("foo", "bin", "bin")],
+            ),
             generated: "",
             out_dir: OUT,
             nightly: false,
@@ -153,7 +157,9 @@ fn made() -> [Case; CONTEXTS] {
 fn directives(input: &[u8]) -> Vec<&str> {
     input
         .split(|it| *it == b'\n')
-        .filter_map(|line| std::str::from_utf8(line).ok().map(str::trim).filter(|it| it.starts_with("cargo:")))
+        .filter_map(|line| {
+            std::str::from_utf8(line).ok().map(str::trim).filter(|it| it.starts_with("cargo:"))
+        })
         .collect()
 }
 
@@ -186,7 +192,9 @@ fn add(into: &mut Output, from: Output) {
 /// Every text kept from the script's lines (not the messages cargo words around them).
 fn kept(out: &Output) -> Vec<&str> {
     let mut kept: Vec<&str> = Vec::new();
-    kept.extend(out.library_paths.iter().map(|it| it.path().to_str().expect("a kept path was text")));
+    kept.extend(
+        out.library_paths.iter().map(|it| it.path().to_str().expect("a kept path was text")),
+    );
     kept.extend(out.library_links.iter().map(String::as_str));
     for (target, arg) in &out.linker_args {
         if let LinkArgTarget::SingleBin(bin) = target {
@@ -194,7 +202,9 @@ fn kept(out: &Output) -> Vec<&str> {
         }
         kept.push(arg);
     }
-    kept.extend(out.cfgs.iter().chain(&out.check_cfgs).chain(&out.rerun_if_env_changed).map(String::as_str));
+    kept.extend(
+        out.cfgs.iter().chain(&out.check_cfgs).chain(&out.rerun_if_env_changed).map(String::as_str),
+    );
     for (name, value) in out.env.iter().chain(&out.metadata) {
         kept.extend([name.as_str(), value.as_str()]);
     }
@@ -216,7 +226,11 @@ fn check_case(data: &[u8], case: usize) {
     let case = &cases()[case];
     let cx = case.cx();
     let (most, got) = blaze_fuzz::largest_allocation(|| parse(data, &cx));
-    assert!(most <= blaze_fuzz::allowed(data.len()), "reading {} bytes asked for {most} at once", data.len());
+    assert!(
+        most <= blaze_fuzz::allowed(data.len()),
+        "reading {} bytes asked for {most} at once",
+        data.len()
+    );
 
     assert_eq!(parse(&normalized, &cx), got, "the input reads as its directives alone");
 
@@ -236,11 +250,18 @@ fn check_case(data: &[u8], case: usize) {
     let moved = !case.generated.is_empty() && case.generated != case.out_dir;
     for text in kept(&out) {
         assert!(!text.contains('\n'), "a kept text has a line break: {text:?}");
-        assert!(!(moved && text.contains(case.generated)), "a kept text names the old `OUT_DIR`: {text:?}");
+        assert!(
+            !(moved && text.contains(case.generated)),
+            "a kept text names the old `OUT_DIR`: {text:?}"
+        );
     }
     for path in &out.library_paths {
         let ours = search_path_of(path.path()).starts_with(case.out_dir);
-        assert_eq!(matches!(path, LibraryPath::CargoArtifact(_)), ours, "{path:?} is cargo's own exactly when in the `OUT_DIR`");
+        assert_eq!(
+            matches!(path, LibraryPath::CargoArtifact(_)),
+            ours,
+            "{path:?} is cargo's own exactly when in the `OUT_DIR`"
+        );
     }
 }
 

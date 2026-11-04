@@ -15,7 +15,9 @@ mod tests;
 use std::mem::{self, offset_of};
 
 use base_db::Db;
-use blaze_format::{ALIGN, FormatError, Part, Placed, Record, SchemaHash, Slice, Writer, open_as, schema_of};
+use blaze_format::{
+    ALIGN, FormatError, Part, Placed, Record, SchemaHash, Slice, Writer, open_as, schema_of,
+};
 use blaze_ids::ContentId;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,
@@ -27,7 +29,10 @@ use hir_expand::{
     builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
 
-use super::{BodyFacts, INSTALLED, Lookup, Step, infer::{Keyed, items_of}};
+use super::{
+    BodyFacts, INSTALLED, Lookup, Step,
+    infer::{Keyed, items_of},
+};
 use crate::{
     InferBodyId,
     check_cache::ids::{self, Table},
@@ -140,7 +145,11 @@ fn ran<T>(run: impl FnOnce() -> T) -> T {
 /// `run` unless it is stored, and offered after `run` with what it read when it is `Ok`. With
 /// no item store installed, one load and a branch.
 #[inline]
-pub(crate) fn built<'db>(db: &'db Db, owner: MirOwner<'db>, run: impl FnOnce() -> Built<'db>) -> Built<'db> {
+pub(crate) fn built<'db>(
+    db: &'db Db,
+    owner: MirOwner<'db>,
+    run: impl FnOnce() -> Built<'db>,
+) -> Built<'db> {
     if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return run();
     }
@@ -164,8 +173,18 @@ fn stored<'db>(db: &'db Db, owner: MirOwner<'db>, run: impl FnOnce() -> Built<'d
             let fresh = ran(run);
             match &fresh {
                 Ok(body) if *body == value => {}
-                Ok(_) => super::fail(db, def, Step::Mir, format_args!("{owner:?} stored, it differs from building it")),
-                Err(_) => super::fail(db, def, Step::Mir, format_args!("{owner:?} stored, building it fails")),
+                Ok(_) => super::fail(
+                    db,
+                    def,
+                    Step::Mir,
+                    format_args!("{owner:?} stored, it differs from building it"),
+                ),
+                Err(_) => super::fail(
+                    db,
+                    def,
+                    Step::Mir,
+                    format_args!("{owner:?} stored, building it fails"),
+                ),
             }
             fresh
         }
@@ -201,14 +220,22 @@ fn in_body(db: &Db, owner: InferBodyId<'_>) -> Option<(DefWithBodyId, u64)> {
                     let expr = u64::from(loc.expr.into_raw().into_u32());
                     Some((def, (expr << 1) | u64::from(loc.allow_using_generic_params)))
                 }
-                ExpressionStoreOwnerId::Signature(_) | ExpressionStoreOwnerId::VariantFields(_) => None,
+                ExpressionStoreOwnerId::Signature(_) | ExpressionStoreOwnerId::VariantFields(_) => {
+                    None
+                }
             }
         }
     }
 }
 
 fn schema_at(tag: u64, anon: u64, expr: u64, kind: u64) -> SchemaHash {
-    schema_of(&[Part::Schema(SCHEMA), Part::U64(tag), Part::U64(anon), Part::U64(expr), Part::U64(kind)])
+    schema_of(&[
+        Part::Schema(SCHEMA),
+        Part::U64(tag),
+        Part::U64(anon),
+        Part::U64(expr),
+        Part::U64(kind),
+    ])
 }
 
 fn kind_code(kind: ClosureKind) -> u64 {
@@ -234,7 +261,12 @@ fn kind_code(kind: ClosureKind) -> u64 {
 }
 
 /// `owner`'s stored MIR, made in this database; `def` and `schema` are its [`place`].
-fn lookup_mir<'db>(db: &'db Db, def: DefWithBodyId, owner: MirOwner<'db>, schema: SchemaHash) -> Lookup<MirBody<'db>> {
+fn lookup_mir<'db>(
+    db: &'db Db,
+    def: DefWithBodyId,
+    owner: MirOwner<'db>,
+    schema: SchemaHash,
+) -> Lookup<MirBody<'db>> {
     super::lookup(db, def, Step::Mir, schema, |facts, bytes| {
         // alloc: the reason an answer does not read
         decode(db, facts, def, bytes).map_err(|why| format!("{owner:?}: {why}"))
@@ -251,15 +283,17 @@ fn offer_mir<'db>(
     reads: Option<blaze_query::db::Reads>,
 ) {
     let mut unreadable = None;
-    super::offer(db, def, Step::Mir, schema, reads, |facts, out| match encode(db, facts, def, body, out) {
-        Ok(()) => Ok(()),
-        // alloc: the reason a body is not stored
-        Err(EncodeError::Refused(why)) => Err(format!("{owner:?}: {why}")),
-        Err(EncodeError::Unreadable(why)) => {
+    super::offer(db, def, Step::Mir, schema, reads, |facts, out| {
+        match encode(db, facts, def, body, out) {
+            Ok(()) => Ok(()),
             // alloc: the reason a body is not stored
-            let why = format!("{owner:?}: {why}");
-            unreadable = Some(why.clone()); // clone: the build's error, once per broken body
-            Err(why)
+            Err(EncodeError::Refused(why)) => Err(format!("{owner:?}: {why}")),
+            Err(EncodeError::Unreadable(why)) => {
+                // alloc: the reason a body is not stored
+                let why = format!("{owner:?}: {why}");
+                unreadable = Some(why.clone()); // clone: the build's error, once per broken body
+                Err(why)
+            }
         }
     });
     // A body that does not read back is a lowering or writer bug: the build's error, never a
@@ -294,7 +328,10 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback of every read, which hands it the error by value"
+)]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason an answer does not read
     error.to_string()
@@ -314,11 +351,12 @@ pub(super) fn encode<'db>(
     let mut table = Table::default();
     // alloc: the reason a body is not stored
     let locations = locations(db, def)?;
-    let record = ids::relocating(&mut table, || persist::write(db, body, Some(locations))).map_err(|why| match why {
-        // alloc: the reason a body is not stored
-        persist::WriteError::Unwritable(why) => EncodeError::Refused(why.to_owned()),
-        persist::WriteError::Unreadable(why) => EncodeError::Unreadable(why),
-    })?;
+    let record = ids::relocating(&mut table, || persist::write(db, body, Some(locations)))
+        .map_err(|why| match why {
+            // alloc: the reason a body is not stored
+            persist::WriteError::Unwritable(why) => EncodeError::Refused(why.to_owned()),
+            persist::WriteError::Unreadable(why) => EncodeError::Unreadable(why),
+        })?;
     let mut locs = TyTableWriter::new(interner);
     let mut items = Keyed::new(db, facts, def);
     let words = ids::write_with(db, &mut table, &mut locs, &mut items)?;
@@ -336,7 +374,11 @@ pub(super) fn encode<'db>(
     let field = |offset: usize| at + offset as u64;
     let root = MirAnswerRoot {
         locs,
-        body: Slice::between(field(offset_of!(MirAnswerRoot, body)), record_at as u64, record.len()),
+        body: Slice::between(
+            field(offset_of!(MirAnswerRoot, body)),
+            record_at as u64,
+            record.len(),
+        ),
         ids: words.slice(field(offset_of!(MirAnswerRoot, ids))),
         items: keys.slice(field(offset_of!(MirAnswerRoot, items))),
         kinds: kinds.slice(field(offset_of!(MirAnswerRoot, kinds))),

@@ -64,17 +64,7 @@ pub struct PathX {
 }
 
 #[derive(
-    Copy,
-    Clone,
-    Debug,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    ToDebugSNode
+    Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, ToDebugSNode,
 )]
 pub enum VarIdentDisambiguate {
     // AIR names that don't derive from rustc's names:
@@ -106,7 +96,9 @@ pub enum VarIdentDisambiguate {
 }
 
 /// A local variable name, possibly renamed for disambiguation
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, ToDebugSNode)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, ToDebugSNode,
+)]
 pub struct VarIdent(pub Ident, pub VarIdentDisambiguate);
 
 pub type VarBinder<A> = Arc<VarBinderX<A>>;
@@ -154,17 +146,7 @@ pub enum Mode {
 
 /// Describes integer types
 #[derive(
-    Copy,
-    Clone,
-    Debug,
-    Serialize,
-    Deserialize,
-    ToDebugSNode,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord
+    Copy, Clone, Debug, Serialize, Deserialize, ToDebugSNode, PartialEq, Eq, Hash, PartialOrd, Ord,
 )]
 pub enum IntRange {
     /// The set of all mathematical integers Z (..., -2, -1, 0, 1, 2, ...)
@@ -216,17 +198,7 @@ pub enum IntRange {
 ///   - `place.typ` (See docs for `Place`)
 ///   - Most places where `Typ` is given as an explicit field of a node
 #[derive(
-    Debug,
-    Serialize,
-    Deserialize,
-    Hash,
-    ToDebugSNode,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord
+    Debug, Serialize, Deserialize, Hash, ToDebugSNode, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
 )]
 pub enum TypDecoration {
     /// &T
@@ -252,17 +224,7 @@ pub enum TypDecoration {
 }
 
 #[derive(
-    Copy,
-    Clone,
-    Debug,
-    ToDebugSNode,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize
+    Copy, Clone, Debug, ToDebugSNode, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
 pub enum Primitive {
     Array,
@@ -498,7 +460,9 @@ pub enum MutRefFutureSourceName {
     Final,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, ToDebugSNode)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, ToDebugSNode,
+)]
 pub enum VariantCheck {
     /// No check necessary
     None,
@@ -509,7 +473,9 @@ pub enum VariantCheck {
     Recommends,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, ToDebugSNode)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, ToDebugSNode,
+)]
 pub struct FieldOpr {
     pub datatype: Dt,
     pub variant: Ident,
@@ -520,7 +486,9 @@ pub struct FieldOpr {
     pub check: VariantCheck,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, ToDebugSNode)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, ToDebugSNode,
+)]
 pub enum IntegerTypeBoundKind {
     UnsignedMax,
     SignedMin,
@@ -1861,7 +1829,9 @@ pub enum DatatypeTransparency {
 /// After ast_simplify, all the tuples are added to the Krate, so we can uniformly
 /// use Dt as a key. Prior to ast_simplify you need to use Paths as keys and handle
 /// tuples separately.
-#[derive(Clone, Debug, Serialize, Deserialize, ToDebugSNode, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, ToDebugSNode, Hash, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum Dt {
     Path(Path),
     Tuple(usize),

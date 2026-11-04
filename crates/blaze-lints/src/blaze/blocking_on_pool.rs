@@ -12,15 +12,13 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir::AsAssocItem as _;
 use hir_def::{
-    DefWithBodyId, FunctionId, HasModule as _,
-    hir::Expr,
-    signatures::FunctionSignature,
+    DefWithBodyId, FunctionId, HasModule as _, hir::Expr, signatures::FunctionSignature,
 };
 use hir_ty::next_solver::GenericArgs;
 use rustc_type_ir::inherent::GenericArgs as _;
+use std::alloc::Global;
 
 use super::{Finding, Lint, alloc::written_callee, facts};
 use crate::check::Cx;
@@ -53,7 +51,9 @@ enum Instead {
 impl Instead {
     fn say(self) -> &'static str {
         match self {
-            Instead::Sleep => "wait for the deadline through the scheduler: `blaze_graph::sched::wait(Wait::Until(deadline))`",
+            Instead::Sleep => {
+                "wait for the deadline through the scheduler: `blaze_graph::sched::wait(Wait::Until(deadline))`"
+            }
             Instead::Event => {
                 "wait through the scheduler: a `blaze_graph::sched::Event` the other side sets, or a `Wait::Key` or `Wait::Job` it completes"
             }
@@ -105,9 +105,17 @@ const METHODS: &[(Of, &[&str], Instead)] = &[
         Instead::Io,
     ),
     (Of::Std(&["std", "fs", "OpenOptions"]), &["open"], Instead::Io),
-    (Of::Std(&["std", "net", "TcpStream"]), &["connect", "peek", "read", "write", "flush", "shutdown"], Instead::Io),
+    (
+        Of::Std(&["std", "net", "TcpStream"]),
+        &["connect", "peek", "read", "write", "flush", "shutdown"],
+        Instead::Io,
+    ),
     (Of::Std(&["std", "net", "TcpListener"]), &["bind", "accept", "incoming"], Instead::Io),
-    (Of::Std(&["std", "net", "UdpSocket"]), &["bind", "connect", "recv", "send", "peek"], Instead::Io),
+    (
+        Of::Std(&["std", "net", "UdpSocket"]),
+        &["bind", "connect", "recv", "send", "peek"],
+        Instead::Io,
+    ),
 ];
 
 /// The blocking free functions, by their path.
@@ -131,7 +139,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     // alloc: the findings of one body, reported at the edge
     let mut found = Vec::new();
     let Some(analysis) = cx.analysis() else { return found };
-    let Ok(DefWithBodyId::FunctionId(owner)) = DefWithBodyId::try_from(analysis.def()) else { return found };
+    let Ok(DefWithBodyId::FunctionId(owner)) = DefWithBodyId::try_from(analysis.def()) else {
+        return found;
+    };
     let db = cx.db();
     if !on_fiber_set(db, owner.krate(db)).contains(owner) {
         return found;
@@ -169,13 +179,15 @@ fn blocking<'db>(
     let function = hir::Function::from(f);
     let name = FunctionSignature::of(db, f).name.as_str();
     let Some(item) = function.as_assoc_item(db) else {
-        if let Some((path, instead)) =
-            FREE.iter().find(|(path, _)| cx.std_def(path) == Some(hir::ModuleDef::Function(function)))
+        if let Some((path, instead)) = FREE
+            .iter()
+            .find(|(path, _)| cx.std_def(path) == Some(hir::ModuleDef::Function(function)))
         {
             return Some((format!("`{}`", path.join("::")), *instead));
         }
         let fs = cx.std_def(&["std", "fs"])?;
-        return (fs == hir::ModuleDef::Module(function.module(db))).then(|| (format!("`std::fs::{name}`"), Instead::Io));
+        return (fs == hir::ModuleDef::Module(function.module(db)))
+            .then(|| (format!("`std::fs::{name}`"), Instead::Io));
     };
     let (self_ty, trait_) = match item.container(db) {
         hir::AssocItemContainer::Trait(it) => (analysis.ty(args.type_at(0)), Some(it)),
@@ -187,11 +199,15 @@ fn blocking<'db>(
         prefixes.iter().any(|it| name.starts_with(it))
             && match of {
                 Of::Std(path) => cx.std_def(path) == Some(hir::ModuleDef::Adt(adt)),
-                Of::Crate(krate, it) => adt_name.as_str() == *it && facts::crate_is(db, adt.module(db).krate(db), krate),
+                Of::Crate(krate, it) => {
+                    adt_name.as_str() == *it && facts::crate_is(db, adt.module(db).krate(db), krate)
+                }
             }
     })?;
     let what = match trait_ {
-        Some(trait_) => format!("`{}::{name}` on `{}`", trait_.name(db).as_str(), adt_name.as_str()),
+        Some(trait_) => {
+            format!("`{}::{name}` on `{}`", trait_.name(db).as_str(), adt_name.as_str())
+        }
         None => format!("`{}::{name}`", adt_name.as_str()),
     };
     Some((what, row.2))

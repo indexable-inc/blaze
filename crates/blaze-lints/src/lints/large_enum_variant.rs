@@ -63,7 +63,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         })
         .collect();
     sizes.sort_by(|a, b| b.size.cmp(&a.size));
-    let threshold = u64::try_from(cx.conf().int("enum-variant-size-threshold", 200)).expect("a count, checked as the configuration loads");
+    let threshold = u64::try_from(cx.conf().int("enum-variant-size-threshold", 200))
+        .expect("a count, checked as the configuration loads");
     let mut difference = sizes[0].size - sizes[1].size;
     if difference <= threshold {
         return;
@@ -148,7 +149,12 @@ fn field_types<'t>(variant: ast::Variant<'t>) -> Vec<ast::Type<'t>> {
 
 /// clippy's `maybe_copy`: a generic enum with an impl of `Copy` of its own, which holds for
 /// some arguments.
-fn maybe_copy<'q>(db: &'q base_db::Db, krate: hir::Crate, ty: &hir::Type<'q>, copy: hir::Trait) -> bool {
+fn maybe_copy<'q>(
+    db: &'q base_db::Db,
+    krate: hir::Crate,
+    ty: &hir::Type<'q>,
+    copy: hir::Trait,
+) -> bool {
     ty.type_arguments().next().is_some()
         && hir::Impl::all_for_type(db, krate, ty.clone())
             .into_iter()
@@ -181,7 +187,9 @@ pub(super) fn approx_ty_size<'q>(db: &'q base_db::Db, ty: &hir::Type<'q>, depth:
         Some(hir::Adt::Enum(def)) => def
             .variants(db)
             .into_iter()
-            .map(|variant| ty.variant_fields(db, variant).iter().map(|(_, it)| size(it)).sum::<u64>())
+            .map(|variant| {
+                ty.variant_fields(db, variant).iter().map(|(_, it)| size(it)).sum::<u64>()
+            })
             .max()
             .unwrap_or_default(),
         Some(hir::Adt::Union(_)) => {

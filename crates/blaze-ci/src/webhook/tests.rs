@@ -62,9 +62,15 @@ fn a_wrong_signature_is_401() {
     let error = verify(b"It's a Secret to Everybody", b"Hello, World?", Some(good)).unwrap_err();
     assert_eq!(error.status, 401);
     let bad = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e1";
-    assert_eq!(verify(b"It's a Secret to Everybody", b"Hello, World!", Some(bad)).unwrap_err().status, 401);
+    assert_eq!(
+        verify(b"It's a Secret to Everybody", b"Hello, World!", Some(bad)).unwrap_err().status,
+        401
+    );
     let sha1 = "sha1=01dc10d0c83e72ed246219cdd91669667fe2ca59";
-    assert_eq!(verify(b"It's a Secret to Everybody", b"Hello, World!", Some(sha1)).unwrap_err().status, 401);
+    assert_eq!(
+        verify(b"It's a Secret to Everybody", b"Hello, World!", Some(sha1)).unwrap_err().status,
+        401
+    );
 }
 
 #[test]
@@ -81,19 +87,28 @@ fn a_push_to_a_branch() {
     let delivery = receive(SECRET, &request("push", &push("refs/heads/main", false))).unwrap();
     assert_eq!(delivery.id, "72d3162e-cc78-11e3-81ab-4c9367dc0958");
     assert_eq!(delivery.repo, "indexable-inc/blaze");
-    assert_eq!(delivery.event, Some(Event::Push { branch: "main".to_owned(), commit: HEAD.to_owned() }));
+    assert_eq!(
+        delivery.event,
+        Some(Event::Push { branch: "main".to_owned(), commit: HEAD.to_owned() })
+    );
 }
 
 #[test]
 fn a_branch_with_slashes_keeps_them() {
     let delivery = parse("push", "1", push("refs/heads/lanes/ci", false).as_bytes()).unwrap();
-    assert_eq!(delivery.event, Some(Event::Push { branch: "lanes/ci".to_owned(), commit: HEAD.to_owned() }));
+    assert_eq!(
+        delivery.event,
+        Some(Event::Push { branch: "lanes/ci".to_owned(), commit: HEAD.to_owned() })
+    );
 }
 
 #[test]
 fn a_pushed_tag() {
     let delivery = parse("push", "1", push("refs/tags/v2.0.0", false).as_bytes()).unwrap();
-    assert_eq!(delivery.event, Some(Event::Tag { name: "v2.0.0".to_owned(), commit: HEAD.to_owned() }));
+    assert_eq!(
+        delivery.event,
+        Some(Event::Tag { name: "v2.0.0".to_owned(), commit: HEAD.to_owned() })
+    );
 }
 
 #[test]
@@ -114,7 +129,8 @@ fn a_push_to_another_kind_of_ref_is_ignored() {
 #[test]
 fn a_pull_request_from_the_same_repository() {
     for action in ["opened", "synchronize", "reopened", "ready_for_review"] {
-        let delivery = receive(SECRET, &request("pull_request", &pull_request(action, SAME_REPO))).unwrap();
+        let delivery =
+            receive(SECRET, &request("pull_request", &pull_request(action, SAME_REPO))).unwrap();
         assert_eq!(delivery.repo, "indexable-inc/blaze");
         assert_eq!(
             delivery.event,
@@ -138,14 +154,16 @@ fn a_pull_request_from_a_fork() {
 
 #[test]
 fn a_pull_request_whose_fork_was_deleted_is_from_a_fork() {
-    let delivery = parse("pull_request", "1", pull_request("synchronize", "null").as_bytes()).unwrap();
+    let delivery =
+        parse("pull_request", "1", pull_request("synchronize", "null").as_bytes()).unwrap();
     assert!(matches!(delivery.event, Some(Event::PullRequest { from_fork: true, .. })));
 }
 
 #[test]
 fn other_pull_request_actions_are_ignored() {
     for action in ["closed", "labeled", "edited", "converted_to_draft"] {
-        let delivery = parse("pull_request", "1", pull_request(action, SAME_REPO).as_bytes()).unwrap();
+        let delivery =
+            parse("pull_request", "1", pull_request(action, SAME_REPO).as_bytes()).unwrap();
         assert_eq!(delivery.event, None, "{action}");
         assert_eq!(delivery.repo, "indexable-inc/blaze");
     }
@@ -155,7 +173,14 @@ fn other_pull_request_actions_are_ignored() {
 fn a_ping_is_ignored() {
     let body = r#"{"zen":"Keep it logically awesome.","hook_id":1,"hook":{"type":"App"}}"#;
     let delivery = receive(SECRET, &request("ping", body)).unwrap();
-    assert_eq!(delivery, Delivery { id: "72d3162e-cc78-11e3-81ab-4c9367dc0958".to_owned(), repo: String::new(), event: None });
+    assert_eq!(
+        delivery,
+        Delivery {
+            id: "72d3162e-cc78-11e3-81ab-4c9367dc0958".to_owned(),
+            repo: String::new(),
+            event: None
+        }
+    );
 }
 
 #[test]
@@ -181,7 +206,12 @@ fn missing_headers_are_400_and_only_post_is_taken() {
     let mut no_event = request("push", &body);
     no_event.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("X-GitHub-Event"));
     let error = receive(SECRET, &no_event).unwrap_err();
-    assert_eq!((error.status, error.what.contains("X-GitHub-Event")), (400, true), "{}", error.what);
+    assert_eq!(
+        (error.status, error.what.contains("X-GitHub-Event")),
+        (400, true),
+        "{}",
+        error.what
+    );
 
     let mut no_id = request("push", &body);
     no_id.headers.retain(|(name, _)| name != "X-GitHub-Delivery");
@@ -204,7 +234,9 @@ fn the_signature_is_checked_before_the_payload_is_read() {
 fn a_form_encoded_delivery_is_refused_by_name() {
     let mut request = request("push", &push("refs/heads/main", false));
     request.headers.retain(|(name, _)| name != "Content-Type");
-    request.headers.push(("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()));
+    request
+        .headers
+        .push(("Content-Type".to_owned(), "application/x-www-form-urlencoded".to_owned()));
     let error = receive(SECRET, &request).unwrap_err();
     assert_eq!(error.status, 415);
 }
@@ -216,7 +248,10 @@ fn escaped_strings_are_read_as_well_as_borrowed_ones() {
         .replace("indexable-inc/blaze", r"indexable-inc\/blaze");
     let delivery = parse("push", "1", body.as_bytes()).unwrap();
     assert_eq!(delivery.repo, "indexable-inc/blaze");
-    assert_eq!(delivery.event, Some(Event::Push { branch: "léne".to_owned(), commit: HEAD.to_owned() }));
+    assert_eq!(
+        delivery.event,
+        Some(Event::Push { branch: "léne".to_owned(), commit: HEAD.to_owned() })
+    );
 }
 
 #[test]
@@ -243,7 +278,10 @@ fn a_signature_of_the_right_length_with_a_non_hex_digit_is_401() {
     let bad = good.replace("e17", "e1g");
     let error = verify(b"It's a Secret to Everybody", b"Hello, World!", Some(&bad)).unwrap_err();
     assert_eq!(error.status, 401);
-    assert_eq!(blaze_format::hex::decode::<32>(&good["sha256=".len()..]).map(|it| it[0]), Some(0x75));
+    assert_eq!(
+        blaze_format::hex::decode::<32>(&good["sha256=".len()..]).map(|it| it[0]),
+        Some(0x75)
+    );
 }
 
 /// The decoder before sonic-rs, kept to hold it to.
@@ -295,8 +333,15 @@ fn sonic_rs_takes_and_refuses_the_payloads_serde_json_did() {
         let mut check = |kind: &str, body: &[u8]| {
             let said = || format!("{kind} {:?}", String::from_utf8_lossy(body));
             match std::str::from_utf8(body) {
-                Ok(_) => assert_eq!(decoded::<Sonic>(kind, body), decoded::<SerdeJson>(kind, body), "{}", said()),
-                Err(_) => assert!(matches!(decoded::<Sonic>(kind, body), Err((400, _))), "{}", said()),
+                Ok(_) => assert_eq!(
+                    decoded::<Sonic>(kind, body),
+                    decoded::<SerdeJson>(kind, body),
+                    "{}",
+                    said()
+                ),
+                Err(_) => {
+                    assert!(matches!(decoded::<Sonic>(kind, body), Err((400, _))), "{}", said())
+                }
             }
             checked += 1;
         };
@@ -327,16 +372,41 @@ fn sonic_rs_takes_and_refuses_the_payloads_serde_json_did() {
         ("ping", r#"{"repository":{"full_name":"a\u0000b"}}"#.to_owned()),
         ("ping", r#"{"repository":{"full_name":"\ud800"}}"#.to_owned()),
         ("ping", r#"{"x":1e400,"repository":{"full_name":"a/b"}}"#.to_owned()),
-        ("ping", format!(r#"{{"x":{}{},"repository":{{"full_name":"a/b"}}}}"#, "[".repeat(100), "]".repeat(100))),
+        (
+            "ping",
+            format!(
+                r#"{{"x":{}{},"repository":{{"full_name":"a/b"}}}}"#,
+                "[".repeat(100),
+                "]".repeat(100)
+            ),
+        ),
         // A skipped field nested far past any stack, whole and cut short: serde_json skips it
         // with its open brackets on the heap, at no depth limit, and so must sonic-rs.
-        ("ping", format!(r#"{{"x":{}1{},"repository":{{"full_name":"a/b"}}}}"#, r#"[{"k":"#.repeat(100_000), "}]".repeat(100_000))),
-        ("ping", format!(r#"{{"x":{}1{},"repository":{{"full_name":"a/b"}}}}"#, r#"[{"k":"#.repeat(100_000), "}]".repeat(99_999))),
+        (
+            "ping",
+            format!(
+                r#"{{"x":{}1{},"repository":{{"full_name":"a/b"}}}}"#,
+                r#"[{"k":"#.repeat(100_000),
+                "}]".repeat(100_000)
+            ),
+        ),
+        (
+            "ping",
+            format!(
+                r#"{{"x":{}1{},"repository":{{"full_name":"a/b"}}}}"#,
+                r#"[{"k":"#.repeat(100_000),
+                "}]".repeat(99_999)
+            ),
+        ),
         ("pull_request", pull_request("opened", SAME_REPO).replace("42", "042")),
         ("pull_request", pull_request("opened", SAME_REPO).replace("42", "18446744073709551616")),
         ("pull_request", pull_request("opened", SAME_REPO).replace("42", "4.2e1")),
     ] {
-        assert_eq!(decoded::<Sonic>(kind, body.as_bytes()), decoded::<SerdeJson>(kind, body.as_bytes()), "{kind} {body}");
+        assert_eq!(
+            decoded::<Sonic>(kind, body.as_bytes()),
+            decoded::<SerdeJson>(kind, body.as_bytes()),
+            "{kind} {body}"
+        );
     }
     assert!(checked > 10_000, "{checked}");
 }
@@ -360,7 +430,8 @@ fn a_request_read_in_place_is_received_as_the_owned_one_is() {
         change(&mut it);
         it
     };
-    let drop_header = |name: &'static str| move |it: &mut HttpRequest| it.headers.retain(|(at, _)| at != name);
+    let drop_header =
+        |name: &'static str| move |it: &mut HttpRequest| it.headers.retain(|(at, _)| at != name);
     let requests = [
         request("push", &push),
         request("pull_request", &pull_request("opened", SAME_REPO)),
@@ -375,10 +446,15 @@ fn a_request_read_in_place_is_received_as_the_owned_one_is() {
         with("push", &push, &|it| it.body[3] ^= 1),
         with("push", &push, &|it| {
             it.headers.retain(|(name, _)| name != "Content-Type");
-            it.headers.push(("content-type".to_owned(), "Application/JSON; charset=utf-8".to_owned()));
+            it.headers
+                .push(("content-type".to_owned(), "Application/JSON; charset=utf-8".to_owned()));
         }),
-        with("push", &push, &|it| it.headers.push(("Content-Type".to_owned(), "text/plain".to_owned()))),
-        with("push", &push, &|it| it.headers.insert(0, ("X-GitHub-Event".to_owned(), "ping".to_owned()))),
+        with("push", &push, &|it| {
+            it.headers.push(("Content-Type".to_owned(), "text/plain".to_owned()))
+        }),
+        with("push", &push, &|it| {
+            it.headers.insert(0, ("X-GitHub-Event".to_owned(), "ping".to_owned()))
+        }),
     ];
     for (at, original) in requests.iter().enumerate() {
         let bytes = wire(original);
@@ -396,7 +472,11 @@ fn a_request_read_in_place_is_received_as_the_owned_one_is() {
         let lent = in_place.next_ref().unwrap().expect("the request is whole");
         let want = receive(SECRET, &read);
         let verifier = Verifier::new(SECRET);
-        assert_eq!(receive_ref(&verifier, &lent).map(DeliveryRef::into_owned), want, "request {at}");
+        assert_eq!(
+            receive_ref(&verifier, &lent).map(DeliveryRef::into_owned),
+            want,
+            "request {at}"
+        );
         assert_eq!(receive(SECRET, original), want, "request {at}");
     }
 }
@@ -409,7 +489,11 @@ fn a_key_made_once_verifies_as_one_made_per_delivery() {
     for secret in [&b"It's a Secret to Everybody"[..], b"another secret", b""] {
         let verifier = Verifier::new(secret);
         for signature in [Some(good), Some(bad.as_str()), Some("sha256=zz"), None] {
-            assert_eq!(verifier.verify(body, signature), verify(secret, body, signature), "{signature:?}");
+            assert_eq!(
+                verifier.verify(body, signature),
+                verify(secret, body, signature),
+                "{signature:?}"
+            );
         }
     }
 }
@@ -422,7 +506,9 @@ fn a_delivery_read_in_place_lends_its_strings_from_the_request() {
     assert!(std::ptr::eq(lent.id, id));
     let Cow::Borrowed(repo) = &lent.repo else { panic!("the repository was copied") };
     assert!(body.as_bytes().as_ptr_range().contains(&repo.as_ptr()));
-    let Some(EventRef::Push { branch: Cow::Borrowed(branch), commit: Cow::Borrowed(commit) }) = &lent.event else {
+    let Some(EventRef::Push { branch: Cow::Borrowed(branch), commit: Cow::Borrowed(commit) }) =
+        &lent.event
+    else {
         panic!("the event was copied: {:?}", lent.event);
     };
     assert_eq!((*branch, *commit), ("main", HEAD));
@@ -446,9 +532,11 @@ fn a_warm_delivery_allocates_only_its_events_strings() {
             parser.reset();
             parser.push(&bytes);
             let lent = parser.next_ref().unwrap().expect("the request is whole");
-            let delivery = blaze_alloc_count::assert_at_most(0, "a delivery checked and read in place", || {
-                receive_ref(&verifier, &lent).unwrap()
-            });
+            let delivery = blaze_alloc_count::assert_at_most(
+                0,
+                "a delivery checked and read in place",
+                || receive_ref(&verifier, &lent).unwrap(),
+            );
             let event = blaze_alloc_count::assert_at_most(
                 *strings,
                 "an event handed to the service: its two strings, its own",

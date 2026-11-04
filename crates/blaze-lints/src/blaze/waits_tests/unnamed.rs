@@ -60,7 +60,10 @@ pub fn by_macro(f: &Flights) -> u32 {
 "#,
         "-A clippy::all --warn=blaze::unnamed_wait",
     );
-    assert!(out.contains("`Flights::get_or_run` names what it waits for only as its key's hash"), "{out}");
+    assert!(
+        out.contains("`Flights::get_or_run` names what it waits for only as its key's hash"),
+        "{out}"
+    );
     assert!(out.contains("`Flights::get_or_run_named` names nothing it waits for"), "{out}");
     assert!(out.contains("`wait::lock` names what it waits for only as `\"wait\"`"), "{out}");
     assert!(out.contains("`sched::wait` names nothing it waits for"), "{out}");

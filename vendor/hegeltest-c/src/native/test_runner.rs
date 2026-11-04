@@ -155,10 +155,7 @@ enum Backtrack {
     /// A history entry cleared the discovery bar and is the origin's
     /// incumbent again; the origin is confirmed and the restored save
     /// superseded the barred one.
-    Restored {
-        nodes: Vec<ChoiceNode>,
-        spans: Vec<Span>,
-    },
+    Restored { nodes: Vec<ChoiceNode>, spans: Vec<Span> },
     /// No entry cleared the bar within the scan and bar budgets. Carries
     /// the accumulated physical (fails, runs) for the caller's reject.
     Exhausted { evidence: (u64, u64) },
@@ -243,12 +240,7 @@ pub(crate) async fn explore_external(
 ) -> Result<TestRunResult, RunError> {
     let mut engine = Engine::new(settings, database_key, exchange)?;
     engine.external = true;
-    engine
-        .run(
-            TOO_SLOW_THRESHOLD,
-            core::time::Duration::from_secs(MAX_SHRINKING_SECONDS),
-        )
-        .await
+    engine.run(TOO_SLOW_THRESHOLD, core::time::Duration::from_secs(MAX_SHRINKING_SECONDS)).await
 }
 
 /// Replay a reproduce blob (used by `hegel_run_start_blob`) and return the
@@ -329,11 +321,7 @@ pub(crate) async fn reproduce_blob(
                         .entry(&origin)
                         .trust(Some((graph, longest)), (evidence.fails(), evidence.runs()));
                     let caveat = engine.origins.caveat(&origin);
-                    Vec::from([Failure {
-                        origin,
-                        reproduce_blob: None,
-                        caveat,
-                    }])
+                    Vec::from([Failure { origin, reproduce_blob: None, caveat }])
                 }
                 None => Vec::new(),
             };
@@ -374,9 +362,7 @@ async fn run_main(
     too_slow_threshold: core::time::Duration,
     shrink_budget: core::time::Duration,
 ) -> Result<TestRunResult, RunError> {
-    Engine::new(settings, database_key, exchange)?
-        .run(too_slow_threshold, shrink_budget)
-        .await
+    Engine::new(settings, database_key, exchange)?.run(too_slow_threshold, shrink_budget).await
 }
 
 impl<'a> Engine<'a> {
@@ -426,18 +412,13 @@ impl<'a> Engine<'a> {
                 values.sort_by(|a, b| shortlex(a, b));
                 replay_aligned = !values.is_empty();
                 let primary_count = values.len();
-                let desired_factor = if settings.phases.contains(&Phase::Generate) {
-                    0.1
-                } else {
-                    1.0
-                };
+                let desired_factor =
+                    if settings.phases.contains(&Phase::Generate) { 0.1 } else { 1.0 };
                 let desired_size =
                     ((libm::ceil((max_test_cases as f64) * desired_factor)) as usize).max(2);
                 if values.len() < desired_size {
-                    let mut extra = self
-                        .db()
-                        .map(|db| db.fetch(&secondary_key))
-                        .unwrap_or_default();
+                    let mut extra =
+                        self.db().map(|db| db.fetch(&secondary_key)).unwrap_or_default();
                     extra.retain(|e| !values.contains(e));
                     let shortfall = desired_size - values.len();
                     if extra.len() > shortfall {
@@ -494,10 +475,7 @@ impl<'a> Engine<'a> {
                                     let graph = Arc::new(state.graph);
                                     let longest = (state.longest as usize).min(self.choice_bound());
                                     (
-                                        ReproSource::Graph {
-                                            graph: Arc::clone(&graph),
-                                            longest,
-                                        },
+                                        ReproSource::Graph { graph: Arc::clone(&graph), longest },
                                         Some((graph, longest)),
                                     )
                                 }
@@ -555,11 +533,7 @@ impl<'a> Engine<'a> {
 
         let shrink_phase = settings.phases.contains(&Phase::Shrink);
         let found_in_reuse = self.origins.any_live() && stop_on_first;
-        let reuse_incumbents = if replay_aligned {
-            Some(self.live_fingerprints()?)
-        } else {
-            None
-        };
+        let reuse_incumbents = if replay_aligned { Some(self.live_fingerprints()?) } else { None };
 
         let actually_generate =
             settings.phases.contains(&Phase::Generate) && !found_in_reuse && !self.test_is_trivial;
@@ -574,9 +548,8 @@ impl<'a> Engine<'a> {
             && !found_in_reuse
             && max_test_cases > 1
         {
-            let (run, mismatch) = self
-                .test_function(NativeTestCase::for_simplest(self.choice_bound())?)
-                .await?;
+            let (run, mismatch) =
+                self.test_function(NativeTestCase::for_simplest(self.choice_bound())?).await?;
             if let Some(err) = mismatch {
                 return Err(err);
             }
@@ -587,10 +560,7 @@ impl<'a> Engine<'a> {
                 self.choice_bound(),
                 settings.health_check_suppressed(HealthCheck::LargeInitialTestCase),
             ) {
-                return Err(RunError::HealthCheck(
-                    HealthCheck::LargeInitialTestCase,
-                    msg,
-                ));
+                return Err(RunError::HealthCheck(HealthCheck::LargeInitialTestCase, msg));
             }
         }
 
@@ -793,10 +763,8 @@ impl<'a> Engine<'a> {
                 if let (Some(_), Some(key)) = (self.db(), database_key) {
                     let key_bytes = key.as_bytes().to_vec();
                     let secondary_key = crate::native::database::sub_key(&key_bytes, b"secondary");
-                    let mut entries = self
-                        .db()
-                        .map(|db| db.fetch(&secondary_key))
-                        .unwrap_or_default();
+                    let mut entries =
+                        self.db().map(|db| db.fetch(&secondary_key)).unwrap_or_default();
                     entries.sort_by(|a, b| shortlex(a, b));
                     let primary_max: Option<Vec<u8>> = self
                         .origins
@@ -850,8 +818,7 @@ impl<'a> Engine<'a> {
                 let origin = if report_multiple {
                     live.into_iter().find(|o| !shrunk_origins.contains(o))
                 } else {
-                    self.smallest_origin(live)
-                        .filter(|o| !shrunk_origins.contains(o))
+                    self.smallest_origin(live).filter(|o| !shrunk_origins.contains(o))
                 };
                 let Some(origin) = origin else {
                     break;
@@ -859,10 +826,7 @@ impl<'a> Engine<'a> {
                 let initial = self
                     .origins
                     .get(&origin)
-                    .and_then(|c| {
-                        c.incumbent()
-                            .map(|n| (n.to_vec(), c.incumbent_spans().to_vec()))
-                    })
+                    .and_then(|c| c.incumbent().map(|n| (n.to_vec(), c.incumbent_spans().to_vec())))
                     .unwrap_or_default();
                 shrink_timed_out |= self
                     .shrink_origin(
@@ -895,8 +859,7 @@ impl<'a> Engine<'a> {
 
         let final_deadline =
             shrink_deadline.or_else(|| crate::sys::Instant::now().map(|now| now + shrink_budget));
-        self.final_replay(verbosity, &output, final_deadline, shrink_phase)
-            .await?;
+        self.final_replay(verbosity, &output, final_deadline, shrink_phase).await?;
 
         self.reconcile_database()?;
 
@@ -1026,11 +989,8 @@ impl<'a> Engine<'a> {
             if nd_blobs && c.needs_confirmation() {
                 continue;
             }
-            let state = if nd_blobs && c.incumbent().is_some() {
-                Some(c.repro_state()?)
-            } else {
-                None
-            };
+            let state =
+                if nd_blobs && c.incumbent().is_some() { Some(c.repro_state()?) } else { None };
             if let Some(nodes) = c.evict() {
                 origins_sorted.push((origin.to_string(), nodes, state));
             }
@@ -1064,11 +1024,7 @@ impl<'a> Engine<'a> {
                 );
                 (Some(blob), None)
             };
-            failures.push(Failure {
-                origin,
-                reproduce_blob,
-                caveat,
-            });
+            failures.push(Failure { origin, reproduce_blob, caveat });
         }
         if failures.is_empty() && nd_blobs {
             let mut unconfirmed: Vec<String> =
@@ -1201,11 +1157,7 @@ pub(crate) fn large_initial_check(
 /// divergence position, richer than the tree's kind message. Used under
 /// `error` strictness; quiet and warn flip instead.
 fn first_check_diagnostic(expected: &[ChoiceValue], realized: &[ChoiceValue]) -> String {
-    let at = expected
-        .iter()
-        .zip(realized)
-        .take_while(|(e, r)| *e == *r)
-        .count();
+    let at = expected.iter().zip(realized).take_while(|(e, r)| *e == *r).count();
     let detail = if at == expected.len().min(realized.len()) {
         format!(
             "{} choices were recorded but the replay realized {}",
@@ -1236,10 +1188,7 @@ pub(crate) fn flaky_diagnostic() -> String {
 /// `error`-strictness aborts that know it: the first-interesting check,
 /// the shrink verify, and the final replay.
 pub(crate) fn flaky_diagnostic_for(origin: &str) -> String {
-    format!(
-        "{}\nThe failure that did not reproduce was: {origin}",
-        flaky_diagnostic()
-    )
+    format!("{}\nThe failure that did not reproduce was: {origin}", flaky_diagnostic())
 }
 
 /// Notice emitted once per run under
@@ -1355,9 +1304,7 @@ fn should_generate_more(
         return false;
     };
     let last = last_bug_at.unwrap_or(first);
-    let heuristic = first
-        .saturating_add(POST_BUG_EXTRA_CALLS)
-        .min(last.saturating_mul(2));
+    let heuristic = first.saturating_add(POST_BUG_EXTRA_CALLS).min(last.saturating_mul(2));
     calls < MIN_TEST_CALLS || calls < heuristic
 }
 
@@ -1496,8 +1443,7 @@ impl<'a> Persister<'a> {
             }
         }
         self.saved_this_run.insert(new_bytes.clone());
-        self.last_saved
-            .insert(origin.to_string(), (nodes.to_vec(), new_bytes));
+        self.last_saved.insert(origin.to_string(), (nodes.to_vec(), new_bytes));
     }
 }
 
@@ -1844,9 +1790,7 @@ impl<'a> Engine<'a> {
             witness
         } else if !self.origins.needs_confirmation(&origin) {
             let (graph, longest) = self.replay_source(&origin)?;
-            let batch = self
-                .nd_evidence_batch(&origin, graph, longest, None)
-                .await?;
+            let batch = self.nd_evidence_batch(&origin, graph, longest, None).await?;
             let evidence = (batch.evidence.fails(), batch.evidence.runs());
             if let Some(witness) = batch.witness {
                 probe_anchor = batch.evidence.lower_bound();
@@ -1874,9 +1818,7 @@ impl<'a> Engine<'a> {
                 return Ok(false);
             }
             let (graph, longest) = self.replay_source(&origin)?;
-            let batch = self
-                .nd_evidence_batch(&origin, graph, longest, None)
-                .await?;
+            let batch = self.nd_evidence_batch(&origin, graph, longest, None).await?;
             let evidence = (batch.evidence.fails(), batch.evidence.runs());
             if !batch.bar_accepted {
                 self.reject_origin(&origin, evidence);
@@ -1919,11 +1861,8 @@ impl<'a> Engine<'a> {
                 output: output.clone(),
             };
             shrinker.shrink(&mut probe).await?;
-            let anchor = self
-                .origins
-                .get(&origin)
-                .and_then(Counterexample::anchor)
-                .unwrap_or(probe_anchor);
+            let anchor =
+                self.origins.get(&origin).and_then(Counterexample::anchor).unwrap_or(probe_anchor);
             if verbosity == Verbosity::Debug {
                 output.line(&format!(
                     "nd shrink done: origin={origin} edges={} anchor={anchor:.3} timed_out={}",
@@ -1935,10 +1874,7 @@ impl<'a> Engine<'a> {
             shrinker.timed_out
         } else {
             let (shrunk, shrunk_spans, timed_out) = {
-                let probe = EngineShrinkProbe {
-                    engine: &mut *self,
-                    target_origin: origin.clone(),
-                };
+                let probe = EngineShrinkProbe { engine: &mut *self, target_origin: origin.clone() };
                 let mut shrinker =
                     Shrinker::with_probe(Box::new(probe), verify.nodes, Spans::from(verify.spans));
                 shrinker.deadline = shrink_deadline;
@@ -1994,11 +1930,8 @@ impl<'a> Engine<'a> {
         let mut replayed: Vec<String> = Vec::new();
         while !pending.is_empty() {
             let origin = pending.remove(0);
-            let nodes = self
-                .origins
-                .incumbent(&origin)
-                .map(<[ChoiceNode]>::to_vec)
-                .unwrap_or_default();
+            let nodes =
+                self.origins.incumbent(&origin).map(<[ChoiceNode]>::to_vec).unwrap_or_default();
             let choices: Vec<ChoiceValue> = nodes.iter().map(|n| n.value()).collect();
             if !self.nd_handling() {
                 self.capture_replays = true;
@@ -2051,10 +1984,7 @@ impl<'a> Engine<'a> {
                 "final_replay: {origin} lost its incumbent without continuing"
             );
             let (graph, longest) = self.replay_source(&origin)?;
-            let source = ReproSource::Graph {
-                graph: Arc::clone(&graph),
-                longest,
-            };
+            let source = ReproSource::Graph { graph: Arc::clone(&graph), longest };
             self.capture_replays = true;
             let (reproduction, evidence) = self
                 .nd_reproduce(
@@ -2217,13 +2147,7 @@ impl<'a> Engine<'a> {
             }
         };
         self.capture_replays = capture_entry;
-        Ok(NdBatch {
-            bar_accepted,
-            evidence,
-            witness,
-            graph: grafted,
-            longest: grafted_longest,
-        })
+        Ok(NdBatch { bar_accepted, evidence, witness, graph: grafted, longest: grafted_longest })
     }
 
     /// Backtrack over `origin`'s history for the reproduction boundary —
@@ -2260,10 +2184,7 @@ impl<'a> Engine<'a> {
                 ));
             }
         }
-        let attempts_left = self
-            .origins
-            .get(origin)
-            .is_some_and(|c| c.backtrack_attempts_left());
+        let attempts_left = self.origins.get(origin).is_some_and(|c| c.backtrack_attempts_left());
         if entries.is_empty() || !attempts_left {
             return Ok(Backtrack::Exhausted { evidence: (0, 0) });
         }
@@ -2349,9 +2270,7 @@ impl<'a> Engine<'a> {
             };
             let Some(candidate) = candidate else {
                 if second_pass_done || replays_left == 0 {
-                    return Ok(Backtrack::Exhausted {
-                        evidence: (fails, runs),
-                    });
+                    return Ok(Backtrack::Exhausted { evidence: (fails, runs) });
                 }
                 second_pass_done = true;
                 for idx in (0..entries.len()).rev() {
@@ -2372,9 +2291,7 @@ impl<'a> Engine<'a> {
                 continue;
             };
             if !self.origins.entry(origin).spend_backtrack_attempt() {
-                return Ok(Backtrack::Exhausted {
-                    evidence: (fails, runs),
-                });
+                return Ok(Backtrack::Exhausted { evidence: (fails, runs) });
             }
             let (candidate_graph, candidate_len) = {
                 let c = self.origins.entry(origin);
@@ -2384,9 +2301,8 @@ impl<'a> Engine<'a> {
                     entry.map_or(0, |e| crate::native::core::flattened_len(&e.nodes)),
                 )
             };
-            let batch = self
-                .nd_evidence_batch(origin, candidate_graph, candidate_len, None)
-                .await?;
+            let batch =
+                self.nd_evidence_batch(origin, candidate_graph, candidate_len, None).await?;
             runs += batch.evidence.runs();
             fails += batch.evidence.fails();
             if !batch.bar_accepted {
@@ -2445,9 +2361,9 @@ impl<'a> Engine<'a> {
         anchor: f64,
     ) -> Result<Option<(RunResult, f64)>, RunError> {
         if self.settings.verbosity == Verbosity::Debug {
-            self.settings.output.line(&format!(
-                "nd boost: origin={origin} racing from anchor {anchor:.3}"
-            ));
+            self.settings
+                .output
+                .line(&format!("nd boost: origin={origin} racing from anchor {anchor:.3}"));
         }
         let incumbent = realized_values(incumbent);
         let mut candidates: Vec<Vec<ChoiceValue>> = Vec::from([incumbent.clone()]);
@@ -2501,9 +2417,9 @@ impl<'a> Engine<'a> {
         Ok(match (witness, lcb > anchor) {
             (Some(witness), true) => {
                 if self.settings.verbosity == Verbosity::Debug {
-                    self.settings.output.line(&format!(
-                        "nd boost: origin={origin} anchor {anchor:.3} -> {lcb:.3}"
-                    ));
+                    self.settings
+                        .output
+                        .line(&format!("nd boost: origin={origin} anchor {anchor:.3} -> {lcb:.3}"));
                 }
                 if winner == incumbent {
                     self.origins.entry(origin).raise_anchor(lcb);
@@ -2564,14 +2480,7 @@ impl<'a> Engine<'a> {
                 };
                 races += 1;
                 if self
-                    .nd_target_race(
-                        label,
-                        reference,
-                        &nodes,
-                        &timeline,
-                        *best_score,
-                        best_choices,
-                    )
+                    .nd_target_race(label, reference, &nodes, &timeline, *best_score, best_choices)
                     .await?
                 {
                     adopted = true;
@@ -2595,15 +2504,11 @@ impl<'a> Engine<'a> {
         label: &str,
         seed: &[ChoiceValue],
     ) -> Result<(), RunError> {
-        let (scores, nodes) = self
-            .nd_target_scores(seed, label, nd::TARGET_ND_HOLDOUT)
-            .await?;
+        let (scores, nodes) = self.nd_target_scores(seed, label, nd::TARGET_ND_HOLDOUT).await?;
         let target = match (nd::target_median(&scores), nodes) {
-            (Some(reference), Some(nodes)) => crate::native::targeting::NdTarget {
-                nodes,
-                reference,
-                dead: false,
-            },
+            (Some(reference), Some(nodes)) => {
+                crate::native::targeting::NdTarget { nodes, reference, dead: false }
+            }
             _ => {
                 if self.origins.any_live() {
                     return Ok(());
@@ -2672,11 +2577,7 @@ impl<'a> Engine<'a> {
                 }
             }
             let mean = |entry: &(usize, f64, u64)| {
-                if entry.2 == 0 {
-                    f64::NEG_INFINITY
-                } else {
-                    entry.1 / entry.2 as f64
-                }
+                if entry.2 == 0 { f64::NEG_INFINITY } else { entry.1 / entry.2 as f64 }
             };
             scores.sort_by(|a, b| mean(b).total_cmp(&mean(a)));
             scores.truncate(nd::boost_keep(scores.len()));
@@ -2687,9 +2588,8 @@ impl<'a> Engine<'a> {
             return Ok(false);
         }
         let winner = candidates[winner_idx].clone();
-        let (holdout_scores, _nodes) = self
-            .nd_target_scores(&winner, label, nd::TARGET_ND_HOLDOUT)
-            .await?;
+        let (holdout_scores, _nodes) =
+            self.nd_target_scores(&winner, label, nd::TARGET_ND_HOLDOUT).await?;
         let beats = holdout_scores.iter().filter(|&&s| s > reference).count() as u64;
         if !nd::target_adopt(beats, nd::TARGET_ND_HOLDOUT) {
             return Ok(false);
@@ -2707,9 +2607,8 @@ impl<'a> Engine<'a> {
         winner: &[ChoiceValue],
         reference: f64,
     ) -> Result<bool, RunError> {
-        let (fresh_scores, fresh_nodes) = self
-            .nd_target_scores(winner, label, nd::TARGET_ND_HOLDOUT)
-            .await?;
+        let (fresh_scores, fresh_nodes) =
+            self.nd_target_scores(winner, label, nd::TARGET_ND_HOLDOUT).await?;
         let (Some(median), Some(new_nodes)) = (nd::target_median(&fresh_scores), fresh_nodes)
         else {
             return Ok(false);
@@ -2790,11 +2689,7 @@ impl<'a> Engine<'a> {
         if !climbable.is_empty() && self.rng.random_range(0..2) == 0 {
             let idx = climbable[self.rng.random_range(0..climbable.len())];
             let magnitude = 1i128 << self.rng.random_range(0..7);
-            let delta = if self.rng.random_range(0..2) == 0 {
-                magnitude
-            } else {
-                -magnitude
-            };
+            let delta = if self.rng.random_range(0..2) == 0 { magnitude } else { -magnitude };
             let Some(value) = crate::native::targeting::step_choice(&nodes[idx], delta) else {
                 return Ok(None);
             };
@@ -2924,9 +2819,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let (graph, longest) = self.replay_source(&origin)?;
-            let batch = self
-                .nd_evidence_batch(&origin, graph, longest, None)
-                .await?;
+            let batch = self.nd_evidence_batch(&origin, graph, longest, None).await?;
             if verbosity == Verbosity::Debug {
                 output.line(&format!(
                     "nd discovery confirm: origin={origin} fails={}/{} accepted={}",
@@ -2975,9 +2868,7 @@ impl<'a> Engine<'a> {
 
     /// Whether `origin` has pre-flip history for a backtrack to scan.
     fn has_history(&self, origin: &str) -> bool {
-        self.origins
-            .get(origin)
-            .is_some_and(|c| !c.history().is_empty())
+        self.origins.get(origin).is_some_and(|c| !c.history().is_empty())
     }
 
     /// The discovery bar rejected `origin` with `evidence`: record it and
@@ -2997,18 +2888,13 @@ impl<'a> Engine<'a> {
         longest: usize,
         evidence: (u64, u64),
     ) -> Result<(), InternalError> {
-        self.origins
-            .entry(origin)
-            .confirm(anchor, None, graph, longest, evidence)?;
+        self.origins.entry(origin).confirm(anchor, None, graph, longest, evidence)?;
         self.record_nd_incumbent(origin)
     }
 
     fn record_nd_incumbent(&mut self, origin: &str) -> Result<(), InternalError> {
         let counterexample = self.origins.entry(origin);
-        let nodes = counterexample
-            .incumbent()
-            .map(<[ChoiceNode]>::to_vec)
-            .unwrap_or_default();
+        let nodes = counterexample.incumbent().map(<[ChoiceNode]>::to_vec).unwrap_or_default();
         let state = counterexample.repro_state()?;
         self.persister.record_nd(origin, &nodes, &state)
     }
@@ -3084,15 +2970,11 @@ impl<'a> Engine<'a> {
         elapsed: core::time::Duration,
         measurement: bool,
     ) -> Result<Option<RunError>, InternalError> {
-        let (mismatch, mismatched_origin) = if self.nd_active {
-            (None, None)
-        } else {
-            self.record_execution(run)?
-        };
+        let (mismatch, mismatched_origin) =
+            if self.nd_active { (None, None) } else { self.record_execution(run)? };
         if measurement {
             if self.nd_active || self.check_window {
-                self.statistics
-                    .record_measurement(run.status == Status::Interesting);
+                self.statistics.record_measurement(run.status == Status::Interesting);
             }
         } else {
             self.calls += 1;
@@ -3132,14 +3014,11 @@ impl<'a> Engine<'a> {
                     counterexample.record_sighting(&run.nodes, &run.spans, accept)?;
                 }
             } else if self.origins.incumbent(&origin).is_none() {
-                self.origins
-                    .entry(&origin)
-                    .adopt(run.nodes.clone(), run.spans.clone());
+                self.origins.entry(&origin).adopt(run.nodes.clone(), run.spans.clone());
             }
         }
-        if let Some(counterexample) = mismatched_origin
-            .as_deref()
-            .and_then(|origin| self.origins.get_mut(origin))
+        if let Some(counterexample) =
+            mismatched_origin.as_deref().and_then(|origin| self.origins.get_mut(origin))
         {
             counterexample.record_miss();
         }
@@ -3351,9 +3230,7 @@ impl ShrinkProbe for EngineShrinkProbe<'_, '_> {
             let run = match req {
                 ShrinkRun::Full(nodes) => {
                     let choices: Vec<ChoiceValue> = nodes.iter().map(|n| n.value()).collect();
-                    self.engine
-                        .cached_test_function(&choices, Some(nodes), 0)
-                        .await?
+                    self.engine.cached_test_function(&choices, Some(nodes), 0).await?
                 }
                 ShrinkRun::Probe { prefix, max_size } => {
                     self.engine
@@ -3382,10 +3259,7 @@ struct EngineGraphProbe<'e, 'a> {
 impl GraphProbe for EngineGraphProbe<'_, '_> {
     fn replay<'s>(&'s mut self, graph: Arc<Graph>, max_size: usize) -> GraphProbeFuture<'s> {
         Box::pin(async move {
-            let replay = self
-                .engine
-                .nd_replay_graph(graph, max_size, Some(&self.origin))
-                .await?;
+            let replay = self.engine.nd_replay_graph(graph, max_size, Some(&self.origin)).await?;
             let run = replay.run;
             Ok(GraphOutcome {
                 failed: replay.failed,
@@ -3399,11 +3273,12 @@ impl GraphProbe for EngineGraphProbe<'_, '_> {
     }
 
     fn charge(&mut self, anchor: f64, drive: bool) -> u64 {
-        self.engine
-            .origins
-            .entry(&self.origin)
-            .gauntlet_spend
-            .charge(&nd::Evidence::default(), anchor, drive, None)
+        self.engine.origins.entry(&self.origin).gauntlet_spend.charge(
+            &nd::Evidence::default(),
+            anchor,
+            drive,
+            None,
+        )
     }
 
     fn adopted(
@@ -3471,10 +3346,7 @@ impl<'a> Engine<'a> {
         let mut by_label: crate::native::HashMap<u64, crate::native::HashSet<(usize, usize)>> =
             crate::native::HashMap::default();
         for span in spans.iter() {
-            by_label
-                .entry(span.label)
-                .or_default()
-                .insert((span.start, span.end));
+            by_label.entry(span.label).or_default().insert((span.start, span.end));
         }
         let multi: Vec<Vec<(usize, usize)>> = by_label
             .into_values()
@@ -3522,17 +3394,10 @@ impl<'a> Engine<'a> {
                 out.extend_from_slice(&values[start_a..]);
                 out
             } else {
-                let (donor_start, donor_end) = if self.rng.random::<bool>() {
-                    (start_a, end_a)
-                } else {
-                    (start_b, end_b)
-                };
+                let (donor_start, donor_end) =
+                    if self.rng.random::<bool>() { (start_a, end_a) } else { (start_b, end_b) };
                 let replacement: &[ChoiceValue] = &values[donor_start..donor_end];
-                let mid = if end_a <= start_b {
-                    &values[end_a..start_b]
-                } else {
-                    &[][..]
-                };
+                let mid = if end_a <= start_b { &values[end_a..start_b] } else { &[][..] };
                 let mut out = Vec::new();
                 out.extend_from_slice(&values[..start_a]);
                 out.extend_from_slice(replacement);

@@ -15,12 +15,13 @@ use syntax::SyntaxKind;
 
 use super::{can_be_used_for_suggestions, cast_ty_span, expr_span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set},
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
 
-const NOTE: &str = "for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>";
+const NOTE: &str =
+    "for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>";
 
 #[derive(Default)]
 pub(crate) struct ImplicitProvenanceCasts;
@@ -49,11 +50,18 @@ fn is_integral(ty: Ty<'_>) -> bool {
 }
 
 /// rustc's `lint_ptr2int`.
-fn ptr2int(b: &BodyCx<'_, '_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, out: &mut Vec<Found>) {
+fn ptr2int(
+    b: &BodyCx<'_, '_, '_>,
+    expr: ExprId,
+    from: ExprId,
+    to_ty: Ty<'_>,
+    out: &mut Vec<Found>,
+) {
     let (Some(at), Some(span)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
     let (Some(from_text), Some(to_text)) = (ty_text(b, from), ty_text(b, expr)) else { return };
     // alloc: the lint's text, for a lint found
-    let message = format!("cast from `{from_text}` to `{to_text}` implicitly exposes pointer provenance");
+    let message =
+        format!("cast from `{from_text}` to `{to_text}` implicitly exposes pointer provenance");
     // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("implicit_provenance_casts", message, span.clone());
     diag.help("if conforming to strict provenance is not possible, use `.expose_provenance()`");
@@ -68,7 +76,8 @@ fn ptr2int(b: &BodyCx<'_, '_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, ou
         match (!unambiguous(b, from), !to_ty.is_usize()) {
             (true, true) => {
                 // alloc: the lint's text, for a lint found
-                let parts = vec![(lo, "(".to_owned()), (cast_span, format!(").addr() as {to_text}"))];
+                let parts =
+                    vec![(lo, "(".to_owned()), (cast_span, format!(").addr() as {to_text}"))];
                 diag.suggestion_with_style(parts, message, applicability, SuggestionStyle::ShowCode)
             }
             (true, false) => {
@@ -77,7 +86,9 @@ fn ptr2int(b: &BodyCx<'_, '_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, ou
                 diag.suggestion_with_style(parts, message, applicability, SuggestionStyle::ShowCode)
             }
             // alloc: the lint's text, for a lint found
-            (false, true) => diag.suggestion(cast_span, message, format!(".addr() as {to_text}"), applicability),
+            (false, true) => {
+                diag.suggestion(cast_span, message, format!(".addr() as {to_text}"), applicability)
+            }
             (false, false) => diag.suggestion(cast_span, message, ".addr()", applicability),
         };
     }
@@ -89,7 +100,8 @@ fn int2ptr(b: &BodyCx<'_, '_, '_>, expr: ExprId, from: ExprId, out: &mut Vec<Fou
     let (Some(at), Some(span)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
     let (Some(from_text), Some(to_text)) = (ty_text(b, from), ty_text(b, expr)) else { return };
     // alloc: the lint's text, for a lint found
-    let message = format!("cast from `{from_text}` to `{to_text}` implicitly relies on exposed provenance");
+    let message =
+        format!("cast from `{from_text}` to `{to_text}` implicitly relies on exposed provenance");
     // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("implicit_provenance_casts", message, span.clone());
     diag.help("if conforming to strict provenance is not possible, use `std::ptr::with_exposed_provenance()`");
@@ -133,7 +145,9 @@ fn unambiguous(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
         | Expr::Let { .. }
         | Expr::UnaryOp { .. } => false,
         _ => match b.expr_node(expr) {
-            Some(node) => !b.cx.syntax_view(node).value.children().any(|it| it.kind() == SyntaxKind::ATTR),
+            Some(node) => {
+                !b.cx.syntax_view(node).value.children().any(|it| it.kind() == SyntaxKind::ATTR)
+            }
             None => true,
         },
     }

@@ -65,7 +65,10 @@ pub enum Advice {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapOptions {
     populate: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "huge pages of files are Linux's"))]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "huge pages of files are Linux's")
+    )]
     huge: bool,
     advice: Advice,
 }
@@ -126,8 +129,9 @@ impl MapOptions {
     /// a view of which is open, but not to write it.)
     pub unsafe fn map(self, file: &File) -> io::Result<Mapped> {
         // `fstat` of the descriptor mapped: the one length every read is bounded by.
-        let len = usize::try_from(file.metadata()?.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
+        let len = usize::try_from(file.metadata()?.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory")
+        })?;
         if len == 0 {
             return Ok(Mapped::EMPTY);
         }
@@ -222,7 +226,11 @@ mod sys {
     /// # Safety
     ///
     /// As [`super::MapOptions::map`]; `len` is the file's length, not 0.
-    pub(super) unsafe fn map(file: &File, len: usize, options: MapOptions) -> io::Result<(NonNull<u8>, usize)> {
+    pub(super) unsafe fn map(
+        file: &File,
+        len: usize,
+        options: MapOptions,
+    ) -> io::Result<(NonNull<u8>, usize)> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let populate = if options.populate { libc::MAP_POPULATE } else { 0 };
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -302,8 +310,8 @@ mod sys {
 
     use windows_sys::Win32::System::{
         Memory::{
-            CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY,
-            PrefetchVirtualMemory, UnmapViewOfFile, WIN32_MEMORY_RANGE_ENTRY,
+            CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READONLY, PrefetchVirtualMemory, UnmapViewOfFile, WIN32_MEMORY_RANGE_ENTRY,
         },
         Threading::GetCurrentProcess,
     };
@@ -314,7 +322,11 @@ mod sys {
     ///
     /// As [`super::MapOptions::map`]; `len` is the file's length, not 0 (an empty file has no
     /// section).
-    pub(super) unsafe fn map(file: &File, len: usize, options: MapOptions) -> io::Result<(NonNull<u8>, usize)> {
+    pub(super) unsafe fn map(
+        file: &File,
+        len: usize,
+        options: MapOptions,
+    ) -> io::Result<(NonNull<u8>, usize)> {
         // The section is `len` bytes, the length every read is bounded by: Windows refuses a
         // read-only section longer than the file, so one cut short since `fstat` fails here
         // rather than leaving the slice longer than the view.
@@ -345,7 +357,8 @@ mod sys {
         // The view keeps the section and the file open after their handles close.
         drop(section);
         if options.populate || options.advice == Advice::WillNeed {
-            let range = WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: at.as_ptr().cast(), NumberOfBytes: len };
+            let range =
+                WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: at.as_ptr().cast(), NumberOfBytes: len };
             // SAFETY: a pseudo-handle of this process, which needs no closing.
             let process = unsafe { GetCurrentProcess() };
             // SAFETY: one range, of the view just made; a prefetch reads its pages in, never
@@ -381,15 +394,23 @@ mod sys {
     /// # Safety
     ///
     /// `len` is not 0.
-    pub(super) unsafe fn map(file: &File, len: usize, _: MapOptions) -> io::Result<(NonNull<u8>, usize)> {
-        let layout = Layout::from_size_align(len, ALIGN)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
+    pub(super) unsafe fn map(
+        file: &File,
+        len: usize,
+        _: MapOptions,
+    ) -> io::Result<(NonNull<u8>, usize)> {
+        let layout = Layout::from_size_align(len, ALIGN).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory")
+        })?;
         // SAFETY: `layout` is not of size 0, by the caller. Zeroed, so the bytes are
         // initialized before they are read into.
         // alloc: the file's bytes, WASI's stand-in for its mapping; freed by `unmap`.
         let at = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).ok_or_else(|| {
             // alloc: an error path.
-            io::Error::new(io::ErrorKind::OutOfMemory, format!("{len} bytes to read the file into: WASI maps no file"))
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("{len} bytes to read the file into: WASI maps no file"),
+            )
         })?;
         // SAFETY: `len` initialized bytes at `at`, just allocated, this function's alone.
         let bytes = unsafe { std::slice::from_raw_parts_mut(at.as_ptr(), len) };
@@ -399,7 +420,10 @@ mod sys {
                 // SAFETY: allocated above with `layout`, and lent to nothing now.
                 unsafe { std::alloc::dealloc(at.as_ptr(), layout) };
                 // alloc: an error path.
-                Err(io::Error::new(error.kind(), format!("reading its {len} bytes whole (WASI maps no file): {error}")))
+                Err(io::Error::new(
+                    error.kind(),
+                    format!("reading its {len} bytes whole (WASI maps no file): {error}"),
+                ))
             }
         }
     }
@@ -423,8 +447,15 @@ mod sys {
     /// # Safety
     ///
     /// None: nothing is mapped.
-    pub(super) unsafe fn map(_: &File, _: usize, _: MapOptions) -> io::Result<(NonNull<u8>, usize)> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "this system has no file mapping blaze uses"))
+    pub(super) unsafe fn map(
+        _: &File,
+        _: usize,
+        _: MapOptions,
+    ) -> io::Result<(NonNull<u8>, usize)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this system has no file mapping blaze uses",
+        ))
     }
 
     /// # Safety

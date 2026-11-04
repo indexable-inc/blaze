@@ -18,7 +18,6 @@
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_items::{
     ItemId, ItemKey,
@@ -38,6 +37,7 @@ use hir_ty::{
     next_solver::{ImplTraitIdx, SolverDefId},
 };
 use la_arena::{Idx, RawIdx};
+use std::alloc::Global;
 
 use crate::identity::names::{Target, names_of};
 

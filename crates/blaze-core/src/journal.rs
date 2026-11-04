@@ -161,8 +161,13 @@ impl Stamp {
 
     /// Of a name the system would not say anything of (no permission, an I/O error): moved
     /// from any stamp a file had, so the asker looks at it and meets the error itself.
-    pub const UNKNOWN: Stamp =
-        Stamp { ino: u64::MAX, size: u64::MAX, mtime_ns: u64::MAX, ctime_ns: u64::MAX, mode: u32::MAX };
+    pub const UNKNOWN: Stamp = Stamp {
+        ino: u64::MAX,
+        size: u64::MAX,
+        mtime_ns: u64::MAX,
+        ctime_ns: u64::MAX,
+        mode: u32::MAX,
+    };
 
     pub fn is_unknown(&self) -> bool {
         *self == Stamp::UNKNOWN
@@ -266,9 +271,8 @@ impl Cursor {
     /// Of [`Cursor::encode`]'s bytes; `None` for fewer than `BYTES` or an unknown kind.
     pub fn decode(bytes: &[u8]) -> Option<Cursor> {
         let bytes = bytes.get(..Cursor::BYTES)?;
-        let word = |n: usize| {
-            u64::from_le_bytes(bytes[1 + n * 8..9 + n * 8].try_into().expect("8 bytes"))
-        };
+        let word =
+            |n: usize| u64::from_le_bytes(bytes[1 + n * 8..9 + n * 8].try_into().expect("8 bytes"));
         Some(match bytes[0] {
             0 => Cursor::None,
             1 => {
@@ -403,7 +407,8 @@ mod tests {
 
     #[test]
     fn stamps_and_cursors_round_trip() {
-        let stamp = Stamp { ino: 7, size: 1 << 40, mtime_ns: 3, ctime_ns: u64::MAX, mode: 0o100755 };
+        let stamp =
+            Stamp { ino: 7, size: 1 << 40, mtime_ns: 3, ctime_ns: u64::MAX, mode: 0o100755 };
         let mut bytes = Vec::new();
         stamp.encode(&mut bytes);
         assert_eq!(bytes.len(), Stamp::BYTES);

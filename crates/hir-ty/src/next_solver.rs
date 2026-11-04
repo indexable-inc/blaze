@@ -159,7 +159,10 @@ impl std::fmt::Debug for DefaultAny<'_> {
 
 #[inline]
 pub fn default_types<'db>() -> &'db DefaultAny<'db> {
-    #[expect(clippy::disallowed_types, reason = "the process's one set of default types: shared by every database")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the process's one set of default types: shared by every database"
+    )]
     static TYPES: std::sync::OnceLock<DefaultAny<'static>> = std::sync::OnceLock::new();
 
     let types = TYPES.get_or_init(|| {

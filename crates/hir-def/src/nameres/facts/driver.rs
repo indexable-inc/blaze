@@ -10,13 +10,13 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_expand::{
     MacroCallId, MacroDefId,
     mod_path::{ModPath, PathKind},
     name::Name,
 };
+use std::alloc::Global;
 use stdx::always;
 use syntax::ast;
 use triomphe::Arc;
@@ -87,7 +87,11 @@ pub(crate) fn fixpoint_limit<'a>(
     for op in imports {
         pending_imports += 1;
         if first.len() < 2 * FixpointLimit::LISTED {
-            first.push(format!("import `{}` in {}", op.path.display(db, edition), module(op.module))); // alloc: as above
+            first.push(format!(
+                "import `{}` in {}",
+                op.path.display(db, edition),
+                module(op.module)
+            )); // alloc: as above
         }
     }
     FixpointLimit {
@@ -121,7 +125,11 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
         stack.push(queries::root_decl(db, krate));
         while let Some(key) = stack.pop() {
             let decl = key.decl(db);
-            assert!(declared.insert(decl.module), "nameres facts: {:?} is declared twice at round 0", decl.module);
+            assert!(
+                declared.insert(decl.module),
+                "nameres facts: {:?} is declared twice at round 0",
+                decl.module
+            );
             order.push(decl.module);
             rows.push(ModuleRow {
                 origin: decl.origin,
@@ -185,7 +193,9 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
         };
         for op in step.ops.iter() {
             match op.target() {
-                Some(target) if target == module && op.is_resolution_op() => own |= RoundModules::GAINS,
+                Some(target) if target == module && op.is_resolution_op() => {
+                    own |= RoundModules::GAINS
+                }
                 Some(target) if target == root && module != root => flags[0] |= RoundModules::GAINS,
                 _ => {}
             }
@@ -194,7 +204,11 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
         for (new, row) in step.new_modules.iter() {
             debug_assert_eq!(row.since, r, "a module the step of round {} declared", r - 1);
             let fresh = !previous.index.contains_key(new) && declared.insert(*new);
-            assert!(fresh, "nameres facts: {new:?} is declared twice, again by {module:?} at round {}", r - 1);
+            assert!(
+                fresh,
+                "nameres facts: {new:?} is declared twice, again by {module:?} at round {}",
+                r - 1
+            );
             order.push(*new);
             // clone: a new module's row, once.
             rows.push(row.clone());
@@ -228,7 +242,8 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
     ran.extend_from_slice(&previous.ran);
     let mut since = Vec::with_capacity_in(order.len(), frame);
     since.extend_from_slice(&previous.since);
-    let active_before = (r > 1).then(|| (queries::round_active(db, before), queries::partition(db, before)));
+    let active_before =
+        (r > 1).then(|| (queries::round_active(db, before), queries::partition(db, before)));
     for at in 0..n {
         let module = previous.order[at];
         let ran_before = match active_before {
@@ -254,7 +269,8 @@ pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundMod
     since.resize(order.len(), NO_ROUND);
 
     let touched = RoundModules::STEP | RoundModules::GAINS;
-    let active = || (0u32..).zip(flags.iter()).filter(|&(_, &it)| it & touched != 0).map(|(at, _)| at);
+    let active =
+        || (0u32..).zip(flags.iter()).filter(|&(_, &it)| it & touched != 0).map(|(at, _)| at);
     // alloc: the round's active modules, a few, at exact size.
     let mut active_list = Vec::with_capacity(active().count());
     active_list.extend(active());
@@ -292,7 +308,9 @@ fn has_directive(log: &OpLog, module: ModuleId) -> bool {
 }
 
 fn index_of_in(index: &HashMap<ModuleId, u32, Global>, module: ModuleId, round: u32) -> u32 {
-    *index.get(&module).unwrap_or_else(|| panic!("nameres facts: {module:?} is not a module of round {round}"))
+    *index
+        .get(&module)
+        .unwrap_or_else(|| panic!("nameres facts: {module:?} is not a module of round {round}"))
 }
 
 /// What module `key.module` gains at round `key.round >= 1` (the contract's §3 rule): the
@@ -302,7 +320,10 @@ fn index_of_in(index: &HashMap<ModuleId, u32, Global>, module: ModuleId, round: 
 /// ran are read: a module that did not step at the round before made no op.
 pub(crate) fn module_round(db: &Db, frame: &Frame, key: FactKey) -> ModuleRound {
     let (module, krate, r) = (key.module(db), key.krate(db), key.round(db));
-    assert!(r >= 1, "nameres facts: module_round of {module:?} at round 0, whose ops are module_decls'");
+    assert!(
+        r >= 1,
+        "nameres facts: module_round of {module:?} at round 0, whose ops are module_decls'"
+    );
     let modules = queries::round_modules(db, RoundKey::new(db, krate, r));
     let row = modules
         .row(module)
@@ -352,7 +373,12 @@ pub(crate) fn module_round(db: &Db, frame: &Frame, key: FactKey) -> ModuleRound 
 /// The module whose step of round `round - 1` declared `module` (declared at `round`): its
 /// nearest ancestor that existed before, as an expansion's modules nest in the module it was
 /// collected into.
-fn declaring_module(modules: &RoundModules, module: ModuleId, row: &ModuleRow, round: u32) -> ModuleId {
+fn declaring_module(
+    modules: &RoundModules,
+    module: ModuleId,
+    row: &ModuleRow,
+    round: u32,
+) -> ModuleId {
     let mut at = row;
     loop {
         let parent = at.parent.unwrap_or_else(|| {
@@ -389,7 +415,8 @@ pub(crate) fn import_shape(db: &Db, frame: &Frame, round: RoundKey) -> ImportSha
     let root = queries::crate_root(db, krate);
     let edition = queries::crate_data(db, krate).edition;
     let extern_prelude = &queries::round_env(db, round).env(db).extern_prelude;
-    let names = || extern_prelude.iter().filter(|&&(_, module, _)| module == root).map(|&(name, ..)| name);
+    let names =
+        || extern_prelude.iter().filter(|&&(_, module, _)| module == root).map(|&(name, ..)| name);
     // alloc: the shape's value, a few names, at exact size.
     let mut extern_prelude_self = Vec::with_capacity(names().count());
     extern_prelude_self.extend(names());
@@ -463,9 +490,11 @@ fn shapes(op: &DeclOp, module: ModuleId, root: ModuleId) -> bool {
     match op {
         DeclOp::Import(it) => it.module == module,
         DeclOp::PushChild { parent, .. } => *parent == module,
-        DeclOp::Update { module: target, import: Some(ImportOrExternCrate::ExternCrate(_)), .. } => {
-            *target == module
-        }
+        DeclOp::Update {
+            module: target,
+            import: Some(ImportOrExternCrate::ExternCrate(_)),
+            ..
+        } => *target == module,
         DeclOp::ExternPrelude { root: it, .. } => *it == root && module == root,
         _ => false,
     }
@@ -480,7 +509,11 @@ struct ShapeScratch<'f> {
 
 impl<'f> ShapeScratch<'f> {
     fn new_in(frame: &'f Frame) -> Self {
-        ShapeScratch { local_names: Vec::new_in(frame), imports: Vec::new_in(frame), other_paths: Vec::new_in(frame) }
+        ShapeScratch {
+            local_names: Vec::new_in(frame),
+            imports: Vec::new_in(frame),
+            other_paths: Vec::new_in(frame),
+        }
     }
 
     fn clear(&mut self) {
@@ -596,13 +629,15 @@ pub(crate) fn round_progress(db: &Db, round: RoundKey) -> RoundOutcome {
         out.progress |= step.progress;
         out.deferred_eager |= step.deferred_eager;
     }
-    let with_directives = (0u32..).zip(modules.flags.iter()).filter(|&(_, &it)| {
-        it & (RoundModules::STEP | RoundModules::PENDING) != 0
-    });
+    let with_directives = (0u32..)
+        .zip(modules.flags.iter())
+        .filter(|&(_, &it)| it & (RoundModules::STEP | RoundModules::PENDING) != 0);
     for (at, _) in with_directives {
         let module = modules.order[at as usize];
         let index = match modules.steps(at) {
-            true => macros::first_attr(queries::macro_step(db, FactKey::new(db, module, krate, r)).pending.iter()),
+            true => macros::first_attr(
+                queries::macro_step(db, FactKey::new(db, module, krate, r)).pending.iter(),
+            ),
             false => macros::first_attr(macros::Carried::at(db, krate, modules, at).directives()),
         };
         if let Some(index) = index {
@@ -668,7 +703,11 @@ pub(crate) fn round_row(db: &Db, round: RoundKey, module: ModuleId) -> Option<Mo
 /// diagnostics and the final units' unresolved imports (`collect` and `finish` of the old
 /// collector).
 #[cfg(test)]
-pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap) {
+pub(crate) fn collect_crate<'db>(
+    db: &'db Db,
+    frame: &Frame,
+    krate: Crate,
+) -> (DefMap, LocalDefMap) {
     let mut r = 0;
     while queries::round_kind(db, RoundKey::new(db, krate, r)) != RoundKind::Final {
         blaze_query::db::unwind_if_cancelled(db);
@@ -677,7 +716,11 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
     let round = RoundKey::new(db, krate, r);
     let root = queries::crate_root(db, krate);
     let modules = queries::round_modules(db, round);
-    assert_eq!(modules.order.first(), Some(&root), "nameres facts: the round's first module is not the crate root");
+    assert_eq!(
+        modules.order.first(),
+        Some(&root),
+        "nameres facts: the round's first module is not the crate root"
+    );
 
     let mut table = ModulesMap::new();
     table.reserve(modules.order.len());
@@ -720,7 +763,8 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
 
     // One state per component, by its anchor in module order.
     let partition = queries::partition(db, round);
-    let mut states: Vec<&'db SccState, &Frame> = Vec::with_capacity_in(partition.len() as usize, frame);
+    let mut states: Vec<&'db SccState, &Frame> =
+        Vec::with_capacity_in(partition.len() as usize, frame);
     for (at, &module) in (0u32..).zip(modules.order.iter()) {
         if partition.anchor(partition.of(at)) == at {
             states.push(queries::scc_state(db, SccKey::new(db, module, krate, r)));
@@ -741,7 +785,10 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
         );
         for (&item, helpers) in helpers_of {
             // clone: the final tables are query values; each helper is copied into the map once.
-            derive_helpers.entry(item).or_insert_with(|| Vec::new_in(frame)).extend(helpers.iter().cloned());
+            derive_helpers
+                .entry(item)
+                .or_insert_with(|| Vec::new_in(frame))
+                .extend(helpers.iter().cloned());
         }
         if modules.has_pending(at) {
             pending.push(carried);
@@ -750,8 +797,9 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
 
     let env = queries::round_env(db, round).env(db);
     let local = env.local_def_map();
-    let CrateOps { mut diagnostics, data, session_macros, unresolved_extern_crates, records, .. } =
-        crate_ops;
+    let CrateOps {
+        mut diagnostics, data, session_macros, unresolved_extern_crates, records, ..
+    } = crate_ops;
     let mut def_map = DefMap {
         krate,
         block: None,
@@ -777,7 +825,8 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
         (def_map, local)
     } else {
         let cx = collect::cx(db, frame, krate, false);
-        let mut sink = FinishSink { db, def_map, local, states: &states, diagnostics: &mut diagnostics };
+        let mut sink =
+            FinishSink { db, def_map, local, states: &states, diagnostics: &mut diagnostics };
         for carried in &pending {
             macros::unresolved_macro_diagnostics(&cx, &mut sink, carried.directives());
         }
@@ -790,7 +839,10 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
     for state in &states {
         imports.extend(state.imports.iter().map(|(import, status)| {
             let at = *modules.index.get(&import.module).unwrap_or_else(|| {
-                panic!("nameres facts: an import of {:?}, which is not a module of round {r}", import.module)
+                panic!(
+                    "nameres facts: an import of {:?}, which is not a module of round {r}",
+                    import.module
+                )
             });
             (at, import, *status)
         }));
@@ -1026,7 +1078,9 @@ pub(crate) fn name_records<'a>(
 
 /// The def map's derive helpers, from a run's frame tables: the table and each list at exact
 /// size.
-fn owned_helpers(helpers: &FrameMap<'_, AstId<ast::Item>, FrameVec<'_, DeriveHelper>>) -> DeriveHelpers {
+fn owned_helpers(
+    helpers: &FrameMap<'_, AstId<ast::Item>, FrameVec<'_, DeriveHelper>>,
+) -> DeriveHelpers {
     // alloc: the def map's table, at its size, once per def map; each item's list, at exact
     // size, once per def map; clone: each helper once.
     DeriveHelpers::from_iter_in(helpers.iter().map(|(&item, list)| (item, list.to_vec())), Global)
@@ -1042,7 +1096,9 @@ pub(crate) fn copy_diagnostic(diagnostic: &DefDiagnostic) -> DefDiagnostic {
         }
         K::UnresolvedExternCrate { ast } => K::UnresolvedExternCrate { ast: *ast },
         K::UnresolvedImport { id, index } => K::UnresolvedImport { id: *id, index: *index },
-        K::TraitItemImport { id, index, why } => K::TraitItemImport { id: *id, index: *index, why: *why },
+        K::TraitItemImport { id, index, why } => {
+            K::TraitItemImport { id: *id, index: *index, why: *why }
+        }
         K::UnconfiguredCode { ast_id, cfg } => {
             K::UnconfiguredCode { ast_id: *ast_id, cfg: cfg.clone() } // clone: see above.
         }
@@ -1053,9 +1109,13 @@ pub(crate) fn copy_diagnostic(diagnostic: &DefDiagnostic) -> DefDiagnostic {
         K::InvalidDeriveTarget { ast, id } => K::InvalidDeriveTarget { ast: *ast, id: *id },
         K::MalformedDerive { ast, id } => K::MalformedDerive { ast: *ast, id: *id },
         // clone: see above.
-        K::MacroDefError { ast, message } => K::MacroDefError { ast: *ast, message: message.clone() },
+        K::MacroDefError { ast, message } => {
+            K::MacroDefError { ast: *ast, message: message.clone() }
+        }
         // clone: see above.
-        K::MacroError { ast, path, err } => K::MacroError { ast: *ast, path: *path, err: err.clone() },
+        K::MacroError { ast, path, err } => {
+            K::MacroError { ast: *ast, path: *path, err: err.clone() }
+        }
         K::Prelude { krate, error } => K::Prelude { krate: *krate, error: *error },
     };
     DefDiagnostic { in_module: diagnostic.in_module, kind }
@@ -1135,7 +1195,8 @@ pub(crate) fn collect_block<'db>(
 ) -> DefMap {
     let krate = def_map.krate;
     let cx = collect::cx(db, frame, krate, true);
-    let mut sink = BlockSink { unit: Unit::block(&cx, def_map, local), records: Records::new_in(frame) };
+    let mut sink =
+        BlockSink { unit: Unit::block(&cx, def_map, local), records: Records::new_in(frame) };
     let mut side: SideTablesIn<'_> = SideTables::new_in(frame);
     let mut pending: FrameVec<'_, MacroOp> = Vec::new_in(frame);
     collect::seed_block(&cx, &mut sink, &mut side, tree_id);
@@ -1164,7 +1225,8 @@ pub(crate) fn collect_block<'db>(
             eager_with_errors = false;
             rounds += 1;
             if rounds > FIXED_POINT_LIMIT {
-                let imports = sink.unit.import_outcomes().filter(|(_, it)| it.is_none()).map(|(it, _)| it);
+                let imports =
+                    sink.unit.import_outcomes().filter(|(_, it)| it.is_none()).map(|(it, _)| it);
                 fixpoint_limit(db, krate, true, rounds, pending.iter(), imports).throw();
             }
         }
@@ -1190,10 +1252,18 @@ pub(crate) fn collect_block<'db>(
     diagnostics.extend(
         unit.unresolved_imports()
             .filter(|it| !in_unresolved_extern_crate(&it.path, unit.unresolved_extern_crates()))
-            .map(|it| DefDiagnostic::unresolved_import(it.module, it.source.id.lookup(db).id, it.source.use_tree)),
+            .map(|it| {
+                DefDiagnostic::unresolved_import(
+                    it.module,
+                    it.source.id.lookup(db).id,
+                    it.source.use_tree,
+                )
+            }),
     );
     for (import, status) in unit.import_outcomes() {
-        trait_item_import_diagnostics(db, unit.def_map(), import, status, |it| diagnostics.push(it));
+        trait_item_import_diagnostics(db, unit.def_map(), import, status, |it| {
+            diagnostics.push(it)
+        });
     }
     let names = name_records(db, frame, unit.def_map(), local, unit.import_outcomes(), records);
     let mut def_map = unit.into_def_map();
@@ -1335,8 +1405,15 @@ pub struct S;
             .iter()
             .map(|row| path(row.origin))
             .collect();
-        let expected =
-            ["crate", "crate::a", "crate::a::inner", "crate::b", "crate::b::c", "crate::b::d", "crate::e"];
+        let expected = [
+            "crate",
+            "crate::a",
+            "crate::a::inner",
+            "crate::b",
+            "crate::b::c",
+            "crate::b::d",
+            "crate::e",
+        ];
         assert_eq!(order, expected);
     }
 
@@ -1371,7 +1448,11 @@ extern crate self as me;
             root.imports.iter().map(|it| (it.binds, it.is_glob)).collect();
         assert_eq!(
             binds,
-            [(Some(Name::new_root("X")), false), (None, true), (Some(Name::new_root("renamed")), false)]
+            [
+                (Some(Name::new_root("X")), false),
+                (None, true),
+                (Some(Name::new_root("renamed")), false)
+            ]
         );
         assert!(root.other_paths.is_empty(), "{:?}", root.other_paths);
         assert_eq!(shape.modules[2].other_paths.len(), 1, "{:?}", shape.modules[2].other_paths);
@@ -1420,7 +1501,10 @@ outer!();
 "#;
         let db = fixture_db(fixture);
         let krate = db.fetch_test_crate();
-        assert_eq!(round_kinds(&db, krate), [RoundKind::Normal, RoundKind::Normal, RoundKind::Final]);
+        assert_eq!(
+            round_kinds(&db, krate),
+            [RoundKind::Normal, RoundKind::Normal, RoundKind::Final]
+        );
         let def_map = crate_local_def_map(&db, krate).def_map(&db);
         let scope = def_map.module(&db, def_map.root).scope(&db);
         assert_ne!(scope.get(&Name::new_root("Made")), PerNs::none(), "`Made` through the glob");
@@ -1533,9 +1617,24 @@ mod still {
         };
         assert_eq!(module_path(&db, crate::Lookup::lookup(&it, &db).container), "crate::c");
         let settled = root.glob_ambiguities().iter().filter(|it| it.name == x).count();
-        assert_eq!(settled, 0, "the root's `X` is `c::X`, no longer ambiguous: {:?}", root.glob_ambiguities());
-        let still = *map.module(&db, map.root).children(&db).get(&Name::new_root("still")).expect("`still`");
-        let ambiguous = map.module(&db, still).scope(&db).glob_ambiguities().iter().filter(|it| it.name == x).count();
+        assert_eq!(
+            settled,
+            0,
+            "the root's `X` is `c::X`, no longer ambiguous: {:?}",
+            root.glob_ambiguities()
+        );
+        let still = *map
+            .module(&db, map.root)
+            .children(&db)
+            .get(&Name::new_root("still"))
+            .expect("`still`");
+        let ambiguous = map
+            .module(&db, still)
+            .scope(&db)
+            .glob_ambiguities()
+            .iter()
+            .filter(|it| it.name == x)
+            .count();
         assert_ne!(ambiguous, 0, "`still`'s `X` is ambiguous between its globs");
     }
 
@@ -1577,15 +1676,24 @@ fn f() {
         let block = blocks[0].to_db(&db);
         let real = crate::nameres::block_def_map(&db, block);
         let again = block_def_map_again(&db, block);
-        let diff =
-            compare(&project(&db, real, None, &Exempt::NONE), &project(&db, again, None, &Exempt::NONE));
+        let diff = compare(
+            &project(&db, real, None, &Exempt::NONE),
+            &project(&db, again, None, &Exempt::NONE),
+        );
         assert!(diff.is_empty(), "{diff}");
         let scope = again.module(&db, again.root).scope(&db);
         for name in ["inner", "Inner", "Outer", "Local"] {
             assert_ne!(scope.get(&Name::new_root(name)), PerNs::none(), "`{name}` in the block");
         }
-        assert!(!again.diagnostics(&db).is_empty(), "the unresolved import and macro are diagnosed");
-        assert_eq!(records(real.name_records(&db)), records(again.name_records(&db)), "the block's name records");
+        assert!(
+            !again.diagnostics(&db).is_empty(),
+            "the unresolved import and macro are diagnosed"
+        );
+        assert_eq!(
+            records(real.name_records(&db)),
+            records(again.name_records(&db)),
+            "the block's name records"
+        );
         assert_eq!(records(again.name_records(&db)).1[0], 1, "one unresolved import");
     }
 

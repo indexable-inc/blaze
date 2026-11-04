@@ -2,10 +2,10 @@
 
 use std::{fmt, ops::Deref};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_hashcons::{Consed, HashCons, Interned};
-use blaze_mem::Frame;
 use blaze_ids::{Domain, Hasher};
+use blaze_mem::Frame;
 use hir_def::{
     AdtId, EnumId, EnumVariantId, LocalFieldId, StructId, VariantId,
     attrs::AttrFlags,
@@ -20,11 +20,11 @@ use rustc_abi::{
     WrappingRange,
 };
 use rustc_index::{IndexSlice, IndexVec, bit_set::BitMatrix};
-use smallvec::SmallVec;
 use rustc_type_ir::{
     FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{GenericArgs as _, IntoKind},
 };
+use smallvec::SmallVec;
 
 use crate::{
     ParamEnvAndCrate,
@@ -42,8 +42,8 @@ use crate::{
 pub use self::{
     adt::layout_of_adt_query,
     bits::{
-        BitWidth, BitWidthError, BitsError, BitsField, BitsLayout, bit_width_of, bits_display_target,
-        bits_layout, bits_struct_of, is_bits_struct,
+        BitWidth, BitWidthError, BitsError, BitsField, BitsLayout, bit_width_of,
+        bits_display_target, bits_layout, bits_struct_of, is_bits_struct,
     },
     target::target_data_layout_query,
 };
@@ -125,8 +125,12 @@ impl Consed for InternedLayout {
 
 /// Every layout of the process, never freed, as `crates/intern`'s tables are: a handle stays
 /// valid in every revision and every database.
-#[expect(clippy::disallowed_types, reason = "the process's one layout interner: handles stay valid across databases and revisions")]
-static LAYOUTS: std::sync::LazyLock<HashCons<InternedLayout>> = std::sync::LazyLock::new(HashCons::new);
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one layout interner: handles stay valid across databases and revisions"
+)]
+static LAYOUTS: std::sync::LazyLock<HashCons<InternedLayout>> =
+    std::sync::LazyLock::new(HashCons::new);
 
 /// The one handle of `layout`.
 pub fn intern_layout(layout: Layout) -> Interned<'static, InternedLayout> {
@@ -143,13 +147,17 @@ pub enum LayoutError {
     /// A `#[blaze::bits]` struct that is refused: [`BitsError::message`] says why.
     Bits(Box<BitsError>),
     /// `variant`'s discriminant did not evaluate; rustc reports it (E0080) and stops.
-    DiscriminantFailed { variant: EnumVariantId },
+    DiscriminantFailed {
+        variant: EnumVariantId,
+    },
     HasErrorConst,
     HasErrorType,
     HasPlaceholder,
     InvalidSimdType,
     /// `ty`'s aliases do not normalize: rustc's `LayoutError::NormalizationFailure`.
-    NormalizationFailure { ty: StoredTy },
+    NormalizationFailure {
+        ty: StoredTy,
+    },
     NotImplemented,
     RecursiveTypeWithoutIndirection,
     /// A scalable vector in a struct, enum, tuple, array or closure: rustc lays it out at the
@@ -181,7 +189,11 @@ impl fmt::Display for LayoutError {
             LayoutError::HasPlaceholder => write!(f, "type contains placeholders"),
             LayoutError::InvalidSimdType => write!(f, "invalid simd type definition"),
             LayoutError::NormalizationFailure { ty } => {
-                write!(f, "unable to determine layout for `{:?}`: it cannot be normalized", ty.as_ref())
+                write!(
+                    f,
+                    "unable to determine layout for `{:?}`: it cannot be normalized",
+                    ty.as_ref()
+                )
             }
             LayoutError::NotImplemented => write!(f, "not implemented"),
             LayoutError::RecursiveTypeWithoutIndirection => {
@@ -365,14 +377,26 @@ struct Normalizer<'db> {
     krate: Crate,
     param_env: ParamEnv<'db>,
     cause: ObligationCause,
-    #[expect(clippy::disallowed_types, reason = "the inference context, set once per normalizer: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the inference context, set once per normalizer: not global"
+    )]
     infcx: std::cell::OnceCell<InferCtxt<'db>>,
 }
 
 impl<'db> Normalizer<'db> {
-    #[expect(clippy::disallowed_types, reason = "the inference context, set once per normalizer: not global")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the inference context, set once per normalizer: not global"
+    )]
     fn new(db: &'db Db, krate: Crate, param_env: ParamEnv<'db>) -> Self {
-        Self { db, krate, param_env, cause: ObligationCause::dummy(), infcx: std::cell::OnceCell::new() }
+        Self {
+            db,
+            krate,
+            param_env,
+            cause: ObligationCause::dummy(),
+            infcx: std::cell::OnceCell::new(),
+        }
     }
 
     fn normalize(&self, ty: Ty<'db>) -> Result<Ty<'db>, LayoutError> {
@@ -443,7 +467,9 @@ pub fn layout_of_ty_query(
     // A field's layout is a query inside its ADT's, one per level of a type as deep as the
     // program built it (`Option` 130 deep): an overflow aborts the process, so each level makes
     // sure of its stack (rule 17).
-    stdx::ensure_sufficient_stack(|| blaze_mem::frame::current(|frame| layout_of_ty_in(db, ty, trait_env, frame)))
+    stdx::ensure_sufficient_stack(|| {
+        blaze_mem::frame::current(|frame| layout_of_ty_in(db, ty, trait_env, frame))
+    })
 }
 
 /// The crate's empty environment when `ty` has no parameter, inference variable or placeholder
@@ -649,7 +675,9 @@ fn layout_of_ty_in(
             let body = db
                 .monomorphized_mir(owner, runtime, parent_args.store(), trait_env.clone()) // clone: two `u32` handles
                 // alloc: an error's text, kept in the layout query's memo
-                .map_err(|error| LayoutError::CoroutineBody(format!("{error:?}").into_boxed_str()))?;
+                .map_err(|error| {
+                    LayoutError::CoroutineBody(format!("{error:?}").into_boxed_str())
+                })?;
             let held = body.held_locals_in(frame);
             let upvar_tys = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty());
             let mut upvars = Vec::with_capacity_in(upvar_tys.len(), frame);
@@ -941,7 +969,9 @@ pub fn dyn_tail_place<'a, 'l, E>(
                 }
                 let fields = variant_field_ids(db, id.into());
                 let Some(&last) = fields.last() else { return Ok(None) };
-                let pack = AttrFlags::repr(db, id.into()).and_then(|it| it.pack).map(|it| it.bytes_usize());
+                let pack = AttrFlags::repr(db, id.into())
+                    .and_then(|it| it.pack)
+                    .map(|it| it.bytes_usize());
                 chain.push((at, fields.len() - 1, pack));
                 normalize(field_ty(db, id.into(), last, args))?
             }
@@ -1056,9 +1086,9 @@ mod tests {
     use std::ops::ControlFlow;
 
     use blaze_ids::rng::SplitMix64;
+    use blaze_query::db::FromId;
     use hir_def::{ConstId, TypeAliasId};
     use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
-    use blaze_query::db::FromId;
 
     use super::*;
     use crate::next_solver::{
@@ -1134,7 +1164,8 @@ mod tests {
         for case in 0..400 {
             // Up to twelve fields.
             let len = seed.index(13);
-            let mut fields: Vec<&Layout> = (0..len).map(|_| &pool[seed.index(pool.len())]).collect();
+            let mut fields: Vec<&Layout> =
+                (0..len).map(|_| &pool[seed.index(pool.len())]).collect();
             let kinds: &[StructKind] = match case % 3 {
                 // A closure: every field free to move.
                 0 => &[StructKind::AlwaysSized],

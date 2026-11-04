@@ -184,6 +184,10 @@ pub(crate) struct Frame {
     pub(crate) members_start: u32,
     /// Where the rows its verify proved on an assumption start on the pending list.
     pub(crate) pending_start: u32,
+    /// What its cycle read outside itself, over every round, while it heads one: gathered
+    /// from each run of the cycle as it ends, so the converged head's edges cover every input
+    /// the cycle's values came from ([`CycleReads`]).
+    pub(crate) cycle: CycleReads,
     /// A number no other run of this thread had: keys its tracked structs' occurrences.
     pub(crate) serial: u64,
 }
@@ -212,9 +216,36 @@ impl Frame {
             round: 1,
             members_start: 0,
             pending_start: 0,
+            cycle: CycleReads::NONE,
             serial: 0,
         }
     }
+}
+
+/// The reads a cycle made outside itself, gathered on its head's frame over its rounds: the
+/// reads themselves on [`Local::cycle_edges`] from `start` (each round's in read order, its
+/// members' at the place their reader read them), and what they carry. Reads of the cycle's
+/// own rows record no edge (`function::read_provisional`), so a converged cycle's head stores
+/// an acyclic set of edges that a verify walks like any row's (keys cover every input: a read
+/// only an early round made is in it, as a run from scratch would make it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CycleReads {
+    /// Where its reads start on [`Local::cycle_edges`].
+    pub(crate) start: u32,
+    /// Where this round's reads go, after its earlier rounds' (and, before it runs, after what
+    /// its verify was handed): what is given it from a verify this round goes above.
+    pub(crate) round: u32,
+    /// The lowest durability read, `u8::MAX` for none.
+    pub(crate) durability: u8,
+    /// A run of the cycle made an untracked read.
+    pub(crate) untracked: bool,
+    /// The summaries of the reads its runs replayed ([`Frame::summary`]).
+    pub(crate) summary: [u64; 2],
+}
+
+impl CycleReads {
+    pub(crate) const NONE: CycleReads =
+        CycleReads { start: 0, round: 0, durability: u8::MAX, untracked: false, summary: [0; 2] };
 }
 
 /// A row a verify proved unchanged assuming a verify lower on the stack (a cycle's) is too:
@@ -281,6 +312,9 @@ pub(crate) struct Local {
     pub(crate) edges: Vec<u32>,
     pub(crate) captures: Vec<Capture>,
     pub(crate) members: Vec<Member>,
+    /// The open cycles' reads outside themselves, each head's from its frame's
+    /// [`CycleReads::start`] ([`Frame::cycle`]).
+    pub(crate) cycle_edges: Vec<u32>,
     pub(crate) pending: Vec<Pending>,
     /// Where each row's entry is on the pending list, by its header's address. An entry here
     /// may be stale (its row's entry was marked or dropped since); [`Local::pending_head`]
@@ -347,11 +381,12 @@ impl Local {
     const fn empty() -> Local {
         Local {
             // Each buffer is empty and grows once per thread to its high-water mark.
-            frames: Vec::new(), // alloc: none, empty
-            edges: Vec::new(), // alloc: none, empty
-            captures: Vec::new(), // alloc: none, empty
-            members: Vec::new(), // alloc: none, empty
-            pending: Vec::new(), // alloc: none, empty
+            frames: Vec::new(),      // alloc: none, empty
+            edges: Vec::new(),       // alloc: none, empty
+            captures: Vec::new(),    // alloc: none, empty
+            members: Vec::new(),     // alloc: none, empty
+            cycle_edges: Vec::new(), // alloc: none, empty
+            pending: Vec::new(),     // alloc: none, empty
             pending_at: hashbrown::HashMap::with_hasher(FixedState),
             walk: Vec::new(), // alloc: none, empty
             bloom: [0; BLOOM],
@@ -359,8 +394,8 @@ impl Local {
             occurrences: hashbrown::HashMap::with_hasher(FixedState),
             seen: hashbrown::HashSet::with_hasher(FixedState),
             segments: Vec::new(), // alloc: none, empty
-            entries: Vec::new(), // alloc: none, empty
-            spans: Vec::new(), // alloc: none, empty
+            entries: Vec::new(),  // alloc: none, empty
+            spans: Vec::new(),    // alloc: none, empty
             walked: hashbrown::HashSet::with_hasher(FixedState),
             attached: None,
             fuel: None,
@@ -379,6 +414,7 @@ impl Local {
             && self.segments.is_empty()
             && self.captures.is_empty()
             && self.members.is_empty()
+            && self.cycle_edges.is_empty()
             && self.pending.is_empty()
             && self.walk.is_empty()
             && self.occurrences.is_empty()
@@ -412,6 +448,7 @@ impl Local {
             edges,
             captures,
             members,
+            cycle_edges,
             pending,
             pending_at,
             walk,
@@ -433,6 +470,7 @@ impl Local {
         vec(edges);
         vec(captures);
         vec(members);
+        vec(cycle_edges);
         vec(pending);
         map(pending_at);
         vec(walk);
@@ -487,10 +525,16 @@ impl Local {
     pub(crate) fn steps(&mut self, given: u64) -> Option<Steps> {
         let walls = self.walls;
         let given = match &self.steps {
-            Some(outer) if outer.walls == walls => given.min(outer.given.saturating_sub(outer.seen.len() as u64)),
+            Some(outer) if outer.walls == walls => {
+                given.min(outer.given.saturating_sub(outer.seen.len() as u64))
+            }
             _ => given,
         };
-        self.steps.replace(Steps { given, seen: hashbrown::HashSet::with_hasher(FixedState), walls })
+        self.steps.replace(Steps {
+            given,
+            seen: hashbrown::HashSet::with_hasher(FixedState),
+            walls,
+        })
     }
 
     /// Takes the task's step bound away, `outer` (what [`Local::steps`] gave back) in its place:
@@ -643,7 +687,8 @@ impl Local {
         let pending =
             self.pending.get(at as usize).filter(|it| it.header == header && it.word == word)?;
         let frame = self.frames.get(pending.head as usize)?;
-        (frame.serial == pending.head_serial && self.may_assume(pending.head)).then_some(pending.head)
+        (frame.serial == pending.head_serial && self.may_assume(pending.head))
+            .then_some(pending.head)
     }
 }
 
@@ -792,7 +837,9 @@ pub(crate) fn next_dedup(start: usize, kept: usize) -> u32 {
 /// new mark, for the caller to name the run ([`super::noted`]). A load first, so a run that
 /// sets no mark writes no shared line.
 fn most_reads(held: u64) -> Note {
-    if MOST_RUN_READS.load(Ordering::Relaxed) < held && MOST_RUN_READS.fetch_max(held, Ordering::Relaxed) < held {
+    if MOST_RUN_READS.load(Ordering::Relaxed) < held
+        && MOST_RUN_READS.fetch_max(held, Ordering::Relaxed) < held
+    {
         Note::Most(held)
     } else {
         Note::Fine
@@ -815,7 +862,13 @@ impl Local {
     /// does next, once it has let go of the stack ([`super::noted`]): [`Note::Runaway`], and
     /// the read not recorded, when that run recorded more reads than [`RUN_READS`].
     #[inline(always)]
-    pub(crate) fn read(&mut self, storage: *const Storage, node: u32, durability: u8, changed: u32) -> Note {
+    pub(crate) fn read(
+        &mut self,
+        storage: *const Storage,
+        node: u32,
+        durability: u8,
+        changed: u32,
+    ) -> Note {
         let edges_len = self.edges.len() as u32;
         let last = self.edges.last().copied();
         let Some(frame) = self.recording(storage) else { return Note::Fine };
@@ -892,6 +945,15 @@ impl Local {
         once_each(&mut self.edges, start, &mut self.seen);
     }
 
+    /// Drops the repeats of the cycle reads from `start` on, the first of each kept in read
+    /// order, and returns them: what a converged head stores as its edges, and between rounds
+    /// what keeps a head's gathering at the reads it made, not the reads times its rounds.
+    pub(crate) fn cycle_union(&mut self, start: usize) -> &[u32] {
+        let Local { cycle_edges, seen, .. } = self;
+        once_each(cycle_edges, start, seen);
+        &cycle_edges[start..]
+    }
+
     /// Drops the edges from `len` on, and the segments over them.
     pub(crate) fn truncate_edges(&mut self, len: usize) {
         self.edges.truncate(len);
@@ -910,7 +972,11 @@ impl Local {
         self.drop_segments_from(start);
         if capture != 0 && self.edges.len() > start {
             // alloc: none once warm: the segment list grows to its high-water mark once per thread
-            self.segments.push(Segment { start: start as u32, end: self.edges.len() as u32, capture });
+            self.segments.push(Segment {
+                start: start as u32,
+                end: self.edges.len() as u32,
+                capture,
+            });
         }
     }
 
@@ -966,6 +1032,8 @@ impl Local {
         frame.dedup_at = next_dedup(frame.edges_start as usize, 0);
         frame.members_start = self.members.len() as u32;
         frame.pending_start = self.pending.len() as u32;
+        let gathered = self.cycle_edges.len() as u32;
+        frame.cycle = CycleReads { start: gathered, round: gathered, ..CycleReads::NONE };
         self.serial += 1;
         frame.serial = self.serial;
         self.walls += u32::from(frame.kind == Kind::Barrier { lifted: false });
@@ -995,6 +1063,9 @@ impl Local {
         if self.frames.is_empty() {
             self.occurrences.clear();
             self.pending_at.clear();
+            // No head is left to gather for: what a frame that ended outside its cycle left
+            // goes with the stack.
+            self.cycle_edges.clear();
         }
     }
 
@@ -1021,6 +1092,8 @@ impl Local {
         frame.summary = [0; 2];
         frame.untracked = false;
         frame.head = NONE;
+        // What its verify was handed (a cycle that met it) comes before its run's reads.
+        frame.cycle.round = self.cycle_edges.len() as u32;
         let pending = frame.pending_start as usize;
         self.truncate_pending(pending);
     }
@@ -1173,6 +1246,7 @@ impl Frame {
             round: 1,
             members_start: 0,
             pending_start: 0,
+            cycle: CycleReads::NONE,
             serial: 0,
         }
     }

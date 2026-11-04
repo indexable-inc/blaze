@@ -21,7 +21,6 @@ use std::{
 
 use base_db::{ConstEvalBudget, Crate, CrateOrigin, Db, Env};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_profile::span::{Ending, MacroExpand, MacroExpanded, Name as SpanName, Outcome};
 use hir_def::{AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map};
 use hir_expand::name::Name;
@@ -37,6 +36,7 @@ use hir_ty_mir::mir::{
 };
 use intern::Symbol;
 use span::{Edition, Span};
+use std::alloc::Global;
 
 use crate::{
     guest::{Guest, Stop},
@@ -71,7 +71,10 @@ fn method(db: &Db, krate: Crate, path: &[&str], name: &str) -> Result<FunctionId
     let def_map = crate_def_map(db, krate);
     let mut module = def_map.crate_root(db);
     for part in path {
-        let child = def_map.module(db, module).children(db).get(&Name::new_symbol_root(Symbol::intern(part)));
+        let child = def_map
+            .module(db, module)
+            .children(db)
+            .get(&Name::new_symbol_root(Symbol::intern(part)));
         let Some(&child) = child else {
             // alloc: error path
             return Err(format!("its `proc_macro` has no module `{}`", path.join("::")));
@@ -263,7 +266,11 @@ impl Guest for Memory<'_, '_> {
 fn word_at(bytes: &[u8], word: usize, n: usize) -> Result<u64, Stop> {
     let Some(it) = bytes.get(n * word..(n + 1) * word) else {
         // alloc: error path
-        return Err(Stop(format!("gave {} bytes where the bridge has {} words", bytes.len(), n + 1)));
+        return Err(Stop(format!(
+            "gave {} bytes where the bridge has {} words",
+            bytes.len(),
+            n + 1
+        )));
     };
     let mut out = [0; 8];
     out[..word].copy_from_slice(it);
@@ -276,12 +283,20 @@ fn set_word(bytes: &mut [u8], word: usize, n: usize, value: u64) {
 
 /// The buffer `buffer` (its five words' bytes) made to hold `bytes` and nothing else: grown
 /// by its own `reserve` when it is too small, as the client's `extend_from_slice` grows it.
-fn fill(db: &Db, eval: &mut Evaluator<'_>, buffer: &mut Vec<u8>, word: usize, bytes: &[u8]) -> Result<(), Stop> {
+fn fill(
+    db: &Db,
+    eval: &mut Evaluator<'_>,
+    buffer: &mut Vec<u8>,
+    word: usize,
+    bytes: &[u8],
+) -> Result<(), Stop> {
     set_word(buffer, word, 1, 0);
     if (word_at(buffer, word, 2)? as usize) < bytes.len() {
         let reserve = buffer[3 * word..4 * word].to_vec(); // alloc: a growth, once per buffer too small
         let additional = (bytes.len() as u64).to_le_bytes();
-        *buffer = eval.call_pointer(&reserve, &[buffer, &additional[..word]]).map_err(|e| stop_of(db, &e))?;
+        *buffer = eval
+            .call_pointer(&reserve, &[buffer, &additional[..word]])
+            .map_err(|e| stop_of(db, &e))?;
     }
     let data = word_at(buffer, word, 0)?;
     if !bytes.is_empty() {
@@ -293,7 +308,12 @@ fn fill(db: &Db, eval: &mut Evaluator<'_>, buffer: &mut Vec<u8>, word: usize, by
 
 impl<'r, 'e> Host<'r, 'e> {
     /// `Closure::call(&mut self, buffer)`: the request in the buffer answered in it.
-    fn dispatch(&self, eval: &mut Evaluator<'_>, args: &[&[u8]], ret: &mut [u8]) -> Result<(), Stop> {
+    fn dispatch(
+        &self,
+        eval: &mut Evaluator<'_>,
+        args: &[&[u8]],
+        ret: &mut [u8],
+    ) -> Result<(), Stop> {
         let Some(buffer) = args.get(1) else {
             return Err(Stop("called the bridge's dispatch without its buffer".to_owned())); // alloc: error path
         };
@@ -304,7 +324,8 @@ impl<'r, 'e> Host<'r, 'e> {
             let state = &mut *state;
             let word = state.word;
             let (data, len) = (word_at(buffer, word, 0)?, word_at(buffer, word, 1)?);
-            let len = usize::try_from(len).map_err(|_| Stop("sent a request longer than memory".to_owned()))?; // alloc: error path
+            let len = usize::try_from(len)
+                .map_err(|_| Stop("sent a request longer than memory".to_owned()))?; // alloc: error path
             let request = eval.read_bytes(data, len).map_err(|e| stop_of(self.db, &e))?;
             let mut reply = std::mem::take(&mut state.reply);
             let answered = state.server.dispatch(self.db, request, &mut reply);
@@ -317,7 +338,11 @@ impl<'r, 'e> Host<'r, 'e> {
         filled?;
         if ret.len() != buffer.len() {
             // alloc: error path
-            return Err(Stop(format!("returns a buffer of {} bytes, not the bridge's {}", ret.len(), buffer.len())));
+            return Err(Stop(format!(
+                "returns a buffer of {} bytes, not the bridge's {}",
+                ret.len(),
+                buffer.len()
+            )));
         }
         ret.copy_from_slice(&buffer);
         Ok(())
@@ -353,7 +378,10 @@ impl<'db, 'r: 'db, 'e: 'db> Foreign<'db> for Host<'r, 'e> {
             self.next = now + PROGRESS;
             let secs = now.duration_since(self.started).as_secs();
             let steps = eval.steps_spent();
-            eprintln!("blaze serve: {} has run {secs} s on the evaluator, {steps} steps into its expansion", self.what);
+            eprintln!(
+                "blaze serve: {} has run {secs} s on the evaluator, {steps} steps into its expansion",
+                self.what
+            );
         }
         let result = if func == self.closure_call {
             self.dispatch(eval, args, ret).map(|()| Claimed::Answered)
@@ -361,10 +389,13 @@ impl<'db, 'r: 'db, 'e: 'db> Foreign<'db> for Host<'r, 'e> {
             let mut state = self.state.borrow_mut();
             let state = &mut *state;
             match state.shims.get(&func) {
-                Some(&shim) => state.os.call(shim, &mut Memory { db: self.db, eval }, args, ret).map(|answer| match answer {
-                    Answer::Answered => Claimed::Answered,
-                    Answer::Evaluator => Claimed::Declined,
-                }),
+                Some(&shim) => state
+                    .os
+                    .call(shim, &mut Memory { db: self.db, eval }, args, ret)
+                    .map(|answer| match answer {
+                        Answer::Answered => Claimed::Answered,
+                        Answer::Evaluator => Claimed::Declined,
+                    }),
                 None => Err(Stop("called a claimed function that has no shim".to_owned())), // alloc: error path
             }
         };
@@ -481,14 +512,24 @@ fn on_evaluator<'db>(
         eval.preset_static(*id, bytes);
     }
     let started = Instant::now();
-    let host = Host { db, closure_call: bridge.closure_call, state, what, started, next: started + PROGRESS };
+    let host = Host {
+        db,
+        closure_call: bridge.closure_call,
+        state,
+        what,
+        started,
+        next: started + PROGRESS,
+    };
     eval.set_foreign(Some(Box::new(host))); // alloc: once per run, the evaluator's embedder
     let interner = DbInterner::new_with(db, krate);
-    let call_args = GenericArgs::for_item(interner, SolverDefId::FunctionId(bridge.closure_call), |_, _, _, _| {
-        GenericArg::from(Region::new_erased(interner))
-    });
+    let call_args = GenericArgs::for_item(
+        interner,
+        SolverDefId::FunctionId(bridge.closure_call),
+        |_, _, _, _| GenericArg::from(Region::new_erased(interner)),
+    );
     let dispatch = eval.fn_pointer(bridge.closure_call, call_args)?;
-    let ran = expand_all(db, bridge, state, &mut eval, interner, &dispatch, budget, expansions, spent);
+    let ran =
+        expand_all(db, bridge, state, &mut eval, interner, &dispatch, budget, expansions, spent);
     spent.steps += eval.steps_spent();
     spent.peak_bytes = eval.memory_peak();
     ran
@@ -514,7 +555,8 @@ fn expand_all<'db>(
     let mut config = Vec::new(); // alloc: once per run, as above
     for (at, expansion) in expansions.iter().enumerate() {
         if at > 0 {
-            state.borrow_mut().server = Server::new(expansion.sites, expansion.edition, expansion.forced_keywords);
+            state.borrow_mut().server =
+                Server::new(expansion.sites, expansion.edition, expansion.forced_keywords);
             spent.steps += eval.steps_spent();
             eval.set_budget(budget);
         }
@@ -525,7 +567,9 @@ fn expand_all<'db>(
             GenericArgs::default(),
         );
         let expand_args =
-            GenericArgs::for_item(interner, SolverDefId::FunctionId(expand), |_, _, _, _| GenericArg::from(macro_fn));
+            GenericArgs::for_item(interner, SolverDefId::FunctionId(expand), |_, _, _, _| {
+                GenericArg::from(macro_fn)
+            });
         // `f`, the macro's function item, has no bytes.
         let client = eval.call(expand, expand_args, &[&[]])?;
         let mut buffer = eval.call(bridge.buffer_new, GenericArgs::default(), &[])?;
@@ -581,7 +625,10 @@ fn expand_all<'db>(
 
 /// The macro functions of `krate`, a proc-macro crate, by the name each is invoked by: what
 /// `__blaze_proc_macros` lists, made from the crate's def map as that list is.
-pub(crate) fn functions(db: &Db, krate: Crate) -> Vec<(Symbol, hir_expand::proc_macro::ProcMacroKind, FunctionId)> {
+pub(crate) fn functions(
+    db: &Db,
+    krate: Crate,
+) -> Vec<(Symbol, hir_expand::proc_macro::ProcMacroKind, FunctionId)> {
     let def_map = crate_def_map(db, krate);
     // alloc: once a proc-macro crate, its list
     let mut out = Vec::new();
@@ -591,7 +638,8 @@ pub(crate) fn functions(db: &Db, krate: Crate) -> Vec<(Symbol, hir_expand::proc_
         let kind = hir_def::Lookup::lookup(&id, db).kind;
         let name = match kind {
             hir_expand::proc_macro::ProcMacroKind::CustomDerive => {
-                match hir_def::attrs::AttrFlags::derive_info(db, hir_def::MacroId::ProcMacroId(id)) {
+                match hir_def::attrs::AttrFlags::derive_info(db, hir_def::MacroId::ProcMacroId(id))
+                {
                     Some(info) => info.trait_name.clone(), // clone: a symbol, once a macro
                     None => continue,
                 }

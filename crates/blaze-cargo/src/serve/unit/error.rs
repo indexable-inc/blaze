@@ -53,14 +53,20 @@ impl fmt::Display for UnitError {
                 write!(f, "the manifest of `{package}`, `{path}`, is in no directory")
             }
             UnitError::ScriptProgram { unit } => {
-                write!(f, "the build script compiled by unit {unit} has no output: its program has no path")
+                write!(
+                    f,
+                    "the build script compiled by unit {unit} has no output: its program has no path"
+                )
             }
             UnitError::ProfileDir { package, out_dir } => write!(
                 f,
                 "the OUT_DIR of `{package}`'s build script, `{out_dir}`, is under no `<profile>/build` directory"
             ),
             UnitError::NoVariable { package, name } => {
-                write!(f, "the run of `{package}`'s build script is planned with no `{name}`, which cargo always sets")
+                write!(
+                    f,
+                    "the run of `{package}`'s build script is planned with no `{name}`, which cargo always sets"
+                )
             }
             UnitError::Parallelism { package, error } => write!(
                 f,
@@ -69,17 +75,27 @@ impl fmt::Display for UnitError {
             UnitError::NoCrate { unit } => {
                 write!(f, "the front end has no crate for the build script compiled by unit {unit}")
             }
-            UnitError::NoExecutable { target } => write!(f, "the program `{target}` `cargo run` picked has no executable"),
+            UnitError::NoExecutable { target } => {
+                write!(f, "the program `{target}` `cargo run` picked has no executable")
+            }
             UnitError::NoTestExecutable { target } => {
                 write!(f, "the test unit of `{target}` compiled no executable: its tests can't run")
             }
             UnitError::TestDir { dir, why } => {
-                write!(f, "the test run's directory {dir} is no name blaze's driver can give a file: {why}")
+                write!(
+                    f,
+                    "the test run's directory {dir} is no name blaze's driver can give a file: {why}"
+                )
             }
             UnitError::NoSelector { binary } => {
-                write!(f, "the test binary `{binary}` gave its selector back before its tests were chosen")
+                write!(
+                    f,
+                    "the test binary `{binary}` gave its selector back before its tests were chosen"
+                )
             }
-            UnitError::RunEnded { how } => write!(f, "the program `cargo run` started ended as {how}"),
+            UnitError::RunEnded { how } => {
+                write!(f, "the program `cargo run` started ended as {how}")
+            }
         }
     }
 }
@@ -98,5 +114,8 @@ pub(crate) fn manifest_dir(package: &str, path: &str) -> Result<std::path::PathB
         .parent()
         .filter(|it| !it.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
-        .ok_or_else(|| UnitError::ManifestDir { package: package.to_owned(), path: path.to_owned() }) // alloc: error path
+        .ok_or_else(|| UnitError::ManifestDir {
+            package: package.to_owned(),
+            path: path.to_owned(),
+        }) // alloc: error path
 }

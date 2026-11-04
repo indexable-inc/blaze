@@ -1,7 +1,6 @@
 //! rustc's `find_fallback_pattern_typo`: a catch-all binding that makes a later pattern
 //! unreachable may have been meant as a constant, mistyped or not in scope.
 
-use hir_ty::db::HirDatabase;
 use hir_def::{
     AssocItemId, ConstId, HasModule, ModuleDefId, ModuleIdLt,
     expr_store::Body,
@@ -11,6 +10,7 @@ use hir_def::{
     signatures::ConstSignature,
 };
 use hir_expand::name::Name;
+use hir_ty::db::HirDatabase;
 use hir_ty::{InferenceResult, ValueTyDefId, next_solver::Ty};
 use stdx::edit_distance::find_best_match_for_name_by;
 
@@ -45,7 +45,9 @@ pub(crate) fn find_fallback_pattern_typo<'db>(
             const_path: found.accessible_path[i].clone(), // clone: one path, into the lint.
         });
     }
-    if let Some(typo) = find_best_match_for_name_by(&found.accessible, Name::as_str, name.as_str(), None) {
+    if let Some(typo) =
+        find_best_match_for_name_by(&found.accessible, Name::as_str, name.as_str(), None)
+    {
         return Some(PatternTypo::WantedConstant {
             is_typo: true,
             const_name: typo.as_str().into(),
@@ -55,7 +57,9 @@ pub(crate) fn find_fallback_pattern_typo<'db>(
     if let Some(i) = found.imported.iter().position(|c| c == name) {
         return Some(PatternTypo::AccessibleConstant(found.imported_at[i]));
     }
-    if let Some(typo) = find_best_match_for_name_by(&found.imported, Name::as_str, name.as_str(), None) {
+    if let Some(typo) =
+        find_best_match_for_name_by(&found.imported, Name::as_str, name.as_str(), None)
+    {
         return Some(PatternTypo::WantedConstant {
             is_typo: true,
             const_name: typo.as_str().into(),

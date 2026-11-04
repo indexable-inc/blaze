@@ -73,8 +73,8 @@ pub(super) fn finding<'db>(
     let costly = copy_like(k, ty, 0).err()?;
     let shown = |ty: &hir::Type<'db>| ty.display(k.db, k.target).to_string();
     let message = format!("this `clone` of `{}` {}", shown(ty), costly.why.says());
-    let note = (costly.ty != *ty)
-        .then(|| format!("`{}` in it {}", shown(&costly.ty), costly.why.says()));
+    let note =
+        (costly.ty != *ty).then(|| format!("`{}` in it {}", shown(&costly.ty), costly.why.says()));
     Some((message, note))
 }
 

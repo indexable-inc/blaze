@@ -22,8 +22,8 @@ pub mod const_check;
 mod ctfe_limit;
 pub mod dispatch;
 mod eval;
-pub mod home;
 mod framed;
+pub mod home;
 pub mod location;
 mod lower;
 mod monomorphization;
@@ -59,11 +59,10 @@ pub fn answered_by_codegen(db: &base_db::Db, func: hir_def::FunctionId) -> bool 
 
 // The memos of what this crate computes are hir-ty's; `providers` registers the code.
 pub use hir_ty::providers::{
-    mir_body_for_closure_query, mir_body_for_coroutine_by_move_query,
-    mir_body_for_coroutine_query, mir_body_query,
-    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
-    monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,
-    monomorphized_optimized_mir_body_for_closure_query,
+    mir_body_for_closure_query, mir_body_for_coroutine_by_move_query, mir_body_for_coroutine_query,
+    mir_body_query, monomorphized_mir_body_for_closure_query,
+    monomorphized_mir_body_for_coroutine_by_move_query, monomorphized_mir_body_for_coroutine_query,
+    monomorphized_mir_body_query, monomorphized_optimized_mir_body_for_closure_query,
     monomorphized_optimized_mir_body_for_coroutine_by_move_query,
     monomorphized_optimized_mir_body_for_coroutine_query, monomorphized_optimized_mir_body_query,
     monomorphized_runtime_mir_body_for_closure_query,
@@ -79,11 +78,11 @@ pub use lower::{
     EarlyDrop, has_failed_expansion, inline_const_at, lower_body_to_mir, lower_to_mir_with_store,
     lower_with_early_drops, promoted_mir_body_query,
 };
-pub use monomorphization::monomorphized;
-pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
-pub use monomorphization::monomorphized_promoted_mir_body_query;
 pub use monomorphization::erase_and_anonymize_regions;
+pub use monomorphization::monomorphized;
+pub use monomorphization::monomorphized_promoted_mir_body_query;
 pub use monomorphization::normalize_or_keep;
+pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
 pub use optimize::{
     BOX_IN_PLACE_MIN, CallerLocation, CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, caller_location,
     heap_held, owner_of, passes_not_ported, set_interpreter_mir_opt_level, source_span,
@@ -119,7 +118,10 @@ pub fn local_span(
         }
     }
     if let Some((binding, _)) = body.binding_locals.iter().find(|&(_, &it)| it == local) {
-        let (_, map) = hir_def::expr_store::ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
+        let (_, map) = hir_def::expr_store::ExpressionStore::with_source_map(
+            db,
+            owner.expression_store_owner(db),
+        );
         return match map.patterns_for_binding(binding).first() {
             Some(&pat) => MirSpan::PatId(pat),
             None => MirSpan::BindingId(binding),

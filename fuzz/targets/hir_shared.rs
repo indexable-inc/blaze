@@ -78,7 +78,9 @@ fn arbitrary<T: Persist + PartialEq>(bytes: &[u8], decode: fn(&[u8]) -> Result<T
     let written = blaze_format::to_bytes(&value);
     let again = match read(&written, decode) {
         Ok(again) => again,
-        Err(error) => panic!("fixpoint: a decoded value is written as a buffer its reader refuses: {error}"),
+        Err(error) => {
+            panic!("fixpoint: a decoded value is written as a buffer its reader refuses: {error}")
+        }
     };
     assert!(again == value, "fixpoint: a decoded value, written and read again, is another value");
     assert!(
@@ -92,7 +94,11 @@ fn editable(valid: &[Valid]) -> impl Iterator<Item = &Valid> {
     valid.iter().filter(|it| !it.columns.is_empty())
 }
 
-fn edited<T: Persist + PartialEq>(rest: &[u8], valid: &[Valid], decode: fn(&[u8]) -> Result<T, FormatError>) {
+fn edited<T: Persist + PartialEq>(
+    rest: &[u8],
+    valid: &[Valid],
+    decode: fn(&[u8]) -> Result<T, FormatError>,
+) {
     let Some((&pick, edits)) = rest.split_first() else { return };
     let count = editable(valid).count();
     let Some(seed) = editable(valid).nth(usize::from(pick) % count.max(1)) else { return };

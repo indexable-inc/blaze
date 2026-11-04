@@ -135,23 +135,10 @@ enum Cmd {
 
 #[derive(Debug)]
 enum Token {
-    Text {
-        content: String,
-        width: usize,
-    },
-    Breakable {
-        sep: String,
-        width: usize,
-        indent: isize,
-        group: usize,
-    },
-    IfBreak {
-        content: String,
-        group: usize,
-    },
-    Comment {
-        content: String,
-    },
+    Text { content: String, width: usize },
+    Breakable { sep: String, width: usize, indent: isize, group: usize },
+    IfBreak { content: String, group: usize },
+    Comment { content: String },
 }
 
 impl Token {
@@ -323,24 +310,13 @@ impl Printer {
         indent: usize,
         open: &str,
     ) -> Result<(), PrinterError> {
-        self.dispatch(
-            target,
-            Cmd::BeginGroup {
-                indent,
-                open: open.to_string(),
-            },
-        )
+        self.dispatch(target, Cmd::BeginGroup { indent, open: open.to_string() })
     }
 
     /// Close the innermost group: undo the indentation its `begin_group`
     /// added, then emit `close`.
     pub fn end_group(&mut self, target: Target, close: &str) -> Result<(), PrinterError> {
-        self.dispatch(
-            target,
-            Cmd::EndGroup {
-                close: close.to_string(),
-            },
-        )
+        self.dispatch(target, Cmd::EndGroup { close: close.to_string() })
     }
 
     /// Adjust the indentation applied by subsequent break points by `delta`.
@@ -429,12 +405,7 @@ impl Printer {
             Cmd::HardBreak => true,
             Cmd::Splice(SlotId(id)) => {
                 let slot = &self.slots[*id];
-                match slot
-                    .commands
-                    .iter()
-                    .rev()
-                    .find(|cmd| !matches!(cmd, Cmd::ShiftIndent(_)))
-                {
+                match slot.commands.iter().rev().find(|cmd| !matches!(cmd, Cmd::ShiftIndent(_))) {
                     Some(cmd) => self.ends_line(cmd),
                     None => slot.starts_line,
                 }
@@ -879,10 +850,7 @@ impl<'a> Renderer<'a> {
                     content.push_str(s);
                     *w += width;
                 }
-                _ => self.buffer.push_back(Token::Text {
-                    content: s.to_string(),
-                    width,
-                }),
+                _ => self.buffer.push_back(Token::Text { content: s.to_string(), width }),
             }
             self.buffer_width += width;
             self.break_outer_groups();
@@ -912,10 +880,7 @@ impl<'a> Renderer<'a> {
         if self.groups[group].want_break {
             self.text(s);
         } else {
-            self.buffer.push_back(Token::IfBreak {
-                content: s.to_string(),
-                group,
-            });
+            self.buffer.push_back(Token::IfBreak { content: s.to_string(), group });
         }
     }
 
@@ -923,9 +888,7 @@ impl<'a> Renderer<'a> {
         if self.buffer.is_empty() {
             self.pending_comments.push_str(s);
         } else {
-            self.buffer.push_back(Token::Comment {
-                content: s.to_string(),
-            });
+            self.buffer.push_back(Token::Comment { content: s.to_string() });
         }
     }
 
@@ -946,13 +909,7 @@ impl<'a> Renderer<'a> {
         let depth = self.groups[*self.group_stack.last().unwrap()].depth + 1;
         let id = self.groups.len();
         let comment = self.force_break[id];
-        self.groups.push(Group {
-            depth,
-            indent,
-            pending: 0,
-            want_break: comment,
-            comment,
-        });
+        self.groups.push(Group { depth, indent, pending: 0, want_break: comment, comment });
         self.group_stack.push(id);
         if self.group_queue.len() <= depth {
             self.group_queue.resize_with(depth + 1, Vec::new);
@@ -1017,10 +974,7 @@ impl<'a> Renderer<'a> {
 
     fn deq(&mut self) -> Option<usize> {
         for level in self.group_queue.iter_mut() {
-            if let Some(pos) = level
-                .iter()
-                .position(|&group| self.groups[group].pending > 0)
-            {
+            if let Some(pos) = level.iter().position(|&group| self.groups[group].pending > 0) {
                 let id = level.remove(pos);
                 self.groups[id].want_break = true;
                 return Some(id);
@@ -1045,12 +999,7 @@ impl<'a> Renderer<'a> {
             Token::Comment { content } => {
                 self.pending_comments.push_str(&content);
             }
-            Token::Breakable {
-                sep,
-                width,
-                indent,
-                group,
-            } => {
+            Token::Breakable { sep, width, indent, group } => {
                 self.groups[group].pending -= 1;
                 if self.groups[group].want_break {
                     self.start_line(indent);

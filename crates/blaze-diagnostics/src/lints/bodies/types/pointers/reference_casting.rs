@@ -9,7 +9,6 @@
 //! (`InvalidReferenceCastingDiag`) (MIT or Apache-2.0).
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_def::{
     AdtId, HasModule, VariantId,
     hir::{BinaryOp, BindingId, Expr, ExprId, Pat, UnaryOp},
@@ -23,6 +22,7 @@ use rustc_type_ir::{
     Interner as _, Mutability,
     inherent::{AdtDef as _, IntoKind as _},
 };
+use std::alloc::Global;
 
 use super::{Inits, LayoutFacts, callee_item, expr_or_init, layout, peel_casts, span, type_info};
 use crate::{
@@ -32,7 +32,8 @@ use crate::{
 };
 
 const LINT: &str = "invalid_reference_casting";
-const NOTE: &str = "for more information, visit <https://doc.rust-lang.org/book/ch15-05-interior-mutability.html>";
+const NOTE: &str =
+    "for more information, visit <https://doc.rust-lang.org/book/ch15-05-interior-mutability.html>";
 
 #[derive(Default)]
 pub(crate) struct InvalidReferenceCasting {
@@ -65,7 +66,9 @@ impl LatePass for InvalidReferenceCasting {
             && is_invalid_cast_from_ref_to_mut_ptr(b, init, &mut peel)
         {
             let message = match pat {
-                PatternKind::Assign => "assigning to `&T` is undefined behavior, consider using an `UnsafeCell`",
+                PatternKind::Assign => {
+                    "assigning to `&T` is undefined behavior, consider using an `UnsafeCell`"
+                }
                 PatternKind::Borrow { .. } => {
                     "casting `&T` to `&mut T` is undefined behavior, even if the reference is unused, consider instead using an `UnsafeCell`"
                 }
@@ -109,14 +112,17 @@ fn borrow_or_assign(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<(ExprId, Pat
         _ => None,
     };
     let place = match store.expr(expr) {
-        Expr::Ref { expr: place, mutability, .. } => {
-            Some((place, PatternKind::Borrow { mutable: mutability == hir_def::hir::type_ref::Mutability::Mut }))
-        }
+        Expr::Ref { expr: place, mutability, .. } => Some((
+            place,
+            PatternKind::Borrow { mutable: mutability == hir_def::hir::type_ref::Mutability::Mut },
+        )),
         Expr::Assignment { target, .. } => match store.pat(target) {
             Pat::Expr(place) => Some((place, PatternKind::Assign)),
             _ => None,
         },
-        Expr::BinaryOp { lhs, op: Some(BinaryOp::Assignment { op: Some(_) }), .. } => Some((lhs, PatternKind::Assign)),
+        Expr::BinaryOp { lhs, op: Some(BinaryOp::Assignment { op: Some(_) }), .. } => {
+            Some((lhs, PatternKind::Assign))
+        }
         _ => None,
     };
     if let Some((place, pat)) = place {
@@ -130,13 +136,19 @@ fn borrow_or_assign(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<(ExprId, Pat
         .then_some((*pointer, PatternKind::Assign))
 }
 
-fn is_invalid_cast_from_ref_to_mut_ptr(b: &BodyCx<'_, '_, '_>, orig: ExprId, peel: &mut impl FnMut() -> ExprId) -> bool {
+fn is_invalid_cast_from_ref_to_mut_ptr(
+    b: &BodyCx<'_, '_, '_>,
+    orig: ExprId,
+    peel: &mut impl FnMut() -> ExprId,
+) -> bool {
     if !matches!(util::ty(b, orig).kind(), TyKind::RawPtr(_, Mutability::Mut)) {
         return false;
     }
     let e = peel();
     match util::ty(b, e).kind() {
-        TyKind::Ref(_, inner, Mutability::Not) => !(has_concrete_skeleton(inner) && is_ty_fully_unsafe_celled(b, inner)),
+        TyKind::Ref(_, inner, Mutability::Not) => {
+            !(has_concrete_skeleton(inner) && is_ty_fully_unsafe_celled(b, inner))
+        }
         _ => false,
     }
 }
@@ -201,7 +213,12 @@ fn is_ty_fully_unsafe_celled<'db>(b: &BodyCx<'_, '_, 'db>, ty: Ty<'db>) -> bool 
     fully_unsafe_celled(b, interner, ty, 0)
 }
 
-fn fully_unsafe_celled<'db>(b: &BodyCx<'_, '_, 'db>, interner: DbInterner<'db>, ty: Ty<'db>, depth: usize) -> bool {
+fn fully_unsafe_celled<'db>(
+    b: &BodyCx<'_, '_, 'db>,
+    interner: DbInterner<'db>,
+    ty: Ty<'db>,
+    depth: usize,
+) -> bool {
     if depth >= interner.recursion_limit() {
         return false;
     }
@@ -222,10 +239,15 @@ fn fully_unsafe_celled<'db>(b: &BodyCx<'_, '_, 'db>, interner: DbInterner<'db>, 
                 AdtId::StructId(it) => it.into(),
                 AdtId::UnionId(it) => it.into(),
             };
-            b.db().field_types(variant).iter().all(|(_, field)| inner(field.ty().instantiate(interner, args).skip_norm_wip()))
+            b.db()
+                .field_types(variant)
+                .iter()
+                .all(|(_, field)| inner(field.ty().instantiate(interner, args).skip_norm_wip()))
         }
         TyKind::Tuple(fields) => fields.iter().all(inner),
-        TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => inner(element),
+        TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+            inner(element)
+        }
         _ => false,
     }
 }

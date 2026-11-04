@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::rng::SplitMix64;
+use std::alloc::Global;
 
 use super::*;
 use crate::unit::{ConfigEnv, Dependency, DylibSearch, Package, Profile, Target, Tools};
@@ -313,7 +313,8 @@ fn set_from_the_unit_or_passed_through() {
 
     let passed: Vec<_> = env.passed_through().map(|(name, _)| name.to_str().unwrap()).collect();
     assert_eq!(passed, ["CC", "HOME", "PATH"]);
-    let set: BTreeMap<_, _> = env.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
+    let set: BTreeMap<_, _> =
+        env.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
     let mut whole = set.clone();
     whole.extend(env.passed_through().map(|(n, v)| (n.to_owned(), v.to_owned())));
     assert_eq!(
@@ -340,7 +341,8 @@ fn set_from_the_unit_or_passed_through() {
         it.remove(OsStr::new("LD_LIBRARY_PATH"));
         it
     }
-    let set: BTreeMap<&OsStr, &OsStr> = set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
+    let set: BTreeMap<&OsStr, &OsStr> =
+        set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
     let other_set: BTreeMap<&OsStr, &OsStr> =
         other_set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
     assert_eq!(without_dylib(&set), without_dylib(&other_set));
@@ -474,7 +476,8 @@ fn a_value_missing_is_an_error() {
     }
     let mut unit = bar();
     unit.target_cfgs.push("target_os=linux".into());
-    let want = crate::unit::Unfilled::Cfg { package: "bar v0.5.0".into(), line: "target_os=linux".into() };
+    let want =
+        crate::unit::Unfilled::Cfg { package: "bar v0.5.0".into(), line: "target_os=linux".into() };
     assert_eq!(refused(&unit), Error::from(want));
 }
 
@@ -577,8 +580,10 @@ fn the_sorted_environment_is_the_one_built_before() {
     for _ in 0..4_000 {
         let mut unit = bar();
         unit.host = hosts[rng.index(hosts.len())].into();
-        unit.features = (0..rng.index(4)).map(|_| features[rng.index(features.len())].to_owned()).collect();
-        unit.target_cfgs = (0..rng.index(14)).map(|_| cfgs[rng.index(cfgs.len())].to_owned()).collect();
+        unit.features =
+            (0..rng.index(4)).map(|_| features[rng.index(features.len())].to_owned()).collect();
+        unit.target_cfgs =
+            (0..rng.index(14)).map(|_| cfgs[rng.index(cfgs.len())].to_owned()).collect();
         unit.profile.debug_assertions = rng.index(2) == 0;
         unit.profile.debuginfo = rng.index(2) == 0;
         unit.profile.release = rng.index(2) == 0;
@@ -665,7 +670,6 @@ fn names_and_numbers_are_made_as_format_made_them() {
         assert_eq!(decimal(n), n.to_string());
     }
 }
-
 
 /// Reading a script's environment allocates nothing, for a name it has or not.
 #[test]

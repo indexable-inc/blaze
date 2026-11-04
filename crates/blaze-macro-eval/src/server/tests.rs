@@ -79,7 +79,10 @@ fn trees_given_become_a_stream_with_rustcs_spacing_and_come_back_as_given() {
     let handle = handle_of(&reply);
     let trees = server.stream(handle).unwrap().trees();
     assert_eq!(trees.len(), 3);
-    assert!(matches!(&trees[0], Tree::Ident { kind: IdentKind::Normal, spacing: Spacing::Alone, .. }));
+    assert!(matches!(
+        &trees[0],
+        Tree::Ident { kind: IdentKind::Normal, spacing: Spacing::Alone, .. }
+    ));
     assert!(matches!(&trees[1], Tree::Punct { ch: b'+', spacing: Spacing::Joint, .. }));
     assert!(matches!(&trees[2], Tree::Punct { ch: b'=', spacing: Spacing::Alone, .. }));
 
@@ -194,9 +197,7 @@ fn streams_are_cloned_by_handle_dropped_once_and_concatenated_in_order() {
     let db = Db::new();
     let mut server = server(&db);
     let mut reply = Vec::new();
-    let one = |name: &str| {
-        request(Method::TsFromTokenTree, |w| ident_tree(w, name, 2))
-    };
+    let one = |name: &str| request(Method::TsFromTokenTree, |w| ident_tree(w, name, 2));
     server.dispatch(&db, &one("a"), &mut reply).unwrap();
     let a = handle_of(&reply);
     server.dispatch(&db, &one("b"), &mut reply).unwrap();
@@ -227,7 +228,9 @@ fn streams_are_cloned_by_handle_dropped_once_and_concatenated_in_order() {
     server.dispatch(&db, &request(Method::TsDrop, |w| w.handle(all)), &mut reply).unwrap();
     assert!(server.dispatch(&db, &request(Method::TsDrop, |w| w.handle(all)), &mut reply).is_err());
     // `a` went into the concatenation.
-    assert!(server.dispatch(&db, &request(Method::TsIsEmpty, |w| w.handle(a)), &mut reply).is_err());
+    assert!(
+        server.dispatch(&db, &request(Method::TsIsEmpty, |w| w.handle(a)), &mut reply).is_err()
+    );
 }
 
 #[test]
@@ -255,7 +258,9 @@ fn spans_are_interned_and_answered_without_the_database_where_they_can_be() {
     let mut r = Reader::new(&reply);
     assert!(r.some().unwrap());
     let id = r.usize().unwrap();
-    server.dispatch(&db, &request(Method::SpanRecoverProcMacroSpan, |w| w.usize(id)), &mut reply).unwrap();
+    server
+        .dispatch(&db, &request(Method::SpanRecoverProcMacroSpan, |w| w.usize(id)), &mut reply)
+        .unwrap();
     assert_eq!(handle_of(&reply), handle);
     assert!(!server.asked);
 }
@@ -294,7 +299,9 @@ fn a_request_the_bridge_never_sends_stops_the_expansion() {
         w.u8(0);
     });
     assert!(server.dispatch(&db, &extra, &mut reply).is_err());
-    assert!(server.dispatch(&db, &request(Method::SpanStart, |w| w.handle(99)), &mut reply).is_err());
+    assert!(
+        server.dispatch(&db, &request(Method::SpanStart, |w| w.handle(99)), &mut reply).is_err()
+    );
 }
 
 #[test]

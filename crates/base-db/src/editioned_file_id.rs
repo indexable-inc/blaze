@@ -3,10 +3,10 @@
 
 use std::{hash::Hash, sync::Arc};
 
+use crate::FileId;
 use blaze_ids::ContentId;
 use span::Edition;
 use syntax::{SyntaxError, ast};
-use crate::FileId;
 
 use crate::{Db, trees::Trees};
 
@@ -26,7 +26,9 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     let span = tracing::info_span!("parse_query", function = tracing::field::Empty);
     if !span.is_disabled() {
         // alloc: only while a subscriber records the span, which interns it
-        let path = db.path_for_file(file_id).map_or_else(|| format!("{{file {}}}", file_id.index()), |it| it.to_string());
+        let path = db
+            .path_for_file(file_id)
+            .map_or_else(|| format!("{{file {}}}", file_id.index()), |it| it.to_string());
         span.record("function", path.as_str());
     }
     let _p = span.entered();
@@ -36,7 +38,9 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     parse.unwrap_or_else(|error| {
         let root = db.source_root(db.file_source_root(file_id).source_root_id(db));
         let path = root.source_root_ref(db).path_for_file(&file_id).cloned();
-        panic!("{error}, read for {file_id:?} at {path:?}: delete the daemon's image to store it again")
+        panic!(
+            "{error}, read for {file_id:?} at {path:?}: delete the daemon's image to store it again"
+        )
     })
 }
 

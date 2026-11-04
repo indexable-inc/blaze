@@ -76,10 +76,9 @@ pub struct Workspace<'a> {
 /// A percent of `key`, `text` its TOML number (`1`, `0.5`, `1e-4`), in parts per billion; an
 /// error naming the key and `named_in` for anything but a number from 0 to 100.
 pub fn percent_ppb(text: &str, key: &str, named_in: &str) -> Result<u64, String> {
-    let percent: f64 = text
-        .trim()
-        .parse()
-        .map_err(|_| format!("`{key}` in {named_in} is `{text}`, not a percent (a number from 0 to 100)"))?;
+    let percent: f64 = text.trim().parse().map_err(|_| {
+        format!("`{key}` in {named_in} is `{text}`, not a percent (a number from 0 to 100)")
+    })?;
     if !(0.0..=100.0).contains(&percent) {
         return Err(format!("`{key}` in {named_in} is {percent}, not a percent from 0 to 100"));
     }
@@ -112,7 +111,10 @@ impl std::hash::Hash for Loaded {
 
 impl std::fmt::Debug for Loaded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Loaded").field("settings", &self.settings).field("id", &format_args!("{:x}", self.profile.id)).finish()
+        f.debug_struct("Loaded")
+            .field("settings", &self.settings)
+            .field("id", &format_args!("{:x}", self.profile.id))
+            .finish()
     }
 }
 
@@ -120,19 +122,23 @@ impl Loaded {
     /// The profile's file name, as the lints' messages name it.
     pub fn file_name(&self) -> String {
         let path = &self.settings.path;
-        path.file_name().map_or_else(|| path.display().to_string(), |it| it.to_string_lossy().into_owned())
+        path.file_name()
+            .map_or_else(|| path.display().to_string(), |it| it.to_string_lossy().into_owned())
     }
 
     /// How `count` of the profile's counts stands against its thresholds.
     pub fn hit(&self, agg: Agg) -> Hit {
         let total = self.profile.total;
         // `count / total` in parts per billion, rounded down; `total` is never zero ([`read`]).
-        let share_ppb = u64::try_from(agg.count.saturating_mul(1_000_000_000) / total).unwrap_or(u64::MAX);
+        let share_ppb =
+            u64::try_from(agg.count.saturating_mul(1_000_000_000) / total).unwrap_or(u64::MAX);
         Hit {
             count: agg.count,
             share_ppb,
             hot: share_ppb >= self.settings.hot_ppb,
-            cold: agg.count == 0 || agg.count.saturating_mul(1_000_000_000) < u128::from(self.settings.cold_ppb) * total,
+            cold: agg.count == 0
+                || agg.count.saturating_mul(1_000_000_000)
+                    < u128::from(self.settings.cold_ppb) * total,
             instances: agg.instances,
         }
     }
@@ -206,7 +212,11 @@ impl Hit {
 pub fn load(settings: Settings) -> Result<Loaded, String> {
     let path = &settings.path;
     let bytes = std::fs::read(path).map_err(|error| {
-        format!("the lint profile `{}` (`profile` in {}) can't be read: {error}", path.display(), settings.named_in)
+        format!(
+            "the lint profile `{}` (`profile` in {}) can't be read: {error}",
+            path.display(),
+            settings.named_in
+        )
     })?;
     let profile = read(&bytes).map_err(|what| {
         format!("the lint profile `{}` (`profile` in {}) {what}", path.display(), settings.named_in)
@@ -342,7 +352,9 @@ fn without_arguments(db: &Db, f: hir::Function) -> bool {
     let own = hir::GenericDef::Function(f).type_or_const_params(db).is_empty();
     own && match f.as_assoc_item(db).map(|it| it.container(db)) {
         None => true,
-        Some(hir::AssocItemContainer::Impl(imp)) => hir::GenericDef::Impl(imp).type_or_const_params(db).is_empty(),
+        Some(hir::AssocItemContainer::Impl(imp)) => {
+            hir::GenericDef::Impl(imp).type_or_const_params(db).is_empty()
+        }
         Some(hir::AssocItemContainer::Trait(_)) => false,
     }
 }
@@ -370,7 +382,8 @@ pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
         }
         keyed.push((id, key, blaze));
     }
-    let mut hits = Hits { functions: u32::try_from(keyed.len()).unwrap_or(u32::MAX), ..Hits::default() };
+    let mut hits =
+        Hits { functions: u32::try_from(keyed.len()).unwrap_or(u32::MAX), ..Hits::default() };
     let mut matched_keys: blaze_hash::HashSet<&str, Global> = blaze_hash::HashSet::new_in(Global);
     for (id, key, blaze) in &keyed {
         let unique = key.as_deref().filter(|it| seen.get(*it).copied() == Some(1));
@@ -386,7 +399,10 @@ pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
         let agg = match (*blaze, by_key) {
             (None, None) => continue,
             (Some(a), None) | (None, Some(a)) => a,
-            (Some(a), Some(b)) => Agg { count: a.count.saturating_add(b.count), instances: a.instances.saturating_add(b.instances) },
+            (Some(a), Some(b)) => Agg {
+                count: a.count.saturating_add(b.count),
+                instances: a.instances.saturating_add(b.instances),
+            },
         };
         hits.matched += 1;
         hits.by_fn.insert(*id, loaded.hit(agg));
@@ -400,7 +416,10 @@ pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
         let mut unmatched: Vec<(Box<str>, Hit)> = profile
             .by_key
             .iter()
-            .filter(|(key, _)| (key.starts_with(&plain) || key.starts_with(&qualified)) && !matched_keys.contains(&***key))
+            .filter(|(key, _)| {
+                (key.starts_with(&plain) || key.starts_with(&qualified))
+                    && !matched_keys.contains(&***key)
+            })
             .map(|(key, agg)| (key.clone(), loaded.hit(*agg)))
             .filter(|(_, hit)| hit.hot)
             .collect();
@@ -413,7 +432,11 @@ pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
 
 /// How well a profile covers `krate`: its [`Hits`] under the profile `conf` names, if it
 /// names one.
-pub fn coverage<'db>(db: &'db Db, krate: hir::Crate, conf: &crate::conf::Conf) -> Option<&'db Hits> {
+pub fn coverage<'db>(
+    db: &'db Db,
+    krate: hir::Crate,
+    conf: &crate::conf::Conf,
+) -> Option<&'db Hits> {
     let loaded = conf.profile.as_ref()?;
     // clone: the profile's settings and a refcount, once per crate
     Some(query::profile_hits(db, krate.base(), query::ProfileKey::new(db, loaded.clone())))
@@ -427,14 +450,21 @@ mod tests {
     fn percents_read_as_numbers_from_0_to_100() {
         assert_eq!(percent_ppb("1", "profile-hot-percent", "x").unwrap(), HOT_DEFAULT_PPB);
         assert_eq!(percent_ppb("0.0001", "profile-cold-percent", "x").unwrap(), COLD_DEFAULT_PPB);
-        assert!(percent_ppb("101", "profile-hot-percent", "x").unwrap_err().contains("from 0 to 100"));
-        assert!(percent_ppb("\"hot\"", "profile-hot-percent", "x").unwrap_err().contains("not a percent"));
+        assert!(
+            percent_ppb("101", "profile-hot-percent", "x").unwrap_err().contains("from 0 to 100")
+        );
+        assert!(
+            percent_ppb("\"hot\"", "profile-hot-percent", "x")
+                .unwrap_err()
+                .contains("not a percent")
+        );
     }
 
     #[test]
     fn a_profile_folds_instances_and_counts_its_total() {
         let legacy = "_ZN3app3run17h0123456789abcdefE";
-        let bytes = indexed::written(indexed::IR_PROF, &[(legacy, 1, &[90, 10]), ("main", 2, &[100])]);
+        let bytes =
+            indexed::written(indexed::IR_PROF, &[(legacy, 1, &[90, 10]), ("main", 2, &[100])]);
         let profile = read(&bytes).unwrap();
         assert_eq!(profile.total, 200);
         assert_eq!(profile.foreign, 1);
@@ -448,10 +478,12 @@ mod tests {
     /// zero counts read too.
     #[test]
     fn a_profiles_names_are_sorted_by_who_made_them() {
-        let blaze = format!("{}{}", blaze_items::pgo::NAME_PREFIX, "0123456789abcdef0123456789abcdef");
+        let blaze =
+            format!("{}{}", blaze_items::pgo::NAME_PREFIX, "0123456789abcdef0123456789abcdef");
         let rustc = "_ZN3app3run17h0123456789abcdefE";
         let internal = "src/lib.rs;_ZN3app4stop17h0123456789abcdefE";
-        let records: &[(&str, u64, &[u64])] = &[(&blaze, 1, &[0]), (rustc, 2, &[0]), (internal, 3, &[0]), ("main", 4, &[0])];
+        let records: &[(&str, u64, &[u64])] =
+            &[(&blaze, 1, &[0]), (rustc, 2, &[0]), (internal, 3, &[0]), ("main", 4, &[0])];
         let bytes = indexed::written(indexed::IR_PROF, records);
         let names = names(&bytes).unwrap();
         assert_eq!(names, Names { records: 4, blaze: 1, rustc: 2, foreign: 1 });

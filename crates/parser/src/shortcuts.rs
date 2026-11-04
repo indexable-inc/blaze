@@ -31,7 +31,10 @@ pub enum OutlineStrStep<'a> {
     Step(StrStep<'a>),
     /// A lazy node of `kind` over `text`, its tokens not parsed. It starts and ends with a token
     /// that is not trivia: the trivia around it are its parent's, as in a full parse.
-    Lazy { kind: SyntaxKind, text: &'a str },
+    Lazy {
+        kind: SyntaxKind,
+        text: &'a str,
+    },
 }
 
 impl LexedStr<'_> {
@@ -208,7 +211,8 @@ impl<'a, F: FnMut(OutlineStrStep<'_>) + ?Sized> Builder<'a, '_, F> {
         let leading_trivias = self.pos..self.pos + n_trivias;
         let lexed = self.lexed;
         // clone: a range of token indices, no heap.
-        let end = self.offset + leading_trivias.clone().map(|it| lexed.token_len(it)).sum::<usize>();
+        let end =
+            self.offset + leading_trivias.clone().map(|it| lexed.token_len(it)).sum::<usize>();
         let n_attached_trivias = n_attached_trivias(
             kind,
             leading_trivias.rev().scan(end, |end, it| {

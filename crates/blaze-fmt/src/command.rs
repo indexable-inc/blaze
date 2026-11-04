@@ -69,15 +69,15 @@ fn names_files(args: &[String]) -> bool {
 
 /// The `.rs` files `args` name before `--`.
 fn files_of(args: &[String]) -> impl Iterator<Item = &str> {
-    (0..args.len()).filter(|at| is_file_at(args, *at)).map(|at| args[at].as_str())
+    (0..args.len())
+        .filter(|at| is_file_at(args, *at))
+        .map(|at| args[at].as_str())
 }
 
 /// Whether the word at `at` is a file: a word ending in `.rs`, not an option, before any `--`.
 fn is_file_at(args: &[String], at: usize) -> bool {
     let word = &args[at];
-    !args[..at].iter().any(|it| it == "--")
-        && !word.starts_with('-')
-        && word.ends_with(".rs")
+    !args[..at].iter().any(|it| it == "--") && !word.starts_with('-') && word.ends_with(".rs")
 }
 
 /// Whether the command line says the edition itself, or prints instead of formatting: then
@@ -123,7 +123,9 @@ impl Packages {
     /// package's (the member whose directory holds it most closely); `None` when it is in no
     /// package, or does not exist (rustfmt then says so, as for any file it can't open).
     fn edition_of(&mut self, file: &Path) -> anyhow::Result<Option<Edition>> {
-        let Ok(file) = file.canonicalize() else { return Ok(None) };
+        let Ok(file) = file.canonicalize() else {
+            return Ok(None);
+        };
         let Some(manifest) = file
             .ancestors()
             .skip(1)

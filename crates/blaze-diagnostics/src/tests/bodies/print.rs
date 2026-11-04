@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
+use hir_expand::fixture;
 use span::FileId;
 use syntax::view::{self as ast, AstNode as _};
-use hir_expand::fixture;
 
 use crate::{
     cx::{Cx, Files},
@@ -35,7 +35,9 @@ fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) ->
             .descendants()
             .filter_map(ast::LetStmt::cast)
             .filter_map(|it| it.initializer())
-            .map(|init| f(&cx, &cx.vsema.type_of_expr(init).expect("an initializer has a type").original))
+            .map(|init| {
+                f(&cx, &cx.vsema.type_of_expr(init).expect("an initializer has a type").original)
+            })
             .collect()
     })
 }
@@ -169,7 +171,17 @@ fn main() {
 "#;
     assert_eq!(
         printed(fixture),
-        ["()", "(u8,)", "(u8, char, bool)", "[u16; 4]", "*const u8", "*mut i64", "&'static str", "f32", "!"]
+        [
+            "()",
+            "(u8,)",
+            "(u8, char, bool)",
+            "[u16; 4]",
+            "*const u8",
+            "*mut i64",
+            "&'static str",
+            "f32",
+            "!"
+        ]
     );
 }
 
@@ -225,7 +237,10 @@ fn main() {
     let y = u();
 }
 ";
-    assert_eq!(printed(fixture), ["impl Tr", "impl Tr + Gen<u8>", "impl Fn(u8) -> u8", "impl FnOnce()"]);
+    assert_eq!(
+        printed(fixture),
+        ["impl Tr", "impl Tr + Gen<u8>", "impl Fn(u8) -> u8", "impl FnOnce()"]
+    );
 }
 
 #[test]

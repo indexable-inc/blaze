@@ -133,9 +133,7 @@ pub fn expand_composite(f: ItemFn) -> TokenStream {
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let mut printable_generics = generics.clone();
-    printable_generics
-        .params
-        .push(syn::parse_quote! { __HegelT });
+    printable_generics.params.push(syn::parse_quote! { __HegelT });
     let (printable_impl_generics, _, _) = printable_generics.split_for_impl();
     let lifetimes: Vec<_> = generics.lifetimes().map(|l| &l.lifetime).collect();
     let type_params: Vec<_> = generics.type_params().map(|t| &t.ident).collect();
@@ -147,15 +145,10 @@ pub fn expand_composite(f: ItemFn) -> TokenStream {
     });
     let marker_init = has_marker.then(|| quote! { __hegel_phantom: ::core::marker::PhantomData, });
 
-    let user_predicates: Vec<_> = generics
-        .where_clause
-        .as_ref()
-        .map(|w| w.predicates.iter().collect())
-        .unwrap_or_default();
-    let clone_bounds: Vec<_> = field_types
-        .iter()
-        .map(|ty| quote! { #ty: ::core::clone::Clone })
-        .collect();
+    let user_predicates: Vec<_> =
+        generics.where_clause.as_ref().map(|w| w.predicates.iter().collect()).unwrap_or_default();
+    let clone_bounds: Vec<_> =
+        field_types.iter().map(|ty| quote! { #ty: ::core::clone::Clone }).collect();
     let generator_where = if clone_bounds.is_empty() && user_predicates.is_empty() {
         quote! {}
     } else {

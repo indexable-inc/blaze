@@ -37,7 +37,7 @@ fn length(db: &TestDb, source: Source) -> usize {
 #[test]
 fn a_query_runs_once_and_again_when_what_it_read_changes() {
     let mut db = TestDb::new();
-    let source = Source::new(&db, "a,b".to_owned(), 2);
+    let source = Source::new(&db, Durability::LOW, "a,b".to_owned(), 2);
     assert_eq!(answer(&db), 42);
     assert_eq!(answer(&db), 42);
     assert_eq!(runs(), ["answer"]);
@@ -72,7 +72,7 @@ fn repeat(db: &TestDb, source: Source, times: usize, separator: char) -> String 
 #[test]
 fn several_arguments_are_one_hidden_key() {
     let db = TestDb::new();
-    let source = Source::new(&db, "ab".to_owned(), 1);
+    let source = Source::new(&db, Durability::LOW, "ab".to_owned(), 1);
     assert_eq!(repeat(&db, source, 3, '-'), "ab-ab-ab");
     assert_eq!(repeat(&db, source, 3, '-'), "ab-ab-ab");
     assert_eq!(repeat(&db, source, 2, '+'), "ab+ab");
@@ -113,8 +113,8 @@ fn first_str(db: &TestDb, source: Source) -> Option<Box<str>> {
 #[test]
 fn every_return_mode_hands_out_its_form() {
     let db = TestDb::new();
-    let source = Source::new(&db, "x,y".to_owned(), 1);
-    let number = Source::new(&db, "12".to_owned(), 1);
+    let source = Source::new(&db, Durability::LOW, "x,y".to_owned(), 1);
+    let number = Source::new(&db, Durability::LOW, "12".to_owned(), 1);
 
     let all: &Vec<String> = words(&db, source);
     assert_eq!(all, &["x", "y"]);
@@ -138,8 +138,8 @@ fn doubled(db: &TestDb, source: Source) -> u32 {
 #[test]
 fn an_lru_query_evicts_its_values_and_runs_again() {
     let mut db = TestDb::new();
-    let a = Source::new(&db, String::new(), 1);
-    let b = Source::new(&db, String::new(), 2);
+    let a = Source::new(&db, Durability::LOW, String::new(), 1);
+    let b = Source::new(&db, Durability::LOW, String::new(), 2);
     assert_eq!((doubled(&db, a), doubled(&db, b)), (2, 4));
     assert_eq!(runs(), ["doubled", "doubled"]);
 
@@ -165,7 +165,8 @@ fn tripled(db: &TestDb, source: Source) -> u32 {
 fn an_lru_query_keeps_its_values_under_its_tags_budget_from_the_next_view() {
     use blaze_query::db::plumbing::Tag;
     let mut db = TestDb::new();
-    let sources: Vec<Source> = (1..=6).map(|i| Source::new(&db, String::new(), i)).collect();
+    let sources: Vec<Source> =
+        (1..=6).map(|i| Source::new(&db, Durability::LOW, String::new(), i)).collect();
     let fetch_all = |db: &TestDb| {
         for (&source, weight) in sources.iter().zip(1..) {
             assert_eq!(tripled(db, source), weight * 3);
@@ -199,7 +200,7 @@ fn weighed(db: &TestDb, source: Source) -> u32 {
 #[test]
 fn mem_tag_and_self_ty_expand_and_self_ty_names_the_query() {
     let db = TestDb::new();
-    let source = Source::new(&db, String::new(), 5);
+    let source = Source::new(&db, Durability::LOW, String::new(), 5);
     assert_eq!(tagged(&db, source), 6);
     assert_eq!(weighed(&db, source), 5);
     assert_eq!(runs(), ["tagged", "Source::weighed"]);
@@ -217,7 +218,7 @@ fn looped_result(_db: &TestDb, _id: Id, _source: Source) -> u32 {
 #[test]
 fn a_cycle_result_is_the_value_of_the_cycle() {
     let db = TestDb::new();
-    let source = Source::new(&db, String::new(), 1);
+    let source = Source::new(&db, Durability::LOW, String::new(), 1);
     assert_eq!(looped(&db, source), 100);
     assert_eq!(looped(&db, source), 100);
 }
@@ -249,7 +250,7 @@ fn climb_recover(_db: &TestDb, cycle: &Cycle<'_>, last: &u32, value: u32, source
 #[test]
 fn a_fixpoint_runs_from_its_initial_value_until_it_settles() {
     let mut db = TestDb::new();
-    let source = Source::new(&db, String::new(), 3);
+    let source = Source::new(&db, Durability::LOW, String::new(), 3);
     assert_eq!(climb(&db, source), 3);
     assert!(ROUNDS.with(Cell::get) > 1, "it took rounds");
     source.set_weight(&mut db).to(5);
@@ -264,7 +265,7 @@ fn settle(db: &TestDb, source: Source) -> u32 {
 #[test]
 fn a_closure_is_a_cycle_initial_and_no_cycle_fn_keeps_each_round() {
     let db = TestDb::new();
-    let source = Source::new(&db, String::new(), 3);
+    let source = Source::new(&db, Durability::LOW, String::new(), 3);
     assert_eq!(settle(&db, source), 6);
 }
 
@@ -277,7 +278,7 @@ fn spin(db: &TestDb, source: Source) -> u32 {
 #[should_panic(expected = "dependency graph cycle")]
 fn a_cycle_without_recovery_panics() {
     let db = TestDb::new();
-    let source = Source::new(&db, String::new(), 1);
+    let source = Source::new(&db, Durability::LOW, String::new(), 1);
     spin(&db, source);
 }
 
@@ -304,7 +305,7 @@ fn even_reader(db: &TestDb, source: Source) -> u8 {
 #[test]
 fn no_eq_makes_every_run_a_change_and_equal_values_cut_off() {
     let mut db = TestDb::new();
-    let source = Source::new(&db, String::new(), 2);
+    let source = Source::new(&db, Durability::LOW, String::new(), 2);
     assert_eq!((even_no_eq_reader(&db, source), even_reader(&db, source)), (1, 1));
     let mut ran = runs();
     ran.sort_unstable();
@@ -336,7 +337,7 @@ fn elided(db: &TestDb, name: Name<'_>) -> usize {
 #[test]
 fn keys_and_values_name_the_database_lifetime() {
     let db = TestDb::new();
-    let source = Source::new(&db, "ab,c,ab".to_owned(), 1);
+    let source = Source::new(&db, Durability::LOW, "ab,c,ab".to_owned(), 1);
     let all = names(&db, source);
     assert_eq!(all.len(), 3);
     assert_eq!(all[0], all[2], "equal fields intern to one ID");
@@ -349,7 +350,7 @@ fn keys_and_values_name_the_database_lifetime() {
 #[test]
 fn debug_reads_the_attached_database() {
     let db = TestDb::new();
-    let source = Source::new(&db, "x".to_owned(), 7);
+    let source = Source::new(&db, Durability::LOW, "x".to_owned(), 7);
     let name = Name::new(&db, "n");
 
     let detached = format!("{source:?}");
@@ -369,7 +370,7 @@ fn debug_reads_the_attached_database() {
 #[test]
 fn out_of_fuel_names_the_keys_value() {
     let db = TestDb::new();
-    let source = Source::new(&db, "ab".to_owned(), 1);
+    let source = Source::new(&db, Durability::LOW, "ab".to_owned(), 1);
     let id = source.as_id();
 
     let out = blaze_query::db::with_fuel(0, || length(&db, source)).expect_err("no fuel");
@@ -378,7 +379,11 @@ fn out_of_fuel_names_the_keys_value() {
     assert!(out.to_string().contains(r#"text: "ab""#), "{out}");
 
     let out = blaze_query::db::with_fuel(0, || repeat(&db, source, 3, '-')).expect_err("no fuel");
-    assert_eq!(out.value, format!(r#"(Source {{ [id]: {id:?}, text: "ab", weight: 1 }}, 3, '-')"#), "{out}");
+    assert_eq!(
+        out.value,
+        format!(r#"(Source {{ [id]: {id:?}, text: "ab", weight: 1 }}, 3, '-')"#),
+        "{out}"
+    );
 
     let out = blaze_query::db::with_fuel(0, || answer(&db)).expect_err("no fuel");
     assert_eq!(out.value, "()", "{out}");

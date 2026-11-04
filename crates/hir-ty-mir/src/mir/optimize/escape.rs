@@ -106,8 +106,8 @@ use crate::{
     layout::enum_variant_ids,
     mir::{
         BasicBlockId, BorrowKind, CastKind, Local, LocalId, MirBody, MirLowerError, MutBorrowKind,
-        Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue, Statement,
-        StatementKind, StoredPlace, Terminator, TerminatorKind,
+        Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue, Statement, StatementKind,
+        StoredPlace, Terminator, TerminatorKind,
         framed::{FrameMap, map_in},
         return_slot,
         transform::Ctx,
@@ -290,7 +290,11 @@ pub(super) fn heap_to_stack<'db>(
 /// The locals a `Box::new`, `Rc::new` or `Box::new_uninit` call returns into, in the order of
 /// the first such call's block. A call that returns into a place other than a whole local (a
 /// field, through a pointer) stores what it allocates, which so leaves the local: not one.
-fn candidates<'p>(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, frame: &'p Frame) -> Vec<Candidate<'p>, &'p Frame> {
+fn candidates<'p>(
+    ctx: &Ctx<'_, '_>,
+    body: &MirBody<'_>,
+    frame: &'p Frame,
+) -> Vec<Candidate<'p>, &'p Frame> {
     let mut found: Vec<Candidate<'p>, &'p Frame> = Vec::new_in(frame);
     let mut by_local: FrameMap<'_, LocalId, usize> = map_in(frame);
     for (block, data) in body.basic_blocks.iter() {
@@ -380,7 +384,10 @@ fn closed_body<'db>(
             TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
                 let ty = place.as_ref().ty(body, &ctx.infcx, ctx.env).ty;
                 if !closed.drop_closed(ctx, ty) {
-                    return Err((block, "the body drops a value whose drop may run the program's code"));
+                    return Err((
+                        block,
+                        "the body drops a value whose drop may run the program's code",
+                    ));
                 }
             }
             TerminatorKind::TailCall { .. } => {
@@ -548,15 +555,19 @@ impl<'p, 'db> Closed<'p, 'db> {
             }
             TyKind::Tuple(fields) => fields.iter().all(|it| self.drop_closed(ctx, it)),
             TyKind::Array(inner, _) | TyKind::Slice(inner) => self.drop_closed(ctx, inner),
-            TyKind::Closure(_, args) => {
-                self.drop_closed(ctx, args.as_closure().tupled_upvars_ty())
-            }
+            TyKind::Closure(_, args) => self.drop_closed(ctx, args.as_closure().tupled_upvars_ty()),
             _ => self.closed(ctx, ty),
         }
     }
 
     /// Whether every field of every variant of `adt` with `args` is closed (`drop`: its drop is).
-    fn fields(&mut self, ctx: &Ctx<'_, 'db>, adt: AdtId, args: GenericArgs<'db>, drop: bool) -> bool {
+    fn fields(
+        &mut self,
+        ctx: &Ctx<'_, 'db>,
+        adt: AdtId,
+        args: GenericArgs<'db>,
+        drop: bool,
+    ) -> bool {
         let db = ctx.db;
         let interner = ctx.infcx.interner;
         let variant = |this: &mut Self, variant: VariantId| {
@@ -568,7 +579,9 @@ impl<'p, 'db> Closed<'p, 'db> {
         match adt {
             AdtId::StructId(id) => variant(self, id.into()),
             AdtId::UnionId(id) => variant(self, id.into()),
-            AdtId::EnumId(id) => enum_variant_ids(db, id).iter().all(|&it| variant(self, it.into())),
+            AdtId::EnumId(id) => {
+                enum_variant_ids(db, id).iter().all(|&it| variant(self, it.into()))
+            }
         }
     }
 }
@@ -589,11 +602,14 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
         }
         let local = candidate.local;
         if !is_own(self.body, local) {
-            return Err("it is the return place, a parameter, a capture, a guard's reference or a \
-                        promoted constant");
+            return Err(
+                "it is the return place, a parameter, a capture, a guard's reference or a \
+                        promoted constant",
+            );
         }
         for &block in &candidate.ctors {
-            let Some(TerminatorKind::Call { func, args, target, .. }) = self.terminator(block) else {
+            let Some(TerminatorKind::Call { func, args, target, .. }) = self.terminator(block)
+            else {
                 return Err("its constructor is not a call");
             };
             if target.is_none() {
@@ -626,7 +642,13 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
         (is_temp(self.body, local) && self.mentions[local_index(local)] == 2).then_some(local)
     }
 
-    fn plan(&self, kind: Kind, local: LocalId, held: Ty<'db>, ctors: Vec<BasicBlockId, &'p Frame>) -> Plan<'p, 'db> {
+    fn plan(
+        &self,
+        kind: Kind,
+        local: LocalId,
+        held: Ty<'db>,
+        ctors: Vec<BasicBlockId, &'p Frame>,
+    ) -> Plan<'p, 'db> {
         Plan {
             kind,
             local,
@@ -640,7 +662,11 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
     }
 
     /// `_b` of type `Box<T>`: read and written only through `*_b`, dropped, and freed.
-    fn check_box(&self, candidate: Candidate<'p>, ty: Ty<'db>) -> std::result::Result<Plan<'p, 'db>, Refusal> {
+    fn check_box(
+        &self,
+        candidate: Candidate<'p>,
+        ty: Ty<'db>,
+    ) -> std::result::Result<Plan<'p, 'db>, Refusal> {
         let b = candidate.local;
         let held = match ty.kind() {
             TyKind::Adt(adt, args) if adt.is_box() => args.type_at(0),
@@ -650,11 +676,14 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
         for (block, data) in self.body.basic_blocks.iter() {
             for (index, statement) in data.statements.iter().enumerate() {
                 match &statement.kind {
-                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
+                    StatementKind::StorageLive(_)
+                    | StatementKind::StorageDead(_)
+                    | StatementKind::Nop => {}
                     StatementKind::FakeRead(place) if is_whole(place, b) => {}
-                    StatementKind::Assign(to, Rvalue::Ref(BorrowKind::Mut { kind: MutBorrowKind::Default }, place))
-                        if is_whole(place, b) =>
-                    {
+                    StatementKind::Assign(
+                        to,
+                        Rvalue::Ref(BorrowKind::Mut { kind: MutBorrowKind::Default }, place),
+                    ) if is_whole(place, b) => {
                         // The free after the value's drop: `_r = &mut _b; <Box<T> as Drop>::drop(move _r)`.
                         let freed = self.borrow_temp(to).is_some_and(|r| self.frees(block, r, ty));
                         if !freed {
@@ -665,8 +694,10 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
                     }
                     other => {
                         if !statement_places(other, |it| through_deref(it, b)) {
-                            return Err("the box itself is moved, copied, borrowed or written, not only \
-                                        what it holds");
+                            return Err(
+                                "the box itself is moved, copied, borrowed or written, not only \
+                                        what it holds",
+                            );
                         }
                     }
                 }
@@ -680,8 +711,10 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
                     if is_whole(place, b) || (place.local == b && through_deref(place, b)) => {}
                 other => {
                     if !terminator_places(other, |it| through_deref(it, b)) {
-                        return Err("the box itself is moved, copied, returned into or dropped in \
-                                    part, not only what it holds");
+                        return Err(
+                            "the box itself is moved, copied, returned into or dropped in \
+                                    part, not only what it holds",
+                        );
                     }
                 }
             }
@@ -692,7 +725,8 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
     /// Whether `block` ends by freeing the box of type `box_ty` that `r` borrows:
     /// `<Box<T, A> as Drop>::drop(move r)`, its one other mention.
     fn frees(&self, block: BasicBlockId, r: LocalId, box_ty: Ty<'db>) -> bool {
-        let Some(TerminatorKind::Call { func, args, target: Some(_), .. }) = self.terminator(block) else {
+        let Some(TerminatorKind::Call { func, args, target: Some(_), .. }) = self.terminator(block)
+        else {
             return false;
         };
         let Some((callee, generic)) = func.fn_item() else { return false };
@@ -702,7 +736,11 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
     }
 
     /// `_r` of type `Rc<T>`: only borrowed for `deref`, and dropped.
-    fn check_rc(&self, candidate: Candidate<'p>, ty: Ty<'db>) -> std::result::Result<Plan<'p, 'db>, Refusal> {
+    fn check_rc(
+        &self,
+        candidate: Candidate<'p>,
+        ty: Ty<'db>,
+    ) -> std::result::Result<Plan<'p, 'db>, Refusal> {
         let db = self.ctx.db;
         let r = candidate.local;
         let held = match ty.kind() {
@@ -713,11 +751,17 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
         for (_, data) in self.body.basic_blocks.iter() {
             for statement in &data.statements {
                 match &statement.kind {
-                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
+                    StatementKind::StorageLive(_)
+                    | StatementKind::StorageDead(_)
+                    | StatementKind::Nop => {}
                     StatementKind::FakeRead(place) if is_whole(place, r) => {}
-                    StatementKind::Assign(to, Rvalue::Ref(BorrowKind::Shared, place)) if is_whole(place, r) => {
+                    StatementKind::Assign(to, Rvalue::Ref(BorrowKind::Shared, place))
+                        if is_whole(place, r) =>
+                    {
                         let Some(t) = self.borrow_temp(to) else {
-                            return Err("the `Rc` is borrowed into a place that is read more than once");
+                            return Err(
+                                "the `Rc` is borrowed into a place that is read more than once",
+                            );
                         };
                         plan.borrows.push(t);
                     }
@@ -737,20 +781,27 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
                 _ if plan.ctors.contains(&block) => {}
                 TerminatorKind::Drop { place, .. } if is_whole(place, r) => {}
                 TerminatorKind::Call { func, args, target: Some(_), .. }
-                    if args.first().and_then(whole_use).is_some_and(|t| plan.borrows.contains(&t)) =>
+                    if args
+                        .first()
+                        .and_then(whole_use)
+                        .is_some_and(|t| plan.borrows.contains(&t)) =>
                 {
                     // Its destination is of `&T`, so it is no place of the `Rc`, and `deref`
                     // never unwinds, so its cleanup edge goes with the call.
                     let is_deref = func.fn_item().is_some_and(|(it, _)| Some(it) == deref);
                     if !is_deref || args.len() != 1 {
-                        return Err("a borrow of the `Rc` is given to something other than `Deref::deref`");
+                        return Err(
+                            "a borrow of the `Rc` is given to something other than `Deref::deref`",
+                        );
                     }
                     plan.derefs.push(block);
                 }
                 other => {
                     if !terminator_places(other, |it| !names(it, r)) {
-                        return Err("the `Rc` is used other than through `*`: moved, returned into, \
-                                    or given to a call");
+                        return Err(
+                            "the `Rc` is used other than through `*`: moved, returned into, \
+                                    or given to a call",
+                        );
                     }
                 }
             }
@@ -764,7 +815,11 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
     /// `_u` of type `Box<MaybeUninit<[T; N]>>`, the start of `vec!`'s chain: `_w =
     /// write_box_via_move(move _u, [..])`, `_v = box_assume_init_into_vec_unsafe(move _w)`, and
     /// `_v` only borrowed for what never grows it, and dropped.
-    fn check_vec(&self, candidate: Candidate<'p>, ty: Ty<'db>) -> std::result::Result<Plan<'p, 'db>, Refusal> {
+    fn check_vec(
+        &self,
+        candidate: Candidate<'p>,
+        ty: Ty<'db>,
+    ) -> std::result::Result<Plan<'p, 'db>, Refusal> {
         let ctx = self.ctx;
         let lang = ctx.infcx.interner.lang_items();
         let u = candidate.local;
@@ -776,7 +831,9 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
             _ => return Err("`Box::new_uninit` returns into a local that is not a `Box`"),
         };
         let array = match slot.kind() {
-            TyKind::Adt(adt, args) if lang.MaybeUninit.map(AdtId::UnionId) == Some(adt.def_id()) => {
+            TyKind::Adt(adt, args)
+                if lang.MaybeUninit.map(AdtId::UnionId) == Some(adt.def_id()) =>
+            {
                 ctx.normalize(args.type_at(0))
             }
             _ => return Err("its box is not of a `MaybeUninit`"),
@@ -791,7 +848,9 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
             return Err("its box is not written once by `write_box_via_move`: not `vec!`'s");
         };
         let Some((made_at, v)) = self.consumer(w, "box_assume_init_into_vec_unsafe") else {
-            return Err("its written box is not made a `Vec` once by `box_assume_init_into_vec_unsafe`");
+            return Err(
+                "its written box is not made a `Vec` once by `box_assume_init_into_vec_unsafe`",
+            );
         };
         if !is_temp(self.body, w) || !is_own(self.body, v) {
             return Err("a local of `vec!`'s chain is a parameter, a capture or the return place");
@@ -805,18 +864,25 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
         for (_, data) in self.body.basic_blocks.iter() {
             for statement in &data.statements {
                 match &statement.kind {
-                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
-                    StatementKind::FakeRead(place) if links.iter().any(|&it| is_whole(place, it)) => {}
+                    StatementKind::StorageLive(_)
+                    | StatementKind::StorageDead(_)
+                    | StatementKind::Nop => {}
+                    StatementKind::FakeRead(place)
+                        if links.iter().any(|&it| is_whole(place, it)) => {}
                     StatementKind::Assign(to, Rvalue::Ref(kind, place)) if is_whole(place, v) => {
                         let shared = match kind {
                             BorrowKind::Shared | BorrowKind::Shallow => true,
-                            BorrowKind::Mut { kind: MutBorrowKind::Default | MutBorrowKind::TwoPhasedBorrow } => false,
+                            BorrowKind::Mut {
+                                kind: MutBorrowKind::Default | MutBorrowKind::TwoPhasedBorrow,
+                            } => false,
                             BorrowKind::Mut { kind: MutBorrowKind::ClosureCapture } => {
                                 return Err("the `Vec` is captured by a closure");
                             }
                         };
                         let Some(x) = self.borrow_temp(to) else {
-                            return Err("the `Vec` is borrowed into a place that is read more than once");
+                            return Err(
+                                "the `Vec` is borrowed into a place that is read more than once",
+                            );
                         };
                         borrows.push((x, shared));
                     }
@@ -835,28 +901,43 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
                 _ if block == built => {}
                 // The chain's calls: the link they read is their first argument, the next the
                 // whole place they return into, and neither is named anywhere else in them.
-                TerminatorKind::Call { func, args, .. } if block == written_at || block == made_at => {
-                    if operand_names_any(func, &links) || args.iter().skip(1).any(|it| operand_names_any(it, &links)) {
+                TerminatorKind::Call { func, args, .. }
+                    if block == written_at || block == made_at =>
+                {
+                    if operand_names_any(func, &links)
+                        || args.iter().skip(1).any(|it| operand_names_any(it, &links))
+                    {
                         return Err("a call of `vec!`'s chain reads a link of it twice");
                     }
                 }
-                TerminatorKind::Drop { place, .. } if links.iter().any(|&it| is_whole(place, it)) => {
+                TerminatorKind::Drop { place, .. }
+                    if links.iter().any(|&it| is_whole(place, it)) =>
+                {
                     plan.jumps.push(block);
                 }
                 TerminatorKind::Call { func, args, destination, target: Some(_), .. }
-                    if let Some(&(_, shared)) = args.first().and_then(whole_use).and_then(|x| borrows.iter().find(|it| it.0 == x)) =>
+                    if let Some(&(_, shared)) = args
+                        .first()
+                        .and_then(whole_use)
+                        .and_then(|x| borrows.iter().find(|it| it.0 == x)) =>
                 {
                     if !self.never_grows(func, shared) {
-                        return Err("a borrow of the `Vec` is given to a call that may grow it or hand it out");
+                        return Err(
+                            "a borrow of the `Vec` is given to a call that may grow it or hand it out",
+                        );
                     }
-                    if named(destination) || args.iter().skip(1).any(|it| operand_names_any(it, &links)) {
+                    if named(destination)
+                        || args.iter().skip(1).any(|it| operand_names_any(it, &links))
+                    {
                         return Err("a call given a borrow of the `Vec` names it again");
                     }
                     used += 1;
                 }
                 other => {
                     if !terminator_places(other, |it| !named(it)) {
-                        return Err("the `Vec` or a box of `vec!` is moved, returned into or given to a call");
+                        return Err(
+                            "the `Vec` or a box of `vec!` is moved, returned into or given to a call",
+                        );
                     }
                 }
             }
@@ -896,7 +977,9 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
         let db = self.ctx.db;
         let lang = self.ctx.infcx.interner.lang_items();
         let Some((callee, _)) = func.fn_item() else { return false };
-        let of_vec = |name: &str| inherent_of(db, callee, name).is_some_and(|it| is_alloc_struct(db, it, "Vec"));
+        let of_vec = |name: &str| {
+            inherent_of(db, callee, name).is_some_and(|it| is_alloc_struct(db, it, "Vec"))
+        };
         let trait_methods = match shared {
             true => [lang.Deref_deref, lang.Index_index, lang.IntoIterIntoIter],
             false => [lang.DerefMut_deref_mut, lang.IndexMut_index_mut, lang.IntoIterIntoIter],
@@ -912,7 +995,11 @@ impl<'c, 'p, 'f, 'db> Check<'c, 'p, 'f, 'db> {
 }
 
 /// `plan` carried out on `body`.
-fn rewrite<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, plan: &Plan<'_, 'db>) -> Result<'db, ()> {
+fn rewrite<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    plan: &Plan<'_, 'db>,
+) -> Result<'db, ()> {
     let interner = ctx.infcx.interner;
     let local = plan.local;
     match plan.kind {
@@ -924,7 +1011,10 @@ fn rewrite<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, plan: &Plan<'_, 'db
             if plan.kind == Kind::Box {
                 body.walk_places(|place| {
                     if place.local == local
-                        && matches!(place.projection.as_slice().first(), Some(ProjectionElem::Deref))
+                        && matches!(
+                            place.projection.as_slice().first(),
+                            Some(ProjectionElem::Deref)
+                        )
                     {
                         let rest = place.projection.as_slice()[1..].iter().copied();
                         place.projection = Projection::new_from_iter(rest).store();
@@ -963,7 +1053,8 @@ fn rewrite<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, plan: &Plan<'_, 'db
                 kind: StatementKind::Assign(Place::from(pointer).store(), borrow),
                 span,
             });
-            data.statements.push(Statement { kind: StatementKind::Assign(destination, to_box), span });
+            data.statements
+                .push(Statement { kind: StatementKind::Assign(destination, to_box), span });
             data.terminator = Some(Terminator { span, kind: TerminatorKind::Goto { target } });
         }
     }
@@ -1012,20 +1103,27 @@ fn call_to_copy<'db>(body: &mut MirBody<'db>, block: BasicBlockId, kind: Kind) -
     if !fits {
         return Err(changed(owner, block, kind.name()));
     }
-    let Some(Terminator { span, kind: TerminatorKind::Call { args, destination, target: Some(target), .. } }) =
-        data.terminator.take()
+    let Some(Terminator {
+        span,
+        kind: TerminatorKind::Call { args, destination, target: Some(target), .. },
+    }) = data.terminator.take()
     else {
         return Err(changed(owner, block, kind.name()));
     };
     let mut args = args.into_vec();
     let Some(arg) = args.pop() else { return Err(changed(owner, block, kind.name())) };
-    data.statements.push(Statement { kind: StatementKind::Assign(destination, Rvalue::Use(arg)), span });
+    data.statements
+        .push(Statement { kind: StatementKind::Assign(destination, Rvalue::Use(arg)), span });
     data.terminator = Some(Terminator { span, kind: TerminatorKind::Goto { target } });
     Ok(())
 }
 
 /// The error of a rewrite that finds a block other than its check did: a bug of the pass.
-fn changed<'db>(owner: crate::InferBodyId<'db>, block: BasicBlockId, what: &str) -> MirLowerError<'db> {
+fn changed<'db>(
+    owner: crate::InferBodyId<'db>,
+    block: BasicBlockId,
+    what: &str,
+) -> MirLowerError<'db> {
     MirLowerError::ImplementationError(format!(
         "HeapToStack: bb{} of {owner:?} no longer ends in {what}, which its check found there",
         block_index(block)
@@ -1106,7 +1204,11 @@ fn is_whole(place: &StoredPlace, local: LocalId) -> bool {
 /// `place` names `local`: as its base or as an index in it.
 fn names(place: &StoredPlace, local: LocalId) -> bool {
     place.local == local
-        || place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Index(l) if *l == local))
+        || place
+            .projection
+            .as_slice()
+            .iter()
+            .any(|it| matches!(it, ProjectionElem::Index(l) if *l == local))
 }
 
 /// `place` names the box `local` only through `*local`, if at all.

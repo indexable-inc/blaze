@@ -18,11 +18,11 @@ use std::{
 };
 
 use blaze_format::cursor::Put as _;
+use blaze_hash::SipKey;
 use blaze_ids::{
     ContentId,
     bits::{BitIndex, BitSet},
 };
-use blaze_hash::SipKey;
 use blaze_image::Corrupt;
 use hashbrown::{HashTable, hash_table};
 use smallvec::{SmallVec, smallvec};
@@ -149,8 +149,7 @@ pub(crate) fn op_paths(op: &Op) -> impl Iterator<Item = &str> {
 
 /// Checks that `path` has one or more parts, none empty, `.` or `..`.
 pub(crate) fn check(path: &str) -> Result<(), OpError> {
-    let bad =
-        path.is_empty() || path.split('/').any(|it| it.is_empty() || it == "." || it == "..");
+    let bad = path.is_empty() || path.split('/').any(|it| it.is_empty() || it == "." || it == "..");
     // alloc: the error's path
     if bad { Err(OpError::BadPath(path.to_owned())) } else { Ok(()) }
 }
@@ -826,7 +825,8 @@ impl Tree {
             Op::Write { .. } => unreachable!("staged above"),
             Op::Edit { path, at, len, bytes } => {
                 // clone: the error's path
-                let blob = file_at(pending, path)?.ok_or_else(|| OpError::NotFound(path.clone()))?;
+                let blob =
+                    file_at(pending, path)?.ok_or_else(|| OpError::NotFound(path.clone()))?;
                 let (old, mode) = (self.staged_bytes(&blob)?, blob.mode());
                 let size = old.len() as u64;
                 if at.checked_add(*len).is_none_or(|end| end > size) {
@@ -927,8 +927,7 @@ impl Tree {
         let name_at = |change: &Staged<'_>| parts[change.0 + depth];
         while start < changes.len() {
             let name = name_at(&changes[start]);
-            let end =
-                start + changes[start..].iter().take_while(|it| name_at(*it) == name).count();
+            let end = start + changes[start..].iter().take_while(|it| name_at(*it) == name).count();
             let group = &changes[start..end];
             start = end;
             while kept < old && self.name_bytes(stack[kept].0) < name.as_bytes() {
@@ -936,8 +935,8 @@ impl Tree {
                 stack.push(entry);
                 kept += 1;
             }
-            let existing = (kept < old && self.name_bytes(stack[kept].0) == name.as_bytes())
-                .then(|| {
+            let existing =
+                (kept < old && self.name_bytes(stack[kept].0) == name.as_bytes()).then(|| {
                     kept += 1;
                     stack[kept - 1]
                 });

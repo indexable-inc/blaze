@@ -84,9 +84,7 @@ pub fn generate_float(ntc: &mut NativeTestCase, spec: &FloatSpec) -> Result<f64,
         )));
     }
     if spec.min_value.is_nan() || spec.max_value.is_nan() {
-        return Err(EngineError::InvalidArgument(
-            "float bounds must not be NaN".to_string(),
-        ));
+        return Err(EngineError::InvalidArgument("float bounds must not be NaN".to_string()));
     }
     if spec.allow_nan && (spec.min_value.is_finite() || spec.max_value.is_finite()) {
         return Err(EngineError::InvalidArgument(
@@ -138,20 +136,9 @@ pub fn generate_float(ntc: &mut NativeTestCase, spec: &FloatSpec) -> Result<f64,
              after exclusive-bound adjustment"
         )));
     }
-    let width = if spec.width == 32 {
-        FloatWidth::F32
-    } else {
-        FloatWidth::F64
-    };
+    let width = if spec.width == 32 { FloatWidth::F32 } else { FloatWidth::F64 };
     let v = spanned(ntc, LABEL_FLOAT, |ntc| {
-        ntc.draw_float(
-            width,
-            min_value,
-            max_value,
-            spec.allow_nan,
-            spec.allow_infinity,
-            snm,
-        )
+        ntc.draw_float(width, min_value, max_value, spec.allow_nan, spec.allow_infinity, snm)
     })?;
     Ok(if spec.width == 32 && v.is_finite() {
         narrow_to_f32(min_value, max_value, snm, v)
@@ -192,9 +179,7 @@ pub fn generate_integer(
              got [{min_value}, {max_value}]"
         )));
     }
-    spanned(ntc, LABEL_INTEGER, |ntc| {
-        ntc.draw_integer(min_value.clone(), max_value.clone())
-    })
+    spanned(ntc, LABEL_INTEGER, |ntc| ntc.draw_integer(min_value.clone(), max_value.clone()))
 }
 
 /// Draw an integer identifier unique within the test case's family,
@@ -296,11 +281,7 @@ impl StringSpec {
                     .to_string(),
             ));
         }
-        Ok(StringSpec::Text {
-            intervals,
-            min_size,
-            max_size,
-        })
+        Ok(StringSpec::Text { intervals, min_size, max_size })
     }
 
     /// A regex draw: strings matching `pattern`, whose categories, word
@@ -330,11 +311,7 @@ impl StringSpec {
             return Err(compiled.unproducible_error());
         }
         let kind = Arc::new(compiled.kind(fullmatch)?);
-        Ok(StringSpec::Regex {
-            compiled: Box::new(compiled),
-            fullmatch,
-            kind,
-        })
+        Ok(StringSpec::Regex { compiled: Box::new(compiled), fullmatch, kind })
     }
 
     /// An RFC 5321/5322 email-address draw.
@@ -358,18 +335,10 @@ impl StringSpec {
 /// spec's kind so the shrinker treats each drawn string as a unit.
 pub fn generate_string(ntc: &mut NativeTestCase, spec: &StringSpec) -> Result<String, EngineError> {
     match spec {
-        StringSpec::Text {
-            intervals,
-            min_size,
-            max_size,
-        } => spanned(ntc, LABEL_STRING, |ntc| {
+        StringSpec::Text { intervals, min_size, max_size } => spanned(ntc, LABEL_STRING, |ntc| {
             ntc.draw_string(Arc::clone(intervals), *min_size, *max_size)
         }),
-        StringSpec::Regex {
-            compiled,
-            fullmatch,
-            kind,
-        } => {
+        StringSpec::Regex { compiled, fullmatch, kind } => {
             regex::ensure_simplest(ntc, compiled, *fullmatch, kind)?;
             spanned(ntc, LABEL_REGEX, |ntc| {
                 ntc.draw_string_from(Arc::clone(kind), |d| {
@@ -379,9 +348,9 @@ pub fn generate_string(ntc: &mut NativeTestCase, spec: &StringSpec) -> Result<St
         }
         StringSpec::Email => spanned(ntc, LABEL_EMAIL, internet::generate_email),
         StringSpec::Url => spanned(ntc, LABEL_URL, internet::generate_url),
-        StringSpec::Domain(spec) => spanned(ntc, LABEL_DOMAIN, |ntc| {
-            internet::generate_domain(ntc, spec)
-        }),
+        StringSpec::Domain(spec) => {
+            spanned(ntc, LABEL_DOMAIN, |ntc| internet::generate_domain(ntc, spec))
+        }
     }
 }
 
@@ -651,12 +620,8 @@ fn recursion_decision_probability(state: &RecursionState, depth: u64) -> f64 {
         return recursion_priced_probability(state);
     }
     let tail = recursion_tail_probability(state);
-    let profile = recursion_profile(
-        target as f64,
-        recursion_arity_estimate(state),
-        tail,
-        state.max_depth,
-    );
+    let profile =
+        recursion_profile(target as f64, recursion_arity_estimate(state), tail, state.max_depth);
     if depth < profile.boundary_depth {
         RECURSION_MAX_BRANCH_PROBABILITY
     } else if depth == profile.boundary_depth {
@@ -687,9 +652,7 @@ pub(crate) fn new_recursion_state(
             ntc.weighted_precise(RECURSION_LARGE_TARGET_PROBABILITY, None)
         })?;
         if large {
-            spanned(ntc, LABEL_INTEGER, |ntc| {
-                ntc.draw_integer_uniform(2, max_leaves)
-            })?
+            spanned(ntc, LABEL_INTEGER, |ntc| ntc.draw_integer_uniform(2, max_leaves))?
         } else {
             1
         }
@@ -725,11 +688,8 @@ pub(crate) fn recursion_branch(
     depth: u64,
 ) -> Result<bool, EngineError> {
     state.observe_decision(depth);
-    let p = if depth >= state.max_depth {
-        0.0
-    } else {
-        recursion_decision_probability(state, depth)
-    };
+    let p =
+        if depth >= state.max_depth { 0.0 } else { recursion_decision_probability(state, depth) };
     let branch = spanned(ntc, LABEL_BOOLEAN, |ntc| ntc.weighted_precise(p, None))?;
     if branch {
         state.observe_branch(depth);
@@ -797,13 +757,9 @@ pub(crate) fn recursion_finish(
     let mispriced = if target == 1 {
         recursion_priced_probability(state) - state.branch_probability > RECURSION_REPRICE_THRESHOLD
     } else {
-        let reachable = recursion_profile(
-            target as f64,
-            recursion_arity_estimate(state),
-            0.0,
-            state.max_depth,
-        )
-        .expected_leaves;
+        let reachable =
+            recursion_profile(target as f64, recursion_arity_estimate(state), 0.0, state.max_depth)
+                .expected_leaves;
         state.leaves.saturating_mul(2) < target && 2.0 * reachable >= target as f64
     };
     if !mispriced {

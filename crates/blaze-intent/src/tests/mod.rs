@@ -46,7 +46,11 @@ fn write(path: &str, bytes: &str) -> Op {
 
 /// The roots `ops` and plain writes of `after` make from a tree of `before`: equal when the
 /// edit's bytes are the text edit's.
-pub(crate) fn roots(before: &BTreeMap<String, String>, ops: &[Op], after: &BTreeMap<String, String>) -> (ContentId, ContentId) {
+pub(crate) fn roots(
+    before: &BTreeMap<String, String>,
+    ops: &[Op],
+    after: &BTreeMap<String, String>,
+) -> (ContentId, ContentId) {
     let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
     let writes: Vec<Op> = before.iter().map(|(path, text)| write(path, text)).collect();
     let base = vfs.apply(vfs.empty(), &writes).unwrap();

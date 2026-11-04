@@ -88,12 +88,11 @@
 //! active crate for a given position, and then provide an API to resolve all
 //! syntax nodes against this specific crate.
 
-use std::sync::Arc;
 use blaze_hash::hash_map::Entry;
+use std::sync::Arc;
 
 use base_db::{Crate, Db, relevant_crates};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_def::{
     AdtId, DefWithBodyId, EnumId, ExpressionStoreOwnerId, GenericDefId, ImplId, Lookup, ModuleId,
     TraitId, VariantId, dyn_map::DynMap, nameres::crate_def_map,
@@ -101,6 +100,7 @@ use hir_def::{
 use hir_expand::{EditionedFileId, ExpansionInfo, HirFileId, MacroCallId};
 use smallvec::SmallVec;
 use span::FileId;
+use std::alloc::Global;
 use stdx::impl_from;
 
 use crate::db::HirDatabase;
@@ -138,7 +138,8 @@ fn crates_of<'a>(
         true => &[][..],
         false => relevant_crates(db, file),
     };
-    let others = others.iter().copied().filter(move |it| !within.is_some_and(|within| within.contains(it)));
+    let others =
+        others.iter().copied().filter(move |it| !within.is_some_and(|within| within.contains(it)));
     chosen.into_iter().chain(others)
 }
 

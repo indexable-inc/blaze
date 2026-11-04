@@ -47,14 +47,22 @@ enum Instead {
 impl Instead {
     fn say(self) -> &'static str {
         match self {
-            Instead::Fs => "use the runtime's file API (`tokio::fs`, `async_std::fs`) or move the call into `spawn_blocking`",
+            Instead::Fs => {
+                "use the runtime's file API (`tokio::fs`, `async_std::fs`) or move the call into `spawn_blocking`"
+            }
             Instead::Sleep => "await the runtime's timer (`tokio::time::sleep`, `async_io::Timer`)",
-            Instead::Net => "use the runtime's sockets (`tokio::net`, `async_std::net`) or move the call into `spawn_blocking`",
+            Instead::Net => {
+                "use the runtime's sockets (`tokio::net`, `async_std::net`) or move the call into `spawn_blocking`"
+            }
             Instead::Channel => {
                 "use an async channel (`tokio::sync::mpsc`, `async-channel`, flume's `recv_async`) or move the wait into `spawn_blocking`"
             }
-            Instead::Process => "use the runtime's process API (`tokio::process::Command`) or move the call into `spawn_blocking`",
-            Instead::Join => "await a task's handle (`tokio::task::JoinHandle`) or join inside `spawn_blocking`",
+            Instead::Process => {
+                "use the runtime's process API (`tokio::process::Command`) or move the call into `spawn_blocking`"
+            }
+            Instead::Join => {
+                "await a task's handle (`tokio::task::JoinHandle`) or join inside `spawn_blocking`"
+            }
         }
     }
 }
@@ -73,11 +81,30 @@ const METHODS: &[(Of, &[&str], &[&str], Instead)] = &[
     (
         Of::Std("fs"),
         &["File"],
-        &["open", "create", "sync_", "set_len", "metadata", "set_permissions", "set_times", "set_modified", "lock", "read", "write", "flush", "seek"],
+        &[
+            "open",
+            "create",
+            "sync_",
+            "set_len",
+            "metadata",
+            "set_permissions",
+            "set_times",
+            "set_modified",
+            "lock",
+            "read",
+            "write",
+            "flush",
+            "seek",
+        ],
         Instead::Fs,
     ),
     (Of::Std("fs"), &["OpenOptions"], &["open"], Instead::Fs),
-    (Of::Std("net"), &["TcpStream"], &["connect", "peek", "read", "write", "flush", "shutdown"], Instead::Net),
+    (
+        Of::Std("net"),
+        &["TcpStream"],
+        &["connect", "peek", "read", "write", "flush", "shutdown"],
+        Instead::Net,
+    ),
     (Of::Std("net"), &["TcpListener"], &["bind", "accept"], Instead::Net),
     (Of::Std("net"), &["Incoming"], &["next"], Instead::Net),
     (Of::Std("net"), &["UdpSocket"], &["bind", "connect", "recv", "send", "peek"], Instead::Net),
@@ -150,7 +177,12 @@ fn blocking(db: &Db, callee: &Callee<'_>) -> Option<(String, Instead)> {
             }
     })?;
     let what = match callee.trait_ {
-        Some(trait_) => format!("`{}::{}` on `{}`", trait_.name(db).as_str(), callee.name, adt.name(db).as_str()),
+        Some(trait_) => format!(
+            "`{}::{}` on `{}`",
+            trait_.name(db).as_str(),
+            callee.name,
+            adt.name(db).as_str()
+        ),
         None => format!("`{}::{}`", adt.name(db).as_str(), callee.name),
     };
     Some((what, *instead))

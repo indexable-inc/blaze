@@ -40,16 +40,9 @@ pub mod prelude_lints;
 mod sized_bound;
 pub(crate) mod unify;
 
-use std::{
-    cell::RefCell,
-    cmp,
-    convert::identity,
-    fmt,
-    hash::Hash,
-    ops::Deref,
-};
+use std::{cell::RefCell, cmp, convert::identity, fmt, hash::Hash, ops::Deref};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
@@ -115,8 +108,8 @@ use crate::{
     method_resolution::{CandidateId, Pick, PickKind},
     next_solver::{
         AliasConstKind, AliasTy, AnonConstIdWrapper, Const, ConstKind, DbInterner, ErrorGuaranteed,
-        GenericArgs, IsRigid, Region, RegionExt, StoredFnSig, StoredGenericArg, StoredGenericArgs,
-        StoredClauses, StoredPredicate, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
+        GenericArgs, IsRigid, Region, RegionExt, StoredClauses, StoredFnSig, StoredGenericArg,
+        StoredGenericArgs, StoredPredicate, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
         abi::Safety,
         infer::{
             InferCtxt, ObligationInspector,
@@ -124,8 +117,8 @@ use crate::{
         },
     },
     solver_errors::SolverDiagnostic,
-    solver_errors::{Ambiguity, NamedTerm, TypeAnnotationNeeded},
     solver_errors::StoredGoal,
+    solver_errors::{Ambiguity, NamedTerm, TypeAnnotationNeeded},
     utils::TargetFeatureIsSafeInTarget,
 };
 
@@ -179,9 +172,12 @@ pub(crate) fn infer_body_in<'db>(
     }
 
     match def {
-        DefWithBodyId::FunctionId(f) => {
-            ctx.collect_fn(f, body.self_param.map(|param| param.formal), &body.params, body.root_expr())
-        }
+        DefWithBodyId::FunctionId(f) => ctx.collect_fn(
+            f,
+            body.self_param.map(|param| param.formal),
+            &body.params,
+            body.root_expr(),
+        ),
         DefWithBodyId::ConstId(c) => ctx.collect_const_or_static(c.into()),
         DefWithBodyId::StaticId(s) => ctx.collect_const_or_static(s.into()),
         DefWithBodyId::VariantId(v) => {
@@ -238,10 +234,7 @@ fn infer_cycle_result<'db>(
 }
 
 /// Infer types for an anonymous const expression.
-fn infer_anon_const_query<'db>(
-    db: &'db Db,
-    def: AnonConstId<'db>,
-) -> InferenceResult<'db> {
+fn infer_anon_const_query<'db>(db: &'db Db, def: AnonConstId<'db>) -> InferenceResult<'db> {
     blaze_mem::frame::current(|frame| {
         let loc = def.loc(db);
         let _p = hir_def::span_names::of_inner(
@@ -1690,7 +1683,10 @@ fn last_adjustment(adjustments: &[Adjustment]) -> Option<&Adjustment> {
 
 /// An expression's type after all its adjustments: the last one's target (a trailing
 /// `NeverToAny` included, unlike [`last_adjustment`]), or `unadjusted` when it has none.
-fn adjusted_ty<'a>(adjustments: Option<&[Adjustment]>, unadjusted: impl FnOnce() -> Ty<'a>) -> Ty<'a> {
+fn adjusted_ty<'a>(
+    adjustments: Option<&[Adjustment]>,
+    unadjusted: impl FnOnce() -> Ty<'a>,
+) -> Ty<'a> {
     match adjustments.and_then(<[Adjustment]>::last) {
         Some(it) => it.target.as_ref(),
         None => unadjusted(),
@@ -2103,10 +2099,7 @@ fn inference_bytes(value: &InferenceResult<'_>) -> usize {
     weigh = inference_bytes,
     mem_tag = Infer
 )]
-pub(crate) fn infer_body_query<'db>(
-    db: &'db Db,
-    def: DefWithBodyId,
-) -> InferenceResult<'db> {
+pub(crate) fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult<'db> {
     if let Some(served) = crate::check_cache::served_inference(db, def) {
         return served;
     }
@@ -2134,10 +2127,7 @@ pub(crate) fn infer_anon_const_body_query<'db>(
 
 impl<'db> InferenceResult<'db> {
     #[inline]
-    pub fn of(
-        db: &'db Db,
-        def: impl Into<InferBodyId<'db>>,
-    ) -> &'db InferenceResult<'db> {
+    pub fn of(db: &'db Db, def: impl Into<InferBodyId<'db>>) -> &'db InferenceResult<'db> {
         match def.into() {
             InferBodyId::DefWithBodyId(it) => infer_body_query(db, it),
             InferBodyId::AnonConstId(it) => {
@@ -2205,7 +2195,11 @@ impl<'db> InferenceResult<'db> {
     /// The largest universe of a `for const` binder of the body, `ROOT` when it has none: an
     /// inference context that solves goals naming a binder first creates universes up to it.
     pub fn comptime_max_universe(&self) -> UniverseIndex {
-        self.comptime_loops.values().map(ComptimeLoop::universe).max().unwrap_or(UniverseIndex::ROOT)
+        self.comptime_loops
+            .values()
+            .map(ComptimeLoop::universe)
+            .max()
+            .unwrap_or(UniverseIndex::ROOT)
     }
 
     /// `env` with what every `for const` loop of the body assumes of its binder: the
@@ -2994,7 +2988,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let (diagnostics, resolver_has_errors) = resolver.resolve_diagnostics();
         // rustc taints the typeck results on any error typeck emits, and the checks after it
         // (match checking, the `unused_mut` lint) skip a tainted body.
-        *has_errors |= resolver_has_errors || diagnostics.iter().any(InferenceDiagnostic::taints_body);
+        *has_errors |=
+            resolver_has_errors || diagnostics.iter().any(InferenceDiagnostic::taints_body);
 
         // A `Vec`'s drain is `TrustedLen`: each `Box` is made once at its length, none when empty.
         result.freeze(
@@ -3574,7 +3569,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn report_unknown_receiver(&self, span: Span, ty: Ty<'db>, raw_pointer: bool) {
         let reported = |diagnostic: &InferenceDiagnostic| match diagnostic {
             InferenceDiagnostic::TypeMustBeKnown { at_point, .. }
-            | InferenceDiagnostic::MethodOnUnknownRawPointee { span: at_point } => *at_point == span,
+            | InferenceDiagnostic::MethodOnUnknownRawPointee { span: at_point } => {
+                *at_point == span
+            }
             _ => false,
         };
         if self.tainted_by_errors() || self.diagnostics.any(reported) {
@@ -3597,9 +3594,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// rustc's `tyvar_behind_raw_pointer` from `probe_op` (edition 2015, where the call goes on
     /// unresolved), once per call at `span`.
     pub(crate) fn lint_tyvar_behind_raw_pointer(&self, span: Span) {
-        let reported = |diagnostic: &InferenceDiagnostic| {
-            matches!(diagnostic, InferenceDiagnostic::TyvarBehindRawPointer { span: at } if *at == span)
-        };
+        let reported = |diagnostic: &InferenceDiagnostic| matches!(diagnostic, InferenceDiagnostic::TyvarBehindRawPointer { span: at } if *at == span);
         if !self.diagnostics.any(reported) {
             self.push_diagnostic(InferenceDiagnostic::TyvarBehindRawPointer { span });
         }
@@ -3776,7 +3771,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 {
                     let found = StructPathFound::Def(def);
                     self.diagnostics.push(not_a_struct_path(node, found, None));
-                } else if let Some(segment) = Self::segment_after_a_variant(self.db, &self.resolver, path) {
+                } else if let Some(segment) =
+                    Self::segment_after_a_variant(self.db, &self.resolver, path)
+                {
                     let found = StructPathFound::AfterVariant { segment };
                     self.diagnostics.push(not_a_struct_path(node, found, None));
                 }
@@ -3832,7 +3829,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             match path_ctx.resolve_path_in_type_ns() {
                 Some((it, idx)) => (it, idx),
                 None => {
-                    if let Some(segment) = Self::segment_after_a_variant(self.db, &self.resolver, path) {
+                    if let Some(segment) =
+                        Self::segment_after_a_variant(self.db, &self.resolver, path)
+                    {
                         let found = StructPathFound::AfterVariant { segment };
                         self.diagnostics.push(not_a_struct_path(node, found, None));
                     }
@@ -4006,7 +4005,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     && let Some((AdtId::EnumId(id), _)) = ty.as_adt()
                 {
                     let ctxt = path.segment_hygiene(remaining_idx + 1).syntax_context();
-                    if let Some(variant) = EnumVariants::variant_written(self.db, id, segment.name, ctxt) {
+                    if let Some(variant) =
+                        EnumVariants::variant_written(self.db, id, segment.name, ctxt)
+                    {
                         return if remaining_segments.len() == 2 {
                             let segment = remaining_idx + 1;
                             Self::forbid_type_relative_variant_args(
@@ -4147,7 +4148,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
     /// The segment after an enum variant in `path` (`X` of `E::A::X`), which the resolver
     /// resolves to nothing: rustc's E0433 "`A` is a variant, not a module".
-    fn segment_after_a_variant(db: &'db Db, resolver: &Resolver<'db>, path: Path<'_>) -> Option<u32> {
+    fn segment_after_a_variant(
+        db: &'db Db,
+        resolver: &Resolver<'db>,
+        path: Path<'_>,
+    ) -> Option<u32> {
         if path.type_anchor().is_some() {
             return None;
         }
@@ -4262,16 +4267,15 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let segments = mod_path.segments();
         // this could be an enum variant or associated type
         if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt()
-            && let Some(variant) =
-                EnumVariants::variant_written(self.db, enum_id, &segments[first], path.segment_hygiene(first).syntax_context())
+            && let Some(variant) = EnumVariants::variant_written(
+                self.db,
+                enum_id,
+                &segments[first],
+                path.segment_hygiene(first).syntax_context(),
+            )
         {
             if remaining == 1 {
-                Self::forbid_type_relative_variant_args(
-                    &self.diagnostics,
-                    node,
-                    path,
-                    first,
-                );
+                Self::forbid_type_relative_variant_args(&self.diagnostics, node, path, first);
                 return (ty, Some(variant.into()));
             }
             let found = StructPathFound::AfterVariant { segment: (first + 1) as u32 };
@@ -4478,9 +4482,7 @@ fn in_automatically_derived_impl(db: &Db, owner: InferBodyId<'_>) -> bool {
         _ => return false,
     };
     match container {
-        ItemContainerId::ImplId(it) => {
-            AttrFlags::has_word(db, it.into(), "automatically_derived")
-        }
+        ItemContainerId::ImplId(it) => AttrFlags::has_word(db, it.into(), "automatically_derived"),
         _ => false,
     }
 }

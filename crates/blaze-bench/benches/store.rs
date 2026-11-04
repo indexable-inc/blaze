@@ -6,9 +6,9 @@
 
 use std::hint::black_box;
 
+use blaze_bench::{IntoBenchmarks, benchmark_fn};
 use blaze_cas::{Driven, Handle, Key, Kind};
 use blaze_ids::ContentId;
-use blaze_bench::{IntoBenchmarks, benchmark_fn};
 
 /// What the store holds when the benchmarks read it: a thousand values of 512 bytes.
 const COUNT: usize = 1000;
@@ -35,7 +35,8 @@ struct Filled {
 
 impl Filled {
     fn new(name: &str) -> Filled {
-        let dir = std::env::temp_dir().join(format!("blaze-bench-store-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blaze-bench-store-{name}-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         let mut driven = Driven::open(&dir).expect("a store");
         let handle = driven.handle();

@@ -155,8 +155,18 @@ mod tests {
     #[test]
     fn kept_images_past_the_budget_go_least_recently_linked_first_and_never_a_live_one() {
         // Path 3 is the oldest but live; then 1, then 0 and 4 linked together, then 2.
-        let mut rows = [row(2, 30, 9, false), row(0, 20, 5, false), row(3, 50, 1, true), row(4, 10, 5, false), row(1, 40, 2, false)];
-        assert_eq!(evictions(&mut rows.clone(), 150), Evictions { ids: vec![], held: 150 }, "under the budget");
+        let mut rows = [
+            row(2, 30, 9, false),
+            row(0, 20, 5, false),
+            row(3, 50, 1, true),
+            row(4, 10, 5, false),
+            row(1, 40, 2, false),
+        ];
+        assert_eq!(
+            evictions(&mut rows.clone(), 150),
+            Evictions { ids: vec![], held: 150 },
+            "under the budget"
+        );
         // 150 held, 85 allowed: 1 (40) leaves 110, 0 (20) leaves 90, 4 (10) leaves 80.
         assert_eq!(evictions(&mut rows, 85), Evictions { ids: vec![1, 0, 4], held: 80 });
         // The live image alone is over: every other goes, it stays.

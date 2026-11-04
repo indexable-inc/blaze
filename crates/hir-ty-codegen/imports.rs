@@ -28,11 +28,11 @@ use std::{
 
 use base_db::Db;
 use blaze_hash::{HashSet, SharedMap};
-use std::alloc::Global;
 use cranelift_codegen::ir;
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
 use rustc_abi::ExternAbi;
+use std::alloc::Global;
 
 use super::{
     Instance, InstanceDef,
@@ -170,17 +170,16 @@ type Key = (InstanceDef, StoredGenericArgs, bool);
 
 /// The exports of the process, each built once: a compile that asks for one another is
 /// building waits for it, and no export asks for another while it is built.
-#[expect(clippy::disallowed_types, reason = "the process's one table of exports, each built once by the first compile that asks")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one table of exports, each built once by the first compile that asks"
+)]
 static EXPORTS: std::sync::LazyLock<SharedMap<Key, Arc<std::sync::OnceLock<Option<Arc<Export>>>>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
 /// not imported: too large, a coroutine, or a body LLVM has no lowering for.
-fn export(
-    db: &Db,
-    instance: &Instance,
-    env: &StoredParamEnvAndCrate,
-) -> Option<Arc<Export>> {
+fn export(db: &Db, instance: &Instance, env: &StoredParamEnvAndCrate) -> Option<Arc<Export>> {
     // clone: a refcount of the interned arguments, which the shared table keeps as its key
     let key = (instance.def, instance.args.clone(), instance.checked);
     // clone: the slot's `Arc`, so the table's guard is let go before the export is built
@@ -199,11 +198,7 @@ fn export(
 
 /// The export of `instance`: its body built alone, with nothing of what it calls built in but
 /// the small functions of the standard library every compile builds in.
-fn build(
-    db: &Db,
-    instance: &Instance,
-    env: &StoredParamEnvAndCrate,
-) -> Option<Export> {
+fn build(db: &Db, instance: &Instance, env: &StoredParamEnvAndCrate) -> Option<Export> {
     let (tracked, flags) = match instance.def {
         InstanceDef::Fn(func) => {
             let signature = FunctionSignature::of(db, func);

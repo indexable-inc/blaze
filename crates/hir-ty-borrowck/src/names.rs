@@ -108,7 +108,9 @@ impl<'a, 'db> Ctx<'a, 'db> {
         let (_, &binding) = self
             .bindings
             .iter()
-            .filter(|(local, _)| ComptimeBinder::of(body.locals[**local].ty.as_ref()) == Some(binder))
+            .filter(|(local, _)| {
+                ComptimeBinder::of(body.locals[**local].ty.as_ref()) == Some(binder)
+            })
             .min_by_key(|(local, _)| local.into_raw())?;
         Some(self.store[binding].name.as_str())
     }

@@ -223,8 +223,10 @@ fn made(out: &Path) {
     }
     if !differ.is_empty() {
         let host = env::var("HOST").unwrap_or_else(|e| format!("<HOST: {e}>"));
-        let files: Vec<String> =
-            Variant::ALL.iter().map(|variant| out.join(variant.file()).display().to_string()).collect();
+        let files: Vec<String> = Variant::ALL
+            .iter()
+            .map(|variant| out.join(variant.file()).display().to_string())
+            .collect();
         refuse(format_args!(
             "the stencil libraries the pinned LLVM made from this tree on {host} are not the ones {} \
              pins and {} holds: {}. If the change to what the generator makes is meant, pin and \

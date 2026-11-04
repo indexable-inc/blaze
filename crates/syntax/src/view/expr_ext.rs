@@ -326,7 +326,11 @@ impl<'t> ast::Literal<'t> {
 pub enum BlockModifier<'t> {
     Async(Token<'t>),
     Unsafe(Token<'t>),
-    Try { try_token: Token<'t>, bikeshed_token: Option<Token<'t>>, result_type: Option<ast::Type<'t>> },
+    Try {
+        try_token: Token<'t>,
+        bikeshed_token: Option<Token<'t>>,
+        result_type: Option<ast::Type<'t>>,
+    },
     Const(Token<'t>),
     AsyncGen(Token<'t>),
     Gen(Token<'t>),

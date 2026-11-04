@@ -3,7 +3,6 @@ use std::sync::Arc;
 use base_db::{Crate, Db, Env};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use hir_def::{
     ConstId, ModuleDefId,
@@ -14,6 +13,7 @@ use hir_expand::fixture;
 use parking_lot::Mutex;
 use rustc_abi::Size;
 use rustc_type_ir::{IntTy, Mutability, UintTy};
+use std::alloc::Global;
 
 use super::{codec, *};
 use crate::{
@@ -33,7 +33,8 @@ fn ty(kind: TyKind<'static>) -> Ty<'static> {
 
 fn usize_value(n: u64) -> Const<'static> {
     let scalar = ScalarInt::try_from_uint(n, Size::from_bytes(8u64)).unwrap();
-    let value = ValueConst::new(default_types().types.usize, ValTree::new(ValTreeKind::Leaf(scalar)));
+    let value =
+        ValueConst::new(default_types().types.usize, ValTree::new(ValTreeKind::Leaf(scalar)));
     Const::new_without_interner(ConstKind::Value(value))
 }
 
@@ -82,8 +83,16 @@ fn kept_kinds() -> Vec<Allocation<'static>> {
         scalar(ty(TyKind::RawPtr(types.u8, Mutability::Mut)), &0x1000u64.to_le_bytes()),
         alloc(types.static_str_ref, &str_ref, complex()),
         alloc(types.static_u8_slice, &slice_ref, complex()),
-        alloc(ty(TyKind::Ref(regions.erased, types.u32, Mutability::Not)), &[0, 0x10, 0, 0, 0, 0, 0, 0], complex()),
-        alloc(ty(TyKind::Ref(regions.statik, types.u8_slice, Mutability::Mut)), &slice_ref, complex()),
+        alloc(
+            ty(TyKind::Ref(regions.erased, types.u32, Mutability::Not)),
+            &[0, 0x10, 0, 0, 0, 0, 0, 0],
+            complex(),
+        ),
+        alloc(
+            ty(TyKind::Ref(regions.statik, types.u8_slice, Mutability::Mut)),
+            &slice_ref,
+            complex(),
+        ),
         alloc(ty(TyKind::Slice(types.u8)), &[1, 2], MemoryMap::simple(Box::new([4, 5]))),
         alloc(types.u32, &[1, 0, 0, 0], MemoryMap::simple(Box::default())),
         alloc(types.u32, &[1, 0, 0, 0], MemoryMap::Complex(Box::default())),
@@ -95,9 +104,10 @@ fn kept_kinds() -> Vec<Allocation<'static>> {
     {
         kinds.push(scalar(ty(TyKind::Int(int)), &(-(size as i128)).to_le_bytes()[..size]));
     }
-    for (uint, size) in [UintTy::Usize, UintTy::U8, UintTy::U16, UintTy::U32, UintTy::U64, UintTy::U128]
-        .into_iter()
-        .zip(sizes)
+    for (uint, size) in
+        [UintTy::Usize, UintTy::U8, UintTy::U16, UintTy::U32, UintTy::U64, UintTy::U128]
+            .into_iter()
+            .zip(sizes)
     {
         kinds.push(scalar(ty(TyKind::Uint(uint)), &(size as u128 * 0x1234).to_le_bytes()[..size]));
     }

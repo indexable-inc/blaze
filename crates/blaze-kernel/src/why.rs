@@ -111,7 +111,13 @@ impl Miss {
     /// A miss of a key made of `parts`, which are sorted here. A part given twice alike is
     /// kept once; two different parts of one name make the miss [`Missed::Failed`], naming it,
     /// as no change of either could be told from the other's.
-    pub fn of_parts(step: &'static str, subject: ContentId, item: String, key: ContentId, mut parts: Vec<Part>) -> Miss {
+    pub fn of_parts(
+        step: &'static str,
+        subject: ContentId,
+        item: String,
+        key: ContentId,
+        mut parts: Vec<Part>,
+    ) -> Miss {
         parts.sort();
         parts.dedup();
         let twice = parts.windows(2).find(|pair| pair[0].name == pair[1].name).map(|pair| {
@@ -157,12 +163,15 @@ fn explained<W: World + ?Sized, G: Get + ?Sized>(
             false => Missed::New,
         });
     };
-    let Some(bytes) = store.get(&key).map_err(|why| at(key, why))? else { return Ok(Missed::Collected) };
+    let Some(bytes) = store.get(&key).map_err(|why| at(key, why))? else {
+        return Ok(Missed::Collected);
+    };
     let entry = Entry::read(bytes, key, identity).map_err(|why| at(key, why))?;
     let (mut first, mut changed) = (None, 0u32);
     for (read, was) in entry.reads() {
         // alloc: an error
-        let now = world.hash(read).map_err(|error| format!("{}: {}", world.describe(read), error.why))?;
+        let now =
+            world.hash(read).map_err(|error| format!("{}: {}", world.describe(read), error.why))?;
         if now == was {
             continue;
         }
@@ -173,9 +182,14 @@ fn explained<W: World + ?Sized, G: Get + ?Sized>(
     }
     let reads = u32::try_from(entry.reads().len()).unwrap_or(u32::MAX);
     Ok(match first {
-        Some((read, was, now)) => {
-            Missed::Read { read: world.describe(read), names: world.names(read), was, now, changed, reads }
-        }
+        Some((read, was, now)) => Missed::Read {
+            read: world.describe(read),
+            names: world.names(read),
+            was,
+            now,
+            changed,
+            reads,
+        },
         None => Missed::Unshaped,
     })
 }

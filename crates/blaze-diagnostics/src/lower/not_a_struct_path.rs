@@ -64,10 +64,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
         return invalid_lhs_of_assignment::lower(cx, &lhs);
     }
     let Some(path) = path_of(node.value) else {
-        return refused(cx, ptr, "hir found it in a node that is not a struct literal or a pattern");
+        return refused(
+            cx,
+            ptr,
+            "hir found it in a node that is not a struct literal or a pattern",
+        );
     };
     // alloc: the path's prefixes, for an error hir found
-    let mut prefixes: Vec<ast::Path<'_>> = std::iter::successors(Some(path), |it| it.qualifier()).collect();
+    let mut prefixes: Vec<ast::Path<'_>> =
+        std::iter::successors(Some(path), |it| it.qualifier()).collect();
     prefixes.reverse();
     let Some(first) = prefixes.first().and_then(|it| it.segment()) else {
         return refused(cx, ptr, "its path has no first segment");
@@ -81,12 +86,19 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
     let segment_at = |segment: u32| segments.get(lead + segment as usize);
 
     let diag = match d.found {
-        StructPathFound::Def(StructPathDef::Static) if source == PathSource::Pat && segments.len() == 1 => {
+        StructPathFound::Def(StructPathDef::Static)
+            if source == PathSource::Pat && segments.len() == 1 =>
+        {
             let what = binding_kind(node.value);
             // alloc: the error's text, for an error hir found
-            let mut diag = Diag::error(Some("E0530"), format!("{what} bindings cannot shadow statics"), path_span.clone());
+            let mut diag = Diag::error(
+                Some("E0530"),
+                format!("{what} bindings cannot shadow statics"),
+                path_span.clone(),
+            );
             diag.span_label(path_span, "cannot be named the same as a static");
-            if let Some(hir::PathResolution::Def(def @ hir::ModuleDef::Static(_))) = cx.vsema.resolve_path(path)
+            if let Some(hir::PathResolution::Def(def @ hir::ModuleDef::Static(_))) =
+                cx.vsema.resolve_path(path)
                 && let Some(at) = def_span(cx, Ns::Value, def)
             {
                 // alloc: the error's text, for an error hir found
@@ -95,19 +107,27 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
             diag
         }
         StructPathFound::Def(StructPathDef::ConstParam) if source == PathSource::Pat => {
-            let mut diag =
-                Diag::error(Some("E0158"), "constant parameters cannot be referenced in patterns", path_span.clone());
+            let mut diag = Diag::error(
+                Some("E0158"),
+                "constant parameters cannot be referenced in patterns",
+                path_span.clone(),
+            );
             diag.span_label(path_span, "can't be used in patterns");
             if let Some(hir::PathResolution::ConstParam(it)) = cx.vsema.resolve_path(path)
                 && let Some(source) = cx.vsema.source(it.merge())
             {
-                diag.span_label(cx.span(source.map(|it| it.syntax().text_range())), "constant defined here");
+                diag.span_label(
+                    cx.span(source.map(|it| it.syntax().text_range())),
+                    "constant defined here",
+                );
             }
             diag
         }
         StructPathFound::Def(StructPathDef::TypeParam) => {
             // alloc: the error's text, for an error hir found
-            let message = format!("expected struct, variant or union type, found type parameter `{path_str}`");
+            let message = format!(
+                "expected struct, variant or union type, found type parameter `{path_str}`"
+            );
             // clone: a handle, on the error path
             let mut diag = Diag::error(Some("E0071"), message, path_span.clone());
             diag.span_label(path_span, "not a struct");
@@ -120,7 +140,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
             };
             let expected = source.expected();
             // alloc: the error's text, for an error hir found
-            let message = format!("expected {expected}, found {} `{path_str}`", descr(cx, def, path));
+            let message =
+                format!("expected {expected}, found {} `{path_str}`", descr(cx, def, path));
             // clone: a handle, on the error path
             let mut diag = Diag::error(Some(code), message, path_span.clone());
             // alloc: the error's text, for an error hir found
@@ -132,7 +153,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
                 return refused(cx, ptr, "hir found a type of another kind but gave no type");
             };
             // alloc: the error's text, for an error hir found
-            let message = format!("expected struct, variant or union type, found {}", sort_string(cx, ty));
+            let message =
+                format!("expected struct, variant or union type, found {}", sort_string(cx, ty));
             // clone: a handle, on the error path
             let mut diag = Diag::error(Some("E0071"), message, path_span.clone());
             diag.span_label(path_span, "not a struct");
@@ -226,7 +248,9 @@ fn descr<'db>(cx: &Cx<'_, 'db>, def: StructPathDef, path: ast::Path<'db>) -> &'s
     match def {
         StructPathDef::Struct | StructPathDef::Variant | StructPathDef::Union => {
             match cx.vsema.resolve_path(path) {
-                Some(hir::PathResolution::Def(it)) => def_descr(cx, Ns::Value, it).unwrap_or("struct"),
+                Some(hir::PathResolution::Def(it)) => {
+                    def_descr(cx, Ns::Value, it).unwrap_or("struct")
+                }
                 _ => "struct",
             }
         }

@@ -119,11 +119,15 @@ fn parts_of<'db>(
         db.field_types(variant)
             .iter()
             .enumerate()
-            .map(|(index, (_, it))| (field(index), it.ty().instantiate(interner, args).skip_norm_wip()))
+            .map(|(index, (_, it))| {
+                (field(index), it.ty().instantiate(interner, args).skip_norm_wip())
+            })
             .collect::<Vec<_>>() // alloc: a held path's parts, on a body with a linear value
     };
     match ty.kind() {
-        TyKind::Adt(def, args) if def.is_box() => vec![(Some(ProjectionElem::Deref), args.type_at(0))], // alloc: as above
+        TyKind::Adt(def, args) if def.is_box() => {
+            vec![(Some(ProjectionElem::Deref), args.type_at(0))]
+        } // alloc: as above
         TyKind::Adt(def, args) => match (path.ty.variant_id, def.def_id()) {
             (Some(variant), _) => fields(variant, args),
             (None, AdtId::StructId(id)) => fields(id.into(), args),
@@ -131,12 +135,16 @@ fn parts_of<'db>(
             // fields does.
             (None, AdtId::EnumId(id)) => hir_ty::layout::enum_variant_ids(db, id)
                 .iter()
-                .filter(|&&variant| fields(variant.into(), args).iter().any(|&(_, it)| types.holds(it)))
+                .filter(|&&variant| {
+                    fields(variant.into(), args).iter().any(|&(_, it)| types.holds(it))
+                })
                 .map(|&variant| (Some(ProjectionElem::Downcast(variant.into())), ty))
                 .collect(), // alloc: as above
             (None, AdtId::UnionId(_)) => Vec::new(), // alloc: empty
         },
-        TyKind::Tuple(tys) => tys.iter().enumerate().map(|(index, it)| (field(index), it)).collect(), // alloc: as above
+        TyKind::Tuple(tys) => {
+            tys.iter().enumerate().map(|(index, it)| (field(index), it)).collect()
+        } // alloc: as above
         TyKind::Closure(_, args) => args
             .as_closure()
             .upvar_tys()
@@ -148,7 +156,8 @@ fn parts_of<'db>(
             let len = hir_ty::consteval::try_const_usize(db, len).unwrap_or(0) as u64;
             (0..len)
                 .map(|offset| {
-                    let step = ProjectionElem::ConstantIndex { offset, min_length: len, from_end: false };
+                    let step =
+                        ProjectionElem::ConstantIndex { offset, min_length: len, from_end: false };
                     (Some(step), element)
                 })
                 .collect() // alloc: as above
@@ -193,8 +202,8 @@ fn report<'db>(
     let how = match exit {
         Exit::ScopeEnd => "at the end of its scope".to_owned(), // alloc: error path
         Exit::Overwrite => "when a new value is assigned over it".to_owned(), // alloc: error path
-        Exit::Early(_, what) => format!("when {what}"), // alloc: error path
-        Exit::Here => "here".to_owned(), // alloc: error path
+        Exit::Early(_, what) => format!("when {what}"),         // alloc: error path
+        Exit::Here => "here".to_owned(),                        // alloc: error path
     };
     let some = match dropped {
         Dropped::Whole { maybe_moved: true } => ", on a path that does not move it,",
@@ -220,7 +229,10 @@ fn report<'db>(
     };
     let mut labels = Vec::new(); // alloc: error path
     if let Some(binding) = names::binding_of(body, state.place.local) {
-        labels.push((MirSpan::BindingId(binding), format!("`{}` is declared here", names::binding(db, body, binding))));
+        labels.push((
+            MirSpan::BindingId(binding),
+            format!("`{}` is declared here", names::binding(db, body, binding)),
+        ));
     }
     if let Exit::Early(_, _) = exit {
         labels.push((state.span, "and dropped here, at the end of its scope".to_owned())); // alloc: error path
@@ -246,9 +258,9 @@ fn exit_of<'db>(db: &'db base_db::Db, body: &MirBody<'db>, state: &DropState<'db
     if state.replace {
         return Exit::Overwrite;
     }
-    let assigned = body.basic_blocks[state.target].statements.first().is_some_and(|it| {
-        matches!(&it.kind, StatementKind::Assign(place, _) if *place == state.place)
-    });
+    let assigned = body.basic_blocks[state.target].statements.first().is_some_and(
+        |it| matches!(&it.kind, StatementKind::Assign(place, _) if *place == state.place),
+    );
     if assigned {
         return Exit::Overwrite;
     }
@@ -263,7 +275,10 @@ fn exit_of<'db>(db: &'db base_db::Db, body: &MirBody<'db>, state: &DropState<'db
     while let Some(at) = queue.pop_front() {
         for (pred, block) in body.basic_blocks.iter() {
             let Some(terminator) = &block.terminator else { continue };
-            if block.is_cleanup || seen[index(pred)] || !terminator.kind.successors().any(|it| it == at) {
+            if block.is_cleanup
+                || seen[index(pred)]
+                || !terminator.kind.successors().any(|it| it == at)
+            {
                 continue;
             }
             seen[index(pred)] = true;
@@ -272,9 +287,10 @@ fn exit_of<'db>(db: &'db base_db::Db, body: &MirBody<'db>, state: &DropState<'db
             {
                 return Exit::Early(expr, what);
             }
-            let chain = block.statements.iter().all(|it| {
-                matches!(it.kind, StatementKind::StorageDead(_) | StatementKind::Nop)
-            });
+            let chain = block
+                .statements
+                .iter()
+                .all(|it| matches!(it.kind, StatementKind::StorageDead(_) | StatementKind::Nop));
             if chain {
                 queue.push_back(pred);
             }
@@ -328,7 +344,7 @@ pub(crate) fn check_coroutine<'db>(
                 "`{value}` holds a `#[blaze::linear]` `{shown}` in an `async` body: the future \
                  may be dropped at any `.await`, which drops it without consuming it"
             ),
-            labels: Vec::new(), // alloc: error path, empty
+            labels: Vec::new(),              // alloc: error path, empty
             notes: vec![CONSUME.to_owned()], // alloc: error path
         });
     }

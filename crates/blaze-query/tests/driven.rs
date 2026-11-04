@@ -14,7 +14,8 @@ static ONE: Mutex<()> = Mutex::new(());
 
 fn run(name: &str) {
     let _one = ONE.lock();
-    let (_, scenario) = scenarios::ON_THE_SEED.iter().find(|(it, _)| *it == name).expect("a scenario of that name");
+    let (_, scenario) =
+        scenarios::ON_THE_SEED.iter().find(|(it, _)| *it == name).expect("a scenario of that name");
     scenario();
 }
 

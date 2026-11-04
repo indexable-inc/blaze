@@ -130,9 +130,16 @@ impl<'f> ImportGraph<'f> {
     /// sorts (by target, then stably by source), so it depends on the set of edges only, not
     /// their order or repeats. Columns and scratch are in `frame`: `#[blaze::noalloc]`.
     #[blaze::noalloc]
-    pub(super) fn from_edges(frame: &'f Frame, nodes: u32, edges: &[(u32, u32)]) -> ImportGraph<'f> {
+    pub(super) fn from_edges(
+        frame: &'f Frame,
+        nodes: u32,
+        edges: &[(u32, u32)],
+    ) -> ImportGraph<'f> {
         let kept = edges.iter().copied().filter(move |&(src, dst)| {
-            assert!(src < nodes && dst < nodes, "import graph edge {src} -> {dst} outside {nodes} modules");
+            assert!(
+                src < nodes && dst < nodes,
+                "import graph edge {src} -> {dst} outside {nodes} modules"
+            );
             src != dst
         });
         let mut graph = Csr::new_in(frame);
@@ -278,8 +285,12 @@ pub(super) fn import_graph<'f>(frame: &'f Frame, shape: &ImportShape) -> ImportG
 
 /// Blaze's test harness module (`blaze-engine`'s `test_harness::MODULE`). A path of the harness
 /// reads the children of the harness's parent (`DefMap::is_test_harness`).
-#[expect(clippy::disallowed_types, reason = "the process's one test harness name symbol for this solver: the constant is interned once")]
-static TEST_HARNESS: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one test harness name symbol for this solver: the constant is interned once"
+)]
+static TEST_HARNESS: std::sync::LazyLock<Symbol> =
+    std::sync::LazyLock::new(|| Symbol::intern("__blaze_test_harness"));
 
 const ROOT: u32 = 0;
 const NONE: u32 = u32::MAX;
@@ -459,7 +470,15 @@ impl<'a, 'f> Solver<'a, 'f> {
                 let binds = if import.is_glob { None } else { import.binds };
                 let glob = import.is_glob && !import.is_prelude;
                 let path = &import.path;
-                self.add_path(x, path, ResolveMode::Import, binds, glob, import.is_prelude, import.hygienic);
+                self.add_path(
+                    x,
+                    path,
+                    ResolveMode::Import,
+                    binds,
+                    glob,
+                    import.is_prelude,
+                    import.hygienic,
+                );
                 // Which module the prelude is, every module learns from this import's
                 // resolution, so each comes after the module that has it.
                 if import.is_prelude {
@@ -575,7 +594,10 @@ impl<'a, 'f> Solver<'a, 'f> {
         match self.pair_ids.entry((module, name)) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
-                assert!(self.pairs.len() < ID_LIMIT, "an import shape with 2^31 (module, name) pairs");
+                assert!(
+                    self.pairs.len() < ID_LIMIT,
+                    "an import shape with 2^31 (module, name) pairs"
+                );
                 entry.insert(id);
                 self.pairs.push(PairRow {
                     name,

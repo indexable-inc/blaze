@@ -10,7 +10,10 @@
 //! The tables are the check's: [`Paths`] lives in [`Cx`] and keeps them in its frame, each built
 //! the first time it is read, and every later answer is a hash probe and a slice.
 
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one check, dropped with it, not global state"
+)]
 use std::cell::OnceCell;
 
 use base_db::{CrateOrigin, LangCrateOrigin};
@@ -18,7 +21,8 @@ use blaze_hash::FixedState;
 use blaze_mem::Frame;
 use hashbrown::hash_map::Entry;
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExternCrateId, ItemContainerId, Lookup, ModuleDefId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExternCrateId, ItemContainerId, Lookup,
+    ModuleDefId,
     attrs::AttrFlags,
     expr_store::Body,
     item_scope::{ImportOrExternCrate, ImportOrGlob, ItemScope},
@@ -71,10 +75,20 @@ fn list_children(cx: &Cx<'_, '_>, def: Def, out: &mut Column<'_, Child>) {
             scope_children(cx, scope, out, child);
         }
         Def::Adt(AdtId::EnumId(it)) => {
-            out.extend(it.enum_variants(db).variants.iter().map(|(name, &(id, _))| child(name, Def::Variant(id), false)));
+            out.extend(
+                it.enum_variants(db)
+                    .variants
+                    .iter()
+                    .map(|(name, &(id, _))| child(name, Def::Variant(id), false)),
+            );
         }
         Def::Trait(it) => {
-            out.extend(it.trait_items(db).items.iter().map(|(name, item)| child(name, Def::of_assoc(*item), false)));
+            out.extend(
+                it.trait_items(db)
+                    .items
+                    .iter()
+                    .map(|(name, item)| child(name, Def::of_assoc(*item), false)),
+            );
         }
         _ => {}
     }
@@ -86,7 +100,8 @@ fn scope_children(
     out: &mut Column<'_, Child>,
     child: impl Fn(&Name, Def, bool) -> Child,
 ) {
-    let hidden = |owner: AttrDefId| AttrFlags::query(cx.db, owner).contains(AttrFlags::IS_DOC_HIDDEN);
+    let hidden =
+        |owner: AttrDefId| AttrFlags::query(cx.db, owner).contains(AttrFlags::IS_DOC_HIDDEN);
     let reexport = |import: Option<ImportOrExternCrate>| match import {
         Some(ImportOrExternCrate::Import(it)) => hidden(AttrDefId::UseId(it.use_)),
         Some(ImportOrExternCrate::Glob(it)) => hidden(AttrDefId::UseId(it.use_)),
@@ -182,7 +197,10 @@ impl<'f> Tree<'f> {
 /// - printing's (`trimmed_def_paths`, `visible_parent_map`, the crate's `extern crate` items),
 ///   the first time a path is printed;
 /// - [`Decls`], every declaration by its name, the first time an import is looked for.
-#[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "OnceCell: a memo of one check, dropped with it, not global state"
+)]
 pub(crate) struct Paths<'f> {
     frame: &'f Frame,
     printing: OnceCell<Printing<'f>>,
@@ -199,7 +217,10 @@ struct Printing<'f> {
 }
 
 impl<'f> Paths<'f> {
-    #[expect(clippy::disallowed_types, reason = "OnceCell: a memo of one check, dropped with it, not global state")]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: a memo of one check, dropped with it, not global state"
+    )]
     pub(crate) fn new(cx: &Cx<'f, '_>) -> Paths<'f> {
         Paths { frame: cx.frame(), printing: OnceCell::new(), decls: OnceCell::new() }
     }
@@ -218,7 +239,11 @@ impl<'f> Paths<'f> {
     }
 
     /// The `extern crate` item the crate names `krate` by, when it writes one.
-    pub(crate) fn extern_crate(&self, cx: &Cx<'_, '_>, krate: base_db::Crate) -> Option<ExternCrateId> {
+    pub(crate) fn extern_crate(
+        &self,
+        cx: &Cx<'_, '_>,
+        krate: base_db::Crate,
+    ) -> Option<ExternCrateId> {
         self.printing(cx).extern_crates.get(&krate).copied()
     }
 
@@ -293,7 +318,8 @@ fn local_names<'f>(
 ) {
     let db = cx.db;
     let mut bodies: Column<'f, DefWithBodyId> = Vec::new_in(frame);
-    let mut seen_bodies: Set<'f, DefWithBodyId> = hashbrown::HashSet::with_hasher_in(FixedState, frame);
+    let mut seen_bodies: Set<'f, DefWithBodyId> =
+        hashbrown::HashSet::with_hasher_in(FixedState, frame);
     let def_map = crate_def_map(db, cx.krate.into());
     let mut scopes: Column<'f, &ItemScope> = Vec::new_in(frame);
     scopes.extend(def_map.modules(db).map(|(_, data)| data.scope(db)));
@@ -340,7 +366,9 @@ fn local_names<'f>(
                     ModuleDefId::ConstId(it) => bodies.push(it.into()),
                     ModuleDefId::StaticId(it) => bodies.push(it.into()),
                     ModuleDefId::TraitId(it) => {
-                        bodies.extend(it.trait_items(db).items.iter().filter_map(|(_, it)| body_of(*it)));
+                        bodies.extend(
+                            it.trait_items(db).items.iter().filter_map(|(_, it)| body_of(*it)),
+                        );
                     }
                     _ => {}
                 }
@@ -382,11 +410,10 @@ fn direct_crates<'f>(
         CrateOrigin::Lang(it) => Some(it),
         _ => None,
     };
-    let injected = deps
-        .iter()
-        .map(|it| it.krate)
-        .find(|&it| lang(it) == Some(LangCrateOrigin::Std))
-        .or_else(|| deps.iter().map(|it| it.krate).find(|&it| lang(it) == Some(LangCrateOrigin::Core)));
+    let injected =
+        deps.iter().map(|it| it.krate).find(|&it| lang(it) == Some(LangCrateOrigin::Std)).or_else(
+            || deps.iter().map(|it| it.krate).find(|&it| lang(it) == Some(LangCrateOrigin::Core)),
+        );
     let mut out: Column<'f, hir::Crate> = Vec::with_capacity_in(deps.len(), frame);
     out.extend(injected);
     for krate in deps.iter().map(|it| it.krate) {
@@ -493,7 +520,9 @@ impl<'f> Decls<'f> {
             let row = *at.entry(*name.symbol()).or_insert(next);
             pairs.push((row, Decl { def, local }));
         };
-        for krate in std::iter::once(cx.krate).chain(cx.krate.dependencies_iter(db).map(|it| it.krate)) {
+        for krate in
+            std::iter::once(cx.krate).chain(cx.krate.dependencies_iter(db).map(|it| it.krate))
+        {
             let local = krate == cx.krate;
             for (_, data) in crate_def_map(db, krate.into()).modules(db) {
                 for id in data.scope(db).declarations() {

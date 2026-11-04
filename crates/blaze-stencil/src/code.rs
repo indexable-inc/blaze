@@ -72,7 +72,10 @@ pub struct Reloc {
 pub enum Name {
     /// A user name of the function's IR (`ir::UserExternalName`): namespace 0 functions and
     /// 1 data, as the IR builder declares them, any other one of its own.
-    User { namespace: u32, index: u32 },
+    User {
+        namespace: u32,
+        index: u32,
+    },
     LibCall(ir::LibCall),
     Known(ir::KnownSymbol),
     /// The function itself, this many bytes into its code.
@@ -189,7 +192,9 @@ impl UnwindRef<'_> {
             // alloc: a function's unwind information, owned by its `Code`.
             UnwindRef::Windows { len, info } => Unwind::Windows { len, info: info.to_vec() },
             // alloc: a function's unwind information, owned by its `Code`.
-            UnwindRef::WindowsArm64 { len, codes } => Unwind::WindowsArm64 { len, codes: codes.to_vec() },
+            UnwindRef::WindowsArm64 { len, codes } => {
+                Unwind::WindowsArm64 { len, codes: codes.to_vec() }
+            }
         }
     }
 }
@@ -204,11 +209,17 @@ impl Code {
         self.align = align;
         refill(&mut self.relocs, relocs);
         match (&mut self.unwind, unwind) {
-            (Some(Unwind::Dwarf { len, rows }), Some(UnwindRef::Dwarf { len: new, rows: theirs })) => {
+            (
+                Some(Unwind::Dwarf { len, rows }),
+                Some(UnwindRef::Dwarf { len: new, rows: theirs }),
+            ) => {
                 *len = new;
                 refill(rows, theirs);
             }
-            (Some(Unwind::Windows { len, info }), Some(UnwindRef::Windows { len: new, info: theirs })) => {
+            (
+                Some(Unwind::Windows { len, info }),
+                Some(UnwindRef::Windows { len: new, info: theirs }),
+            ) => {
                 *len = new;
                 refill(info, theirs);
             }

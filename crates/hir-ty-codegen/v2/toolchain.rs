@@ -100,8 +100,10 @@ const AARCH64_IMPLIES: &[(&str, &[&str])] = &[
 ];
 
 const X86_64: &[&str] = &["fxsr", "sse", "sse2", "x87"];
-const X86_64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse3", "sse4.1", "sse4.2", "ssse3"];
-const X86_64_V3: &[&str] = &["avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"];
+const X86_64_V2: &[&str] =
+    &["cmpxchg16b", "lahfsahf", "popcnt", "sse3", "sse4.1", "sse4.2", "ssse3"];
+const X86_64_V3: &[&str] =
+    &["avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"];
 const X86_64_V4: &[&str] = &["avx512bw", "avx512cd", "avx512dq", "avx512f", "avx512vl"];
 const AARCH64: &[&str] = &["fp-armv8", "neon"];
 const APPLE_M1: &[&str] = &["fp-armv8", "lse", "neon"];
@@ -129,7 +131,12 @@ pub enum Runs {
 /// `-C target-feature` in the flags wins over where it runs. `target_data` is what the front end
 /// lays the unit's types out by (its crates' `TargetData`, the data layout from blaze-units'
 /// recorded spec): part of the id, as code made under one layout is not code for another.
-pub fn toolchain(target: &str, target_data: &TargetData, rustflags: &[String], runs: Runs) -> Result<Toolchain, String> {
+pub fn toolchain(
+    target: &str,
+    target_data: &TargetData,
+    rustflags: &[String],
+    runs: Runs,
+) -> Result<Toolchain, String> {
     toolchain_for(&code()?, target, target_data, rustflags, runs)
 }
 
@@ -283,7 +290,11 @@ pub struct CodegenCode(pub ContentId);
 impl CodegenCode {
     /// Of the 64 hex digits `blaze_codegen_code::emit` sets `BLAZE_CODEGEN_CODE` to.
     pub fn from_hex(hex: &str) -> Result<CodegenCode, String> {
-        let refused = || format!("the code generator's code identity `{hex}` is not 64 hex digits (`BLAZE_CODEGEN_CODE`)");
+        let refused = || {
+            format!(
+                "the code generator's code identity `{hex}` is not 64 hex digits (`BLAZE_CODEGEN_CODE`)"
+            )
+        };
         if hex.len() != 64 {
             return Err(refused());
         }
@@ -336,7 +347,8 @@ pub fn code() -> Result<CodegenCode, String> {
 pub(crate) fn fixture_target_data(tuple: &str) -> TargetData {
     TargetData {
         tuple: intern::Symbol::intern(tuple),
-        data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128".into(),
+        data_layout: "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+            .into(),
         arch: base_db::target::Arch::Other,
         has_thumb_interworking: false,
     }
@@ -458,9 +470,26 @@ fn host_features(target: &Target) -> Vec<&'static str> {
             };
         }
         detect!(
-            "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt", "avx", "avx2", "fma", "f16c", "bmi1",
-            "bmi2", "lzcnt", "avx512f", "avx512vl", "avx512dq", "avx512bw", "avx512cd",
-            "avx512bitalg", "avx512vbmi", "avx512vnni"
+            "sse3",
+            "ssse3",
+            "sse4.1",
+            "sse4.2",
+            "popcnt",
+            "avx",
+            "avx2",
+            "fma",
+            "f16c",
+            "bmi1",
+            "bmi2",
+            "lzcnt",
+            "avx512f",
+            "avx512vl",
+            "avx512dq",
+            "avx512bw",
+            "avx512cd",
+            "avx512bitalg",
+            "avx512vbmi",
+            "avx512vnni"
         );
     }
     #[cfg(target_arch = "aarch64")]
@@ -472,7 +501,9 @@ fn host_features(target: &Target) -> Vec<&'static str> {
         }
         detect!("lse", "fp16", "dotprod", "i8mm");
         // rustc has them on or off together.
-        if std::arch::is_aarch64_feature_detected!("paca") && std::arch::is_aarch64_feature_detected!("pacg") {
+        if std::arch::is_aarch64_feature_detected!("paca")
+            && std::arch::is_aarch64_feature_detected!("pacg")
+        {
             found.extend(["paca", "pacg"]);
         }
     }
@@ -542,21 +573,67 @@ struct Flags {
 /// The flags of rustc that take the next word as their value, when not given it after `=`
 /// or joined: their value is not a flag.
 const TAKES_VALUE: &[&str] = &[
-    "--cfg", "--check-cfg", "-L", "-l", "--extern", "--cap-lints", "-A", "-W", "-D", "-F",
-    "--allow", "--warn", "--deny", "--forbid", "--force-warn", "--edition", "--crate-type",
-    "--crate-name", "--emit", "--print", "-o", "--out-dir", "--target", "--sysroot",
-    "--error-format", "--json", "--color", "--explain", "--diagnostic-width", "--env-set",
-    "-Z", "--remap-path-scope",
+    "--cfg",
+    "--check-cfg",
+    "-L",
+    "-l",
+    "--extern",
+    "--cap-lints",
+    "-A",
+    "-W",
+    "-D",
+    "-F",
+    "--allow",
+    "--warn",
+    "--deny",
+    "--forbid",
+    "--force-warn",
+    "--edition",
+    "--crate-type",
+    "--crate-name",
+    "--emit",
+    "--print",
+    "-o",
+    "--out-dir",
+    "--target",
+    "--sysroot",
+    "--error-format",
+    "--json",
+    "--color",
+    "--explain",
+    "--diagnostic-width",
+    "--env-set",
+    "-Z",
+    "--remap-path-scope",
 ];
 
 /// The `-C` options that change only the link, the output's names or what is reported:
 /// the link's and cargo's, not the code's.
 const NOT_CODE: &[&str] = &[
-    "ar", "codegen-units", "default-linker-libraries", "dlltool", "embed-bitcode",
-    "extra-filename", "incremental", "inline-threshold", "link-arg", "link-args",
-    "link-dead-code", "link-self-contained", "linker", "linker-flavor", "metadata",
-    "no-stack-check", "prefer-dynamic", "relro-level", "remark", "rpath", "save-temps",
-    "split-debuginfo", "strip", "unsafe-allow-abi-mismatch",
+    "ar",
+    "codegen-units",
+    "default-linker-libraries",
+    "dlltool",
+    "embed-bitcode",
+    "extra-filename",
+    "incremental",
+    "inline-threshold",
+    "link-arg",
+    "link-args",
+    "link-dead-code",
+    "link-self-contained",
+    "linker",
+    "linker-flavor",
+    "metadata",
+    "no-stack-check",
+    "prefer-dynamic",
+    "relro-level",
+    "remark",
+    "rpath",
+    "save-temps",
+    "split-debuginfo",
+    "strip",
+    "unsafe-allow-abi-mismatch",
 ];
 
 /// The `-C` options the profile says: blaze compiles with the profile's.
@@ -571,8 +648,14 @@ const PROFILE: &[(&str, &str)] = &[
 /// The `-C` options that change code and are off unless asked: blaze's code is as with
 /// them off, so only an off value is taken.
 const OFF: &[&str] = &[
-    "control-flow-guard", "instrument-coverage", "linker-plugin-lto", "lto",
-    "no-prepopulate-passes", "no-redzone", "no-vectorize-loops", "no-vectorize-slp",
+    "control-flow-guard",
+    "instrument-coverage",
+    "linker-plugin-lto",
+    "lto",
+    "no-prepopulate-passes",
+    "no-redzone",
+    "no-vectorize-loops",
+    "no-vectorize-slp",
     "soft-float",
 ];
 
@@ -633,7 +716,8 @@ impl Flags {
             "target-cpu" => {
                 let cpu = value.filter(|it| !it.is_empty());
                 // alloc: an error
-                self.cpu = Some(cpu.ok_or_else(|| format!("{}: no CPU named", shown()))?.to_owned());
+                self.cpu =
+                    Some(cpu.ok_or_else(|| format!("{}: no CPU named", shown()))?.to_owned());
             }
             "target-feature" => {
                 for feature in value.unwrap_or_default().split(',').filter(|it| !it.is_empty()) {
@@ -671,7 +755,8 @@ impl Flags {
                     Some(model.ok_or_else(|| format!("{}: no model named", shown()))?.to_owned());
             }
             "passes" => {
-                let passes = value.unwrap_or_default().split([' ', ',']).filter(|it| !it.is_empty());
+                let passes =
+                    value.unwrap_or_default().split([' ', ',']).filter(|it| !it.is_empty());
                 for pass in passes {
                     if pass != "sancov-module" {
                         // alloc: an error

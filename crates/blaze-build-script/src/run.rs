@@ -9,9 +9,8 @@
 //! is given; the caller makes cargo's files of a run itself from [`invoked`] and [`files`].
 
 use std::{
-    fs,
+    fmt, fs,
     io::Write,
-    fmt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -51,10 +50,14 @@ impl Ended {
 impl fmt::Display for Ended {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.signal, self.code) {
-            (Some(signal), _) => write!(f, "signal: {signal}{}", blaze_core::signal::described(signal)),
+            (Some(signal), _) => {
+                write!(f, "signal: {signal}{}", blaze_core::signal::described(signal))
+            }
             // std's Windows text: a code with the high bit set is an exception's, said in hex.
             #[cfg(windows)]
-            (None, Some(code)) if code as u32 & 0x8000_0000 != 0 => write!(f, "exit code: {:#x}", code as u32),
+            (None, Some(code)) if code as u32 & 0x8000_0000 != 0 => {
+                write!(f, "exit code: {:#x}", code as u32)
+            }
             #[cfg(windows)]
             (None, Some(code)) => write!(f, "exit code: {code}"),
             #[cfg(not(windows))]
@@ -195,11 +198,8 @@ fn refused(unit: &Unit, status: Ended, stdout: &[u8], stderr: &[u8]) -> Result<(
     let failed = |error: String| Failed { error: Error(error), log_messages: logged(stdout) };
     if !status.success() {
         // alloc: error path.
-        let mut cause = format!(
-            "process didn't exit successfully: `{}` ({})",
-            unit.script.display(),
-            status
-        );
+        let mut cause =
+            format!("process didn't exit successfully: `{}` ({})", unit.script.display(), status);
         for (name, out) in [("stdout", stdout), ("stderr", stderr)] {
             if let Ok(out) = std::str::from_utf8(out)
                 && !out.trim().is_empty()

@@ -393,7 +393,10 @@ fn update_submodule(
         .is_ok_and(|it| it.trim() == "none")
     {
         if !context.net.retry.quiet {
-            eprintln!("    Skipping git submodule `{}` due to update strategy in .gitmodules", blaze_fetch::redact(&url));
+            eprintln!(
+                "    Skipping git submodule `{}` due to update strategy in .gitmodules",
+                blaze_fetch::redact(&url)
+            );
         }
         return Ok(());
     }
@@ -612,7 +615,11 @@ fn walk(
     Ok(())
 }
 
-fn read_nested(dir: &Path, found: &mut Vec<Found>, visited: &mut blaze_hash::HashSet<PathBuf, std::alloc::Global>) {
+fn read_nested(
+    dir: &Path,
+    found: &mut Vec<Found>,
+    visited: &mut blaze_hash::HashSet<PathBuf, std::alloc::Global>,
+) {
     if !visited.insert(dir.to_owned()) {
         return;
     }
@@ -689,7 +696,11 @@ mod tests {
         }
         paths.push(PathBuf::from("/w/a").join("/x/../y"));
         for path in &paths {
-            assert_eq!(blaze_manifest::paths::normalize_path(path), old_normalize(path), "{path:?}");
+            assert_eq!(
+                blaze_manifest::paths::normalize_path(path),
+                old_normalize(path),
+                "{path:?}"
+            );
         }
     }
 

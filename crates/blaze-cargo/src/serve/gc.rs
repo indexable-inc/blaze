@@ -161,8 +161,8 @@ impl Gc {
             sizes: Some(Sizes::new()),
             locks: (0..count).map(|_| None).collect(), // alloc: once per daemon, an area or two
             held_areas: vec![String::new(); count],    // alloc: once per daemon, an area or two
-            askers: Vec::new(), // alloc: none until `blaze cache gc` asks
-            answers: Vec::new(), // alloc: none until `blaze cache gc` asks
+            askers: Vec::new(),                        // alloc: none until `blaze cache gc` asks
+            answers: Vec::new(),                       // alloc: none until `blaze cache gc` asks
         };
         gc.lock_areas();
         gc
@@ -239,7 +239,9 @@ impl Gc {
         };
         // clone: the areas, once a build out of space
         let areas = self.collector.config().areas.clone();
-        let area = areas.iter().position(|area| blaze_gc::space::volume(Path::new(area)).is_ok_and(|it| it.id == full));
+        let area = areas.iter().position(|area| {
+            blaze_gc::space::volume(Path::new(area)).is_ok_and(|it| it.id == full)
+        });
         match area {
             Some(area) => Some(self.hold(Some(area))),
             None => {
@@ -313,7 +315,9 @@ impl Gc {
             match blaze_gc::space::volume(Path::new(area)) {
                 Ok(volume) => self.collector.volume(at, volume),
                 Err(why) => {
-                    let why = format!("the volume of {area} was not measured, so its free space does not pace the collector: {why}");
+                    let why = format!(
+                        "the volume of {area} was not measured, so its free space does not pace the collector: {why}"
+                    );
                     // Once a change of problem: the volumes are measured every second while
                     // builds run, and the report names it once.
                     if self.problem.as_deref() != Some(why.as_str()) {
@@ -368,14 +372,21 @@ impl Gc {
         // A build that starts, and every second while builds run: one `statvfs` an area.
         let started = !idle && self.idle;
         // A build held for space is let go once the volume is measured freed (review N5).
-        let every = if idle && !self.collector.holding() { MEASURE_IDLE_NS } else { MEASURE_BUSY_NS };
+        let every =
+            if idle && !self.collector.holding() { MEASURE_IDLE_NS } else { MEASURE_BUSY_NS };
         let measured = started || now.saturating_sub(self.measured_ns) >= every;
         if measured {
             self.measure(now);
         }
         let due = self.collector.next_deadline().is_some_and(|at| now >= at);
         let ledger_due = self.ledger_due && now.saturating_sub(self.written_ns) >= LEDGER_EVERY_NS;
-        if !answered && !measured && !due && !ledger_due && idle == self.idle && !self.collector.running() {
+        if !answered
+            && !measured
+            && !due
+            && !ledger_due
+            && idle == self.idle
+            && !self.collector.running()
+        {
             // What was leased meanwhile matters only to a run under way.
             while blaze_gc::lease::take_used().is_some() {}
             return;
@@ -483,8 +494,16 @@ impl Gc {
             move || {
                 let mut sizes = sizes;
                 let answer = match &mut sizes {
-                    Some(sizes) => blaze_gc::fs::execute(&decision, &areas, Some(&gate), &gate.clock, sizes),
-                    None => blaze_gc::fs::execute(&decision, &areas, Some(&gate), &gate.clock, &mut Sizes::new()),
+                    Some(sizes) => {
+                        blaze_gc::fs::execute(&decision, &areas, Some(&gate), &gate.clock, sizes)
+                    }
+                    None => blaze_gc::fs::execute(
+                        &decision,
+                        &areas,
+                        Some(&gate),
+                        &gate.clock,
+                        &mut Sizes::new(),
+                    ),
                 };
                 (answer, sizes)
             },
@@ -521,7 +540,9 @@ impl Gc {
             None,
             Class::Background,
             move || {
-                let _span = tracing::info_span!(target: "blaze", "gc ledger write", path = %path.display()).entered();
+                let _span =
+                    tracing::info_span!(target: "blaze", "gc ledger write", path = %path.display())
+                        .entered();
                 blaze_gc::ledger::write(&path, &ledger)
             },
             move |done| {
@@ -542,10 +563,16 @@ fn failed(decision: &Decision, why: String) -> Option<Answer> {
         Decision::Scan { run, .. } => Some(Answer::Scanned { run: *run, found: Err(why) }),
         Decision::Trash { run, path, .. } => {
             // clone: the answer's own path, once a failure
-            Some(Answer::Trashed { run: *run, path: path.clone(), swept: blaze_gc::plan::Swept::Failed(why) })
+            Some(Answer::Trashed {
+                run: *run,
+                path: path.clone(),
+                swept: blaze_gc::plan::Swept::Failed(why),
+            })
         }
         // clone: the answer's own path, once a failure
-        Decision::Unlink { run, path } => Some(Answer::Unlinked { run: *run, path: path.clone(), done: Err(why) }),
+        Decision::Unlink { run, path } => {
+            Some(Answer::Unlinked { run: *run, path: path.clone(), done: Err(why) })
+        }
         Decision::Record { .. } => None,
     }
 }

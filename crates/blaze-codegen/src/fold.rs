@@ -30,7 +30,10 @@ use crate::{InstanceKey, Settings, Target, backend::Emitted, content::target_id,
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Constant {
     /// An integer immediate of `bits` bits, zero-extended.
-    Int { bits: u8, value: u128 },
+    Int {
+        bits: u8,
+        value: u128,
+    },
     /// A float immediate's bits.
     F32(u32),
     F64(u64),
@@ -362,7 +365,8 @@ impl<'a> Split<'a> {
             if members.len() < limits.min_members as usize {
                 continue;
             }
-            let (varying_of, classes) = (&self.varying[part * n..][..n], &self.classes[part * n..][..n]);
+            let (varying_of, classes) =
+                (&self.varying[part * n..][..n], &self.classes[part * n..][..n]);
             self.param_of.clear();
             self.param_of.resize(n, u32::MAX);
             // alloc: the group's own list, moved into it
@@ -644,7 +648,10 @@ mod tests {
         forms: &'a Forms,
         items: &'a [(InstanceKey, Masked, Vec<Target>)],
     ) -> Vec<(InstanceKey, InstanceKey, Settings, Masking<'a>, &'a Refs)> {
-        items.iter().map(|(k, m, r)| (*k, *k, settings(1), masking(forms, m), r.as_slice())).collect()
+        items
+            .iter()
+            .map(|(k, m, r)| (*k, *k, settings(1), masking(forms, m), r.as_slice()))
+            .collect()
     }
 
     /// The body is emitted as the group's first member, with that member's line rows, side
@@ -676,10 +683,17 @@ mod tests {
 
         let edited = group(&[(key(1), key(41), s, ma, &rs[..]), (key(3), key(3), s, mc, &rs[..])]);
         assert_eq!(edited.2, key(41));
-        assert_ne!(first_1.3, edited.3, "the first member's code kept under another key is another body");
+        assert_ne!(
+            first_1.3, edited.3,
+            "the first member's code kept under another key is another body"
+        );
 
-        let other_rest = group(&[(key(1), key(1), s, ma, &rs[..]), (key(4), key(4), s, md, &rs[..])]);
-        assert_eq!(first_1.3, other_rest.3, "one first member and shape is one body, whatever the others");
+        let other_rest =
+            group(&[(key(1), key(1), s, ma, &rs[..]), (key(4), key(4), s, md, &rs[..])]);
+        assert_eq!(
+            first_1.3, other_rest.3,
+            "one first member and shape is one body, whatever the others"
+        );
     }
 
     /// One instance key given twice with its code kept under two keys: which one stays would
@@ -692,7 +706,14 @@ mod tests {
         let (a, b) = (grow(4, 4), grow(8, 2));
         let (ma, mb) = (masking(&forms, &a), masking(&forms, &b));
         let s = settings(1);
-        groups(&[(key(1), key(1), s, ma, &rs[..]), (key(1), key(41), s, ma, &rs[..]), (key(3), key(3), s, mb, &rs[..])], &Limits::default());
+        groups(
+            &[
+                (key(1), key(1), s, ma, &rs[..]),
+                (key(1), key(41), s, ma, &rs[..]),
+                (key(3), key(3), s, mb, &rs[..]),
+            ],
+            &Limits::default(),
+        );
     }
 
     /// 3 has one reference more than 1 and 2, which no instruction names: the merged body is
@@ -703,13 +724,20 @@ mod tests {
         let forms = Forms::new();
         let mut more = refs(9, 10);
         more.push(Target::Extern("memcpy".to_owned()));
-        let items = [(key(1), grow(4, 4), refs(9, 10)), (key(2), grow(8, 8), refs(9, 10)), (key(3), grow(16, 8), more)];
+        let items = [
+            (key(1), grow(4, 4), refs(9, 10)),
+            (key(2), grow(8, 8), refs(9, 10)),
+            (key(3), grow(16, 8), more),
+        ];
         let groups = groups(&of(&forms, &items), &Limits::default());
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![key(1), key(2)]);
 
         let alike = [(key(1), grow(4, 4), refs(9, 10)), (key(2), grow(8, 8), refs(9, 10))];
-        assert_eq!(groups[0].key(), super::groups(&of(&forms, &alike), &Limits::default())[0].key());
+        assert_eq!(
+            groups[0].key(),
+            super::groups(&of(&forms, &alike), &Limits::default())[0].key()
+        );
     }
 
     #[test]
@@ -802,7 +830,10 @@ mod tests {
         let forms = Forms::new();
         let a = [(key(1), grow(8, 8), refs(9, 10)), (key(2), grow(4, 8), refs(9, 10))];
         let b = [(key(1), grow(8, 8), refs(12, 10)), (key(2), grow(4, 8), refs(12, 10))];
-        let (a, b) = (groups(&of(&forms, &a), &Limits::default()), groups(&of(&forms, &b), &Limits::default()));
+        let (a, b) = (
+            groups(&of(&forms, &a), &Limits::default()),
+            groups(&of(&forms, &b), &Limits::default()),
+        );
         assert_eq!(a[0].varying, b[0].varying);
         assert_ne!(a[0].key(), b[0].key());
     }
@@ -1030,7 +1061,8 @@ mod tests {
                         _ => int(u128::from(rng.below(2) * 8)),
                     })
                     .collect();
-                let refs = (0..3).map(|_| Target::Function(key(100 + rng.below(3) as u8))).collect();
+                let refs =
+                    (0..3).map(|_| Target::Function(key(100 + rng.below(3) as u8))).collect();
                 let size = if rng.below(8) == 0 { 4 } else { [40, 400, 4000][shape as usize] };
                 let masked = Masked { shape: vec![shape], constants, size };
                 let settings = settings(if rng.below(8) == 0 { 2 } else { 1 });
@@ -1054,8 +1086,10 @@ mod tests {
             let items = random(&mut rng);
             let candidates: Vec<_> =
                 items.iter().map(|(k, s, m, r)| (*k, *k, *s, m, r.as_slice())).collect();
-            let interned: Vec<_> =
-                items.iter().map(|(k, s, m, r)| (*k, *k, *s, masking(&forms, m), r.as_slice())).collect();
+            let interned: Vec<_> = items
+                .iter()
+                .map(|(k, s, m, r)| (*k, *k, *s, masking(&forms, m), r.as_slice()))
+                .collect();
             for limits in &limits {
                 let want = reference::groups(&candidates, limits);
                 found += want.len();
@@ -1081,7 +1115,9 @@ mod tests {
             match rng.below(7) {
                 0 => Target::Function(key(n)),
                 1 => Target::Direct(key(n)),
-                2 => Target::Static { item: blaze_items::ItemKey(id), instance: ContentId([0; 32]) },
+                2 => {
+                    Target::Static { item: blaze_items::ItemKey(id), instance: ContentId([0; 32]) }
+                }
                 3 => Target::Data(id),
                 4 => Target::Extern(name),
                 5 => Target::Weak(name),
@@ -1157,7 +1193,10 @@ mod tests {
         let rs = refs(9, 10);
         let ma = Masking::of(&forms, &a);
         let wrong = Masking { form: Masking::of(&forms, &b).form, constants: &other };
-        let candidates = [(key(1), key(1), settings(1), ma, &rs[..]), (key(2), key(2), settings(1), wrong, &rs[..])];
+        let candidates = [
+            (key(1), key(1), settings(1), ma, &rs[..]),
+            (key(2), key(2), settings(1), wrong, &rs[..]),
+        ];
         groups(&candidates, &Limits::default());
     }
 

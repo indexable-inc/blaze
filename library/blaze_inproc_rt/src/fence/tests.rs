@@ -158,7 +158,8 @@ fn every_slot_taken_leaves_a_thread_without_one() {
 #[test]
 fn a_full_table_waits() {
     let mut fences = Fences::new(words());
-    let entries: Vec<u32> = (0..ENTRIES as u64).map(|it| fences.post(it * 16, it * 16 + 16).unwrap()).collect();
+    let entries: Vec<u32> =
+        (0..ENTRIES as u64).map(|it| fences.post(it * 16, it * 16 + 16).unwrap()).collect();
     assert_eq!(fences.post(0, 16), None);
     fences.clear(entries[17]);
     assert_eq!(fences.post(0, 16), Some(17));
@@ -186,8 +187,16 @@ fn a_waiter_for_an_announcement_wakes_at_it_or_at_its_timeout() {
     let fences = Arc::new(Fences::new(words()));
     fences.announce(3);
     let started = Instant::now();
-    assert_eq!(Thread::wait_announced(fences.words(), 2, Duration::from_secs(60)), 3, "not what was seen: at once");
-    assert_eq!(Thread::wait_announced(fences.words(), 3, Duration::from_millis(20)), 3, "nothing announced");
+    assert_eq!(
+        Thread::wait_announced(fences.words(), 2, Duration::from_secs(60)),
+        3,
+        "not what was seen: at once"
+    );
+    assert_eq!(
+        Thread::wait_announced(fences.words(), 3, Duration::from_millis(20)),
+        3,
+        "nothing announced"
+    );
     let announcer = Arc::clone(&fences);
     let announcing = std::thread::spawn(move || {
         blaze_spin::busy(Duration::from_millis(50));
@@ -354,7 +363,10 @@ fn threads_never_run_freed_code() {
     let mut generation = 1u64;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut listed: Vec<u64> = Vec::new();
-    let collect = |fences: &mut Fences<Shared>, limbo: &mut Vec<(Grace, u32, usize)>, free: &mut Vec<usize>, listed: &mut Vec<u64>| {
+    let collect = |fences: &mut Fences<Shared>,
+                   limbo: &mut Vec<(Grace, u32, usize)>,
+                   free: &mut Vec<usize>,
+                   listed: &mut Vec<u64>| {
         let births = fences.births();
         listed.clear();
         listed.extend_from_slice(&world.listed.lock());
@@ -375,7 +387,9 @@ fn threads_never_run_freed_code() {
     // Moves go on until the workers have called through them, however late they are scheduled;
     // all the lanes having ended (a worker panicked) stops them, to report that panic.
     let mut moves = 0;
-    while (moves < MOVES || world.calls.load(Ordering::Relaxed) < OVERLAP) && !lanes.iter().all(|it| it.is_finished()) {
+    while (moves < MOVES || world.calls.load(Ordering::Relaxed) < OVERLAP)
+        && !lanes.iter().all(|it| it.is_finished())
+    {
         assert!(
             Instant::now() < deadline,
             "{} calls landed in {moves} moves",
@@ -383,7 +397,11 @@ fn threads_never_run_freed_code() {
         );
         moves += 1;
         while free.is_empty() {
-            assert!(Instant::now() < deadline, "the fence never passed: {} ranges held", limbo.len());
+            assert!(
+                Instant::now() < deadline,
+                "the fence never passed: {} ranges held",
+                limbo.len()
+            );
             freed += collect(&mut fences, &mut limbo, &mut free, &mut listed);
             std::thread::yield_now();
         }

@@ -17,8 +17,9 @@ use crate::{
         attrs::{
             accept::{Accept, BinaryFormat},
             args::{ArgParser, MetaItem, MetaItemOrLit, MetaList, NameValue},
-            cfg, is, with_path,
+            cfg, is,
             parsed::{Inline, Optimize, Parsed, ParsedAttr, Repr},
+            with_path,
         },
         features::attributes,
     },
@@ -128,7 +129,9 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
         ["instrument_fn"] => Accepted::Single(instrument_fn(cx, args)),
         ["sanitize"] => Accepted::Single(sanitize(cx, args)),
         ["thread_local"] => no_args(cx, args, other("ThreadLocal")),
-        ["rustc_pass_indirectly_in_non_rustic_abis"] => no_args(cx, args, Parsed::RustcPassIndirectlyInNonRusticAbis),
+        ["rustc_pass_indirectly_in_non_rustic_abis"] => {
+            no_args(cx, args, Parsed::RustcPassIndirectlyInNonRusticAbis)
+        }
         ["rustc_eii_foreign_item"] => no_args(cx, args, other("RustcEiiForeignItem")),
         ["patchable_function_entry"] => Accepted::Single(patchable_function_entry(cx, args)),
         ["inline"] => Accepted::Single(inline(cx, args)),
@@ -185,7 +188,11 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
     }
 }
 
-pub(crate) fn finalize(state: &mut State, group: &'static str, fx: &mut Finalize<'_, '_, '_>) -> Option<Parsed> {
+pub(crate) fn finalize(
+    state: &mut State,
+    group: &'static str,
+    fx: &mut Finalize<'_, '_, '_>,
+) -> Option<Parsed> {
     match group {
         "naked" => {
             let naked = state.naked?;
@@ -194,7 +201,9 @@ pub(crate) fn finalize(state: &mut State, group: &'static str, fx: &mut Finalize
         }
         "used" => state.used.then_some(Parsed::Other("Used")),
         "target_feature" => state.target_feature.then_some(Parsed::Other("TargetFeature")),
-        "force_target_feature" => state.force_target_feature.then_some(Parsed::Other("TargetFeature")),
+        "force_target_feature" => {
+            state.force_target_feature.then_some(Parsed::Other("TargetFeature"))
+        }
         "repr" => Some(Parsed::Repr(std::mem::take(&mut state.repr))),
         "link" => state.link.then_some(Parsed::Other("Link")),
         "rustc_align" => state.align.map(|_| Parsed::Other("RustcAlign")),
@@ -203,29 +212,48 @@ pub(crate) fn finalize(state: &mut State, group: &'static str, fx: &mut Finalize
     }
 }
 
-pub(crate) fn check(group: GroupId, first: usize, fx: &mut Finalize<'_, '_, '_>, _parsed: &[ParsedAttr]) {
+pub(crate) fn check(
+    group: GroupId,
+    first: usize,
+    fx: &mut Finalize<'_, '_, '_>,
+    _parsed: &[ParsedAttr],
+) {
     match group {
         GroupId::Named("target_feature") => {
             if fx.session.target.is_like_wasm() {
                 return;
             }
-            let lang =
-                fx.owner.attrs.iter().find_map(|attr| ["panic_handler", "lang"].into_iter().find(|it| is(attr, it)));
+            let lang = fx
+                .owner
+                .attrs
+                .iter()
+                .find_map(|attr| ["panic_handler", "lang"].into_iter().find(|it| is(attr, it)));
             if let Some(kind) = lang {
                 let what = match kind {
                     "panic_handler" => "`#[panic_handler]`",
                     _ => "lang item",
                 };
                 // alloc: the error's message
-                let mut diag = Diag::error(None, format!("`#[target_feature]` cannot be applied to a {what} function"), fx.attr_span(first));
+                let mut diag = Diag::error(
+                    None,
+                    format!("`#[target_feature]` cannot be applied to a {what} function"),
+                    fx.attr_span(first),
+                );
                 // alloc: the error's label
-                diag.span_label(fx.target_span(), format!("{what} function is not allowed to have `#[target_feature]`"));
+                diag.span_label(
+                    fx.target_span(),
+                    format!("{what} function is not allowed to have `#[target_feature]`"),
+                );
                 fx.emit_err(diag);
             }
         }
         GroupId::Single(["ffi_pure"]) => {
             if fx.owner.attrs.iter().any(|it| is(it, "ffi_const")) {
-                let diag = Diag::error(Some("E0757"), "`#[ffi_const]` function cannot be `#[ffi_pure]`", fx.attr_span(first));
+                let diag = Diag::error(
+                    Some("E0757"),
+                    "`#[ffi_const]` function cannot be `#[ffi_pure]`",
+                    fx.attr_span(first),
+                );
                 fx.emit_err(diag);
             }
         }
@@ -272,7 +300,8 @@ fn export_name(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> 
     let nv = cx.expect_name_value(args, cx.attr_range(), None)?;
     let name = cx.expect_string_literal(nv)?;
     if name.contains('\0') {
-        let diag = cx.err(Some("E0648"), "`export_name` may not contain null characters", cx.attr_range());
+        let diag =
+            cx.err(Some("E0648"), "`export_name` may not contain null characters", cx.attr_range());
         cx.emit_err(diag);
         return None;
     }
@@ -289,13 +318,18 @@ fn objc(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, what: &str) -> Option<Par
     let nv = cx.expect_name_value(args, cx.attr_range(), None)?;
     let Some(value) = nv.value_as_str() else {
         // alloc: the error's message
-        let diag = cx.err(None, format!("`objc::{what}!` expected a string literal"), nv.value_range());
+        let diag =
+            cx.err(None, format!("`objc::{what}!` expected a string literal"), nv.value_range());
         cx.emit_err(diag);
         return None;
     };
     if value.contains('\0') {
         // alloc: the error's message
-        let diag = cx.err(None, format!("`objc::{what}!` may not contain null characters"), nv.value_range());
+        let diag = cx.err(
+            None,
+            format!("`objc::{what}!` may not contain null characters"),
+            nv.value_range(),
+        );
         cx.emit_err(diag);
         return None;
     }
@@ -344,7 +378,11 @@ fn naked_compatible(fx: &mut Finalize<'_, '_, '_>, naked: usize) {
             continue;
         }
         if is(attr, "target_feature") {
-            let diag = attributes::naked_target_feature(fx.cx, &fx.session.features, attr.in_file(attr.path_range()));
+            let diag = attributes::naked_target_feature(
+                fx.cx,
+                &fx.session.features,
+                attr.in_file(attr.path_range()),
+            );
             if let Some(diag) = diag {
                 fx.emit_err(diag);
             }
@@ -352,9 +390,16 @@ fn naked_compatible(fx: &mut Finalize<'_, '_, '_>, naked: usize) {
         }
         let path_span = fx.span(index, attr.path_range());
         // clone: the error's span
-        let mut diag = Diag::error(Some("E0736"), "attribute incompatible with `#[unsafe(naked)]`", path_span.clone());
+        let mut diag = Diag::error(
+            Some("E0736"),
+            "attribute incompatible with `#[unsafe(naked)]`",
+            path_span.clone(),
+        );
         // alloc: the error's label
-        diag.span_label(path_span, format!("the `{}` attribute is incompatible with `#[unsafe(naked)]`", attr.name()));
+        diag.span_label(
+            path_span,
+            format!("the `{}` attribute is incompatible with `#[unsafe(naked)]`", attr.name()),
+        );
         diag.span_label(fx.attr_span(naked), "function marked with `#[unsafe(naked)]` here");
         fx.emit_err(diag);
     }
@@ -368,7 +413,12 @@ fn used(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
             let Some(item) = cx.expect_single(list) else { return false };
             match word_of(item) {
                 Some(by @ ("compiler" | "linker")) => {
-                    cx.emit_gate(attributes::used_with_arg(cx.cx, &cx.session.features, by, cx.in_file(cx.attr_range())));
+                    cx.emit_gate(attributes::used_with_arg(
+                        cx.cx,
+                        &cx.session.features,
+                        by,
+                        cx.in_file(cx.attr_range()),
+                    ));
                     true
                 }
                 _ => {
@@ -460,7 +510,10 @@ fn sanitize(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
             "hwaddress" | "kernel_hwaddress" => apply(cx, HWADDRESS | KERNELHWADDRESS),
             "realtime" => {
                 if !matches!(value.value_as_str(), Some("nonblocking" | "blocking" | "caller")) {
-                    cx.expected_specific_argument_strings(value.value_range(), &["nonblocking", "blocking", "caller"]);
+                    cx.expected_specific_argument_strings(
+                        value.value_range(),
+                        &["nonblocking", "blocking", "caller"],
+                    );
                 }
             }
             _ => cx.expected_specific_argument_strings(
@@ -485,7 +538,11 @@ fn sanitize(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
         && let Some((_, field)) = NAMES.iter().find(|(bit, _)| set & !ADDRESS & bit != 0)
     {
         // alloc: the error's message
-        let mut diag = cx.err(None, format!("`#[sanitize({field} = ...)]` attribute cannot be used on statics"), cx.attr_range());
+        let mut diag = cx.err(
+            None,
+            format!("`#[sanitize({field} = ...)]` attribute cannot be used on statics"),
+            cx.attr_range(),
+        );
         diag.help("`#[sanitize]` can be used on statics if only the address is sanitized");
         cx.emit_err(diag);
     }
@@ -520,7 +577,11 @@ fn patchable_function_entry(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Op
                     return None;
                 };
                 if name.contains('\0') {
-                    let diag = cx.err(Some("E0648"), "`section` may not contain null characters", value.value_range());
+                    let diag = cx.err(
+                        Some("E0648"),
+                        "`section` may not contain null characters",
+                        value.value_range(),
+                    );
                     cx.emit_err(diag);
                 }
                 if name.is_empty() {
@@ -679,10 +740,13 @@ const DATA: &[Policy] = &[
 
 /// `parse_repr`.
 fn repr_hint(cx: &mut Accept<'_, '_, '_>, param: &MetaItem) -> Option<Repr> {
-    const INTS: &[&str] = &["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize"];
+    const INTS: &[&str] =
+        &["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize"];
     /// Each of `INTS` as `check_target` writes its arguments.
-    const INT_ARGS: [&str; 12] =
-        ["(i8)", "(u8)", "(i16)", "(u16)", "(i32)", "(u32)", "(i64)", "(u64)", "(i128)", "(u128)", "(isize)", "(usize)"];
+    const INT_ARGS: [&str; 12] = [
+        "(i8)", "(u8)", "(i16)", "(u16)", "(i32)", "(u32)", "(i64)", "(u64)", "(i128)", "(u128)",
+        "(isize)", "(usize)",
+    ];
     let hint = param.path.word_sym();
     match hint {
         Some("align") => {
@@ -723,7 +787,11 @@ fn repr_hint(cx: &mut Accept<'_, '_, '_>, param: &MetaItem) -> Option<Repr> {
             })
         }
         Some("simd") => {
-            cx.emit_gate(attributes::repr_simd(cx.cx, &cx.session.features, cx.in_file(param.range())));
+            cx.emit_gate(attributes::repr_simd(
+                cx.cx,
+                &cx.session.features,
+                cx.in_file(param.range()),
+            ));
             cx.check_target("(simd)", Targets::AllowList(&[Policy::Allow(Target::Struct)]));
             cx.expect_no_args(&param.args)?;
             Some(Repr::Simd)
@@ -775,7 +843,9 @@ fn alignment(cx: &mut Accept<'_, '_, '_>, lit: &crate::checks::attrs::args::Lit)
                 match max {
                     Some(max) if value > max => {
                         // alloc: the error's reason
-                        format!("alignment larger than `isize::MAX` bytes ({max} for the current target)")
+                        format!(
+                            "alignment larger than `isize::MAX` bytes ({max} for the current target)"
+                        )
                     }
                     _ => return Some(value as u64),
                 }
@@ -822,7 +892,8 @@ fn link_name(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
     let nv = cx.expect_name_value(args, cx.attr_range(), None)?;
     let name = cx.expect_string_literal(nv)?;
     if name.contains('\0') {
-        let diag = cx.err(Some("E0648"), "link name may not contain null characters", nv.value_range());
+        let diag =
+            cx.err(Some("E0648"), "link name may not contain null characters", nv.value_range());
         cx.emit_err(diag);
         return None;
     }
@@ -903,8 +974,14 @@ fn link(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
             Some("cfg") => {
                 if cfg {
                     cx.duplicate_key(item.range(), "cfg");
-                } else if let Some(predicate) = cx.expect_single_element_list(&item.args, item.range()) {
-                    cx.emit_gate(attributes::link_cfg(cx.cx, &cx.session.features, cx.in_file(item.range())));
+                } else if let Some(predicate) =
+                    cx.expect_single_element_list(&item.args, item.range())
+                {
+                    cx.emit_gate(attributes::link_cfg(
+                        cx.cx,
+                        &cx.session.features,
+                        cx.in_file(item.range()),
+                    ));
                     cfg = cfg::entry(cx, predicate);
                 }
                 true
@@ -922,12 +999,16 @@ fn link(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
                     cx.duplicate_key(item.range(), "import_name_type");
                 } else if let Some((value, _)) = link_string(cx, item, "import_name_type") {
                     if cx.session.target.arch != "x86" {
-                        let diag = cx.err(None, "import name type is only supported on x86", item.range());
+                        let diag =
+                            cx.err(None, "import name type is only supported on x86", item.range());
                         cx.emit_err(diag);
                     } else if matches!(value.as_str(), "decorated" | "noprefix" | "undecorated") {
                         import_name_type = Some(item.range());
                     } else {
-                        cx.expected_specific_argument_strings(item.range(), &["decorated", "noprefix", "undecorated"]);
+                        cx.expected_specific_argument_strings(
+                            item.range(),
+                            &["decorated", "noprefix", "undecorated"],
+                        );
                     }
                 }
                 true
@@ -950,12 +1031,20 @@ fn link(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
     if let Some(range) = wasm_import_module
         && (name.is_some() || kind.is_some() || modifiers.is_some() || cfg)
     {
-        let diag = cx.err(None, "`wasm_import_module` is incompatible with other arguments in `#[link]` attributes", range);
+        let diag = cx.err(
+            None,
+            "`wasm_import_module` is incompatible with other arguments in `#[link]` attributes",
+            range,
+        );
         cx.emit_err(diag);
     }
     let is_wasm_import = wasm_import_module.is_some();
     if name.is_none() && !is_wasm_import {
-        let mut diag = cx.err(Some("E0459"), "`#[link]` attribute requires a `name = \"string\"` argument", cx.attr_range());
+        let mut diag = cx.err(
+            Some("E0459"),
+            "`#[link]` attribute requires a `name = \"string\"` argument",
+            cx.attr_range(),
+        );
         diag.span_label(cx.attr_span(), "missing `name` argument");
         cx.emit_err(diag);
         return false;
@@ -963,14 +1052,19 @@ fn link(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
     if let Some(range) = import_name_type
         && (is_wasm_import || kind != Some(LinkKind::RawDylib))
     {
-        let diag = cx.err(None, "import name type can only be used with link kind `raw-dylib`", range);
+        let diag =
+            cx.err(None, "import name type can only be used with link kind `raw-dylib`", range);
         cx.emit_err(diag);
     }
     true
 }
 
 /// `name = "string"` of a `#[link]` argument.
-fn link_string(cx: &mut Accept<'_, '_, '_>, item: &MetaItem, key: &str) -> Option<(String, TextRange)> {
+fn link_string(
+    cx: &mut Accept<'_, '_, '_>,
+    item: &MetaItem,
+    key: &str,
+) -> Option<(String, TextRange)> {
     let nv: &NameValue = cx.expect_name_value(&item.args, item.range(), Some(key))?;
     let value = cx.expect_string_literal(nv)?;
     Some((value, nv.value_range()))
@@ -979,14 +1073,21 @@ fn link_string(cx: &mut Accept<'_, '_, '_>, item: &MetaItem, key: &str) -> Optio
 /// `parse_link_kind`'s errors of `kind = ".."`.
 fn link_kind(cx: &mut Accept<'_, '_, '_>, value: &str, range: TextRange) -> Option<LinkKind> {
     let target = &cx.session.target;
-    let (is_darwin, is_windows, is_elf) =
-        (target.is_like_darwin(), target.is_like_windows(), target.binary_format() == BinaryFormat::Elf);
+    let (is_darwin, is_windows, is_elf) = (
+        target.is_like_darwin(),
+        target.is_like_windows(),
+        target.binary_format() == BinaryFormat::Elf,
+    );
     Some(match value {
         "static" => LinkKind::Static,
         "dylib" => LinkKind::Dylib,
         "framework" => {
             if !is_darwin {
-                let diag = cx.err(Some("E0455"), "link kind `framework` is only supported on Apple targets", range);
+                let diag = cx.err(
+                    Some("E0455"),
+                    "link kind `framework` is only supported on Apple targets",
+                    range,
+                );
                 cx.emit_err(diag);
             }
             LinkKind::Framework
@@ -994,26 +1095,46 @@ fn link_kind(cx: &mut Accept<'_, '_, '_>, value: &str, range: TextRange) -> Opti
         "raw-dylib" => {
             if is_windows || is_elf && cx.feature("raw_dylib_elf") {
             } else if is_elf && cx.session.features.nightly {
-                cx.emit_gate(attributes::link_kind_raw_dylib_elf(cx.cx, &cx.session.features, cx.in_file(range)));
+                cx.emit_gate(attributes::link_kind_raw_dylib_elf(
+                    cx.cx,
+                    &cx.session.features,
+                    cx.in_file(range),
+                ));
             } else {
-                let diag = cx.err(Some("E0455"), "link kind `raw-dylib` is only supported on Windows targets", range);
+                let diag = cx.err(
+                    Some("E0455"),
+                    "link kind `raw-dylib` is only supported on Windows targets",
+                    range,
+                );
                 cx.emit_err(diag);
             }
             LinkKind::RawDylib
         }
         "link-arg" => {
-            cx.emit_gate(attributes::link_kind_link_arg(cx.cx, &cx.session.features, cx.in_file(range)));
+            cx.emit_gate(attributes::link_kind_link_arg(
+                cx.cx,
+                &cx.session.features,
+                cx.in_file(range),
+            ));
             LinkKind::LinkArg
         }
         _ => {
-            cx.expected_specific_argument_strings(range, &["static", "dylib", "framework", "raw-dylib", "link-arg"]);
+            cx.expected_specific_argument_strings(
+                range,
+                &["static", "dylib", "framework", "raw-dylib", "link-arg"],
+            );
             return None;
         }
     })
 }
 
 /// The errors of `modifiers = ".."`.
-fn link_modifiers(cx: &mut Accept<'_, '_, '_>, modifiers: &str, range: TextRange, kind: Option<LinkKind>) {
+fn link_modifiers(
+    cx: &mut Accept<'_, '_, '_>,
+    modifiers: &str,
+    range: TextRange,
+    kind: Option<LinkKind>,
+) {
     // Each of the five modifiers `assign` is given at most once.
     let (mut seen, mut count) = ([""; 5], 0);
     for modifier in modifiers.split(',') {
@@ -1029,7 +1150,11 @@ fn link_modifiers(cx: &mut Accept<'_, '_, '_>, modifiers: &str, range: TextRange
         let mut assign = |cx: &mut Accept<'_, '_, '_>, name: &'static str| {
             if seen[..count].contains(&name) {
                 // alloc: the error's message
-                let diag = cx.err(None, format!("multiple `{name}` modifiers in a single `modifiers` argument"), range);
+                let diag = cx.err(
+                    None,
+                    format!("multiple `{name}` modifiers in a single `modifiers` argument"),
+                    range,
+                );
                 cx.emit_err(diag);
             } else {
                 seen[count] = name;
@@ -1040,7 +1165,11 @@ fn link_modifiers(cx: &mut Accept<'_, '_, '_>, modifiers: &str, range: TextRange
         match name {
             "bundle" if is_static => assign(cx, "bundle"),
             "bundle" => {
-                let diag = cx.err(None, "linking modifier `bundle` is only compatible with `static` linking kind", range);
+                let diag = cx.err(
+                    None,
+                    "linking modifier `bundle` is only compatible with `static` linking kind",
+                    range,
+                );
                 cx.emit_err(diag);
             }
             "export-symbols" if is_static => assign(cx, "export-symbols"),
@@ -1054,8 +1183,18 @@ fn link_modifiers(cx: &mut Accept<'_, '_, '_>, modifiers: &str, range: TextRange
                 let diag = cx.err(None, "linking modifier `whole-archive` is only compatible with `static` linking kind", range);
                 cx.emit_err(diag);
             }
-            "as-needed" if matches!(kind, Some(LinkKind::Dylib | LinkKind::Framework | LinkKind::RawDylib)) => {
-                cx.emit_gate(attributes::link_modifier(cx.cx, &cx.session.features, "as-needed", cx.in_file(range)));
+            "as-needed"
+                if matches!(
+                    kind,
+                    Some(LinkKind::Dylib | LinkKind::Framework | LinkKind::RawDylib)
+                ) =>
+            {
+                cx.emit_gate(attributes::link_modifier(
+                    cx.cx,
+                    &cx.session.features,
+                    "as-needed",
+                    cx.in_file(range),
+                ));
                 assign(cx, "as-needed");
             }
             "as-needed" => {
@@ -1078,7 +1217,11 @@ fn link_section(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed>
     let nv = cx.expect_name_value(args, cx.attr_range(), None)?;
     let name = cx.expect_string_literal(nv)?;
     if name.contains('\0') {
-        let diag = cx.err(Some("E0648"), "`link_section` may not contain null characters", cx.attr_range());
+        let diag = cx.err(
+            Some("E0648"),
+            "`link_section` may not contain null characters",
+            cx.attr_range(),
+        );
         cx.emit_err(diag);
         return None;
     }
@@ -1097,7 +1240,9 @@ fn link_section(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed>
             match reason {
                 None => {
                     diag.note("a Mach-O section specifier requires a segment and a section, separated by a comma");
-                    diag.help("an example of a valid Mach-O section specifier is `__TEXT,__cstring`");
+                    diag.help(
+                        "an example of a valid Mach-O section specifier is `__TEXT,__cstring`",
+                    );
                 }
                 Some(section) => {
                     // alloc: the error's note
@@ -1115,7 +1260,11 @@ fn link_ordinal(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed>
     let ordinal = single_integer(cx, args)?;
     if u16::try_from(ordinal).is_err() {
         // alloc: the error's message
-        let mut diag = cx.err(None, format!("ordinal value in `link_ordinal` is too large: `{ordinal}`"), cx.attr_range());
+        let mut diag = cx.err(
+            None,
+            format!("ordinal value in `link_ordinal` is too large: `{ordinal}`"),
+            cx.attr_range(),
+        );
         diag.note("the value may not exceed `u16::MAX`");
         cx.emit_err(diag);
         return None;
@@ -1276,7 +1425,11 @@ fn custom_mir(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
         {
             failed = true;
             // alloc: the error's message
-            let mut diag = cx.err(None, format!("the {dialect} dialect is not compatible with the {phase} phase"), cx.attr_range());
+            let mut diag = cx.err(
+                None,
+                format!("the {dialect} dialect is not compatible with the {phase} phase"),
+                cx.attr_range(),
+            );
             diag.span_label(cx.span(*dialect_range), "this dialect...");
             diag.span_label(cx.span(phase_range), "... is not compatible with this phase");
             cx.emit_err(diag);

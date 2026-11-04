@@ -131,7 +131,9 @@ fn a_thread_that_ends_gives_its_slot_back() {
     for _ in 0..(SLOTS * 3) {
         thread::spawn(|| drop(enter())).join().unwrap();
     }
-    let taken: usize = blocks().map(|block| block.slots.iter().filter(|it| it.taken.load(Ordering::SeqCst)).count()).sum();
+    let taken: usize = blocks()
+        .map(|block| block.slots.iter().filter(|it| it.taken.load(Ordering::SeqCst)).count())
+        .sum();
     assert!(taken < SLOTS * 2, "{taken} slots held after their threads ended");
 }
 
@@ -150,8 +152,10 @@ fn readers_never_see_a_node_freed_under_them() {
         }
     }
     const NODES: usize = 20_000;
-    let freed: Arc<Vec<AtomicBool>> = Arc::new((0..NODES).map(|_| AtomicBool::new(false)).collect());
-    let shared = Arc::new(AtomicPtr::new(Box::into_raw(Box::new(Node { id: 0, freed: freed.clone() }))));
+    let freed: Arc<Vec<AtomicBool>> =
+        Arc::new((0..NODES).map(|_| AtomicBool::new(false)).collect());
+    let shared =
+        Arc::new(AtomicPtr::new(Box::into_raw(Box::new(Node { id: 0, freed: freed.clone() }))));
     let stop = Arc::new(AtomicBool::new(false));
     let (bad, reads) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicU64::new(0)));
     let readers: Vec<_> = (0..4)

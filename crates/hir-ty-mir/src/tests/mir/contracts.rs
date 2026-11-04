@@ -33,7 +33,8 @@ fn lowered<T>(fixture_text: &str, name: &str, check: impl FnOnce(&MirBody<'_>, S
             .declarations()
             .find_map(|x| match x {
                 hir_def::ModuleDefId::FunctionId(it)
-                    if hir_def::signatures::FunctionSignature::of(&db, it).name.as_str() == name =>
+                    if hir_def::signatures::FunctionSignature::of(&db, it).name.as_str()
+                        == name =>
                 {
                     Some(it)
                 }

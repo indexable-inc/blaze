@@ -8,7 +8,8 @@ use blaze_ids::rng::SplitMix64;
 
 use crate::frame::{self, FrameError, Header, Kind, Reader, Writer, kinds};
 use crate::handshake::{
-    Grant, Hello, Lookup, MOST_BINDS, MOST_NAME, OVERLAY_BYTES, Overlay, Place, VERSION, hex, host_var, unhex,
+    Grant, Hello, Lookup, MOST_BINDS, MOST_NAME, OVERLAY_BYTES, Overlay, Place, VERSION, hex,
+    host_var, unhex,
 };
 use crate::image::testing::{R, RX, elf};
 use crate::sys::Rights;
@@ -42,7 +43,10 @@ fn frames_round_trip_whole_and_wait_when_cut() {
         let mut bytes = Vec::new();
         frame::encode(kind, seq, &body, &mut bytes).unwrap();
         let (decoded, used) = frame::decode(&bytes).unwrap().unwrap();
-        assert_eq!((decoded.kind, decoded.seq, decoded.body, used), (kind, seq, body.as_slice(), bytes.len()));
+        assert_eq!(
+            (decoded.kind, decoded.seq, decoded.body, used),
+            (kind, seq, body.as_slice(), bytes.len())
+        );
         let cut = rng.index(bytes.len());
         assert_eq!(frame::decode(&bytes[..cut]), Ok(None));
         let mut two = bytes.clone();
@@ -105,7 +109,15 @@ fn no_bytes_make_a_frame_panic() {
 #[test]
 fn fields_round_trip() {
     let mut body = Vec::new();
-    Writer::new(&mut body).u8(1).u16(2).u32(3).u64(4).i64(-5).bytes(b"six").str("seven").raw(&[8, 8]);
+    Writer::new(&mut body)
+        .u8(1)
+        .u16(2)
+        .u32(3)
+        .u64(4)
+        .i64(-5)
+        .bytes(b"six")
+        .str("seven")
+        .raw(&[8, 8]);
     let mut read = Reader::new(&body);
     assert_eq!(read.u8(), Ok(1));
     assert_eq!(read.u16(), Ok(2));
@@ -149,7 +161,13 @@ fn kind_ranges_are_apart() {
 
 #[test]
 fn hellos_round_trip_and_refuse_cuts() {
-    let hello = Hello { token: core::array::from_fn(|it| it as u8), pid: 77, version: VERSION, page: 0x4000, header: 0x5555_0000_0000 };
+    let hello = Hello {
+        token: core::array::from_fn(|it| it as u8),
+        pid: 77,
+        version: VERSION,
+        page: 0x4000,
+        header: 0x5555_0000_0000,
+    };
     let mut bytes = Vec::new();
     hello.encode(&mut bytes);
     assert_eq!(Hello::decode(&bytes), Ok(hello));
@@ -205,8 +223,24 @@ fn a_grant() -> Grant {
                 place: Place::Reserved,
                 image: false,
             },
-            Overlay { object: 3, offset: 0, len: P, at: 0x10_c000, access: Access::Shared, place: Place::Reserved, image: false },
-            Overlay { object: 4, offset: 0, len: 8 * P, at: 0x11_0000, access: Access::Copy, place: Place::Reserved, image: true },
+            Overlay {
+                object: 3,
+                offset: 0,
+                len: P,
+                at: 0x10_c000,
+                access: Access::Shared,
+                place: Place::Reserved,
+                image: false,
+            },
+            Overlay {
+                object: 4,
+                offset: 0,
+                len: 8 * P,
+                at: 0x11_0000,
+                access: Access::Copy,
+                place: Place::Reserved,
+                image: true,
+            },
         ],
         writes: vec![
             ImageWrite { place: 0x11_0010, value: 0x11_2000, address: true },
@@ -253,11 +287,24 @@ fn a_grant_cut_or_mutated_is_an_error_not_a_panic() {
             let first: Vec<Rights> = grant.objects[..3].iter().map(|it| it.1).collect();
             assert_eq!(first, [Rights::Code, Rights::Words, Rights::Words]);
             for overlay in &grant.overlays {
-                assert!(overlay.object != 1 && overlay.object != 2 && (overlay.object as usize) < grant.objects.len());
+                assert!(
+                    overlay.object != 1
+                        && overlay.object != 2
+                        && (overlay.object as usize) < grant.objects.len()
+                );
                 let rights = grant.objects[overlay.object as usize].1;
-                assert!(rights != Rights::Code || overlay.access != Access::Shared, "code shared writable");
-                assert!(rights != Rights::Words || overlay.access == Access::Shared, "words executable");
-                assert!(overlay.place != Place::Code || (overlay.object == 0 && overlay.access == Access::Execute));
+                assert!(
+                    rights != Rights::Code || overlay.access != Access::Shared,
+                    "code shared writable"
+                );
+                assert!(
+                    rights != Rights::Words || overlay.access == Access::Shared,
+                    "words executable"
+                );
+                assert!(
+                    overlay.place != Place::Code
+                        || (overlay.object == 0 && overlay.access == Access::Execute)
+                );
                 assert!(grant.span.start <= overlay.at && overlay.range().end <= grant.span.end);
             }
             assert!(grant.overlays.windows(2).all(|it| it[0].range().end <= it[1].at));
@@ -331,10 +378,14 @@ fn a_grants_writes_and_lookups_round_trip_and_refuse_short_or_oversized_counts()
     let grant = a_grant();
     let decoded = Grant::decode(&encoded(&grant)).unwrap();
     assert_eq!(decoded.writes, grant.writes);
-    assert_eq!(decoded.lookups.iter().map(|it| decoded.name(it)).collect::<Vec<_>>(), ["malloc", "__rg_alloc"]);
+    assert_eq!(
+        decoded.lookups.iter().map(|it| decoded.name(it)).collect::<Vec<_>>(),
+        ["malloc", "__rg_alloc"]
+    );
     assert_eq!(decoded, grant);
 
-    let empty = Grant { writes: Vec::new(), lookups: Vec::new(), names: String::new(), ..a_grant() };
+    let empty =
+        Grant { writes: Vec::new(), lookups: Vec::new(), names: String::new(), ..a_grant() };
     assert_eq!(Grant::decode(&encoded(&empty)), Ok(empty));
 
     let bytes = encoded(&grant);
@@ -343,7 +394,9 @@ fn a_grants_writes_and_lookups_round_trip_and_refuse_short_or_oversized_counts()
     let lookups = writes + 4 + 17 * grant.writes.len();
     assert_eq!(bytes[lookups..lookups + 4], 2u32.to_le_bytes());
     // Counts past the bytes there are refused before anything is allocated for them.
-    for (at, count) in [(writes, u32::MAX), (writes, 3), (lookups, u32::MAX), (lookups, 3), (lookups, 1 << 30)] {
+    for (at, count) in
+        [(writes, u32::MAX), (writes, 3), (lookups, u32::MAX), (lookups, 3), (lookups, 1 << 30)]
+    {
         let mut forged = bytes.clone();
         forged[at..at + 4].copy_from_slice(&count.to_le_bytes());
         assert!(Grant::decode(&forged).is_err(), "a count of {count} at {at} was read");
@@ -356,7 +409,13 @@ fn a_grants_writes_and_lookups_round_trip_and_refuse_short_or_oversized_counts()
     assert!(Grant::decode(&forged).is_err());
     let long = "x".repeat(MOST_NAME + 1);
     let oversized = Grant {
-        lookups: vec![Lookup { place: 0x11_0020, addend: 0, weak: false, name: 0, len: long.len() as u32 }],
+        lookups: vec![Lookup {
+            place: 0x11_0020,
+            addend: 0,
+            weak: false,
+            name: 0,
+            len: long.len() as u32,
+        }],
         names: long.clone(),
         ..a_grant()
     };
@@ -366,7 +425,10 @@ fn a_grants_writes_and_lookups_round_trip_and_refuse_short_or_oversized_counts()
     let mut most = Grant { names: long[..MOST_NAME].to_owned(), ..oversized };
     most.lookups[0].len = MOST_NAME as u32;
     assert_eq!(Grant::decode(&encoded(&most)), Ok(most));
-    assert!(MOST_BINDS * 17 > frame::MOST_BODY as usize, "the frame bounds what a grant carries first");
+    assert!(
+        MOST_BINDS * 17 > frame::MOST_BODY as usize,
+        "the frame bounds what a grant carries first"
+    );
 }
 
 #[test]
@@ -399,7 +461,10 @@ fn a_grant_stores_only_into_a_dependency_images_private_copy() {
     for overlay in 0..3 {
         let mut grant = a_grant();
         grant.overlays[overlay].image = true;
-        assert!(Grant::decode(&encoded(&grant)).is_err(), "overlay {overlay} flagged a dependency image");
+        assert!(
+            Grant::decode(&encoded(&grant)).is_err(),
+            "overlay {overlay} flagged a dependency image"
+        );
     }
     // Flags other than 0 and 1.
     let bytes = encoded(&a_grant());
@@ -471,7 +536,8 @@ fn the_start_stores_writes_and_lookups_in_the_private_copy_and_a_weak_miss_as_ze
 
     // A weak lookup found gets its addend.
     let mut copied = Copied::of(&grant, 0);
-    crate::bind::bind(&grant, 0, |_| Ok(Some(0x1000)), |at, value| copied.store(at, value)).unwrap();
+    crate::bind::bind(&grant, 0, |_| Ok(Some(0x1000)), |at, value| copied.store(at, value))
+        .unwrap();
     assert_eq!(copied.word(0x11_0028), 0x1000 - 16);
 }
 
@@ -481,7 +547,8 @@ fn a_strong_miss_fails_the_start_naming_it_and_is_never_stored() {
     grant.lookups.push(Lookup { place: 0x11_0030, addend: 0, weak: false, name: 0, len: 6 });
     let grant = Grant::decode(&encoded(&grant)).unwrap();
     let mut copied = Copied::of(&grant, 0);
-    let error = crate::bind::bind(&grant, 0, |_| Ok(None), |at, value| copied.store(at, value)).unwrap_err();
+    let error = crate::bind::bind(&grant, 0, |_| Ok(None), |at, value| copied.store(at, value))
+        .unwrap_err();
     assert!(error.what.contains("`malloc`, `malloc`"), "{error}");
     assert!(copied.untouched(0x11_0020) && copied.untouched(0x11_0030), "a strong miss stored");
     assert_eq!(copied.word(0x11_0028), 0, "the weak one is still 0");
@@ -493,13 +560,25 @@ fn a_strong_miss_fails_the_start_naming_it_and_is_never_stored() {
     });
     let many = Grant {
         writes: Vec::new(),
-        lookups: (0..12).map(|it| Lookup { place: 0x11_0100 + 8 * it as u64, addend: 0, weak: false, name: 3 * it, len: 3 }).collect(),
+        lookups: (0..12)
+            .map(|it| Lookup {
+                place: 0x11_0100 + 8 * it as u64,
+                addend: 0,
+                weak: false,
+                name: 3 * it,
+                len: 3,
+            })
+            .collect(),
         names,
         ..a_grant()
     };
     let many = Grant::decode(&encoded(&many)).unwrap();
-    let error = crate::bind::bind(&many, 0, |_| Ok(None), |_, _| panic!("stored a strong miss")).unwrap_err();
-    assert!(error.what.contains("`f00`") && error.what.contains("`f07`") && !error.what.contains("f08"), "{error}");
+    let error = crate::bind::bind(&many, 0, |_| Ok(None), |_, _| panic!("stored a strong miss"))
+        .unwrap_err();
+    assert!(
+        error.what.contains("`f00`") && error.what.contains("`f07`") && !error.what.contains("f08"),
+        "{error}"
+    );
     assert!(error.what.contains("and 4 more"), "{error}");
 
     // What the scope says goes wrong is the start's error.
@@ -512,7 +591,10 @@ fn a_slide_is_refused_while_a_dependency_image_is_mapped_and_moves_only_addresse
     let grant = a_grant();
     crate::bind::check_slide(&grant, 0).unwrap();
     let error = crate::bind::check_slide(&grant, 0x5555_0000_0000).unwrap_err();
-    assert!(error.what.contains("0x110000..0x118000") && error.what.contains("0x555500000000"), "{error}");
+    assert!(
+        error.what.contains("0x110000..0x118000") && error.what.contains("0x555500000000"),
+        "{error}"
+    );
     let mut plain = a_grant();
     plain.overlays[3].image = false;
     plain.writes.clear();
@@ -522,7 +604,8 @@ fn a_slide_is_refused_while_a_dependency_image_is_mapped_and_moves_only_addresse
     // Where the rule is lifted, a write's address moves with the slide and an offset doesn't.
     let slide = 0x1_0000;
     let mut copied = Copied::of(&grant, slide);
-    crate::bind::bind(&grant, slide, |_| Ok(Some(0x9000)), |at, value| copied.store(at, value)).unwrap();
+    crate::bind::bind(&grant, slide, |_| Ok(Some(0x9000)), |at, value| copied.store(at, value))
+        .unwrap();
     assert_eq!(copied.word(0x11_0010 + slide), 0x11_2000 + slide);
     assert_eq!(copied.word(0x11_0000 + 8 * P - 8 + slide), 0x40);
     assert_eq!(copied.word(0x11_0020 + slide), 0x9000, "a found address is the process's own");
@@ -562,11 +645,15 @@ fn tokens_are_32_hex_digits_after_the_address() {
     let token: [u8; 16] = core::array::from_fn(|it| (it as u8) * 17);
     assert_eq!(hex(&token), "00112233445566778899aabbccddeeff");
     assert_eq!(unhex(hex(&token).as_bytes()), Some(token));
-    assert_eq!(unhex(b"000102030405060708090a0b0c0d0e0f"), Some(core::array::from_fn(|it| it as u8)));
+    assert_eq!(
+        unhex(b"000102030405060708090a0b0c0d0e0f"),
+        Some(core::array::from_fn(|it| it as u8))
+    );
     assert_eq!(unhex(b"000102030405060708090a0b0c0d0e0"), None);
     assert_eq!(unhex(b"000102030405060708090a0b0c0d0eFF"), None);
     assert_eq!(unhex(b"zz0102030405060708090a0b0c0d0e0f"), None);
-    let (address, token) = host_var(b"/run/blaze/host.sock\t000102030405060708090a0b0c0d0e0f").unwrap();
+    let (address, token) =
+        host_var(b"/run/blaze/host.sock\t000102030405060708090a0b0c0d0e0f").unwrap();
     assert_eq!((address, token), ("/run/blaze/host.sock", core::array::from_fn(|it| it as u8)));
     assert!(host_var(b"/run/blaze/host.sock").is_err());
     assert!(host_var(b"\xff\t000102030405060708090a0b0c0d0e0f").is_err());
@@ -683,7 +770,9 @@ fn the_arena_hands_out_aligned_ranges_after_the_image() {
         let range = memory.reserve(100, align).unwrap();
         assert!(range.offset >= image && range.end() <= memory.len());
         assert!(range.offset.is_multiple_of(align));
-        assert!(taken.iter().all(|it: &CodeRange| it.end() <= range.offset || range.end() <= it.offset));
+        assert!(
+            taken.iter().all(|it: &CodeRange| it.end() <= range.offset || range.end() <= it.offset)
+        );
         taken.push(range);
     }
     for range in taken {
@@ -702,7 +791,12 @@ fn the_arena_hands_out_aligned_ranges_after_the_image() {
 /// An ELF executable for pages of `page`: headers, one page of code at file offset `page`,
 /// and reservations for an arena and cells of a page each.
 fn an_executable(page: u64) -> Vec<u8> {
-    let mut bytes = elf(&[(R, 0, 0, 0x200, 0x200), (RX, page, page, page, page), (0, 0, 4 * page, 0, page), (0, 0, 6 * page, 0, page)]);
+    let mut bytes = elf(&[
+        (R, 0, 0, 0x200, 0x200),
+        (RX, page, page, page, page),
+        (0, 0, 4 * page, 0, page),
+        (0, 0, 6 * page, 0, page),
+    ]);
     bytes.resize(2 * page as usize, 0);
     bytes
 }
@@ -779,7 +873,11 @@ mod linux {
 
     fn temp_dir() -> PathBuf {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        std::env::temp_dir().join(format!("bzi-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+        std::env::temp_dir().join(format!(
+            "bzi-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// A function returning `value`, as bytes.
@@ -855,7 +953,14 @@ mod linux {
         fn new(len: usize) -> FileLike {
             // SAFETY: a new private anonymous mapping the kernel places; nothing else uses it.
             let at = unsafe {
-                libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
             };
             assert_ne!(at, libc::MAP_FAILED);
             FileLike { at: at as u64, len }
@@ -867,7 +972,16 @@ mod linux {
             // SAFETY: `len` writable bytes of the mapping `new` made, which no thread runs yet.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at as *mut u8, self.len) };
             // SAFETY: the same mapping, made read and execute before any thread runs it.
-            assert_eq!(unsafe { libc::mprotect(self.at as *mut libc::c_void, self.len, libc::PROT_READ | libc::PROT_EXEC) }, 0);
+            assert_eq!(
+                unsafe {
+                    libc::mprotect(
+                        self.at as *mut libc::c_void,
+                        self.len,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                    )
+                },
+                0
+            );
         }
 
         fn bytes(&self) -> &[u8] {
@@ -886,7 +1000,8 @@ mod linux {
     }
 
     #[test]
-    fn an_overlay_swaps_a_running_threads_code_with_every_byte_equal_and_a_patch_is_one_store_it_sees() {
+    fn an_overlay_swaps_a_running_threads_code_with_every_byte_equal_and_a_patch_is_one_store_it_sees()
+     {
         let mut memory = CodeMemory::new("swap", 1, 0).unwrap();
         let page = memory.page();
         let (stub, word) = stub();
@@ -923,21 +1038,38 @@ mod linux {
             })
         };
         let ran_since = |since: u64, what: &str| {
-            blaze_spin::SpinWait::within(what, Duration::from_secs(10), || calls.load(Ordering::Relaxed) > since);
+            blaze_spin::SpinWait::within(what, Duration::from_secs(10), || {
+                calls.load(Ordering::Relaxed) > since
+            });
         };
         ran_since(0, "the running thread to call the code");
         let (mut channel, _, _) = connected();
         let granted = [sys::granted(memory.object(), Rights::Code).unwrap()];
-        let overlay =
-            Overlay { object: 0, offset: 0, len: page, at: 0x1000_0000, access: Access::Execute, place: Place::Code, image: false };
-        sys::overlay(&mut channel, &granted, &[overlay], image.at.wrapping_sub(0x1000_0000)).unwrap();
+        let overlay = Overlay {
+            object: 0,
+            offset: 0,
+            len: page,
+            at: 0x1000_0000,
+            access: Access::Execute,
+            place: Place::Code,
+            image: false,
+        };
+        sys::overlay(&mut channel, &granted, &[overlay], image.at.wrapping_sub(0x1000_0000))
+            .unwrap();
         assert_eq!(image.bytes(), memory.bytes(CodeRange { offset: 0, len: page }).unwrap());
-        ran_since(calls.load(Ordering::Relaxed) + 1, "the running thread to call the code through the overlay");
+        ran_since(
+            calls.load(Ordering::Relaxed) + 1,
+            "the running thread to call the code through the overlay",
+        );
 
         memory.write(b, &returning(8)).unwrap();
         memory.publish(CodeRange { offset: b, len: 16 }).unwrap();
         memory.store_word(at + word, image.at + b).unwrap();
-        assert_eq!(image.bytes()[b as usize..b as usize + returning(8).len()], returning(8)[..], "the run sees the daemon's write");
+        assert_eq!(
+            image.bytes()[b as usize..b as usize + returning(8).len()],
+            returning(8)[..],
+            "the run sees the daemon's write"
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         stop.store(true, Ordering::Relaxed);
         while !runner.is_finished() {
@@ -962,7 +1094,9 @@ mod linux {
     fn the_listener_is_this_users_alone_and_knows_its_peer() {
         let dir = temp_dir();
         let (listener, address) = sys::Listener::bind(&dir).unwrap();
-        let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&dir).unwrap().permissions());
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&dir).unwrap().permissions(),
+        );
         assert_eq!(mode & 0o077, 0);
         let _hook = sys::connect(&address).unwrap();
         let (_, pid) = listener.accept().unwrap();
@@ -973,7 +1107,8 @@ mod linux {
 
         let open = temp_dir();
         std::fs::create_dir(&open).unwrap();
-        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         assert!(sys::Listener::bind(&open).is_err());
         let _ = std::fs::remove_dir(&open);
     }
@@ -1062,7 +1197,15 @@ mod linux {
                 (P, Rights::Words),
                 (memory.object().len(), Rights::Code),
             ],
-            overlays: vec![Overlay { object: 3, offset: 0, len: page, at, access: Access::Copy, place: Place::Reserved, image: true }],
+            overlays: vec![Overlay {
+                object: 3,
+                offset: 0,
+                len: page,
+                at,
+                access: Access::Copy,
+                place: Place::Reserved,
+                image: true,
+            }],
             writes: vec![ImageWrite { place: at + 8, value: 0x1234, address: false }],
             lookups: vec![
                 Lookup { place: at + 0x13, addend: 4, weak: false, name: 0, len: 6 },
@@ -1086,11 +1229,19 @@ mod linux {
         let copy = unsafe { std::slice::from_raw_parts(at as *const u8, page as usize) };
         let word = |offset: usize| u64::from_le_bytes(copy[offset..offset + 8].try_into().unwrap());
         assert_eq!(word(8), 0x1234);
-        assert_eq!(word(0x13), libc::getpid as usize as u64 + 4, "the global scope's getpid, unaligned");
+        assert_eq!(
+            word(0x13),
+            libc::getpid as usize as u64 + 4,
+            "the global scope's getpid, unaligned"
+        );
         assert_eq!(word(0x20), 0, "a weak miss");
         assert_eq!(copy[..8], data[..8]);
         assert_eq!(copy[0x28..], data[0x28..]);
-        assert_eq!(memory.bytes(CodeRange { offset: 0, len: page }).unwrap(), &data[..], "the memory object changed");
+        assert_eq!(
+            memory.bytes(CodeRange { offset: 0, len: page }).unwrap(),
+            &data[..],
+            "the memory object changed"
+        );
 
         let mut strong = grant.clone();
         strong.lookups[1].weak = false;
@@ -1114,13 +1265,17 @@ mod linux {
         assert_eq!(granted[0].len(), memory.object().len());
         assert_eq!(granted[1].len(), memory.control().len());
 
-        assert!(granted[0].map_anywhere(&mut hook, Access::Shared).is_err(), "the image mapped writable shared");
+        assert!(
+            granted[0].map_anywhere(&mut hook, Access::Shared).is_err(),
+            "the image mapped writable shared"
+        );
         let code = granted[0].map_anywhere(&mut hook, Access::Read).unwrap();
         // SAFETY: the object's first bytes, mapped readable for the rest of the test.
         assert_eq!(unsafe { std::slice::from_raw_parts(code as *const u8, 6) }, &returning(7)[..6]);
 
         let control = granted[1].map_anywhere(&mut hook, Access::Shared).unwrap();
-        let words = sys::adopt_words(control, granted[1].len(), crate::fence::CONTROL_BYTES).unwrap();
+        let words =
+            sys::adopt_words(control, granted[1].len(), crate::fence::CONTROL_BYTES).unwrap();
         assert!(crate::fence::Thread::ready(&words));
         assert_eq!(crate::fence::Thread::epoch(&words), memory.fences.epoch());
         memory.announce(41);
@@ -1132,7 +1287,8 @@ mod linux {
         use std::ffi::{CStr, CString, c_char};
 
         let take = |entries: &[&str]| {
-            let strings: Vec<CString> = entries.iter().map(|it| CString::new(*it).unwrap()).collect();
+            let strings: Vec<CString> =
+                entries.iter().map(|it| CString::new(*it).unwrap()).collect();
             let mut envp: Vec<*const c_char> = strings.iter().map(|it| it.as_ptr()).collect();
             envp.push(std::ptr::null());
             // SAFETY: a null-terminated array of the NUL-terminated `strings`, alive meanwhile.
@@ -1204,18 +1360,27 @@ mod linux {
             let path = dir.join("prog");
             let len = 2 * page - 3;
             let write = |memory: &CodeMemory, key: u8, store: Option<&std::path::Path>| {
-                host.write_executable(memory, &Executable { path: &path, key: [key; 32], len, store })
+                host.write_executable(
+                    memory,
+                    &Executable { path: &path, key: [key; 32], len, store },
+                )
             };
             let want = memory.bytes(CodeRange { offset: 0, len }).unwrap().to_vec();
 
             assert_eq!(write(&memory, 1, None), Ok(Wrote::Written));
             assert_eq!(std::fs::read(&path).unwrap(), want);
-            let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions());
+            let mode = std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&path).unwrap().permissions(),
+            );
             assert_eq!(mode & 0o777, 0o755);
             assert_eq!(write(&memory, 1, None), Ok(Wrote::Kept));
             assert_eq!(write(&memory, 2, None), Ok(Wrote::Written));
             std::fs::write(&path, b"another tool's file").unwrap();
-            assert_eq!(write(&memory, 2, None), Ok(Wrote::Written), "a file changed since is written again");
+            assert_eq!(
+                write(&memory, 2, None),
+                Ok(Wrote::Written),
+                "a file changed since is written again"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), want);
 
             let store = dir.join("store");
@@ -1232,10 +1397,18 @@ mod linux {
             assert_eq!(std::fs::read(&path).unwrap(), want);
 
             memory.store_word(page, 1).unwrap();
-            assert_eq!(write(&memory, 5, None), Ok(Wrote::Kept), "the file of this key is there: nothing to write");
+            assert_eq!(
+                write(&memory, 5, None),
+                Ok(Wrote::Kept),
+                "the file of this key is there: nothing to write"
+            );
             let error = write(&memory, 6, None).unwrap_err();
             assert!(error.what.contains("no longer the file the linker wrote"), "{error}");
-            let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|it| it.ok()).filter(|it| it.file_name().to_string_lossy().ends_with(".tmp")).collect();
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|it| it.ok())
+                .filter(|it| it.file_name().to_string_lossy().ends_with(".tmp"))
+                .collect();
             assert!(leftovers.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -1243,12 +1416,31 @@ mod linux {
         /// Plays the start hook of `command` in this process: hello at a slid header, the
         /// grant checked against the image's own layout, the control words and the asks
         /// mapped, STARTED.
-        fn play_hook(command: &Command, own: &Layout, slide: u64) -> (Channel, Grant, &'static [std::sync::atomic::AtomicU64]) {
-            let var = command.env.iter().find(|(name, _)| name == HOST_VAR).unwrap().1.to_str().unwrap().to_owned();
+        fn play_hook(
+            command: &Command,
+            own: &Layout,
+            slide: u64,
+        ) -> (Channel, Grant, &'static [std::sync::atomic::AtomicU64]) {
+            let var = command
+                .env
+                .iter()
+                .find(|(name, _)| name == HOST_VAR)
+                .unwrap()
+                .1
+                .to_str()
+                .unwrap()
+                .to_owned();
             let (address, token) = host_var(var.as_bytes()).unwrap();
             let mut channel = Channel::new(sys::connect(address).unwrap());
             let mut hello = Vec::new();
-            Hello { token, pid: std::process::id(), version: VERSION, page: sys::page(), header: own.header + slide }.encode(&mut hello);
+            Hello {
+                token,
+                pid: std::process::id(),
+                version: VERSION,
+                page: sys::page(),
+                header: own.header + slide,
+            }
+            .encode(&mut hello);
             channel.send(kinds::HELLO, 0, &hello).unwrap();
             let grant = {
                 let frame = channel.recv().unwrap();
@@ -1258,7 +1450,8 @@ mod linux {
             grant.check(own, sys::page()).unwrap();
             let granted = sys::recv_objects(&mut channel, grant.objects.len()).unwrap();
             let control = granted[1].map_anywhere(&mut channel, Access::Shared).unwrap();
-            let control = sys::adopt_words(control, granted[1].len(), crate::fence::CONTROL_BYTES).unwrap();
+            let control =
+                sys::adopt_words(control, granted[1].len(), crate::fence::CONTROL_BYTES).unwrap();
             assert!(crate::fence::Thread::ready(&control));
             let asks = granted[2].map_anywhere(&mut channel, Access::Shared).unwrap();
             let asks = sys::adopt_words(asks, granted[2].len(), crate::ask::BYTES).unwrap();
@@ -1319,21 +1512,43 @@ mod linux {
                 grant.objects.iter().map(|it| it.1).collect::<Vec<_>>(),
                 [Rights::Code, Rights::Words, Rights::Words, Rights::Words]
             );
-            assert_eq!(grant.overlays, [
-                Overlay { object: 0, offset: page, len: page, at: page, access: Access::Execute, place: Place::Code, image: false },
-                Overlay {
-                    object: 0,
-                    offset: 2 * page,
-                    len: page,
-                    at: 4 * page,
-                    access: Access::Execute,
-                    place: Place::Reserved,
-                    image: false,
-                },
-                Overlay { object: 3, offset: 0, len: page, at: 6 * page, access: Access::Shared, place: Place::Reserved, image: false },
-            ]);
+            assert_eq!(
+                grant.overlays,
+                [
+                    Overlay {
+                        object: 0,
+                        offset: page,
+                        len: page,
+                        at: page,
+                        access: Access::Execute,
+                        place: Place::Code,
+                        image: false
+                    },
+                    Overlay {
+                        object: 0,
+                        offset: 2 * page,
+                        len: page,
+                        at: 4 * page,
+                        access: Access::Execute,
+                        place: Place::Reserved,
+                        image: false,
+                    },
+                    Overlay {
+                        object: 3,
+                        offset: 0,
+                        len: page,
+                        at: 6 * page,
+                        access: Access::Shared,
+                        place: Place::Reserved,
+                        image: false
+                    },
+                ]
+            );
             let session = pending.wait(Duration::from_secs(10)).unwrap();
-            assert_eq!((session.pid, session.slide, session.thread), (std::process::id(), slide, sys::thread_id()));
+            assert_eq!(
+                (session.pid, session.slide, session.thread),
+                (std::process::id(), slide, sys::thread_id())
+            );
             assert_eq!(session.killed(), None);
             let (mut reader, sender) = session.split();
             assert_eq!(sender.pid(), std::process::id());
@@ -1343,17 +1558,34 @@ mod linux {
                 sender.send(Kind(0x301), frame.seq, b"answer").unwrap();
             });
             let mut answer = [0u8; 16];
-            let asked = crate::ask::request(&asks, channel.stream(), Kind(0x300), b"ask", &mut answer).unwrap();
+            let asked =
+                crate::ask::request(&asks, channel.stream(), Kind(0x300), b"ask", &mut answer)
+                    .unwrap();
             assert_eq!((asked, &answer[..6]), ((Kind(0x301), 6), &b"answer"[..]));
             answering.join().unwrap();
 
             let (stale, wrong) = host.launch(&launch).unwrap();
-            let var = stale.env.iter().find(|(name, _)| name == HOST_VAR).unwrap().1.to_str().unwrap().to_owned();
+            let var = stale
+                .env
+                .iter()
+                .find(|(name, _)| name == HOST_VAR)
+                .unwrap()
+                .1
+                .to_str()
+                .unwrap()
+                .to_owned();
             let (address, mut token) = host_var(var.as_bytes()).unwrap();
             token[0] ^= 1;
             let mut channel = Channel::new(sys::connect(address).unwrap());
             let mut hello = Vec::new();
-            Hello { token, pid: std::process::id(), version: VERSION, page: sys::page(), header: 0 }.encode(&mut hello);
+            Hello {
+                token,
+                pid: std::process::id(),
+                version: VERSION,
+                page: sys::page(),
+                header: 0,
+            }
+            .encode(&mut hello);
             channel.send(kinds::HELLO, 0, &hello).unwrap();
             assert!(wrong.wait(Duration::from_millis(300)).is_err());
         }

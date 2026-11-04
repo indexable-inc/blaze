@@ -82,10 +82,16 @@ pub(super) fn key_of(version: &ContentId, crate_key: &ContentId, words: &[u32]) 
     out.finish(words.len())
 }
 
-fn put_goal<'db, O: Out>(sink: &mut Stable<'_, 'db, O>, interner: DbInterner<'db>, goal: Goal<'db>) {
+fn put_goal<'db, O: Out>(
+    sink: &mut Stable<'_, 'db, O>,
+    interner: DbInterner<'db>,
+    goal: Goal<'db>,
+) {
     sink.word(u32::from(goal.mode));
     sink.word(u32::from(interner.regions()));
-    sink.word(u32::try_from(rustc_type_ir::Interner::recursion_limit(interner)).unwrap_or(u32::MAX));
+    sink.word(
+        u32::try_from(rustc_type_ir::Interner::recursion_limit(interner)).unwrap_or(u32::MAX),
+    );
     goal.predicate.put(sink);
     goal.clauses.put(sink);
 }

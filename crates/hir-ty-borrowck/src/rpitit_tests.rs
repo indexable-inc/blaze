@@ -46,7 +46,11 @@ fn the_value_of_a_trait_methods_impl_trait_borrows_self_while_held() {
         };
         assert_eq!(codes("held"), ["E0506"], "`held` assigns to `s.0` while `it` borrows it");
         assert_eq!(codes("dropped"), Vec::<&str>::new());
-        assert_eq!(codes("held_generic"), ["E0502"], "`touch` borrows `t` mutably while `it` borrows it");
+        assert_eq!(
+            codes("held_generic"),
+            ["E0502"],
+            "`touch` borrows `t` mutably while `it` borrows it"
+        );
         assert_eq!(codes("dropped_generic"), Vec::<&str>::new());
     });
 }
@@ -102,8 +106,12 @@ fn a_trait_methods_impl_trait_called_on_an_impl_type_borrows_what_is_passed() {
                 assert_eq!(result.skipped, None, "`{name}` {mode:?}");
                 assert_eq!(result.not_checked, None, "`{name}` {mode:?}");
                 // alloc: test
-                let codes: Vec<&str> =
-                    result.diagnostics.iter().filter(|it| it.is_error()).map(|it| it.code).collect();
+                let codes: Vec<&str> = result
+                    .diagnostics
+                    .iter()
+                    .filter(|it| it.is_error())
+                    .map(|it| it.code)
+                    .collect();
                 assert_eq!(codes, want, "`{name}` {mode:?}");
             }
         };
@@ -178,7 +186,8 @@ fn trait_method(db: &Db, name: &str) -> DefWithBodyId {
     for (_, module) in crate_def_map(db, fixture::test_crate(db)).modules(db) {
         for def in module.scope(db).declarations() {
             if let ModuleDefId::TraitId(tr) = def
-                && let Some(it) = tr.trait_items(db).method_by_name(&hir_expand::name::Name::new_root(name))
+                && let Some(it) =
+                    tr.trait_items(db).method_by_name(&hir_expand::name::Name::new_root(name))
             {
                 return it.into();
             }

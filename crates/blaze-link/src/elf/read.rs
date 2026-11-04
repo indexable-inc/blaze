@@ -115,7 +115,9 @@ fn header<'data>(
     let (machine, label) = match arch {
         Arch::X86_64 => (elf::EM_X86_64, "x86-64"),
         Arch::Aarch64 => (elf::EM_AARCH64, "AArch64"),
-        Arch::Wasm32 | Arch::Wasm64 => return Err(format!("{name}: an ELF input to a {arch:?} link")), // alloc: error path
+        Arch::Wasm32 | Arch::Wasm64 => {
+            return Err(format!("{name}: an ELF input to a {arch:?} link"));
+        } // alloc: error path
     };
     let found = header.e_machine(ENDIAN);
     if found != machine {
@@ -178,7 +180,11 @@ fn file_name(path: &str) -> String {
 /// A symbol's kind; an IFUNC is a function here, and [`object`] refuses one. A type ELF does
 /// not define (an OS or processor one other than IFUNC) is refused: what it asks of the link is
 /// unknown.
-fn kind(name: &str, symbol: impl FnOnce() -> String, st_type: elf::SymbolType) -> Result<SymbolKind, String> {
+fn kind(
+    name: &str,
+    symbol: impl FnOnce() -> String,
+    st_type: elf::SymbolType,
+) -> Result<SymbolKind, String> {
     Ok(match st_type {
         elf::STT_FUNC | elf::STT_GNU_IFUNC => SymbolKind::Function,
         elf::STT_OBJECT | elf::STT_COMMON => SymbolKind::Data,
@@ -186,7 +192,13 @@ fn kind(name: &str, symbol: impl FnOnce() -> String, st_type: elf::SymbolType) -
         elf::STT_SECTION => SymbolKind::Section,
         elf::STT_NOTYPE | elf::STT_FILE => SymbolKind::Other,
         // alloc: error path
-        other => return Err(format!("{name}: symbol {} has type {}, which blaze-link does not read", symbol(), other.0)),
+        other => {
+            return Err(format!(
+                "{name}: symbol {} has type {}, which blaze-link does not read",
+                symbol(),
+                other.0
+            ));
+        }
     })
 }
 
@@ -272,7 +284,12 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
     };
     let mut shstrtab = match sections.len() {
         0 => Table::new(name, &[])?,
-        _ => table(name, &sections, header.section_strings_index(ENDIAN, data).map_err(error)?, data)?,
+        _ => table(
+            name,
+            &sections,
+            header.section_strings_index(ENDIAN, data).map_err(error)?,
+            data,
+        )?,
     };
     for (index, section) in sections.enumerate() {
         let section =
@@ -289,7 +306,8 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         {
             continue;
         }
-        if object.sections.get(to).is_none_or(|it| it.what == SectionKind::Dropped) || to == index.0 {
+        if object.sections.get(to).is_none_or(|it| it.what == SectionKind::Dropped) || to == index.0
+        {
             // alloc: error path
             return Err(format!(
                 "{name}: section {} is SHF_LINK_ORDER to section {to}, which is not another section the link loads",
@@ -322,10 +340,9 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         let def = match symbol.st_shndx(ENDIAN) {
             elf::SHN_UNDEF => SymbolDef::Undefined,
             elf::SHN_ABS => SymbolDef::Absolute(symbol.st_value(ENDIAN)),
-            elf::SHN_COMMON => SymbolDef::Common {
-                size: symbol.st_size(ENDIAN),
-                align: symbol.st_value(ENDIAN),
-            },
+            elf::SHN_COMMON => {
+                SymbolDef::Common { size: symbol.st_size(ENDIAN), align: symbol.st_value(ENDIAN) }
+            }
             shndx => {
                 let section = if shndx == elf::SHN_XINDEX {
                     symtab
@@ -440,7 +457,9 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
     order.extend(
         sections
             .enumerate()
-            .filter(|(_, it)| matches!(it.sh_type(ENDIAN), elf::SHT_RELA | elf::SHT_REL | elf::SHT_CREL))
+            .filter(|(_, it)| {
+                matches!(it.sh_type(ENDIAN), elf::SHT_RELA | elf::SHT_REL | elf::SHT_CREL)
+            })
             .map(|(index, it)| (it.sh_info(ENDIAN), index.0 as u32)),
     );
     order.sort_unstable();
@@ -528,9 +547,11 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                         .map_err(|why| format!("{}: {why}", place(&object)))?;
                     make(apply, size, None)
                 }
-                How::GotBase(apply) => {
-                    make(apply, added.got(&mut object.symbols, &mut object.names).map_err(full)?, None)
-                }
+                How::GotBase(apply) => make(
+                    apply,
+                    added.got(&mut object.symbols, &mut object.names).map_err(full)?,
+                    None,
+                ),
                 How::GotOff(apply) => {
                     let got = added.got(&mut object.symbols, &mut object.names).map_err(full)?;
                     make(apply, symbol, Some(got))
@@ -595,7 +616,11 @@ fn section(
         ));
     }
     match sh_type {
-        elf::SHT_PROGBITS | elf::SHT_NOBITS | elf::SHT_INIT_ARRAY | elf::SHT_FINI_ARRAY | elf::SHT_PREINIT_ARRAY => {}
+        elf::SHT_PROGBITS
+        | elf::SHT_NOBITS
+        | elf::SHT_INIT_ARRAY
+        | elf::SHT_FINI_ARRAY
+        | elf::SHT_PREINIT_ARRAY => {}
         elf::SHT_X86_64_UNWIND if arch == Arch::X86_64 => {}
         other => {
             // alloc: error path
@@ -772,13 +797,16 @@ impl Added {
     fn module(&mut self, symbols: &mut Vec<Symbol>) -> u32 {
         let empty = self.empty;
         *self.module.get_or_insert_with(|| {
-            Self::push(symbols, Symbol {
-                name: empty,
-                def: SymbolDef::Absolute(0),
-                binding: Binding::Local,
-                kind: SymbolKind::Tls,
-                hidden: true,
-            })
+            Self::push(
+                symbols,
+                Symbol {
+                    name: empty,
+                    def: SymbolDef::Absolute(0),
+                    binding: Binding::Local,
+                    kind: SymbolKind::Tls,
+                    hidden: true,
+                },
+            )
         })
     }
 
@@ -786,13 +814,16 @@ impl Added {
         if let Some(got) = self.got {
             return Ok(got);
         }
-        let got = Self::push(symbols, Symbol {
-            name: names.push(GOT)?,
-            def: SymbolDef::Undefined,
-            binding: Binding::Global,
-            kind: SymbolKind::Other,
-            hidden: false,
-        });
+        let got = Self::push(
+            symbols,
+            Symbol {
+                name: names.push(GOT)?,
+                def: SymbolDef::Undefined,
+                binding: Binding::Global,
+                kind: SymbolKind::Other,
+                hidden: false,
+            },
+        );
         self.got = Some(got);
         Ok(got)
     }
@@ -836,13 +867,16 @@ impl Added {
             }
             _ => {}
         }
-        let symbol = Self::push(symbols, Symbol {
-            name: self.empty,
-            def: SymbolDef::Absolute(elf[target as usize].st_size(ENDIAN)),
-            binding: Binding::Local,
-            kind: SymbolKind::Other,
-            hidden: true,
-        });
+        let symbol = Self::push(
+            symbols,
+            Symbol {
+                name: self.empty,
+                def: SymbolDef::Absolute(elf[target as usize].st_size(ENDIAN)),
+                binding: Binding::Local,
+                kind: SymbolKind::Other,
+                hidden: true,
+            },
+        );
         Ok(*entry.insert(symbol))
     }
 }
@@ -854,61 +888,163 @@ macro_rules! names {
 }
 
 const X86_64_NAMES: &[(elf::RelocationType, &str)] = names![
-    R_X86_64_NONE, R_X86_64_64, R_X86_64_PC32, R_X86_64_GOT32, R_X86_64_PLT32, R_X86_64_COPY,
-    R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_GOTPCREL, R_X86_64_32,
-    R_X86_64_32S, R_X86_64_16, R_X86_64_PC16, R_X86_64_8, R_X86_64_PC8, R_X86_64_DTPMOD64,
-    R_X86_64_DTPOFF64, R_X86_64_TPOFF64, R_X86_64_TLSGD, R_X86_64_TLSLD, R_X86_64_DTPOFF32,
-    R_X86_64_GOTTPOFF, R_X86_64_TPOFF32, R_X86_64_PC64, R_X86_64_GOTOFF64, R_X86_64_GOTPC32,
-    R_X86_64_GOT64, R_X86_64_GOTPCREL64, R_X86_64_GOTPC64, R_X86_64_GOTPLT64, R_X86_64_PLTOFF64,
-    R_X86_64_SIZE32, R_X86_64_SIZE64, R_X86_64_GOTPC32_TLSDESC, R_X86_64_TLSDESC_CALL,
-    R_X86_64_TLSDESC, R_X86_64_IRELATIVE, R_X86_64_RELATIVE64, R_X86_64_GOTPCRELX,
+    R_X86_64_NONE,
+    R_X86_64_64,
+    R_X86_64_PC32,
+    R_X86_64_GOT32,
+    R_X86_64_PLT32,
+    R_X86_64_COPY,
+    R_X86_64_GLOB_DAT,
+    R_X86_64_JUMP_SLOT,
+    R_X86_64_RELATIVE,
+    R_X86_64_GOTPCREL,
+    R_X86_64_32,
+    R_X86_64_32S,
+    R_X86_64_16,
+    R_X86_64_PC16,
+    R_X86_64_8,
+    R_X86_64_PC8,
+    R_X86_64_DTPMOD64,
+    R_X86_64_DTPOFF64,
+    R_X86_64_TPOFF64,
+    R_X86_64_TLSGD,
+    R_X86_64_TLSLD,
+    R_X86_64_DTPOFF32,
+    R_X86_64_GOTTPOFF,
+    R_X86_64_TPOFF32,
+    R_X86_64_PC64,
+    R_X86_64_GOTOFF64,
+    R_X86_64_GOTPC32,
+    R_X86_64_GOT64,
+    R_X86_64_GOTPCREL64,
+    R_X86_64_GOTPC64,
+    R_X86_64_GOTPLT64,
+    R_X86_64_PLTOFF64,
+    R_X86_64_SIZE32,
+    R_X86_64_SIZE64,
+    R_X86_64_GOTPC32_TLSDESC,
+    R_X86_64_TLSDESC_CALL,
+    R_X86_64_TLSDESC,
+    R_X86_64_IRELATIVE,
+    R_X86_64_RELATIVE64,
+    R_X86_64_GOTPCRELX,
     R_X86_64_REX_GOTPCRELX,
 ];
 
 const AARCH64_NAMES: &[(elf::RelocationType, &str)] = names![
-    R_AARCH64_NONE, R_AARCH64_ABS64, R_AARCH64_ABS32, R_AARCH64_ABS16, R_AARCH64_PREL64,
-    R_AARCH64_PREL32, R_AARCH64_PREL16, R_AARCH64_MOVW_UABS_G0, R_AARCH64_MOVW_UABS_G0_NC,
-    R_AARCH64_MOVW_UABS_G1, R_AARCH64_MOVW_UABS_G1_NC, R_AARCH64_MOVW_UABS_G2,
-    R_AARCH64_MOVW_UABS_G2_NC, R_AARCH64_MOVW_UABS_G3, R_AARCH64_MOVW_SABS_G0,
-    R_AARCH64_MOVW_SABS_G1, R_AARCH64_MOVW_SABS_G2, R_AARCH64_LD_PREL_LO19,
-    R_AARCH64_ADR_PREL_LO21, R_AARCH64_ADR_PREL_PG_HI21, R_AARCH64_ADR_PREL_PG_HI21_NC,
-    R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_LDST8_ABS_LO12_NC, R_AARCH64_TSTBR14,
-    R_AARCH64_CONDBR19, R_AARCH64_JUMP26, R_AARCH64_CALL26, R_AARCH64_LDST16_ABS_LO12_NC,
-    R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC, R_AARCH64_MOVW_PREL_G0,
-    R_AARCH64_MOVW_PREL_G0_NC, R_AARCH64_MOVW_PREL_G1, R_AARCH64_MOVW_PREL_G1_NC,
-    R_AARCH64_MOVW_PREL_G2, R_AARCH64_MOVW_PREL_G2_NC, R_AARCH64_MOVW_PREL_G3,
-    R_AARCH64_LDST128_ABS_LO12_NC, R_AARCH64_MOVW_GOTOFF_G0, R_AARCH64_MOVW_GOTOFF_G0_NC,
-    R_AARCH64_MOVW_GOTOFF_G1, R_AARCH64_MOVW_GOTOFF_G1_NC, R_AARCH64_MOVW_GOTOFF_G2,
-    R_AARCH64_MOVW_GOTOFF_G2_NC, R_AARCH64_MOVW_GOTOFF_G3, R_AARCH64_GOTREL64,
-    R_AARCH64_GOTREL32, R_AARCH64_GOT_LD_PREL19, R_AARCH64_LD64_GOTOFF_LO15,
-    R_AARCH64_ADR_GOT_PAGE, R_AARCH64_LD64_GOT_LO12_NC, R_AARCH64_LD64_GOTPAGE_LO15,
-    R_AARCH64_TLSGD_ADR_PREL21, R_AARCH64_TLSGD_ADR_PAGE21, R_AARCH64_TLSGD_ADD_LO12_NC,
-    R_AARCH64_TLSGD_MOVW_G1, R_AARCH64_TLSGD_MOVW_G0_NC, R_AARCH64_TLSLD_ADR_PREL21,
-    R_AARCH64_TLSLD_ADR_PAGE21, R_AARCH64_TLSLD_ADD_LO12_NC, R_AARCH64_TLSLD_MOVW_G1,
-    R_AARCH64_TLSLD_MOVW_G0_NC, R_AARCH64_TLSLD_LD_PREL19, R_AARCH64_TLSLD_MOVW_DTPREL_G2,
-    R_AARCH64_TLSLD_MOVW_DTPREL_G1, R_AARCH64_TLSLD_MOVW_DTPREL_G1_NC,
-    R_AARCH64_TLSLD_MOVW_DTPREL_G0, R_AARCH64_TLSLD_MOVW_DTPREL_G0_NC,
-    R_AARCH64_TLSLD_ADD_DTPREL_HI12, R_AARCH64_TLSLD_ADD_DTPREL_LO12,
-    R_AARCH64_TLSLD_ADD_DTPREL_LO12_NC, R_AARCH64_TLSLD_LDST8_DTPREL_LO12,
-    R_AARCH64_TLSLD_LDST8_DTPREL_LO12_NC, R_AARCH64_TLSLD_LDST16_DTPREL_LO12,
-    R_AARCH64_TLSLD_LDST16_DTPREL_LO12_NC, R_AARCH64_TLSLD_LDST32_DTPREL_LO12,
-    R_AARCH64_TLSLD_LDST32_DTPREL_LO12_NC, R_AARCH64_TLSLD_LDST64_DTPREL_LO12,
-    R_AARCH64_TLSLD_LDST64_DTPREL_LO12_NC, R_AARCH64_TLSIE_MOVW_GOTTPREL_G1,
-    R_AARCH64_TLSIE_MOVW_GOTTPREL_G0_NC, R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21,
-    R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC, R_AARCH64_TLSIE_LD_GOTTPREL_PREL19,
-    R_AARCH64_TLSLE_MOVW_TPREL_G2, R_AARCH64_TLSLE_MOVW_TPREL_G1,
-    R_AARCH64_TLSLE_MOVW_TPREL_G1_NC, R_AARCH64_TLSLE_MOVW_TPREL_G0,
-    R_AARCH64_TLSLE_MOVW_TPREL_G0_NC, R_AARCH64_TLSLE_ADD_TPREL_HI12,
-    R_AARCH64_TLSLE_ADD_TPREL_LO12, R_AARCH64_TLSLE_ADD_TPREL_LO12_NC,
-    R_AARCH64_TLSLE_LDST8_TPREL_LO12, R_AARCH64_TLSLE_LDST8_TPREL_LO12_NC,
-    R_AARCH64_TLSLE_LDST16_TPREL_LO12, R_AARCH64_TLSLE_LDST16_TPREL_LO12_NC,
-    R_AARCH64_TLSLE_LDST32_TPREL_LO12, R_AARCH64_TLSLE_LDST32_TPREL_LO12_NC,
-    R_AARCH64_TLSLE_LDST64_TPREL_LO12, R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC,
-    R_AARCH64_TLSDESC_LD_PREL19, R_AARCH64_TLSDESC_ADR_PREL21, R_AARCH64_TLSDESC_ADR_PAGE21,
-    R_AARCH64_TLSDESC_LD64_LO12, R_AARCH64_TLSDESC_ADD_LO12, R_AARCH64_TLSDESC_OFF_G1,
-    R_AARCH64_TLSDESC_OFF_G0_NC, R_AARCH64_TLSDESC_LDR, R_AARCH64_TLSDESC_ADD,
-    R_AARCH64_TLSDESC_CALL, R_AARCH64_TLSLE_LDST128_TPREL_LO12,
-    R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC, R_AARCH64_TLSLD_LDST128_DTPREL_LO12,
+    R_AARCH64_NONE,
+    R_AARCH64_ABS64,
+    R_AARCH64_ABS32,
+    R_AARCH64_ABS16,
+    R_AARCH64_PREL64,
+    R_AARCH64_PREL32,
+    R_AARCH64_PREL16,
+    R_AARCH64_MOVW_UABS_G0,
+    R_AARCH64_MOVW_UABS_G0_NC,
+    R_AARCH64_MOVW_UABS_G1,
+    R_AARCH64_MOVW_UABS_G1_NC,
+    R_AARCH64_MOVW_UABS_G2,
+    R_AARCH64_MOVW_UABS_G2_NC,
+    R_AARCH64_MOVW_UABS_G3,
+    R_AARCH64_MOVW_SABS_G0,
+    R_AARCH64_MOVW_SABS_G1,
+    R_AARCH64_MOVW_SABS_G2,
+    R_AARCH64_LD_PREL_LO19,
+    R_AARCH64_ADR_PREL_LO21,
+    R_AARCH64_ADR_PREL_PG_HI21,
+    R_AARCH64_ADR_PREL_PG_HI21_NC,
+    R_AARCH64_ADD_ABS_LO12_NC,
+    R_AARCH64_LDST8_ABS_LO12_NC,
+    R_AARCH64_TSTBR14,
+    R_AARCH64_CONDBR19,
+    R_AARCH64_JUMP26,
+    R_AARCH64_CALL26,
+    R_AARCH64_LDST16_ABS_LO12_NC,
+    R_AARCH64_LDST32_ABS_LO12_NC,
+    R_AARCH64_LDST64_ABS_LO12_NC,
+    R_AARCH64_MOVW_PREL_G0,
+    R_AARCH64_MOVW_PREL_G0_NC,
+    R_AARCH64_MOVW_PREL_G1,
+    R_AARCH64_MOVW_PREL_G1_NC,
+    R_AARCH64_MOVW_PREL_G2,
+    R_AARCH64_MOVW_PREL_G2_NC,
+    R_AARCH64_MOVW_PREL_G3,
+    R_AARCH64_LDST128_ABS_LO12_NC,
+    R_AARCH64_MOVW_GOTOFF_G0,
+    R_AARCH64_MOVW_GOTOFF_G0_NC,
+    R_AARCH64_MOVW_GOTOFF_G1,
+    R_AARCH64_MOVW_GOTOFF_G1_NC,
+    R_AARCH64_MOVW_GOTOFF_G2,
+    R_AARCH64_MOVW_GOTOFF_G2_NC,
+    R_AARCH64_MOVW_GOTOFF_G3,
+    R_AARCH64_GOTREL64,
+    R_AARCH64_GOTREL32,
+    R_AARCH64_GOT_LD_PREL19,
+    R_AARCH64_LD64_GOTOFF_LO15,
+    R_AARCH64_ADR_GOT_PAGE,
+    R_AARCH64_LD64_GOT_LO12_NC,
+    R_AARCH64_LD64_GOTPAGE_LO15,
+    R_AARCH64_TLSGD_ADR_PREL21,
+    R_AARCH64_TLSGD_ADR_PAGE21,
+    R_AARCH64_TLSGD_ADD_LO12_NC,
+    R_AARCH64_TLSGD_MOVW_G1,
+    R_AARCH64_TLSGD_MOVW_G0_NC,
+    R_AARCH64_TLSLD_ADR_PREL21,
+    R_AARCH64_TLSLD_ADR_PAGE21,
+    R_AARCH64_TLSLD_ADD_LO12_NC,
+    R_AARCH64_TLSLD_MOVW_G1,
+    R_AARCH64_TLSLD_MOVW_G0_NC,
+    R_AARCH64_TLSLD_LD_PREL19,
+    R_AARCH64_TLSLD_MOVW_DTPREL_G2,
+    R_AARCH64_TLSLD_MOVW_DTPREL_G1,
+    R_AARCH64_TLSLD_MOVW_DTPREL_G1_NC,
+    R_AARCH64_TLSLD_MOVW_DTPREL_G0,
+    R_AARCH64_TLSLD_MOVW_DTPREL_G0_NC,
+    R_AARCH64_TLSLD_ADD_DTPREL_HI12,
+    R_AARCH64_TLSLD_ADD_DTPREL_LO12,
+    R_AARCH64_TLSLD_ADD_DTPREL_LO12_NC,
+    R_AARCH64_TLSLD_LDST8_DTPREL_LO12,
+    R_AARCH64_TLSLD_LDST8_DTPREL_LO12_NC,
+    R_AARCH64_TLSLD_LDST16_DTPREL_LO12,
+    R_AARCH64_TLSLD_LDST16_DTPREL_LO12_NC,
+    R_AARCH64_TLSLD_LDST32_DTPREL_LO12,
+    R_AARCH64_TLSLD_LDST32_DTPREL_LO12_NC,
+    R_AARCH64_TLSLD_LDST64_DTPREL_LO12,
+    R_AARCH64_TLSLD_LDST64_DTPREL_LO12_NC,
+    R_AARCH64_TLSIE_MOVW_GOTTPREL_G1,
+    R_AARCH64_TLSIE_MOVW_GOTTPREL_G0_NC,
+    R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21,
+    R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC,
+    R_AARCH64_TLSIE_LD_GOTTPREL_PREL19,
+    R_AARCH64_TLSLE_MOVW_TPREL_G2,
+    R_AARCH64_TLSLE_MOVW_TPREL_G1,
+    R_AARCH64_TLSLE_MOVW_TPREL_G1_NC,
+    R_AARCH64_TLSLE_MOVW_TPREL_G0,
+    R_AARCH64_TLSLE_MOVW_TPREL_G0_NC,
+    R_AARCH64_TLSLE_ADD_TPREL_HI12,
+    R_AARCH64_TLSLE_ADD_TPREL_LO12,
+    R_AARCH64_TLSLE_ADD_TPREL_LO12_NC,
+    R_AARCH64_TLSLE_LDST8_TPREL_LO12,
+    R_AARCH64_TLSLE_LDST8_TPREL_LO12_NC,
+    R_AARCH64_TLSLE_LDST16_TPREL_LO12,
+    R_AARCH64_TLSLE_LDST16_TPREL_LO12_NC,
+    R_AARCH64_TLSLE_LDST32_TPREL_LO12,
+    R_AARCH64_TLSLE_LDST32_TPREL_LO12_NC,
+    R_AARCH64_TLSLE_LDST64_TPREL_LO12,
+    R_AARCH64_TLSLE_LDST64_TPREL_LO12_NC,
+    R_AARCH64_TLSDESC_LD_PREL19,
+    R_AARCH64_TLSDESC_ADR_PREL21,
+    R_AARCH64_TLSDESC_ADR_PAGE21,
+    R_AARCH64_TLSDESC_LD64_LO12,
+    R_AARCH64_TLSDESC_ADD_LO12,
+    R_AARCH64_TLSDESC_OFF_G1,
+    R_AARCH64_TLSDESC_OFF_G0_NC,
+    R_AARCH64_TLSDESC_LDR,
+    R_AARCH64_TLSDESC_ADD,
+    R_AARCH64_TLSDESC_CALL,
+    R_AARCH64_TLSLE_LDST128_TPREL_LO12,
+    R_AARCH64_TLSLE_LDST128_TPREL_LO12_NC,
+    R_AARCH64_TLSLD_LDST128_DTPREL_LO12,
 ];
 
 /// The name of relocation type `r_type` of `arch`, for errors.

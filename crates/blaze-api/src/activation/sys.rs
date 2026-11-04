@@ -39,8 +39,11 @@ pub(super) unsafe fn systemd(want: &str) -> Result<OwnedFd, ActivationError> {
 unsafe extern "C" {
     /// `<launch.h>`, in libSystem: on success `*fds` is a `malloc`ed array of `*cnt`
     /// descriptors, the caller's to close and free.
-    fn launch_activate_socket(name: *const libc::c_char, fds: *mut *mut libc::c_int, cnt: *mut libc::size_t)
-    -> libc::c_int;
+    fn launch_activate_socket(
+        name: *const libc::c_char,
+        fds: *mut *mut libc::c_int,
+        cnt: *mut libc::size_t,
+    ) -> libc::c_int;
 }
 
 #[cfg(target_os = "macos")]
@@ -102,7 +105,10 @@ pub(super) fn uid() -> u32 {
 unsafe fn adopt(fd: RawFd, by: Manager) -> Result<OwnedFd, ActivationError> {
     let failed = |what: &str| {
         // alloc: error path, a daemon that cannot start.
-        ActivationError::new(format!("fd {fd}, which {by} passed: {what}: {}", std::io::Error::last_os_error()))
+        ActivationError::new(format!(
+            "fd {fd}, which {by} passed: {what}: {}",
+            std::io::Error::last_os_error()
+        ))
     };
     // SAFETY: no pointers; an fd that is not open fails with EBADF.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };

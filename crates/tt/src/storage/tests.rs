@@ -5,10 +5,10 @@
 use std::{fmt::Write as _, hash::BuildHasher, path::Path};
 
 use blaze_hash::FixedState;
-use std::alloc::Global;
 use blaze_ids::rng::SplitMix64;
 use hegel::generators as gs;
 use span::ErasedFileAstId;
+use std::alloc::Global;
 
 use super::{varint::VarintTree, *};
 use crate::{FlatToken, TtElement, buffer::Cursor, token_to_literal};
@@ -119,7 +119,12 @@ impl Gen {
                     true => len as u32 - self.rng.below(2) as u32,
                     false => self.rng.below(len.min(30) as u64 + 1) as u32,
                 };
-                Leaf::Literal(Literal { text_and_suffix: Symbol::intern(&text), span, kind, suffix_len })
+                Leaf::Literal(Literal {
+                    text_and_suffix: Symbol::intern(&text),
+                    span,
+                    kind,
+                    suffix_len,
+                })
             }
         }
     }
@@ -135,10 +140,7 @@ impl Gen {
         let close = match self.rng.below(3) {
             0 => open,
             1 => self.span(),
-            _ => Span {
-                range: open.range + TextSize::new(self.rng.below(3000) as u32),
-                ..open
-            },
+            _ => Span { range: open.range + TextSize::new(self.rng.below(3000) as u32), ..open },
         };
         Delimiter { open, close, kind }
     }
@@ -161,7 +163,8 @@ impl Gen {
     fn tree(&mut self, budget: u64) -> Vec<TokenTree> {
         let mut out = vec![TokenTree::Leaf(self.leaf())];
         self.token_trees(&mut out, budget, 0);
-        out[0] = TokenTree::Subtree(Subtree { delimiter: self.delimiter(), len: out.len() as u32 - 1 });
+        out[0] =
+            TokenTree::Subtree(Subtree { delimiter: self.delimiter(), len: out.len() as u32 - 1 });
         out
     }
 }
@@ -330,7 +333,11 @@ fn rebuild(tokens: &[TokenTree], skip: bool, rng: &mut SplitMix64) -> TopSubtree
         }
         if rng.one_in(7) {
             let point = builder.restore_point();
-            builder.push(Leaf::Ident(Ident { sym: Symbol::intern("junk"), span: junk, is_raw: IdentIsRaw::No }));
+            builder.push(Leaf::Ident(Ident {
+                sym: Symbol::intern("junk"),
+                span: junk,
+                is_raw: IdentIsRaw::No,
+            }));
             builder.open(DelimiterKind::Brace, junk);
             builder.push(Leaf::Punct(Punct { char: '!', spacing: Spacing::Joint, span: junk }));
             builder.close(junk);
@@ -721,7 +728,9 @@ fn equality_and_hash_are_those_of_the_token_trees() {
     }
     let built: Vec<(TopSubtree, VarintTree)> = cases
         .iter()
-        .map(|it| (TopSubtree::from_serialized(it.clone()), VarintTree::from_serialized(it.clone())))
+        .map(|it| {
+            (TopSubtree::from_serialized(it.clone()), VarintTree::from_serialized(it.clone()))
+        })
         .collect();
     for (a, (tree_a, model_a)) in cases.iter().zip(&built) {
         for (b, (tree_b, model_b)) in cases.iter().zip(&built) {
@@ -755,7 +764,11 @@ fn spans_too_wide_to_pack_and_more_parts_than_fit() {
             is_raw: IdentIsRaw::No,
         })));
     }
-    let top_span = Span { range: TextRange::at(TextSize::new(1), TextSize::new(1 << 24)), anchor: anchor(1, 1), ctx };
+    let top_span = Span {
+        range: TextRange::at(TextSize::new(1), TextSize::new(1 << 24)),
+        anchor: anchor(1, 1),
+        ctx,
+    };
     tokens[0] = TokenTree::Subtree(Subtree {
         delimiter: Delimiter { open: top_span, close: top_span, kind: DelimiterKind::Brace },
         len: 70_000,
@@ -770,7 +783,10 @@ fn a_literal_keeps_a_suffix_of_any_length_a_node_holds() {
     let ctx = SyntaxContext::root(Edition::Edition2021);
     let span = Span { range: TextRange::empty(TextSize::new(0)), anchor: anchor(0, 0), ctx };
     let top = |len| {
-        TokenTree::Subtree(Subtree { delimiter: Delimiter { open: span, close: span, kind: DelimiterKind::Invisible }, len })
+        TokenTree::Subtree(Subtree {
+            delimiter: Delimiter { open: span, close: span, kind: DelimiterKind::Invisible },
+            len,
+        })
     };
     let mut tokens = vec![top(4)];
     for len in [255, 256, 70_000, MAX_SUFFIX as usize] {
@@ -797,7 +813,8 @@ fn changing_a_tree_in_place_gives_the_tree_of_its_new_token_trees() {
         tree.set_top_subtree_delimiter_kind(DelimiterKind::Bracket);
         let mut expected = tokens.clone();
         let TokenTree::Subtree(top) = &mut expected[0] else { unreachable!() };
-        top.delimiter = Delimiter { open: span.open, close: span.close, kind: DelimiterKind::Bracket };
+        top.delimiter =
+            Delimiter { open: span.open, close: span.close, kind: DelimiterKind::Bracket };
         assert!(tree == TopSubtree::from_serialized(expected.clone()));
         assert_eq!(flat(&tree), expected);
 
@@ -885,7 +902,9 @@ fn lex(file: u32, text: &str) -> TopSubtree {
             TokenKind::Ident | TokenKind::RawIdent => {
                 builder.push(Ident::new(token, span(start, len)).into())
             }
-            TokenKind::Literal { .. } => builder.push(token_to_literal(token, span(start, len)).into()),
+            TokenKind::Literal { .. } => {
+                builder.push(token_to_literal(token, span(start, len)).into())
+            }
             _ => match token {
                 "(" | "[" | "{" => builder.open(delimiter(token), span(start, len)),
                 ")" | "]" | "}" => {
@@ -1013,9 +1032,30 @@ fn literals_are_what_they_were() {
         ctx: SyntaxContext::root(Edition::CURRENT),
     };
     let mut texts: Vec<String> = [
-        "1", "1u8", "1_", "1_u8", "0x1Fusize", "1.0", "1.0f32", "1e3", "1e3_f64", "1.", "'a'",
-        "b'a'", "\"s\"", "\"s\"suffix", "r\"x\"", "r#\"x\"#", "br\"x\"", "c\"x\"", "cr#\"x\"#",
-        "\"unterminated", "'", "x", "", "1.5e10suffix_long_enough_to_spill_the_inline_buffer",
+        "1",
+        "1u8",
+        "1_",
+        "1_u8",
+        "0x1Fusize",
+        "1.0",
+        "1.0f32",
+        "1e3",
+        "1e3_f64",
+        "1.",
+        "'a'",
+        "b'a'",
+        "\"s\"",
+        "\"s\"suffix",
+        "r\"x\"",
+        "r#\"x\"#",
+        "br\"x\"",
+        "c\"x\"",
+        "cr#\"x\"#",
+        "\"unterminated",
+        "'",
+        "x",
+        "",
+        "1.5e10suffix_long_enough_to_spill_the_inline_buffer",
     ]
     .iter()
     .map(|it| it.to_string())
@@ -1101,9 +1141,10 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
         // The first build leaves the builder's and the encoder's buffers at this size.
         let delimiter = tree.top_subtree().delimiter;
         let warm = TopSubtree::from_token_trees(delimiter, view);
-        let built = blaze_alloc_count::assert_at_most(1, "building a tree with a warm builder", || {
-            TopSubtree::from_token_trees(delimiter, view)
-        });
+        let built =
+            blaze_alloc_count::assert_at_most(1, "building a tree with a warm builder", || {
+                TopSubtree::from_token_trees(delimiter, view)
+            });
         assert!(built == warm && built == *tree);
         assert_eq!(built.block(), tree.block());
 
@@ -1282,7 +1323,11 @@ fn literal_codes_are_the_old_ones(tc: hegel::TestCase) {
 
 /// The scan-then-map index the in-process bridge's `Parts::index` had, before it took
 /// [`IndexTable`].
-fn old_index(list: &mut Vec<u32>, map: &mut blaze_hash::HashMap<u32, u32, Global>, value: u32) -> u32 {
+fn old_index(
+    list: &mut Vec<u32>,
+    map: &mut blaze_hash::HashMap<u32, u32, Global>,
+    value: u32,
+) -> u32 {
     if list.len() <= SCAN {
         if let Some(at) = list.iter().position(|it| *it == value) {
             return at as u32;

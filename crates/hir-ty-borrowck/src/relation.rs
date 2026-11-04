@@ -308,9 +308,8 @@ mod tests {
             let mut rng = SplitMix64::new(0x2545f4914f6cdd1d);
             for _ in 0..300 {
                 let nodes = 1 + rng.index(30);
-                let pairs: Vec<(u32, u32)> = (0..rng.index(200))
-                    .map(|it| (rng.index(nodes) as u32, it as u32))
-                    .collect();
+                let pairs: Vec<(u32, u32)> =
+                    (0..rng.index(200)).map(|it| (rng.index(nodes) as u32, it as u32)).collect();
                 let ours = Csr::build(frame, nodes, pairs.iter().copied());
                 let radix = blaze_ids::radix::Csr::build(nodes, pairs.iter().copied());
                 for node in 0..nodes {

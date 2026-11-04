@@ -414,9 +414,12 @@ fn ui(mode: Mode, name: &str, edition: &str, source: &str) -> String {
             "    pub mod {edition} {{\n        pub use core::prelude::{edition}::*;\n{PRELUDE}    }}\n"
         ));
     }
-    fixture.push_str(&format!("}}\n{ITEMS}\n//- /{name} crate:other:main edition:{edition} deps:std\n{source}"));
-    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(mode, &Options::default()))
-        .stderr_with(Style { ui_testing: true, ..Style::default() });
+    fixture.push_str(&format!(
+        "}}\n{ITEMS}\n//- /{name} crate:other:main edition:{edition} deps:std\n{source}"
+    ));
+    let stderr =
+        crate::tests::checked_with(&fixture, "$DIR/", &compiletest(mode, &Options::default()))
+            .stderr_with(Style { ui_testing: true, ..Style::default() });
     crate::tests::normalized(&stderr)
 }
 
@@ -440,13 +443,37 @@ macro_rules! ui {
 }
 
 // `tests/ui/lint/`.
-ui!(for_loop_over_fallibles, Other, "for_loop_over_fallibles", "2015", "for_loop_over_fallibles.stderr");
+ui!(
+    for_loop_over_fallibles,
+    Other,
+    "for_loop_over_fallibles",
+    "2015",
+    "for_loop_over_fallibles.stderr"
+);
 
 // `tests/ui/iterators/`; `into-iter-on-arrays-lint` runs in each edition of `2015..2021`.
-ui!(into_iter_on_arrays_2018, Other, "into-iter-on-arrays-2018", "2018", "into-iter-on-arrays-2018.stderr");
+ui!(
+    into_iter_on_arrays_2018,
+    Other,
+    "into-iter-on-arrays-2018",
+    "2018",
+    "into-iter-on-arrays-2018.stderr"
+);
 ui!(into_iter_on_arrays_2021, Other, "into-iter-on-arrays-2021", "2021");
-ui!(into_iter_on_arrays_lint_2015, RunPass, "into-iter-on-arrays-lint", "2015", "into-iter-on-arrays-lint.stderr");
-ui!(into_iter_on_arrays_lint_2018, RunPass, "into-iter-on-arrays-lint", "2018", "into-iter-on-arrays-lint.stderr");
+ui!(
+    into_iter_on_arrays_lint_2015,
+    RunPass,
+    "into-iter-on-arrays-lint",
+    "2015",
+    "into-iter-on-arrays-lint.stderr"
+);
+ui!(
+    into_iter_on_arrays_lint_2018,
+    RunPass,
+    "into-iter-on-arrays-lint",
+    "2018",
+    "into-iter-on-arrays-lint.stderr"
+);
 ui!(
     into_iter_on_boxed_slices_2021,
     Other,
@@ -484,5 +511,11 @@ ui!(
     "lint-if-let-rescope-gated.edition2021.stderr"
 );
 ui!(lint_if_let_rescope_gated_edition2024, Other, "lint-if-let-rescope-gated", "2024");
-ui!(lint_if_let_rescope_with_macro, Other, "lint-if-let-rescope-with-macro", "2021", "lint-if-let-rescope-with-macro.stderr");
+ui!(
+    lint_if_let_rescope_with_macro,
+    Other,
+    "lint-if-let-rescope-with-macro",
+    "2021",
+    "lint-if-let-rescope-with-macro.stderr"
+);
 ui!(lint_if_let_rescope_false_positives, Other, "lint-if-let-rescope-false-positives", "2021");

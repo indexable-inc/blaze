@@ -51,7 +51,8 @@ impl Fuse8 {
         let mut seeds = SplitMix64::new(SEEDS);
         let mut failed = 0;
         loop {
-            let first_slots = segments.checked_mul(segment_length).expect("a filter of fewer than 2^31 keys");
+            let first_slots =
+                segments.checked_mul(segment_length).expect("a filter of fewer than 2^31 keys");
             let mut filter = Fuse8 {
                 seed: seeds.next_u64(),
                 segment_length,
@@ -95,13 +96,15 @@ impl Fuse8 {
         let Some((header, fingerprints)) = bytes.split_first_chunk::<HEADER>() else {
             return Err("is shorter than its header");
         };
-        let word = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().expect("four bytes"));
+        let word =
+            |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().expect("four bytes"));
         let seed = u64::from_le_bytes(header[..8].try_into().expect("eight bytes"));
         let (segment_length, segments) = (word(8), word(12));
         if !segment_length.is_power_of_two() || segment_length > SEGMENT_MOST {
             return Err("has a segment length that is not a power of two up to 2^18");
         }
-        let Some(first_slots) = segments.checked_mul(segment_length).filter(|_| segments > 0) else {
+        let Some(first_slots) = segments.checked_mul(segment_length).filter(|_| segments > 0)
+        else {
             return Err("has no segments or more than 2^32 slots");
         };
         if fingerprints.len() as u64 != u64::from(first_slots) + 2 * u64::from(segment_length) {
@@ -130,7 +133,8 @@ impl Fuse8 {
     fn fill(&mut self, keys: &[u64]) -> bool {
         let slots = self.fingerprints.len();
         // alloc: a build's scratch, once per seed tried
-        let mut hashes: Vec<u64> = keys.iter().map(|&key| mix(key.wrapping_add(self.seed))).collect();
+        let mut hashes: Vec<u64> =
+            keys.iter().map(|&key| mix(key.wrapping_add(self.seed))).collect();
         // In order of first slot, so the counts fill a segment at a time.
         hashes.sort_unstable();
         // Per slot: the keys hashing to it times four, plus the xor of which of each key's
@@ -149,7 +153,8 @@ impl Fuse8 {
             }
         }
         // alloc: a build's scratch, once per seed tried
-        let mut alone: Vec<u32> = (0..slots as u32).filter(|&at| count[at as usize] >> 2 == 1).collect();
+        let mut alone: Vec<u32> =
+            (0..slots as u32).filter(|&at| count[at as usize] >> 2 == 1).collect();
         // alloc: a build's scratch, once per seed tried
         let mut peeled: Vec<(u64, u8)> = Vec::with_capacity(keys.len());
         while let Some(at) = alone.pop() {
@@ -199,7 +204,8 @@ fn sizes(keys: usize) -> (u32, u32) {
         return (4, 1);
     }
     let size = keys as f64;
-    let length = (1u32 << ((size.ln() / 3.33f64.ln() + 2.25).floor() as u32).min(18)).min(SEGMENT_MOST);
+    let length =
+        (1u32 << ((size.ln() / 3.33f64.ln() + 2.25).floor() as u32).min(18)).min(SEGMENT_MOST);
     let factor = (0.875 + 0.25 * 1e6f64.ln() / size.ln()).max(1.125);
     let room = (size * factor).round() as u64;
     let segments = room.div_ceil(u64::from(length)).saturating_sub(2).max(1);

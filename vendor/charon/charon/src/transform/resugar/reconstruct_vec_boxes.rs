@@ -142,10 +142,7 @@ fn branched_before(body: &ExprBody, start: BlockId, target: BlockId) -> Option<b
 }
 
 fn unique_target(term: &Terminator) -> Option<BlockId> {
-    term.targets_ignoring_unwind()
-        .into_iter()
-        .exactly_one()
-        .ok()
+    term.targets_ignoring_unwind().into_iter().exactly_one().ok()
 }
 
 fn find_next_move_of(
@@ -178,12 +175,8 @@ fn find_next_drop(
     let mut visited = HashSet::new();
     while visited.insert(block_id) {
         let block = &body.body[block_id];
-        if let TerminatorKind::Drop {
-            place: dropped,
-            target,
-            on_unwind,
-            ..
-        } = &block.terminator.kind
+        if let TerminatorKind::Drop { place: dropped, target, on_unwind, .. } =
+            &block.terminator.kind
             && dropped == dropped_place
         {
             return Some((block_id, *target, *on_unwind));
@@ -303,61 +296,53 @@ impl UllbcPass for Transform {
         // conditional_drop box1
         // box3 = move box2
         // box4 = assume_init(move box3)
-        let rewrites = body
-            .body
-            .iter_enumerated()
-            .filter_map(|(new_uninit_bid, block)| {
-                let TerminatorKind::Call {
-                    call,
-                    dest,
-                    target: new_uninit_target,
-                    ..
-                } = &block.terminator.kind
-                else {
-                    return None;
-                };
+        let rewrites = body.body.iter_enumerated().filter_map(|(new_uninit_bid, block)| {
+            let TerminatorKind::Call { call, dest, target: new_uninit_target, .. } =
+                &block.terminator.kind
+            else {
+                return None;
+            };
 
-                if !is_new_uninit_call(ctx, call) {
-                    return None;
-                }
-                // check uninit_box: Box<MaybeUninit<_>>
-                let uninit_box = dest.clone();
-                let maybe_uninit_array_ty = box_inner(uninit_box.ty())?;
-                let maybe_uninit_ref = maybe_uninit_array_ty.as_adt()?;
-                let mu_decl = &ctx.translated.type_decls.get(maybe_uninit_ref.id)?;
-                if mu_decl.item_meta.lang_item.as_ref() != Some(&from_rustc::LangItem::MaybeUninit)
-                {
-                    return None;
-                };
-                // `MaybeUninit<T>` and `Box::new<T>` have the same generic parameters (`T: Sized`).
-                let box_new_generics = maybe_uninit_ref.generics.as_ref().clone();
-                let uninit_box_l = uninit_box.local_id()?;
+            if !is_new_uninit_call(ctx, call) {
+                return None;
+            }
+            // check uninit_box: Box<MaybeUninit<_>>
+            let uninit_box = dest.clone();
+            let maybe_uninit_array_ty = box_inner(uninit_box.ty())?;
+            let maybe_uninit_ref = maybe_uninit_array_ty.as_adt()?;
+            let mu_decl = &ctx.translated.type_decls.get(maybe_uninit_ref.id)?;
+            if mu_decl.item_meta.lang_item.as_ref() != Some(&from_rustc::LangItem::MaybeUninit) {
+                return None;
+            };
+            // `MaybeUninit<T>` and `Box::new<T>` have the same generic parameters (`T: Sized`).
+            let box_new_generics = maybe_uninit_ref.generics.as_ref().clone();
+            let uninit_box_l = uninit_box.local_id()?;
 
-                // (*uninit_box).1.0.0 = [...]
-                let payload = find_array_assign(body, *new_uninit_target, uninit_box_l)?;
+            // (*uninit_box).1.0.0 = [...]
+            let payload = find_array_assign(body, *new_uninit_target, uninit_box_l)?;
 
-                // assume_init(uninit_box2)
-                let tail = find_assume_init_tail(ctx, body, payload.loc.after(), &uninit_box)?;
-                Some(Rewrite {
-                    new_uninit_bid,
-                    new_uninit_target: *new_uninit_target,
-                    drop_bid: tail.drop_bid,
-                    target_bid: tail.target_bid,
-                    payload_loc: payload.loc,
-                    move_loc: tail.move_loc,
-                    arg_move_loc: tail.arg_move_loc,
-                    span: payload.span,
-                    array_value: payload.array_value,
-                    array_ty: payload.array_ty,
-                    uninit_box,
-                    branched_before_payload: payload.branched_before_payload,
-                    box_new_generics,
-                    assume_init_generics: tail.assume_init_generics,
-                    drop_on_unwind: tail.drop_on_unwind,
-                    box_array: tail.box_array,
-                    assume_init_target: tail.assume_init_target,
-                })
-            });
+            // assume_init(uninit_box2)
+            let tail = find_assume_init_tail(ctx, body, payload.loc.after(), &uninit_box)?;
+            Some(Rewrite {
+                new_uninit_bid,
+                new_uninit_target: *new_uninit_target,
+                drop_bid: tail.drop_bid,
+                target_bid: tail.target_bid,
+                payload_loc: payload.loc,
+                move_loc: tail.move_loc,
+                arg_move_loc: tail.arg_move_loc,
+                span: payload.span,
+                array_value: payload.array_value,
+                array_ty: payload.array_ty,
+                uninit_box,
+                branched_before_payload: payload.branched_before_payload,
+                box_new_generics,
+                assume_init_generics: tail.assume_init_generics,
+                drop_on_unwind: tail.drop_on_unwind,
+                box_array: tail.box_array,
+                assume_init_target: tail.assume_init_target,
+            })
+        });
 
         for rw in rewrites.collect::<Vec<_>>() {
             let array_local = body.locals.new_var(None, rw.array_ty);
@@ -382,15 +367,11 @@ impl UllbcPass for Transform {
             let (fn_ptr, args) = if rw.branched_before_payload {
                 (
                     FnPtr::new(FnPtrKind::Fun(box_write), rw.assume_init_generics),
-                    vec![
-                        Operand::Move(rw.uninit_box),
-                        Operand::Move(array_local.clone()),
-                    ],
+                    vec![Operand::Move(rw.uninit_box), Operand::Move(array_local.clone())],
                 )
             } else {
-                body.body[rw.new_uninit_bid].terminator.kind = TerminatorKind::Goto {
-                    target: rw.new_uninit_target,
-                };
+                body.body[rw.new_uninit_bid].terminator.kind =
+                    TerminatorKind::Goto { target: rw.new_uninit_target };
                 (
                     FnPtr::new(FnPtrKind::Fun(box_new), rw.box_new_generics),
                     vec![Operand::Move(array_local.clone())],
@@ -398,26 +379,20 @@ impl UllbcPass for Transform {
             };
 
             let drop_block = &mut body.body[rw.drop_bid];
-            drop_block.statements.push(Statement::new(
-                rw.span,
-                StatementKind::StorageLive(box_array_lid),
-            ));
+            drop_block
+                .statements
+                .push(Statement::new(rw.span, StatementKind::StorageLive(box_array_lid)));
             drop_block.terminator.kind = TerminatorKind::Call {
-                call: Call {
-                    func: FnOperand::Regular(fn_ptr),
-                    args,
-                    safety: CallSafety::Inherit,
-                },
+                call: Call { func: FnOperand::Regular(fn_ptr), args, safety: CallSafety::Inherit },
                 dest: box_array_local.clone(),
                 target: rw.target_bid,
                 on_unwind: rw.drop_on_unwind,
             };
 
             let target_block = &mut body.body[rw.target_bid];
-            target_block.statements.push(Statement::new(
-                rw.span,
-                StatementKind::StorageDead(array_lid),
-            ));
+            target_block
+                .statements
+                .push(Statement::new(rw.span, StatementKind::StorageDead(array_lid)));
             target_block.statements.push(Statement::new(
                 rw.span,
                 StatementKind::Assign(
@@ -425,13 +400,10 @@ impl UllbcPass for Transform {
                     Rvalue::Use(Operand::Move(box_array_local), WithRetag::No),
                 ),
             ));
-            target_block.statements.push(Statement::new(
-                rw.span,
-                StatementKind::StorageDead(box_array_lid),
-            ));
-            target_block.terminator.kind = TerminatorKind::Goto {
-                target: rw.assume_init_target,
-            };
+            target_block
+                .statements
+                .push(Statement::new(rw.span, StatementKind::StorageDead(box_array_lid)));
+            target_block.terminator.kind = TerminatorKind::Goto { target: rw.assume_init_target };
         }
     }
 }

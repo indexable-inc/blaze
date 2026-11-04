@@ -99,9 +99,11 @@ pub fn mounts() -> Result<Vec<std::path::PathBuf>, String> {
 /// mount `path` is under, the longest mount point that holds it); `None` off btrfs.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn btrfs_source(path: &Path) -> Result<Option<String>, String> {
-    let resolved = std::fs::canonicalize(path).map_err(|error| format!("resolving {}: {error}", path.display()))?;
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|error| format!("resolving {}: {error}", path.display()))?;
     let table = "/proc/self/mountinfo";
-    let text = std::fs::read_to_string(table).map_err(|error| format!("reading {table}: {error}"))?;
+    let text =
+        std::fs::read_to_string(table).map_err(|error| format!("reading {table}: {error}"))?;
     let mut best: Option<(usize, Option<String>)> = None;
     for line in text.lines() {
         // `id parent major:minor root mount-point options [optional...] - fstype source super`.
@@ -137,7 +139,8 @@ fn unescape(field: &str) -> std::ffi::OsString {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        let octal = bytes.get(at + 1..at + 4).filter(|it| it.iter().all(|b| (b'0'..=b'7').contains(b)));
+        let octal =
+            bytes.get(at + 1..at + 4).filter(|it| it.iter().all(|b| (b'0'..=b'7').contains(b)));
         match (bytes[at], octal) {
             (b'\\', Some(digits)) => {
                 let value = digits.iter().fold(0u32, |n, b| n * 8 + u32::from(b - b'0'));
@@ -176,7 +179,8 @@ pub fn mounts() -> Result<Vec<std::path::PathBuf>, String> {
     Ok(stats[..got as usize]
         .iter()
         .map(|it| {
-            let name: Vec<u8> = it.f_mntonname.iter().take_while(|it| **it != 0).map(|it| *it as u8).collect(); // alloc: one a mount
+            let name: Vec<u8> =
+                it.f_mntonname.iter().take_while(|it| **it != 0).map(|it| *it as u8).collect(); // alloc: one a mount
             std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&name))
         })
         .collect())
@@ -194,7 +198,10 @@ pub fn mounts() -> Result<Vec<std::path::PathBuf>, String> {
 /// mount inside a directory from the directory.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
 pub fn mounts() -> Result<Vec<std::path::PathBuf>, String> {
-    Err(format!("listing the mounts is not done on {}: blaze removes no directory there, since it could not tell a mount inside one", std::env::consts::OS))
+    Err(format!(
+        "listing the mounts is not done on {}: blaze removes no directory there, since it could not tell a mount inside one",
+        std::env::consts::OS
+    ))
 }
 
 /// The APFS container `path`'s volume is in (`disk3` of `/dev/disk3s5`): the volumes of one
@@ -209,7 +216,11 @@ pub fn apfs_container(path: &Path) -> Result<Option<String>, String> {
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
     if unsafe { libc::statfs(name.as_ptr(), &mut stat) } != 0 {
-        return Err(format!("the file system of {}: {}", path.display(), std::io::Error::last_os_error()));
+        return Err(format!(
+            "the file system of {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
     }
     let text = |field: &[libc::c_char]| -> String {
         let bytes: Vec<u8> = field.iter().take_while(|it| **it != 0).map(|it| *it as u8).collect(); // alloc: one a measure
@@ -223,9 +234,13 @@ pub fn apfs_container(path: &Path) -> Result<Option<String>, String> {
     // `com.apple.os.update-<hash>@/dev/disk1s5` (review N12): the container is `disk3`, after the
     // last `/dev/`.
     let device = from.rfind("/dev/").map_or(from.as_str(), |at| &from[at + "/dev/".len()..]);
-    let digits = device.strip_prefix("disk").map(|rest| rest.bytes().take_while(u8::is_ascii_digit).count());
+    let digits =
+        device.strip_prefix("disk").map(|rest| rest.bytes().take_while(u8::is_ascii_digit).count());
     match digits {
         Some(n) if n > 0 => Ok(Some(device[..4 + n].to_owned())),
-        _ => Err(format!("{} is on APFS mounted from {from}, which names no container (diskN)", path.display())),
+        _ => Err(format!(
+            "{} is on APFS mounted from {from}, which names no container (diskN)",
+            path.display()
+        )),
     }
 }

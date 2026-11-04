@@ -508,11 +508,7 @@ impl<'p, E: Clone, const N: usize> Cache<'p, Counted<[E; N]>> {
     /// Places `head`, then clones of `fill` up to `N` elements, in a slot with one owner. Each
     /// element is written in place: the array never passes through the stack, so a slot of
     /// megabytes works, and a copy (`head` a whole array) is one pass over the slot.
-    pub fn try_share_from(
-        &mut self,
-        head: &[E],
-        fill: &E,
-    ) -> Result<Shared<'p, [E; N]>, MemError> {
+    pub fn try_share_from(&mut self, head: &[E], fill: &E) -> Result<Shared<'p, [E; N]>, MemError> {
         assert!(head.len() <= N, "{} elements for a slot of {N}", head.len());
         if self.len == 0 {
             self.refill()?;

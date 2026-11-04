@@ -229,10 +229,7 @@ LL +         if break return () {
 error: aborting due to 3 previous errors
 
 "#;
-    assert_eq!(
-        ui("unused-parens-assign-expr-in-ret-issue-131989.rs", "2015", source),
-        expected
-    );
+    assert_eq!(ui("unused-parens-assign-expr-in-ret-issue-131989.rs", "2015", source), expected);
 }
 
 #[test]
@@ -333,7 +330,10 @@ fn main() {
     if (return) {} // ok
 }
 "#;
-    assert_eq!(ui_run_pass("no-unused-parens-return-block.rs", "2015", source, &Options::default()), "");
+    assert_eq!(
+        ui_run_pass("no-unused-parens-return-block.rs", "2015", source, &Options::default()),
+        ""
+    );
 }
 
 #[test]
@@ -365,9 +365,13 @@ fn foo() {
 fn main() {}
 "#;
     assert_reports(
-        &ui_core("unused-parens-labeled-break-issue-143256.rs", "2015", "default, ord, builtin_impls", source),
-        &[
-        ],
+        &ui_core(
+            "unused-parens-labeled-break-issue-143256.rs",
+            "2015",
+            "default, ord, builtin_impls",
+            source,
+        ),
+        &[],
     );
 }
 

@@ -121,11 +121,17 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
                     FieldsShape::Tuple => "(..)",
                     FieldsShape::Record => " { .. }",
                 };
-                Some(format!("{}{}{fields}", prefix.as_deref().unwrap_or_default(), name.display(db, edition)))
+                Some(format!(
+                    "{}{}{fields}",
+                    prefix.as_deref().unwrap_or_default(),
+                    name.display(db, edition)
+                ))
             })
             .collect();
         let named = |it: &EnumVariantId| {
-            variants.get_index(it.index(db)).map(|(name, _)| format!("`{enum_name}::{}`", name.display(db, edition)))
+            variants
+                .get_index(it.index(db))
+                .map(|(name, _)| format!("`{enum_name}::{}`", name.display(db, edition)))
         };
         let mut shown =
             catch_all.variants.iter().take(NAMED).filter_map(named).collect::<Vec<_>>().join(", "); // alloc: a message's part
@@ -178,7 +184,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
 fn of_workspace(cx: &Cx<'_, '_>, enum_: EnumId) -> bool {
     let db = cx.db();
     enum_.krate(db).data(db).origin.is_local()
-        && !AttrFlags::query(db, AttrDefId::AdtId(AdtId::EnumId(enum_))).contains(AttrFlags::NON_EXHAUSTIVE)
+        && !AttrFlags::query(db, AttrDefId::AdtId(AdtId::EnumId(enum_)))
+            .contains(AttrFlags::NON_EXHAUSTIVE)
 }
 
 /// The path, up to and with its last `::`, another arm of the match names a variant of `enum_`
@@ -199,11 +206,17 @@ fn written_prefix(
     for arm in arms {
         body.walk_pats(arm.pat, &mut |pat| {
             if prefix.is_some()
-                || !matches!(body.pat(pat), HirPat::Path(_) | HirPat::TupleStruct { .. } | HirPat::Record { .. })
+                || !matches!(
+                    body.pat(pat),
+                    HirPat::Path(_) | HirPat::TupleStruct { .. } | HirPat::Record { .. }
+                )
             {
                 return;
             }
-            let Some(VariantId::EnumVariantId(variant)) = infer.variant_resolution_for_pat(pat) else { return };
+            let Some(VariantId::EnumVariantId(variant)) = infer.variant_resolution_for_pat(pat)
+            else {
+                return;
+            };
             if variant.lookup(db).parent != enum_ {
                 return;
             }
@@ -229,7 +242,11 @@ fn module_prefix(cx: &Cx<'_, '_>, def: DefWithBodyId, enum_: EnumId) -> Option<S
         prefer_absolute: false,
         allow_unstable: true,
     };
-    let path = module.find_path(db, hir::ModuleDef::Adt(hir::Adt::Enum(hir::Enum::from(enum_))), config)?;
+    let path = module.find_path(
+        db,
+        hir::ModuleDef::Adt(hir::Adt::Enum(hir::Enum::from(enum_))),
+        config,
+    )?;
     Some(format!("{}::", path.display(db, cx.edition())))
 }
 
@@ -239,7 +256,9 @@ fn needs_parens(body: &hir_def::expr_store::Body, arm_pat: PatId, pat: PatId) ->
     let mut parens = false;
     body.walk_pats(arm_pat, &mut |it| {
         parens |= match body.pat(it) {
-            HirPat::Ref { pat: inner, .. } | HirPat::Box { inner } | HirPat::Deref { inner } => inner == pat,
+            HirPat::Ref { pat: inner, .. } | HirPat::Box { inner } | HirPat::Deref { inner } => {
+                inner == pat
+            }
             HirPat::Bind { subpat: Some(inner), .. } => inner == pat,
             _ => false,
         };

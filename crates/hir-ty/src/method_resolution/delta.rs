@@ -34,9 +34,9 @@ use hir_expand::name::Name;
 pub use self::{
     head::{Head, HeadDef},
     publish::{
-        CANDIDATE_SET_DOMAIN, CandidateSlice, DirectorySlot, IMPL_SET_DOMAIN, ImplIdentities, ImplSlices,
-        InherentSlice, SliceDirectory, TraitImplsSlice, candidate_set_hash, impl_identity,
-        impl_set_hash, install_identities,
+        CANDIDATE_SET_DOMAIN, CandidateSlice, DirectorySlot, IMPL_SET_DOMAIN, ImplIdentities,
+        ImplSlices, InherentSlice, SliceDirectory, TraitImplsSlice, candidate_set_hash,
+        impl_identity, impl_set_hash, install_identities,
     },
     read::{blanket_hash, impl_row_hash},
     state::State,

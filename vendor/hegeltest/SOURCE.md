@@ -17,9 +17,13 @@ Hegel, the property-based testing library blaze's property tests use (docs/contr
 - The three directories are excluded from blaze's workspace (root `Cargo.toml`), so their own
   tests are not blaze's to run; they are built only as dependencies of blaze's tests.
 
-Kept from `tests/`: the files under `tests/embedded/` that the `#[cfg(test)] #[path = ...]`
-modules name, unchanged, because `cargo fmt --all` (fmt.yaml) resolves those modules and stops
-on a missing file. Left out: the rest of every `tests/` directory (the integration tests and
+Kept from `tests/`: every file under `tests/embedded/` (subdirectories too) that a
+`#[cfg(test)] #[path = ...]` module names, and the data files those include with `include!`
+(`native/statistics_oracle_data.rs`, `native/unicodedata_python_reference_data.rs`,
+`native/unicodedata_python_reference_deltas.rs`), unchanged from the commit above, because
+`blaze fmt --all` (fmt.yaml) resolves those modules and fails on a missing file. Until
+2026-11-04 only the top-level ones were kept, and the 91 under `ffi/`, `generators/` and
+`native/` were missing. Left out: the rest of every `tests/` directory (the integration tests and
 libhegel's other embedded tests), `examples/`, `benches/`,
 `scripts/`, `include/` (the C header), the justfiles, AGENTS.md, CHANGELOG.md, RELEASE.md, the
 `[[bin]]` fixtures and the dev-dependencies they need, and the hegel workspace's own

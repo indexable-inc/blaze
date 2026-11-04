@@ -102,9 +102,7 @@ impl Output {
 
     /// Deliver each line to `sink` instead of stderr.
     pub fn callback(sink: impl Fn(&str) + Send + Sync + 'static) -> Self {
-        Output {
-            sink: Some(alloc::sync::Arc::new(sink)),
-        }
+        Output { sink: Some(alloc::sync::Arc::new(sink)) }
     }
 
     /// Emit one line of output to this destination.
@@ -464,11 +462,8 @@ impl Settings {
             }
         }
         if let Some(value) = env_value(&env, "HEGEL_DATABASE") {
-            self.database = if value == "disabled" {
-                Database::Disabled
-            } else {
-                Database::Path(value)
-            };
+            self.database =
+                if value == "disabled" { Database::Disabled } else { Database::Path(value) };
         }
         if let Some(value) = env_value(&env, "HEGEL_STATISTICS") {
             if value != "0" {
@@ -556,11 +551,8 @@ pub(crate) enum Database {
 
 /// The database in the base settings: the default disk database, except on
 /// WebAssembly, which has no filesystem to keep one in.
-const BASE_DATABASE: Database = if cfg!(target_family = "wasm") {
-    Database::Disabled
-} else {
-    Database::Unset
-};
+const BASE_DATABASE: Database =
+    if cfg!(target_family = "wasm") { Database::Disabled } else { Database::Unset };
 
 pub(crate) fn is_in_ci_from(env: impl Fn(&str) -> Option<String>) -> bool {
     const CI_VARS: &[(&str, Option<&str>)] = &[

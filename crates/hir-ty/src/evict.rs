@@ -41,7 +41,9 @@ pub fn drop_statics(db: &mut Db, statics: &[StaticId]) {
 /// generic arguments, anonymous constants (array lengths, repeat counts, const arguments,
 /// `const` blocks) and statics. Returns how many.
 pub fn drop_all_const_eval(db: &mut Db) -> usize {
-    const_eval_query::evict_values(db) + anon_const_eval_query::evict_values(db) + const_eval_static_query::evict_values(db)
+    const_eval_query::evict_values(db)
+        + anon_const_eval_query::evict_values(db)
+        + const_eval_static_query::evict_values(db)
 }
 
 /// Lets go of the trait solver's caches shared by the queries of `crates` (each crate's search

@@ -34,7 +34,10 @@ use hir::AsAssocItem as _;
 use hir_def::{
     DefWithBodyId,
     expr_store::{Body, scope::ExprScopes},
-    hir::{Array, BinaryOp, BindingId, CmpOp, Expr, ExprId, Literal, LogicOp, Pat, PatId, Statement, UnaryOp},
+    hir::{
+        Array, BinaryOp, BindingId, CmpOp, Expr, ExprId, Literal, LogicOp, Pat, PatId, Statement,
+        UnaryOp,
+    },
     resolver::{ValueNs, resolver_for_scope},
     signatures::FunctionSignature,
     type_ref::Mutability,
@@ -62,7 +65,8 @@ const RULE: &str = "keys known at compile time: build a perfect hash with `blaze
                     array of values with what it returns";
 
 /// The constructors of an empty map that `insert(lit, ..)` statements may fill.
-const CONSTRUCT: &[&str] = &["new", "default", "with_capacity", "with_hasher", "with_capacity_and_hasher"];
+const CONSTRUCT: &[&str] =
+    &["new", "default", "with_capacity", "with_hasher", "with_capacity_and_hasher"];
 /// The methods a `collect` or `from_iter` source is followed through to its array or `const`.
 const CHAIN: &[&str] = &["iter", "into_iter", "copied", "cloned"];
 /// The cells a `static` keeps a value in, by crate and name: what is in one is only lent out.
@@ -138,7 +142,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     for (id, expr) in body.exprs() {
         match expr {
             Expr::Call { .. } | Expr::MethodCall { .. } => walk.map(cx, id, &mut found),
-            Expr::Match { expr: scrutinee, arms } => walk.matched(cx, id, scrutinee, arms, &mut found),
+            Expr::Match { expr: scrutinee, arms } => {
+                walk.matched(cx, id, scrutinee, arms, &mut found)
+            }
             Expr::If { .. } => walk.chain(cx, id, &mut found),
             _ => {}
         }
@@ -217,7 +223,9 @@ impl<'db> Walk<'_, 'db> {
         // alloc: the uses of one fixed map's local, a few
         let mut uses = Vec::new();
         for (id, expr) in self.body.exprs() {
-            if matches!(expr, Expr::Path(_)) && matches!(self.value_of(id), Some(ValueNs::LocalBinding(it)) if it == local) {
+            if matches!(expr, Expr::Path(_))
+                && matches!(self.value_of(id), Some(ValueNs::LocalBinding(it)) if it == local)
+            {
                 uses.push(id);
             }
         }
@@ -264,14 +272,21 @@ impl<'db> Walk<'_, 'db> {
         let Some(range) = self.analysis.expr_range(id) else { return };
         let holder = match held {
             Held::Static(it) => format!("the static `{}`", path_of(db, it.into())),
-            Held::Local(it) => format!("the local `{}` in {}", self.body[it].name.as_str(), item_name(db, self.analysis.def())),
+            Held::Local(it) => format!(
+                "the local `{}` in {}",
+                self.body[it].name.as_str(),
+                item_name(db, self.analysis.def())
+            ),
         };
         let count = match count {
             Count::Written(n) => format!("{n} keys"),
             Count::Of(name, Some(n)) => format!("the {n} keys of `{name}`"),
             Count::Of(name, None) => format!("the keys of `{name}`"),
         };
-        let message = format!("{holder} is a `{}` of {count}, filled at run time; {RULE}", adt.name(db).as_str());
+        let message = format!(
+            "{holder} is a `{}` of {count}, filled at run time; {RULE}",
+            adt.name(db).as_str()
+        );
         facts::push(found, LINT, range, message, None);
     }
 
@@ -328,10 +343,12 @@ impl<'db> Walk<'_, 'db> {
         let block = self.parents().of_expr(id)?;
         let Expr::Block { statements, .. } = self.body.expr(block) else { return None };
         let (at, local) = statements.iter().enumerate().find_map(|(at, it)| match it {
-            Statement::Let { pat, initializer: Some(init), .. } if init == id => match self.body.pat(pat) {
-                Pat::Bind { id: local, subpat: None } => Some((at, local)),
-                _ => None,
-            },
+            Statement::Let { pat, initializer: Some(init), .. } if init == id => {
+                match self.body.pat(pat) {
+                    Pat::Bind { id: local, subpat: None } => Some((at, local)),
+                    _ => None,
+                }
+            }
             _ => None,
         })?;
         // alloc: the inserts that fill one map, a few dozen
@@ -339,9 +356,11 @@ impl<'db> Walk<'_, 'db> {
         for statement in statements.iter().skip(at + 1) {
             let Statement::Expr { expr, .. } = statement else { break };
             let Expr::MethodCall { receiver, args, .. } = self.body.expr(expr) else { break };
-            let insert = written_callee(self.infer, self.body, expr).is_some_and(|(f, _)| self.name_of(f) == "insert");
+            let insert = written_callee(self.infer, self.body, expr)
+                .is_some_and(|(f, _)| self.name_of(f) == "insert");
             let arity = if set { 1 } else { 2 };
-            let on_local = matches!(self.value_of(receiver), Some(ValueNs::LocalBinding(it)) if it == local);
+            let on_local =
+                matches!(self.value_of(receiver), Some(ValueNs::LocalBinding(it)) if it == local);
             if !insert || args.len() != arity || !on_local || !self.fixed_key(args[0]) {
                 break;
             }
@@ -459,7 +478,11 @@ impl<'db> Walk<'_, 'db> {
         if keys <= KEYS || !self.written(id) || self.compile_time(id) {
             return;
         }
-        let Some(range) = self.analysis.expr_range(scrutinee).or_else(|| self.analysis.expr_range(id)) else { return };
+        let Some(range) =
+            self.analysis.expr_range(scrutinee).or_else(|| self.analysis.expr_range(id))
+        else {
+            return;
+        };
         let message = format!(
             "this `match` on `{}` in {} compares {keys} string literals one after another; {RULE}",
             cx.snippet(range),
@@ -474,7 +497,9 @@ impl<'db> Walk<'_, 'db> {
         match self.body.pat(pat) {
             Pat::Lit(expr) => match self.body.expr(expr) {
                 Expr::Literal(Literal::String(_)) => Some(1),
-                Expr::Literal(Literal::ByteString(bytes)) => std::str::from_utf8(bytes).is_ok().then_some(1),
+                Expr::Literal(Literal::ByteString(bytes)) => {
+                    std::str::from_utf8(bytes).is_ok().then_some(1)
+                }
                 _ => Some(0),
             },
             Pat::Or(pats) => pats.iter().try_fold(0, |sum, &it| Some(sum + self.literal_pats(it)?)),
@@ -515,7 +540,10 @@ impl<'db> Walk<'_, 'db> {
             Expr::If { condition, .. } => condition,
             _ => id,
         };
-        let Some(range) = self.analysis.expr_range(head).or_else(|| self.analysis.expr_range(id)) else { return };
+        let Some(range) = self.analysis.expr_range(head).or_else(|| self.analysis.expr_range(id))
+        else {
+            return;
+        };
         let compared = self.analysis.expr_range(place).map_or("it", |it| cx.snippet(it));
         let message = format!(
             "this `if`/`else if` chain in {} compares `{compared}` with {keys} string literals one after another; {RULE}",
@@ -531,7 +559,11 @@ impl<'db> Walk<'_, 'db> {
             Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::LogicOp(LogicOp::Or)) } => {
                 Some(self.compares(lhs, place)? + self.compares(rhs, place)?)
             }
-            Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(CmpOp::Eq { negated: false })) } => {
+            Expr::BinaryOp {
+                lhs,
+                rhs,
+                op: Some(BinaryOp::CmpOp(CmpOp::Eq { negated: false })),
+            } => {
                 let other = match (self.is_text_literal(lhs), self.is_text_literal(rhs)) {
                     (false, true) => lhs,
                     (true, false) => rhs,
@@ -570,10 +602,20 @@ impl<'db> Walk<'_, 'db> {
                 (Some(ValueNs::StaticId(x)), Some(ValueNs::StaticId(y))) => x == y,
                 _ => false,
             },
-            (Expr::Field { expr: x, name: n }, Expr::Field { expr: y, name: m }) => n == m && self.same_place(x, y, depth),
-            (Expr::UnaryOp { expr: x, op: UnaryOp::Deref }, Expr::UnaryOp { expr: y, op: UnaryOp::Deref })
-            | (Expr::Ref { expr: x, .. }, Expr::Ref { expr: y, .. }) => self.same_place(x, y, depth),
-            (Expr::MethodCall { receiver: x, args: [], .. }, Expr::MethodCall { receiver: y, args: [], .. }) => {
+            (Expr::Field { expr: x, name: n }, Expr::Field { expr: y, name: m }) => {
+                n == m && self.same_place(x, y, depth)
+            }
+            (
+                Expr::UnaryOp { expr: x, op: UnaryOp::Deref },
+                Expr::UnaryOp { expr: y, op: UnaryOp::Deref },
+            )
+            | (Expr::Ref { expr: x, .. }, Expr::Ref { expr: y, .. }) => {
+                self.same_place(x, y, depth)
+            }
+            (
+                Expr::MethodCall { receiver: x, args: [], .. },
+                Expr::MethodCall { receiver: y, args: [], .. },
+            ) => {
                 let callee = |it: ExprId| written_callee(self.infer, self.body, it).map(|(f, _)| f);
                 callee(a).is_some_and(|f| Some(f) == callee(b)) && self.same_place(x, y, depth)
             }
@@ -594,12 +636,16 @@ fn text_literal(literal: &Literal) -> bool {
 /// Whether `ty`, its references peeled, is `str` or `[u8]`: a key `blaze_phf` looks up.
 fn text_key(ty: &hir::Type<'_>) -> bool {
     let ty = ty.strip_references();
-    ty.is_str() || ty.as_slice().is_some_and(|it| it.as_builtin().is_some_and(|it| it.name().as_str() == "u8"))
+    ty.is_str()
+        || ty
+            .as_slice()
+            .is_some_and(|it| it.as_builtin().is_some_and(|it| it.name().as_str() == "u8"))
 }
 
 /// [`text_key`], or a `String`: what is compared with a string literal.
 fn text_place(db: &Db, ty: &hir::Type<'_>) -> bool {
-    text_key(ty) || ty.strip_references().as_adt().is_some_and(|it| facts::adt_is(db, it, "alloc", "String"))
+    text_key(ty)
+        || ty.strip_references().as_adt().is_some_and(|it| facts::adt_is(db, it, "alloc", "String"))
 }
 
 /// The item `def` is, with its path: "function `main::parse`".
@@ -632,7 +678,10 @@ fn path_of(db: &Db, item: hir::ModuleDef) -> String {
         }
     }
     if let hir::ModuleDef::Function(f) = item
-        && let Some(adt) = f.as_assoc_item(db).and_then(|it| it.implementing_ty(db)).and_then(|it| it.strip_references().as_adt())
+        && let Some(adt) = f
+            .as_assoc_item(db)
+            .and_then(|it| it.implementing_ty(db))
+            .and_then(|it| it.strip_references().as_adt())
     {
         push(adt.name(db).as_str());
     }
@@ -685,10 +734,14 @@ pub mod sync {
 use std::{collections::HashMap, sync::LazyLock};
 "#;
 
-    const RULE: &str = "keys known at compile time: build a perfect hash with `blaze_phf::phf_table!`";
+    const RULE: &str =
+        "keys known at compile time: build a perfect hash with `blaze_phf::phf_table!`";
 
     fn lint_main(main: &str) -> String {
-        lint(&format!("{STD}{}", main.trim_start_matches('\n')), "-A clippy::all --warn=blaze::fixed_key_lookup")
+        lint(
+            &format!("{STD}{}", main.trim_start_matches('\n')),
+            "-A clippy::all --warn=blaze::fixed_key_lookup",
+        )
     }
 
     /// `n` arms of a `match` on `word`, each a string literal.
@@ -724,11 +777,27 @@ pub fn handed_out() -> HashMap<&'static str, u32> {
 "#,
         );
         assert_eq!(found.matches(RULE).count(), 3, "{found}");
-        assert!(found.contains("the static `main::NAMES` is a `HashMap` of 3 keys, filled at run time"), "{found}");
-        assert!(found.contains("the static `main::FILLED` is a `HashMap` of 2 keys, filled at run time"), "{found}");
-        assert!(found.contains("the local `names` in function `main::read` is a `HashMap` of 2 keys"), "{found}");
-        assert!(!found.contains("in function `main::grown` is a"), "a map inserted into later is not fixed:\n{found}");
-        assert!(!found.contains("in function `main::handed_out` is a"), "a returned map may change in its caller:\n{found}");
+        assert!(
+            found.contains("the static `main::NAMES` is a `HashMap` of 3 keys, filled at run time"),
+            "{found}"
+        );
+        assert!(
+            found
+                .contains("the static `main::FILLED` is a `HashMap` of 2 keys, filled at run time"),
+            "{found}"
+        );
+        assert!(
+            found.contains("the local `names` in function `main::read` is a `HashMap` of 2 keys"),
+            "{found}"
+        );
+        assert!(
+            !found.contains("in function `main::grown` is a"),
+            "a map inserted into later is not fixed:\n{found}"
+        );
+        assert!(
+            !found.contains("in function `main::handed_out` is a"),
+            "a returned map may change in its caller:\n{found}"
+        );
     }
 
     /// A `match` on a `&str` of 20 literal arms is found, one of 5 is not, and an `#[expect]`

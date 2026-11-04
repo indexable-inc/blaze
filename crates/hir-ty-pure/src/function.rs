@@ -140,7 +140,9 @@ impl Refusal {
             .chain
             .iter()
             .map(|step| match &step.at {
-                Some(at) if !at.path.is_empty() => format!("`{}` ({}:{})", step.name, at.path, at.line), // alloc: as above
+                Some(at) if !at.path.is_empty() => {
+                    format!("`{}` ({}:{})", step.name, at.path, at.line)
+                } // alloc: as above
                 _ => format!("`{}`", step.name), // alloc: as above
             })
             .collect();
@@ -182,15 +184,25 @@ pub fn check(
     let Some(index) = effect_index(effect) else { return Err(unregistered(db, func, effect)) };
     let env = ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }.store();
     // clone: a lint's answer, once per function
-    checked(db, env, func, args, index as u8, effect.refuses.0, false).as_result().map(Clone::clone).map_err(Clone::clone)
+    checked(db, env, func, args, index as u8, effect.refuses.0, false)
+        .as_result()
+        .map(Clone::clone)
+        .map_err(Clone::clone)
 }
 
 /// `effect` of the definition `func`, in its own where-clauses.
-pub fn check_generic(db: &Db, func: FunctionId, effect: &EffectDef) -> Result<EffectProof, Refusal> {
+pub fn check_generic(
+    db: &Db,
+    func: FunctionId,
+    effect: &EffectDef,
+) -> Result<EffectProof, Refusal> {
     let Some(index) = effect_index(effect) else { return Err(unregistered(db, func, effect)) };
     let (env, args) = generic(db, func);
     // clone: a lint's answer, once per function
-    checked(db, env, func, args, index as u8, effect.refuses.0, true).as_result().map(Clone::clone).map_err(Clone::clone)
+    checked(db, env, func, args, index as u8, effect.refuses.0, true)
+        .as_result()
+        .map(Clone::clone)
+        .map_err(Clone::clone)
 }
 
 /// Every kind of effect the instance `body<args>` may have, `krate`'s impls in scope, no trust
@@ -262,7 +274,9 @@ fn checked(
         refused = refused.union(EffectSet::one(Rule::Open));
     }
     // The kind with the fewest calls to it, the first in `Rule` order of those.
-    let shortest = refused.iter().min_by_key(|rule| summary.witness(index, *rule).map_or(u16::MAX, |it| it.depth));
+    let shortest = refused
+        .iter()
+        .min_by_key(|rule| summary.witness(index, *rule).map_or(u16::MAX, |it| it.depth));
     if let Some(rule) = shortest {
         return FnPurity::Impure(refusal(&cx, def, index, rule, &root, summary));
     }
@@ -305,7 +319,13 @@ impl Found {
 /// Every instance the root reaches for `def`, past none trusted for it (nor, for an effect that
 /// holds of what returns, through one that never does), each trusted one met kept in `found`:
 /// how many instances it reached.
-fn reach(db: &Db, env: &StoredParamEnvAndCrate, root: &Instance, def: &EffectDef, found: &mut Found) -> u32 {
+fn reach(
+    db: &Db,
+    env: &StoredParamEnvAndCrate,
+    root: &Instance,
+    def: &EffectDef,
+    found: &mut Found,
+) -> u32 {
     let mut seen: HashSet<Instance, Global> = HashSet::new_in(Global);
     let mut stack: Vec<Instance> = Vec::new(); // alloc: the walk's frontier, once per check
     seen.insert(root.clone()); // clone: reference counts
@@ -339,7 +359,14 @@ fn reach(db: &Db, env: &StoredParamEnvAndCrate, root: &Instance, def: &EffectDef
 
 /// The refusal of `rule` for `def` (at `index` of [`EFFECTS`]) of `root`, whose summary is
 /// `summary`: its witnesses followed down to where it is done.
-fn refusal(cx: &Cx<'_>, def: &EffectDef, index: usize, rule: Rule, root: &Instance, summary: &Summary) -> Refusal {
+fn refusal(
+    cx: &Cx<'_>,
+    def: &EffectDef,
+    index: usize,
+    rule: Rule,
+    root: &Instance,
+    summary: &Summary,
+) -> Refusal {
     let db = cx.db;
     let mut chain: Vec<Step> = Vec::new(); // alloc: the refusal's chain, once
     let mut at = (root.clone(), summary); // clone: reference counts
@@ -402,7 +429,8 @@ fn place(cx: &Cx<'_>, instance: &Instance, span: MirSpan) -> Option<Place> {
     };
     let (file, line, column) = source_location_in_file(db, owner, span)?;
     let (_, range) = source_file_range(db, owner, span)?;
-    let path = source_path(db, hir_def::HasModule::krate(&owner, db), file).unwrap_or_default().into();
+    let path =
+        source_path(db, hir_def::HasModule::krate(&owner, db), file).unwrap_or_default().into();
     Some(Place { file, path, line, column, range })
 }
 
@@ -413,18 +441,25 @@ fn instance_path(db: &Db, instance: &Instance) -> Box<str> {
         InferBodyId::DefWithBodyId(_) | InferBodyId::AnonConstId(_) => "a constant".into(),
     };
     match instance.def {
-        Def::Body(Body::Fn(func)) | Def::Leaf(func, _) => fn_path(db, func, instance.args.as_ref().as_slice()),
+        Def::Body(Body::Fn(func)) | Def::Leaf(func, _) => {
+            fn_path(db, func, instance.args.as_ref().as_slice())
+        }
         Def::Body(Body::Closure(id)) => {
             format!("{}::{{closure}}", owner(InternedClosureId::from_id(id).loc(db).owner)).into() // alloc: a refusal's name
         }
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
-            format!("{}::{{async block}}", owner(InternedCoroutineId::from_id(id).loc(db).owner)).into() // alloc: a refusal's name
+            format!("{}::{{async block}}", owner(InternedCoroutineId::from_id(id).loc(db).owner))
+                .into() // alloc: a refusal's name
         }
     }
 }
 
 /// `func` by path, crate first, with `args` where its symbol has them.
-fn fn_path<'db>(db: &'db Db, func: FunctionId, args: &[hir_ty::next_solver::GenericArg<'db>]) -> Box<str> {
+fn fn_path<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: &[hir_ty::next_solver::GenericArg<'db>],
+) -> Box<str> {
     let spelled = blaze_query::db::attach(db, || hir_ty_print::rustc_function_name(db, func, args));
     match spelled {
         Some(path) => path.into(),
@@ -445,8 +480,10 @@ fn params<'db>(
     found: &mut Found,
 ) -> Option<Refusal> {
     let db = cx.db;
-    let sig = db.callable_item_signature(func.into()).instantiate(cx.interner, args).skip_norm_wip();
-    let mut scan = Params { cx, def, generic, seen: HashSet::new_in(Global), trouble: None, refuses, found };
+    let sig =
+        db.callable_item_signature(func.into()).instantiate(cx.interner, args).skip_norm_wip();
+    let mut scan =
+        Params { cx, def, generic, seen: HashSet::new_in(Global), trouble: None, refuses, found };
     for input in sig.skip_binder().inputs().iter().copied() {
         scan.ty(input, false, false);
         if scan.trouble.is_some() {
@@ -503,7 +540,9 @@ impl<'db> Params<'_, 'db> {
             if self.generic {
                 self.found.open = true;
             } else {
-                self.refuse(Rule::Unchecked, || format!("takes `{}`, a type the check can't see into", cx.shown(ty)));
+                self.refuse(Rule::Unchecked, || {
+                    format!("takes `{}`, a type the check can't see into", cx.shown(ty))
+                });
             }
             return;
         }

@@ -27,11 +27,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedArrayPatLen) -> Vec<Foun
         }
         true => {
             // alloc: the error's text, for an error hir found
-            let message = format!("pattern requires at least {min} element{} but array has {size}", s(min));
+            let message =
+                format!("pattern requires at least {min} element{} but array has {size}", s(min));
             // clone: on the error path, for an error hir found
             let mut diag = Diag::error(Some("E0528"), message, span.clone());
             // alloc: the error's text, for an error hir found
-            diag.span_label(span, format!("pattern cannot match array of {size} element{}", s(size)));
+            diag.span_label(
+                span,
+                format!("pattern cannot match array of {size} element{}", s(size)),
+            );
             diag
         }
     };

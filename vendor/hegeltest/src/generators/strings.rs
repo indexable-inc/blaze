@@ -223,15 +223,12 @@ impl TextGenerator {
                     invalid_argument!("Cannot have max_size < min_size");
                 }
             }
-            let max_size = self
-                .max_size
-                .unwrap_or(if self.min_size > DEFAULT_MAX_SIZE {
-                    self.min_size + DEFAULT_MAX_SIZE
-                } else {
-                    DEFAULT_MAX_SIZE
-                });
-            self.char_fields
-                .build_text_handle(self.min_size as u64, max_size as u64)
+            let max_size = self.max_size.unwrap_or(if self.min_size > DEFAULT_MAX_SIZE {
+                self.min_size + DEFAULT_MAX_SIZE
+            } else {
+                DEFAULT_MAX_SIZE
+            });
+            self.char_fields.build_text_handle(self.min_size as u64, max_size as u64)
         })
     }
 }
@@ -340,8 +337,7 @@ impl CharactersGenerator {
     }
 
     fn handle(&self) -> &ffi::StringGenerator {
-        self.handle
-            .get_or_init(|| self.char_fields.build_text_handle(1, 1))
+        self.handle.get_or_init(|| self.char_fields.build_text_handle(1, 1))
     }
 
     /// Build a standalone text handle carrying this alphabet, for use as a
@@ -362,13 +358,8 @@ impl Generator<char> for CharactersGenerator {
     fn do_draw(&self, tc: &TestCase) -> char {
         let s = tc.generate_string(self.handle());
         let mut chars = s.chars();
-        let c = chars
-            .next()
-            .expect("expected a single character, got empty string");
-        hegel_internal_assert!(
-            chars.next().is_none(),
-            "expected a single character, got multiple"
-        );
+        let c = chars.next().expect("expected a single character, got empty string");
+        hegel_internal_assert!(chars.next().is_none(), "expected a single character, got multiple");
         c
     }
 }
@@ -377,10 +368,7 @@ impl Generator<char> for CharactersGenerator {
 ///
 /// See [`CharactersGenerator`] for builder methods.
 pub fn characters() -> CharactersGenerator {
-    CharactersGenerator {
-        char_fields: CharacterFields::new(),
-        handle: OnceLock::new(),
-    }
+    CharactersGenerator { char_fields: CharacterFields::new(), handle: OnceLock::new() }
 }
 
 /// Generator for strings matching a regex pattern. Created by [`from_regex()`].
@@ -485,13 +473,11 @@ impl Generator<Vec<u8>> for BinaryGenerator {
                 invalid_argument!("Cannot have max_size < min_size");
             }
         }
-        let max_size = self
-            .max_size
-            .unwrap_or(if self.min_size > DEFAULT_MAX_SIZE {
-                self.min_size + DEFAULT_MAX_SIZE
-            } else {
-                DEFAULT_MAX_SIZE
-            });
+        let max_size = self.max_size.unwrap_or(if self.min_size > DEFAULT_MAX_SIZE {
+            self.min_size + DEFAULT_MAX_SIZE
+        } else {
+            DEFAULT_MAX_SIZE
+        });
         tc.generate_bytes(self.min_size, max_size)
     }
 }
@@ -500,10 +486,7 @@ impl Generator<Vec<u8>> for BinaryGenerator {
 ///
 /// See [`BinaryGenerator`] for builder methods.
 pub fn binary() -> BinaryGenerator {
-    BinaryGenerator {
-        min_size: 0,
-        max_size: None,
-    }
+    BinaryGenerator { min_size: 0, max_size: None }
 }
 
 /// Generator for email address strings. Created by [`emails()`].
@@ -528,9 +511,7 @@ impl Generator<String> for EmailGenerator {
 
 /// Generate email address strings.
 pub fn emails() -> EmailGenerator {
-    EmailGenerator {
-        handle: OnceLock::new(),
-    }
+    EmailGenerator { handle: OnceLock::new() }
 }
 
 /// Generator for URL strings. Created by [`urls()`].
@@ -555,9 +536,7 @@ impl Generator<String> for UrlGenerator {
 
 /// Generate URL strings.
 pub fn urls() -> UrlGenerator {
-    UrlGenerator {
-        handle: OnceLock::new(),
-    }
+    UrlGenerator { handle: OnceLock::new() }
 }
 
 /// Generator for domain name strings. Created by [`domains()`].
@@ -598,10 +577,7 @@ impl Generator<String> for DomainGenerator {
 ///
 /// See [`DomainGenerator`] for builder methods.
 pub fn domains() -> DomainGenerator {
-    DomainGenerator {
-        max_length: 255,
-        handle: OnceLock::new(),
-    }
+    DomainGenerator { max_length: 255, handle: OnceLock::new() }
 }
 
 /// Generator for IP addresses. Created by [`ip_addresses()`].
@@ -683,10 +659,7 @@ pub(crate) fn format_time(t: hegel_c::hegel_time_t) -> String {
     if t.nanosecond == 0 {
         format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)
     } else {
-        format!(
-            "{:02}:{:02}:{:02}.{:09}",
-            t.hour, t.minute, t.second, t.nanosecond
-        )
+        format!("{:02}:{:02}:{:02}.{:09}", t.hour, t.minute, t.second, t.nanosecond)
     }
 }
 

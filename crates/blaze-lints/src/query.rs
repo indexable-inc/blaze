@@ -11,12 +11,12 @@ mod tests;
 
 use base_db::{Db, EditionedFileId};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir::HasVisibility as _;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, ImplId, ItemContainerId, Lookup as _, ModuleDefId,
     nameres::crate_def_map, visibility::Visibility,
 };
+use std::alloc::Global;
 use syntax::{TextRange, TextSize};
 
 use crate::{

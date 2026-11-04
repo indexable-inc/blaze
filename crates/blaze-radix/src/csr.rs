@@ -220,10 +220,15 @@ impl<A: Allocator> Csr<u32, A> {
         I: IntoIterator<Item = (u32, u32)>,
         I::IntoIter: Clone,
     {
-        by_target.rebuild(nodes, edges.into_iter().map(|(source, target)| (target, source)), cursors);
+        by_target.rebuild(
+            nodes,
+            edges.into_iter().map(|(source, target)| (target, source)),
+            cursors,
+        );
         let by_target = &*by_target;
-        let sources = (0..nodes as u32)
-            .flat_map(move |target| by_target.row(target as usize).iter().map(move |&source| (source, target)));
+        let sources = (0..nodes as u32).flat_map(move |target| {
+            by_target.row(target as usize).iter().map(move |&source| (source, target))
+        });
         self.rebuild(nodes, sources, cursors);
     }
 }

@@ -201,7 +201,9 @@ pub(super) fn return_call_signature(
             }
             func.dfg.ext_funcs[func_ref].signature
         }
-        InstructionData::CallIndirect { opcode: Opcode::ReturnCallIndirect, sig_ref, .. } => sig_ref,
+        InstructionData::CallIndirect { opcode: Opcode::ReturnCallIndirect, sig_ref, .. } => {
+            sig_ref
+        }
         _ => return Ok(None),
     };
     let conv = func.dfg.signatures[sig].call_conv;
@@ -240,10 +242,8 @@ pub(super) fn call_signature(func: &ir::Function, inst: ir::Inst) -> Option<ir::
 /// Whether `inst` finds a thread-local's address with a call (ELF's TLS descriptor, Mach-O's
 /// `tlv` thunk), as Cranelift's `ElfTlsGetAddr` and `MachOTlsGetAddr` are calls.
 fn makes_tls_call(func: &ir::Function, target: &Target, inst: ir::Inst) -> bool {
-    let InstructionData::UnaryGlobalValue {
-        opcode: Opcode::TlsValue,
-        global_value,
-    } = func.dfg.insts[inst]
+    let InstructionData::UnaryGlobalValue { opcode: Opcode::TlsValue, global_value } =
+        func.dfg.insts[inst]
     else {
         return false;
     };
@@ -385,7 +385,8 @@ fn write_probe(buf: &mut Buf<'_>, probe: Probe) {
 /// The most bytes [`exit`] writes: [`unframe`]'s, a `tail` function's pop and the `ret`.
 pub(super) const EXIT_MAX: u32 = UNFRAME_MAX + inst::ADD_ANY_MAX + 4;
 /// The most bytes [`unframe`] writes.
-pub(super) const UNFRAME_MAX: u32 = inst::ADD_ANY_MAX + 4 * (D_PAIRS.len() + X_PAIRS.len()) as u32 + 4;
+pub(super) const UNFRAME_MAX: u32 =
+    inst::ADD_ANY_MAX + 4 * (D_PAIRS.len() + X_PAIRS.len()) as u32 + 4;
 
 /// Frees the frame, restores the saved registers and the frame record, pops a `tail`
 /// function's incoming argument area and returns, as `gen_epilogue` does. Like Cranelift's,

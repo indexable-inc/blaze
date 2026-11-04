@@ -463,7 +463,13 @@ fn lint_deref_nullptr() {
 #[test]
 fn ptr_null_checks() {
     let source = include_str!("pointers/ui/ptr_null_checks.rs");
-    let actual = ui(Ui { name: "ptr_null_checks.rs", core: FLAGS, std: Some((PRELUDE, STD)), source, ..Ui::default() });
+    let actual = ui(Ui {
+        name: "ptr_null_checks.rs",
+        core: FLAGS,
+        std: Some((PRELUDE, STD)),
+        source,
+        ..Ui::default()
+    });
     // A comparison of a pointer made from a reference or a function with null, each its line;
     // one made through `ptr::from_ref` and the like names that function.
     let plain = NULL_CHECKS.map(|line| warning(line, &[]));
@@ -472,7 +478,8 @@ fn ptr_null_checks() {
 }
 
 /// The lines of `ptr_null_checks.rs` with a null check of a pointer that can't be null.
-const NULL_CHECKS: [usize; 21] = [12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 48, 51, 53, 55, 57, 59, 61, 63];
+const NULL_CHECKS: [usize; 21] =
+    [12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 48, 51, 53, 55, 57, 59, 61, 63];
 
 /// The lines of `ptr_null_checks.rs` whose pointer is made by the function named.
 const NULL_CHECKS_THROUGH: [(usize, &[&str]); 6] = [
@@ -506,7 +513,14 @@ fn dangling_pointers_from_locals() {
 fn dangling_pointers_from_temporaries_types() {
     let source = include_str!("pointers/ui/dangling-pointers-from-temporaries/types.rs");
     let library = &["sync_unsafe_cell"];
-    let actual = ui(Ui { name: "types.rs", core: FLAGS, std: Some((PRELUDE, STD)), library, source, ..Ui::default() });
+    let actual = ui(Ui {
+        name: "types.rs",
+        core: FLAGS,
+        std: Some((PRELUDE, STD)),
+        library,
+        source,
+        ..Ui::default()
+    });
     assert_reports(
         &actual,
         &[

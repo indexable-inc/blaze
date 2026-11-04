@@ -7,11 +7,11 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{FunctionSignature, TraitSignature},
 };
+use hir_expand::fixture;
 use hir_expand::name::Name;
 use intern::Symbol;
 use la_arena::RawIdx;
 use rustc_type_ir::Interner as _;
-use hir_expand::fixture;
 
 use crate::{
     ImplTraitId,
@@ -25,7 +25,9 @@ use crate::{
 fn modules(db: &Db) -> Vec<ModuleId> {
     all_crates(db)
         .iter()
-        .flat_map(|&krate| crate_def_map(db, krate).modules(db).map(|(id, _)| id).collect::<Vec<_>>())
+        .flat_map(|&krate| {
+            crate_def_map(db, krate).modules(db).map(|(id, _)| id).collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -79,9 +81,7 @@ fn impl_of(db: &Db, trait_name: &str) -> ImplId {
     modules(db)
         .into_iter()
         .flat_map(|module| scope(db, module).impls().collect::<Vec<_>>())
-        .find(|&impl_| {
-            db.impl_trait(impl_).is_some_and(|it| it.skip_binder().def_id.0 == wanted)
-        })
+        .find(|&impl_| db.impl_trait(impl_).is_some_and(|it| it.skip_binder().def_id.0 == wanted))
         .unwrap_or_else(|| panic!("no impl of `{trait_name}` in the fixture"))
 }
 

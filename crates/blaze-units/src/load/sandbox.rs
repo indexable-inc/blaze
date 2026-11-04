@@ -68,13 +68,22 @@ fn sandbox_table(metadata: Option<&toml::Value>) -> Option<&toml::Table> {
 }
 
 fn wrong(table: &str, manifest: &Path, what: &str) -> LoadError {
-    LoadError { what: format!("{table} in {}: {what}", manifest.display()), at: Some(manifest.display().to_string()) }
+    LoadError {
+        what: format!("{table} in {}: {what}", manifest.display()),
+        at: Some(manifest.display().to_string()),
+    }
 }
 
 /// What `[workspace.metadata]` (`metadata`) of the root manifest at `manifest` says in
 /// [`WORKSPACE_TABLE`] and [`EXPERIMENTAL`].
-pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Result<WorkspaceOptOut, LoadError> {
-    let mut out = WorkspaceOptOut { sandboxed_tests: sandboxed_tests(metadata, manifest)?, ..WorkspaceOptOut::default() };
+pub(crate) fn workspace(
+    metadata: Option<&toml::Value>,
+    manifest: &Path,
+) -> Result<WorkspaceOptOut, LoadError> {
+    let mut out = WorkspaceOptOut {
+        sandboxed_tests: sandboxed_tests(metadata, manifest)?,
+        ..WorkspaceOptOut::default()
+    };
     let Some(table) = sandbox_table(metadata) else { return Ok(out) };
     let wrong = |what: &str| wrong(WORKSPACE_TABLE, manifest, what);
     let root = manifest.parent().unwrap_or(Path::new("/"));
@@ -83,15 +92,22 @@ pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Resu
     for (key, value) in table {
         let names = || -> Result<Vec<&str>, LoadError> {
             let list = value.as_array().ok_or_else(|| wrong(&format!("`{key}` is a list")))?;
-            list.iter().map(|it| it.as_str().ok_or_else(|| wrong(&format!("`{key}` lists names, as strings")))).collect()
+            list.iter()
+                .map(|it| {
+                    it.as_str().ok_or_else(|| wrong(&format!("`{key}` lists names, as strings")))
+                })
+                .collect()
         };
         match key.as_str() {
-            "unsandboxed-build-scripts" => out.build_scripts = names()?.into_iter().map(str::to_owned).collect(),
+            "unsandboxed-build-scripts" => {
+                out.build_scripts = names()?.into_iter().map(str::to_owned).collect()
+            }
             "build-script-link-dirs" => {
                 for dir in names()? {
                     // Expanded from the script's environment when it runs (`blaze_cargo::directives::link_dirs`).
                     if let Some(rest) = dir.strip_prefix("${") {
-                        let name = rest.split_once('}').map(|(name, _)| name).filter(|it| !it.is_empty());
+                        let name =
+                            rest.split_once('}').map(|(name, _)| name).filter(|it| !it.is_empty());
                         let name = name.ok_or_else(|| {
                             wrong(&format!("`{dir}` of `build-script-link-dirs` starts `${{` with no `NAME}}` after it"))
                         })?;
@@ -99,8 +115,9 @@ pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Resu
                         out.link_dirs.push(dir.to_owned());
                         continue;
                     }
-                    let absolute = super::files::normal(&root.join(dir))
-                        .ok_or_else(|| wrong(&format!("`{dir}` of `build-script-link-dirs` is not a UTF-8 path")))?;
+                    let absolute = super::files::normal(&root.join(dir)).ok_or_else(|| {
+                        wrong(&format!("`{dir}` of `build-script-link-dirs` is not a UTF-8 path"))
+                    })?;
                     out.link_dirs.push(absolute);
                 }
             }
@@ -147,19 +164,26 @@ pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Resu
 /// lists [`SANDBOXED_TESTS`]. A name not [`KNOWN`], or a value that is not a list of strings, is
 /// an error worded as v1's.
 fn sandboxed_tests(metadata: Option<&toml::Value>, manifest: &Path) -> Result<bool, LoadError> {
-    let Some(listed) = blaze_table(metadata).and_then(|it| it.get(EXPERIMENTAL)) else { return Ok(false) };
+    let Some(listed) = blaze_table(metadata).and_then(|it| it.get(EXPERIMENTAL)) else {
+        return Ok(false);
+    };
     let wrong = |what: &str| LoadError {
-        what: format!("`{EXPERIMENTAL}` in [workspace.metadata.blaze] of {}: {what}", manifest.display()),
+        what: format!(
+            "`{EXPERIMENTAL}` in [workspace.metadata.blaze] of {}: {what}",
+            manifest.display()
+        ),
         at: Some(manifest.display().to_string()),
     };
     // alloc: the known names, only for an error
     let known = || KNOWN.iter().map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", ");
-    let names = listed.as_array().ok_or_else(|| wrong(&format!("a list of experiments' names (known: {})", known())))?;
+    let names = listed
+        .as_array()
+        .ok_or_else(|| wrong(&format!("a list of experiments' names (known: {})", known())))?;
     let mut on = false;
     for name in names {
-        let name = name
-            .as_str()
-            .ok_or_else(|| wrong(&format!("a list of experiments' names, as strings (known: {})", known())))?;
+        let name = name.as_str().ok_or_else(|| {
+            wrong(&format!("a list of experiments' names, as strings (known: {})", known()))
+        })?;
         if !KNOWN.contains(&name) {
             return Err(wrong(&format!("`{name}` is not known (known: {})", known())));
         }
@@ -170,7 +194,10 @@ fn sandboxed_tests(metadata: Option<&toml::Value>, manifest: &Path) -> Result<bo
 
 /// What `[package.metadata]` (`metadata`) of the member whose manifest is `manifest` says in
 /// [`PACKAGE_TABLE`]: `build-script = false`, and how its tests run (v1's `sandboxed::opt_out`).
-pub(crate) fn package(metadata: Option<&toml::Value>, manifest: &Path) -> Result<PackageOptOut, LoadError> {
+pub(crate) fn package(
+    metadata: Option<&toml::Value>,
+    manifest: &Path,
+) -> Result<PackageOptOut, LoadError> {
     let mut out = PackageOptOut::default();
     let Some(table) = sandbox_table(metadata) else { return Ok(out) };
     let wrong = |what: &str| wrong(PACKAGE_TABLE, manifest, what);
@@ -181,19 +208,23 @@ pub(crate) fn package(metadata: Option<&toml::Value>, manifest: &Path) -> Result
                 (out.tests.all, out.tests.opted_in) = (!tests, tests);
             }
             "unsandboxed-tests" => {
-                let names = value.as_array().ok_or_else(|| wrong("`unsandboxed-tests` is a list"))?;
+                let names =
+                    value.as_array().ok_or_else(|| wrong("`unsandboxed-tests` is a list"))?;
                 out.tests.tests = names
                     .iter()
                     .map(|it| {
                         it.as_str()
                             // alloc: a test's name, once per name the member lists
                             .map(str::to_owned)
-                            .ok_or_else(|| wrong("`unsandboxed-tests` lists tests by their names, as strings"))
+                            .ok_or_else(|| {
+                                wrong("`unsandboxed-tests` lists tests by their names, as strings")
+                            })
                     })
                     .collect::<Result<_, _>>()?;
             }
             "build-script" => {
-                out.build_script_outside = !value.as_bool().ok_or_else(|| wrong("`build-script` is true or false"))?;
+                out.build_script_outside =
+                    !value.as_bool().ok_or_else(|| wrong("`build-script` is true or false"))?;
             }
             other => {
                 return Err(wrong(&format!(
@@ -210,7 +241,8 @@ pub(crate) fn package(metadata: Option<&toml::Value>, manifest: &Path) -> Result
 /// Whether [`EXPERIMENTAL`] in the root manifest's `[workspace.metadata.blaze]` (`metadata`)
 /// lists [`CONST_MACROS`]; the list itself is checked by [`workspace`].
 pub(crate) fn const_macros_on(metadata: Option<&toml::Value>) -> bool {
-    let listed = blaze_table(metadata).and_then(|it| it.get(EXPERIMENTAL)).and_then(|it| it.as_array());
+    let listed =
+        blaze_table(metadata).and_then(|it| it.get(EXPERIMENTAL)).and_then(|it| it.as_array());
     listed.is_some_and(|names| names.iter().any(|it| it.as_str() == Some(CONST_MACROS)))
 }
 
@@ -225,7 +257,9 @@ pub(crate) fn const_macros(
     root_manifest: &Path,
     on: bool,
 ) -> Result<Option<String>, LoadError> {
-    let Some(value) = blaze_table(metadata).and_then(|it| it.get(CONST_MACROS)) else { return Ok(None) };
+    let Some(value) = blaze_table(metadata).and_then(|it| it.get(CONST_MACROS)) else {
+        return Ok(None);
+    };
     let wrong = |what: String| LoadError { what, at: Some(manifest.display().to_string()) };
     let Some(path) = value.as_str() else {
         return Err(wrong(format!(
@@ -272,7 +306,10 @@ mod tests {
         assert!(out.unsandboxed("z-sys") && !out.unsandboxed("z"));
         assert!(!out.sandboxed_tests);
         assert_eq!(workspace(None, manifest).unwrap(), WorkspaceOptOut::default());
-        assert_eq!(workspace(Some(&metadata("[other]\nx = 1\n")), manifest).unwrap(), WorkspaceOptOut::default());
+        assert_eq!(
+            workspace(Some(&metadata("[other]\nx = 1\n")), manifest).unwrap(),
+            WorkspaceOptOut::default()
+        );
     }
 
     /// A link dir under a variable is kept as written, for the run to expand; its variable must
@@ -287,9 +324,17 @@ mod tests {
         let out = workspace(Some(&declared), manifest).unwrap();
         assert_eq!(out.link_dirs, ["${LLVM_SYS_231_PREFIX}/lib", "/opt/lib"]);
 
-        let undeclared = metadata("[blaze.sandbox]\nbuild-script-link-dirs = [\"${LLVM_SYS_231_PREFIX}/lib\"]\n");
+        let undeclared = metadata(
+            "[blaze.sandbox]\nbuild-script-link-dirs = [\"${LLVM_SYS_231_PREFIX}/lib\"]\n",
+        );
         let error = workspace(Some(&undeclared), manifest).unwrap_err();
-        assert!(error.what.ends_with("is under `LLVM_SYS_231_PREFIX`, which `build-script-env` does not list"), "{}", error.what);
+        assert!(
+            error.what.ends_with(
+                "is under `LLVM_SYS_231_PREFIX`, which `build-script-env` does not list"
+            ),
+            "{}",
+            error.what
+        );
         let unclosed = metadata("[blaze.sandbox]\nbuild-script-link-dirs = [\"${LLVM/lib\"]\n");
         let error = workspace(Some(&unclosed), manifest).unwrap_err();
         assert!(error.what.contains("with no `NAME}` after it"), "{}", error.what);
@@ -298,55 +343,112 @@ mod tests {
     #[test]
     fn a_table_said_otherwise_is_an_error() {
         let manifest = Path::new("/w/Cargo.toml");
-        let unknown = workspace(Some(&metadata("[blaze.sandbox]\nbuild-scripts = []\n")), manifest).unwrap_err();
-        assert!(unknown.what.starts_with("[workspace.metadata.blaze.sandbox] in /w/Cargo.toml: `build-scripts`"), "{}", unknown.what);
-        let not_list = workspace(Some(&metadata("[blaze.sandbox]\nunsandboxed-build-scripts = \"a\"\n")), manifest).unwrap_err();
-        assert!(not_list.what.ends_with("`unsandboxed-build-scripts` is a list"), "{}", not_list.what);
+        let unknown = workspace(Some(&metadata("[blaze.sandbox]\nbuild-scripts = []\n")), manifest)
+            .unwrap_err();
+        assert!(
+            unknown.what.starts_with(
+                "[workspace.metadata.blaze.sandbox] in /w/Cargo.toml: `build-scripts`"
+            ),
+            "{}",
+            unknown.what
+        );
+        let not_list = workspace(
+            Some(&metadata("[blaze.sandbox]\nunsandboxed-build-scripts = \"a\"\n")),
+            manifest,
+        )
+        .unwrap_err();
+        assert!(
+            not_list.what.ends_with("`unsandboxed-build-scripts` is a list"),
+            "{}",
+            not_list.what
+        );
         for key in ["unsandboxed-proc-macros", "wasi-build-scripts"] {
-            let asked = workspace(Some(&metadata(&format!("[blaze.sandbox]\n{key} = [\"m\"]\n"))), manifest).unwrap_err();
+            let asked = workspace(
+                Some(&metadata(&format!("[blaze.sandbox]\n{key} = [\"m\"]\n"))),
+                manifest,
+            )
+            .unwrap_err();
             assert!(asked.what.contains(&format!("`{key}` lists [\"m\"]")), "{}", asked.what);
             assert!(asked.what.ends_with("remove the key"), "{}", asked.what);
         }
         let member = Path::new("/w/a/Cargo.toml");
-        let not_bool = package(Some(&metadata("[blaze.sandbox]\nbuild-script = \"no\"\n")), member).unwrap_err();
+        let not_bool = package(Some(&metadata("[blaze.sandbox]\nbuild-script = \"no\"\n")), member)
+            .unwrap_err();
         assert!(not_bool.what.ends_with("`build-script` is true or false"), "{}", not_bool.what);
-        let not_names = package(Some(&metadata("[blaze.sandbox]\nunsandboxed-tests = [1]\n")), member).unwrap_err();
-        assert!(not_names.what.ends_with("`unsandboxed-tests` lists tests by their names, as strings"), "{}", not_names.what);
-        let not_tests = package(Some(&metadata("[blaze.sandbox]\ntests = \"yes\"\n")), member).unwrap_err();
+        let not_names =
+            package(Some(&metadata("[blaze.sandbox]\nunsandboxed-tests = [1]\n")), member)
+                .unwrap_err();
+        assert!(
+            not_names.what.ends_with("`unsandboxed-tests` lists tests by their names, as strings"),
+            "{}",
+            not_names.what
+        );
+        let not_tests =
+            package(Some(&metadata("[blaze.sandbox]\ntests = \"yes\"\n")), member).unwrap_err();
         assert!(not_tests.what.ends_with("`tests` is true or false"), "{}", not_tests.what);
     }
 
     #[test]
     fn a_member_takes_its_build_script_out() {
         let member = Path::new("/w/a/Cargo.toml");
-        assert!(package(Some(&metadata("[blaze.sandbox]\nbuild-script = false\n")), member).unwrap().build_script_outside);
-        assert!(!package(Some(&metadata("[blaze.sandbox]\nbuild-script = true\ntests = false\n")), member).unwrap().build_script_outside);
+        assert!(
+            package(Some(&metadata("[blaze.sandbox]\nbuild-script = false\n")), member)
+                .unwrap()
+                .build_script_outside
+        );
+        assert!(
+            !package(
+                Some(&metadata("[blaze.sandbox]\nbuild-script = true\ntests = false\n")),
+                member
+            )
+            .unwrap()
+            .build_script_outside
+        );
         assert_eq!(package(None, member).unwrap(), PackageOptOut::default());
     }
 
     #[test]
     fn a_member_says_how_its_tests_run() {
         let member = Path::new("/w/a/Cargo.toml");
-        let opted = package(Some(&metadata("[blaze.sandbox]\ntests = true\nunsandboxed-tests = [\"b\", \"a::c\", \"b\"]\n")), member)
-            .unwrap()
-            .tests;
-        assert_eq!(opted, TestSandbox { all: false, opted_in: true, tests: vec!["a::c".to_owned(), "b".to_owned()] });
+        let opted = package(
+            Some(&metadata(
+                "[blaze.sandbox]\ntests = true\nunsandboxed-tests = [\"b\", \"a::c\", \"b\"]\n",
+            )),
+            member,
+        )
+        .unwrap()
+        .tests;
+        assert_eq!(
+            opted,
+            TestSandbox {
+                all: false,
+                opted_in: true,
+                tests: vec!["a::c".to_owned(), "b".to_owned()]
+            }
+        );
         assert!(opted.outside("b") && opted.outside("a::c") && !opted.outside("a"));
-        let out = package(Some(&metadata("[blaze.sandbox]\ntests = false\n")), member).unwrap().tests;
+        let out =
+            package(Some(&metadata("[blaze.sandbox]\ntests = false\n")), member).unwrap().tests;
         assert_eq!(out, TestSandbox { all: true, opted_in: false, tests: Vec::new() });
-        let named = package(Some(&metadata("[blaze.sandbox]\nunsandboxed-tests = [\"t\"]\n")), member).unwrap().tests;
+        let named =
+            package(Some(&metadata("[blaze.sandbox]\nunsandboxed-tests = [\"t\"]\n")), member)
+                .unwrap()
+                .tests;
         assert_eq!(named, TestSandbox { all: false, opted_in: false, tests: vec!["t".to_owned()] });
     }
 
     #[test]
     fn a_workspace_opts_into_sandboxed_tests() {
         let manifest = Path::new("/w/Cargo.toml");
-        let on = |text: &str| workspace(Some(&metadata(text)), manifest).map(|it| it.sandboxed_tests);
+        let on =
+            |text: &str| workspace(Some(&metadata(text)), manifest).map(|it| it.sandboxed_tests);
         assert_eq!(on("[blaze]\nnative-proc-macros = []\n"), Ok(false));
         assert_eq!(on("[blaze]\nexperimental = [\"const-macros\"]\n"), Ok(false));
         assert_eq!(on("[blaze]\nexperimental = [\"sandboxed-tests\"]\n"), Ok(true));
         assert_eq!(
-            on("[blaze]\nexperimental = [\"sandboxed-tests\"]\n[blaze.sandbox]\nunsandboxed-build-scripts = []\n"),
+            on(
+                "[blaze]\nexperimental = [\"sandboxed-tests\"]\n[blaze.sandbox]\nunsandboxed-build-scripts = []\n"
+            ),
             Ok(true)
         );
         let unknown = on("[blaze]\nexperimental = [\"sandboxed-test\"]\n").unwrap_err();
@@ -356,7 +458,11 @@ mod tests {
              (known: `sandboxed-tests`, `const-macros`)"
         );
         let not_list = on("[blaze]\nexperimental = \"sandboxed-tests\"\n").unwrap_err();
-        assert!(not_list.what.contains("Cargo.toml: a list of experiments' names"), "{}", not_list.what);
+        assert!(
+            not_list.what.contains("Cargo.toml: a list of experiments' names"),
+            "{}",
+            not_list.what
+        );
         let not_strings = on("[blaze]\nexperimental = [true]\n").unwrap_err();
         assert!(not_strings.what.contains("as strings"), "{}", not_strings.what);
     }
@@ -364,20 +470,32 @@ mod tests {
     #[test]
     fn a_package_names_its_const_macros_once_the_workspace_turns_them_on() {
         let (root, member) = (Path::new("/w/Cargo.toml"), Path::new("/w/a/Cargo.toml"));
-        assert!(const_macros_on(Some(&metadata("[blaze]\nexperimental = [\"sandboxed-tests\", \"const-macros\"]\n"))));
-        assert!(!const_macros_on(Some(&metadata("[blaze]\nexperimental = [\"sandboxed-tests\"]\n"))));
+        assert!(const_macros_on(Some(&metadata(
+            "[blaze]\nexperimental = [\"sandboxed-tests\", \"const-macros\"]\n"
+        ))));
+        assert!(!const_macros_on(Some(&metadata(
+            "[blaze]\nexperimental = [\"sandboxed-tests\"]\n"
+        ))));
         assert!(!const_macros_on(None));
         let named = metadata("[blaze]\nconst-macros = \"src/../macros/derive.rs\"\n");
-        assert_eq!(const_macros(Some(&named), member, root, true), Ok(Some("/w/a/macros/derive.rs".to_owned())));
+        assert_eq!(
+            const_macros(Some(&named), member, root, true),
+            Ok(Some("/w/a/macros/derive.rs".to_owned()))
+        );
         assert_eq!(const_macros(None, member, root, true), Ok(None));
-        assert_eq!(const_macros(Some(&metadata("[blaze.sandbox]\ntests = true\n")), member, root, false), Ok(None));
+        assert_eq!(
+            const_macros(Some(&metadata("[blaze.sandbox]\ntests = true\n")), member, root, false),
+            Ok(None)
+        );
         let off = const_macros(Some(&named), member, root, false).unwrap_err();
         assert_eq!(
             off.what,
             "`const-macros` under [package.metadata.blaze] in /w/a/Cargo.toml is an experiment: \
              `experimental = [\"const-macros\"]` under [workspace.metadata.blaze] in /w/Cargo.toml turns it on"
         );
-        let not_path = const_macros(Some(&metadata("[blaze]\nconst-macros = 1\n")), member, root, true).unwrap_err();
+        let not_path =
+            const_macros(Some(&metadata("[blaze]\nconst-macros = 1\n")), member, root, true)
+                .unwrap_err();
         assert!(not_path.what.ends_with("is a path, as a string"), "{}", not_path.what);
     }
 }

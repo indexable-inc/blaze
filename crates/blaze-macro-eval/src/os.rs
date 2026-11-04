@@ -30,8 +30,7 @@ mod tests;
 use base_db::{CrateOrigin, Db, Env, LangCrateOrigin};
 use blaze_usercode::trace::Seen;
 use hir_def::{
-    FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags,
-    signatures::FunctionSignature,
+    FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags, signatures::FunctionSignature,
 };
 
 use crate::guest::{Guest, Stop, put_word, word};
@@ -274,11 +273,11 @@ impl<'a> Os<'a> {
             answers: Vec::new(), // alloc: one entry per variable read, once
             environ: None,
             allocated: Vec::new(), // alloc: none until a `realpath` or `getcwd` allocates
-            given: String::new(), // alloc: none until the first path, then reused
-            real: String::new(), // alloc: as `given`
-            rest: String::new(), // alloc: as `given`
-            scratch: Vec::new(), // alloc: none until the first listing, then reused
-            bytes: Vec::new(), // alloc: none until the first string given, then reused
+            given: String::new(),  // alloc: none until the first path, then reused
+            real: String::new(),   // alloc: as `given`
+            rest: String::new(),   // alloc: as `given`
+            scratch: Vec::new(),   // alloc: none until the first listing, then reused
+            bytes: Vec::new(),     // alloc: none until the first string given, then reused
         }
     }
 
@@ -351,7 +350,9 @@ impl<'a> Os<'a> {
                 let flags = int(args, 2)?;
                 self.open(t, g, ret, (int(args, 0)?, word(args, 1)?, flags))
             }
-            Call::Read => self.read(t, g, ret, (int(args, 0)?, word(args, 1)?, word(args, 2)?, None)),
+            Call::Read => {
+                self.read(t, g, ret, (int(args, 0)?, word(args, 1)?, word(args, 2)?, None))
+            }
             Call::Pread => {
                 let offset = int(args, 3)?;
                 self.read(t, g, ret, (int(args, 0)?, word(args, 1)?, word(args, 2)?, Some(offset)))
@@ -363,7 +364,8 @@ impl<'a> Os<'a> {
             Call::Fstat => self.fstat(t, g, ret, (int(args, 0)?, word(args, 1)?)),
             Call::Stat | Call::Lstat => {
                 let at = (t.at_flags().fdcwd, word(args, 0)?);
-                let flags = if shim.call == Call::Lstat { t.at_flags().symlink_nofollow } else { 0 };
+                let flags =
+                    if shim.call == Call::Lstat { t.at_flags().symlink_nofollow } else { 0 };
                 self.fstatat(t, g, ret, at, word(args, 1)?, flags, files::Form::Stat)
             }
             Call::Fstatat => {
@@ -372,7 +374,9 @@ impl<'a> Os<'a> {
             }
             Call::Getcwd => self.getcwd(t, g, ret, (word(args, 0)?, word(args, 1)?)),
             Call::Realpath => self.realpath(t, g, ret, (word(args, 0)?, word(args, 1)?)),
-            Call::Readlink => self.readlink(t, g, ret, (word(args, 0)?, word(args, 1)?, word(args, 2)?)),
+            Call::Readlink => {
+                self.readlink(t, g, ret, (word(args, 0)?, word(args, 1)?, word(args, 2)?))
+            }
             Call::Access => {
                 let at = (t.at_flags().fdcwd, word(args, 0)?);
                 self.faccessat(t, g, ret, at, int(args, 1)?, 0)
@@ -421,7 +425,11 @@ impl<'a> Os<'a> {
 
     /// The paths it was refused, in the order it asked for them.
     pub(crate) fn refused(&self) -> impl Iterator<Item = &str> {
-        self.trace.lines.iter().filter(|line| line.noted == Noted::RefusedRead).map(|line| self.trace.text(line))
+        self.trace
+            .lines
+            .iter()
+            .filter(|line| line.noted == Noted::RefusedRead)
+            .map(|line| self.trace.text(line))
     }
 
     /// Why what it read can't be keyed, when it can't: a read that failed in a way the trace

@@ -7,8 +7,8 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{FunctionSignature, TraitSignature},
 };
-use rustc_type_ir::{BoundConstness, ClauseKind, inherent::IntoKind as _};
 use hir_expand::fixture;
+use rustc_type_ir::{BoundConstness, ClauseKind, inherent::IntoKind as _};
 
 use crate::{
     ImplTraitId,
@@ -41,7 +41,9 @@ fn trait_named(db: &Db, name: &str) -> TraitId {
     declarations(db)
         .into_iter()
         .find_map(|def| match def {
-            ModuleDefId::TraitId(it) if TraitSignature::of(db, it).name.as_str() == name => Some(it),
+            ModuleDefId::TraitId(it) if TraitSignature::of(db, it).name.as_str() == name => {
+                Some(it)
+            }
             _ => None,
         })
         .unwrap_or_else(|| panic!("no trait `{name}` in the fixture"))
@@ -51,7 +53,9 @@ fn make(db: &Db) -> FunctionId {
     declarations(db)
         .into_iter()
         .find_map(|def| match def {
-            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == "make" => {
+            ModuleDefId::FunctionId(it)
+                if FunctionSignature::of(db, it).name.as_str() == "make" =>
+            {
                 Some(it)
             }
             _ => None,

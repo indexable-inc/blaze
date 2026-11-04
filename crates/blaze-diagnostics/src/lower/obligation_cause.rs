@@ -24,7 +24,10 @@ use hir_def::{FunctionId, unstable_features::UnstableFeatures};
 use intern::sym;
 use syntax::{
     TextRange,
-    view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    view::{
+        self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
+        HasTypeBounds as _,
+    },
 };
 
 use crate::{
@@ -39,7 +42,12 @@ use crate::{
 
 /// rustc's `note_obligation_cause_code` of `cause`, for a bound of `trait_` when the failed
 /// goal is a trait's.
-pub(super) fn note(cx: &Cx<'_, '_>, diag: &mut Diag, cause: hir::ObligationCauseCode, trait_: Option<hir::Trait>) {
+pub(super) fn note(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    cause: hir::ObligationCauseCode,
+    trait_: Option<hir::Trait>,
+) {
     note_of(cx, diag, cause, trait_, None);
 }
 
@@ -68,7 +76,8 @@ fn note_of(
         }
         hir::ObligationCauseCode::SizedArgumentType => {
             diag.note("all function arguments must have a statically known size");
-            if !UnstableFeatures::query(cx.db, cx.krate.base()).is_enabled(&sym::unsized_fn_params) {
+            if !UnstableFeatures::query(cx.db, cx.krate.base()).is_enabled(&sym::unsized_fn_params)
+            {
                 diag.help("unsized fn params are gated as an unstable feature");
             }
         }
@@ -102,7 +111,10 @@ fn impl_trait_in_trait(
     bound: Option<InFile<syntax::SyntaxNodePtr>>,
 ) {
     // alloc: the error's text, for an error hir found
-    let name = format!("{}::{{anon_assoc#{impl_trait}}}", print::def_path(cx, ModuleDef::Function(trait_method)));
+    let name = format!(
+        "{}::{{anon_assoc#{impl_trait}}}",
+        print::def_path(cx, ModuleDef::Function(trait_method))
+    );
     // alloc: the error's text, for an error hir found
     let descr = format!("required by a bound in `{name}`");
     match bound {
@@ -120,7 +132,10 @@ fn impl_trait_in_trait(
     }
     if let Ok(id) = FunctionId::try_from(trait_method) {
         // alloc: the error's text, for an error hir found
-        diag.fact(Fact::Signature(cx.key(ItemId::Function(id))), format!("the signature of `{name}`"));
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Function(id))),
+            format!("the signature of `{name}`"),
+        );
     }
 }
 
@@ -176,14 +191,20 @@ fn where_clause<'db>(
             relax_sized(cx, diag, item, trait_);
             let at = param_span(cx, param.merge());
             if param.parent(cx.db) == item {
-                (at, "an implicit `Sized` bound", "the implicit `Sized` requirement on this type parameter")
+                (
+                    at,
+                    "an implicit `Sized` bound",
+                    "the implicit `Sized` requirement on this type parameter",
+                )
             } else {
                 (at, "a bound", "this bound")
             }
         }
-        Some(hir::BoundSource::ConstParamType(param)) => {
-            (param_span(cx, param.merge()), "a const generic parameter", "this const generic parameter")
-        }
+        Some(hir::BoundSource::ConstParamType(param)) => (
+            param_span(cx, param.merge()),
+            "a const generic parameter",
+            "this const generic parameter",
+        ),
         None => (None, "a bound", "this bound"),
     };
     // alloc: the error's text, for an error hir found
@@ -214,7 +235,10 @@ fn where_clause<'db>(
         && let Ok(id) = FunctionId::try_from(f)
     {
         // alloc: the error's text, for an error hir found
-        diag.fact(Fact::Signature(cx.key(ItemId::Function(id))), format!("the signature of `{name}`"));
+        diag.fact(
+            Fact::Signature(cx.key(ItemId::Function(id))),
+            format!("the signature of `{name}`"),
+        );
     }
     if let Some(hir::BoundSource::ImplicitSized(param)) = source {
         suggest_unsized(cx, diag, item, param);
@@ -251,7 +275,11 @@ fn suggest_unsized(cx: &Cx<'_, '_>, diag: &mut Diag, item: hir::GenericDef, para
         )
         // alloc: the error's parts, for an error hir found
         .collect();
-    if preds.iter().flat_map(|it| it.bounds()).any(|it| bound_trait(cx, it).is_some_and(|t| is_lang(cx, t, LangItem::Sized))) {
+    if preds
+        .iter()
+        .flat_map(|it| it.bounds())
+        .any(|it| bound_trait(cx, it).is_some_and(|t| is_lang(cx, t, LangItem::Sized)))
+    {
         return;
     }
     if let hir::GenericDef::Adt(_) = item
@@ -267,7 +295,10 @@ fn suggest_unsized(cx: &Cx<'_, '_>, diag: &mut Diag, item: hir::GenericDef, para
             span.labels.push((at, format!("this could be changed to `{name}: ?Sized`...")));
             for range in bare {
                 // alloc: the error's text, for an error hir found
-                span.labels.push((cx.span(src.with_value(range)), format!("...if indirection were used here: `Box<{name}>`")));
+                span.labels.push((
+                    cx.span(src.with_value(range)),
+                    format!("...if indirection were used here: `Box<{name}>`"),
+                ));
             }
             diag.span_help(
                 span,
@@ -289,17 +320,27 @@ fn suggest_unsized(cx: &Cx<'_, '_>, diag: &mut Diag, item: hir::GenericDef, para
             Some(ret) => (ret.end(), " +", Some(ret.start())),
             None => (bound.syntax().text_range().end(), " +", None),
         },
-        None => (tp.name().map_or(tp.syntax().text_range(), |it| it.syntax().text_range()).end(), ":", None),
+        None => (
+            tp.name().map_or(tp.syntax().text_range(), |it| it.syntax().text_range()).end(),
+            ":",
+            None,
+        ),
     };
     let point = |offset| cx.span(src.with_value(TextRange::empty(offset)));
     // alloc: the suggestion's parts, for an error hir found
     let parts = match open {
         // alloc: the suggestion's text, for an error hir found
-        Some(open) => vec![(point(open), "(".to_owned()), (point(end), format!("){separator} ?Sized"))],
+        Some(open) => {
+            vec![(point(open), "(".to_owned()), (point(end), format!("){separator} ?Sized"))]
+        }
         // alloc: the suggestion's text, for an error hir found
         None => vec![(point(end), format!("{separator} ?Sized"))],
     };
-    diag.multipart_suggestion("consider relaxing the implicit `Sized` restriction", parts, Applicability::MachineApplicable);
+    diag.multipart_suggestion(
+        "consider relaxing the implicit `Sized` restriction",
+        parts,
+        Applicability::MachineApplicable,
+    );
 }
 
 /// Whether `ty` is the type parameter `name` written alone (rustc's one-segment resolved path).
@@ -378,7 +419,9 @@ fn param_span(cx: &Cx<'_, '_>, param: hir::TypeOrConstParam) -> Option<Span> {
                 Some(default) => default.syntax().text_range().end(),
                 None => it.ty()?.syntax().text_range().end(),
             };
-            let start = it.const_token().map_or(it.syntax().text_range().start(), |it| it.text_range().start());
+            let start = it
+                .const_token()
+                .map_or(it.syntax().text_range().start(), |it| it.text_range().start());
             TextRange::new(start, end)
         }
         Either::Right(_) => return None,
@@ -401,16 +444,24 @@ fn ident_of(cx: &Cx<'_, '_>, item: hir::GenericDef) -> Option<(Span, &'static st
             };
             (cx.vsema.source(it)?.map(|it| it.syntax()), kind)
         }
-        hir::GenericDef::Adt(hir::Adt::Struct(it)) => (cx.vsema.source(it)?.map(|it| it.syntax()), "struct"),
-        hir::GenericDef::Adt(hir::Adt::Enum(it)) => (cx.vsema.source(it)?.map(|it| it.syntax()), "enum"),
-        hir::GenericDef::Adt(hir::Adt::Union(it)) => (cx.vsema.source(it)?.map(|it| it.syntax()), "union"),
+        hir::GenericDef::Adt(hir::Adt::Struct(it)) => {
+            (cx.vsema.source(it)?.map(|it| it.syntax()), "struct")
+        }
+        hir::GenericDef::Adt(hir::Adt::Enum(it)) => {
+            (cx.vsema.source(it)?.map(|it| it.syntax()), "enum")
+        }
+        hir::GenericDef::Adt(hir::Adt::Union(it)) => {
+            (cx.vsema.source(it)?.map(|it| it.syntax()), "union")
+        }
         hir::GenericDef::Trait(it) => (cx.vsema.source(it)?.map(|it| it.syntax()), "trait"),
         hir::GenericDef::TypeAlias(it) => {
-            let kind = if it.as_assoc_item(db).is_some() { "associated type" } else { "type alias" };
+            let kind =
+                if it.as_assoc_item(db).is_some() { "associated type" } else { "type alias" };
             (cx.vsema.source(it)?.map(|it| it.syntax()), kind)
         }
         hir::GenericDef::Const(it) => {
-            let kind = if it.as_assoc_item(db).is_some() { "associated constant" } else { "constant" };
+            let kind =
+                if it.as_assoc_item(db).is_some() { "associated constant" } else { "constant" };
             (cx.vsema.source(it)?.map(|it| it.syntax()), kind)
         }
         hir::GenericDef::Static(it) => (cx.vsema.source(it)?.map(|it| it.syntax()), "static"),
@@ -422,7 +473,12 @@ fn ident_of(cx: &Cx<'_, '_>, item: hir::GenericDef) -> Option<(Span, &'static st
 
 /// rustc's "consider relaxing the implicit `Sized` restriction" for a `Sized` bound required
 /// by a local trait's associated type that has no default and writes no `Sized` bound.
-fn relax_sized(cx: &Cx<'_, '_>, diag: &mut Diag, item: hir::GenericDef, trait_: Option<hir::Trait>) {
+fn relax_sized(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    item: hir::GenericDef,
+    trait_: Option<hir::Trait>,
+) {
     let hir::GenericDef::TypeAlias(alias) = item else { return };
     if !trait_.is_some_and(|it| is_lang(cx, it, LangItem::Sized))
         || alias.as_assoc_item(cx.db).and_then(|it| it.container_trait(cx.db)).is_none()

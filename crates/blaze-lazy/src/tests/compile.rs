@@ -131,7 +131,11 @@ fn each_write_that_stops_a_compile_has_it_compiled_again_on_the_next_reader() {
     let (lazily, db) = lazily(Db { stops: AtomicU32::new(3), ..Db::default() });
     assert_eq!(lazily.compile(key(1)).unwrap().key, key(1));
     let revisions: Vec<u64> = db.compiles.lock().iter().map(|it| it.2).collect();
-    assert_eq!(revisions, vec![0, 1, 2, 3], "each attempt on a reader of the revision after the write");
+    assert_eq!(
+        revisions,
+        vec![0, 1, 2, 3],
+        "each attempt on a reader of the revision after the write"
+    );
     assert_eq!(db.held.load(SeqCst), 0);
     assert_eq!(db.kept.lock().len(), 2, "kept once, by the compile that ended");
 }
@@ -193,21 +197,35 @@ fn a_first_compile_takes_a_memo_hit_before_any_reader() {
 
 #[test]
 fn a_tier_up_compiles_at_its_tier_under_the_same_rule() {
-    let (lazily, db) = lazily(Db { stops: AtomicU32::new(1), moved: vec![key(9)], ..Db::default() });
+    let (lazily, db) =
+        lazily(Db { stops: AtomicU32::new(1), moved: vec![key(9)], ..Db::default() });
     assert_eq!(lazily.tier_up(key(8), Tier::Cranelift).unwrap().key, key(8));
-    assert_eq!(*db.compiles.lock(), vec![(key(8), Some(Tier::Cranelift), 0), (key(8), Some(Tier::Cranelift), 1)]);
-    assert!(lazily.tier_up(key(9), Tier::Llvm).unwrap_err().contains("changed before its first call"));
+    assert_eq!(
+        *db.compiles.lock(),
+        vec![(key(8), Some(Tier::Cranelift), 0), (key(8), Some(Tier::Cranelift), 1)]
+    );
+    assert!(
+        lazily.tier_up(key(9), Tier::Llvm).unwrap_err().contains("changed before its first call")
+    );
 }
 
 #[test]
 fn in_a_run_an_edited_function_fails_on_its_first_call_and_stops_the_run() {
-    let (lazily, db) = lazily(Db { moved: vec![key(1)], memo: vec![key(2)], broken: vec![key(3)], ..Db::default() });
+    let (lazily, db) = lazily(Db {
+        moved: vec![key(1)],
+        memo: vec![key(2)],
+        broken: vec![key(3)],
+        ..Db::default()
+    });
     let (runner, mail) = start(4, lazily, 1);
 
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 0)).unwrap();
     let (kind, body) = mail.wait(0, 1);
     assert_eq!(kind, READY_KIND);
-    assert_eq!(Frame::decode(&body).unwrap(), Frame::Ready { request: 1, lazy: 0, target: target_of(0) });
+    assert_eq!(
+        Frame::decode(&body).unwrap(),
+        Frame::Ready { request: 1, lazy: 0, target: target_of(0) }
+    );
 
     pause();
     runner.frame(0, ASK_KIND, 2, &wire::ask(2, 2)).unwrap();
@@ -219,14 +237,18 @@ fn in_a_run_an_edited_function_fails_on_its_first_call_and_stops_the_run() {
     runner.frame(0, ASK_KIND, 3, &wire::ask(3, 3)).unwrap();
     let (kind, body) = mail.wait(0, 3);
     assert_eq!(kind, FAILED_KIND);
-    let Frame::Failed { lazy, why, .. } = Frame::decode(&body).unwrap() else { panic!("not a failure") };
+    let Frame::Failed { lazy, why, .. } = Frame::decode(&body).unwrap() else {
+        panic!("not a failure")
+    };
     assert_eq!(lazy, 3);
     assert!(why.contains("the memo's template") && why.contains("on its first call"), "{why}");
 
     runner.frame(0, ASK_KIND, 4, &wire::ask(4, 1)).unwrap();
     let (kind, body) = mail.wait(0, 4);
     assert_eq!(kind, FAILED_KIND);
-    let Frame::Failed { lazy, why, .. } = Frame::decode(&body).unwrap() else { panic!("not a failure") };
+    let Frame::Failed { lazy, why, .. } = Frame::decode(&body).unwrap() else {
+        panic!("not a failure")
+    };
     assert_eq!(lazy, 1);
     assert!(why.contains("changed before its first call"), "{why}");
 

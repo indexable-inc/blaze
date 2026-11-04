@@ -1,9 +1,9 @@
 use std::ops::ControlFlow;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use hir_def::signatures::TraitSignature;
 use hir_expand::fixture;
+use std::alloc::Global;
 use syntax::ToSmolStr;
 
 use crate::{

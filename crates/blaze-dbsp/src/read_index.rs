@@ -1,8 +1,13 @@
 use std::hash::Hash;
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use smallvec::SmallVec;
+use std::alloc::Global;
+
+/// [`ReadIndex::forget_many`] sweeps once the readers it forgets hold at least one in this many
+/// of the edges: a one-at-a-time forget costs about three probes at random per edge it drops,
+/// a sweep a pass over every edge and a probe per edge left in a key row that lost some.
+const SWEEP_SHARE: usize = 4;
 
 /// Readers of keys, both ways: what woke whom. K: the key read ((module, name), negative reads
 /// included); R: a reader handle. Adding is idempotent; `forget(r)` drops every key of `r`.
@@ -109,9 +114,11 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
         let Some(&r) = self.by_reader.slot.get(&reader) else { return };
         let items = std::mem::take(&mut self.by_reader.rows[r as usize].items);
         for &(_, k) in &items {
-            let (in_key, _) = self.pairs.remove(&(k, r)).expect("a read index edge without its pair");
+            let (in_key, _) =
+                self.pairs.remove(&(k, r)).expect("a read index edge without its pair");
             if let Some(moved) = self.by_key.remove_at(k, in_key) {
-                self.pairs.get_mut(&(k, moved)).expect("a read index edge without its pair").0 = in_key;
+                self.pairs.get_mut(&(k, moved)).expect("a read index edge without its pair").0 =
+                    in_key;
             }
             if self.by_key.rows[k as usize].items.is_empty() {
                 self.by_key.release(k);
@@ -121,6 +128,76 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
         row.items = items;
         row.items.clear();
         self.by_reader.release(r);
+    }
+
+    /// [`ReadIndex::forget`] of each of `readers`. While they hold less than
+    /// `1 / SWEEP_SHARE` of the edges it forgets them one at a time; past that it drops their
+    /// edges in one pass over the pair map and the key rows, and fixes the places of the edges
+    /// left in the key rows that lost some. Forgetting most of the index at once (hir-ty's
+    /// impls maintainer resetting every crate a proc macro reached) is then a sweep, not three
+    /// probes at random per edge, and leaves the pair map with no tombstones to probe past.
+    pub fn forget_many(&mut self, readers: impl IntoIterator<Item = R>) {
+        // alloc: once per call, a flag per reader row
+        let mut dropped = vec![false; self.by_reader.rows.len()];
+        // alloc: once per call, the rows of the readers forgotten
+        let mut gone: Vec<u32> = Vec::new();
+        let mut edges = 0usize;
+        for reader in readers {
+            let Some(&r) = self.by_reader.slot.get(&reader) else { continue };
+            if !std::mem::replace(&mut dropped[r as usize], true) {
+                gone.push(r);
+                edges += self.by_reader.rows[r as usize].items.len();
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        if edges.saturating_mul(SWEEP_SHARE) < self.pairs.len() {
+            for r in gone {
+                let reader = self.by_reader.rows[r as usize].owner;
+                self.forget(reader);
+            }
+            return;
+        }
+        self.sweep(&dropped, &gone);
+    }
+
+    /// Drops every edge of the reader rows `gone` (flagged in `dropped`) in one pass.
+    fn sweep(&mut self, dropped: &[bool], gone: &[u32]) {
+        let ReadIndex { by_key, by_reader, pairs } = self;
+        pairs.retain(|&(_, r), _| !dropped[r as usize]);
+        // alloc: once per sweep, the key rows that lost an edge and kept others
+        let mut changed: Vec<u32> = Vec::new();
+        for k in 0..by_key.rows.len() {
+            let items = &mut by_key.rows[k].items;
+            let before = items.len();
+            if before == 0 {
+                continue;
+            }
+            items.retain(|&mut (_, r)| !dropped[r as usize]);
+            if items.len() == before {
+                continue;
+            }
+            if items.is_empty() {
+                by_key.release(k as u32);
+            } else {
+                changed.push(k as u32);
+            }
+        }
+        // A surviving reader's row is untouched (only whole readers go, and a key row released
+        // above held only theirs); the edges left in a changed key row moved up in it.
+        for &k in &changed {
+            for (at, &(_, r)) in by_key.rows[k as usize].items.iter().enumerate() {
+                pairs.get_mut(&(k, r)).expect("a read index edge without its pair").0 = at as u32;
+            }
+        }
+        for &r in gone {
+            by_reader.rows[r as usize].items.clear();
+            by_reader.release(r);
+        }
+        // Into a table of its own size: the one the removals left holds their tombstones.
+        let len = pairs.len();
+        pairs.shrink_to(len);
     }
 
     /// Drops the one edge `key` -> `reader`, if it is there.

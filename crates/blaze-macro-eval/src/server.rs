@@ -13,11 +13,11 @@ use std::{fmt::Write as _, ops::Bound};
 
 use base_db::Db;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_lower::{SubRequest, SubResponse};
 use intern::Symbol;
 use proc_macro_api::bridge::spans::{self, spanned};
 use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SyntaxContext, TextRange, TextSize};
+use std::alloc::Global;
 
 use crate::{
     guest::Stop,
@@ -83,7 +83,10 @@ pub(crate) struct Server {
 }
 
 fn freed() -> Stop {
-    Stop("used a token stream it had given back (use-after-free in a `proc_macro` handle)".to_owned()) // alloc: error path
+    Stop(
+        "used a token stream it had given back (use-after-free in a `proc_macro` handle)"
+            .to_owned(),
+    ) // alloc: error path
 }
 
 /// The end of the run of trees from `at` that rustc's stream holds as one token, and the
@@ -116,7 +119,11 @@ fn delimiter_of(n: u8) -> Result<Delimiter, Stop> {
         2 => Delimiter::Bracket,
         3 => Delimiter::Invisible,
         // alloc: error path
-        other => return Err(Stop(format!("sent the server the delimiter {other}, which the pinned bridge never sends"))),
+        other => {
+            return Err(Stop(format!(
+                "sent the server the delimiter {other}, which the pinned bridge never sends"
+            )));
+        }
     })
 }
 
@@ -126,7 +133,11 @@ fn ident_kind_of(n: u8) -> Result<IdentKind, Stop> {
         1 => IdentKind::Raw,
         2 => IdentKind::ForcedKeyword,
         // alloc: error path
-        other => return Err(Stop(format!("sent the server the ident kind {other}, which the pinned bridge never sends"))),
+        other => {
+            return Err(Stop(format!(
+                "sent the server the ident kind {other}, which the pinned bridge never sends"
+            )));
+        }
     })
 }
 
@@ -152,7 +163,11 @@ fn lit_kind_of(r: &mut Reader<'_>) -> Result<LitKind, Stop> {
         9 => LitKind::CStrRaw(r.u8()?),
         10 => LitKind::Err,
         // alloc: error path
-        other => return Err(Stop(format!("sent the server the literal kind {other}, which the pinned bridge never sends"))),
+        other => {
+            return Err(Stop(format!(
+                "sent the server the literal kind {other}, which the pinned bridge never sends"
+            )));
+        }
     })
 }
 
@@ -208,8 +223,8 @@ impl Server {
             tracked: Vec::new(), // alloc: once per expansion, as above
             emitted: Vec::new(), // alloc: once per expansion, as above
             text: String::new(), // alloc: once per expansion, as above
-            lexed: Vec::new(), // alloc: once per expansion, as above
-            warned: Vec::new(), // alloc: once per expansion, as above
+            lexed: Vec::new(),   // alloc: once per expansion, as above
+            warned: Vec::new(),  // alloc: once per expansion, as above
             lost: None,
         };
         for site in sites {
@@ -226,11 +241,17 @@ impl Server {
 
     /// The stream of `handle`, taken: the client gave it up.
     pub(crate) fn take(&mut self, handle: u32) -> Result<Stream, Stop> {
-        self.streams.get_mut((handle as usize).wrapping_sub(1)).and_then(Option::take).ok_or_else(freed)
+        self.streams
+            .get_mut((handle as usize).wrapping_sub(1))
+            .and_then(Option::take)
+            .ok_or_else(freed)
     }
 
     fn stream(&self, handle: u32) -> Result<&Stream, Stop> {
-        self.streams.get((handle as usize).wrapping_sub(1)).and_then(Option::as_ref).ok_or_else(freed)
+        self.streams
+            .get((handle as usize).wrapping_sub(1))
+            .and_then(Option::as_ref)
+            .ok_or_else(freed)
     }
 
     pub(crate) fn span_handle(&mut self, span: Span) -> u32 {
@@ -282,7 +303,9 @@ impl Server {
             (true, false) => Ok(Stream::default()),
             // alloc: the macro's panic message, given to the error that says it
             (false, true) => Err(r.str()?.to_owned()),
-            (false, false) => Err("the proc macro panicked with a payload that is not a string".to_owned()), // alloc: error path
+            (false, false) => {
+                Err("the proc macro panicked with a payload that is not a string".to_owned())
+            } // alloc: error path
         };
         Ok(answer)
     }
@@ -314,7 +337,13 @@ impl Server {
                 let close = self.read_span(r)?;
                 let entire = self.read_span(r)?;
                 let span = DelimSpan { open, close, entire };
-                Tree::Group { delimiter, stream, span, open: Spacing::Alone, spacing: Spacing::Alone }
+                Tree::Group {
+                    delimiter,
+                    stream,
+                    span,
+                    open: Spacing::Alone,
+                    spacing: Spacing::Alone,
+                }
             }
             1 => {
                 let ch = r.u8()?;
@@ -340,13 +369,24 @@ impl Server {
                 Tree::Literal { kind, symbol, suffix, span, spacing: Spacing::Alone }
             }
             // alloc: error path
-            other => return Err(Stop(format!("sent the server the token tree tag {other}, which the pinned bridge never sends"))),
+            other => {
+                return Err(Stop(format!(
+                    "sent the server the token tree tag {other}, which the pinned bridge never sends"
+                )));
+            }
         };
         push_given(tree, out);
         Ok(())
     }
 
-    fn put_literal(&mut self, w: &mut Writer<'_>, kind: LitKind, symbol: &Symbol, suffix: Option<&Symbol>, span: Span) {
+    fn put_literal(
+        &mut self,
+        w: &mut Writer<'_>,
+        kind: LitKind,
+        symbol: &Symbol,
+        suffix: Option<&Symbol>,
+        span: Span,
+    ) {
         put_lit_kind(w, kind);
         w.str(symbol.as_str());
         w.some(suffix.is_some());
@@ -395,7 +435,14 @@ impl Server {
 
     /// A punctuation mark or identifier as the client reads it, at `span`; `joint` is the
     /// mark's.
-    fn put_token(&mut self, w: &mut Writer<'_>, tree: &Tree, span: Span, joint: bool, count: &mut u64) {
+    fn put_token(
+        &mut self,
+        w: &mut Writer<'_>,
+        tree: &Tree,
+        span: Span,
+        joint: bool,
+        count: &mut u64,
+    ) {
         match tree {
             Tree::Punct { ch, .. } => {
                 w.u8(1);
@@ -420,7 +467,13 @@ impl Server {
     /// (`Span::to`), split again into characters, each its byte of a span exactly the
     /// operator's length and else the whole span; a `'` glued to an identifier is a lifetime,
     /// both at its span. Streams the lexer made hold glued tokens split this way already.
-    fn put_trees(&mut self, db: &(impl Answer + ?Sized), w: &mut Writer<'_>, trees: &[Tree], count: &mut u64) -> Result<(), Stop> {
+    fn put_trees(
+        &mut self,
+        db: &(impl Answer + ?Sized),
+        w: &mut Writer<'_>,
+        trees: &[Tree],
+        count: &mut u64,
+    ) -> Result<(), Stop> {
         let mut at = 0;
         while at < trees.len() {
             let (end, op) = glued(trees, at);
@@ -440,7 +493,10 @@ impl Server {
                 let joint = i < last || tree.spacing() == Spacing::Joint;
                 let span = match split {
                     true => Span {
-                        range: TextRange::at(span.range.start() + TextSize::from(i as u32), TextSize::from(1)),
+                        range: TextRange::at(
+                            span.range.start() + TextSize::from(i as u32),
+                            TextSize::from(1),
+                        ),
                         ..span
                     },
                     false => span,
@@ -474,7 +530,12 @@ impl Server {
 
     /// A diagnostic and its children, each on a line of `text` indented by its depth: whether
     /// it is an error.
-    fn read_diagnostic(&mut self, r: &mut Reader<'_>, depth: usize, text: &mut String) -> Result<bool, Stop> {
+    fn read_diagnostic(
+        &mut self,
+        r: &mut Reader<'_>,
+        depth: usize,
+        text: &mut String,
+    ) -> Result<bool, Stop> {
         let level = r.u8()?;
         let message = r.str()?;
         let spans = r.count()?;
@@ -487,7 +548,11 @@ impl Server {
             2 => (false, "note"),
             3 => (false, "help"),
             // alloc: error path
-            other => return Err(Stop(format!("sent the server the diagnostic level {other}, which the pinned bridge never sends"))),
+            other => {
+                return Err(Stop(format!(
+                    "sent the server the diagnostic level {other}, which the pinned bridge never sends"
+                )));
+            }
         };
         if depth > 0 {
             text.push('\n');
@@ -502,7 +567,12 @@ impl Server {
 
     /// Answers the request `request`, writing the reply, `Result<_, PanicMessage>`, to `reply`;
     /// what `db` could not answer stops it.
-    pub(crate) fn dispatch(&mut self, db: &(impl Answer + ?Sized), request: &[u8], reply: &mut Vec<u8>) -> Result<(), Stop> {
+    pub(crate) fn dispatch(
+        &mut self,
+        db: &(impl Answer + ?Sized),
+        request: &[u8],
+        reply: &mut Vec<u8>,
+    ) -> Result<(), Stop> {
         let answered = self.answer_request(db, request, reply);
         match self.lost.take() {
             Some(stop) => Err(stop),
@@ -510,13 +580,20 @@ impl Server {
         }
     }
 
-    fn answer_request(&mut self, db: &(impl Answer + ?Sized), request: &[u8], reply: &mut Vec<u8>) -> Result<(), Stop> {
+    fn answer_request(
+        &mut self,
+        db: &(impl Answer + ?Sized),
+        request: &[u8],
+        reply: &mut Vec<u8>,
+    ) -> Result<(), Stop> {
         reply.clear();
         let mut r = Reader::new(request);
         let tag = r.u8()?;
         let Some(method) = Method::of(tag) else {
             // alloc: error path
-            return Err(Stop(format!("sent the server the request {tag}, which the pinned bridge has not")));
+            return Err(Stop(format!(
+                "sent the server the request {tag}, which the pinned bridge has not"
+            )));
         };
         let mut w = Writer { out: reply };
         match method {
@@ -537,7 +614,14 @@ impl Server {
                 let text = r.str()?;
                 let call_site = self.sites[1];
                 self.lexed.clear();
-                let lexed = lex::literal(text, call_site, self.edition, self.forced_keywords, &mut self.lexed, &mut self.warned);
+                let lexed = lex::literal(
+                    text,
+                    call_site,
+                    self.edition,
+                    self.forced_keywords,
+                    &mut self.lexed,
+                    &mut self.warned,
+                );
                 self.lexed_errors();
                 w.ok(true);
                 match lexed {
@@ -546,7 +630,9 @@ impl Server {
                         self.put_literal(&mut w, kind, &symbol, suffix.as_ref(), span);
                     }
                     Ok(_) => {
-                        return Err(Stop("got a literal from the lexer that is not one".to_owned())); // alloc: error path
+                        return Err(Stop(
+                            "got a literal from the lexer that is not one".to_owned(),
+                        )); // alloc: error path
                     }
                     Err(why) => {
                         w.ok(false);
@@ -591,7 +677,14 @@ impl Server {
                 let text = r.str()?;
                 let call_site = self.sites[1];
                 self.lexed.clear();
-                let lexed = lex::stream(text, call_site, self.edition, self.forced_keywords, &mut self.lexed, &mut self.warned);
+                let lexed = lex::stream(
+                    text,
+                    call_site,
+                    self.edition,
+                    self.forced_keywords,
+                    &mut self.lexed,
+                    &mut self.warned,
+                );
                 self.lexed_errors();
                 w.ok(true);
                 match lexed {
@@ -764,7 +857,9 @@ impl Server {
                 let span = self.read_span(&mut r)?;
                 let at = match (span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER, method) {
                     (true, _) => span,
-                    (false, Method::SpanStart) => Span { range: TextRange::empty(span.range.start()), ..span },
+                    (false, Method::SpanStart) => {
+                        Span { range: TextRange::empty(span.range.start()), ..span }
+                    }
                     (false, _) => Span { range: TextRange::empty(span.range.end()), ..span },
                 };
                 let handle = self.span_handle(at);

@@ -155,11 +155,7 @@ pub(crate) fn decode_nd_state(bytes: &[u8]) -> Option<NdReproState> {
     let entropy = u64::from_le_bytes(*entropy_bytes);
     let (longest_bytes, rest) = rest.split_first_chunk::<4>()?;
     let longest = u32::from_le_bytes(*longest_bytes);
-    Some(NdReproState {
-        graph: Graph::decode(rest)?,
-        entropy,
-        longest,
-    })
+    Some(NdReproState { graph: Graph::decode(rest)?, entropy, longest })
 }
 
 /// Encode nondeterministic replay state into a failure blob (prefix 2/3),

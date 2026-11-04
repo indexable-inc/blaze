@@ -31,10 +31,7 @@ pub(super) fn as_integer_ratio(v: f64) -> Result<Option<(u128, u128)>, InternalE
     let (mut num, mut exp) = if biased_exp == 0 {
         (u128::from(mantissa_bits), -1074i32)
     } else {
-        (
-            u128::from((1u64 << 52) | mantissa_bits),
-            biased_exp - 1023 - 52,
-        )
+        (u128::from((1u64 << 52) | mantissa_bits), biased_exp - 1023 - 52)
     };
     let trailing = num.trailing_zeros() as i32;
     num >>= trailing;
@@ -84,16 +81,14 @@ impl<'a> Shrinker<'a> {
 
                 let s = fc.simplest()?;
                 if ChoiceValue::Float(s) != ChoiceValue::Float(v) {
-                    self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(s))]))
-                        .await?;
+                    self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(s))])).await?;
                 }
 
                 let v = self.float_at(i).ok_or(PassExit::NodeGone)?;
                 if v != 0.0 {
                     let s = fc.simplest_nonzero()?;
                     if ChoiceValue::Float(s) != ChoiceValue::Float(v) {
-                        self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(s))]))
-                            .await?;
+                        self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(s))])).await?;
                     }
                 }
 
@@ -101,11 +96,8 @@ impl<'a> Shrinker<'a> {
 
                 if v.is_infinite() {
                     if v < 0.0 && fc.validate(f64::INFINITY) {
-                        self.replace(&HashMap::from_iter([(
-                            i,
-                            ChoiceValue::Float(f64::INFINITY),
-                        )]))
-                        .await?;
+                        self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(f64::INFINITY))]))
+                            .await?;
                     }
                     let v = self.float_at(i).ok_or(PassExit::NodeGone)?;
                     if v.is_infinite() {
@@ -155,8 +147,7 @@ impl<'a> Shrinker<'a> {
                 if v.is_sign_negative() {
                     let neg = -v;
                     if fc.validate(neg) {
-                        self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(neg))]))
-                            .await?;
+                        self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(neg))])).await?;
                     }
                 }
 
@@ -165,11 +156,8 @@ impl<'a> Shrinker<'a> {
                 let v_abs = v.abs();
                 let is_neg = v.is_sign_negative();
                 if v_abs.is_finite() && v_abs > 0.0 && v_abs >= MAX_PRECISE_INTEGER {
-                    let base: i128 = if v_abs >= (i128::MAX as f64) {
-                        i128::MAX
-                    } else {
-                        v_abs as i128
-                    };
+                    let base: i128 =
+                        if v_abs >= (i128::MAX as f64) { i128::MAX } else { v_abs as i128 };
                     let i_capture = i;
                     let fc_capture = fc.clone();
                     let mut search = FindInteger::new();
@@ -179,11 +167,7 @@ impl<'a> Shrinker<'a> {
                         } else {
                             let shifted = base >> k;
                             let candidate_mag = shifted as f64;
-                            let candidate = if is_neg {
-                                -candidate_mag
-                            } else {
-                                candidate_mag
-                            };
+                            let candidate = if is_neg { -candidate_mag } else { candidate_mag };
                             if !fc_capture.validate(candidate) {
                                 false
                             } else {
@@ -213,11 +197,8 @@ impl<'a> Shrinker<'a> {
                                     false
                                 } else {
                                     let candidate_mag = attempt as f64;
-                                    let candidate = if is_neg {
-                                        -candidate_mag
-                                    } else {
-                                        candidate_mag
-                                    };
+                                    let candidate =
+                                        if is_neg { -candidate_mag } else { candidate_mag };
                                     self.replace(&HashMap::from_iter([(
                                         i_capture,
                                         ChoiceValue::Float(candidate),
@@ -241,11 +222,7 @@ impl<'a> Shrinker<'a> {
                             {
                                 continue;
                             }
-                            let candidate = if is_neg {
-                                -candidate_mag
-                            } else {
-                                candidate_mag
-                            };
+                            let candidate = if is_neg { -candidate_mag } else { candidate_mag };
                             if fc.validate(candidate) {
                                 self.replace(&HashMap::from_iter([(
                                     i,
@@ -265,11 +242,7 @@ impl<'a> Shrinker<'a> {
                     let mut search = BinSearchDown::new(0, current_idx as i128);
                     while let Some(idx) = search.probe() {
                         let candidate_mag = index_to_float(idx as u64);
-                        let candidate = if is_neg {
-                            -candidate_mag
-                        } else {
-                            candidate_mag
-                        };
+                        let candidate = if is_neg { -candidate_mag } else { candidate_mag };
                         let ok = if fc.validate(candidate) {
                             self.replace(&HashMap::from_iter([(i, ChoiceValue::Float(candidate))]))
                                 .await?
@@ -291,11 +264,7 @@ impl<'a> Shrinker<'a> {
                             while let Some(k) = search.probe() {
                                 let num_sum = (k as u128) * n + r;
                                 let candidate_abs = (num_sum as f64) / (n as f64);
-                                let candidate = if is_neg {
-                                    -candidate_abs
-                                } else {
-                                    candidate_abs
-                                };
+                                let candidate = if is_neg { -candidate_abs } else { candidate_abs };
                                 let ok = if !fc.validate(candidate) {
                                     false
                                 } else {
@@ -353,10 +322,7 @@ impl<'a> Shrinker<'a> {
                 ) else {
                     continue;
                 };
-                if matches!(
-                    (&num_i, &num_j),
-                    (Numeric::Integer(..), Numeric::Integer(..))
-                ) {
+                if matches!((&num_i, &num_j), (Numeric::Integer(..), Numeric::Integer(..))) {
                     continue;
                 }
                 if !num_i.can_choose_for_redistribute() || !num_j.can_choose_for_redistribute() {
@@ -408,10 +374,7 @@ impl<'a> Shrinker<'a> {
                     };
                     let mut accepted = false;
                     for (val_i, val_j) in scaled_candidates(&num_i, &num_j) {
-                        if self
-                            .replace(&HashMap::from_iter([(i, val_i), (j, val_j)]))
-                            .await?
-                        {
+                        if self.replace(&HashMap::from_iter([(i, val_i), (j, val_j)])).await? {
                             accepted = true;
                             break;
                         }
@@ -468,15 +431,9 @@ fn scaled_integer_candidates(
     if d_i.sign() == Sign::Minus {
         push(&t_i - &d_i, &t_j - &d_j);
     }
-    let bound = if d_j.sign() == Sign::Plus {
-        &ic_j.max_value() - &t_j
-    } else {
-        &ic_j.min_value() - &t_j
-    };
-    let scaled: Vec<BigInt> = SCALE_FACTORS
-        .iter()
-        .map(|&f| &d_j * BigInt::from(f))
-        .collect();
+    let bound =
+        if d_j.sign() == Sign::Plus { &ic_j.max_value() - &t_j } else { &ic_j.min_value() - &t_j };
+    let scaled: Vec<BigInt> = SCALE_FACTORS.iter().map(|&f| &d_j * BigInt::from(f)).collect();
     let step_i = BigInt::from(if d_i.sign() == Sign::Plus { 1 } else { -1 });
     for raised in core::iter::once(bound).chain(scaled) {
         if raised.magnitude() <= d_j.magnitude() {
@@ -515,11 +472,8 @@ fn scaled_float_candidates(
     if v_i.is_sign_negative() {
         push(-v_i, -v_j);
     }
-    let bound = if v_j > 0.0 {
-        fc_j.max_value.min(f64::MAX)
-    } else {
-        fc_j.min_value.max(-f64::MAX)
-    };
+    let bound =
+        if v_j > 0.0 { fc_j.max_value.min(f64::MAX) } else { fc_j.min_value.max(-f64::MAX) };
     let scaled = SCALE_FACTORS.iter().map(|&f| v_j * f64::from(f));
     for raised in core::iter::once(bound).chain(scaled) {
         if !raised.is_finite() || raised.abs() <= v_j.abs() {
@@ -637,9 +591,7 @@ async fn redistribute_pair(
             Some(val_i) => match cand_j.build_value() {
                 None => false,
                 Some(val_j) => {
-                    shrinker
-                        .replace(&HashMap::from_iter([(i, val_i), (j, val_j)]))
-                        .await?
+                    shrinker.replace(&HashMap::from_iter([(i, val_i), (j, val_j)])).await?
                 }
             },
         };

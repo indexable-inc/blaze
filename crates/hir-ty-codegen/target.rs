@@ -33,7 +33,10 @@ const _: () = assert!(MOST_FEATURE_SETS <= u8::MAX as usize + 1);
 /// The sets [`Features`] number, past the baseline's (0, never set), in the order they were
 /// first named, each once. Only added to, under [`ADDING`], in order, so a slot that is not
 /// set yet ends the sets; read with no lock.
-#[expect(clippy::disallowed_types, reason = "the process's one numbering of feature sets: a `Features` is its number, read with no lock")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's one numbering of feature sets: a `Features` is its number, read with no lock"
+)]
 static FEATURE_SETS: [std::sync::OnceLock<Box<[String]>>; MOST_FEATURE_SETS] =
     [const { std::sync::OnceLock::new() }; MOST_FEATURE_SETS];
 
@@ -258,7 +261,9 @@ impl Target {
         }
         if named.len() >= MOST_TARGETS {
             // alloc: an error
-            return Err(format!("{triple} is past the {MOST_TARGETS} targets one process lowers for"));
+            return Err(format!(
+                "{triple} is past the {MOST_TARGETS} targets one process lowers for"
+            ));
         }
         let index = named.len() as u8;
         // alloc: leaked once per target named, for the process (setup)
@@ -338,7 +343,9 @@ impl Target {
             Some(("+", name)) if !name.is_empty() => (true, name),
             Some(("-", name)) if !name.is_empty() => (false, name),
             // alloc: an error at setup, read once per ISA made.
-            _ => return Err(format!("the target feature {feature:?} is not `+` or `-` and a name")),
+            _ => {
+                return Err(format!("the target feature {feature:?} is not `+` or `-` and a name"));
+            }
         };
         let (table, always): (&[(&str, &str)], &[&str]) = match self.arch {
             Arch::X86_64 => (&X86_FEATURES, &["x87", "fxsr", "sse", "sse2", "cmpxchg16b"]),
@@ -417,7 +424,9 @@ impl Target {
         // AAPCS64 on AArch64, which Apple's differs from in what goes on the stack.
         let (object_format, unwind, call_conv) = match (system, arch) {
             // The calling convention is the one of the ISA whose settings are borrowed.
-            (_, Arch::Wasm32 | Arch::Wasm64) => (ObjectFormat::Wasm, UnwindFormat::None, CallConv::SystemV),
+            (_, Arch::Wasm32 | Arch::Wasm64) => {
+                (ObjectFormat::Wasm, UnwindFormat::None, CallConv::SystemV)
+            }
             (Some("linux"), _) => (ObjectFormat::Elf, UnwindFormat::EhFrame, CallConv::SystemV),
             (Some("darwin"), Arch::Aarch64) => {
                 (ObjectFormat::MachO, UnwindFormat::EhFrame, CallConv::AppleAarch64)
@@ -711,7 +720,16 @@ impl Target {
         let (pic, tls) = self.addressing();
         // `isa` leaves Cranelift's `probestack_size_log2` at its default: a page of 4 KiB.
         // Code counts nothing unless its unit's spec says it does (`Spec::counted`).
-        Some(blaze_stencil::Target { arch, os, cpu, pic, tls, probe_stack: true, probe_log2: 12, counts: false })
+        Some(blaze_stencil::Target {
+            arch,
+            os,
+            cpu,
+            pic,
+            tls,
+            probe_stack: true,
+            probe_log2: 12,
+            counts: false,
+        })
     }
 
     /// The settings of Cranelift's ISA that the [`cpu`](Self::cpu) rustc compiles for has:
@@ -830,7 +848,11 @@ mod tests {
         let numbered: Vec<Vec<Features>> = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..8)
                 .map(|_| {
-                    scope.spawn(|| sets.iter().map(|it| x86.features_of(it).expect("a set")).collect::<Vec<_>>())
+                    scope.spawn(|| {
+                        sets.iter()
+                            .map(|it| x86.features_of(it).expect("a set"))
+                            .collect::<Vec<_>>()
+                    })
                 })
                 .collect();
             threads.into_iter().map(|it| it.join().expect("a thread")).collect()
@@ -848,7 +870,9 @@ mod tests {
     #[test]
     fn each_set_has_its_own_isa() {
         let x86 = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        let avx2 = x86.features_of(&names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"])).expect("a set");
+        let avx2 = x86
+            .features_of(&names(&["+avx", "+avx2", "+sse3", "+sse4.1", "+sse4.2", "+ssse3"]))
+            .expect("a set");
         let ssse3 = x86.features_of(&names(&["+sse3", "+ssse3"])).expect("a set");
         assert_eq!(setting_with(&x86, avx2, "has_avx2"), Some(true));
         assert_eq!(setting_with(&x86, avx2, "has_sse41"), Some(true));
@@ -867,7 +891,14 @@ mod tests {
         let linux = Target::of("x86_64-unknown-linux-gnu").expect("a target");
         assert_eq!(linux.llvm_features(Features::BASELINE), "");
         let set = linux
-            .features_of(&names(&["+avx2", "+bmi1", "+lahfsahf", "+pclmulqdq", "+sse4.2", "-cmpxchg16b"]))
+            .features_of(&names(&[
+                "+avx2",
+                "+bmi1",
+                "+lahfsahf",
+                "+pclmulqdq",
+                "+sse4.2",
+                "-cmpxchg16b",
+            ]))
             .expect("a set");
         assert_eq!(linux.llvm_features(set), "+avx2,+bmi,+sahf,+pclmul,+sse4.2,+crc32,-cx16");
         let off = linux.features_of(&names(&["-sse4.2"])).expect("a set");
@@ -877,7 +908,8 @@ mod tests {
         let avx = windows.features_of(&names(&["+avx"])).expect("a set");
         assert_eq!(windows.llvm_features(avx), "+cx16,+avx");
         let arm = Target::of("aarch64-unknown-linux-gnu").expect("a target");
-        let set = arm.features_of(&names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"])).expect("a set");
+        let set =
+            arm.features_of(&names(&["+fp16", "+paca", "+pacg", "+rcpc2", "+tme"])).expect("a set");
         assert_eq!(arm.llvm_features(set), "+fullfp16,+pauth,+rcpc-immo");
         let neon = arm.features_of(&names(&["+fhm", "+neon"])).expect("a set");
         assert_eq!(arm.llvm_features(neon), "+fp16fml,+neon,+fp-armv8");
@@ -915,7 +947,9 @@ mod tests {
         for triple in triples {
             let target = Target::of(triple).expect("a target");
             let stencil = target.stencil().expect("a stencil target");
-            let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+            let isa = target
+                .isa(Features::BASELINE, "backtracking", false, OptLevel::None)
+                .expect("the ISA");
             let flags = isa.flags();
             assert_eq!(stencil.pic, flags.is_pic(), "{triple}");
             let tls = match flags.tls_model() {
@@ -930,10 +964,22 @@ mod tests {
             let lse = setting(&target, "has_lse") == Some(true);
             assert_eq!(stencil.cpu == blaze_stencil::Cpu::AppleM1, lse, "{triple}");
         }
-        let apple = Target::of("aarch64-apple-darwin").expect("a target").stencil().expect("a stencil target");
-        assert_eq!((apple.arch, apple.os), (blaze_codegen::Arch::Aarch64, blaze_stencil::Os::MacOs));
-        let windows = Target::of("x86_64-pc-windows-msvc").expect("a target").stencil().expect("a stencil target");
-        assert_eq!((windows.arch, windows.os), (blaze_codegen::Arch::X86_64, blaze_stencil::Os::Windows));
+        let apple = Target::of("aarch64-apple-darwin")
+            .expect("a target")
+            .stencil()
+            .expect("a stencil target");
+        assert_eq!(
+            (apple.arch, apple.os),
+            (blaze_codegen::Arch::Aarch64, blaze_stencil::Os::MacOs)
+        );
+        let windows = Target::of("x86_64-pc-windows-msvc")
+            .expect("a target")
+            .stencil()
+            .expect("a stencil target");
+        assert_eq!(
+            (windows.arch, windows.os),
+            (blaze_codegen::Arch::X86_64, blaze_stencil::Os::Windows)
+        );
         assert_eq!(Target::of("wasm32-wasip1").expect("a target").stencil(), None);
     }
 
@@ -947,7 +993,8 @@ mod tests {
     #[test]
     fn blazes_wasm_feature_decides_nothing_of_a_targets_code() {
         fn walk(dir: &std::path::Path, root: &std::path::Path, uses: &mut Vec<(String, usize)>) {
-            let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().map(|it| it.unwrap().path()).collect();
+            let mut entries: Vec<_> =
+                std::fs::read_dir(dir).unwrap().map(|it| it.unwrap().path()).collect();
             entries.sort();
             for path in entries {
                 if path.is_dir() {
@@ -956,7 +1003,8 @@ mod tests {
                     let text = std::fs::read_to_string(&path).unwrap();
                     let count = text.matches(concat!("feature = ", "\"wasm\"")).count();
                     if count != 0 {
-                        let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                        let name =
+                            path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
                         uses.push((name, count));
                     }
                 }
@@ -966,16 +1014,22 @@ mod tests {
         let mut uses = Vec::new();
         walk(root, root, &mut uses);
         let expected = [("target.rs".to_owned(), 2), ("v2/toolchain.rs".to_owned(), 1)];
-        assert_eq!(uses, expected, "where hir-ty-codegen reads its `wasm` feature: `host`, `calls` and the toolchain's id");
+        assert_eq!(
+            uses, expected,
+            "where hir-ty-codegen reads its `wasm` feature: `host`, `calls` and the toolchain's id"
+        );
     }
 
     #[test]
     fn cranelift_checks_nothing_blazes_verifier_checked() {
         let target = Target::of("x86_64-unknown-linux-gnu").expect("a target");
-        let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+        let isa =
+            target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
         assert!(!isa.flags().enable_verifier());
         assert_eq!(isa.flags().opt_level(), OptLevel::None);
-        let isa = target.isa(Features::BASELINE, "backtracking", false, OptLevel::Speed).expect("the ISA");
+        let isa = target
+            .isa(Features::BASELINE, "backtracking", false, OptLevel::Speed)
+            .expect("the ISA");
         assert_eq!(isa.flags().opt_level(), OptLevel::Speed);
     }
 
@@ -1004,9 +1058,14 @@ mod tests {
         let apple = Target::of("aarch64-apple-darwin").expect("a target");
         assert_eq!(apple.call_conv, cranelift_codegen::isa::CallConv::AppleAarch64);
         assert!(crate::f16_f128::soft_floats(&apple));
-        assert!(crate::f16_f128::soft_floats(&Target::of("aarch64-unknown-linux-gnu").expect("a target")));
-        assert!(!crate::f16_f128::soft_floats(&Target::of("x86_64-pc-windows-msvc").expect("a target")));
-        let isa = apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+        assert!(crate::f16_f128::soft_floats(
+            &Target::of("aarch64-unknown-linux-gnu").expect("a target")
+        ));
+        assert!(!crate::f16_f128::soft_floats(
+            &Target::of("x86_64-pc-windows-msvc").expect("a target")
+        ));
+        let isa =
+            apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
         let mut signature = ir::Signature::new(apple.call_conv);
         signature.params.extend([AbiParam::new(types::F16), AbiParam::new(types::F128)]);
         signature.returns.extend([AbiParam::new(types::F128), AbiParam::new(types::F16)]);

@@ -121,15 +121,23 @@ pub fn geometric_mean_permille(pairs: &[(u128, u128)]) -> u64 {
 ///
 /// Requires at least 3 pairs per cell, every cell the same count, and
 /// every mean positive.
-pub fn discoveries(cells: &[Vec<(u128, u128)>], q_permille: u64, margin_permille: u64) -> Vec<Judgment> {
+pub fn discoveries(
+    cells: &[Vec<(u128, u128)>],
+    q_permille: u64,
+    margin_permille: u64,
+) -> Vec<Judgment> {
     let pairs = cells.first().map_or(0, Vec::len);
-    assert!(pairs >= 3 && cells.iter().all(|c| c.len() == pairs), "every cell has the same count of pairs, at least 3");
+    assert!(
+        pairs >= 3 && cells.iter().all(|c| c.len() == pairs),
+        "every cell has the same count of pairs, at least 3"
+    );
     // (p-value, geometric mean ratio) per cell.
     let tested: Vec<(f64, f64)> = cells
         .iter()
         .map(|c| {
             let mu = mean_log_ratio(c);
-            let d: Vec<f64> = c.iter().map(|&(old, new)| (new as f64).ln() - (old as f64).ln()).collect();
+            let d: Vec<f64> =
+                c.iter().map(|&(old, new)| (new as f64).ln() - (old as f64).ln()).collect();
             let n = d.len() as f64;
             let var = d.iter().map(|x| (x - mu) * (x - mu)).sum::<f64>() / (n - 1.0);
             let p = if var == 0.0 {
@@ -149,7 +157,8 @@ pub fn discoveries(cells: &[Vec<(u128, u128)>], q_permille: u64, margin_permille
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&a, &b| tested[a].0.total_cmp(&tested[b].0));
     let q = q_permille as f64 / 1000.0;
-    let passed = (1..=m).rev().find(|&k| tested[order[k - 1]].0 <= q * k as f64 / m as f64).unwrap_or(0);
+    let passed =
+        (1..=m).rev().find(|&k| tested[order[k - 1]].0 <= q * k as f64 / m as f64).unwrap_or(0);
     let mut verdicts = vec![Verdict::Level; m];
     let margin = margin_permille as f64 / 1000.0;
     for &i in &order[..passed] {
@@ -160,7 +169,11 @@ pub fn discoveries(cells: &[Vec<(u128, u128)>], q_permille: u64, margin_permille
             verdicts[i] = Verdict::Faster;
         }
     }
-    verdicts.into_iter().zip(cells).map(|(verdict, c)| Judgment { verdict, ratio_permille: geometric_mean_permille(c) }).collect()
+    verdicts
+        .into_iter()
+        .zip(cells)
+        .map(|(verdict, c)| Judgment { verdict, ratio_permille: geometric_mean_permille(c) })
+        .collect()
 }
 
 /// Student's t two-sided p-value: P(|T| >= |t|) with `df` degrees of
@@ -178,7 +191,8 @@ fn incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
     if x >= 1.0 {
         return 1.0;
     }
-    let front = (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+    let front =
+        (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
     if x < (a + 1.0) / (a + b + 2.0) {
         front * beta_fraction(a, b, x) / a
     } else {
@@ -196,7 +210,10 @@ fn beta_fraction(a: f64, b: f64, x: f64) -> f64 {
     for m in 1..300 {
         let m = m as f64;
         let m2 = 2.0 * m;
-        for aa in [m * (b - m) * x / ((qam + m2) * (a + m2)), -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))] {
+        for aa in [
+            m * (b - m) * x / ((qam + m2) * (a + m2)),
+            -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2)),
+        ] {
             d = 1.0 + aa * d;
             d = 1.0 / if d.abs() < tiny { tiny } else { d };
             c = 1.0 + aa / c;
@@ -224,7 +241,8 @@ fn ln_gamma(x: f64) -> f64 {
         1.505_632_735_149_311_6e-7,
     ];
     if x < 0.5 {
-        return (core::f64::consts::PI / (core::f64::consts::PI * x).sin()).ln() - ln_gamma(1.0 - x);
+        return (core::f64::consts::PI / (core::f64::consts::PI * x).sin()).ln()
+            - ln_gamma(1.0 - x);
     }
     let x = x - 1.0;
     let mut a = G[0];
@@ -295,7 +313,9 @@ mod tests {
     /// 0.01; t = 0, p = 1.
     #[test]
     fn t_p_values_match_the_tables() {
-        for (t, df, p) in [(2.776, 4.0, 0.05), (2.228, 10.0, 0.05), (3.169, 10.0, 0.01), (0.0, 4.0, 1.0)] {
+        for (t, df, p) in
+            [(2.776, 4.0, 0.05), (2.228, 10.0, 0.05), (3.169, 10.0, 0.01), (0.0, 4.0, 1.0)]
+        {
             assert!((t_two_sided(t, df) - p).abs() < 2e-4, "t {t} df {df}: {}", t_two_sided(t, df));
         }
     }
@@ -306,15 +326,26 @@ mod tests {
     /// still found among 1000 unchanged ones; at q = 0 nothing is.
     #[test]
     fn discoveries_judge_every_cell_at_once() {
-        let pairs = |ratios: &[u128]| ratios.iter().map(|&r| (1000u128 << 63, r << 63)).collect::<Vec<_>>();
-        let cells = vec![pairs(&[1100, 1102, 1098, 1101, 1099]), pairs(&[1030, 970, 1025, 975, 1000]), pairs(&[990, 991, 989, 990, 990])];
+        let pairs =
+            |ratios: &[u128]| ratios.iter().map(|&r| (1000u128 << 63, r << 63)).collect::<Vec<_>>();
+        let cells = vec![
+            pairs(&[1100, 1102, 1098, 1101, 1099]),
+            pairs(&[1030, 970, 1025, 975, 1000]),
+            pairs(&[990, 991, 989, 990, 990]),
+        ];
         let judged = discoveries(&cells, 50, 30);
-        assert_eq!(judged.iter().map(|j| j.verdict).collect::<Vec<_>>(), [Verdict::Slower, Verdict::Level, Verdict::Level]);
+        assert_eq!(
+            judged.iter().map(|j| j.verdict).collect::<Vec<_>>(),
+            [Verdict::Slower, Verdict::Level, Verdict::Level]
+        );
         // Each judgment carries the ratio judged: the pairs' geometric mean.
         assert_eq!(judged.iter().map(|j| j.ratio_permille).collect::<Vec<_>>(), [1100, 1000, 990]);
         let mut many = vec![pairs(&[1030, 970, 1025, 975, 1000]); 1000];
         many.push(pairs(&[1100, 1102, 1098, 1101, 1099]));
-        assert_eq!(discoveries(&many, 50, 30).iter().filter(|j| j.verdict != Verdict::Level).count(), 1);
+        assert_eq!(
+            discoveries(&many, 50, 30).iter().filter(|j| j.verdict != Verdict::Level).count(),
+            1
+        );
         assert!(discoveries(&many, 0, 30).iter().all(|j| j.verdict == Verdict::Level));
     }
 }

@@ -1,9 +1,13 @@
+use blaze_query::db::{Database as _, EventKind};
 use expect_test::Expect;
 use hir_def::{DefWithBodyId, ModuleDefId};
-use blaze_query::db::{Database as _, EventKind};
 use hir_expand::fixture;
 
-use crate::{InferenceResult, method_resolution::TraitImpls, test_db::{TestDB, TestDBExt as _}};
+use crate::{
+    InferenceResult,
+    method_resolution::TraitImpls,
+    test_db::{TestDB, TestDBExt as _},
+};
 
 use super::visit_module;
 

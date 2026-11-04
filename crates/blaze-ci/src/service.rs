@@ -35,10 +35,10 @@ use std::{
 
 use blaze_api::{Diagnostic, Level, Mismatch, Request, Response, TestOutcome, TestResult, ViewRef};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_vfs::View;
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 use crate::{
     CheckRun, CheckStatus, Checkout, Event, Train,
@@ -118,47 +118,97 @@ pub enum Input {
     /// A delivery whose signature checked.
     Event(Event),
     /// The job's commit is a root on the daemon, held open once; or why not.
-    CheckedOut { job: JobId, result: Result<ContentId, String> },
+    CheckedOut {
+        job: JobId,
+        result: Result<ContentId, String>,
+    },
     /// A response of the request sent for `run`, before its `Done`.
-    Response { job: JobId, run: RunId, response: Response },
+    Response {
+        job: JobId,
+        run: RunId,
+        response: Response,
+    },
     /// The request sent for `run` is over: its `Done`, or `ok` false when the daemon could not
     /// be asked (after a [`Response::Error`] saying why).
-    Ended { job: JobId, run: RunId, ok: bool },
+    Ended {
+        job: JobId,
+        run: RunId,
+        ok: bool,
+    },
     /// GitHub created the check run, with its id; or why not, after retries.
-    Created { run: RunId, result: Result<u64, String> },
+    Created {
+        run: RunId,
+        result: Result<u64, String>,
+    },
     /// A root held open was lost (the daemon restarted without it).
-    Unpinned { root: ContentId, why: String },
+    Unpinned {
+        root: ContentId,
+        why: String,
+    },
     Snapshotted(Result<Kept, String>),
-    Removed { id: String, result: Result<(), String> },
+    Removed {
+        id: String,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(PartialEq, Debug)]
 pub enum Output {
     /// Hold `root` open once more on the pin connection.
-    Pin { root: ContentId },
+    Pin {
+        root: ContentId,
+    },
     /// Let go of one hold of `root`.
-    Unpin { root: ContentId },
+    Unpin {
+        root: ContentId,
+    },
     /// Fetch `fetch`, diff `from`'s commit (the empty tree for `None`) to `commit`, apply the ops
     /// to `from`'s root (`Head("ci/empty")` for `None`) and hold the result open; with `head`,
     /// commit the same ops to that head and check it reached the same root. Answered with
     /// [`Input::CheckedOut`]. The job's worker starts here.
-    Checkout { job: JobId, commit: String, fetch: Vec<String>, from: Option<Checkout>, head: Option<String> },
+    Checkout {
+        job: JobId,
+        commit: String,
+        fetch: Vec<String>,
+        from: Option<Checkout>,
+        head: Option<String>,
+    },
     /// Send `request` for `run`, on the job's own connection.
-    Send { job: JobId, run: RunId, request: Request },
+    Send {
+        job: JobId,
+        run: RunId,
+        request: Request,
+    },
     /// Cancel every request of the job still running; each still ends with [`Input::Ended`].
-    Cancel { job: JobId },
+    Cancel {
+        job: JobId,
+    },
     /// The job's worker has nothing more to do.
-    EndJob { job: JobId },
+    EndJob {
+        job: JobId,
+    },
     /// Create the check run; answered with [`Input::Created`].
-    Create { run: RunId, job: JobId, check: CheckRun },
-    Update { run: RunId, id: u64, check: CheckRun },
+    Create {
+        run: RunId,
+        job: JobId,
+        check: CheckRun,
+    },
+    Update {
+        run: RunId,
+        id: u64,
+        check: CheckRun,
+    },
     /// Write the state file, [`Service::state`]: once for any number of these together.
     Save,
     /// [`Request::Snapshot`], then the snapshot command with `name`; answered with
     /// [`Input::Snapshotted`].
-    Snapshot { name: String },
+    Snapshot {
+        name: String,
+    },
     /// The remove command for `id`; answered with [`Input::Removed`].
-    RemoveSnapshot { id: String },
+    RemoveSnapshot {
+        id: String,
+    },
     /// A line for stderr: an error no check run carries.
     Log(String),
 }
@@ -212,7 +262,11 @@ impl Job {
 enum Work {
     /// The check at `at` in [`Settings::checks`], or in [`Settings::release_checks`] when
     /// `release`.
-    Check { kind: CheckKind, release: bool, at: u32 },
+    Check {
+        kind: CheckKind,
+        release: bool,
+        at: u32,
+    },
     Oracle,
 }
 
@@ -343,7 +397,13 @@ impl Service {
 
     fn tag(&mut self, name: &str, commit: String, out: &mut Vec<Output>) {
         // alloc: once per tag, the job's ref and its kind's name
-        let job = self.new_job(format!("tag/{name}"), commit, JobKind::Tag { name: name.to_owned() }, true, out);
+        let job = self.new_job(
+            format!("tag/{name}"),
+            commit,
+            JobKind::Tag { name: name.to_owned() },
+            true,
+            out,
+        );
         let idle = self.train.running.is_none();
         let replaced = self.train.arrive(name.to_owned()); // alloc: once per tag, the train's
         if idle {
@@ -401,7 +461,16 @@ impl Service {
             out.push(Output::Create { run, job, check: check.clone() });
             let github = GitHubId::Creating;
             let report = Report::default();
-            let run_of = Run { job, check, work, github, unposted: false, pending: false, report, done: false };
+            let run_of = Run {
+                job,
+                check,
+                work,
+                github,
+                unposted: false,
+                pending: false,
+                report,
+                done: false,
+            };
             self.runs.insert(run, run_of);
         }
         self.jobs.insert(
@@ -448,14 +517,19 @@ impl Service {
     /// Once per checkout: the copy goes to the job's worker in [`Output::Checkout`].
     fn from(&self, job: &Job) -> Option<Checkout> {
         // clone: once per checkout
-        let held = |reference: &str| self.state.checkouts.get(reference).map(|it| it.checkout.clone());
+        let held =
+            |reference: &str| self.state.checkouts.get(reference).map(|it| it.checkout.clone());
         if job.kind == (JobKind::Branch { default: true }) {
             // The head `ci/<branch>` is at this ref's checkout; its commit moves from there.
             return held(&job.reference);
         }
         let with_commit = |commit: &str| {
             // clone: once per checkout
-            self.state.checkouts.values().find(|it| it.checkout.commit == commit).map(|it| it.checkout.clone())
+            self.state
+                .checkouts
+                .values()
+                .find(|it| it.checkout.commit == commit)
+                .map(|it| it.checkout.clone())
         };
         if let Some(same) = with_commit(&job.commit) {
             return Some(same);
@@ -488,7 +562,9 @@ impl Service {
         fetch.push(it.commit.clone()); // clone: once per checkout
         let head = match it.kind {
             // alloc: once per checkout
-            JobKind::Branch { default: true } => Some(format!("ci/{}", self.settings.default_branch)),
+            JobKind::Branch { default: true } => {
+                Some(format!("ci/{}", self.settings.default_branch))
+            }
             _ => None,
         };
         let commit = it.commit.clone(); // clone: once per checkout
@@ -509,7 +585,12 @@ impl Service {
         out.push(Output::Checkout { job, commit, fetch, from, head });
     }
 
-    fn checked_out(&mut self, job: JobId, result: Result<ContentId, String>, out: &mut Vec<Output>) {
+    fn checked_out(
+        &mut self,
+        job: JobId,
+        result: Result<ContentId, String>,
+        out: &mut Vec<Output>,
+    ) {
         let Some(it) = self.jobs.get_mut(&job) else { return };
         if it.phase != Phase::CheckingOut {
             return;
@@ -542,7 +623,8 @@ impl Service {
             Err(what) => {
                 if !it.replaced {
                     // alloc: error path
-                    let summary = format!("The checkout of {} failed, so nothing ran: {what}", it.commit);
+                    let summary =
+                        format!("The checkout of {} failed, so nothing ran: {what}", it.commit);
                     for run in it.runs().map(RunId) {
                         // clone: error path
                         self.conclude(run, CheckStatus::Failure, summary.clone(), out);
@@ -603,7 +685,8 @@ impl Service {
             }
             let (request, what) = match it.work {
                 Work::Check { kind, release, at } => {
-                    let checks = if release { &self.settings.release_checks } else { &self.settings.checks };
+                    let checks =
+                        if release { &self.settings.release_checks } else { &self.settings.checks };
                     (checks[at as usize].request(view()), kind_name(kind))
                 }
                 Work::Oracle => (
@@ -637,7 +720,9 @@ impl Service {
     }
 
     fn ended(&mut self, job: JobId, run: RunId, ok: bool, out: &mut Vec<Output>) {
-        let (Some(it), Some(of)) = (self.runs.get_mut(&run), self.jobs.get_mut(&job)) else { return };
+        let (Some(it), Some(of)) = (self.runs.get_mut(&run), self.jobs.get_mut(&job)) else {
+            return;
+        };
         if it.job != job || !it.pending {
             return;
         }
@@ -714,7 +799,13 @@ impl Service {
     }
 
     /// Completes the run, unless it is already.
-    fn conclude(&mut self, run: RunId, status: CheckStatus, summary: String, out: &mut Vec<Output>) {
+    fn conclude(
+        &mut self,
+        run: RunId,
+        status: CheckStatus,
+        summary: String,
+        out: &mut Vec<Output>,
+    ) {
         let Some(it) = self.runs.get_mut(&run) else { return };
         if it.done {
             return;
@@ -987,7 +1078,8 @@ impl Report {
 
     /// The run's summary, written into one string sized for what it lists.
     fn summary(&self, kind: CheckKind, ok: bool) -> String {
-        let lists = self.listed.len() + self.failures.len() + self.said.len() + self.unexpected.len();
+        let lists =
+            self.listed.len() + self.failures.len() + self.said.len() + self.unexpected.len();
         // alloc: once per check-run post, the summary GitHub is sent
         let mut text = String::with_capacity(SUMMARY_ROOM + lists);
         let _ = write!(
@@ -1024,7 +1116,8 @@ impl Report {
             text.push_str("\n\n## Failed tests\n");
             text.push_str(&self.failures);
             if self.failed > self.failures_count {
-                let _ = write!(text, "\nand {} more failed tests\n", self.failed - self.failures_count);
+                let _ =
+                    write!(text, "\nand {} more failed tests\n", self.failed - self.failures_count);
             }
         }
         let mut text = self.with_errors(text);

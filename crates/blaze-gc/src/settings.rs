@@ -54,10 +54,13 @@ impl GcSettings {
         let path = root.join(SETTINGS);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(GcSettings { levels, auto: true }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(GcSettings { levels, auto: true });
+            }
             Err(error) => return Err(format!("reading {}: {error}", path.display())),
         };
-        let set: Settings = serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        let set: Settings = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         // A free level of 100% or more is never met, so every run would be urgent; a share of
         // 0% would ask to free everything blaze holds (review C14).
         let percent = |name: &str, it: Option<u8>, low: u8, high: u8| match it {
@@ -106,7 +109,11 @@ mod tests {
     use super::*;
 
     fn read(text: &str) -> Result<GcSettings, String> {
-        let dir = std::env::temp_dir().join(format!("blaze-gc-settings-{}-{}", std::process::id(), crate::record::now_ns()));
+        let dir = std::env::temp_dir().join(format!(
+            "blaze-gc-settings-{}-{}",
+            std::process::id(),
+            crate::record::now_ns()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(SETTINGS), text).unwrap();
         let read = GcSettings::read(&dir, Levels::default());
@@ -117,7 +124,11 @@ mod tests {
     #[test]
     fn gc_json_refuses_levels_that_cannot_hold_and_reads_auto() {
         assert!(read(r#"{"share_percent": 0}"#).unwrap_err().contains("share_percent is 0"));
-        assert!(read(r#"{"comfortable_percent": 100}"#).unwrap_err().contains("comfortable_percent is 100"));
+        assert!(
+            read(r#"{"comfortable_percent": 100}"#)
+                .unwrap_err()
+                .contains("comfortable_percent is 100")
+        );
         assert!(read(r#"{"floor_percent": 100}"#).is_err());
         assert!(read(r#"{"autos": false}"#).is_err());
         assert!(!read(r#"{"auto": false}"#).unwrap().auto);

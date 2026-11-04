@@ -1,7 +1,7 @@
 use base_db::all_crates;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use hir_expand::fixture;
+use std::alloc::Global;
 
 use super::{MacroReachable, Reached, macro_reach_module};
 use crate::{

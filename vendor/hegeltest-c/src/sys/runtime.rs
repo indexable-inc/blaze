@@ -93,10 +93,7 @@ extern "C" fn _Unwind_Resume() -> ! {
 /// a report rather than unwinding garbage state into the host.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    let mut out = TruncatingBuffer {
-        buf: [0; 512],
-        len: 0,
-    };
+    let mut out = TruncatingBuffer { buf: [0; 512], len: 0 };
     let _ = write!(out, "libhegel internal error (please file a bug): {info}");
     imp::stderr_write(&out.buf[..out.len]);
     imp::stderr_write(b"\n");

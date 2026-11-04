@@ -17,10 +17,14 @@ fn on_code_memory() -> Result<Option<u64>, String> {
     if !blaze_inproc::runtime::hooked() {
         return Ok(None);
     }
-    let attached = blaze_inproc::runtime::attach()
-        .map_err(|error| format!("a dev executable's test process not on the daemon's code memory: {error}"))?;
+    let attached = blaze_inproc::runtime::attach().map_err(|error| {
+        format!("a dev executable's test process not on the daemon's code memory: {error}")
+    })?;
     if std::env::var_os("BLAZE_INPROC").is_some() {
-        return Err("the start hook left `BLAZE_INPROC` in the environment, where the program sees it".to_owned());
+        return Err(
+            "the start hook left `BLAZE_INPROC` in the environment, where the program sees it"
+                .to_owned(),
+        );
     }
     Ok(Some(attached.slide()))
 }

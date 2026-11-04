@@ -396,7 +396,11 @@ impl Diag {
 
     /// Marks this error fatal: rustc stops at it.
     pub fn stop(&mut self) -> &mut Diag {
-        assert!(self.is_error() && !self.is_lint(), "only an error rustc gives is fatal: {:?}", self.message);
+        assert!(
+            self.is_error() && !self.is_lint(),
+            "only an error rustc gives is fatal: {:?}",
+            self.message
+        );
         self.fatal = true;
         self
     }
@@ -455,11 +459,19 @@ impl Diag {
         self.sub(Sublevel::Warning, message, MultiSpan::default(), false)
     }
 
-    pub fn span_note(&mut self, span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diag {
+    pub fn span_note(
+        &mut self,
+        span: impl Into<MultiSpan>,
+        message: impl Into<String>,
+    ) -> &mut Diag {
         self.sub(Sublevel::Note, message, span.into(), false)
     }
 
-    pub fn span_help(&mut self, span: impl Into<MultiSpan>, message: impl Into<String>) -> &mut Diag {
+    pub fn span_help(
+        &mut self,
+        span: impl Into<MultiSpan>,
+        message: impl Into<String>,
+    ) -> &mut Diag {
         self.sub(Sublevel::Help, message, span.into(), false)
     }
 
@@ -598,7 +610,8 @@ impl Diag {
     /// The text of [`Diag::originates_in`]'s note, when a primary span of it or of a child is
     /// in a macro's expansion: the innermost macro, and the outermost when it is another.
     pub fn origin_note(&self) -> Option<String> {
-        let spans = self.span.primary.iter().chain(self.children.iter().flat_map(|it| &it.span.primary));
+        let spans =
+            self.span.primary.iter().chain(self.children.iter().flat_map(|it| &it.span.primary));
         let mut macros = spans.flat_map(Span::macro_backtrace);
         let first = macros.next()?;
         let last = macros.last().unwrap_or(first);
@@ -607,7 +620,11 @@ impl Diag {
         }
         let and_then = match last.name != first.name {
             // alloc: the note of a diagnostic in a macro, the edge
-            true => format!(" which comes from the expansion of the {} `{}`", last.kind.descr(), last.name),
+            true => format!(
+                " which comes from the expansion of the {} `{}`",
+                last.kind.descr(),
+                last.name
+            ),
             false => String::new(), // alloc: empty, allocates nothing
         };
         // alloc: the note of a diagnostic in a macro, the edge
@@ -623,7 +640,10 @@ impl Diag {
     /// suggestion rustfix takes as it is.
     pub fn is_fixable(&self) -> bool {
         !self.suggestions_disabled
-            && self.suggestions.iter().any(|it| it.applicability == Applicability::MachineApplicable)
+            && self
+                .suggestions
+                .iter()
+                .any(|it| it.applicability == Applicability::MachineApplicable)
     }
 }
 
@@ -666,7 +686,12 @@ mod tests {
 
     #[test]
     fn a_lint_with_an_error_code_is_a_lint_that_shows_the_code() {
-        let lint = Diag::lint_with_code("unsafe_op_in_unsafe_fn", "E0133", "call to unsafe function", span(0, 1));
+        let lint = Diag::lint_with_code(
+            "unsafe_op_in_unsafe_fn",
+            "E0133",
+            "call to unsafe function",
+            span(0, 1),
+        );
         assert!(lint.is_lint());
         assert_eq!(lint.lint_name(), Some("unsafe_op_in_unsafe_fn"));
         assert_eq!(lint.code.as_ref().map(Code::as_str), Some("E0133"));
@@ -678,7 +703,10 @@ mod tests {
     #[test]
     fn a_diagnostic_round_trips_in_json() {
         let mut diag = Diag::lint("unused_variables", "unused variable: `x`", span(8, 9));
-        diag.fact(Fact::Code(blaze_items::ItemKey(blaze_ids::ContentId([1; 32]))), "the code of `f`");
+        diag.fact(
+            Fact::Code(blaze_items::ItemKey(blaze_ids::ContentId([1; 32]))),
+            "the code of `f`",
+        );
         let text = serde_json::to_string(&diag).unwrap();
         let back: Diag = serde_json::from_str(&text).unwrap();
         assert_eq!(back, diag);

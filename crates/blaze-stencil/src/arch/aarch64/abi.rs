@@ -36,10 +36,9 @@ pub(super) enum Place {
 /// Windows' (`windows_fastcall`, AArch64 Windows triples' default) is AAPCS64 to Cranelift.
 pub(super) fn check(conv: CallConv) -> Result<(), Error> {
     match conv {
-        CallConv::SystemV
-        | CallConv::AppleAarch64
-        | CallConv::WindowsFastcall
-        | CallConv::Tail => Ok(()),
+        CallConv::SystemV | CallConv::AppleAarch64 | CallConv::WindowsFastcall | CallConv::Tail => {
+            Ok(())
+        }
         // alloc: the error's message, once, as the function fails to compile.
         other => Err(Error::new(format!(
             "the {other} calling convention on AArch64: the glue passes values in `system_v`, \

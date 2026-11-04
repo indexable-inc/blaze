@@ -224,7 +224,10 @@ fn run_random(seed: u64) -> Vec<(u32, Promote)> {
                 let was_flying = tiering.in_flight(function);
                 tiering.observe(function, seen, &mut out);
                 for promote in &out {
-                    assert!(!was_flying, "seed {seed} step {step}: a second recompile of {function}");
+                    assert!(
+                        !was_flying,
+                        "seed {seed} step {step}: a second recompile of {function}"
+                    );
                     assert!(promote.to > before[function as usize]);
                     assert!(promote.to <= policy.highest);
                     assert!(seen.weighted(policy.back_edge_weight) >= policy.threshold(promote.to));
@@ -264,7 +267,11 @@ fn run_random(seed: u64) -> Vec<(u32, Promote)> {
         flying_functions.sort_unstable();
         let before_dedup = flying_functions.len();
         flying_functions.dedup();
-        assert_eq!(flying_functions.len(), before_dedup, "two recompiles of one function in flight");
+        assert_eq!(
+            flying_functions.len(),
+            before_dedup,
+            "two recompiles of one function in flight"
+        );
     }
     log
 }
@@ -312,7 +319,8 @@ fn a_warm_round_allocates_nothing() {
     for function in 0..FUNCTIONS {
         bump(&memory, u64::from(function * CELLS), CALLS, 1);
     }
-    let (promotes, used) = blaze_alloc_count::measure(|| driver.round(memory.as_slice()).unwrap().len());
+    let (promotes, used) =
+        blaze_alloc_count::measure(|| driver.round(memory.as_slice()).unwrap().len());
     assert_eq!(promotes, 0, "every function is in flight");
     assert_eq!(used, blaze_alloc_count::Used::default());
 }
@@ -551,7 +559,8 @@ impl Recompile for Arc<Threaded> {
         if function == 3 {
             panic!("function 3's backend fell over");
         }
-        let cells = to.counts().then(|| self.next.fetch_add(1, Ordering::Relaxed) * u64::from(CELLS));
+        let cells =
+            to.counts().then(|| self.next.fetch_add(1, Ordering::Relaxed) * u64::from(CELLS));
         self.slots.lock()[function as usize] = (to, cells);
         Ok(cells)
     }
@@ -563,11 +572,15 @@ fn the_runner_tiers_a_running_program() {
     let daemon = Arc::new(Threaded {
         memory: (0..128).map(|_| AtomicU64::new(0)).collect(),
         next: AtomicU64::new(u64::from(FUNCTIONS)),
-        slots: Mutex::new((0..FUNCTIONS).map(|it| (Tier::Stencil, Some(u64::from(it * CELLS)))).collect()),
+        slots: Mutex::new(
+            (0..FUNCTIONS).map(|it| (Tier::Stencil, Some(u64::from(it * CELLS)))).collect(),
+        ),
         recompiles: Mutex::new(Vec::new()),
     });
     let config = Config { period: Duration::from_millis(1), workers: 2 };
-    let runner = Runner::start(FUNCTIONS, policy(), config, Arc::clone(&daemon.memory), Arc::clone(&daemon)).unwrap();
+    let runner =
+        Runner::start(FUNCTIONS, policy(), config, Arc::clone(&daemon.memory), Arc::clone(&daemon))
+            .unwrap();
     for function in 0..FUNCTIONS {
         runner.bind(function, Some(u64::from(function * CELLS))).unwrap();
     }
@@ -702,7 +715,10 @@ fn looped(end: impl FnOnce(&mut FuncCursor<'_>, [ir::Block; 4], [ir::Value; 4]))
 fn verify(func: &ir::Function) {
     let flags = settings::Flags::new(settings::builder());
     if let Err(errors) = cranelift_codegen::verify_function(func, &flags) {
-        panic!("{}\n{func}", cranelift_codegen::print_errors::pretty_verifier_error(func, None, errors));
+        panic!(
+            "{}\n{func}",
+            cranelift_codegen::print_errors::pretty_verifier_error(func, None, errors)
+        );
     }
 }
 
@@ -712,11 +728,15 @@ fn counted(func: &ir::Function, block: ir::Block) -> Vec<i32> {
     for inst in func.layout.block_insts(block) {
         if let ir::InstructionData::Store { args: [_, at], offset, .. } = func.dfg.insts[inst] {
             let def = func.dfg.value_def(at).inst().unwrap();
-            let ir::InstructionData::UnaryGlobalValue { global_value, .. } = func.dfg.insts[def] else {
+            let ir::InstructionData::UnaryGlobalValue { global_value, .. } = func.dfg.insts[def]
+            else {
                 panic!("a store to something not the cells");
             };
-            let ir::GlobalValueData::Symbol { name: ir::ExternalName::User(name), colocated: true, .. } =
-                func.global_values[global_value]
+            let ir::GlobalValueData::Symbol {
+                name: ir::ExternalName::User(name),
+                colocated: true,
+                ..
+            } = func.global_values[global_value]
             else {
                 panic!("cells that are not a colocated user name");
             };
@@ -757,21 +777,29 @@ fn a_two_way_branch_back_counts_on_its_own_edges() {
         let next = cursor.ins().iadd_imm(i, 1);
         let sum = cursor.ins().iadd(acc, i);
         let odd = cursor.ins().band_imm(i, 1);
-        cursor.ins().brif(odd, header, &[next.into(), sum.into()], header, &[next.into(), acc.into()]);
+        cursor.ins().brif(
+            odd,
+            header,
+            &[next.into(), sum.into()],
+            header,
+            &[next.into(), acc.into()],
+        );
     });
     let blocks: Vec<ir::Block> = func.layout.blocks().collect();
     let (header, body) = (blocks[1], blocks[2]);
     let expected: Vec<Vec<ir::BlockArg>> = {
         let last = func.layout.last_inst(body).unwrap();
-        let dests = func.dfg.insts[last].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        let dests = func.dfg.insts[last]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
         dests.iter().map(|it| it.args(&func.dfg.value_lists).collect()).collect()
     };
     instrument(&mut func).unwrap();
     verify(&func);
     assert!(counted(&func, body).is_empty(), "the branch itself counts nothing");
     let last = func.layout.last_inst(body).unwrap();
-    let dests: Vec<ir::BlockCall> =
-        func.dfg.insts[last].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables).to_vec();
+    let dests: Vec<ir::BlockCall> = func.dfg.insts[last]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        .to_vec();
     let after: Vec<ir::Block> = func.layout.blocks().skip(3).take(2).collect();
     for (k, dest) in dests.iter().enumerate() {
         let edge = dest.block(&func.dfg.value_lists);
@@ -788,7 +816,8 @@ fn a_two_way_branch_back_counts_on_its_own_edges() {
     }
     // The header's exit is forward: not counted, not moved.
     let test = func.layout.last_inst(header).unwrap();
-    let forward = func.dfg.insts[test].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+    let forward =
+        func.dfg.insts[test].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
     assert_eq!(forward[1].block(&func.dfg.value_lists), blocks[3]);
     assert_eq!(all_counted(&func).len(), 3);
 }

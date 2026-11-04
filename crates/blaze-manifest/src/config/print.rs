@@ -11,8 +11,8 @@ use anyhow::{Context as _, bail};
 use cargo_platform::Cfg;
 
 use super::Config;
-use crate::files::Files;
 use super::target::{CompileKind, Flags};
+use crate::files::Files;
 
 impl<F: Files> Config<F> {
     /// The rustc cargo runs, as `GlobalContext::get_tool`: `RUSTC` (against the current

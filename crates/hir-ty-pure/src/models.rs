@@ -13,7 +13,6 @@ use std::fmt::Write as _;
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use either::Either;
 use hir_def::{
     AdtId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, ModuleDefId, ModuleId, TraitId,
@@ -30,6 +29,7 @@ use hir_ty::{
 };
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind;
+use std::alloc::Global;
 
 use crate::{Abs, Effects, Root, allowed_env, safe_relative};
 
@@ -316,7 +316,9 @@ fn join(base: Abs, rel: Abs) -> Abs {
         },
         Abs::Env(_) => rel.as_path().map_or(Abs::Unknown, Abs::Root),
         Abs::Root(Root::OutDir) => Abs::Root(Root::OutDir),
-        Abs::Root(Root::Package) if base.as_path() == Some(Root::Package) => Abs::Root(Root::Package),
+        Abs::Root(Root::Package) if base.as_path() == Some(Root::Package) => {
+            Abs::Root(Root::Package)
+        }
         _ => Abs::Unknown,
     }
 }
@@ -338,7 +340,11 @@ fn path_leaf(paths: &[(Abs, Root, Verb)], effects: Effects) -> Applied {
             _ => return Applied::Refused(refusal(value, want, verb)),
         }
     }
-    if deferred { Applied::Deferred } else { Applied::Done { effects, env: None, ret: Abs::Unknown } }
+    if deferred {
+        Applied::Deferred
+    } else {
+        Applied::Done { effects, env: None, ret: Abs::Unknown }
+    }
 }
 
 /// What a leaf of `verb` does at `value`, which is not under `want`.
@@ -361,7 +367,9 @@ fn refusal(value: Abs, want: Root, verb: Verb) -> String {
         }
         (_, Some(Root::Package)) => write!(said, "{verb} a path in its package, not {wanted}"),
         (_, Some(Root::OutDir)) => write!(said, "{verb} a path in its OUT_DIR, not {wanted}"),
-        (Abs::Env(name), None) => write!(said, "{verb} the path the variable `{}` gives", name.as_str()),
+        (Abs::Env(name), None) => {
+            write!(said, "{verb} the path the variable `{}` gives", name.as_str())
+        }
         _ => write!(said, "{verb} a path not known to be {wanted}"),
     };
     said
@@ -531,10 +539,34 @@ const STD: &[Entry] = &[
     func("std::io::stderr", &["io", "stderr"], PRINT),
     method("std::io::Stdout::lock", &["io", "Stdout"], "lock", PRINT),
     method("std::io::Stderr::lock", &["io", "Stderr"], "lock", PRINT),
-    impls("<std::io::Stdout as Write>", STD_WRITE, SelfTy::Adt(Home::Std, &["io", "Stdout"]), ALL, PRINT),
-    impls("<std::io::StdoutLock as Write>", STD_WRITE, SelfTy::Adt(Home::Std, &["io", "StdoutLock"]), ALL, PRINT),
-    impls("<std::io::Stderr as Write>", STD_WRITE, SelfTy::Adt(Home::Std, &["io", "Stderr"]), ALL, PRINT),
-    impls("<std::io::StderrLock as Write>", STD_WRITE, SelfTy::Adt(Home::Std, &["io", "StderrLock"]), ALL, PRINT),
+    impls(
+        "<std::io::Stdout as Write>",
+        STD_WRITE,
+        SelfTy::Adt(Home::Std, &["io", "Stdout"]),
+        ALL,
+        PRINT,
+    ),
+    impls(
+        "<std::io::StdoutLock as Write>",
+        STD_WRITE,
+        SelfTy::Adt(Home::Std, &["io", "StdoutLock"]),
+        ALL,
+        PRINT,
+    ),
+    impls(
+        "<std::io::Stderr as Write>",
+        STD_WRITE,
+        SelfTy::Adt(Home::Std, &["io", "Stderr"]),
+        ALL,
+        PRINT,
+    ),
+    impls(
+        "<std::io::StderrLock as Write>",
+        STD_WRITE,
+        SelfTy::Adt(Home::Std, &["io", "StderrLock"]),
+        ALL,
+        PRINT,
+    ),
     // The guard inside `StdoutLock` and `StderrLock`: their drop glue releases it.
     impls(
         "<std::sync::ReentrantLockGuard as Drop>",
@@ -558,12 +590,30 @@ const STD: &[Entry] = &[
     impls("<std::fs::File as Write>", STD_WRITE, FILE, ALL, HANDLE),
     impls("<std::fs::File as Seek>", STD_SEEK, FILE, ALL, HANDLE),
     on(Only::Unix, impls("<std::os::fd::OwnedFd as Drop>", DROP, OWNED_FD, ALL, HANDLE)),
-    on(Only::Windows, impls("<std::os::windows::io::OwnedHandle as Drop>", DROP, OWNED_HANDLE, ALL, HANDLE)),
+    on(
+        Only::Windows,
+        impls("<std::os::windows::io::OwnedHandle as Drop>", DROP, OWNED_HANDLE, ALL, HANDLE),
+    ),
     on(
         Only::Unix,
-        impls("<std::os::fd::OwnedFd as FromRawFd>", (Home::Std, &["os", "fd", "FromRawFd"]), OWNED_FD, ALL, RAW),
+        impls(
+            "<std::os::fd::OwnedFd as FromRawFd>",
+            (Home::Std, &["os", "fd", "FromRawFd"]),
+            OWNED_FD,
+            ALL,
+            RAW,
+        ),
     ),
-    on(Only::Unix, impls("<std::fs::File as FromRawFd>", (Home::Std, &["os", "fd", "FromRawFd"]), FILE, ALL, RAW)),
+    on(
+        Only::Unix,
+        impls(
+            "<std::fs::File as FromRawFd>",
+            (Home::Std, &["os", "fd", "FromRawFd"]),
+            FILE,
+            ALL,
+            RAW,
+        ),
+    ),
     on(
         Only::Windows,
         impls(
@@ -646,7 +696,11 @@ const ALLOC: &[Entry] = &[
         ALLOC_LEAF,
     ),
     // std's default handler prints and aborts: the run fails.
-    func("alloc::alloc::__rust_alloc_error_handler", &["alloc", "__rust_alloc_error_handler"], PANIC),
+    func(
+        "alloc::alloc::__rust_alloc_error_handler",
+        &["alloc", "__rust_alloc_error_handler"],
+        PANIC,
+    ),
     method("alloc::string::String::as_str", &["string", "String"], "as_str", SAME),
     impls("<String as From>", FROM, STRING, &["from"], SAME),
     impls("<String as AsRef>", AS_REF, STRING, &["as_ref"], SAME),
@@ -671,7 +725,11 @@ const CORE: &[Entry] = &[
     func("core::panicking::panic_nounwind_fmt", &["panicking", "panic_nounwind_fmt"], PANIC),
     func("core::panicking::panic", &["panicking", "panic"], PANIC),
     func("core::panicking::panic_nounwind", &["panicking", "panic_nounwind"], PANIC),
-    func("core::panicking::panic_nounwind_nobacktrace", &["panicking", "panic_nounwind_nobacktrace"], PANIC),
+    func(
+        "core::panicking::panic_nounwind_nobacktrace",
+        &["panicking", "panic_nounwind_nobacktrace"],
+        PANIC,
+    ),
     func("core::panicking::unreachable_display", &["panicking", "unreachable_display"], PANIC),
     func("core::panicking::panic_str_2015", &["panicking", "panic_str_2015"], PANIC),
     func("core::panicking::panic_display", &["panicking", "panic_display"], PANIC),
@@ -703,31 +761,127 @@ const CORE: &[Entry] = &[
     func("core::panicking::assert_matches_failed", &["panicking", "assert_matches_failed"], PANIC),
     func("core::panicking::assert_failed_inner", &["panicking", "assert_failed_inner"], PANIC),
     func("core::panicking::panic_default_msg", &["panicking", "panic_default_msg"], PANIC),
-    func("core::panicking::unreachable_default_msg", &["panicking", "unreachable_default_msg"], PANIC),
-    func("core::panicking::unimplemented_default_msg", &["panicking", "unimplemented_default_msg"], PANIC),
+    func(
+        "core::panicking::unreachable_default_msg",
+        &["panicking", "unreachable_default_msg"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::unimplemented_default_msg",
+        &["panicking", "unimplemented_default_msg"],
+        PANIC,
+    ),
     func("core::panicking::todo_default_msg", &["panicking", "todo_default_msg"], PANIC),
-    func("core::panicking::panic_const::panic_const_add_overflow", &["panicking", "panic_const", "panic_const_add_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_sub_overflow", &["panicking", "panic_const", "panic_const_sub_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_mul_overflow", &["panicking", "panic_const", "panic_const_mul_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_div_overflow", &["panicking", "panic_const", "panic_const_div_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_rem_overflow", &["panicking", "panic_const", "panic_const_rem_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_neg_overflow", &["panicking", "panic_const", "panic_const_neg_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_shr_overflow", &["panicking", "panic_const", "panic_const_shr_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_shl_overflow", &["panicking", "panic_const", "panic_const_shl_overflow"], PANIC),
-    func("core::panicking::panic_const::panic_const_div_by_zero", &["panicking", "panic_const", "panic_const_div_by_zero"], PANIC),
-    func("core::panicking::panic_const::panic_const_rem_by_zero", &["panicking", "panic_const", "panic_const_rem_by_zero"], PANIC),
-    func("core::panicking::panic_const::panic_const_coroutine_resumed", &["panicking", "panic_const", "panic_const_coroutine_resumed"], PANIC),
-    func("core::panicking::panic_const::panic_const_async_fn_resumed", &["panicking", "panic_const", "panic_const_async_fn_resumed"], PANIC),
-    func("core::panicking::panic_const::panic_const_async_gen_fn_resumed", &["panicking", "panic_const", "panic_const_async_gen_fn_resumed"], PANIC),
-    func("core::panicking::panic_const::panic_const_gen_fn_none", &["panicking", "panic_const", "panic_const_gen_fn_none"], PANIC),
-    func("core::panicking::panic_const::panic_const_coroutine_resumed_panic", &["panicking", "panic_const", "panic_const_coroutine_resumed_panic"], PANIC),
-    func("core::panicking::panic_const::panic_const_async_fn_resumed_panic", &["panicking", "panic_const", "panic_const_async_fn_resumed_panic"], PANIC),
-    func("core::panicking::panic_const::panic_const_async_gen_fn_resumed_panic", &["panicking", "panic_const", "panic_const_async_gen_fn_resumed_panic"], PANIC),
-    func("core::panicking::panic_const::panic_const_gen_fn_none_panic", &["panicking", "panic_const", "panic_const_gen_fn_none_panic"], PANIC),
-    func("core::panicking::panic_const::panic_const_coroutine_resumed_drop", &["panicking", "panic_const", "panic_const_coroutine_resumed_drop"], PANIC),
-    func("core::panicking::panic_const::panic_const_async_fn_resumed_drop", &["panicking", "panic_const", "panic_const_async_fn_resumed_drop"], PANIC),
-    func("core::panicking::panic_const::panic_const_async_gen_fn_resumed_drop", &["panicking", "panic_const", "panic_const_async_gen_fn_resumed_drop"], PANIC),
-    func("core::panicking::panic_const::panic_const_gen_fn_none_drop", &["panicking", "panic_const", "panic_const_gen_fn_none_drop"], PANIC),
+    func(
+        "core::panicking::panic_const::panic_const_add_overflow",
+        &["panicking", "panic_const", "panic_const_add_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_sub_overflow",
+        &["panicking", "panic_const", "panic_const_sub_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_mul_overflow",
+        &["panicking", "panic_const", "panic_const_mul_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_div_overflow",
+        &["panicking", "panic_const", "panic_const_div_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_rem_overflow",
+        &["panicking", "panic_const", "panic_const_rem_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_neg_overflow",
+        &["panicking", "panic_const", "panic_const_neg_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_shr_overflow",
+        &["panicking", "panic_const", "panic_const_shr_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_shl_overflow",
+        &["panicking", "panic_const", "panic_const_shl_overflow"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_div_by_zero",
+        &["panicking", "panic_const", "panic_const_div_by_zero"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_rem_by_zero",
+        &["panicking", "panic_const", "panic_const_rem_by_zero"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_coroutine_resumed",
+        &["panicking", "panic_const", "panic_const_coroutine_resumed"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_async_fn_resumed",
+        &["panicking", "panic_const", "panic_const_async_fn_resumed"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_async_gen_fn_resumed",
+        &["panicking", "panic_const", "panic_const_async_gen_fn_resumed"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_gen_fn_none",
+        &["panicking", "panic_const", "panic_const_gen_fn_none"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_coroutine_resumed_panic",
+        &["panicking", "panic_const", "panic_const_coroutine_resumed_panic"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_async_fn_resumed_panic",
+        &["panicking", "panic_const", "panic_const_async_fn_resumed_panic"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_async_gen_fn_resumed_panic",
+        &["panicking", "panic_const", "panic_const_async_gen_fn_resumed_panic"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_gen_fn_none_panic",
+        &["panicking", "panic_const", "panic_const_gen_fn_none_panic"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_coroutine_resumed_drop",
+        &["panicking", "panic_const", "panic_const_coroutine_resumed_drop"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_async_fn_resumed_drop",
+        &["panicking", "panic_const", "panic_const_async_fn_resumed_drop"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_async_gen_fn_resumed_drop",
+        &["panicking", "panic_const", "panic_const_async_gen_fn_resumed_drop"],
+        PANIC,
+    ),
+    func(
+        "core::panicking::panic_const::panic_const_gen_fn_none_drop",
+        &["panicking", "panic_const", "panic_const_gen_fn_none_drop"],
+        PANIC,
+    ),
     method("core::result::Result::unwrap", &["result", "Result"], "unwrap", SAME),
     method("core::result::Result::expect", &["result", "Result"], "expect", SAME),
     method("core::option::Option::unwrap", &["option", "Option"], "unwrap", SAME),
@@ -837,7 +991,8 @@ impl<'db> Resolver<'db> {
                     SelfTy::RawPtr => Want::RawPtr,
                 };
                 // alloc: setup, once per toolchain crate's table entry
-                let names: smallvec::SmallVec<[Symbol; 2]> = names.iter().map(|it| Symbol::intern(it)).collect();
+                let names: smallvec::SmallVec<[Symbol; 2]> =
+                    names.iter().map(|it| Symbol::intern(it)).collect();
                 TraitImpls::for_crate(db, self.krate).for_trait(trait_, |impls| {
                     let Either::Left(impls) = impls else { return };
                     for &imp in impls {
@@ -864,7 +1019,8 @@ impl<'db> Resolver<'db> {
                 }
             }
             Site::ForeignIn { func, name } => {
-                let Some(ModuleDefId::FunctionId(owner)) = self.item(self.krate, func, false) else {
+                let Some(ModuleDefId::FunctionId(owner)) = self.item(self.krate, func, false)
+                else {
                     return;
                 };
                 let name = Symbol::intern(name);
@@ -872,7 +1028,10 @@ impl<'db> Resolver<'db> {
                     for (_, module) in block.modules(db) {
                         for def in module.scope(db).declarations() {
                             if let ModuleDefId::FunctionId(it) = def
-                                && matches!(it.lookup(db).container, ItemContainerId::ExternBlockId(_))
+                                && matches!(
+                                    it.lookup(db).container,
+                                    ItemContainerId::ExternBlockId(_)
+                                )
                                 && *FunctionSignature::of(db, it).name.symbol() == name
                             {
                                 found.push(it);
@@ -948,7 +1107,12 @@ fn self_ty_is(db: &Db, imp: ImplId, want: Want) -> bool {
 }
 
 /// The methods of `imp` named in `names` (every one when it is empty), into `found`.
-fn methods(db: &Db, imp: ImplId, names: &[Symbol], found: &mut smallvec::SmallVec<[FunctionId; 16]>) {
+fn methods(
+    db: &Db,
+    imp: ImplId,
+    names: &[Symbol],
+    found: &mut smallvec::SmallVec<[FunctionId; 16]>,
+) {
     for (name, item) in imp.impl_items(db).items.iter() {
         if let hir_def::AssocItemId::FunctionId(func) = *item
             && (names.is_empty() || names.contains(name.symbol()))

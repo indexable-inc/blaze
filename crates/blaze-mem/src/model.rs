@@ -138,14 +138,16 @@ fn model_a_pop_sees_what_its_pusher_wrote() {
         let stack = Arc::new(Stack::new());
         let payload = Arc::new(AtomicU32::new(0));
         let pusher = {
-            let (stack, links, payload) = (Arc::clone(&stack), Arc::clone(&links), Arc::clone(&payload));
+            let (stack, links, payload) =
+                (Arc::clone(&stack), Arc::clone(&links), Arc::clone(&payload));
             thread::spawn(move || {
                 payload.store(7, crate::sync::atomic::Ordering::Relaxed);
                 stack.push(0, &*links);
             })
         };
         let popper = {
-            let (stack, links, payload) = (Arc::clone(&stack), Arc::clone(&links), Arc::clone(&payload));
+            let (stack, links, payload) =
+                (Arc::clone(&stack), Arc::clone(&links), Arc::clone(&payload));
             thread::spawn(move || {
                 stack.pop(&*links).map(|_| payload.load(crate::sync::atomic::Ordering::Relaxed))
             })

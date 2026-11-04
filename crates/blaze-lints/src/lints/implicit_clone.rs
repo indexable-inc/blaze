@@ -124,7 +124,8 @@ pub(super) fn of_trait(cx: &Cx<'_, '_>, function: hir::Function, path: &[&str]) 
 /// clippy's `is_diag_item_method`: `function` is of an inherent impl of the type at `path`.
 pub(super) fn inherent_of(cx: &Cx<'_, '_>, function: hir::Function, path: &[&str]) -> bool {
     let db = cx.db();
-    let Some(AssocItemContainer::Impl(impl_)) = function.as_assoc_item(db).map(|it| it.container(db))
+    let Some(AssocItemContainer::Impl(impl_)) =
+        function.as_assoc_item(db).map(|it| it.container(db))
     else {
         return false;
     };

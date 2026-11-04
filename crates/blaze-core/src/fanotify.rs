@@ -32,8 +32,8 @@ use std::{
 };
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{RegionVec, Tag as MemTag};
+use std::alloc::Global;
 
 use crate::{
     Done, FileName,
@@ -170,7 +170,8 @@ impl<V: Copy> Dirs<V> {
     }
 
     fn name_of(&self, entry: &Entry<V>) -> &str {
-        std::str::from_utf8(&self.strings.bytes(entry.span)[entry.key as usize..]).expect("pushed as a str")
+        std::str::from_utf8(&self.strings.bytes(entry.span)[entry.key as usize..])
+            .expect("pushed as a str")
     }
 
     fn find(&self, key: &[u8]) -> Option<u32> {
@@ -305,7 +306,12 @@ impl Room {
 
 impl Fanotify {
     /// Watches `dir` under `root` and everything under it, into `room`'s tables.
-    pub(crate) fn new(root: &Path, dir: &FileName, nonblocking: bool, room: Option<Room>) -> io::Result<Fanotify> {
+    pub(crate) fn new(
+        root: &Path,
+        dir: &FileName,
+        nonblocking: bool,
+        room: Option<Room>,
+    ) -> io::Result<Fanotify> {
         let flags = CLASS_NOTIF
             | CLOEXEC
             | REPORT_DIR_FID
@@ -337,7 +343,8 @@ impl Fanotify {
             None => Room::new()?,
         };
         // alloc: the error of a watch that failed.
-        canonical(root, &mut room.root).map_err(|error| named(&error, &format!("resolving {}", root.display())))?;
+        canonical(root, &mut room.root)
+            .map_err(|error| named(&error, &format!("resolving {}", root.display())))?;
         room.dir.clear();
         room.dir.push_str(dir.as_str());
         let mut watch = Fanotify { fd, room };
@@ -390,7 +397,10 @@ impl Fanotify {
             if !valid(&rel) || (kind == Kind::Above && !is_under(&rel, &self.room.dir)) {
                 return;
             }
-            if mask & ONDIR != 0 && mask & (CREATE | MOVED_TO) != 0 && self.learn(&rel, false, true).is_err() {
+            if mask & ONDIR != 0
+                && mask & (CREATE | MOVED_TO) != 0
+                && self.learn(&rel, false, true).is_err()
+            {
                 lost = true;
             }
             self.room.batch.push(&rel);
@@ -449,15 +459,24 @@ impl Fanotify {
     /// Where the directory of `handle` (whose [`Key`] is `key`) is now, its name relative to the
     /// root written to `rel`: outside the root, or a directory gone that was never under the
     /// watched one, is [`Kind::Outside`]. An error where it cannot be said.
-    fn resolve(&mut self, fsid: &[u8], key: &[u8], kind: i32, handle: &[u8], rel: &mut String) -> io::Result<Kind> {
+    fn resolve(
+        &mut self,
+        fsid: &[u8],
+        key: &[u8],
+        kind: i32,
+        handle: &[u8],
+        rel: &mut String,
+    ) -> io::Result<Kind> {
         let Room { root, dir, mounts, known, link, .. } = &mut self.room;
         let Some(mount) = mounts.iter().find(|it| it.fsid[..] == *fsid) else {
             return Ok(Kind::Outside);
         };
-        let found = open_by_handle(mount.fd.as_raw_fd(), kind, handle).and_then(|fd| path_of(&fd, link));
+        let found =
+            open_by_handle(mount.fd.as_raw_fd(), kind, handle).and_then(|fd| path_of(&fd, link));
         match found {
             Ok(len) => {
-                let Ok(under) = Path::new(OsStr::from_bytes(&link[..len])).strip_prefix(&*root) else {
+                let Ok(under) = Path::new(OsStr::from_bytes(&link[..len])).strip_prefix(&*root)
+                else {
                     known.remove(key);
                     return Ok(Kind::Outside);
                 };
@@ -503,7 +522,8 @@ fn learn_one(
     };
     let raw = opened.as_raw_fd();
     // alloc: the error of a watch that failed.
-    let fsid = fsid(raw).map_err(|error| named(&error, &format!("statfs of {}", path.to_string_lossy())))?;
+    let fsid = fsid(raw)
+        .map_err(|error| named(&error, &format!("statfs of {}", path.to_string_lossy())))?;
     let handle = handle_of(raw).map_err(|error| match error.raw_os_error() {
         Some(libc::EOPNOTSUPP) => io::Error::new(
             io::ErrorKind::Unsupported,
@@ -548,7 +568,9 @@ fn learn_one(
         // Opening a handle needs CAP_DAC_READ_SEARCH, which marking did not.
         open_by_handle(raw, handle.kind, handle.bytes())
             // alloc: the error of a watch that failed.
-            .map_err(|error| keep_eperm(error, &format!("open_by_handle_at in {}", path.to_string_lossy())))?;
+            .map_err(|error| {
+                keep_eperm(error, &format!("open_by_handle_at in {}", path.to_string_lossy()))
+            })?;
         // The mount keeps this descriptor; the walk lists the directory through one of its own.
         mounts.push(Mount { fsid, fd: listed.take().expect("opened above") });
     }
@@ -597,7 +619,8 @@ fn parse<'a>(bytes: &'a [u8], mut each: impl FnMut(u64, Record<'a>)) -> bool {
         let len = u32_at(bytes, at) as usize;
         let metadata_len = u16_at(bytes, at + 6) as usize;
         let mask = u64_at(bytes, at + 8);
-        if len < METADATA || metadata_len < METADATA || metadata_len > len || at + len > bytes.len() {
+        if len < METADATA || metadata_len < METADATA || metadata_len > len || at + len > bytes.len()
+        {
             return true;
         }
         let event = &bytes[at..at + len];
@@ -860,11 +883,23 @@ mod tests {
             vec![
                 (
                     CREATE,
-                    Record { fsid: &fsid, key: file.bytes(), kind: 1, handle: &[9; 8], name: b"lib.rs" }
+                    Record {
+                        fsid: &fsid,
+                        key: file.bytes(),
+                        kind: 1,
+                        handle: &[9; 8],
+                        name: b"lib.rs"
+                    }
                 ),
                 (
                     DELETE | ONDIR,
-                    Record { fsid: &fsid, key: dir.bytes(), kind: 1, handle: &[7; 12], name: b"sub" }
+                    Record {
+                        fsid: &fsid,
+                        key: dir.bytes(),
+                        kind: 1,
+                        handle: &[7; 12],
+                        name: b"sub"
+                    }
                 ),
             ]
         );
@@ -906,7 +941,10 @@ mod tests {
                     }
                 }
                 assert_eq!(ours.len(), theirs.len());
-                assert_eq!(ours.get(key.bytes()), theirs.get(key.bytes()).map(|(at, name)| (*at, name.as_str())));
+                assert_eq!(
+                    ours.get(key.bytes()),
+                    theirs.get(key.bytes()).map(|(at, name)| (*at, name.as_str()))
+                );
             }
             for (key, (at, name)) in &theirs {
                 assert_eq!(ours.get(key), Some((*at, name.as_str())));
@@ -954,7 +992,10 @@ mod tests {
         let names: Vec<&str> = files.iter().map(FileName::as_str).collect();
         assert_eq!(names, ["src", "src/a/moved", "src/a/x.rs"]);
         assert_eq!(watch.room.seen.len(), 1);
-        assert_eq!(watch.room.seen.get(Key::of(&fsid, 1, &under).bytes()), Some((Kind::Outside, "")));
+        assert_eq!(
+            watch.room.seen.get(Key::of(&fsid, 1, &under).bytes()),
+            Some((Kind::Outside, ""))
+        );
         drop(watch);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -988,7 +1029,9 @@ mod tests {
             let mut watch = match Fanotify::new(&root, &src, true, room.take()) {
                 Ok(it) => it,
                 Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                    eprintln!("skipped: fanotify needs CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH: {error}");
+                    eprintln!(
+                        "skipped: fanotify needs CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH: {error}"
+                    );
                     return;
                 }
                 Err(error) => panic!("{error}"),
@@ -1006,7 +1049,8 @@ mod tests {
                 // SAFETY: one pollfd of an open descriptor.
                 unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) };
                 // SAFETY: the buffer has room for what is read.
-                let n = unsafe { libc::read(watch.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
+                let n =
+                    unsafe { libc::read(watch.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
                 if n > 0 {
                     let Done::Changed { files, .. } = watch.take(&buffer[..n as usize]) else {
                         unreachable!()

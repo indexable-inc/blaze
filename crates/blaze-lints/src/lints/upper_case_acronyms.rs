@@ -16,7 +16,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Item<'t>) {
     if !cx.on(LINT)
         || !matches!(
             item,
-            ast::Item::Struct(_) | ast::Item::Trait(_) | ast::Item::TypeAlias(_) | ast::Item::Enum(_)
+            ast::Item::Struct(_)
+                | ast::Item::Trait(_)
+                | ast::Item::TypeAlias(_)
+                | ast::Item::Enum(_)
         )
     {
         return;

@@ -100,6 +100,8 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
     /// Whether `pattern` binds anything by `ref mut`, which makes a deref pattern around it
     /// call `DerefMut::deref_mut` (rustc's `deref_pat_borrow_mode`).
     fn has_ref_mut_binding(&self, pattern: PatId) -> bool {
-        hir_ty::utils::pat_has_ref_mut_binding(self.store, pattern, |pat| self.infer.binding_mode(pat))
+        hir_ty::utils::pat_has_ref_mut_binding(self.store, pattern, |pat| {
+            self.infer.binding_mode(pat)
+        })
     }
 }

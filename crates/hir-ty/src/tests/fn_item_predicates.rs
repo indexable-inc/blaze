@@ -132,10 +132,12 @@ fn a_method_path_predicate_resolves_the_adaptors_methods() {
                 _ => None,
             }));
             for imp in scope.impls() {
-                funcs.extend(imp.impl_items(&db).items.iter().filter_map(|&(_, item)| match item {
-                    AssocItemId::FunctionId(it) => Some(it),
-                    _ => None,
-                }));
+                funcs.extend(imp.impl_items(&db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        AssocItemId::FunctionId(it) => Some(it),
+                        _ => None,
+                    },
+                ));
             }
         }
         let mut failed = String::new();
@@ -203,8 +205,14 @@ fn a_fn_item_with_a_reference_to_dyn_fn_parameter_meets_fn_of_every_lifetime() {
             for def in module.scope(&db).declarations() {
                 let ModuleDefId::FunctionId(func) = def else { continue };
                 let name = FunctionSignature::of(&db, func).name.as_str().to_owned();
-                let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)));
-                if !infer.diagnostics().is_empty() || infer.has_type_mismatches() || infer.is_erroneous() {
+                let infer = InferenceResult::of(
+                    &db,
+                    InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)),
+                );
+                if !infer.diagnostics().is_empty()
+                    || infer.has_type_mismatches()
+                    || infer.is_erroneous()
+                {
                     failed.push_str(&format!("`{name}`: diagnostics {:?}\n", infer.diagnostics()));
                 }
                 checked.push(name);
@@ -277,10 +285,12 @@ fn a_fn_item_with_an_associated_type_parameter_meets_fn_of_every_lifetime() {
                 _ => None,
             }));
             for imp in scope.impls() {
-                funcs.extend(imp.impl_items(&db).items.iter().filter_map(|&(_, item)| match item {
-                    AssocItemId::FunctionId(it) => Some(it),
-                    _ => None,
-                }));
+                funcs.extend(imp.impl_items(&db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        AssocItemId::FunctionId(it) => Some(it),
+                        _ => None,
+                    },
+                ));
             }
         }
         let mut failed = String::new();
@@ -289,7 +299,10 @@ fn a_fn_item_with_an_associated_type_parameter_meets_fn_of_every_lifetime() {
             let name = FunctionSignature::of(&db, func).name.as_str().to_owned();
             let def = DefWithBodyId::FunctionId(func);
             let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
-            if !infer.diagnostics().is_empty() || infer.has_type_mismatches() || infer.is_erroneous() {
+            if !infer.diagnostics().is_empty()
+                || infer.has_type_mismatches()
+                || infer.is_erroneous()
+            {
                 failed.push_str(&format!("`{name}`: diagnostics {:?}\n", infer.diagnostics()));
             }
             checked.push(name);

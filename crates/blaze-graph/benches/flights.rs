@@ -93,11 +93,13 @@ fn best(flights: &Arc<Flights<u64>>, threads: u64, layout: Layout) -> Duration {
 fn pairs_round(flights: &Arc<Flights<u64>>, threads: u64) -> Duration {
     let start = Arc::new(Barrier::new(threads as usize + 1)); // alloc: once a round
     // alloc: each pair's turn, once a round
-    let began: Arc<Vec<AtomicU64>> = Arc::new((0..threads / 2).map(|_| AtomicU64::new(u64::MAX)).collect());
+    let began: Arc<Vec<AtomicU64>> =
+        Arc::new((0..threads / 2).map(|_| AtomicU64::new(u64::MAX)).collect());
     // alloc: a bench's threads, once a round
     let joins: Vec<_> = (0..threads)
         .map(|t| {
-            let (flights, start, began) = (Arc::clone(flights), Arc::clone(&start), Arc::clone(&began));
+            let (flights, start, began) =
+                (Arc::clone(flights), Arc::clone(&start), Arc::clone(&began));
             thread::spawn(move || {
                 let (pair, me) = (t / 2, t % 2);
                 start.wait();
@@ -144,14 +146,18 @@ fn main() {
         "threads  {SPREAD:>3} shards        one shard         one key           pairs             one shard/{SPREAD}"
     );
     for threads in counts {
-        let [spread, one_shard, one_key] = [Layout::Spread, Layout::OneShard, Layout::OneKey].map(|it| best(&flights, threads, it));
+        let [spread, one_shard, one_key] = [Layout::Spread, Layout::OneShard, Layout::OneKey]
+            .map(|it| best(&flights, threads, it));
         let ns = |it: Duration| it.as_nanos() as f64 / OPS as f64;
         let cell = |it: Duration| {
             let mops = (threads * OPS) as f64 / it.as_secs_f64() / 1e6;
             format!("{:>7.1} ({:>6.2})", ns(it), mops) // alloc: a cell of the table
         };
         let pairs = if threads % 2 == 0 {
-            let it = (0..ROUNDS).map(|_| pairs_round(&flights, threads)).min().expect("at least one round");
+            let it = (0..ROUNDS)
+                .map(|_| pairs_round(&flights, threads))
+                .min()
+                .expect("at least one round");
             let ns = it.as_nanos() as f64 / PAIR_OPS as f64;
             let mops = (threads * PAIR_OPS) as f64 / it.as_secs_f64() / 1e6;
             format!("{ns:>7.1} ({mops:>6.2})") // alloc: a cell of the table

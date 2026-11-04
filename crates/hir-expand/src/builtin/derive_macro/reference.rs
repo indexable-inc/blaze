@@ -4,9 +4,9 @@
 //! through handles.
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use itertools::izip;
 use span::Span;
+use std::alloc::Global;
 use stdx::never;
 use syntax_bridge::DocCommentDesugarMode;
 use tracing::debug;
@@ -932,13 +932,13 @@ pub(super) fn hash_expand(
                 |(pat, names)| {
                     let expr = {
                         let it = names.iter().map(|it| {
-                            let bound = bound_of_self(it);
-                            if adt.packed {
-                                quote! {span => #krate::hash::Hash::hash(&#bound, ra_expand_state); }
-                            } else {
-                                quote! {span => #krate::hash::Hash::hash(#bound, ra_expand_state); }
-                            }
-                        });
+                        let bound = bound_of_self(it);
+                        if adt.packed {
+                            quote! {span => #krate::hash::Hash::hash(&#bound, ra_expand_state); }
+                        } else {
+                            quote! {span => #krate::hash::Hash::hash(#bound, ra_expand_state); }
+                        }
+                    });
                         quote! {span => {
                             # #it
                         } }
@@ -1212,7 +1212,8 @@ pub(super) fn partial_ord_expand(
                     for f in fields.into_iter().rev() {
                         let t1 = tt::Ident::new(&format!("{}_self", f.sym), f.span);
                         let t2 = tt::Ident::new(&format!("{}_other", f.sym), f.span);
-                        body = compare(krate, &quote!(span =>#t1), &quote!(span =>#t2), &body, span);
+                        body =
+                            compare(krate, &quote!(span =>#t1), &quote!(span =>#t2), &body, span);
                     }
                     (pat1, pat2, body)
                 },
@@ -1311,8 +1312,7 @@ pub(super) mod handle {
             Some(field) => quote_into!(b, span => Self { #field : value }),
             None => quote_into!(b, span => Self ( value )),
         });
-        let trait_path =
-            group(span, |b| quote_into!(b, span => #krate::convert::From<#field_ty>));
+        let trait_path = group(span, |b| quote_into!(b, span => #krate::convert::From<#field_ty>));
         let no_extra_params = group(span, |_| {});
         ExpandResult::ok(write_derive(frame, span, |b| {
             write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| {

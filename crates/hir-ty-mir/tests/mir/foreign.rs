@@ -8,12 +8,12 @@ use std::{cell::RefCell, rc::Rc};
 
 use base_db::{ConstEvalBudget, Db};
 use hir_def::FunctionId;
+use hir_expand::fixture;
 use hir_ty::next_solver::GenericArgs;
 use hir_ty_mir::mir::{
     Evaluator, MirEvalError,
     foreign::{Claimed, Foreign},
 };
-use hir_expand::fixture;
 
 use crate::{db::TestDB, function};
 

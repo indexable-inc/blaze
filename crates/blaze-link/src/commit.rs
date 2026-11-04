@@ -110,7 +110,11 @@ impl Image {
     /// generation.
     pub(crate) fn can_commit(&self, staged: &Staged) -> Result<(), LinkError> {
         if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into(), refusal: None });
+            return Err(LinkError {
+                function: None,
+                what: "a commit is in flight".into(),
+                refusal: None,
+            });
         }
         if staged.base != self.state.generation {
             return Err(LinkError {
@@ -143,14 +147,24 @@ impl Image {
     /// The writes that give back the file before the last commit, and the message saying so.
     pub(crate) fn roll_back_writes(&self) -> Result<Writes, LinkError> {
         if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into(), refusal: None });
+            return Err(LinkError {
+                function: None,
+                what: "a commit is in flight".into(),
+                refusal: None,
+            });
         }
         let Some(undo) = self.history.back() else {
-            return Err(LinkError { function: None, what: "no commit to roll back".into(), refusal: None });
+            return Err(LinkError {
+                function: None,
+                what: "no commit to roll back".into(),
+                refusal: None,
+            });
         };
         let to = undo.state.generation;
-        let message =
-            self.output.live.map(|_| blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode());
+        let message = self
+            .output
+            .live
+            .map(|_| blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode());
         Ok(Writes {
             full: undo.full,
             len: undo.len,
@@ -162,7 +176,8 @@ impl Image {
 
     /// Makes the history's last state the image's: what a failed file rollback puts back.
     pub(crate) fn take_undo(&mut self) -> Revert {
-        let Undo { state, full, len, writes } = self.history.pop_back().expect("a rollback's writes were made of it");
+        let Undo { state, full, len, writes } =
+            self.history.pop_back().expect("a rollback's writes were made of it");
         let current = std::mem::replace(&mut self.state, state);
         Revert::Push { state: current, full, len, writes }
     }
@@ -171,9 +186,17 @@ impl Image {
     /// leave it: a full write's file starts as zeros, so the gaps between its writes, and what
     /// the last file had past it, are zeroed; a shorter file zeroes what it no longer has.
     /// Each range written is published. Nothing is written when the file doesn't fit.
-    pub(crate) fn write_into(&self, writes: &Writes, memory: &mut CodeMemory) -> Result<(), LinkError> {
+    pub(crate) fn write_into(
+        &self,
+        writes: &Writes,
+        memory: &mut CodeMemory,
+    ) -> Result<(), LinkError> {
         let image = memory.image_len();
-        let end = writes.writes.iter().map(|(at, bytes)| at + bytes.len() as u64).fold(writes.len, u64::max);
+        let end = writes
+            .writes
+            .iter()
+            .map(|(at, bytes)| at + bytes.len() as u64)
+            .fold(writes.len, u64::max);
         if end.max(writes.old_len) > image {
             return Err(LinkError {
                 function: None,
@@ -189,7 +212,11 @@ impl Image {
         }
         let to = &self.to;
         // alloc: error path
-        let fail = |error: blaze_inproc::Error| LinkError { function: None, what: format!("writing {to} into its code memory: {error}"), refusal: None };
+        let fail = |error: blaze_inproc::Error| LinkError {
+            function: None,
+            what: format!("writing {to} into its code memory: {error}"),
+            refusal: None,
+        };
         let zero = |memory: &mut CodeMemory, offset: u64, len: u64| -> Result<(), LinkError> {
             if len == 0 {
                 return Ok(());
@@ -243,12 +270,19 @@ impl Image {
         } else {
             steps.step([Effect::Clone { from: owned(to), to: owned(next), tag: tags.next() }]);
             if writes.len != writes.old_len {
-                steps.step([Effect::Truncate { file: owned(next), len: writes.len, tag: tags.next() }]);
+                steps.step([Effect::Truncate {
+                    file: owned(next),
+                    len: writes.len,
+                    tag: tags.next(),
+                }]);
             }
         }
-        steps.step(
-            writes.writes.into_iter().map(|(at, bytes)| Effect::WriteAt { file: owned(next), at, bytes, tag: tags.next() }),
-        );
+        steps.step(writes.writes.into_iter().map(|(at, bytes)| Effect::WriteAt {
+            file: owned(next),
+            at,
+            bytes,
+            tag: tags.next(),
+        }));
         steps.step([Effect::Sync { file: owned(next), tag: tags.next() }]);
         steps.step([Effect::Mode { file: owned(next), mode: 0o755, tag: tags.next() }]);
         steps.step([Effect::Rename { from: owned(next), to: owned(to), tag: tags.next() }]);
@@ -309,7 +343,11 @@ impl Image {
     /// Takes the completion of one of the image's effects ([`Image::owns`]); asks for the
     /// next step's effects. When the commit or rollback is over, its result: the
     /// generation the image is at, or why it failed (the image is then as it was before).
-    pub fn complete(&mut self, completion: &Completion, effects: &mut Vec<Effect>) -> Option<Result<u64, LinkError>> {
+    pub fn complete(
+        &mut self,
+        completion: &Completion,
+        effects: &mut Vec<Effect>,
+    ) -> Option<Result<u64, LinkError>> {
         let at = self.in_flight(completion.tag)?;
         let pending = self.pending.as_mut().expect("in flight");
         pending.done.insert(at);
@@ -321,7 +359,10 @@ impl Image {
                     format!("writing {}: {why}", self.to)
                 } else {
                     // alloc: error path
-                    format!("{} is renamed into place, but an effect after the rename failed: {why}", self.to)
+                    format!(
+                        "{} is renamed into place, but an effect after the rename failed: {why}",
+                        self.to
+                    )
                 };
                 pending.failed.get_or_insert(LinkError { function: None, what, refusal: None });
             }

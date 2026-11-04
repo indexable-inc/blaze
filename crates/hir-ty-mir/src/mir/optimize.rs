@@ -74,11 +74,7 @@ type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
     match level {
         MirOptLevel::Off => &[],
-        MirOptLevel::Debug => &[
-            "ForceInline",
-            "RemoveZsts",
-            "UnreachableEnumBranching",
-        ],
+        MirOptLevel::Debug => &["ForceInline", "RemoveZsts", "UnreachableEnumBranching"],
         MirOptLevel::Release => &[
             "ForceInline",
             "RemoveZsts",
@@ -354,8 +350,7 @@ fn validate(body: &MirBody<'_>, frame: &Frame) -> std::result::Result<(), String
             }
             continue;
         };
-        if let Some(target) =
-            terminator.kind.all_successors().find(|it| block_index(*it) >= blocks)
+        if let Some(target) = terminator.kind.all_successors().find(|it| block_index(*it) >= blocks)
         {
             // alloc: error path
             return Err(format!(

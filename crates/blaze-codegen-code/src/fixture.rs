@@ -95,7 +95,9 @@ impl Workspace {
 
     /// `identity` of its program.
     pub fn code_of(&self, identity: &Identity) -> [u8; 32] {
-        work_out_of(&self.read().expect("the fixture's workspace"), identity, &env()).expect("the fixture's identity").code
+        work_out_of(&self.read().expect("the fixture's workspace"), identity, &env())
+            .expect("the fixture's identity")
+            .code
     }
 }
 
@@ -131,13 +133,17 @@ pub fn lock(checksum: &str, llvm: bool) -> String {
 fn lock_of(checksum: &str, llvm: bool, solver: bool) -> String {
     let local = |name: &str, deps: &[&str]| {
         let deps: String = deps.iter().map(|it| format!(" \"{it}\",\n")).collect();
-        let deps = if deps.is_empty() { String::new() } else { format!("dependencies = [\n{deps}]\n") };
+        let deps =
+            if deps.is_empty() { String::new() } else { format!("dependencies = [\n{deps}]\n") };
         format!("[[package]]\nname = \"{name}\"\nversion = \"0.1.0\"\n{deps}\n")
     };
     let registry_with = |name: &str, checksum: &str, deps: &[&str]| {
         let deps: String = deps.iter().map(|it| format!(" \"{it}\",\n")).collect();
-        let deps = if deps.is_empty() { String::new() } else { format!("dependencies = [\n{deps}]\n") };
-        format!("[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"{REGISTRY}\"\nchecksum = \"{checksum}\"\n{deps}\n")
+        let deps =
+            if deps.is_empty() { String::new() } else { format!("dependencies = [\n{deps}]\n") };
+        format!(
+            "[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"{REGISTRY}\"\nchecksum = \"{checksum}\"\n{deps}\n"
+        )
     };
     let registry = |name: &str, checksum: &str| registry_with(name, checksum, &[]);
     let codegen: &[&str] = if llvm {
@@ -195,7 +201,8 @@ pub const STENCILS_JSON: &str = r#"{
 "#;
 
 /// A source file of the fixture's vendored trait solver ([`Workspace::with_solver`]) and its text.
-pub const SOLVER_SOURCE: (&str, &str) = ("vendor/rustc_next_trait_solver/src/lib.rs", "pub fn solve() {}\n");
+pub const SOLVER_SOURCE: (&str, &str) =
+    ("vendor/rustc_next_trait_solver/src/lib.rs", "pub fn solve() {}\n");
 
 /// The front end's code identity ([`crate::FRONT_END`]) of a workspace with the vendored trait
 /// solver ([`Workspace::with_solver`]), before and after an edit of the solver's source
@@ -214,7 +221,10 @@ fn files(checksum: &str, llvm: bool, solver: bool) -> Vec<(&'static str, String)
     let llvm_sys = if llvm { "llvm-sys = { path = \"../llvm-sys\" }\n" } else { "" };
     let stencil = if llvm { "blaze-stencil = { path = \"../blaze-stencil\" }\n" } else { "" };
     let mut files = vec![
-        ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/excluded\"]\n".to_owned()),
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/excluded\"]\n".to_owned(),
+        ),
         ("Cargo.lock", lock_of(checksum, llvm, solver)),
         ("harness/toolchain", "nightly-2026-11-01\n".to_owned()),
         (
@@ -239,7 +249,11 @@ fn files(checksum: &str, llvm: bool, solver: bool) -> Vec<(&'static str, String)
             "crates/hir-def/Cargo.toml",
             manifest(
                 "hir-def",
-                if solver { "[dependencies]\nrustc_next_trait_solver = { path = \"../../vendor/rustc_next_trait_solver\" }\n" } else { "" },
+                if solver {
+                    "[dependencies]\nrustc_next_trait_solver = { path = \"../../vendor/rustc_next_trait_solver\" }\n"
+                } else {
+                    ""
+                },
             ),
         ),
         (
@@ -264,7 +278,10 @@ fn files(checksum: &str, llvm: bool, solver: bool) -> Vec<(&'static str, String)
         ("library/proc_macro/src/bridge/mod.rs", "pub mod client;\n".to_owned()),
         ("library/proc_macro/src/bridge/client.rs", "pub fn run() {}\n".to_owned()),
         // No member (the workspace's are `crates/*`): a package of the checkout only `cli` names.
-        (OUTSIDE_MANIFEST, manifest("outside", "[dependencies]\nhir-def = { path = \"../../crates/hir-def\" }\n")),
+        (
+            OUTSIDE_MANIFEST,
+            manifest("outside", "[dependencies]\nhir-def = { path = \"../../crates/hir-def\" }\n"),
+        ),
         ("vendor/outside/src/lib.rs", "pub fn outside() {}\n".to_owned()),
         ("crates/hir-def/src/lib.rs", "pub fn resolve() {}\n".to_owned()),
         ("crates/front/src/lib.rs", "pub fn lower() {}\n".to_owned()),
@@ -290,11 +307,23 @@ fn files(checksum: &str, llvm: bool, solver: bool) -> Vec<(&'static str, String)
         ("crates/excluded/Cargo.toml", "this is no TOML\n".to_owned()),
     ];
     if solver {
-        files.push(("vendor/rustc_next_trait_solver/Cargo.toml", manifest("rustc_next_trait_solver", "")));
+        files.push((
+            "vendor/rustc_next_trait_solver/Cargo.toml",
+            manifest("rustc_next_trait_solver", ""),
+        ));
         files.push((SOLVER_SOURCE.0, SOLVER_SOURCE.1.to_owned()));
-        files.push(("vendor/rustc_next_trait_solver/PATCHES.md", "# Patches\n\n0001-one.patch\n".to_owned()));
-        files.push(("vendor/rustc_next_trait_solver/patches/0001-one.patch", "--- a\n+++ b\n".to_owned()));
-        files.push(("vendor/rustc_next_trait_solver/tests/it.rs", "#[test] fn it() {}\n".to_owned()));
+        files.push((
+            "vendor/rustc_next_trait_solver/PATCHES.md",
+            "# Patches\n\n0001-one.patch\n".to_owned(),
+        ));
+        files.push((
+            "vendor/rustc_next_trait_solver/patches/0001-one.patch",
+            "--- a\n+++ b\n".to_owned(),
+        ));
+        files.push((
+            "vendor/rustc_next_trait_solver/tests/it.rs",
+            "#[test] fn it() {}\n".to_owned(),
+        ));
     }
     if llvm {
         files.push(("crates/llvm-sys/Cargo.toml", manifest("llvm-sys", "")));
@@ -302,7 +331,10 @@ fn files(checksum: &str, llvm: bool, solver: bool) -> Vec<(&'static str, String)
         files.push(("crates/hir-ty-codegen/llvm.json", LLVM_JSON.to_owned()));
         files.push((
             "crates/blaze-stencil/Cargo.toml",
-            manifest("blaze-stencil", "[build-dependencies]\nllvm-sys = { path = \"../llvm-sys\" }\n"),
+            manifest(
+                "blaze-stencil",
+                "[build-dependencies]\nllvm-sys = { path = \"../llvm-sys\" }\n",
+            ),
         ));
         files.push(("crates/blaze-stencil/src/lib.rs", "pub fn patch() {}\n".to_owned()));
         files.push(("crates/blaze-stencil/stencils.json", STENCILS_JSON.to_owned()));
@@ -328,12 +360,17 @@ fn made_at(root: &Path, reversed: bool, checksum: &str, llvm: bool, solver: bool
 
 /// A release build's environment, with a variable that is no input.
 pub fn env() -> BuildEnv {
-    let env: BTreeMap<String, String> =
-        [("TARGET", "aarch64-apple-darwin"), ("HOST", "aarch64-apple-darwin"), ("PROFILE", "release"), ("HOME", "/somewhere")]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect();
+    let env: BTreeMap<String, String> = [
+        ("TARGET", "aarch64-apple-darwin"),
+        ("HOST", "aarch64-apple-darwin"),
+        ("PROFILE", "release"),
+        ("HOME", "/somewhere"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
     let mut env = BuildEnv::of(&env);
-    env.compiler = Some("rustc 1.101.0-nightly (0000000 2026-11-01)\nhost: aarch64-apple-darwin\n".to_owned());
+    env.compiler =
+        Some("rustc 1.101.0-nightly (0000000 2026-11-01)\nhost: aarch64-apple-darwin\n".to_owned());
     env
 }

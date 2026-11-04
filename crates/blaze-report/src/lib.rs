@@ -369,7 +369,10 @@ pub enum Span {
     /// where the terminal has them.
     Path(String),
     /// A package: its name, bold, and its version, dim; `None` for a workspace member's.
-    Package { name: String, version: Option<String> },
+    Package {
+        name: String,
+        version: Option<String>,
+    },
     Version(String),
     /// A content hash or commit, whole: shown as its first 8 characters.
     Hash(String),

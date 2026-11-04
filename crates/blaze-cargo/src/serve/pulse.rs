@@ -69,7 +69,11 @@ pub struct LoopWatch {
 #[cfg(all(unix, feature = "native"))]
 impl LoopWatch {
     pub fn new(report: Duration) -> LoopWatch {
-        LoopWatch { report_ns: u64::try_from(report.as_nanos()).unwrap_or(u64::MAX), seen: None, said: false }
+        LoopWatch {
+            report_ns: u64::try_from(report.as_nanos()).unwrap_or(u64::MAX),
+            seen: None,
+            said: false,
+        }
     }
 
     /// One look: `now_ns` on a monotonic clock, `turns` the loop's count ([`Pulse::turns`]).
@@ -104,7 +108,18 @@ mod tests {
     #[test]
     fn a_turn_past_its_bound_is_reported_once_and_again_after_the_loop_turned() {
         let mut watch = LoopWatch::new(Duration::from_secs(60));
-        let looks = [(0, 5), (S, 6), (2 * S, 7), (30 * S, 7), (61 * S, 7), (62 * S, 7), (500 * S, 7), (501 * S, 8), (502 * S, 8), (600 * S, 8)];
+        let looks = [
+            (0, 5),
+            (S, 6),
+            (2 * S, 7),
+            (30 * S, 7),
+            (61 * S, 7),
+            (62 * S, 7),
+            (500 * S, 7),
+            (501 * S, 8),
+            (502 * S, 8),
+            (600 * S, 8),
+        ];
         let said: Vec<Look> = looks.iter().map(|&(now, turns)| watch.look(now, turns)).collect();
         assert_eq!(
             said,

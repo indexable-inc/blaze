@@ -32,14 +32,19 @@ pub(crate) fn run(workload: Workload) -> f64 {
         Workload::FirstDifference => {
             let mut rng = Rng::new(0x5eed);
             // alloc: the bench's inputs, made once a run before the timer starts.
-            let a: Vec<u8> = (0..OUTPUT_BYTES / 8).flat_map(|_| rng.next_u64().to_le_bytes()).collect();
+            let a: Vec<u8> =
+                (0..OUTPUT_BYTES / 8).flat_map(|_| rng.next_u64().to_le_bytes()).collect();
             // clone: as above.
             let mut b = a.clone();
             *b.last_mut().expect("the output is not empty") ^= 1;
             let began = Instant::now();
             let found = bytes::first_difference_across_cores(&a, &b);
             let ms = began.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(found, Some(OUTPUT_BYTES - 1), "the bench's outputs differ in their last byte");
+            assert_eq!(
+                found,
+                Some(OUTPUT_BYTES - 1),
+                "the bench's outputs differ in their last byte"
+            );
             ms
         }
         Workload::Join => {
@@ -74,7 +79,8 @@ fn nushell_sized() -> Trace {
     keys.dedup();
     let n = keys.len();
     // alloc: as above.
-    let fingerprints: Vec<Fingerprint> = (0..n).map(|_| Fingerprint(u128::from(rng.next_u64()))).collect();
+    let fingerprints: Vec<Fingerprint> =
+        (0..n).map(|_| Fingerprint(u128::from(rng.next_u64()))).collect();
     let mut has = BitSet::<u32>::new(n);
     let mut ran = BitSet::<u32>::new(n);
     for i in 0..n as u32 {

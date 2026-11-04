@@ -98,7 +98,9 @@ pub(crate) fn sections(
         match address_size {
             4 => out.extend_from_slice(
                 // alloc: error path
-                &u32::try_from(value).map_err(|_| format!("the address {value:#x} past 32 bits"))?.to_le_bytes(),
+                &u32::try_from(value)
+                    .map_err(|_| format!("the address {value:#x} past 32 bits"))?
+                    .to_le_bytes(),
             ),
             8 => out.extend_from_slice(&value.to_le_bytes()),
             // alloc: error path
@@ -126,7 +128,11 @@ pub(crate) fn sections(
         let mut subprograms = || -> Result<(Vec<u8>, Vec<u8>), String> {
             // alloc: once per piece, at most its functions' subprograms' size
             let mut info = Vec::with_capacity(chunk.len() * (1 + 4 + asz + 10));
-            let bytes: usize = chunk.iter().filter_map(|at| functions[*at as usize].name).map(|it| it.len() + 1).sum();
+            let bytes: usize = chunk
+                .iter()
+                .filter_map(|at| functions[*at as usize].name)
+                .map(|it| it.len() + 1)
+                .sum();
             // alloc: once per piece, its names' exact size
             let mut strings = Vec::with_capacity(bytes);
             for at in chunk {
@@ -135,10 +141,13 @@ pub(crate) fn sections(
                     Some(name) => {
                         if name.contains('\0') {
                             // alloc: error path
-                            return Err(format!("the function name {name:?}, which DWARF can't hold"));
+                            return Err(format!(
+                                "the function name {name:?}, which DWARF can't hold"
+                            ));
                         }
                         info.push(NAMED);
-                        let offset = u32::try_from(string_at).map_err(|_| "debug strings past 4 GiB")?;
+                        let offset =
+                            u32::try_from(string_at).map_err(|_| "debug strings past 4 GiB")?;
                         info.extend_from_slice(&offset.to_le_bytes());
                         strings.extend_from_slice(name.as_bytes());
                         strings.push(0);
@@ -154,7 +163,8 @@ pub(crate) fn sections(
         (subprograms(), sequences(chunk, functions, rows, files.len(), address_size, &addr))
     };
     // alloc: once per link, one result per piece
-    let pieces: Vec<_> = par::map(par::zip(&chunks, &string_at), |(&chunk, &at)| piece((chunk, at)));
+    let pieces: Vec<_> =
+        par::map(par::zip(&chunks, &string_at), |(&chunk, &at)| piece((chunk, at)));
     // alloc: once per link, the unit's header
     let mut head = Vec::with_capacity(11 + 32 + asz);
     head.extend_from_slice(&[0; 4]);
@@ -177,8 +187,11 @@ pub(crate) fn sections(
     addr(&mut head, low)?;
     uleb(&mut head, high);
     // alloc: once per link, one buffer per piece of each section
-    let (mut infos, mut strings, mut lines) =
-        (Vec::with_capacity(pieces.len()), Vec::with_capacity(pieces.len()), Vec::with_capacity(pieces.len()));
+    let (mut infos, mut strings, mut lines) = (
+        Vec::with_capacity(pieces.len()),
+        Vec::with_capacity(pieces.len()),
+        Vec::with_capacity(pieces.len()),
+    );
     for (subprograms, sequences) in pieces {
         let (info, names) = subprograms?;
         infos.push(info);
@@ -214,7 +227,8 @@ pub(crate) fn sections(
         line.extend_from_slice(&[0, 0, 0, 0]);
     }
     line.push(0);
-    let header_len = u32::try_from(line.len() - header).map_err(|_| "a line program header past 4 GiB")?;
+    let header_len =
+        u32::try_from(line.len() - header).map_err(|_| "a line program header past 4 GiB")?;
     line[6..10].copy_from_slice(&header_len.to_le_bytes());
     // alloc: once per link, one buffer per piece
     let lines: Vec<Vec<u8>> = lines.into_iter().collect::<Result<_, _>>()?;
@@ -247,12 +261,26 @@ pub(crate) fn sections(
         0,
     ]);
     abbrev.extend_from_slice(&[NAMED, DW_TAG_SUBPROGRAM, 0]);
-    abbrev.extend_from_slice(&[DW_AT_LINKAGE_NAME, DW_FORM_STRP, DW_AT_LOW_PC, DW_FORM_ADDR, DW_AT_HIGH_PC, DW_FORM_UDATA, 0, 0]);
+    abbrev.extend_from_slice(&[
+        DW_AT_LINKAGE_NAME,
+        DW_FORM_STRP,
+        DW_AT_LOW_PC,
+        DW_FORM_ADDR,
+        DW_AT_HIGH_PC,
+        DW_FORM_UDATA,
+        0,
+        0,
+    ]);
     abbrev.extend_from_slice(&[UNNAMED, DW_TAG_SUBPROGRAM, 0]);
     abbrev.extend_from_slice(&[DW_AT_LOW_PC, DW_FORM_ADDR, DW_AT_HIGH_PC, DW_FORM_UDATA, 0, 0]);
     abbrev.push(0);
 
-    Ok([(".debug_abbrev", abbrev), (".debug_info", info), (".debug_line", line), (".debug_str", strings)])
+    Ok([
+        (".debug_abbrev", abbrev),
+        (".debug_info", info),
+        (".debug_line", line),
+        (".debug_str", strings),
+    ])
 }
 
 /// The line sequences of `chunk`'s functions (indexes into `functions`, in address order), one
@@ -267,7 +295,8 @@ fn sequences(
     addr: &impl Fn(&mut Vec<u8>, u64) -> Result<(), String>,
 ) -> Result<Vec<u8>, String> {
     let asz = usize::from(address_size);
-    let count: usize = (chunk.iter()).map(|at| &functions[*at as usize].lines).map(|it| it.len()).sum();
+    let count: usize =
+        (chunk.iter()).map(|at| &functions[*at as usize].lines).map(|it| it.len()).sum();
     // alloc: once per piece, sized from its row and function counts
     let mut line = Vec::with_capacity(4 * count + chunk.len() * (3 + asz + 14));
     for at in chunk {
@@ -339,17 +368,23 @@ fn sequences(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gimli::{EndianSlice, LittleEndian};
     use blaze_ids::rng::SplitMix64;
+    use gimli::{EndianSlice, LittleEndian};
 
     type Seen = Vec<(u64, Option<u64>, u64, u64)>;
 
     /// Reads the sections back with gimli: every row (address, line, file, column), and each
     /// subprogram's name and range.
-    fn read(sections: &[(&'static str, Vec<u8>)], address_size: u8) -> (Seen, Vec<(Option<String>, u64, u64)>) {
-        let get = |name: &str| sections.iter().find(|it| it.0 == name).map_or(&[][..], |it| &it.1[..]);
-        let dwarf = gimli::Dwarf::load(|id| -> Result<_, ()> { Ok(EndianSlice::new(get(id.name()), LittleEndian)) })
-            .unwrap();
+    fn read(
+        sections: &[(&'static str, Vec<u8>)],
+        address_size: u8,
+    ) -> (Seen, Vec<(Option<String>, u64, u64)>) {
+        let get =
+            |name: &str| sections.iter().find(|it| it.0 == name).map_or(&[][..], |it| &it.1[..]);
+        let dwarf = gimli::Dwarf::load(|id| -> Result<_, ()> {
+            Ok(EndianSlice::new(get(id.name()), LittleEndian))
+        })
+        .unwrap();
         let mut units = dwarf.units();
         let header = units.next().unwrap().unwrap();
         assert_eq!(header.address_size(), address_size);
@@ -379,7 +414,8 @@ mod tests {
                 Some(gimli::AttributeValue::Addr(it)) => it,
                 other => panic!("low pc {other:?}"),
             };
-            let size = entry.attr_value(gimli::DW_AT_high_pc).and_then(|it| it.udata_value()).unwrap();
+            let size =
+                entry.attr_value(gimli::DW_AT_high_pc).and_then(|it| it.udata_value()).unwrap();
             subprograms.push((name, low, size));
         }
         (seen, subprograms)
@@ -393,13 +429,24 @@ mod tests {
             Row { at: 0, file: 1, line: 9, column: 2 },
         ];
         let functions = [
-            DebugFunction { addr: 0x2000, size: 0x20, name: Some("_RNvCs1_4main4main"), lines: 0..2 },
+            DebugFunction {
+                addr: 0x2000,
+                size: 0x20,
+                name: Some("_RNvCs1_4main4main"),
+                lines: 0..2,
+            },
             DebugFunction { addr: 0x1000, size: 0x8, name: None, lines: 2..3 },
         ];
         let sections = sections(&functions, &rows, &["src/main.rs", "src/lib.rs"], 8).unwrap();
         let (seen, subprograms) = read(&sections, 8);
-        assert_eq!(seen, [(0x1000, Some(9), 2, 2), (0x2000, Some(3), 1, 1), (0x2010, Some(4), 1, 5)]);
-        assert_eq!(subprograms, [(None, 0x1000, 0x8), (Some("_RNvCs1_4main4main".to_owned()), 0x2000, 0x20)]);
+        assert_eq!(
+            seen,
+            [(0x1000, Some(9), 2, 2), (0x2000, Some(3), 1, 1), (0x2010, Some(4), 1, 5)]
+        );
+        assert_eq!(
+            subprograms,
+            [(None, 0x1000, 0x8), (Some("_RNvCs1_4main4main".to_owned()), 0x2000, 0x20)]
+        );
     }
 
     /// Line jumps and address advances past one special opcode's reach, repeated rows at one
@@ -412,10 +459,20 @@ mod tests {
         for n in 0..200u32 {
             let line = if n % 7 == 0 { 1000 + n * 50 } else { 1000 + n };
             rows.push(Row { at, file: n % 3, line, column: n % 4 });
-            want.push((0x40_0000 + u64::from(at), Some(u64::from(line)), u64::from(n % 3) + 1, u64::from(n % 4)));
+            want.push((
+                0x40_0000 + u64::from(at),
+                Some(u64::from(line)),
+                u64::from(n % 3) + 1,
+                u64::from(n % 4),
+            ));
             at += [0, 1, 17, 300, 5][n as usize % 5];
         }
-        let functions = [DebugFunction { addr: 0x40_0000, size: u64::from(at) + 4, name: Some("f"), lines: 0..200 }];
+        let functions = [DebugFunction {
+            addr: 0x40_0000,
+            size: u64::from(at) + 4,
+            name: Some("f"),
+            lines: 0..200,
+        }];
         let sections = sections(&functions, &rows, &["a.rs", "b.rs", "c.rs"], 4).unwrap();
         let (seen, _) = read(&sections, 4);
         assert_eq!(seen, want);
@@ -444,14 +501,20 @@ mod tests {
             let mut rng = SplitMix64::new(0x6477_6172_66 ^ seed);
             let count = [1, 7, CHUNK - 1, CHUNK, 3 * CHUNK + 17, 5 * CHUNK][seed as usize];
             // alloc: test inputs
-            let names: Vec<String> = (0..count).map(|nth| format!("_RNvCs{nth}_1f{}", "x".repeat(nth % 9))).collect();
+            let names: Vec<String> =
+                (0..count).map(|nth| format!("_RNvCs{nth}_1f{}", "x".repeat(nth % 9))).collect();
             let (mut rows, mut functions, mut addr) = (Vec::new(), Vec::new(), 0x1000u64);
             for nth in 0..count {
                 let size = 4 + 4 * rng.below(400);
                 let start = rows.len() as u32;
                 let (mut at, mut line) = (0u64, 1 + rng.below(5000) as u32);
                 while !rng.one_in(6) && at < size {
-                    rows.push(Row { at: at as u32, file: rng.below(3) as u32, line, column: rng.below(80) as u32 });
+                    rows.push(Row {
+                        at: at as u32,
+                        file: rng.below(3) as u32,
+                        line,
+                        column: rng.below(80) as u32,
+                    });
                     at += [0, 1, 4, 17, 300][rng.index(5)];
                     line = line.wrapping_add([0, 1, 3, 40, u32::MAX - 2][rng.index(5)]).max(1);
                 }
@@ -473,10 +536,14 @@ mod tests {
             let mut order: Vec<usize> = (0..count).collect();
             order.sort_by_key(|it| functions[*it].addr);
             let late = order[count - 3];
-            let early = (order.iter().copied()).find(|it| !functions[*it].lines.is_empty()).unwrap();
+            let early =
+                (order.iter().copied()).find(|it| !functions[*it].lines.is_empty()).unwrap();
             let mut bad = rows.clone();
             bad[functions[early].lines.start as usize].file = 9;
-            assert_eq!(sections(&functions, &bad, &files, 8), sections_serial(&functions, &bad, &files, 8));
+            assert_eq!(
+                sections(&functions, &bad, &files, 8),
+                sections_serial(&functions, &bad, &files, 8)
+            );
             assert!(sections(&functions, &bad, &files, 8).is_err());
             let held = "a\0b".to_owned();
             let mut named = std::mem::take(&mut functions);
@@ -507,7 +574,9 @@ mod tests {
             match address_size {
                 4 => out.extend_from_slice(
                     // alloc: error path
-                    &u32::try_from(value).map_err(|_| format!("the address {value:#x} past 32 bits"))?.to_le_bytes(),
+                    &u32::try_from(value)
+                        .map_err(|_| format!("the address {value:#x} past 32 bits"))?
+                        .to_le_bytes(),
                 ),
                 8 => out.extend_from_slice(&value.to_le_bytes()),
                 // alloc: error path
@@ -549,7 +618,8 @@ mod tests {
                         return Err(format!("the function name {name:?}, which DWARF can't hold"));
                     }
                     info.push(NAMED);
-                    let offset = u32::try_from(strings.len()).map_err(|_| "debug strings past 4 GiB")?;
+                    let offset =
+                        u32::try_from(strings.len()).map_err(|_| "debug strings past 4 GiB")?;
                     info.extend_from_slice(&offset.to_le_bytes());
                     strings.extend_from_slice(name.as_bytes());
                     strings.push(0);
@@ -565,7 +635,8 @@ mod tests {
 
         let file_bytes: usize = files.iter().map(|it| it.len() + 4).sum();
         let program = 4 * rows.len() + functions.len() * (3 + asz + 14);
-        let mut line = Vec::with_capacity(10 + 6 + STANDARD_LENGTHS.len() + 2 + file_bytes + program);
+        let mut line =
+            Vec::with_capacity(10 + 6 + STANDARD_LENGTHS.len() + 2 + file_bytes + program);
         line.extend_from_slice(&[0; 4]);
         line.extend_from_slice(&4u16.to_le_bytes());
         line.extend_from_slice(&[0; 4]);
@@ -578,7 +649,8 @@ mod tests {
             line.extend_from_slice(&[0, 0, 0, 0]);
         }
         line.push(0);
-        let header_len = u32::try_from(line.len() - header).map_err(|_| "a line program header past 4 GiB")?;
+        let header_len =
+            u32::try_from(line.len() - header).map_err(|_| "a line program header past 4 GiB")?;
         line[6..10].copy_from_slice(&header_len.to_le_bytes());
         for at in &order {
             let function = &functions[*at as usize];
@@ -619,7 +691,9 @@ mod tests {
                 let delta = i64::from(row.line) - number;
                 let special = (LINE_BASE..LINE_BASE + LINE_RANGE as i64)
                     .contains(&delta)
-                    .then(|| (delta - LINE_BASE) as u64 + LINE_RANGE * advance + u64::from(OPCODE_BASE))
+                    .then(|| {
+                        (delta - LINE_BASE) as u64 + LINE_RANGE * advance + u64::from(OPCODE_BASE)
+                    })
                     .filter(|it| *it <= 255);
                 if let Some(special) = special {
                     line.push(special as u8);
@@ -667,11 +741,25 @@ mod tests {
             0,
         ]);
         abbrev.extend_from_slice(&[NAMED, DW_TAG_SUBPROGRAM, 0]);
-        abbrev.extend_from_slice(&[DW_AT_LINKAGE_NAME, DW_FORM_STRP, DW_AT_LOW_PC, DW_FORM_ADDR, DW_AT_HIGH_PC, DW_FORM_UDATA, 0, 0]);
+        abbrev.extend_from_slice(&[
+            DW_AT_LINKAGE_NAME,
+            DW_FORM_STRP,
+            DW_AT_LOW_PC,
+            DW_FORM_ADDR,
+            DW_AT_HIGH_PC,
+            DW_FORM_UDATA,
+            0,
+            0,
+        ]);
         abbrev.extend_from_slice(&[UNNAMED, DW_TAG_SUBPROGRAM, 0]);
         abbrev.extend_from_slice(&[DW_AT_LOW_PC, DW_FORM_ADDR, DW_AT_HIGH_PC, DW_FORM_UDATA, 0, 0]);
         abbrev.push(0);
 
-        Ok([(".debug_abbrev", abbrev), (".debug_info", info), (".debug_line", line), (".debug_str", strings)])
+        Ok([
+            (".debug_abbrev", abbrev),
+            (".debug_info", info),
+            (".debug_line", line),
+            (".debug_str", strings),
+        ])
     }
 }

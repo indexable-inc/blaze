@@ -21,18 +21,18 @@ use blaze_ids::ContentId;
 use blaze_mem::{MemError, Region, Tag, scratch};
 use blaze_reclaim::Guard;
 
+use crate::sync::{
+    OnceLock,
+    atomic::{AtomicPtr, AtomicU64, Ordering},
+    track,
+};
 use crate::{
-    CHUNK_FROM, EXTERNAL_FROM, Kind, Key, Mismatch, Ticket, Unit, chunk, cold, cold_columns,
+    CHUNK_FROM, EXTERNAL_FROM, Key, Kind, Mismatch, Ticket, Unit, chunk, cold, cold_columns,
     disk::{self, CHUNK_DOMAIN, Form, NO_DICTIONARY, RECORD_HEADER, RecordHeader, content_of},
     flags::Flag,
     read::{Look, Place, Seg, Shared, Spot, carry_flags},
     table::{Held, Table},
     words::stop,
-};
-use crate::sync::{
-    OnceLock,
-    atomic::{AtomicPtr, AtomicU64, Ordering},
-    track,
 };
 
 /// A chunk's length, unless a record needs more.
@@ -103,8 +103,14 @@ impl Chunk {
         let at = region.base().cast::<Chunk>();
         let bytes = region.at(HEAD);
         track::write(bytes.as_ptr(), cap);
-        let chunk =
-            Chunk { region, bytes, cap, published: AtomicU64::new(0), next: AtomicPtr::new(ptr::null_mut()), start };
+        let chunk = Chunk {
+            region,
+            bytes,
+            cap,
+            published: AtomicU64::new(0),
+            next: AtomicPtr::new(ptr::null_mut()),
+            start,
+        };
         // SAFETY: the region's base is page-aligned and its first `HEAD` bytes, at least a
         // `Chunk`, are committed (ensured above) and hold nothing yet. The chunk now owns the
         // region it sits in, freed only by `ChunkRef::free`.
@@ -177,10 +183,7 @@ impl Chunk {
     }
 
     fn publish(&self, bytes: u64, puts: u64) {
-        assert!(
-            bytes < MOST_BYTES && puts < MOST_PUTS,
-            "a chunk of 2^40 bytes or 2^24 puts"
-        );
+        assert!(bytes < MOST_BYTES && puts < MOST_PUTS, "a chunk of 2^40 bytes or 2^24 puts");
         self.published.store(bytes | (puts << BYTES_BITS), Ordering::Release);
     }
 
@@ -325,7 +328,13 @@ pub struct Writer {
 
 impl Writer {
     /// [`Writer::put_in`] of [`Unit::SHARED`].
-    pub fn put(&mut self, guard: &Guard, key: Key, kind: Kind, bytes: &[u8]) -> Result<Ticket, Mismatch> {
+    pub fn put(
+        &mut self,
+        guard: &Guard,
+        key: Key,
+        kind: Kind,
+        bytes: &[u8],
+    ) -> Result<Ticket, Mismatch> {
         self.put_in(guard, Unit::SHARED, key, kind, bytes)
     }
 
@@ -554,19 +563,29 @@ impl Own {
             self.claim(look, unit, record(Form::External, 0, bytes), bytes, ticket)
         } else if let Some(columns) = look.columns_of(bytes).filter(|_| kind.cold()) {
             match cold_columns(columns, bytes) {
-                Ok(payload) => self.claim(look, unit, record(Form::ColdColumns, 0, &payload), &payload, ticket),
+                Ok(payload) => {
+                    self.claim(look, unit, record(Form::ColdColumns, 0, &payload), &payload, ticket)
+                }
                 Err(why) => return Ok(self.fail(kind, &why)),
             }
         } else if kind.cold() && bytes.len() >= cold::LONG_FROM {
             match cold::compress_long(bytes) {
-                Ok(stored) => self.claim(look, unit, record(Form::Zstd, NO_DICTIONARY, &stored), &stored, ticket),
+                Ok(stored) => self.claim(
+                    look,
+                    unit,
+                    record(Form::Zstd, NO_DICTIONARY, &stored),
+                    &stored,
+                    ticket,
+                ),
                 Err(why) => return Ok(self.fail(kind, &why)),
             }
         } else if kind.cold()
             && let Some((number, dictionary)) = look.dictionary_of(kind)
         {
             match cold::compress(dictionary, bytes) {
-                Ok(stored) => self.claim(look, unit, record(Form::Zstd, number, &stored), &stored, ticket),
+                Ok(stored) => {
+                    self.claim(look, unit, record(Form::Zstd, number, &stored), &stored, ticket)
+                }
                 Err(why) => return Ok(self.fail(kind, &why)),
             }
         } else {
@@ -668,7 +687,9 @@ impl Own {
                 }
                 // Lost in the delta, or in a `prev` no longer the store's, which the delta
                 // decides (`Own::lost_in_prev`).
-                Err((_, (_, there))) if !kept && tier.prev.is_none() => return Err((there.content, there.ticket)),
+                Err((_, (_, there))) if !kept && tier.prev.is_none() => {
+                    return Err((there.content, there.ticket));
+                }
                 Err((_, (row, there))) if !kept => {
                     let prev = tier.prev.as_deref().expect("a view with `prev`, the arm above");
                     return Err(self.lost_in_prev(look, prev, row, there, &tier.delta));

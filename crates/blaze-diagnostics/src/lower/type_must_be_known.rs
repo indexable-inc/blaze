@@ -40,7 +40,10 @@ use either::Either;
 use hir::{AsAssocItem as _, InFile, LangItem, PathResolution};
 use syntax::{
     TextRange,
-    view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    view::{
+        self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
+        HasTypeBounds as _,
+    },
 };
 
 use crate::{
@@ -67,7 +70,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMustBeKnown<'db>) -> Vec
         // labels it, writeback does not.
         None => infer(d.top_term.is_none()),
         // An undecided type that must be sized: the type is what is undecided.
-        Some(hir::AmbiguousGoal { goal: hir::SolverGoal::Trait(_), .. }) if d.kind == hir::TypeAnnotationNeeded::E0282 => {
+        Some(hir::AmbiguousGoal { goal: hir::SolverGoal::Trait(_), .. })
+            if d.kind == hir::TypeAnnotationNeeded::E0282 =>
+        {
             infer(false)
         }
         Some(hir::AmbiguousGoal { goal: hir::SolverGoal::Trait(pred), candidates }) => {
@@ -84,34 +89,50 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMustBeKnown<'db>) -> Vec
                     format!("cannot satisfy `{}`", print::predicate(cx, pred))
                 });
             } else {
-                annotate_source_of_ambiguity(cx, node, &mut diag, &print::predicate(cx, pred), candidates);
+                annotate_source_of_ambiguity(
+                    cx,
+                    node,
+                    &mut diag,
+                    &print::predicate(cx, pred),
+                    candidates,
+                );
             }
             diag
         }
         Some(hir::AmbiguousGoal { goal: hir::SolverGoal::WellFormed(_), .. }) => infer(false),
         Some(hir::AmbiguousGoal {
-            goal: hir::SolverGoal::Subtype { .. } | hir::SolverGoal::ConstArgHasType { .. }, ..
+            goal: hir::SolverGoal::Subtype { .. } | hir::SolverGoal::ConstArgHasType { .. },
+            ..
         }) => infer(true),
         Some(hir::AmbiguousGoal { goal: hir::SolverGoal::NormalizesTo { alias }, .. }) => {
             let alias = trait_solver_error::term(cx, alias);
             // alloc: the error's text, for an error hir found
-            let mut diag = Diag::error(Some(code), format!("type annotations needed: cannot normalize `{alias}`"), failure.clone());
+            let mut diag = Diag::error(
+                Some(code),
+                format!("type annotations needed: cannot normalize `{alias}`"),
+                failure.clone(),
+            );
             // alloc: the error's text, for an error hir found
             diag.span_label(failure, format!("cannot normalize `{alias}`"));
             diag
         }
-        Some(hir::AmbiguousGoal { goal: hir::SolverGoal::UnstableFeature(feature), .. }) => Diag::error(
-            None,
-            // alloc: the error's text, for an error hir found
-            format!(
-                "blaze cannot describe the unmet `#[unstable_feature_bound({})]` of an impl yet",
-                feature.as_str()
-            ),
-            failure,
-        ),
+        Some(hir::AmbiguousGoal { goal: hir::SolverGoal::UnstableFeature(feature), .. }) => {
+            Diag::error(
+                None,
+                // alloc: the error's text, for an error hir found
+                format!(
+                    "blaze cannot describe the unmet `#[unstable_feature_bound({})]` of an impl yet",
+                    feature.as_str()
+                ),
+                failure,
+            )
+        }
         Some(hir::AmbiguousGoal { goal, .. }) => match trait_solver_error::goal_text(cx, goal) {
             Some(text) => match (goal, &d.top_term) {
-                (hir::SolverGoal::Projection { .. } | hir::SolverGoal::ConstEvaluatable(_), Some(_)) => {
+                (
+                    hir::SolverGoal::Projection { .. } | hir::SolverGoal::ConstEvaluatable(_),
+                    Some(_),
+                ) => {
                     let mut diag = infer(true);
                     if matches!(goal, hir::SolverGoal::Projection { .. }) {
                         // alloc: the error's text, for an error hir found
@@ -128,7 +149,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMustBeKnown<'db>) -> Vec
     // unstable feature bound.
     if let Some(ambiguity) = &d.ambiguity
         && !matches!(ambiguity.primary.goal, hir::SolverGoal::UnstableFeature(_))
-        && !(matches!(ambiguity.primary.goal, hir::SolverGoal::Trait(_)) && d.kind == hir::TypeAnnotationNeeded::E0282)
+        && !(matches!(ambiguity.primary.goal, hir::SolverGoal::Trait(_))
+            && d.kind == hir::TypeAnnotationNeeded::E0282)
     {
         related_notes(cx, node, &mut diag, &ambiguity.related);
         let trait_ = match &ambiguity.primary.goal {
@@ -145,7 +167,11 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMustBeKnown<'db>) -> Vec
 /// rustc's "type annotations needed: cannot satisfy `goal`", with the label again when `label`.
 fn cannot_satisfy(code: &'static str, goal: &str, at: Span, label: bool) -> Diag {
     // clone: on the error path, for an error hir found
-    let mut diag = Diag::error(Some(code), format!("type annotations needed: cannot satisfy `{goal}`"), at.clone());
+    let mut diag = Diag::error(
+        Some(code),
+        format!("type annotations needed: cannot satisfy `{goal}`"),
+        at.clone(),
+    );
     if label {
         // alloc: the error's text, for an error hir found
         diag.span_label(at, format!("cannot satisfy `{goal}`"));
@@ -173,7 +199,10 @@ fn inference_failure<'db>(
                 // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(Some(code), "type annotations needed", failure.clone());
                 // alloc: the error's text, for an error hir found
-                diag.span_label(failure, format!("cannot infer the value of the constant `{konst}`"));
+                diag.span_label(
+                    failure,
+                    format!("cannot infer the value of the constant `{konst}`"),
+                );
                 return diag;
             }
             // clone: on the error path, for an error hir found
@@ -185,8 +214,12 @@ fn inference_failure<'db>(
         (None, Some(generic)) => (Either::Right(generic), false),
         (Some(source), Some(generic)) => {
             let let_cost = ty_cost(cx, &source.ty);
-            let in_init = source.stmt.initializer().is_some_and(|it| it.syntax().text_range().contains_range(generic.range));
-            let generic_first = in_init || generic.range.start() < source.stmt.syntax().text_range().start();
+            let in_init = source
+                .stmt
+                .initializer()
+                .is_some_and(|it| it.syntax().text_range().contains_range(generic.range));
+            let generic_first =
+                in_init || generic.range.start() < source.stmt.syntax().text_range().start();
             if generic_first {
                 if let_cost + 1 < generic.cost {
                     let collect = source.ty.is_unknown() && is_collect(cx, source.stmt);
@@ -212,10 +245,13 @@ fn inference_failure<'db>(
             if label && !overlaps(&failure, &generic.span) {
                 diag.span_label(failure, "type must be known at this point");
             }
-            let (what, kind) = if generic.is_type { ("type", "type") } else { ("the value", "const") };
+            let (what, kind) =
+                if generic.is_type { ("type", "type") } else { ("the value", "const") };
             let param = match &data.parent {
                 // alloc: the error's text, for an error hir found
-                Some((prefix, name)) => format!("parameter `{}` declared on the {prefix} `{name}`", generic.param),
+                Some((prefix, name)) => {
+                    format!("parameter `{}` declared on the {prefix} `{name}`", generic.param)
+                }
                 // alloc: the error's text, for an error hir found
                 None => format!("parameter {}", generic.param),
             };
@@ -224,12 +260,29 @@ fn inference_failure<'db>(
             if !generic.turbofish {
                 let (message, code) = if generic.is_type {
                     // alloc: the error's text, for an error hir found
-                    (format!("consider specifying a concrete type for the type parameter `{}`", generic.param), "::</* Type */>")
+                    (
+                        format!(
+                            "consider specifying a concrete type for the type parameter `{}`",
+                            generic.param
+                        ),
+                        "::</* Type */>",
+                    )
                 } else {
                     // alloc: the error's text, for an error hir found
-                    (format!("consider specifying a const for the const parameter `{}`", generic.param), "::</* CONST */>")
+                    (
+                        format!(
+                            "consider specifying a const for the const parameter `{}`",
+                            generic.param
+                        ),
+                        "::</* CONST */>",
+                    )
                 };
-                diag.suggestion_verbose(generic.insert, message, code, Applicability::HasPlaceholders);
+                diag.suggestion_verbose(
+                    generic.insert,
+                    message,
+                    code,
+                    Applicability::HasPlaceholders,
+                );
             }
             diag
         }
@@ -255,14 +308,17 @@ fn let_named<'db>(
     }
     let Some(ast::Expr::CallExpr(call)) = source.stmt.initializer() else { return None };
     let callee = call.expr()?;
-    if node.file_id != source.pat.file_id || callee.syntax().text_range() != node.value.text_range() {
+    if node.file_id != source.pat.file_id || callee.syntax().text_range() != node.value.text_range()
+    {
         return None;
     }
     let returns = |ty: &hir::Type<'db>| {
         let callable = ty.as_callable(cx.db)?;
         matches!(
             callable.kind(),
-            hir::CallableKind::Function(_) | hir::CallableKind::TupleStruct(_) | hir::CallableKind::TupleEnumVariant(_)
+            hir::CallableKind::Function(_)
+                | hir::CallableKind::TupleStruct(_)
+                | hir::CallableKind::TupleEnumVariant(_)
         )
         .then(|| callable.return_type())
     };
@@ -301,9 +357,14 @@ fn let_failure<'db>(
     };
     let message = match name {
         // alloc: the error's text, for an error hir found
-        Some(name) => format!("consider giving `{name}` an explicit type{}", data.where_specified(cx, &source.ty)),
+        Some(name) => format!(
+            "consider giving `{name}` an explicit type{}",
+            data.where_specified(cx, &source.ty)
+        ),
         // alloc: the error's text, for an error hir found
-        None => format!("consider giving this pattern a type{}", data.where_specified(cx, &source.ty)),
+        None => {
+            format!("consider giving this pattern a type{}", data.where_specified(cx, &source.ty))
+        }
     };
     let type_name = if collect {
         // alloc: the error's text, for an error hir found
@@ -359,7 +420,11 @@ impl ArgData {
                 }
                 hir::GenericParam::ConstParam(it) => {
                     // alloc: the error's text, for an error hir found
-                    return ArgData { name: it.name(cx.db).as_str().to_owned(), kind: ArgKind::ConstParam, parent };
+                    return ArgData {
+                        name: it.name(cx.db).as_str().to_owned(),
+                        kind: ArgKind::ConstParam,
+                        parent,
+                    };
                 }
                 hir::GenericParam::LifetimeParam(_) => {}
             }
@@ -371,7 +436,9 @@ impl ArgData {
                 parent: None,
             },
             // clone: on the error path, for an error hir found
-            Some(Either::Right(ct)) => ArgData { name: ct.clone(), kind: ArgKind::Const, parent: None },
+            Some(Either::Right(ct)) => {
+                ArgData { name: ct.clone(), kind: ArgKind::Const, parent: None }
+            }
             _ => ArgData {
                 // alloc: the error's text, for an error hir found
                 name: "_".to_owned(),
@@ -455,12 +522,14 @@ fn descr(cx: &Cx<'_, '_>, item: hir::GenericDef) -> Option<(&'static str, String
         hir::GenericDef::Adt(hir::Adt::Enum(it)) => ("enum", it.name(cx.db)),
         hir::GenericDef::Adt(hir::Adt::Union(it)) => ("union", it.name(cx.db)),
         hir::GenericDef::Trait(it) => ("trait", it.name(cx.db)),
-        hir::GenericDef::TypeAlias(it) => {
-            (if it.as_assoc_item(cx.db).is_some() { "associated type" } else { "type alias" }, it.name(cx.db))
-        }
-        hir::GenericDef::Const(it) => {
-            (if it.as_assoc_item(cx.db).is_some() { "associated constant" } else { "constant" }, it.name(cx.db)?)
-        }
+        hir::GenericDef::TypeAlias(it) => (
+            if it.as_assoc_item(cx.db).is_some() { "associated type" } else { "type alias" },
+            it.name(cx.db),
+        ),
+        hir::GenericDef::Const(it) => (
+            if it.as_assoc_item(cx.db).is_some() { "associated constant" } else { "constant" },
+            it.name(cx.db)?,
+        ),
         hir::GenericDef::Static(it) => ("static", it.name(cx.db)),
         hir::GenericDef::Impl(_) => return None,
     };
@@ -502,53 +571,65 @@ fn generic_source<'db>(cx: &Cx<'_, 'db>, d: &hir::TypeMustBeKnown<'db>) -> Optio
     }
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     let range = node.value.text_range();
-    let (span, name_end, end, args, cost) = if let Some(call) = ast::MethodCallExpr::cast(node.value) {
-        let method = cx.vsema.resolve_method_call(call)?;
-        if item != hir::GenericDef::Function(method) {
-            return None;
-        }
-        let name_ref = call.name_ref()?;
-        let args = call.generic_arg_list();
-        let end = args.map_or(name_ref.syntax().text_range().end(), |it| it.syntax().text_range().end());
-        (in_file(name_ref.syntax().text_range()), name_ref.syntax().text_range().end(), end, args, 10)
-    } else {
-        let path = match ast::Expr::cast(node.value)? {
-            ast::Expr::PathExpr(it) => it.path()?,
-            ast::Expr::RecordExpr(it) => it.path()?,
-            _ => return None,
-        };
-        let is_record = ast::RecordExpr::can_cast(node.value.kind());
-        // alloc: the error's parts, for an error hir found
-        let mut segments = Vec::new();
-        let mut at = Some(path);
-        while let Some(path) = at {
-            segments.push(path);
-            at = path.qualifier();
-        }
-        segments.iter().rev().enumerate().find_map(|(index, path)| {
-            let (def, cost) = match cx.vsema.resolve_path(*path)? {
-                PathResolution::Def(hir::ModuleDef::Function(it)) if !is_record => (hir::GenericDef::Function(it), 10),
-                PathResolution::Def(hir::ModuleDef::Adt(it)) => (hir::GenericDef::Adt(it), 10),
-                PathResolution::Def(hir::ModuleDef::EnumVariant(it)) if !is_record => {
-                    (hir::GenericDef::Adt(hir::Adt::Enum(it.parent_enum(cx.db))), 15)
-                }
-                _ => return None,
-            };
-            if def != item {
+    let (span, name_end, end, args, cost) =
+        if let Some(call) = ast::MethodCallExpr::cast(node.value) {
+            let method = cx.vsema.resolve_method_call(call)?;
+            if item != hir::GenericDef::Function(method) {
                 return None;
             }
-            let segment = path.segment()?;
-            let name_ref = segment.name_ref()?;
-            Some((
-                in_file(range),
+            let name_ref = call.name_ref()?;
+            let args = call.generic_arg_list();
+            let end = args
+                .map_or(name_ref.syntax().text_range().end(), |it| it.syntax().text_range().end());
+            (
+                in_file(name_ref.syntax().text_range()),
                 name_ref.syntax().text_range().end(),
-                segment.syntax().text_range().end(),
-                segment.generic_arg_list(),
-                cost + index,
-            ))
-        })?
-    };
-    let turbofish = args.is_some_and(|it| it.generic_args().any(|arg| !matches!(arg, ast::GenericArg::LifetimeArg(_))));
+                end,
+                args,
+                10,
+            )
+        } else {
+            let path = match ast::Expr::cast(node.value)? {
+                ast::Expr::PathExpr(it) => it.path()?,
+                ast::Expr::RecordExpr(it) => it.path()?,
+                _ => return None,
+            };
+            let is_record = ast::RecordExpr::can_cast(node.value.kind());
+            // alloc: the error's parts, for an error hir found
+            let mut segments = Vec::new();
+            let mut at = Some(path);
+            while let Some(path) = at {
+                segments.push(path);
+                at = path.qualifier();
+            }
+            segments.iter().rev().enumerate().find_map(|(index, path)| {
+                let (def, cost) = match cx.vsema.resolve_path(*path)? {
+                    PathResolution::Def(hir::ModuleDef::Function(it)) if !is_record => {
+                        (hir::GenericDef::Function(it), 10)
+                    }
+                    PathResolution::Def(hir::ModuleDef::Adt(it)) => (hir::GenericDef::Adt(it), 10),
+                    PathResolution::Def(hir::ModuleDef::EnumVariant(it)) if !is_record => {
+                        (hir::GenericDef::Adt(hir::Adt::Enum(it.parent_enum(cx.db))), 15)
+                    }
+                    _ => return None,
+                };
+                if def != item {
+                    return None;
+                }
+                let segment = path.segment()?;
+                let name_ref = segment.name_ref()?;
+                Some((
+                    in_file(range),
+                    name_ref.syntax().text_range().end(),
+                    segment.syntax().text_range().end(),
+                    segment.generic_arg_list(),
+                    cost + index,
+                ))
+            })?
+        };
+    let turbofish = args.is_some_and(|it| {
+        it.generic_args().any(|arg| !matches!(arg, ast::GenericArg::LifetimeArg(_)))
+    });
     Some(GenericSource {
         span,
         insert: in_file(TextRange::new(name_end, end)),
@@ -604,24 +685,34 @@ fn is_collect<'db>(cx: &Cx<'_, 'db>, stmt: ast::LetStmt<'db>) -> bool {
     let function = match stmt.initializer() {
         Some(ast::Expr::MethodCallExpr(call)) => cx.vsema.resolve_method_call(call),
         Some(ast::Expr::CallExpr(call)) => match call.expr() {
-            Some(ast::Expr::PathExpr(path)) => match path.path().and_then(|it| cx.vsema.resolve_path(it)) {
-                Some(PathResolution::Def(hir::ModuleDef::Function(it))) => Some(it),
-                _ => None,
-            },
+            Some(ast::Expr::PathExpr(path)) => {
+                match path.path().and_then(|it| cx.vsema.resolve_path(it)) {
+                    Some(PathResolution::Def(hir::ModuleDef::Function(it))) => Some(it),
+                    _ => None,
+                }
+            }
             _ => None,
         },
         _ => None,
     };
     function.is_some_and(|it| {
         it.name(cx.db).as_str() == "collect"
-            && it.as_assoc_item(cx.db).and_then(|it| it.container_trait(cx.db)).is_some_and(|tr| is_lang(cx, tr, LangItem::Iterator))
+            && it
+                .as_assoc_item(cx.db)
+                .and_then(|it| it.container_trait(cx.db))
+                .is_some_and(|tr| is_lang(cx, tr, LangItem::Iterator))
     })
 }
 
 /// rustc's notes of the goals merged into the error, the same variable's at the same place:
 /// "the type must also implement `Trait`", "cannot satisfy `..`" or the impls that could meet it,
 /// each once.
-fn related_notes<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, diag: &mut Diag, related: &[hir::AmbiguousGoal<'db>]) {
+fn related_notes<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<ast::Node<'db>>,
+    diag: &mut Diag,
+    related: &[hir::AmbiguousGoal<'db>],
+) {
     // alloc: the error's parts, for an error hir found
     let mut mentioned: Vec<String> = Vec::new();
     for goal in related {
@@ -633,7 +724,10 @@ fn related_notes<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, diag: &mut
             {
                 if pred.trait_ref().self_ty().is_unknown() {
                     // alloc: the error's text, for an error hir found
-                    format!("the type must also implement `{}`", print::trait_path_sugared(cx, pred))
+                    format!(
+                        "the type must also implement `{}`",
+                        print::trait_path_sugared(cx, pred)
+                    )
                 } else {
                     let text = print::predicate(cx, pred);
                     // alloc: the error's text, for an error hir found
@@ -646,11 +740,13 @@ fn related_notes<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, diag: &mut
                     note
                 }
             }
-            hir::SolverGoal::Projection { .. } => match trait_solver_error::goal_text(cx, &goal.goal) {
-                // alloc: the error's text, for an error hir found
-                Some(text) => format!("cannot satisfy `{text}`"),
-                None => continue,
-            },
+            hir::SolverGoal::Projection { .. } => {
+                match trait_solver_error::goal_text(cx, &goal.goal) {
+                    // alloc: the error's text, for an error hir found
+                    Some(text) => format!("cannot satisfy `{text}`"),
+                    None => continue,
+                }
+            }
             _ => continue,
         };
         if !mentioned.contains(&note) {
@@ -703,7 +799,9 @@ fn annotate_source_of_ambiguity<'db>(
         match where_clause_spans(cx, node, &where_clauses) {
             Some(found) => spans.extend(found),
             None => {
-                diag.note("blaze cannot find the `where` clauses this requirement is ambiguous between");
+                diag.note(
+                    "blaze cannot find the `where` clauses this requirement is ambiguous between",
+                );
                 return;
             }
         }
@@ -753,7 +851,10 @@ fn annotate_source_of_ambiguity<'db>(
         _ => {
             diag.span_note(multi(), msg);
             // alloc: the error's text, for an error hir found
-            diag.note(format!("and more `impl`s found in the following crates: {}{post}", crate_names.join(", ")));
+            diag.note(format!(
+                "and more `impl`s found in the following crates: {}{post}",
+                crate_names.join(", ")
+            ));
         }
     }
 }
@@ -773,7 +874,11 @@ fn impl_header(cx: &Cx<'_, '_>, impl_: hir::Impl) -> Option<String> {
         .map(|it| it.name(cx.db).as_str().to_owned())
         .filter(|it| it != "'_")
         // alloc: the error's text, for an error hir found
-        .chain(def.type_or_const_params(cx.db).into_iter().map(|it| it.name(cx.db).as_str().to_owned()))
+        .chain(
+            def.type_or_const_params(cx.db)
+                .into_iter()
+                .map(|it| it.name(cx.db).as_str().to_owned()),
+        )
         // alloc: the error's text, for an error hir found
         .collect();
     if !names.is_empty() {
@@ -808,7 +913,11 @@ fn impl_header(cx: &Cx<'_, '_>, impl_: hir::Impl) -> Option<String> {
 /// The where clauses rustc points at for an ambiguity between them: the bounds of each trait
 /// written on the item the error is in and on its impl or trait, when they are as many as the
 /// candidates.
-fn where_clause_spans<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, traits: &[hir::Trait]) -> Option<Vec<Span>> {
+fn where_clause_spans<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<ast::Node<'db>>,
+    traits: &[hir::Trait],
+) -> Option<Vec<Span>> {
     // alloc: the error's parts, for an error hir found
     let mut spans = Vec::new();
     for (index, &trait_) in traits.iter().enumerate() {
@@ -844,11 +953,15 @@ fn bounds<'t>(
     params: Option<ast::GenericParamList<'t>>,
     wheres: Option<ast::WhereClause<'t>>,
 ) -> impl Iterator<Item = ast::TypeBound<'t>> {
-    let params = params.into_iter().flat_map(|it| it.type_or_const_params()).filter_map(|param| match param {
-        ast::TypeOrConstParam::Type(param) => param.type_bound_list(),
-        ast::TypeOrConstParam::Const(_) => None,
-    });
-    let wheres = wheres.into_iter().flat_map(|it| it.predicates()).filter_map(|pred| pred.type_bound_list());
+    let params =
+        params.into_iter().flat_map(|it| it.type_or_const_params()).filter_map(
+            |param| match param {
+                ast::TypeOrConstParam::Type(param) => param.type_bound_list(),
+                ast::TypeOrConstParam::Const(_) => None,
+            },
+        );
+    let wheres =
+        wheres.into_iter().flat_map(|it| it.predicates()).filter_map(|pred| pred.type_bound_list());
     params.chain(wheres).flat_map(|list| list.bounds())
 }
 
@@ -878,7 +991,8 @@ fn let_source<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<Let
         return of_stmt(stmt, node.file_id);
     }
     if let Some(ast::Expr::PathExpr(path)) = ast::Expr::cast(node.value)
-        && let Some(PathResolution::Local(local)) = path.path().and_then(|it| cx.vsema.resolve_path(it))
+        && let Some(PathResolution::Local(local)) =
+            path.path().and_then(|it| cx.vsema.resolve_path(it))
     {
         let source = local.primary_source_view(cx.db);
         // The local's tree is given out by `vsema`, so `of_stmt` may ask it of the pattern.
