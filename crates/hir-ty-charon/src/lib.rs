@@ -221,7 +221,35 @@ fn run_passes(mut translated: TranslatedCrate) -> Result<TranslatedCrate, Error>
     if failed {
         return Err(Error::Charon { error_count, items, bodies, unstructured });
     }
-    Ok(ctx.translated)
+    let mut translated = ctx.translated;
+    renumber_llbc_ids(&mut translated);
+    Ok(translated)
+}
+
+/// Charon draws LLBC block and statement ids from process-wide counters
+/// (`BlockId::fresh`, `StatementId::fresh`), so the ids, and the JSON, depend on everything
+/// translated before in the process and on thread timing. This numbers them again from zero in
+/// the crate's order (functions by id, each body in pre-order); one map per kind keeps every
+/// place an id is named the same.
+fn renumber_llbc_ids(krate: &mut TranslatedCrate) {
+    use charon_lib::{
+        ast::BodyVisitable as _,
+        llbc_ast::{BlockId, StatementId},
+    };
+    let mut blocks: blaze_hash::HashMap<BlockId, BlockId, std::alloc::Global> =
+        blaze_hash::HashMap::default(); // alloc: an id map, once per crate
+    let mut statements: blaze_hash::HashMap<StatementId, StatementId, std::alloc::Global> =
+        blaze_hash::HashMap::default(); // alloc: an id map, once per crate
+    for decl in krate.fun_decls.iter_mut() {
+        decl.body.dyn_visit_in_body_mut(|id: &mut BlockId| {
+            let next = BlockId::new(blocks.len());
+            *id = *blocks.entry(*id).or_insert(next);
+        });
+        decl.body.dyn_visit_in_body_mut(|id: &mut StatementId| {
+            let next = StatementId::new(statements.len());
+            *id = *statements.entry(*id).or_insert(next);
+        });
+    }
 }
 
 /// A panic's message, when it has one.

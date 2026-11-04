@@ -6,7 +6,7 @@
 
 use charon_lib::ast::{
     AttrInfo, BuiltinAdt, DeBruijnVar, Field, FieldId, GenericArgs as CArgs, GenericParams,
-    IntTy as CIntTy, IntegerTy, IntegerValue, ItemMeta, ItemOpacity, PtrMetadata, RefKind,
+    IntTy as CIntTy, IntegerTy, IntegerValue, PtrMetadata, RefKind,
     Region as CRegion, RegionId, ScalarTy, SeqHashMap, Span, Ty as CTy, TyKind as CTyKind,
     TypeDecl, TypeDeclId, TypeDeclKind, TypeDeclRef, TypeSource, TypeVarId, UIntTy as CUIntTy,
     Variant, VariantId as CVariantId,
@@ -264,12 +264,8 @@ pub(crate) fn adt_decl<'db>(
     }
     Ok(TypeDecl {
         def_id: id,
-        item_meta: ItemMeta::dummy_public(
-            Span::dummy(),
-            path.name.clone(), // clone: the declaration keeps its name; the crate's map too
-            true,
-            ItemOpacity::Transparent,
-        ),
+        // clone: the declaration keeps its name; the crate's map too
+        item_meta: crate::items::local_meta(path.name.clone()),
         generics: GenericParams::empty(),
         src: TypeSource::Normal,
         kind,
@@ -314,6 +310,11 @@ fn fields<'db>(
         });
     }
     out
+}
+
+/// The type of the local enum `adt`'s discriminant.
+pub(crate) fn enum_discriminant_ty(ctx: &Ctx<'_>, adt: AdtId) -> IntegerTy {
+    discriminant_ty(AdtDef::new(adt, ctx.interner).repr(ctx.db).discr_type())
 }
 
 /// The type of an enum's discriminant, as its `repr` gives it (`isize` without one).

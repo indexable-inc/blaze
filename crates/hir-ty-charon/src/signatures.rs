@@ -13,10 +13,7 @@ use hir_def::{
     CallableDefId, FunctionId, GenericDefId, hir::generics::GenericParams,
     signatures::FunctionSignature,
 };
-use hir_ty::{
-    db::HirDatabase as _,
-    next_solver::{BoundRegionKind, BoundVariableKind},
-};
+use hir_ty::next_solver::{BoundRegionKind, BoundVariableKind};
 use rustc_type_ir::inherent::{Safety as _, SliceLike as _};
 
 use crate::{
@@ -72,7 +69,10 @@ pub(crate) fn signature<'db>(
         errors.push(refuse(item, "a C-variadic function", why::UNSAFE));
     }
 
-    let poly = ctx.db.callable_item_signature(CallableDefId::FunctionId(func)).skip_binder();
+    // The solver's signature, not `callable_item_signature`: each lifetime the parameters leave
+    // out is a late-bound one of its own there, as in rustc's `fn_sig`, where the other keeps
+    // it an error region for inference.
+    let poly = hir_ty::solver_fn_sig(ctx.db, CallableDefId::FunctionId(func)).skip_binder();
     let mut generics = CGenericParams::empty();
     for (index, bound) in poly.bound_vars().iter().enumerate() {
         match bound {

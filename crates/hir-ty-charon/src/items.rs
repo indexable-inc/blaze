@@ -285,12 +285,7 @@ pub(crate) fn translate(db: &Db, krate: Crate) -> Result<TranslatedCrate, Vec<Un
             (Some(Signature { generics, sig }), Ok(body)) => {
                 let decl = FunDecl {
                     def_id: local.id,
-                    item_meta: ItemMeta::dummy_public(
-                        Span::dummy(),
-                        local.path.name,
-                        true,
-                        ItemOpacity::Transparent,
-                    ),
+                    item_meta: local_meta(local.path.name),
                     generics,
                     signature: Box::new(sig), // alloc: a Charon signature
                     src: local.src,
@@ -600,4 +595,19 @@ fn target_info(
         primitive_alignments,
     };
     Ok((triple, info))
+}
+
+impl Ctx<'_> {
+    /// The local struct or enum declared as `id`.
+    pub(crate) fn adt_of(&self, id: TypeDeclId) -> Option<AdtId> {
+        self.adts.iter().find_map(|(&adt, &it)| (it == id).then_some(adt))
+    }
+}
+
+/// The metadata of an item of the crate being translated. `started_from` makes it a root of
+/// Charon's reachability walk (`reorder_decls`), which drops every item no root reaches.
+pub(crate) fn local_meta(name: charon_lib::ast::Name) -> ItemMeta {
+    let mut meta = ItemMeta::dummy_public(Span::dummy(), name, true, ItemOpacity::Transparent);
+    meta.started_from = true;
+    meta
 }

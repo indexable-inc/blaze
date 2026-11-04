@@ -142,6 +142,32 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         }
     }
 
+    /// blaze's MIR reads a discriminant into an `i128` temporary, rustc's into one of the enum's
+    /// discriminant type; Charon (`reconstruct_matches`) matches the switch's values against the
+    /// variants' discriminants by type too. So the temporary `dest` takes the type of `of`'s
+    /// discriminant, before any switch on it is translated (the switch ends the same block).
+    fn retype_discriminant(
+        &mut self,
+        dest: &m::StoredPlace,
+        of: &c::Place,
+    ) -> Result<(), Unsupported> {
+        if !dest.projection.as_slice().is_empty() {
+            return Err(self.refuse("a discriminant read into a projection", why::OPERATIONS));
+        }
+        let enum_ty = of.ty();
+        let Some(adt) = enum_ty.as_adt().and_then(|tref| self.ctx.adt_of(tref.id)) else {
+            // alloc: an error
+            return Err(self.refuse(
+                format!("the discriminant of a value of type `{enum_ty:?}`"),
+                why::TYPES,
+            ));
+        };
+        let int = types::enum_discriminant_ty(self.ctx, adt);
+        let local = self.local_ids[&dest.local];
+        self.locals.locals[local].ty = c::TyKind::Scalar(c::ScalarTy::Integer(int)).into_ty();
+        Ok(())
+    }
+
     /// The id of the block `bb`, queued for translation on first reference.
     fn block(&mut self, bb: m::BasicBlockId) -> c::BlockId {
         if let Some(&id) = self.block_ids.get(&bb) {
@@ -259,8 +285,13 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                 return Ok(Open { id: target, kind, statements: Vec::new() }); // alloc: a block's statements
             }
             m::StatementKind::Assign(place, rvalue) => {
-                let assigned =
-                    (|| Ok(c::StatementKind::Assign(self.place(place)?, self.rvalue(rvalue)?)))();
+                let assigned = (|| {
+                    let rvalue = self.rvalue(rvalue)?;
+                    if let c::Rvalue::Discriminant(of) = &rvalue {
+                        self.retype_discriminant(place, of)?;
+                    }
+                    Ok(c::StatementKind::Assign(self.place(place)?, rvalue))
+                })();
                 match assigned {
                     Ok(it) => it,
                     Err(err) => return Err((open, err)),

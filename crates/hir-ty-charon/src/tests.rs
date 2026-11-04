@@ -109,10 +109,29 @@ fn json_is_deterministic() {
         let db = db(source);
         llbc_json(&to_llbc(&db, main_crate(&db)).expect("LLBC"))
     };
-    assert_eq!(first, second);
+    same_json(&first, &second);
     // The ULLBC alone is the same twice too.
     let db = db(source);
     let a = translate_crate(&db, main_crate(&db)).expect("ULLBC");
     let b = translate_crate(&db, main_crate(&db)).expect("ULLBC");
-    assert_eq!(llbc_json(&a), llbc_json(&b));
+    same_json(&llbc_json(&a), &llbc_json(&b));
+}
+
+
+/// `a` and `b` are the same bytes; when not, the failure shows where they first part.
+fn same_json(a: &[u8], b: &[u8]) {
+    if a == b {
+        return;
+    }
+    let at = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+    let window = |it: &[u8]| {
+        String::from_utf8_lossy(&it[at.saturating_sub(300)..(at + 300).min(it.len())]).into_owned()
+    };
+    panic!(
+        "the JSON differs at byte {at} (lengths {} and {}):\n  first: {}\n second: {}",
+        a.len(),
+        b.len(),
+        window(a),
+        window(b)
+    );
 }

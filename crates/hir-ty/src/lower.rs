@@ -5117,7 +5117,7 @@ pub(crate) fn callable_item_signature<'db>(
 /// ([`bind_elided_lifetimes`]), so `Location::uses_memory` of `fn uses_memory(&self) -> bool`
 /// is `for<'a> FnMut(&'a Location) -> bool`. [`callable_item_signature`] keeps them errors
 /// for inference, which gives each call's its own region ([`ElidedLifetimes`]).
-pub(crate) fn solver_fn_sig<'db>(
+pub fn solver_fn_sig<'db>(
     db: &'db Db,
     def: CallableDefId,
 ) -> EarlyBinder<'db, PolyFnSig<'db>> {
