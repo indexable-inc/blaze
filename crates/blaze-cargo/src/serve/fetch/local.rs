@@ -18,7 +18,7 @@ use std::path::Path;
 use blaze_api::ApiError;
 use blaze_vfs::Mode;
 
-use super::git::read_tree;
+use super::git::{is_executable, read_tree};
 use crate::serve::heads::excluded;
 use crate::serve::work::{LocalRead, Source, SourceFile};
 
@@ -97,15 +97,4 @@ pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
             Ok(LocalRead { at: at.to_owned(), source: Source { files: Vec::new(), under: name.to_owned() }, watched: None, generation })
         }
     }
-}
-
-#[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_: &std::fs::Metadata) -> bool {
-    false
 }

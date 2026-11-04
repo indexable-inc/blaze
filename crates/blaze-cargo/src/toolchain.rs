@@ -16,20 +16,15 @@
 pub mod library;
 pub mod own;
 
-pub use own::home;
-
 use std::path::{Path, PathBuf};
 
 use blaze_registry::http::{Http as _, HttpNotSuccessful, HyperHttp};
-
-/// The toolchain blaze compiles, as rustup names it: `nightly-2026-10-25`.
-pub const OURS: &str = include_str!("../../../harness/toolchain");
 
 /// blaze's toolchain as blaze names it in what it prints: `blaze-2026-10-25`, after the date of
 /// the Rust nightly it is (`harness/toolchain`), so it moves with every bump. rustup knows the
 /// toolchain by the nightly's name, not this one.
 pub fn name() -> String {
-    let ours = OURS.trim();
+    let ours = blaze_units::lock::toolchain();
     format!("blaze-{}", ours.strip_prefix("nightly-").unwrap_or(ours))
 }
 
@@ -103,7 +98,7 @@ impl Chosen {
 
 impl std::fmt::Display for Chosen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (name, ours) = (name(), OURS.trim());
+        let (name, ours) = (name(), blaze_units::lock::toolchain());
         write!(f, "{name}, blaze's toolchain (Rust {ours}), at {}", self.0.display())
     }
 }
@@ -129,7 +124,7 @@ pub fn ensure() -> Result<Chosen, String> {
     if let Some(chosen) = found() {
         return Ok(chosen);
     }
-    let ours = OURS.trim();
+    let ours = blaze_units::lock::toolchain();
     let Some(release) = own::Release::ours() else {
         return Err(format!(
             "blaze builds with Rust {ours}, and the Rust project publishes no copy of it for this machine that blaze knows"
@@ -286,7 +281,9 @@ mod tests {
 
     #[test]
     fn blazes_toolchain_is_named_after_its_nightly_and_its_rustc_says_its_release() {
-        let date = OURS.trim().strip_prefix("nightly-").expect("harness/toolchain names a nightly");
+        let date = blaze_units::lock::toolchain()
+            .strip_prefix("nightly-")
+            .expect("harness/toolchain names a nightly");
         assert_eq!(name(), format!("blaze-{date}"));
         assert!(ours_says().starts_with(ours_release()), "{}", ours_says());
         semver::Version::parse(ours_release()).expect("a release is a version");

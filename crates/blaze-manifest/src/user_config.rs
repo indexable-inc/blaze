@@ -19,17 +19,19 @@ pub fn home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
         return Some(PathBuf::from(home));
     }
+    Some(user_home()?.join(".blaze"))
+}
+
+/// The user's home directory (`HOME`, `USERPROFILE` on Windows), none when unset or empty.
+pub fn user_home() -> Option<PathBuf> {
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(home).join(".blaze"))
+    Some(PathBuf::from(home))
 }
 
 /// `config.toml` under `home`.
 pub fn file(home: &Path) -> PathBuf {
     home.join("config.toml")
 }
-
-/// The file as a message names it when blaze's home can't be found.
-pub const SAID: &str = "~/.blaze/config.toml";
 
 /// `file` as a table, none when there is no file.
 pub fn read(file: &Path) -> Result<Option<toml::Table>, UserConfigError> {

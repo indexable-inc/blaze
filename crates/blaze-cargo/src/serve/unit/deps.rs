@@ -669,17 +669,7 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
             message.push_str(&format!("; {count} {why}")); // alloc: as above
         }
     }
-    Diagnostic {
-        level: Level::Note,
-        code: None,
-        rendered: format!("note: {message}\n"), // alloc: as above
-        message,
-        spans: Vec::new(),    // alloc: none
-        children: Vec::new(), // alloc: none
-        facts: Vec::new(),    // alloc: none
-        unit: None,
-        explanation: None,
-    }
+    Diagnostic::note(message)
 }
 
 /// What `job`'s build was served of each of its library crates that is no workspace member,

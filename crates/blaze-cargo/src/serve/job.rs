@@ -3701,7 +3701,10 @@ impl<S: Steps> Jobs<S> {
                     let kept = match fetch.kind {
                         // clone: an error's text, only when it is under one
                         FetchKind::Local { .. } => {
-                            [&self.setup.sources, &self.setup.views].into_iter().find(|it| under(&fetch.at, it)).cloned()
+                            [&self.setup.sources, &self.setup.views]
+                                .into_iter()
+                                .find(|it| super::unit::files::under(&fetch.at, it).is_some())
+                                .cloned()
                         }
                         _ => None,
                     };
@@ -3840,7 +3843,9 @@ impl<S: Steps> Jobs<S> {
                 w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), tag });
             }
             for line in &lock.said {
-                w.said.push(Said::Report(id, Response::Diagnostic(lock_note(line))));
+                // alloc: a line of the lock write, once per plan that writes one
+                let note = Diagnostic::note(line.to_owned());
+                w.said.push(Said::Report(id, Response::Diagnostic(note)));
             }
         }
         for warning in &units.warnings {
@@ -6350,22 +6355,6 @@ fn script_ended<S: Steps>(w: &mut World<'_, S>, node: NodeId, ok: bool) {
 }
 
 /// A warning of the load, as cargo prints it.
-/// What a build says of the lock files it wrote ([`LockWrite::said`]), as a note.
-fn lock_note(line: &str) -> Diagnostic {
-    // alloc: a line of the lock write, once per plan that writes one
-    Diagnostic {
-        level: Level::Note,
-        code: None,
-        message: line.to_owned(), // alloc: the report owns it
-        spans: Vec::new(),        // alloc: none
-        children: Vec::new(),     // alloc: none
-        facts: Vec::new(),        // alloc: none
-        rendered: format!("note: {line}\n"), // alloc: the report owns it
-        unit: None,
-        explanation: None,
-    }
-}
-
 fn warned(warning: &str) -> Diagnostic {
     // alloc: a warning of the load, once per plan
     Diagnostic {
@@ -6403,17 +6392,7 @@ fn noted(served: &ServedCrate) -> Option<Diagnostic> {
     };
     // alloc: under `-v`, once per dependency refused
     let message = format!("dependency `{}`: {parts} not kept in the store: {why}", served.package);
-    Some(Diagnostic {
-        level: Level::Note,
-        code: None,
-        rendered: format!("note: {message}\n"), // alloc: as above
-        message,
-        spans: Vec::new(),    // alloc: none
-        children: Vec::new(), // alloc: none
-        facts: Vec::new(),    // alloc: none
-        unit: None,
-        explanation: None,
-    })
+    Some(Diagnostic::note(message))
 }
 
 /// Every memo reachable from `from` in `db`, each once, in the order it is reached.
@@ -6472,10 +6451,4 @@ fn verify<S: Steps>(
         }
     }
     Ok(mismatches)
-}
-
-/// Whether `path` is `dir` or under it, by whole components.
-fn under(path: &str, dir: &str) -> bool {
-    let dir = dir.trim_end_matches('/');
-    path.strip_prefix(dir).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }

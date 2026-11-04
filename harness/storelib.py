@@ -17,9 +17,10 @@ The daemon is started here, not by the first `blaze build` (crates/blaze-cargo/s
 `scratch` and `run` are what other harnesses take from here too, and the readers of what blaze
 says for machines, which every harness reads facts from rather than the text blaze prints for
 people: `messages` (a build's `--message-format=json` lines), `worked` and `links` (its
-`blaze-work` line: what the daemon did and how it linked each image), `split_build_output`
-and `build_finished` (its `build-finished` line), `blaze_status` (`blaze status --json`),
-`blaze_toolchain` (`blaze toolchain --json`), `daemon_pid` (the daemon's lock), and `Daemon.command` with `test_results`: any blaze command asked of the daemon,
+`blaze-work` line: what the daemon did and how it linked each image), `linked` (a
+`blaze build` read for how it linked one program), `split_build_output` and `build_finished`
+(its `build-finished` line), `blaze_status` (`blaze status --json`), `blaze_toolchain`
+(`blaze toolchain --json`), `daemon_pid` (the daemon's lock), and `Daemon.command` with `test_results`: any blaze command asked of the daemon,
 and the `blaze-test-result` lines of a `blaze test --reached --message-format=json`
 (crates/blaze-cargo/src/cli/json.rs, `test_result`) read into `TestLine`s.
 """
@@ -336,6 +337,26 @@ def links(said: str, program: str) -> list[Link]:
     return [
         link for work in worked(said) for link in work.links if own.fullmatch(os.path.basename(link.path))
     ]
+
+
+def linked(ws: str, env: Mapping[str, str], step: str, program: str, timeout: float = 900) -> list[Link]:
+    """`blaze build --message-format=json` in `ws`: how it linked `program`, in order (`links`).
+    A failed build, or one with no `blaze-work` line (not the daemon's), stops the harness,
+    naming `step`."""
+    ran = subprocess.run(
+        ["blaze", "build", "--message-format=json"],
+        cwd=ws,
+        env=dict(env),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    said = ran.stdout + ran.stderr
+    if ran.returncode != 0:
+        raise SystemExit(f"{step}: the build failed:\n{said[-3000:]}")
+    if not worked(ran.stdout):
+        raise SystemExit(f"{step}: the build printed no `blaze-work` line:\n{said[-3000:]}")
+    return links(ran.stdout, program)
 
 
 class Daemon:

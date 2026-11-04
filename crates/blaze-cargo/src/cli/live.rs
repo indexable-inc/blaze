@@ -94,13 +94,16 @@ const PLAIN_ARGS: [&str; 9] = [
 
 /// Whether `blaze test` draws its live view: a test run (not `--no-run`, `--reached`, a bench)
 /// whose stdout and stderr are terminals big enough, printed for a person (not JSON, `-q` or
-/// `-v`), with libtest's own output left as the view reads it, and not on CI ([`ci`]), whose
+/// `-v`), with libtest's own output left as the view reads it, and not on CI ([`blaze_units::lock::ci_says`]), whose
 /// workers may hand it a pseudo-terminal whose log is read as text.
 pub fn wanted(asked: &Invocation, shown: Shown) -> bool {
     let plain_ui = std::env::var_os("BLAZE_UI").is_some_and(|it| it == "plain");
     let dumb = std::env::var_os("TERM").is_some_and(|it| it == "dumb");
     if asked.command() != Command::Test
-        || ci(|name| std::env::var_os(name))
+        || blaze_units::lock::ci_says(
+            std::env::var("CI").ok().as_deref(),
+            std::env::var("TF_BUILD").ok().as_deref(),
+        )
         || asked.flags.no_run
         || asked.flags.reached
         || asked.flags.ub
@@ -151,15 +154,6 @@ pub fn drive<A: Api>(
     _started: Instant,
 ) -> io::Result<Then> {
     Err(io::Error::other(NO_TUI))
-}
-
-/// Whether this runs on CI: `CI` set to anything but empty, `0` or `false` (GitHub Actions,
-/// GitLab, Buildkite, CircleCI, Travis and most others set it), or `TF_BUILD` set (Azure
-/// Pipelines, which sets no `CI`).
-fn ci(var: impl Fn(&str) -> Option<OsString>) -> bool {
-    let ci = var("CI")
-        .is_some_and(|it| !(it.is_empty() || it == "0" || it.eq_ignore_ascii_case("false")));
-    ci || var("TF_BUILD").is_some_and(|it| !it.is_empty())
 }
 
 /// What the screen is sent: the view's events in the order they happened, then its end.
@@ -1112,26 +1106,12 @@ fn said(binary: u32, line: &str) -> Option<Event> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, time::Duration};
+    use std::time::Duration;
 
     use blaze_ui::test_view::{BinaryEnd, Event, Verdict};
     use crossbeam_channel::unbounded;
 
-    use super::{Msg, Run, Runner, ci, said};
-
-    #[test]
-    fn ci_is_told_by_its_variables() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| pairs.iter().find(|it| it.0 == name).map(|it| OsString::from(it.1))
-        };
-        assert!(ci(env(&[("CI", "true")])));
-        assert!(ci(env(&[("CI", "1")])));
-        assert!(ci(env(&[("TF_BUILD", "True")])));
-        assert!(!ci(env(&[])));
-        assert!(!ci(env(&[("CI", "false")])));
-        assert!(!ci(env(&[("CI", "0")])));
-        assert!(!ci(env(&[("CI", "")])));
-    }
+    use super::{Msg, Run, Runner, said};
 
     /// A test executable that starts a process which inherits its stdout and outlives it ends
     /// when it exits, its output read until then: the runner does not wait for the pipe to

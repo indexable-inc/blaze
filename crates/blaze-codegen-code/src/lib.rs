@@ -470,12 +470,12 @@ pub const RECORD_CUT: &[Cut] = &[
     },
 ];
 
-/// Files outside every package that [`RECORD`]'s closure reads: the pinned nightly (blaze-cargo's
-/// `toolchain::OURS`, hir-ty's and the code generator's `NIGHTLY`), the digest and upstream of
+/// Files outside every package that [`RECORD`]'s closure reads: the pinned nightly (blaze-units'
+/// `lock::toolchain`, hir-ty's and the code generator's `NIGHTLY`), the digest and upstream of
 /// blaze's own standard library (blaze-cargo's `toolchain::library`), and the pinned nightly's
 /// proc-macro bridge, which blaze-macro-eval serves ([`FRONT_END_EXTRA`]).
 pub const RECORD_EXTRA: &[(&str, &str)] = &[
-    ("blaze-cargo", "../../harness/toolchain"),
+    ("blaze-units", "../../harness/toolchain"),
     ("blaze-cargo", "../../library/DIGEST"),
     ("blaze-cargo", "../../library/UPSTREAM"),
     ("blaze-macro-eval", "../../library/proc_macro/src/bridge"),

@@ -57,6 +57,8 @@ disallowed-macros = [
 
 disallowed-methods = [
     { path = "blaze_resolve::lockfile::lockfile_to_write", replacement = "blaze_units::lock::after_resolve", reason = "one place decides a resolve's lock files, with the lock policy (CI, `lock = \"required\"`, `--no-locked`) and `blaze.lock`: docs/cargo.md, \"Lock files\"", allow-invalid = true },
+    { path = "blaze_cargo::toolchain::own::home", replacement = "blaze_manifest::user_config::home", reason = "one place finds blaze's home (`$BLAZE_HOME`, else `~/.blaze`): blaze-manifest's `user_config`", allow-invalid = true },
+    { path = "blaze_cargo::toolchain::home", replacement = "blaze_manifest::user_config::home", reason = "one place finds blaze's home (`$BLAZE_HOME`, else `~/.blaze`): blaze-manifest's `user_config`", allow-invalid = true },
     { path = "std::process::Command::new", replacement = "toolchain::command", reason = "the latter forces the choice of a working directory" },
     { path = "std::sync::mpsc::channel", replacement = "crossbeam_channel::unbounded", reason = "one channel for every thread handoff: crossbeam's" },
     { path = "std::sync::mpsc::sync_channel", replacement = "crossbeam_channel::bounded", reason = "one channel for every thread handoff: crossbeam's" },

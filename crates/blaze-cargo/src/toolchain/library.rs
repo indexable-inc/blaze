@@ -152,7 +152,7 @@ fn candidates() -> Result<Vec<PathBuf>, String> {
 /// blaze's own copy of the library: `~/.blaze/library/<digest>/library`, in a directory of
 /// its own, so that every file under the one it is in is the library's.
 fn own() -> Option<PathBuf> {
-    Some(super::own::home()?.join("library").join(digest()).join("library"))
+    Some(blaze_manifest::user_config::home()?.join("library").join(digest()).join("library"))
 }
 
 /// The library of the checkout this blaze was built in.

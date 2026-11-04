@@ -188,12 +188,12 @@ fn link_bytes(target: std::path::PathBuf, at: &Path) -> anyhow::Result<Vec<u8>> 
 }
 
 #[cfg(unix)]
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
+pub(super) fn is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-fn is_executable(_: &std::fs::Metadata) -> bool {
+pub(super) fn is_executable(_: &std::fs::Metadata) -> bool {
     false
 }
