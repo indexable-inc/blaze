@@ -69,6 +69,7 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         links: Vec::new(),
         linked: Vec::new(),
         misses: Vec::new(),
+        panics: Vec::new(),
         profiled: false,
         opened_ns: 0,
         opened_unix_ns: None,

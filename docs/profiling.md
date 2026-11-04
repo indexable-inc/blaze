@@ -423,7 +423,7 @@ its message, the reach's two ends marked.
 | t_ns | i64? | when the daemon said it |
 | crate | dict? | the package of the unit it is of |
 | unit | utf8? | the unit as cargo names it: `serde (build script)` |
-| kind | dict | a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic, blaze-bug (a site of a bug the daemon went on past: `function` its value kind, `message` what and how often, `detail` the first report's thread and stack), uncoded |
+| kind | dict | a stable code: rustc's (E0277) or a deny lint's name, else blaze's: derive-panic, attr-panic, macro-panic, expand-failed, link-native-missing, link-failed, template-refs, refused, daemon-panic (a daemon task's panic: `detail` the stack it was raised on, `file` and `line` where), blaze-bug (a site of a bug the daemon went on past: `function` its value kind, `message` what and how often, `detail` the first report's thread and stack), uncoded |
 | function | utf8? | the function or instance it is of: a refused instance, a panicking proc macro |
 | message | utf8 | its first line |
 | detail | utf8? | why: its first help or note, or a refused function's reason |

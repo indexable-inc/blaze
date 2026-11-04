@@ -27,6 +27,7 @@ use std::{
 use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
 use blaze_core::Conn;
 use blaze_profile::{
+    errors::ErrorRow,
     facts::{CrateDepRow, LinkRow, QueryCountRow},
     history::{self, BuildRow, History, OWNER},
     live::{self, Feed, Frame},
@@ -234,6 +235,9 @@ pub struct Ended {
     /// Why each thing it computed again was not reused, its own alone, sorted and each once
     /// ([`blaze_kernel::Miss`]): what `blaze why` explains.
     pub misses: Vec<blaze_kernel::Miss>,
+    /// Errors its daemon raised of itself rather than said of a unit: each of its tasks'
+    /// panics, its stack the row's `detail` (`job::daemon_panic`).
+    pub errors: Vec<ErrorRow>,
 }
 
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends.
@@ -434,7 +438,7 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 history.build_started(row);
                 (history.flush(None), false)
             }
-            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses }, query_counts })) => {
+            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses, errors }, query_counts })) => {
                 let build = row.build_id;
                 let ended_well = matches!(row.outcome, history::Outcome::Ok);
                 doing.set(Step::Explaining, build);
@@ -456,6 +460,7 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 history.crate_graph(crate_deps);
                 history.query_counted(query_counts);
                 history.missed(misses);
+                history.errored(errors);
                 history.build_ended(row);
                 doing.set(Step::Flushing, build);
                 (history.flush(Some(build)), false)
@@ -1043,6 +1048,7 @@ mod tests {
             links: Vec::new(),
             crate_deps: Vec::new(),
             misses: Vec::new(),
+            errors: Vec::new(),
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
@@ -1083,7 +1089,7 @@ mod tests {
             tree: None,
             blaze: None,
         };
-        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new() }
+        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new(), errors: Vec::new() }
     }
 
     fn explained(build: u64) -> Told {

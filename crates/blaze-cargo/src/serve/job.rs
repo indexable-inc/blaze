@@ -84,6 +84,7 @@ use std::alloc::Global;
 use blaze_history::History;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use blaze_profile::{
+    errors::{self as profile_errors, ErrorRow},
     facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow},
     history::{self as profile_history, BuildRow},
 };
@@ -1661,6 +1662,10 @@ struct Job<S: Steps> {
     /// compile and each run handed them over ([`Compiled::misses`], [`RunPuts::misses`]):
     /// this build's alone, sorted when it ends, for `blaze why`.
     misses: Vec<blaze_kernel::Miss>,
+    /// Its tasks' panics, as the history's `errors` rows of kind `daemon-panic`, each with the
+    /// stack it was raised on as its `detail` ([`plane::Panic::trace`]); given its build's
+    /// number as it ends ([`Job::ended`]).
+    panics: Vec<ErrorRow>,
     /// Its command line's environment names a profile's directory ([`profile_dir`]): the
     /// daemon's part of the build is written there as it finishes.
     profiled: bool,
@@ -2060,7 +2065,7 @@ impl<S: Steps> Job<S> {
     }
 
     /// The history's rows of its plane request `request` ([`Job::row`]): its own, each image
-    /// its units linked, and its units' crate graph.
+    /// its units linked, its units' crate graph, and its tasks' panics.
     fn ended(&mut self, request: RequestId, stats: Option<RequestStats>, outcome: profile_history::Outcome) -> Ended {
         let build_id = u64::from(request.0);
         let links = self
@@ -2084,12 +2089,46 @@ impl<S: Steps> Job<S> {
         let mut misses = std::mem::take(&mut self.misses);
         misses.sort_unstable();
         misses.dedup();
-        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses }
+        let mut errors = std::mem::take(&mut self.panics);
+        for it in &mut errors {
+            it.build_id = build_id;
+        }
+        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses, errors }
     }
 
     /// The value its stage waited on, if node `node` gave it.
     fn take_value(&mut self, node: NodeId) -> Option<Value<S>> {
         self.value.take_if(|(at, _)| *at == node).map(|(_, value)| value)
+    }
+}
+
+/// The `errors` row of a task's `panic` (kind `daemon-panic`), said as `what`, of the package
+/// `krate` and the unit `unit` when known: its first line the message, the stack it was raised
+/// on the detail, and the file and line it was raised at. Of build 0 until its job ends
+/// ([`Job::ended`]).
+fn daemon_panic(panic: &plane::Panic, what: String, krate: Option<&str>, unit: Option<String>) -> ErrorRow {
+    // `file:line:column on thread T`, as the hook records it.
+    let place = panic.at.as_deref().and_then(|it| it.split_once(" on thread ")).map(|(place, _)| place);
+    let mut parts = place.map(|it| it.rsplitn(3, ':'));
+    let (_, line, file) = match parts.as_mut() {
+        Some(parts) => (parts.next(), parts.next(), parts.next()),
+        None => (None, None, None),
+    };
+    let message = match what.split_once('\n') {
+        Some((first, _)) => first.to_owned(), // alloc: a panic's row, once
+        None => what,
+    };
+    ErrorRow {
+        build_id: 0,
+        t_ns: Some(blaze_profile::clock::mono_ns()),
+        krate: krate.map(str::to_owned), // alloc: a panic's row, once
+        unit,
+        kind: profile_errors::Kind::DaemonPanic.name().to_owned(), // alloc: a panic's row, once
+        function: None,
+        message,
+        detail: panic.trace.as_deref().map(str::to_owned), // alloc: a panic's row, once
+        file: file.map(str::to_owned), // alloc: a panic's row, once
+        line: line.and_then(|it| it.parse().ok()),
     }
 }
 
@@ -2543,6 +2582,7 @@ impl<S: Steps> Jobs<S> {
             links: Vec::new(),  // alloc: none until a unit links
             linked: Vec::new(), // alloc: none until a unit links
             misses: Vec::new(), // alloc: none until a unit misses
+            panics: Vec::new(), // alloc: none until a task panics
             profiled,
             opened_ns: 0,
             opened_unix_ns: None,
@@ -2876,16 +2916,27 @@ impl<S: Steps> Jobs<S> {
 
     /// A task of a build's units that panicked fails its job with the panic, naming the unit.
     /// A task of any other stage fails its job as it settles, the panic its `why`.
+    /// Either way the panic is an `errors` row of the job's build in the history, its stack the
+    /// row's `detail` ([`daemon_panic`]).
     fn panicked(&mut self, node: NodeId, panic: &plane::Panic) {
         let Some(job) = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id))) else { return };
-        let Stage::Units(build) = &job.stage else { return };
-        let error = match build.unit(node).map(|at| &build.input.units.graph.units[at]) {
-            Some(unit) => ApiError::new(
-                format!("the daemon {panic}, building {} of {}", unit.target.name, unit.pkg_id), // alloc: an error, once
-                Some(unit.pkg_id.clone()), // clone: an error, once
-            ),
-            None => ApiError::new(format!("the daemon {panic}, building the units"), None), // alloc: an error, once
+        let Stage::Units(build) = &job.stage else {
+            job.panics.push(daemon_panic(panic, format!("the daemon {panic}"), None, None)); // alloc: a panic, once
+            return;
         };
+        let unit = build.unit(node).map(|at| &build.input.units.graph.units[at]);
+        let what = match unit {
+            Some(unit) => format!("the daemon {panic}, building {} of {}", unit.target.name, unit.pkg_id), // alloc: an error, once
+            None => format!("the daemon {panic}, building the units"), // alloc: an error, once
+        };
+        let krate = unit.and_then(|it| package_named(&build.input.units, &it.pkg_id));
+        let named = unit.map(|it| {
+            let kind = it.target.kind.first().map_or("", String::as_str);
+            format!("{} ({kind})", it.target.name) // alloc: a panic's row, once
+        });
+        let row = daemon_panic(panic, what.clone(), krate, named); // clone: a panic's row, once
+        job.panics.push(row);
+        let error = ApiError::new(what, unit.map(|it| it.pkg_id.clone())); // clone: an error, once
         job.over.get_or_insert((false, Some(error)));
     }
 

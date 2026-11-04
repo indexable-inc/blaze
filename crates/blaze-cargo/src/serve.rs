@@ -906,7 +906,9 @@ pub(crate) fn engine(serving: Serving, ready: Option<&mut std::fs::File>) -> any
     }
     signals::catch();
     signals::record_ends();
-    plane::record_panics();
+    // Each panic's stack, beside serve.log, synced as the panic is raised: what is left of a
+    // panic that aborts the daemon.
+    plane::record_panics(Some(paths.state.join(plane::PANICS_FILE)));
     plane::record_alloc_failures();
     // Each query run is progress to the stall watchdog: a check inside queries for minutes is
     // no stall. Set once per process, so a second daemon in one (tests) finds it set by the
