@@ -611,7 +611,7 @@ pub(crate) fn say(runs: &str, pin: Pin<'_>, manifest: Option<&Path>) {
 const USAGE: &str = "blaze update                     installs the newest release of the channel, which then runs \
                      outside pinned workspaces\n\
                      blaze update --check             reads latest.json now and says what is out; installs nothing\n\
-                     blaze update --mode warn|auto|off   what blaze does about newer releases ([update] mode)\n\
+                     blaze update --mode warn|auto|off|offline   what blaze does about newer releases ([update] mode)\n\
                      blaze update --channel stable|canary   which releases count ([update] channel)";
 
 /// `blaze update`: [`USAGE`].
