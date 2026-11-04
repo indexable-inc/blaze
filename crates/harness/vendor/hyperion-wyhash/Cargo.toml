@@ -1,0 +1,9 @@
+[package]
+name = "hyperion-wyhash"
+description = "Wyhash as a const fn (layout hashes), from hyperion. Zero dependencies."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]

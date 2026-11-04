@@ -1,0 +1,17 @@
+// ui.LazyColumn in a ui.Scroll: 10 000 rows, scrolled most of the way down; only the rows in view exist (the gallery
+// fills them with harness_native_ui_view::lazy_for_each and writes how many are alive into `status`).
+
+@tree ChildOf
+ex {
+  prefab LazyDemo : ex.Card {
+    label : ui.Label { Text: {s: "LAZY 10 000 ROWS"} }
+    status : ui.Words, Muted { Text: {s: ""} }
+    scroll : ui.Scroll {
+      ScrollState: {x: 0, y: 182000}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 132, min: 0, max: 0}}
+      rows : ui.LazyColumn {
+        Lazy: {count: 10000, row: 22, overscan: 2}
+      }
+    }
+  }
+}

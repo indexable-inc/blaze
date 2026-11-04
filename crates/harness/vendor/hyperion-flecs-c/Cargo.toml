@@ -1,0 +1,24 @@
+[package]
+name = "hyperion-flecs-c"
+description = "Compiles the vendored flecs v4.2.0 amalgamation (vendor/flecs, from indexable-inc/flecs indexable/v4.2; custom build: core plus log, addons by feature) with cc, -O2, for the host and for wasm32-unknown-unknown (with the small C library in wasm-libc/)."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+links = "denflecs"
+build = "build.rs"
+
+[features]
+# Core features that flecs 4.2 moved out of the core into addons (all were core in 4.1).
+prefab = []
+constraint_traits = []
+cached_queries = []
+query_plans = []
+system = []
+pipeline = ["system", "cached_queries", "query_plans"]
+meta = []
+script = ["meta"]
+json = ["meta"]
+
+[build-dependencies]
+cc = "1"

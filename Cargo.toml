@@ -13,6 +13,9 @@ members = [
 # must not be unified into a build of the native crates.
 exclude = [
     "crates/blaze-wasm",
+    # harness, its own workspace with its own lock: a macOS app and daemon blaze does not build
+    # (crates/harness/README.md).
+    "crates/harness",
     "demo",
     "harness",
     # The standard library's own workspace (docs/toolchain.md).

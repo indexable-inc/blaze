@@ -1,0 +1,24 @@
+// LayoutPriority and Truncate: rows 250 points wide whose name does not fit beside its badge. The name (priority 0) gives
+// up its room before the badge (priority 1), cut at its end, middle or start. The last row has a FixedSize badge and no
+// priority: the badge keeps its width anyway.
+
+@tree ChildOf
+ex {
+  prefab TruncRow : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fixed, value: 250, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    name : ui.Line { Text: {s: "harness-native-swiftui-vocabulary-lane.flecs"} }
+    badge : ex.Pill { LayoutPriority: {value: 1}; words { Text: {s: "12 runs"} } }
+  }
+
+  prefab TruncateDemo : ex.Card {
+    label : ui.Label { Text: {s: "LAYOUTPRIORITY, TRUNCATE, FIXEDSIZE"} }
+    tail : ex.TruncRow { name { Truncate: {mode: Tail} } }
+    middle : ex.TruncRow { name { Truncate: {mode: Middle} } }
+    head : ex.TruncRow { name { Truncate: {mode: Head} } }
+    fixed : ex.TruncRow {
+      name { Truncate: {mode: Tail} }
+      badge { LayoutPriority: {value: 0}; FixedSize: {h: true, v: false}; words { Text: {s: "FixedSize"} } }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+// What the SwiftUI-vocabulary examples share: a card per example (a label over its body) and a small pill. Loaded after
+// prims.flecs; the gallery (99-gallery.flecs) lays the cards out in an adaptive grid.
+
+@tree ChildOf
+ex {
+  prefab Card : ui.Box {
+    Flex: {axis: Column, gap: 10, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 14, r: 14, t: 12, b: 14}
+  }
+
+  // A rounded plate in the accent, for backgrounds and badges.
+  prefab Plate : ui.Node {
+    Fill: {dark: {0.580, 0.600, 1.0, 0.22}, light: {0.369, 0.384, 0.902, 0.16}}
+    Shape: {radius: 7, n: 4, border: 0, feather: 0}
+  }
+
+  // A badge: words on an accent plate.
+  prefab Pill : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Padding: {l: 7, r: 7, t: 2, b: 2}
+    bg : ex.Plate { Background }
+    words : ui.Line, Accent {
+      Text: {s: "badge"}
+      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 1}
+    }
+  }
+
+  // A thin outline drawn over its parent (an Overlay child).
+  prefab Outline : ui.Node {
+    Edge: {dark: {0.580, 0.600, 1.0, 0.9}, light: {0.369, 0.384, 0.902, 0.9}}
+    Shape: {radius: 7, n: 4, border: 1, feather: 0}
+  }
+}

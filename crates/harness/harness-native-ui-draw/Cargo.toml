@@ -1,0 +1,25 @@
+[package]
+name = "harness-native-ui-draw"
+description = "Hot-swappable draw pass: decides what each Node paints, in what order, and says so on the node (copied from den, github.com/andrewgazelka/den)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+
+[dependencies]
+harness-native-flecs = { path = "../harness-native-flecs" }
+harness-native-api = { path = "../harness-native-api" }
+harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }
+harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
+harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
+harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
+harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
+
+[lints.rust]
+# The module exports are `no_mangle` statics and `extern "C"` fns (harness-native-api `module!`).
+unsafe_code = "allow"
+
+[lints.clippy]
+dbg_macro = "warn"

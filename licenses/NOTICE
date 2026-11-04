@@ -16,3 +16,13 @@ Verus (MIT), copyright the Verus contributors: vendor/verus (air, vir, vir_macro
 used by crates/hir-ty-verus; the license text is vendor/verus/LICENSE and vendor/verus/SOURCE.md
 says what blaze changed. The parser's Verus syntax follows verus-analyzer's grammar (MIT OR
 Apache-2.0), copyright the verus-analyzer and rust-analyzer developers.
+
+harness (crates/harness, its own cargo workspace; crates/harness/README.md) carries its own
+licenses: its crates say theirs in their Cargo.toml. Third-party code and data it vendors:
+- Flecs (MIT), copyright Sander Mertens: crates/harness/vendor/flecs, license text
+  crates/harness/vendor/flecs/LICENSE; SOURCE.md there names the version and the patches.
+- Inter (SIL OFL 1.1), copyright the Inter Project Authors: crates/harness/harness-native/fonts/inter.
+- JetBrains Mono (SIL OFL 1.1), copyright the JetBrains Mono Project Authors:
+  crates/harness/harness-native/fonts/jetbrains-mono.
+- Symbols Nerd Font (MIT), copyright Ryan L McIntyre: crates/harness/harness-native/fonts/nerd-symbols.
+Each font directory holds its license text.

@@ -1,0 +1,35 @@
+// The SwiftUI-vocabulary gallery (HARNESS_NATIVE_GALLERY=1 with HARNESS_NATIVE_SHOT): every example card in an adaptive
+// grid filling the window. The host writes the window's SafeAreaInset on it (the title-bar strip); its header pads
+// itself out of it.
+
+swiftui_gallery : ui.Column {
+  Fill: $tone_plate
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+  SafeAreaInset: {l: 0, r: 0, t: 0, b: 0}
+  head : ui.Row {
+    SafeAreaPadding: {l: false, r: false, t: true, b: false}
+    Flex: {axis: Row, gap: 10, align: FirstBaseline, justify: Start, wrap: false}
+    Padding: {l: 20, r: 20, t: 8, b: 0}
+    title : ui.Words, Strong { Text: {s: "Layout vocabulary"}; TextStyle: {size: 22, line: 28, role: 0, bold: 1} }
+    sub : ui.Words, Muted { Text: {s: "SwiftUI's, as flecs components and prims"} }
+  }
+  cards : ui.AdaptiveGrid {
+    GridColumns: {min: 290, max: 0}
+    Flex: {axis: Column, gap: 12, align: Stretch, justify: Start, wrap: false}
+    Padding: {l: 20, r: 20, t: 0, b: 20}
+    grid : ex.GridDemo {}
+    adaptive : ex.AdaptiveDemo {}
+    lazy : ex.LazyDemo {}
+    baseline : ex.BaselineDemo {}
+    alignself : ex.AlignSelfDemo {}
+    truncate : ex.TruncateDemo {}
+    compose : ex.ComposeDemo {}
+    safearea : ex.SafeAreaDemo {}
+    fits : ex.FitsDemo {}
+    matched : ex.MatchedDemo {}
+    transition : ex.TransitionDemo {}
+    removal : ex.RemovalDemo {}
+    animate : ex.AnimateDemo {}
+  }
+}
