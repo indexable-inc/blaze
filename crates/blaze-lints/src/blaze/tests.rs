@@ -746,6 +746,37 @@ pub fn named(s: &str) -> String { //~ implicit_allocator
     );
 }
 
+/// An `impl Trait`'s bounds name the type they bound (`impl Iterator` is bounded by
+/// `Self: Iterator`), so the walk of a written `impl Trait` meets it again in its own bounds:
+/// it walks each one's bounds once and ends, in argument and return position, with or without
+/// a finding (it once recursed until a pool worker's stack overflowed and the daemon died).
+#[test]
+fn implicit_allocator_ends_on_an_impl_trait_that_names_itself() {
+    check_implicit(
+        r#"
+pub struct Count(u32);
+impl Iterator for Count {
+    type Item = u32;
+}
+
+pub fn takes(_items: impl Iterator<Item = u32>) {}
+pub fn takes_rows(_rows: impl Iterator<Item = Vec<u32>>) {} //~ implicit_allocator
+pub fn gives() -> impl Iterator<Item = u32> {
+    Count(0)
+}
+pub fn gives_nested() -> impl Iterator<Item = impl Iterator<Item = u32>> {
+    Count(0)
+}
+
+pub fn calls() {
+    takes(Count(0));
+    let _ = gives();
+    let _ = gives_nested();
+}
+"#,
+    );
+}
+
 #[test]
 fn hot_dyn() {
     check(
