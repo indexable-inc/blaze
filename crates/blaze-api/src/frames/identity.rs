@@ -611,6 +611,7 @@ impl Gen {
                 requests: self.many(depth, Gen::wide),
                 settings: self
                     .many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
+                uptime_ms: self.wide(),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
                 build: crate::Build {

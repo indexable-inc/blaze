@@ -41,6 +41,7 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
+  "harness/norustc/setup.py",
   "harness/own_inputs.py",
   "harness/profile_fixtures.py",
   "harness/profile_gate.py",
@@ -66,6 +67,7 @@ include = [
 "harness/hermetic.py" = ["E402"]
 "harness/includes.py" = ["E402"]
 "harness/keys.py" = ["E402"]
+"harness/norustc/setup.py" = ["E402"]
 "harness/v2/*.py" = ["E402"]
 
 [tool.pyright]
@@ -84,6 +86,7 @@ include = [
   "harness/incremental.py",
   "harness/keys.py",
   "harness/live_types.py",
+  "harness/norustc/setup.py",
   "harness/own_inputs.py",
   "harness/profile_fixtures.py",
   "harness/profile_gate.py",

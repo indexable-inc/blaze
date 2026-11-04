@@ -5,7 +5,10 @@ where each step began and ended, how it ended, and what it printed, for classify
 
     count.py ripgrep|nushell|bevy|bun
 
-setup.sh prepares `$NR_ROOT` (default ~/no-rustc) first. NR_PATH_PREFIX goes in front of
+setup.py prepares `$NR_ROOT` (default ~/no-rustc) first: the blaze in `bin/` and the counted
+copy of blaze's toolchain that `setup.json` names, which is linked into a user's home of the
+run's own (`HOME`'s `.blaze/toolchains`, where blaze looks for its toolchain whatever
+BLAZE_HOME says) and put on PATH. NR_PATH_PREFIX goes in front of
 PATH and NR_ENV (JSON) is added to the environment, for a project that needs native
 libraries. docs/no-rustc.md has what these counted. A step ends when its command returns and
 the counted toolchains have gone quiet; v1 also waited for `blaze status` to say `ready`, but
@@ -19,6 +22,16 @@ import bench  # noqa: E402  (PROJECTS: repos, revisions and edits)
 
 # The cores the builds may use, on a host shared with another lane: NR_CPUS=96-191.
 PIN = ["taskset", "-c", os.environ["NR_CPUS"]] if os.environ.get("NR_CPUS") else []
+
+
+def prepared():
+    """What setup.py wrote: the blaze built, and the counted toolchain and its name."""
+    path = f"{L}/setup.json"
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as error:
+        sys.exit(f"count.py: {path} is not setup.py's ({error}): run harness/norustc/setup.py first")
 
 
 def project_spec(name):
@@ -56,19 +69,27 @@ def apply(ws, edits):
 
 def main():
     name = sys.argv[1]
+    setup = prepared()
     base, spec = project_spec(name)
     ws = checkout(base, spec)
     home, cargo_home = (f"{L}/{d}/{name}" for d in ("home", "cargo-home"))
     shutil.rmtree(home, ignore_errors=True)
     os.makedirs(home, mode=0o700)
+    # blaze finds its toolchain at $HOME/.blaze/toolchains/<name>, for every BLAZE_HOME: the
+    # run's own HOME has the counted one there.
+    user = f"{L}/user/{name}"
+    shutil.rmtree(user, ignore_errors=True)
+    os.makedirs(f"{user}/.blaze/toolchains")
+    os.symlink(setup["counted"], f"{user}/.blaze/toolchains/{setup['toolchain']}")
+    real_home = os.path.expanduser("~")
     os.makedirs(cargo_home, exist_ok=True)
     log = f"{L}/logs/{name}.log"
     open(log, "w").close()
     env = {k: v for k, v in os.environ.items() if not k.startswith(("BLAZE_", "RUSTC", "CARGO"))}
     prefix = os.environ.get("NR_PATH_PREFIX", "")
-    env.update(PATH=f"{L}/target/release:{prefix + ':' if prefix else ''}/run/current-system/sw/bin:{env['PATH']}",
-               RUSTUP_TOOLCHAIN="nr-pin",
-               BLAZE_HOME=home, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
+    env.update(PATH=f"{L}/bin:{setup['counted']}/bin:{prefix + ':' if prefix else ''}/run/current-system/sw/bin:{env['PATH']}",
+               BLAZE_HOME=home, HOME=user, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
+               XDG_CACHE_HOME=os.environ.get("XDG_CACHE_HOME") or f"{real_home}/.cache",
                BLAZE_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
     # The standard library's crates are units of the first build like any other.
     extra = json.loads(os.environ.get("NR_ENV", "{}"))
@@ -80,7 +101,7 @@ def main():
         """Waits until nothing of the counted toolchains runs and the log stopped growing."""
         began, size, still = time.time(), -1, 0
         while time.time() - began < limit:
-            busy = subprocess.run(["pgrep", "-f", f"{L}/tc-[a-z]+/bin/"], capture_output=True).returncode == 0
+            busy = subprocess.run(["pgrep", "-f", f"{setup['counted']}/bin/"], capture_output=True).returncode == 0
             now = os.path.getsize(log)
             still = still + 1 if (now == size and not busy) else 0
             size = now
@@ -88,6 +109,7 @@ def main():
                 return
             time.sleep(1)
 
+    # A command returns when its build is done; what the daemon does after it, `quiet` waits for.
     def step(label, argv, edits=()):
         if edits:
             apply(ws, edits)

@@ -17,8 +17,9 @@ The daemon is started here, not by the first `blaze build` (crates/blaze-cargo/s
 `scratch` and `run` are what other harnesses take from here too, and the readers of what blaze
 says for machines, which every harness reads facts from rather than the text blaze prints for
 people: `messages` (a build's `--message-format=json` lines), `worked` and `links` (its
-`blaze-work` line: what the daemon did and how it linked each image), `daemon_pid` (the
-daemon's lock), and `Daemon.command` with `test_results`: any blaze command asked of the daemon,
+`blaze-work` line: what the daemon did and how it linked each image), `split_build_output`
+and `build_finished` (its `build-finished` line), `blaze_status` (`blaze status --json`),
+`blaze_toolchain` (`blaze toolchain --json`), `daemon_pid` (the daemon's lock), and `Daemon.command` with `test_results`: any blaze command asked of the daemon,
 and the `blaze-test-result` lines of a `blaze test --reached --message-format=json`
 (crates/blaze-cargo/src/cli/json.rs, `test_result`) read into `TestLine`s.
 """
@@ -178,8 +179,9 @@ def daemon_pid(home: str) -> int | None:
     daemon's pid as it starts and `<pid> stopped` once its stop wrote its image. A pid the lock
     names without `stopped` whose process is gone ended without its stop: None too.
 
-    `blaze status` prints the same pid for people only (`pid: N`, `status_lines`) and has no
-    machine format, so a harness reads the lock, not that text."""
+    `blaze status --json` (`blaze_status`) says the same pid, but only from a daemon that
+    answers; the lock names one that is busy, stopping or wedged too, so this is the one reader
+    of the daemon's pid."""
     try:
         with open(os.path.join(state_of(home), "serve.lock")) as lock:
             words = lock.read().split()
@@ -236,14 +238,15 @@ def text_of(message: Message, field: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def field_of[T](message: Mapping[str, object], field: str, kind: type[T]) -> T:
+def field_of[T](message: Mapping[str, object], field: str, kind: type[T], where: str | None = None) -> T:
     """The field `field` of `message`, of type `kind`; a message without one, or with one of
-    another type, is refused, naming both."""
+    another type, is refused, naming both and `where` the message came from (by default its
+    `reason`)."""
     value = message.get(field)
     # bool is an int to isinstance: a number field never takes one.
     if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
         reason = message.get("reason")
-        what = f"the `{reason}` message" if isinstance(reason, str) else "a message's object"
+        what = where or (f"the `{reason}` message" if isinstance(reason, str) else "a message's object")
         raise Failed(f"{what}'s `{field}` is {value!r}, not {kind.__name__}: {dict(message)}")
     return value
 
@@ -654,3 +657,260 @@ def test_results(stdout: str) -> list[TestLine]:
             )
         )
     return found
+
+
+# What blaze says of itself in its machine formats, read into frozen dataclasses: the
+# `build-finished` line every build, check, run and test ends its build with under
+# `--message-format=json` (or `json-render-diagnostics`), `blaze status --json` and
+# `blaze toolchain --json` (docs/cargo.md names every field). Each reader refuses a value of
+# another shape by raising `Failed` naming the field, never guesses: a harness that reads one
+# wrong is a harness bug to see, not a build to count. Self-contained (the standard library
+# only) and typed for pyright's strict mode, so any harness takes them as they are.
+
+type Json = None | bool | int | float | str | list["Json"] | dict[str, "Json"]
+
+
+def _object(where: str, value: Json) -> dict[str, Json]:
+    if not isinstance(value, dict):
+        raise Failed(f"{where} is not a JSON object: {value!r:.200}")
+    return value
+
+
+def _maybe[T](where: str, value: dict[str, Json], name: str, kind: type[T]) -> T | None:
+    if value.get(name, ...) is None:
+        return None
+    return field_of(value, name, kind, where)
+
+
+def _only(where: str, value: dict[str, Json], names: set[str]) -> None:
+    unknown = sorted(set(value) - names)
+    if unknown:
+        raise Failed(f"{where} has fields this harness does not know: {', '.join(unknown)}")
+
+
+@dataclass(frozen=True)
+class FinishedUnits:
+    """The build's units: made again, and replayed from the store as they were."""
+    built: int
+    replayed: int
+
+
+@dataclass(frozen=True)
+class FinishedLinks:
+    """Each image the build linked, by how: its first link, spliced into the last, unchanged,
+    or laid out whole again (`full`)."""
+    first: int
+    spliced: int
+    unchanged: int
+    full: int
+
+
+@dataclass(frozen=True)
+class BuildFinished:
+    """`{"reason":"build-finished", ...}`: how a build ended."""
+    success: bool
+    # The profile's name (`dev`, `release`), None when the build placed nothing.
+    profile: str | None
+    # "daemon", or "in-process" for the seed's one-shot engine.
+    served: str
+    took_ms: int
+    # The history's `build_id` (`blaze slow --build N`); None with no work report.
+    build_id: int | None
+    units: FinishedUnits | None
+    links: FinishedLinks | None
+
+    @property
+    def daemon(self) -> bool:
+        """Whether blaze's daemon built it and the build succeeded."""
+        return self.success and self.served == "daemon"
+
+
+FINISHED_FIELDS = {"reason", "success", "profile", "served", "took_ms", "build_id", "units", "links"}
+
+
+def build_finished_of(line: str) -> BuildFinished:
+    """One `build-finished` line read, refused whole when it is not one."""
+    where = "the `build-finished` line"
+    try:
+        value = _object(where, json.loads(line))
+    except json.JSONDecodeError as error:
+        raise Failed(f"{where} is not JSON ({error}): {line!r:.300}") from error
+    if value.get("reason") != "build-finished":
+        raise Failed(f"{where} has reason {value.get('reason')!r}: {line!r:.300}")
+    _only(where, value, FINISHED_FIELDS)
+    units = links = None
+    if (raw := value.get("units")) is not None:
+        it = _object(f"{where}'s `units`", raw)
+        _only(f"{where}'s `units`", it, {"built", "replayed"})
+        units = FinishedUnits(built=field_of(it, "built", int, where), replayed=field_of(it, "replayed", int, where))
+    if (raw := value.get("links")) is not None:
+        it = _object(f"{where}'s `links`", raw)
+        _only(f"{where}'s `links`", it, {"first", "spliced", "unchanged", "full"})
+        links = FinishedLinks(first=field_of(it, "first", int, where), spliced=field_of(it, "spliced", int, where),
+                              unchanged=field_of(it, "unchanged", int, where), full=field_of(it, "full", int, where))
+    return BuildFinished(
+        success=field_of(value, "success", bool, where),
+        profile=_maybe(where, value, "profile", str),
+        served=field_of(value, "served", str, where),
+        took_ms=field_of(value, "took_ms", int, where),
+        build_id=_maybe(where, value, "build_id", int),
+        units=units,
+        links=links,
+    )
+
+
+FINISHED_PREFIX = '{"reason":"build-finished"'
+
+
+def split_build_output(stdout: str) -> tuple[BuildFinished | None, str]:
+    """A command's stdout under `--message-format=json(-render-diagnostics)` cut at its
+    `build-finished` line: what that line says, and what came after it, which is the program's
+    (`blaze run`) or the tests' (`blaze test`) own output. Every line before it is one of blaze's
+    JSON messages. (None, stdout) when no build finished: a command refused before it built.
+    More than one `build-finished` is refused: one command is one build."""
+    lines = stdout.splitlines(keepends=True)
+    at = [n for n, line in enumerate(lines) if line.startswith(FINISHED_PREFIX)]
+    if not at:
+        return None, stdout
+    if len(at) > 1:
+        raise Failed(f"one command's stdout has {len(at)} `build-finished` lines: {stdout[-1500:]!r}")
+    return build_finished_of(lines[at[0]]), "".join(lines[at[0] + 1:])
+
+
+def build_finished(stdout: str) -> BuildFinished | None:
+    """The `build-finished` line of a command's stdout, read; None when it has none."""
+    return split_build_output(stdout)[0]
+
+
+@dataclass(frozen=True)
+class DaemonStatus:
+    """The daemon's half of `blaze status --json`."""
+    pid: int
+    # The hash of its executable as it started, in hex.
+    build: str
+    exe: str
+    uptime_ms: int
+    memory_bytes: int
+    budget_bytes: int
+    # Bugs it went on past, every site's summed.
+    bugs: int
+    requests: tuple[int, ...]
+    views: int
+    history: str | None
+    settings: tuple[tuple[str, str | None], ...]
+
+
+@dataclass(frozen=True)
+class BlazeStatus:
+    """`blaze status --json`: this blaze, where it keeps its state, and its daemon (None when
+    none runs)."""
+    version: str
+    api_schema: int
+    home: str
+    state: str
+    socket: str
+    daemon: DaemonStatus | None
+
+
+STATUS_FORMAT = 1
+
+
+def blaze_status_of(text: str) -> BlazeStatus:
+    """What `blaze status --json` printed, read."""
+    where = "`blaze status --json`"
+    try:
+        value = _object(where, json.loads(text))
+    except json.JSONDecodeError as error:
+        raise Failed(f"{where} is not JSON ({error}): {text!r:.300}") from error
+    _only(where, value, {"format", "version", "api_schema", "home", "state", "socket", "daemon"})
+    if (form := field_of(value, "format", int, where)) != STATUS_FORMAT:
+        raise Failed(f"{where} is of format {form}, this harness reads {STATUS_FORMAT}")
+    daemon = None
+    if (raw := value.get("daemon")) is not None:
+        inner = f"{where}'s `daemon`"
+        it = _object(inner, raw)
+        _only(inner, it, {"pid", "build", "exe", "uptime_ms", "memory_bytes", "budget_bytes", "bugs",
+                          "requests", "views", "history", "settings"})
+        requests_raw, settings_raw = it.get("requests"), it.get("settings")
+        if not isinstance(requests_raw, list) or not isinstance(settings_raw, dict):
+            raise Failed(f"{inner}'s `requests` is no list or its `settings` no object: {raw!r:.300}")
+        requests = tuple(r for r in requests_raw if isinstance(r, int) and not isinstance(r, bool))
+        settings = tuple((k, v) for k, v in sorted(settings_raw.items()) if v is None or isinstance(v, str))
+        if len(requests) != len(requests_raw) or len(settings) != len(settings_raw):
+            raise Failed(f"{inner} has a request that is no number or a setting that is no string: {raw!r:.300}")
+        daemon = DaemonStatus(
+            pid=field_of(it, "pid", int, inner),
+            build=field_of(it, "build", str, inner),
+            exe=field_of(it, "exe", str, inner),
+            uptime_ms=field_of(it, "uptime_ms", int, inner),
+            memory_bytes=field_of(it, "memory_bytes", int, inner),
+            budget_bytes=field_of(it, "budget_bytes", int, inner),
+            bugs=field_of(it, "bugs", int, inner),
+            requests=requests,
+            views=field_of(it, "views", int, inner),
+            history=_maybe(inner, it, "history", str),
+            settings=settings,
+        )
+    return BlazeStatus(
+        version=field_of(value, "version", str, where),
+        api_schema=field_of(value, "api_schema", int, where),
+        home=field_of(value, "home", str, where),
+        state=field_of(value, "state", str, where),
+        socket=field_of(value, "socket", str, where),
+        daemon=daemon,
+    )
+
+
+def blaze_status(blaze: str, env: dict[str, str], cwd: str | None = None, timeout: float = 60) -> BlazeStatus:
+    """`blaze status --json` asked of the daemon `env`'s home names (`BLAZE_HOME`); it starts
+    none. A failed answer is `Failed`, naming its exit code and stderr."""
+    ran = subprocess.run([blaze, "status", "--json"], cwd=cwd, env=env, capture_output=True, text=True,
+                         timeout=timeout, stdin=subprocess.DEVNULL)
+    if ran.returncode != 0:
+        raise Failed(f"`{blaze} status --json` exited {ran.returncode}: {ran.stderr[-1500:]}")
+    return blaze_status_of(ran.stdout)
+
+
+@dataclass(frozen=True)
+class Toolchain:
+    """`blaze toolchain --json`: the Rust blaze builds with, as blaze and rustup name it."""
+    name: str
+    nightly: str
+    rustc: str
+    release: str
+    commit: str
+    host: str
+    sysroot: str
+
+
+def blaze_toolchain_of(text: str) -> Toolchain:
+    """What `blaze toolchain --json` printed, read. A host blaze ships no toolchain for
+    (`"host": null`) is refused: nothing it would build is for a tuple anyone can name."""
+    where = "`blaze toolchain --json`"
+    try:
+        value = _object(where, json.loads(text))
+    except json.JSONDecodeError as error:
+        raise Failed(f"{where} is not JSON ({error}): {text!r:.300}") from error
+    names = {"name", "nightly", "rustc", "release", "commit", "host", "sysroot"}
+    _only(where, value, names)
+    host = _maybe(where, value, "host", str)
+    if host is None:
+        raise Failed(f"{where}: blaze ships no toolchain for this host")
+    return Toolchain(
+        name=field_of(value, "name", str, where),
+        nightly=field_of(value, "nightly", str, where),
+        rustc=field_of(value, "rustc", str, where),
+        release=field_of(value, "release", str, where),
+        commit=field_of(value, "commit", str, where),
+        host=host,
+        sysroot=field_of(value, "sysroot", str, where),
+    )
+
+
+def blaze_toolchain(blaze: str, env: dict[str, str], timeout: float = 900) -> Toolchain:
+    """`blaze toolchain --json`: downloads blaze's Rust once when it is not there yet."""
+    ran = subprocess.run([blaze, "toolchain", "--json"], env=env, capture_output=True, text=True,
+                         timeout=timeout, stdin=subprocess.DEVNULL)
+    if ran.returncode != 0:
+        raise Failed(f"`{blaze} toolchain --json` exited {ran.returncode}: {ran.stderr[-1500:]}")
+    return blaze_toolchain_of(ran.stdout)

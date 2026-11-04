@@ -50,6 +50,7 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+import storelib
 from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -387,13 +388,13 @@ def toolchain():
     once into `~/.blaze/toolchains`, which every BLAZE_HOME reads (crates/blaze-cargo's
     `toolchain::own::toolchains`). A harness that starts `blaze serve` itself downloads nothing,
     and that daemon stops at once where the toolchain is not whole, so a runner (whose harness
-    job installs no blaze) and a Mac start every part the same way."""
-    ran = subprocess.run([BLAZE_CLI, "toolchain"], capture_output=True, text=True, timeout=1800, check=False)
-    if ran.returncode:
-        sys.exit(
-            f"ci.py: `{BLAZE_CLI} toolchain` exited {ran.returncode}, so no harness can build:\n{ran.stderr[-3000:]}"
-        )
-    print(ran.stdout.strip(), flush=True)
+    job installs no blaze) and a Mac start every part the same way. It is read as every harness
+    reads it, by `storelib.blaze_toolchain` (`blaze toolchain --json`)."""
+    try:
+        own = storelib.blaze_toolchain(BLAZE_CLI, dict(os.environ), timeout=1800)
+    except storelib.Failed as error:
+        sys.exit(f"ci.py: {error}, so no harness can build")
+    print(f"toolchain: {own.name} ({own.rustc}) for {own.host} at {own.sysroot}", flush=True)
 
 
 def run(part):

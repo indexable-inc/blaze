@@ -146,7 +146,8 @@ pub fn output(
 /// object or member that asked) and every directory searched. `sysroot` is blaze's toolchain
 /// (`blaze toolchain --path`), whose self-contained C runtime WASI links and whose target
 /// library directory has the sanitizer runtimes. Sets [`Output::rpaths`] to where the loader
-/// finds a shared runtime; set [`Output::sanitize`] first.
+/// finds a shared runtime, then the link arguments' ([`crate::LinkArgs::rpaths`]); set
+/// [`Output::sanitize`] and [`Output::link`] first.
 pub fn locate(
     output: &mut Output,
     libs: &[NativeLib],
@@ -155,6 +156,9 @@ pub fn locate(
 ) -> Result<Vec<Located>, LinkError> {
     let located = locate_with(&CACHE, &System, output, libs, search, sysroot)?;
     output.rpaths = rpaths(Target::parse(&output.triple)?, output, sysroot)?;
+    // The link arguments' after the runtimes', as rustc's link line has them.
+    // clone: once per link, the rpaths the output owns
+    output.rpaths.extend(output.link.rpaths.iter().cloned());
     Ok(located)
 }
 
@@ -376,6 +380,7 @@ fn output_with<A: Ask>(
         sanitize: Sanitize::default(),
         // alloc: none, an empty `Vec` until `locate` sets it
         rpaths: Vec::new(),
+        link: crate::LinkArgs::default(),
     })
 }
 

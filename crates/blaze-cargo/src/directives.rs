@@ -46,7 +46,7 @@ pub const SYSTEM: [&str; 11] = [
 
 /// The link arguments a script may give, whole: what changes how the output is linked, never
 /// which program links it or what it loads.
-pub const LINK_ARGS: [&str; 16] = [
+pub const LINK_ARGS: [&str; 20] = [
     "-pthread",
     "-rdynamic",
     "-nostartfiles",
@@ -61,6 +61,12 @@ pub const LINK_ARGS: [&str; 16] = [
     "-Wl,-undefined,dynamic_lookup",
     "-Wl,-dead_strip",
     "-Wl,-headerpad_max_install_names",
+    "-headerpad_max_install_names",
+    "-Wl,-z,defs",
+    // pyo3's `extension-module` on macOS: two arguments, `-undefined` then its value. Neither
+    // names a path, and blaze's linker reads `dynamic_lookup` only after `-undefined`.
+    "-undefined",
+    "dynamic_lookup",
     // Apple's: load every member of an archive that defines an Objective-C class or category.
     "-ObjC",
     "-Wl,-ObjC",

@@ -27,9 +27,11 @@ report gives the median, min and max.
 `--pause S` waits S seconds after the setup build, before the no-op and the edits, as a
 person would before the first edit.
 
-Every `blaze build` timed runs with `--message-format=json`, and the row says how the daemon
-served it from its `blaze-work` line: `daemon, patched` or `daemon, placed` (how the request
-linked), or `NOT SERVED` when it printed none.
+Every `blaze build` runs with `--message-format=json-render-diagnostics` (`BLAZE_BUILD`),
+and who built it (the row's `built`) is its `build-finished` line, read by
+`blaze_cli.how_built`, with, for the daemon's, how the request linked from its `blaze-work`
+line (`daemon, patched` or `daemon, placed`). The host's `rustc` is the release
+`blaze toolchain --json` names.
 
 Every warm `blaze build` (no-op and edits) runs with BLAZE_PROFILE, and the row keeps
 where the time of its median run went: the build's critical path from the trace BLAZE_PROFILE
@@ -43,6 +45,8 @@ import asyncio, json, os, shutil, statistics, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import storelib  # noqa: E402
+from blaze_cli import how_built, machine_format  # noqa: E402
 from storelib import worked  # noqa: E402
 
 ROOT = os.path.dirname(HERE)
@@ -50,6 +54,8 @@ BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 SOURCES = os.environ.get("BLAZE_PROJECTS") or os.path.expanduser("~/blaze-projects")
 STEP_SECS = 3600
+# `blaze build` with the format `how_built` reads who built it by.
+BLAZE_BUILD = ["blaze", "build", *machine_format("build", ())]
 
 
 def stmt(r, indent):
@@ -130,16 +136,13 @@ async def run(argv, cwd, env, step, timeout=STEP_SECS, check=True):
     return took, proc.returncode, out, err
 
 
-# A `blaze build` timed, with the `blaze-work` line `how_built` reads.
-BUILD = ["blaze", "build", "--message-format=json"]
-
-
-def how_built(stdout):
-    """How the daemon served a `blaze build --message-format=json`, from its `blaze-work` line:
-    how the request linked (`patched` or `placed`). A build without one was not served. (v1
-    read here why cargo built instead; v2 has no cargo to fall back to.)"""
-    works = worked(stdout)
-    return f"daemon, {works[-1].link}" if works else "NOT SERVED"
+def built_by(rc, out, err):
+    """Who built a `BLAZE_BUILD` that exited `rc` and printed `out` and `err`: its
+    `build-finished` line (`blaze_cli.how_built`), and for the daemon's, how the request linked
+    (`patched` or `placed`) from its `blaze-work` line."""
+    how = how_built(subprocess.CompletedProcess(BLAZE_BUILD, rc, out, err))
+    works = worked(out)
+    return f"{how}, {works[-1].link}" if how == "daemon" and works else how
 
 
 async def traced(argv, cwd, env, step, trace):
@@ -225,8 +228,8 @@ async def project(name, spec, work, runs, parts, pause=0.0):
             shutil.copytree(seed, store_of(home), symlinks=True)
         shutil.rmtree(target, ignore_errors=True)
         env = base_env(home, target)
-        took, _, out, _ = await run(BUILD, cwd, env, f"{name} {label} {i} build")
-        how = how_built(out)
+        took, rc, out, err = await run(BLAZE_BUILD, cwd, env, f"{name} {label} {i} build")
+        how = built_by(rc, out, err)
         print(f"  {label:16} run {i}: build {took:7.2f}s  ({how})", flush=True)
         return took, how, env
 
@@ -258,7 +261,7 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     else:
         os.makedirs(env["BLAZE_HOME"], mode=0o700, exist_ok=True)
         await run(["cargo", "build"], ws, cargo_env, f"{name} cargo setup")
-        await run(["blaze", "build"], ws, env, f"{name} blaze setup")
+        await run(BLAZE_BUILD, ws, env, f"{name} blaze setup")
     await run(["cargo", "build"], ws, cargo_env, f"{name} cargo settle")
     await asyncio.sleep(pause)
     # The linker each side's program was linked with.
@@ -269,8 +272,8 @@ async def project(name, spec, work, runs, parts, pause=0.0):
     if "noop" in parts:
         c, r, built, spent = [], [], [], []
         for i in range(1, runs + 1):
-            took, _, out, _, steps = await traced(BUILD, ws, env, f"{name} noop blaze {i}", trace)
-            r.append(took); built.append(how_built(out)); spent.append(steps)
+            took, rc, out, err, steps = await traced(BLAZE_BUILD, ws, env, f"{name} noop blaze {i}", trace)
+            r.append(took); built.append(built_by(rc, out, err)); spent.append(steps)
             took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} noop cargo {i}")
             c.append(took)
             print(f"  {'no-op':16} run {i}: blaze {r[-1]:6.2f}s ({built[-1]})  cargo {took:6.2f}s", flush=True)
@@ -285,8 +288,8 @@ async def project(name, spec, work, runs, parts, pause=0.0):
             try:
                 for i in range(1, runs + 1):
                     open(file, "w").write(edit_text(kind, spec, pristine, i))
-                    took, _, out, _, steps = await traced(BUILD, ws, env, f"{name} {kind} blaze {i}", trace)
-                    r.append(took); built.append(how_built(out)); spent.append(steps)
+                    took, rc, out, err, steps = await traced(BLAZE_BUILD, ws, env, f"{name} {kind} blaze {i}", trace)
+                    r.append(took); built.append(built_by(rc, out, err)); spent.append(steps)
                     took, _, _, _ = await run(["cargo", "build"], ws, cargo_env, f"{name} {kind} cargo {i}")
                     c.append(took)
                     a, b = await outputs(ws, tr, spec, f"{name} {kind} run"), await outputs(ws, tc, spec, f"{name} {kind} run")
@@ -296,7 +299,7 @@ async def project(name, spec, work, runs, parts, pause=0.0):
                         print(f"    blaze: {a}\n    cargo:  {b}", flush=True)
             finally:
                 open(file, "w").write(pristine)
-            await run(["blaze", "build"], ws, env, f"{name} {kind} restore")
+            await run(BLAZE_BUILD, ws, env, f"{name} {kind} restore")
             await run(["cargo", "build"], ws, cargo_env, f"{name} {kind} restore")
             row["edits"][kind] = dict(cargo=summary(c), blaze=summary(r), built=built, same=same,
                                       breakdown=median_breakdown(r, spent))
@@ -378,7 +381,7 @@ async def main():
     rows = json.load(open(out)) if os.path.exists(out) else {}
     host = dict(cpus=os.cpu_count(), cpu=next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), "?"),
                 load=open("/proc/loadavg").read().split()[:3], kernel=os.uname().release,
-                rustc=subprocess.run(["rustc", f"+{TOOLCHAIN}", "-V"], capture_output=True, text=True).stdout.strip(),
+                rustc=storelib.blaze_toolchain("blaze", dict(os.environ, PATH=os.path.dirname(BLAZE) + os.pathsep + os.environ["PATH"])).rustc,
                 blaze=subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip())
     print(json.dumps(host), flush=True)
     for name in names:

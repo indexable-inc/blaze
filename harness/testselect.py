@@ -47,6 +47,8 @@ import subprocess
 import sys
 import tempfile
 
+import storelib
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from storelib import worked  # noqa: E402
@@ -415,7 +417,8 @@ def beside(root, env):
     for path, text in BESIDE.items():
         os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
         open(os.path.join(ws, path), "w").write(text)
-    host = re.search(r"^host: (\S+)", subprocess.run(["rustc", "-vV"], env=env, capture_output=True, text=True).stdout, re.M)[1]
+    # blaze's own answer for the host's tuple, never rustc's.
+    host = storelib.blaze_toolchain(shutil.which("blaze", path=env["PATH"]) or "blaze", env).host
     try:
         for args in ("", "--release", f"--target {host}"):
             code, said = test(ws, env, f"all {args}")

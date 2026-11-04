@@ -33,13 +33,83 @@ const TARGET: &str = r#"{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_
 
 #[test]
 fn build_finished() {
+    let work = Work {
+        build_id: Some(7),
+        built: 2,
+        replayed: 40,
+        first: 0,
+        spliced: 1,
+        unchanged: 0,
+        full: 0,
+    };
+    let done = Finished {
+        success: true,
+        profile: Some("dev"),
+        served: Served::Daemon,
+        took_ms: 812,
+        work: Some(work),
+    };
     assert_eq!(
-        line(|out| super::build_finished(out, true)),
-        r#"{"reason":"build-finished","success":true}"#
+        line(|out| super::build_finished(out, &done)),
+        r#"{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}"#
     );
+    let failed = Finished {
+        success: false,
+        profile: None,
+        served: Served::InProcess,
+        took_ms: 3,
+        work: None,
+    };
     assert_eq!(
-        line(|out| super::build_finished(out, false)),
-        r#"{"reason":"build-finished","success":false}"#
+        line(|out| super::build_finished(out, &failed)),
+        r#"{"reason":"build-finished","success":false,"profile":null,"served":"in-process","took_ms":3,"build_id":null,"units":null,"links":null}"#
+    );
+    // Every field is JSON a reader takes as it is.
+    let value: serde_json::Value =
+        serde_json::from_str(&line(|out| super::build_finished(out, &done))).unwrap();
+    assert_eq!(value["units"]["replayed"], 40);
+}
+
+#[test]
+fn a_profile_is_named_by_what_its_finished_text_quotes() {
+    assert_eq!(profile_name("`dev` profile [unoptimized + debuginfo]"), Some("dev"));
+    assert_eq!(profile_name("`release-lto` profile [optimized]"), Some("release-lto"));
+    assert_eq!(profile_name("dev"), None);
+}
+
+#[test]
+fn work_counts_each_link_by_how() {
+    use blaze_api::{LinkHow, Linked};
+    let link = |how| Linked { how, path: "target/debug/foo".to_owned() };
+    let worked = blaze_api::Worked {
+        link: blaze_api::LinkKind::Placed,
+        found: 5,
+        green: 0,
+        links: vec![
+            link(LinkHow::First),
+            link(LinkHow::Spliced),
+            link(LinkHow::Spliced),
+            link(LinkHow::Full { why: vec!["a layout changed".to_owned()] }),
+        ],
+        reran: 0,
+        placed: blaze_api::PlacedBytes::default(),
+        served: Vec::new(),
+        build_id: Some(3),
+        compiled: 1,
+        steps_us: Vec::new(),
+        critical_path_us: 0,
+    };
+    assert_eq!(
+        Work::of(&worked),
+        Work {
+            build_id: Some(3),
+            built: 1,
+            replayed: 5,
+            first: 1,
+            spliced: 2,
+            unchanged: 0,
+            full: 1
+        }
     );
 }
 

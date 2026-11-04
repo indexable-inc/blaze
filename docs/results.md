@@ -688,7 +688,6 @@ Commands: for each side, `BLAZE_BIN=<side>/blaze taskset -c 0-15 python3 harness
 <projects> --backend cranelift --runs 5`; the after run measured both tiers (with
 `BLAZE_LLVM_BIN` a build with the feature) and is the README's.
 
-||||||| cc22006337
 ## Disagreements
 
 Where reports disagree, this file follows the later one.

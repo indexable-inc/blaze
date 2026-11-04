@@ -2766,10 +2766,18 @@ impl<'a> Stage<'a> {
                 )),
             };
         }
-        if weak && executable {
+        // Left for the loader to find in whatever is loaded (Mach-O's flat lookup, an ELF
+        // undefined dynamic symbol): a shared library's by default, and an executable's under
+        // `-undefined dynamic_lookup`, but for a core root it need not define.
+        let lookup = match self.output.link.undefined {
+            crate::Undefined::Default => !executable,
+            crate::Undefined::DynamicLookup => !(executable && optional(name)),
+            crate::Undefined::Error => false,
+        };
+        if weak && executable && !lookup {
             return Ok(Decision::Zero);
         }
-        if !executable {
+        if lookup || weak {
             // alloc: the writers' `Import` owns its name: once per import a resolution makes
             let import = Import {
                 name: name.to_owned(),
