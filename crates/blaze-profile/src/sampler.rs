@@ -18,7 +18,7 @@ use std::{sync::atomic::AtomicBool, time::Instant};
 
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::{Sampled, flight::Epoch};
+use crate::{dump::Sampled, flight::Epoch};
 
 #[cfg(target_os = "linux")]
 mod linux;

@@ -870,6 +870,9 @@ pub struct RunPuts {
     pub retracted: bool,
     /// Why a run was not reused, for `blaze why`: handed to its job's misses with its puts.
     pub misses: Vec<blaze_kernel::Miss>,
+    /// The tests a run finished, for the history's `test_runs` table: handed to its job with
+    /// its puts, which gives them its build id as it ends.
+    pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
 }
 
 impl RunPuts {
@@ -893,5 +896,6 @@ impl RunPuts {
         self.tickets.extend(&other.tickets);
         self.retracted |= other.retracted;
         self.misses.extend(other.misses);
+        self.test_runs.extend(other.test_runs);
     }
 }

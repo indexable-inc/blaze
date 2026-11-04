@@ -258,6 +258,13 @@ pub enum Whose {
 /// The user and system CPU time `whose` had; None where the kernel says nothing of it.
 #[cfg(unix)]
 pub fn cpu_time(whose: Whose) -> Option<Duration> {
+    cpu_times(whose).map(|(user, system)| user + system)
+}
+
+/// The user CPU time `whose` had, and its system CPU time, apart: what a build's row says the
+/// daemon spent (`builds.daemon_user_ns`); None where the kernel says nothing of it.
+#[cfg(unix)]
+pub fn cpu_times(whose: Whose) -> Option<(Duration, Duration)> {
     let who = match whose {
         Whose::Itself => libc::RUSAGE_SELF,
         Whose::Waited => libc::RUSAGE_CHILDREN,
@@ -276,7 +283,7 @@ pub fn cpu_time(whose: Whose) -> Option<Duration> {
         let micros = Duration::from_micros(u64::try_from(it.tv_usec).unwrap_or(0));
         Duration::from_secs(u64::try_from(it.tv_sec).unwrap_or(0)) + micros
     };
-    Some(time(usage.ru_utime) + time(usage.ru_stime))
+    Some((time(usage.ru_utime), time(usage.ru_stime)))
 }
 
 /// The ticks of the clock in a second, the unit of `/proc/<pid>/stat`'s times.

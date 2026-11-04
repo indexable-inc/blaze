@@ -231,6 +231,8 @@ enum Told {
     /// The flush a reader asked for ([`ToHistory::Flush`]) committed, with its number, or
     /// failed, saying why.
     Flushed { to: RequestRef, seq: Result<u64, String> },
+    /// A client's rows written, or why they were not: what its request is answered.
+    ClientWritten { to: RequestRef, written: Result<(), String> },
 }
 
 /// A build that ended, as the history's rows: its own, each image it linked, and an edge of
@@ -242,6 +244,8 @@ pub struct Ended {
     /// Why each thing it computed again was not reused, its own alone, sorted and each once
     /// ([`blaze_kernel::Miss`]): what `blaze why` explains.
     pub misses: Vec<blaze_kernel::Miss>,
+    /// The tests its runs finished, one row each.
+    pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
 }
 
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends, and
@@ -255,6 +259,9 @@ enum ToHistory {
     /// before the ask is drained by this flush, so a reader that reads the manifest it
     /// committed reads them.
     Flush(RequestRef),
+    /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
+    /// written at once and `to` answered once it is ([`Told::ClientWritten`]).
+    Client { to: RequestRef, rows: history::ClientRows },
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
@@ -354,6 +361,9 @@ pub fn keep_history(
                         tracing::warn!("{error}");
                         _ = failed_to.send(error.to_string());  // alloc: error path, once a daemon
                     }
+                    // Every child the drivers reap from now on is a `processes` row of the
+                    // history's next flush: installed only where a history takes them.
+                    blaze_profile::facts::observe_children();
                     _ = opened_to.send(Ok(history.next_build()));
                     // Off the daemon's start path: builds that end meanwhile wait in `rows`.
                     now.set(Step::Restoring, 0);
@@ -482,7 +492,15 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 history.build_started(row);
                 (history.flush(None), false)
             }
-            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses }, query_counts })) => {
+            Ok(ToHistory::Client { to, rows }) => {
+                let build = rows.build;
+                doing.set(Step::Flushing, build);
+                let flushed = history.client_rows(rows).and_then(|()| history.flush(Some(build)));
+                let written = flushed.as_ref().map(|_| ()).map_err(ToString::to_string);
+                _ = told.send(Told::ClientWritten { to, written });
+                (flushed, false)
+            }
+            Ok(ToHistory::Ended(Finished { ended: Ended { mut row, links, crate_deps, misses, test_runs }, query_counts })) => {
                 let build = row.build_id;
                 let ended_well = matches!(row.outcome, history::Outcome::Ok);
                 doing.set(Step::Explaining, build);
@@ -504,6 +522,7 @@ fn keep(mut history: History, why: &mut File, rows: &Receiver<ToHistory>, failed
                 history.crate_graph(crate_deps);
                 history.query_counted(query_counts);
                 history.missed(misses);
+                history.tests_ran(test_runs);
                 history.build_ended(row);
                 doing.set(Step::Flushing, build);
                 (history.flush(Some(build)), false)
@@ -685,6 +704,19 @@ impl Observe {
         }
     }
 
+    /// What the client of a build sent as it ended: handed to the history's thread, which
+    /// writes it and then has `to` answered ([`Told::ClientWritten`]). A daemon that keeps no
+    /// history answers at once and keeps nothing, as it drops its builds' rows ([`Observe::started`]).
+    pub fn client_rows(&mut self, to: RequestRef, rows: history::ClientRows, out: &mut Vec<Reply>) {
+        let Some(profiling) = &self.profiling else {
+            return out.push(Reply { to, response: Response::Done { ok: true } });
+        };
+        if profiling.ended.send(ToHistory::Client { to, rows }).is_err() {
+            let what = "the profile history's thread (`blaze-history`) is gone: the client's rows can't be written";
+            fail(out, to, ApiError::new(what, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
+        }
+    }
+
     /// `blaze why`: what the last build computed again and why, in groups (each listing
     /// every item with `all`), or `item`'s chain of reasons.
     /// Asked of the last build of the workspace holding `cwd`; while builds that ended before
@@ -810,6 +842,10 @@ impl Observe {
                             Err(why) => fail(out, to, ApiError::new(why, Some("a read of the profile history".to_owned()))),  // alloc: error path
                         }
                     }
+                    Ok(Told::ClientWritten { to, written: Ok(()) }) => out.push(Reply { to, response: Response::Done { ok: true } }),
+                    Ok(Told::ClientWritten { to, written: Err(why) }) => {
+                        fail(out, to, ApiError::new(why, Some(CLIENT_ROWS.to_owned()))); // alloc: error path
+                    }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         // Gone, so nothing more comes back: what is held is answered now, and
@@ -905,6 +941,9 @@ impl Observe {
 }
 
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";
+
+/// What a client's profile rows are named as in an error.
+const CLIENT_ROWS: &str = "a client's profile rows";
 
 /// What a blaze built without blaze-cargo's `native` feature (the seed profile, which has no
 /// C: the explorer serves through Flecs and wtransport on ring) says to the explorer.
@@ -1061,10 +1100,13 @@ mod tests {
                 joined: None,
                 tree: None,
                 blaze: None,
+                client_ns: None,
+                daemon_cpu_ns: None,
             },
             links: Vec::new(),
             crate_deps: Vec::new(),
             misses: Vec::new(),
+            test_runs: Vec::new(),
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
@@ -1141,8 +1183,10 @@ mod tests {
             joined: None,
             tree: None,
             blaze: None,
+            client_ns: None,
+            daemon_cpu_ns: None,
         };
-        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new() }
+        Ended { row, links: Vec::new(), crate_deps: Vec::new(), misses: Vec::new(), test_runs: Vec::new() }
     }
 
     fn explained(build: u64) -> Told {

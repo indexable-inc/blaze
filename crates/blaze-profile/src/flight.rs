@@ -44,7 +44,8 @@ use std::alloc::Global;
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
-    Counter, Event, Part, clock,
+    clock,
+    dump::{Counter, Event, Part},
     span::{self, Said, TYPED},
 };
 
@@ -1205,28 +1206,17 @@ impl tracing::field::Visit for Logged {
     }
 }
 
-/// What [`evented`] wrote of an event: what a profile's part keeps of it beside the ring
-/// (`crate::Recorder`).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Evented {
-    /// Its [`EventRow::event_id`].
-    pub(crate) event_id: u64,
-    pub(crate) job: u64,
-    pub(crate) span: u64,
-    pub(crate) build: u32,
-    pub(crate) logged: Logged,
-}
-
 /// Notes the `tracing` event `event` of `site` now, in this thread's ring: one row, the `events`
 /// table's, then a row each [`COL_WORDS`] of its fields other than its message, the
 /// `event_fields` table's. The event's words: when, the job running here ([`running_job`]), the
 /// span it happened in, its site (level, target and name), its message interned, and its
 /// build; its id is its ring and its row's place there ([`event_id`]). A field's number is kept
-/// as itself, with no allocation, and its text interned. `None` when the thread has no ring.
-pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) -> Option<Evented> {
+/// as itself, with no allocation, and its text interned. Nothing when the thread has no ring
+/// (counted as ringless).
+pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
     let Some(ring) = ring() else {
         RINGLESS.fetch_add(1, Ordering::Relaxed);
-        return None;
+        return;
     };
     let span = if event.is_root() {
         0
@@ -1261,7 +1251,6 @@ pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) -> Option<Evented> 
         row[4] = KIND_PLOT << 62 | slots | EVENT_FIELDS_ROW;
         ring.put(row);
     }
-    Some(Evented { event_id: id, job: running.job, span, build, logged })
 }
 
 /// Fields of events not kept since the process began ([`FIELDS_LOST`]).
@@ -2267,8 +2256,7 @@ pub(crate) fn exited(id: u64) {
 }
 
 /// A handle of the span `id` was dropped, on this thread. With the last, the span closed now:
-/// its row is written to this thread's ring, and `Some` the ticks it lasted, which is what
-/// `BLAZE_PROFILE` keeps of it.
+/// its row is written to this thread's ring, and `Some` the ticks it lasted.
 #[inline]
 pub(crate) fn closed(id: u64) -> Option<u64> {
     if id == UNRECORDED {
@@ -3305,14 +3293,14 @@ pub(crate) fn part(window: Duration) -> Part {
 }
 
 /// The last `window` of every thread's ring and of the CPU samples, as the Chrome trace
-/// (ui.perfetto.dev) `BLAZE_PROFILE` writes: what a stall writes beside its error.
+/// (ui.perfetto.dev, [`crate::dump`]): what a stall writes beside its error.
 pub fn dump(window: Duration) -> Vec<u8> {
     let part = part(window);
     let end = Epoch::now().now_us;
     let start = end.saturating_sub(window.as_micros() as u64);
     // alloc: a dump, on demand
     let mut out = Vec::new();
-    match crate::chrome(&mut out, &[], std::slice::from_ref(&part), start, end) {
+    match crate::dump::chrome(&mut out, std::slice::from_ref(&part), start, end) {
         Ok(()) => out,
         Err(why) => unreachable!("a trace written to memory fails only when out of memory: {why}"),
     }

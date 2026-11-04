@@ -64,6 +64,10 @@ pub struct BuildFacts {
     pub misses: Option<u64>,
     /// How its daemon died during it: it has no end row, and is reported to that daemon's last.
     pub died: Option<Died>,
+    /// The daemon process's user and system CPU over the build, from getrusage; `None` in the
+    /// rows of a blaze before them, and while it runs.
+    pub daemon_user_ns: Option<i64>,
+    pub daemon_system_ns: Option<i64>,
     /// Its panics, and the fatal signal its daemon died of, oldest first (`panics` rows).
     pub panics: Vec<PanicFacts>,
 }
@@ -1218,14 +1222,33 @@ impl<'a> Ctx<'a> {
             if uncounted > 0 {
                 evidence.push(format!("{uncounted} spans have no CPU (closed under another job's clock, or not counted)"));
             }
-            evidence.push("the profile records no OS CPU for the process, so the spans' total can't be checked against it".to_owned());
+            let fix = match (self.facts.build.daemon_user_ns, self.facts.build.daemon_system_ns) {
+                (Some(user), Some(system)) => {
+                    let os = user + system;
+                    evidence.push(format!(
+                        "the OS says the daemon spent {} of CPU over the build ({} user, {} system); spans counted {:.0}% of it",
+                        s(os),
+                        s(user),
+                        s(system),
+                        pct(cpu, os)
+                    ));
+                    match cpu * 2 < os {
+                        true => "the OS saw CPU no span counted: find the threads or jobs whose spans don't fill `self_cpu_ns` (a span closed on another job's clock, a thread with no ring)",
+                        false => "the spans count most of what the OS saw: the rest of the switches' running time is starvation (see starved workers), not CPU",
+                    }
+                }
+                _ => {
+                    evidence.push("the build's row has no OS CPU for the daemon (a blaze before `daemon_user_ns`), so the spans' total can't be checked against it".to_owned());
+                    "a blaze that writes `builds.daemon_user_ns` checks the spans' sum against the OS; the rest is starvation (see starved workers) or CPU outside spans"
+                }
+            };
             out.push(BlindSpot {
                 kind: BlindKind::CpuGap,
                 hidden_ns: (running - cpu).max(0),
                 subject: "self_cpu_ns".to_owned(),
                 title: format!("workers ran {} that no span counted CPU for", s((running - cpu).max(0))),
                 evidence,
-                fix: "record the process's OS CPU (getrusage) per build beside the spans' sum; the rest is starvation (see starved workers) or CPU outside spans".to_owned(),
+                fix: fix.to_owned(),
             });
         }
         let jobs = report::job_totals(model);

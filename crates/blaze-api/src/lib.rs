@@ -80,7 +80,9 @@ use serde::{Deserialize, Serialize};
 /// [`Status::bugs`]. 34: [`Request::FetchUrl`] and [`Response::Stored`]. 35:
 /// [`Status::settings`]. 36: [`Request::Flush`] and [`Response::Flushed`] in place of
 /// `Request::Sql` (`blaze debug sql --live`) and `Response::Queried`: a reader of the profile
-/// history asks the daemon to flush, then reads the history itself.
+/// history asks the daemon to flush, then reads the history itself; and
+/// [`Request::ClientRows`] and [`Worked::build_id`]: a client sends its own recorder's rows of
+/// a build to the daemon, which writes them to the history.
 pub const SCHEMA: u32 = 36;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
@@ -355,6 +357,25 @@ pub enum Request {
         digest: String,
         most_bytes: Option<u64>,
         out: Option<String>,
+    },
+    /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
+    /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
+    /// stream of the profile schema's table (empty for none), every row's `build_id` the
+    /// build's, and when it started and had its answer, on the profile's clock
+    /// (`blaze_profile::clock::mono_ns`). The daemon's loop hands them to its profile history,
+    /// which writes them as the client's process and gives the build's row the two times
+    /// (`builds.client_started_ns`, `client_ended_ns`); answered with `Done { ok: true }` once
+    /// written. A daemon that keeps no history answers at once and keeps nothing.
+    ClientRows {
+        build: u64,
+        #[serde(with = "blaze_protocol::bytes")]
+        events: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
+        folded: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
+        spans: Vec<u8>,
+        ended_ns: i64,
+        started_ns: i64,
     },
 }
 
@@ -933,6 +954,10 @@ pub struct Worked {
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
     /// whether its check outcome and its bodies were served.
     pub served: Vec<ServedCrate>,
+    /// The build's id in the daemon's profile history (`builds.build_id`): what the client
+    /// tags the rows it sends with ([`Request::ClientRows`]). `None` for work no build row
+    /// stands for.
+    pub build_id: Option<u64>,
     /// Functions whose code was generated.
     pub compiled: u64,
     /// The measured run time of the request's nodes, summed by kind: each kind that ran at

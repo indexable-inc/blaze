@@ -83,7 +83,7 @@ use std::alloc::Global;
 use blaze_history::History;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use blaze_profile::{
-    facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow},
+    facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow, TestRunRow},
     history::{self as profile_history, BuildRow},
 };
 use blaze_protocol::events::NodeKind;
@@ -815,12 +815,17 @@ fn targets_of(work: &Work) -> Option<&Targets> {
     }
 }
 
-/// The directory `BLAZE_PROFILE` names in the environment of the cargo command line that asked
-/// for `work`, when it names one.
-fn profile_dir(work: &Work) -> Option<&str> {
-    let cargo = targets_of(work)?.cargo.as_ref()?;
-    let (_, dir) = cargo.env.iter().find(|(name, _)| name == blaze_profile::VAR)?;
-    Some(dir.as_str()).filter(|it| !it.is_empty())
+/// The daemon process's user and system CPU so far (getrusage): what a build's row subtracts
+/// its start's from. `None` where the kernel says nothing of it.
+fn daemon_cpu() -> Option<(Duration, Duration)> {
+    #[cfg(unix)]
+    {
+        crate::raw::process::cpu_times(crate::raw::process::Whose::Itself)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// One word of cargo's command line: made once per job, at the edge.
@@ -1614,9 +1619,12 @@ struct Job<S: Steps> {
     /// compile and each run handed them over ([`Compiled::misses`], [`RunPuts::misses`]):
     /// this build's alone, sorted when it ends, for `blaze why`.
     misses: Vec<blaze_kernel::Miss>,
-    /// Its command line's environment names a profile's directory ([`profile_dir`]): the
-    /// daemon's part of the build is written there as it finishes.
-    profiled: bool,
+    /// The tests its runs finished, for the history ([`RunPuts::test_runs`]): their build id
+    /// given as it ends.
+    test_runs: Vec<TestRunRow>,
+    /// The daemon process's user and system CPU when its plane request opened (getrusage),
+    /// for its row's `daemon_user_ns` and `daemon_system_ns`.
+    opened_cpu: Option<(Duration, Duration)>,
     /// When its plane request opened: on the schema's clock ([`blaze_profile::clock::mono_ns`])
     /// and on the wall's, for its row in the history.
     opened_ns: i64,
@@ -1973,6 +1981,7 @@ impl<S: Steps> Job<S> {
     /// Its plane request opens now.
     fn opening(&mut self) {
         self.opened_ns = blaze_profile::clock::mono_ns();
+        self.opened_cpu = daemon_cpu();
         self.opened_unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -2008,6 +2017,15 @@ impl<S: Steps> Job<S> {
             joined: stats.map(|it| it.joined),
             tree: None,
             blaze: None,
+            client_ns: None,
+            daemon_cpu_ns: match (outcome, self.opened_cpu, daemon_cpu()) {
+                (profile_history::Outcome::Running, ..) => None,
+                (_, Some((user, system)), Some((user_now, system_now))) => {
+                    let ns = |it: Duration| i64::try_from(it.as_nanos()).unwrap_or(i64::MAX);
+                    Some((ns(user_now.saturating_sub(user)), ns(system_now.saturating_sub(system))))
+                }
+                _ => None,
+            },
         }
     }
 
@@ -2036,7 +2054,11 @@ impl<S: Steps> Job<S> {
         let mut misses = std::mem::take(&mut self.misses);
         misses.sort_unstable();
         misses.dedup();
-        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses }
+        let mut test_runs = std::mem::take(&mut self.test_runs);
+        for it in &mut test_runs {
+            it.build_id = build_id;
+        }
+        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses, test_runs }
     }
 
     /// The value its stage waited on, if node `node` gave it.
@@ -2437,14 +2459,6 @@ impl<S: Steps> Jobs<S> {
         };
         let keep_going = keeps_going(&work);
         let snapshot = matches!(work, Work::Snapshot);
-        // A daemon already running starts recording at the first request that asks.
-        let profiled = match profile_dir(&work) {
-            Some(dir) => {
-                blaze_profile::start(std::path::Path::new(dir));
-                true
-            }
-            None => false,
-        };
         let job = Job {
             work,
             views,
@@ -2485,7 +2499,8 @@ impl<S: Steps> Jobs<S> {
             links: Vec::new(),  // alloc: none until a unit links
             linked: Vec::new(), // alloc: none until a unit links
             misses: Vec::new(), // alloc: none until a unit misses
-            profiled,
+            test_runs: Vec::new(), // alloc: none until a test runs
+            opened_cpu: None,
             opened_ns: 0,
             opened_unix_ns: None,
             leases: Arc::default(), // alloc: once per job, shared with its lowering
@@ -4305,6 +4320,7 @@ impl<S: Steps> Jobs<S> {
         if let Some(job) = self.jobs.get_mut(key_of(id)) {
             job.durable.extend(&puts.tickets);
             job.misses.append(&mut puts.misses);
+            job.test_runs.append(&mut puts.test_runs);
         }
         if puts.retracted {
             // A retraction is flushed at once: every other checkout must stop being given
@@ -4713,6 +4729,7 @@ impl<S: Steps> Jobs<S> {
             reran: stats.ran,
             green: stats.cached + stats.joined,
             served: std::mem::take(&mut job.served),
+            build_id: job.request.map(|it| u64::from(it.0)),
             compiled,
             found: fresh,
             link: link_kind(&links),
@@ -5112,13 +5129,6 @@ impl<S: Steps> Jobs<S> {
             self.batches.remove(id);
             self.order.retain(|it| *it != id);
             self.ended = true;
-            // Written before the answer, so the client that puts the profile together finds
-            // this part; a build no profile asked for is in none, unless one under way is.
-            if job.profiled {
-                blaze_profile::write_part();
-            } else if blaze_profile::on() && !self.jobs.values().any(|it| it.profiled) {
-                blaze_profile::discard();
-            }
             w.said.push(Said::Finish(id, ok, error, job.built));
         }
         self.over = over;

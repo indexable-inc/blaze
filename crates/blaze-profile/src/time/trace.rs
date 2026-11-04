@@ -1,7 +1,7 @@
 //! The model as Chrome trace events (ui.perfetto.dev): a track per fiber with its jobs' runs,
 //! parks and queueing as slices, a track per core with the runs on it, a flow arrow from
 //! each waker's slice to the run its wake resumed, and each kept `tracing` event as an instant
-//! on its job's track. `trace.json` (crate::chrome) puts these
+//! on its job's track. The flight dump (crate::dump::chrome) puts these
 //! beside the threads' spans; `blaze debug time --trace` writes them alone.
 
 use serde_json::{Value, json};
@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::{LaneId, Model, State, report};
 
 /// The track id of a fiber's lane, beside a thread's own (its id), its steps (1 << 32) and
-/// its samples (2 << 32) in crate::chrome.
+/// its samples (2 << 32) in crate::dump::chrome.
 pub const FIBER_TRACK: u64 = 3 << 32;
 /// The track id of a core.
 pub const CORE_TRACK: u64 = 4 << 32;

@@ -1149,6 +1149,8 @@ impl Queue {
         };
         let listen = self.tag(For::Listen(b as u32));
         let spawn = self.tag(For::Spawn(b as u32));
+        // What the profile's `processes` row of the fork server names it by.
+        blaze_core::reaped::label(spawn, "test", Some(&command.program.to_string_lossy()));
         let server = self.server(b);
         server.phase = Phase::Starting;
         server.listen = Some(listen);
@@ -1922,6 +1924,8 @@ impl Queue {
             },
         };
         let spawn = self.tag(For::Whole(b as u32));
+        // What the profile's `processes` row of the binary run whole names it by.
+        blaze_core::reaped::label(spawn, "test", Some(&command.program.to_string_lossy()));
         let deadline = self.wheel.insert(due_tick(self.now, timeout), Due::Whole(b as u32));
         self.busy += slots;
         self.bins[b].whole = Some(Whole { spawn, loaded, started: self.now, slots, timed_out: false, deadline: Some(deadline) });

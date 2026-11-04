@@ -18,10 +18,22 @@ SELECT * FROM read_parquet(@counters, union_by_name = true);
 -- One row a build: a build has a row as it starts (outcome `running`, no `dur_ns`) and another
 -- as it ends, with the same `started_ns`, and the view keeps the end's. A build with only its start's row never ended: it
 -- runs, or its daemon died (`history::writes` tells which). A build whose daemon died with its flight recorder persisted
--- has an end row of outcome `crashed`, written by the postmortem (`flight::postmortem`), to the last row read back.
+-- has an end row of outcome `crashed`, written by the postmortem (`flight::postmortem`), to the last row read back. Once
+-- its client sent its rows the end's row is written again with `client_started_ns` and `client_ended_ns`, and the view
+-- keeps that one.
 CREATE OR REPLACE VIEW builds AS
 SELECT * FROM read_parquet(@builds, union_by_name = true)
-QUALIFY row_number() OVER (PARTITION BY build_id, started_ns ORDER BY dur_ns DESC NULLS LAST) = 1;
+QUALIFY row_number() OVER (
+    PARTITION BY build_id, started_ns ORDER BY dur_ns DESC NULLS LAST, client_ended_ns DESC NULLS LAST
+) = 1;
+
+-- One row a child process blaze spawned and reaped, with its own CPU, memory and faults.
+CREATE OR REPLACE VIEW processes AS
+SELECT * FROM read_parquet(@processes, union_by_name = true);
+
+-- One row a test a build ran.
+CREATE OR REPLACE VIEW test_runs AS
+SELECT * FROM read_parquet(@test_runs, union_by_name = true);
 
 CREATE OR REPLACE VIEW samples AS
 SELECT * FROM read_parquet(@samples, union_by_name = true);

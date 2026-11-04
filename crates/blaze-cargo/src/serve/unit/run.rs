@@ -309,6 +309,7 @@ impl Runs<Real> for Program {
         _out: &mut Vec<Response>,
     ) -> Option<bool> {
         let command = self.command.take()?;
+        blaze_core::reaped::label(self.tag, "run", Some(&command.program.to_string_lossy()));
         effects.push(Effect::Spawn { command: Box::new(command), tag: self.tag });
         self.running = true;
         None

@@ -449,6 +449,12 @@ fn run(sql: &str) -> Result<Vec<RecordBatch>, Refusal> {
 /// that writes the history and can't be asked, or whose flush the manifest does not show, is
 /// an error naming it: never a read that quietly misses rows.
 fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
+    Ok(history_paths()?)
+}
+
+/// The DuckDB that reads the history, and the history's directory: an error names what is
+/// missing.
+pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
     let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB))?.ok_or_else(|| {
         format!("{} is unset: it names the DuckDB `nix run .#duckdb` pins, which blaze's own package sets", observe::DUCKDB)
     })?;

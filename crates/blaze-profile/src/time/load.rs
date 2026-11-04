@@ -144,6 +144,15 @@ pub struct Pick {
     pub died: Option<u32>,
 }
 
+/// The build's Chrome trace, as `blaze debug time --trace` writes it, its client's rows
+/// beside its daemon's: what `BLAZE_PROFILE` exports from the history.
+pub fn trace_of(source: &Source<'_>, build: u64) -> Result<Vec<u8>, TimeError> {
+    let Rows { input, .. } = rows(source, pick(source, Some(build))?)?;
+    let model = Model::build(input)?;
+    let path = path::critical(&model);
+    Ok(trace::json(&model, &path))
+}
+
 /// `build`, or the last build that ended or whose daemon died, and its window.
 pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> {
     // The builds a report may be of: `build`, or the last that ended and every one after it,
@@ -434,14 +443,18 @@ pub fn rows(source: &Source<'_>, pick: Pick) -> Result<Rows, TimeError> {
 /// numbered a build so in one history, whose workers and windows read as one build would be
 /// summed (selfbuild4, 2026-11-03: four daemons' build 1 read as one of 72 workers and 2296 s).
 fn build_process(source: &Source<'_>, build: u64) -> Result<Option<u32>, TimeError> {
+    let client = history::CLIENT_PROCESS;
     // alloc: a query, once a report
     let sql = format!(
         "SELECT CAST(process AS BIGINT) AS process, CAST(count(*) AS UBIGINT) AS rows, CAST(min(from_ns) AS BIGINT) AS from_ns, \
          CAST(max(to_ns) AS BIGINT) AS to_ns FROM (\
          SELECT process, start_ns AS from_ns, start_ns + dur_ns AS to_ns FROM spans WHERE build_id = {build} \
+         AND process_name IS DISTINCT FROM '{client}' \
          UNION ALL SELECT process, t_ns, t_ns FROM switches WHERE build_id = {build}) GROUP BY 1 ORDER BY 1"
     );
     let batches = query(source, &sql, "reading which processes wrote the build's rows")?;
+    // The rows its client sent are of the build too, from the client's process, and name it
+    // (`history::CLIENT_PROCESS`): left out above, as the build's daemon is the one asked for.
     // alloc: the build's processes, once a report
     let mut processes = Vec::new();
     for batch in &batches {

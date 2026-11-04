@@ -756,6 +756,7 @@ fn worked() -> Response {
         reran: 3,
         green: 9,
         served: Vec::new(),
+        build_id: Some(3),
         compiled: 1,
         found: 4,
         link: crate::LinkKind::Placed,

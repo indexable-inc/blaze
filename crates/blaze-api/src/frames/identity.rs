@@ -21,7 +21,7 @@ use crate::{
     Unchecked, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 34;
+const REQUESTS: usize = 35;
 const RESPONSES: usize = 43;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
@@ -308,6 +308,14 @@ impl Gen {
                 most_bytes: if self.yes() { Some(self.wide()) } else { None },
                 out: self.maybe_text(),
             },
+            33 => Request::ClientRows {
+                build: self.wide(),
+                events: self.bytes(),
+                folded: self.bytes(),
+                spans: self.bytes(),
+                ended_ns: self.wide() as i64,
+                started_ns: self.wide() as i64,
+            },
             _ => Request::Stop,
         }
     }
@@ -539,6 +547,7 @@ impl Gen {
                     outcome: ServedPart::ALL[(g.next() % 3) as usize],
                     package: g.text(),
                 }),
+                build_id: self.maybe(Gen::wide),
                 compiled: self.wide(),
                 steps_us: self.many(depth, |g| {
                     (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
@@ -845,7 +854,8 @@ fn request_index(request: &Request) -> usize {
         Request::Rebuilt { .. } => 30,
         Request::Launch { .. } => 31,
         Request::FetchUrl { .. } => 32,
-        Request::Stop => 33,
+        Request::ClientRows { .. } => 33,
+        Request::Stop => 34,
     }
 }
 

@@ -2014,7 +2014,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     fn outs(&mut self, mut out: Vec<Out>) {
         for it in out.drain(..) {
             match &it {
-                Out::Pass(Arrived::Request { request: Request::Stop | Request::Status, .. }) => {}
+                Out::Pass(Arrived::Request { request: Request::Stop | Request::Status | Request::ClientRows { .. }, .. }) => {}
                 Out::Pass(Arrived::Request { .. }) | Out::Moved { .. } => self.changed_since_settle = true,
                 _ => {}
             }
@@ -2063,6 +2063,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 Out::Pass(Arrived::Request { from, request: Request::Flush }) => {
                     let mut replies = std::mem::take(&mut self.replies);
                     self.observe.flush(from, self.driver.now(), &mut replies);
+                    self.send(replies);
+                }
+                Out::Pass(Arrived::Request {
+                    from,
+                    request: Request::ClientRows { build, events, folded, spans, ended_ns, started_ns },
+                }) => {
+                    let rows = blaze_profile::history::ClientRows { build, started_ns, ended_ns, spans, events, folded };
+                    let mut replies = std::mem::take(&mut self.replies);
+                    self.observe.client_rows(from, rows, &mut replies);
                     self.send(replies);
                 }
                 Out::Pass(Arrived::Request { from, request: Request::Rebuilt { all, cwd, item } }) => {

@@ -210,6 +210,9 @@ pub fn drive<A: Api>(
         let _ = to_screen.send(Msg::View(event));
     };
     let called = api.call(request, |response, more| {
+        if let ResponseRef::Work(worked) = &response {
+            super::client_rows::heard(worked.build_id);
+        }
         let printed = match response {
             // The build row stands for cargo's `Compiling` lines.
             ResponseRef::Unit(_) => Ok(()),

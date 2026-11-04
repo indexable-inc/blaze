@@ -223,7 +223,8 @@ fn build_row_sql(build: u64) -> String {
     format!(
         "SELECT CAST(workspace AS VARCHAR) AS workspace, CAST(command AS VARCHAR) AS command, \
          CAST(outcome AS VARCHAR) AS outcome, CAST(tree AS VARCHAR) AS tree, CAST(blaze AS VARCHAR) AS blaze, \
-         CAST(hits AS UBIGINT) AS hits, CAST(misses AS UBIGINT) AS misses FROM builds \
+         CAST(hits AS UBIGINT) AS hits, CAST(misses AS UBIGINT) AS misses, \
+         CAST(daemon_user_ns AS BIGINT) AS daemon_user_ns, CAST(daemon_system_ns AS BIGINT) AS daemon_system_ns FROM builds \
          WHERE build_id = {build} ORDER BY dur_ns DESC NULLS LAST LIMIT 1"
     )
 }
@@ -239,6 +240,8 @@ fn build_row(batches: &[RecordBatch], build: u64) -> Result<BuildFacts, TimeErro
         it.blaze = text(batch, T, "blaze", row)?;
         it.hits = uint(batch, T, "hits", row)?;
         it.misses = uint(batch, T, "misses", row)?;
+        it.daemon_user_ns = int(batch, T, "daemon_user_ns", row)?;
+        it.daemon_system_ns = int(batch, T, "daemon_system_ns", row)?;
     }
     Ok(it)
 }

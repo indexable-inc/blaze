@@ -407,6 +407,22 @@ pub const BUILDS: Table = Table {
             Type::U32,
             "the daemon's process id: a build's row with outcome running and no row after it is one its daemon never ended, which died if that process no longer writes the history; null in rows of a blaze before it",
         ),
+        opt(
+            "client_started_ns",
+            Type::I64,
+            "when the client process that asked for it started, on the history's clock (`started_ns`'s): the client's own start-up before it reached the daemon is `started_ns - client_started_ns`; null until the client sent its rows, and for a build no client asked for",
+        ),
+        opt(
+            "client_ended_ns",
+            Type::I64,
+            "when that client had the answer and sent its rows, on the same clock: what the client spent after the daemon ended the build is `client_ended_ns - started_ns - dur_ns`",
+        ),
+        opt(
+            "daemon_user_ns",
+            Type::I64,
+            "the daemon process's user CPU over the build, from getrusage(RUSAGE_SELF) at its start and end: what the OS saw the daemon spend, set beside the spans' `self_cpu_ns` sum to show CPU no span covers. Process-wide, so of two builds that overlap each has the other's share; null while it runs",
+        ),
+        opt("daemon_system_ns", Type::I64, "the daemon process's system CPU over the build, as `daemon_user_ns`"),
     ],
 };
 
@@ -842,8 +858,54 @@ pub const PANICS: Table = Table {
     ],
 };
 
+/// One row a child process blaze spawned and reaped: a build script, a native proc-macro host,
+/// a linker, a test binary, a wrapper (`crate::facts::ProcessRow`). The times are on the
+/// history's clock (`clock::mono_ns`); the costs are the child's own, from its `rusage`.
+pub const PROCESSES: Table = Table {
+    name: "processes",
+    doc: "one row a child process blaze spawned, with what the OS says it cost",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        col("pid", Type::U32, "the child's process id"),
+        col("kind", Type::Dict, "what it was: build_script, test, run, proc_macro_host, linker, wrapper, or unlabelled for a spawn no caller named"),
+        opt("unit", Type::Utf8, "the unit or test binary it ran for, as the spawner names it"),
+        col("program", Type::Utf8, "the program it ran, as given to spawn"),
+        opt("parent_span", Type::U64, "the span it was spawned inside, as `spans.span_id`"),
+        col("spawned_ns", Type::I64, "when blaze asked for it"),
+        opt("exec_ns", Type::I64, "when the spawn call returned, the child having exec'd (vfork and posix_spawn return after exec)"),
+        col("exited_ns", Type::I64, "when blaze reaped it"),
+        opt("sandbox_ns", Type::I64, "how long making its sandbox took, before the spawn; null for a child run with none"),
+        col("user_ns", Type::I64, "its user CPU"),
+        col("system_ns", Type::I64, "its system CPU"),
+        opt("peak_rss", Type::U64, "its peak resident set, in bytes"),
+        opt("minor_faults", Type::U64, "page faults it served without IO"),
+        opt("major_faults", Type::U64, "page faults that read from disk"),
+        opt("voluntary_switches", Type::U64, "times it gave up the CPU to wait"),
+        opt("involuntary_switches", Type::U64, "times the kernel took the CPU from it"),
+        opt("code", Type::U32, "its exit code as an unsigned word; null when a signal ended it"),
+        opt("signal", Type::U32, "the signal that ended it; null for an exit"),
+    ],
+};
+
+/// One row a test the test queue finished (`crate::facts::TestRunRow`).
+pub const TEST_RUNS: Table = Table {
+    name: "test_runs",
+    doc: "one row a test a build ran, and how it ended",
+    columns: &[
+        BUILD_ID,
+        col("test", Type::Utf8, "the test's name, as libtest names it"),
+        opt("crate", Type::Dict, "the package its binary is of"),
+        col("binary", Type::Utf8, "the test binary that ran it"),
+        col("outcome", Type::Dict, "passed, failed, ignored, timed_out or crashed"),
+        col("dur_ns", Type::I64, "how long its last attempt ran"),
+        col("retries", Type::U32, "attempts after the first"),
+        col("ended_ns", Type::I64, "when the queue took its outcome, on the history's clock"),
+    ],
+};
+
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 25] = [
+pub const TABLES: [&Table; 27] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -869,6 +931,8 @@ pub const TABLES: [&Table; 25] = [
     &FOLDED,
     &PANICS,
     &EVENT_FIELDS,
+    &PROCESSES,
+    &TEST_RUNS,
 ];
 
 /// The tables that are results, made on request and not kept.
