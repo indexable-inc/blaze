@@ -1,7 +1,7 @@
 # hegeltest, hegeltest-macros, hegeltest-c
 
-Hegel, the property-based testing library blaze's property tests use (docs/contributing.md,
-"Property tests"): Hypothesis's engine ported to Rust, with a Rust frontend.
+Hegel, the property-based testing library blaze's property tests and deterministic simulation
+tests use (the `testing` skill, .agents/skills/testing/SKILL.md): Hypothesis's engine ported to Rust, with a Rust frontend.
 
 - Upstream: our fork https://github.com/indexable-inc/hegel (of hegeldev/hegel), commit
   `cae7cfa19251314351738a31234a3b576f2c5421` ("Merge pull request #3 from

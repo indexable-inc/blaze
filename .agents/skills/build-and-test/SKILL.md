@@ -1,6 +1,6 @@
 ---
 name: build-and-test
-description: "How blaze is built, checked, tested and measured, and how a lane runs: blaze builds blaze (never cargo), its own pinned nightly, the Mac or an ix VM (never AWS), subagents that only write code while the main agent runs one `blaze check` and `blaze test`, one worktree per lane, cleaning up, measuring the exact tree and testing a causal claim. Load before any build, check, test, benchmark, bisect or measurement, before splitting work across subagents, and when starting or ending a lane."
+description: "How blaze is built, checked, tested and measured, and how a lane runs: blaze builds blaze (never cargo), its own pinned nightly, the Mac or an ix VM (never AWS), subagents that only write code while the main agent runs one `blaze check` and `blaze test`, one worktree per lane, cleaning up and measuring the exact tree. How tests are written (Hegel property tests, deterministic simulation, testing a causal claim) is the `testing` skill. Load before any build, check, test run, benchmark, bisect or measurement, before splitting work across subagents, and when starting or ending a lane."
 ---
 
 # Building, testing and measuring blaze
@@ -48,12 +48,6 @@ See [docs/toolchain.md](../../../docs/toolchain.md).
 A measurement, bisect or checkpoint names the exact tree it ran on (a content digest of the sources
 and the blaze binary's hash) and keeps that tree; never re-sync or rebuild between measuring and
 committing. A result you can't tie to a tree is not evidence.
-
-## test-the-cause (rule 22)
-
-A causal claim (this change caused the regression, this lock causes the convoy, this index makes it
-fast) is tested by removing the cause and watching the effect go, not by checking that its premises
-hold. Pin a load-bearing one with a test named for the property.
 
 ## work-in-ix-vms (rule 33)
 
