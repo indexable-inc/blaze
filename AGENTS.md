@@ -18,8 +18,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 4. **superset-of-rust**: Every program the pinned nightly builds builds and behaves the same under
    blaze; blaze refuses only rustc soundness holes, and its extensions are opt-in. Skill:
    `compiler-correctness`.
-5. **useful-not-parity**: rustc and cargo are references, not specs: judge output by usefulness and
-   match them only where real code or tools depend on it. Skill: `compiler-correctness`.
+5. **useful-not-parity**: rustc and cargo are references, not specs: design every output and interface
+   as if from scratch, the best way for people and agents, and match them only where real code or
+   tools depend on it. Skill: `compiler-correctness`.
 6. **blaze-uses-its-extensions**: blaze's own crates use blaze's language extensions (`#[blaze::pure]`,
    effects, contracts, ...) directly, enforced, with no rustc-compatible fallback or cfg guard.
    Skill: `compiler-correctness`.
@@ -69,8 +70,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     proving it right. Skill: `changing-code`.
 28. **one-concept-one-home**: One type, one rule and one place per concept; merge duplicates and ban the
     removed name. Skill: `changing-code`.
-29. **semantics-in-front-end**: Language semantics go in the front end's salsa crates in `crates/`;
-    codegen, the store, the daemon and the runtime stay outside. Skill: `compiler-correctness`.
+29. **semantics-in-front-end**: Language semantics go in the front end's query crates in `crates/`
+    (blaze-query's engine, derived from salsa, not salsa); codegen, the store, the daemon and the
+    runtime stay outside. Skill: `compiler-correctness`.
 30. **library-over-language**: Build a feature as a library on the language that exists; when no library
     can express it, add the smallest general primitive, never an ad hoc language feature. Skill:
     `compiler-correctness`.

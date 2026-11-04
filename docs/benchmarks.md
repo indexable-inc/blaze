@@ -24,6 +24,7 @@ and `harness/v2/budgets.py` is what measures them.
 - [How fast an edit builds](#how-fast-an-edit-builds)
 - [How much memory and disk it takes](#how-much-memory-and-disk-it-takes)
 - [How fast the built programs run](#how-fast-the-built-programs-run)
+- [Over time](#over-time): blaze against its own earlier runs
 - [What is measured](#what-is-measured), [the machines](#the-machines),
   [run it yourself](#run-it-yourself) and [every number](#results)
 
@@ -327,6 +328,23 @@ Release with dev checks: `cargo build --release` with `-C overflow-checks=on -C 
 Measured by v1's runbench.py on each platform's benchmark machine, the last results before v2, which has no runtime bench yet. Raw JSON: [macOS arm64](benchmarks/runtime-macos-arm64.json), [Linux aarch64](benchmarks/runtime-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-linux-x86-64.json); bun: [macOS arm64](benchmarks/runtime-bun-macos-arm64.json), [Linux aarch64](benchmarks/runtime-bun-linux-aarch64.json), [Linux x86-64](benchmarks/runtime-bun-linux-x86-64.json).
 <!-- runbench:end -->
 
+## Over time
+
+`harness/benchcharts.py` draws these from `docs/benchmarks/history` (below) into the same section
+of the README and this page, each run of a workflow that appends to the history (bench-readme,
+bench-counts and live-latency) right after it appends, and the workflow commits them with the
+history. A platform's trend draws only the runs of the machine of its last run, as the check
+compares them; a chart with fewer than two such runs is a line saying so. Regressions are not
+marked on them yet: the history does not record what the check found.
+
+<!-- benchtrend:start -->
+How blaze's own numbers move from run to run, each platform on its own benchmark machine: the instructions each merge to main retires, how long an edit takes and how soon a live edit runs, from [the history](benchmarks/history) ([how it is kept](#history-and-regressions)). Every workflow that adds to the history draws these again and commits them with it.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="benchmarks/charts/trend-macos-arm64-live-dark.svg"><img alt="From saving an edit to the program running it, macOS arm64: 11 runs from Oct 21 to Oct 30, the first to the latest: bevy 83 ms to 3.79 s; egui 15 ms to 219 ms; life 22 ms to 34 ms (Oct 26); probe 7.7 ms to 14 ms" src="benchmarks/charts/trend-macos-arm64-live-light.svg" width="760"></picture>
+
+Not drawn until there are two runs on one machine: macOS arm64 instructions per merge (none yet), macOS arm64 edit times (one run), Linux aarch64 instructions per merge (none yet), Linux aarch64 edit times (one run), Linux x86-64 instructions per merge (none yet), Linux x86-64 edit times (one run), Windows x86-64 live-edit latency (one run).
+<!-- benchtrend:end -->
+
 ## What is measured
 
 `harness/bench.py` copies each project's pinned checkout and builds it two ways side by side:
@@ -626,9 +644,14 @@ when:
 - the stored run is more than 24 hours old (so the commit the tables name stays within a day
   of main).
 
-It then commits those files to main as `github-actions[bot]` with `[skip ci]` in the message (so
-the commit starts no other workflow), once for every platform, rebasing onto main if main moved
-during the run. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
+It then draws [the trends](#over-time) again (`harness/benchcharts.py`, after the history below is
+appended) and commits those files to main as `github-actions[bot]` with `[skip ci]` in the
+message (so the commit starts no other workflow), once for every platform, rebasing onto main if
+main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml and
+live-latency.yaml commit through too). bench-readme, bench-counts and live-latency each draw
+every trend, so two of them running at once can conflict in the trend charts and sections: a
+conflict only there is settled by drawing them again from the merged history, and one anywhere
+else stops the commit with the files named. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
 the ruleset on main lets past its required check; the job's own `GITHUB_TOKEN` is refused
 ([harness.md](harness.md#ci)). `bench-bun.yaml` does the same for bun, nightly, on the same runners: bun takes
 hours, so it has a workflow and a stored result of its own (`docs/benchmarks/bun-<platform>.json`
@@ -637,6 +660,56 @@ the others in the tables and charts and in their geometric means. Each table fol
 platform's bun result into that platform's own (`benchreport.py`'s `stored_all`), whichever
 workflow wrote last, and a footnote names bun's machine, commit and date; its every number is
 under "macOS arm64, bun" and so on below.
+
+## Instruction counts
+
+Wall time on a machine moves by several percent from run to run, so a change that makes a step
+1-3% slower or faster is invisible in it. Like rustc-perf, the harness also counts what the
+processes doing the work retired, which a busy or noisy machine moves far less, and judges that
+first. `harness/counters.py` is the one way it is counted (bench.py, abbench.py and
+`harness/v2/budgets.py` read counts through it, as memory goes through memory.py):
+
+- Linux: hardware counters from `perf_event_open(2)` for instructions and cycles, user mode only.
+  A command bench.py times starts stopped under `sh` until a counter with `inherit` and
+  `enable_on_exec` is open on it, so the command and every process and thread it starts from
+  then on are counted, the daemon the first `blaze build` starts included. budgets.py opens
+  counters on every thread of the running daemon and what it starts (not the `blaze` command).
+  This needs `kernel.perf_event_paranoid` at most 2 and a PMU: GitHub's hosted runners expose
+  none, so counts come from the dedicated benchmark machines.
+- macOS: `proc_pid_rusage`'s lifetime `ri_instructions` and `ri_cycles` of the command (read once
+  it exited, before it is reaped) and of the daemon and every process below it alive when read;
+  user and kernel mode together, and a short-lived process below the daemon that comes and goes
+  between two reads is missed (`counts_partial` says so when the meter had seen it).
+- A step is counted from quiet to quiet: before and after it the meter waits, at most 10 s, until
+  its processes retire fewer than 2M instructions in 0.2 s, so work the daemon does after the
+  command returned is the step's.
+- Where there are no counters (another OS, a refused or missing counter), a count is null and
+  `counts_gap` says why; nothing is estimated. The test phases are not counted.
+
+Each phase of a result has `instructions` and `cycles` (medians), `instructions_samples` and
+`counts_mode` (`user` or `user+kernel`); the cold phase also `warm_store_instructions`. Counts
+are comparable only on one machine with one mode, which is how the history compares them.
+Retired instructions still move a little from run to run in a multithreaded daemon (work
+stealing, spinning, hash seeds), which is why the band below widens with the spread the history
+shows.
+
+### The stress corpus and the per-merge run
+
+`bench.py --stress` adds the crates of `harness/stress-corpus/manifest.json` (`{"version": 1,
+"crates": [{"name", "path", "what"}]}`, paths relative to `harness/stress-corpus`): small crates,
+each a shape that is hard for a compiler. Each is copied out as a workspace of its own and built
+from nothing (no target directory, an empty home and store, no daemon) by `blaze check` and then
+`blaze build`, `--runs` times each, until the daemon is ready and quiet: wall time, blaze's
+peak memory and the counts. They are in the result under `stress` (and `stress_gap` when the
+manifest is not in the tree), and in a history line as `stress:<crate>/<backend>`.
+
+`.github/workflows/bench-counts.yaml` runs on every push to main that touches code, on the same
+dedicated machines as bench-readme (one run at a time, a newer push replacing the waiting one):
+the stress corpus with fd and hyperfine, the dev profile, three runs. It appends a line per
+platform to `docs/benchmarks/history/<platform>-merge.jsonl` (`benchhistory.py build --suite
+merge`; the site does not chart those yet, [the trends](#over-time) do), checks it as below, writes
+the summary to the run's summary, draws the trends again, commits the history and the trends to
+main with `[skip ci]` and fails on a regression.
 
 ## History and regressions
 
@@ -649,9 +722,17 @@ and the workflow starts the site's deploy after it commits.
 
 `benchhistory.py check` then compares the new line with the median of the last seven from the
 same machine with the same cores. A number regressed when it is above that median by more than
-its noise band and by more than a floor: the band is 10% or three times the spread the history
-shows (1.4826 times the median absolute deviation), whichever is larger, and the floors are
-50 ms for times, 100 MB for memory and 50 MB for the store and disk. Memory checked is
+its noise band and by more than a floor, and improved when it is below it by as much.
+Instructions are the primary signal: their band is 1% (`--instructions-noise`) or three times
+the spread the history shows (1.4826 times the median absolute deviation), whichever is larger,
+with a floor of 1M instructions. Every other number is secondary and keeps the band it had: 10%
+(`--noise`) or three times the spread, with floors of 50 ms for times, 100 MB for memory and
+50 MB for the store and disk. Either band is doubled with fewer than three earlier runs. A wall
+time past its band fails the check as before, since a step can get slower without retiring more
+instructions (a lock, a lost core). The report starts with a summary in rustc-perf's form: for
+instructions, wall time and peak memory, how many numbers regressed and how many improved past
+their band and the geometric mean of their change, and over every number compared, below the
+band too, how many went up and down and the geometric mean of all the changes. Memory checked is
 blaze's: its peak in each phase, what the daemon holds after each phase, once ready and at the
 end of the run, and its disk; cargo's memory is charted, not checked. A step the daemon built that cargo
 builds now is a regression whatever its time. On a regression the workflow opens an issue
@@ -662,8 +743,8 @@ Live edits are checked the same way. `.github/workflows/live-latency.yaml` runs 
 main on a GitHub macOS arm64 runner (`macos-15`), times edits of the four live programs through
 `blaze build` (`harness/live_latency.py cargo`; its socket, burst and replay modes are refused
 until they are clients of `blaze_api::client`, [live.md](live.md#latency-under-typing)), appends
-one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl` and checks the p50
-and p90 of each program and mode (floor 1 ms). A shared runner is noisier than the benchmark
+one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl`, checks the p50
+and p90 of each program and mode (floor 1 ms), and draws the trends again before it commits. A shared runner is noisier than the benchmark
 machine; the band widens with the spread its own history shows.
 
 ## Run it yourself

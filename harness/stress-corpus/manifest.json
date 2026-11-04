@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "crates": [
+    {
+      "name": "deep-vector",
+      "path": "deep-vector",
+      "what": "one vec! literal of 135,000 untyped integers: type inference and integer fallback over a huge expression (rustc-perf deep-vector)"
+    },
+    {
+      "name": "trivial-consts",
+      "path": "trivial-consts",
+      "what": "6,000 libc-style const items with literal values plus a few const fn, size_of and const-block constants: const lowering and evaluation"
+    },
+    {
+      "name": "trait-heavy",
+      "path": "trait-heavy",
+      "what": "type-level Peano arithmetic ~150 deep, an inferred-index HList and a Diesel-shaped query builder with blanket impls, projections and 16-ary tuple impls: trait solving and normalization"
+    },
+    {
+      "name": "deep-macro",
+      "path": "deep-macro",
+      "what": "macro_rules recursion 1,500 deep, a quadratic tt-muncher over 800 tokens and one 12,000-pair invocation: macro expansion and large token streams"
+    },
+    {
+      "name": "big-file",
+      "path": "big-file",
+      "what": "one 1.4 MB file of 18,000 small items: parsing, spans and hashing; edits.json holds a line inserted at the top to shift every span"
+    }
+  ]
+}

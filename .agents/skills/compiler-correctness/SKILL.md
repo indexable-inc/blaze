@@ -1,6 +1,6 @@
 ---
 name: compiler-correctness
-description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's salsa crates, keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
+description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
 ---
 
 # Compiler correctness
@@ -36,10 +36,14 @@ person or agent using it, not by how closely it matches them: errors, warnings, 
 and flags, printed and JSON output, progress, the target directory's layout, file formats, caches,
 symbol names, debug info, what a build or test run does and in what order. Match them only where
 real code or tools depend on it (a program's behavior, a published crate's manifest, an editor
-reading the JSON); everywhere else pick the better design and delete the copy. Tests check what
-makes the result useful and correct, never that it equals rustc's or cargo's. `superset-of-rust` is
-unchanged: every program the pinned nightly builds still builds and runs as it does under rustc,
-except one that only builds through a rustc soundness bug.
+reading the JSON); everywhere else pick the better design and delete the copy. Their style is no
+constraint either: how cargo or rustc words, colours, lays out or orders a message, a progress line,
+a summary or a flag is not a reason for blaze to do the same; design it as blaze would from scratch
+(structured data first, rendered for a person on a terminal and as data for an agent) and change it
+freely when a better way is found. Tests check what makes the result useful and correct, never that
+it equals rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly
+builds still builds and runs as it does under rustc, except one that only builds through a rustc
+soundness bug.
 
 ## blaze-uses-its-extensions (rule 6)
 
@@ -95,9 +99,12 @@ a test builds twice and compares bytes.
 ## semantics-in-front-end (rule 29)
 
 Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity
-hashes) go in the front end's salsa crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived
-from rust-analyzer but no longer synced with it), in a crate of their own where possible. Codegen,
-the store, the daemon, cargo integration and the runtime stay outside the front end.
+hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from
+rust-analyzer but no longer synced with it), whose queries run on blaze's own engine
+(`blaze_query::db`, crates/blaze-query: derived from salsa but not salsa; dense ids, in memory, one
+view at a time; persisted, shared results go through blaze-kernel), in a crate of their own where
+possible. Codegen, the store, the daemon, cargo integration and the runtime stay outside the front
+end.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 

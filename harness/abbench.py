@@ -13,8 +13,9 @@ that is busier for a while is busier for all of them alike, and every number is 
 `rounds x runs` samples.
 
 An edit is timed three ways: the wall time of `blaze build`, the daemon's own
-`edit-to-binary`, and (macOS) the CPU cycles and instructions the daemon's workers spent on it,
-which a loaded machine moves much less than the wall time. Memory is the most the workers have
+`edit-to-binary`, and the CPU cycles and instructions the daemon's workers spent on it (counters.py:
+Linux's counters in user mode, macOS's totals), which a loaded machine moves much less than the
+wall time; the cold start's are macOS's alone (Linux keeps no lifetime count of a process). Memory is the most the workers have
 held at once (VmHWM on Linux, the lifetime peak physical footprint on macOS), read at the end
 of each turn. Plain cargo never builds here: bench.py compares against cargo, this compares
 builds of blaze. `--env NAME=KEY=VALUE` sets a variable for one build only (an allocator
@@ -22,9 +23,9 @@ option, for example); the same DIR may be given under two names with different v
 `--train` ends each turn so that an instrumented build writes its profile
 (.github/scripts/build_release.py trains the release build this way).
 """
-import ctypes, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import json, os, platform, re, shutil, statistics, sys, tempfile, time
 
-import blaze_cli
+import blaze_cli, counters
 from bench import PROJECTS, Daemon, cold_steps, daemon_steps, options, write_edit
 from blaze_cli import Side, base_env, fetch, how_built, wait_warm
 
@@ -32,45 +33,29 @@ DARWIN = platform.system() == "Darwin"
 
 
 class Usage:
-    """What a process has used so far: cycles, instructions, CPU seconds and its peak memory."""
-
-    if DARWIN:
-        _lib = ctypes.CDLL("/usr/lib/libproc.dylib")
-        # rusage_info_v4: a 16-byte uuid, then 64-bit counters.
-        _fields = ["user", "system", "pkg_idle", "interrupt", "pageins", "wired", "resident", "footprint", "start",
-                   "exit", "child_user", "child_system", "child_pkg_idle", "child_interrupt", "child_pageins",
-                   "child_elapsed", "read", "written", "q0", "q1", "q2", "q3", "q4", "q5", "q6", "billed",
-                   "serviced", "logical_writes", "max_footprint", "instructions", "cycles"]
-        _timebase = None
+    """What a process has used so far: its CPU seconds and its peak memory. Its instructions and
+    cycles are counters.py's (a Meter around each build; `counters.lifetime` for the cold start)."""
 
     @classmethod
     def of(cls, pid):
         if DARWIN:
-            buf = (ctypes.c_uint64 * 48)()
-            if cls._lib.proc_pid_rusage(pid, 4, ctypes.byref(buf)) != 0:
+            got = counters.rusage(pid)
+            if got is None:
                 return None
-            got = dict(zip(cls._fields, list(buf)[2:]))
-            if cls._timebase is None:
-                class Timebase(ctypes.Structure):
-                    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
-                tb = Timebase()
-                ctypes.CDLL("/usr/lib/libSystem.dylib").mach_timebase_info(ctypes.byref(tb))
-                cls._timebase = tb.numer / tb.denom
-            cpu = (got["user"] + got["system"]) * cls._timebase / 1e9
-            return dict(cycles=got["cycles"], instructions=got["instructions"], cpu_s=cpu, peak_mb=got["max_footprint"] / 2**20)
+            return dict(cpu_s=got["cpu_ns"] / 1e9, peak_mb=got["lifetime_max_footprint"] / 2**20)
         try:
             stat = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
             status = open(f"/proc/{pid}/status").read()
         except OSError:
             return None
         ticks = os.sysconf("SC_CLK_TCK")
-        return dict(cycles=0, instructions=0, cpu_s=(int(stat[11]) + int(stat[12])) / ticks,
+        return dict(cpu_s=(int(stat[11]) + int(stat[12])) / ticks,
                     peak_mb=int(re.search(r"VmHWM:\s+(\d+) kB", status)[1]) / 1024)
 
     @classmethod
     def total(cls, pids):
         found = [u for u in map(cls.of, pids) if u]
-        return {k: sum(u[k] for u in found) for k in ("cycles", "instructions", "cpu_s", "peak_mb")}
+        return {k: sum(u[k] for u in found) for k in ("cpu_s", "peak_mb")}
 
 
 class Build:
@@ -107,22 +92,27 @@ class Build:
             raise SystemExit(f"{self.name}: the daemon did not get ready: {states}")
         pids = [pid for pid, _ in daemon.workers()]
         said = daemon.said()
+        cold = counters.lifetime(pids)
         self.add("cold", wall_s=round(took + warm, 3), first_build_s=round(took, 3), warm_s=round(warm, 3),
-                 steps_s=cold_steps(said), **Usage.total(pids))
+                 steps_s=cold_steps(said), cycles=cold.cycles, instructions=cold.instructions, **Usage.total(pids))
+        # The workers, and what they start, counted from here on.
+        meter = counters.Meter()
+        for pid in pids:
+            meter.follow(pid)
 
         def timed_build(kind, edit):
             time.sleep(pause)
-            before = Usage.total(pids)
+            before, counted = Usage.total(pids), meter.snapshot()
             took, ran = side.cargo("build", *build)
-            after = Usage.total(pids)
+            after, counted = Usage.total(pids), meter.since(counted)
             built = how_built(ran.stderr)
             if ran.returncode != 0 or built != "daemon":
                 raise SystemExit(f"{self.name} {kind}: built by {built} (exit {ran.returncode}):\n{ran.stderr[-2000:]}")
             said = daemon.said(1 if edit else 0)
             e2b = re.findall(r"^edit-to-binary: (\S+)$", said, re.M)
             self.add(kind, wall_s=took, edit_to_binary_s=sum(map(seconds, e2b)) if e2b else None,
-                     steps_ms=daemon_steps(said), cycles=after["cycles"] - before["cycles"],
-                     instructions=after["instructions"] - before["instructions"], cpu_s=after["cpu_s"] - before["cpu_s"])
+                     steps_ms=daemon_steps(said), cycles=counted.cycles, instructions=counted.instructions,
+                     cpu_s=after["cpu_s"] - before["cpu_s"])
 
         for kind in kinds:
             for _ in range(runs):
@@ -134,6 +124,7 @@ class Build:
                 timed_build(kind, True)
                 write_edit(self.ws, changes, True)
                 timed_build(kind + " back", True)
+        meter.close()
         self.add("memory", peak_mb=Usage.total(pids)["peak_mb"])
         if self.train:
             end_for_profile(side, pids)
