@@ -254,9 +254,7 @@ fn export(loaded: &Loaded, view: &View, args: &[String]) -> Result<(), Refused> 
     let (what, out) = match args {
         [what, out] => (what.as_str(), PathBuf::from(out)),
         _ => {
-            return Err(usage(
-                "`export` takes --pprof, --chrome, --ixprof or --folded, and a file",
-            ));
+            return Err(usage("`export` takes --pprof, --chrome, --ixprof or --folded, and a file"));
         }
     };
     let bytes = match (what, loaded) {
