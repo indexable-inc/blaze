@@ -49,10 +49,11 @@ prefab hn.SideClip : ui.Column {
 
 // The sidebar: the device, then its objects as a tree, clear over the vibrancy. Its top padding is the gap under the
 // title-bar strip; SafeAreaPadding adds the strip (the window's SafeAreaInset, set by the host in lay_chrome).
+// Its left margin is its children's (side_inset): the tree's clip runs to the sidebar's edge so a chevron can hang there.
 prefab hn.Sidebar : ui.Column {
   Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
-  Padding: {l: 10, r: 10, t: 4, b: 10}
+  Padding: {l: 0, r: $side_inset, t: 4, b: 10}
   SafeAreaPadding: {l: false, r: false, t: true, b: false}
 }
 
@@ -61,6 +62,14 @@ prefab hn.Sidebar : ui.Column {
 prefab hn.Tree : ui.Scroll {
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: $side_inset, r: 0, t: 0, b: 0}
+}
+
+// The sidebar's foot (the Archive row), in from its left edge by the margin the tree pads itself with.
+prefab hn.SideFoot : ui.Column {
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+  Padding: {l: $side_inset, r: 0, t: 0, b: 0}
 }
 
 // The selected tree row's pill: a Background under the row (src/app.rs), matched by id so a new selection's pill
@@ -129,7 +138,7 @@ prefab hn.Badge : ui.Row {
 prefab hn.DeviceRow : ui.Row {
   Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
-  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
+  Padding: {l: $label_inset, r: $row_pad, t: 0, b: 0}
   name : ui.Lead, Faint {
     TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
   }
@@ -154,7 +163,17 @@ prefab hn.Disclosure : ui.Row {
   }
 }
 
-// A session: indent, its kind's icon in the kind's colour, its name (13 medium), and on the right its shortcut (on
+// A tree row's hanging disclosure: a layer over the whole row (out of its flow), padded so its slot ends at the row's
+// icon (the host sets the padding by depth: row_pad + depth * indent_step - disclose_w, negative at depth 0, where the
+// chevron hangs in the sidebar's margin).
+prefab hn.Hang : ui.Row {
+  Overlay
+  Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+  Padding: {l: 0, r: 0, t: 0, b: 0}
+  disclose : hn.Disclosure {}
+}
+
+// A session (padded in by its depth, its disclosure hanging left of its icon): its kind's icon in the kind's colour, its name (13 medium), and on the right its shortcut (on
 // hover), a failure's badge and a running dot.
 prefab hn.ObjRow : ui.Row {
   Pressable
@@ -166,10 +185,7 @@ prefab hn.ObjRow : ui.Row {
   Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
-  indent : ui.Node {
-    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-  }
-  disclose : hn.Disclosure {}
+  hang : hn.Hang {}
   glyph : ui.Symbol {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
@@ -186,7 +202,7 @@ prefab hn.ObjRow : ui.Row {
   dot : hn.Dot {}
 }
 
-// A shell run (or one of its pipeline stages) under its session: indent, a small dot tinted by how it went, its command
+// A shell run (or one of its pipeline stages) under its session (padded in by depth): a small dot tinted by how it went, its command
 // (12 regular Inter, secondary), and on the right how long it took (on hover, or always for a failure).
 prefab hn.RunRow : ui.Row {
   Pressable
@@ -198,10 +214,7 @@ prefab hn.RunRow : ui.Row {
   Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $run_h, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
-  indent : ui.Node {
-    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-  }
-  disclose : hn.Disclosure {}
+  hang : hn.Hang {}
   glyph : ui.Symbol, Faint {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
   }
@@ -227,10 +240,7 @@ prefab hn.MoreRow : ui.Row {
   Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
   Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $more_h, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
-  indent : ui.Node {
-    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-  }
-  disclose : hn.Disclosure {}
+  hang : hn.Hang {}
   glyph : ui.Node {
     Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
@@ -534,6 +544,13 @@ prefab hn.Theme {
   // A tree level's indent, and a failure badge's padding while it shows.
   indent {
     Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  // A sidebar row's padding before its icon at depth 0, and the disclosure slot hanging left of the icon.
+  row_inset {
+    Size: {w: {kind: Fixed, value: $row_pad, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+  }
+  disclose {
+    Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
   badge_on {
     Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}

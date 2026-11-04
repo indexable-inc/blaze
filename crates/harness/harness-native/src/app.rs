@@ -297,7 +297,7 @@ impl App {
             set_side_width(side.entity(), w);
         }
         let tree = side.child("hn.Tree");
-        let archive_row = side.child("hn.ArchiveRow");
+        let archive_row = side.child("hn.SideFoot").child("hn.ArchiveRow");
         archive_row.set(HoverAmt::default());
         for name in ["icon", "count"] {
             if let Some(p) = archive_row.part(name) {
@@ -567,6 +567,7 @@ impl App {
         }
         let looks = RowLooks::of(w, clear);
         let step = crate::look::width(w, "indent");
+        let (inset, slot) = (crate::look::width(w, "row_inset"), crate::look::width(w, "disclose"));
         // One row per session, run and stage, with a fold row over each session's older runs.
         let tree = View::of(w.entity_from_id(self.ids.tree));
         let hint: HashMap<u64, usize> = rows.iter().enumerate().map(|(i, &(e, _))| (e, i)).collect();
@@ -582,11 +583,19 @@ impl App {
         let info = self.fold.merge(info, w);
         let me = &*self;
         // Names to clip to their row's room once the loop is done (the typesetter needs `self` mutably).
+        // A row padded in by its depth (its icon at the section label's edge at depth 0), its disclosure's layer padded so
+        // the slot ends at the icon: the chevron hangs in the gutter and never pushes the row's content.
         let indent = |row: View<'_>, depth: usize| {
-            if let Some(p) = row.part("indent") {
-                let s = Size { w: Sizing { kind: SizeKind::Fixed, value: depth as f32 * step, min: 0.0, max: 0.0 }, h: Sizing { kind: SizeKind::Fixed, value: 1.0, min: 0.0, max: 0.0 } };
-                if p.entity().try_cloned::<&Size>() != Some(s) {
-                    p.set(s);
+            let l = inset + depth as f32 * step;
+            use harness_native_ui_layout_api::Padding;
+            let pad = row.entity().try_cloned::<&Padding>().unwrap_or_default();
+            if pad.l != l {
+                row.set(Padding { l, ..pad });
+            }
+            if let Some(h) = row.part("hang") {
+                let pad = Padding { l: l - slot, ..Padding::default() };
+                if h.entity().try_cloned::<&Padding>() != Some(pad) {
+                    h.set(pad);
                 }
             }
         };
