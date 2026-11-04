@@ -56,6 +56,12 @@ prefab ui.Line : ui.Words {
   OneLine
 }
 
+// A row's leading words (its name): a ui.Line that gives up its room first when the row is short of it, so its counts
+// and badges keep theirs.
+prefab ui.Lead : ui.Line {
+  ShrinkFirst
+}
+
 // A glyph of den's icon set, 16 points, in the muted ink.
 prefab ui.Symbol : ui.Node, Muted {
   Icon: {glyph: ""}

@@ -108,6 +108,11 @@ pub struct Centre {
     pub at: f32,
 }
 
+/// Out of room, this child gives up its length along its parent's main axis before its siblings do (down to its `min`):
+/// a row's name cut with an ellipsis before its count or badge is. A tag.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ShrinkFirst;
+
 /// Width over height: when one axis is `Grow` or `Fixed` and the other `Fit`, the other follows.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Aspect {
@@ -170,6 +175,7 @@ hyperion_api_layouts::api_layouts! {
     "Intrinsic" => alias Intrinsic,
     "Viewport" => alias Viewport,
     "ScrollState" => alias ScrollState,
+    "ShrinkFirst" => alias ShrinkFirst,
     "AnchoredTo" => alias AnchoredTo,
     "Side" => alias Side,
     FlexAxis,
@@ -189,6 +195,7 @@ pub fn register(world: &World) {
     world.component::<Centre>().writable();
     world.component::<Intrinsic>().writable();
     world.component::<Viewport>().writable();
+    world.component::<ShrinkFirst>().writable();
     world.component::<ScrollState>().writable();
     world.component::<Side>().writable();
     world.component::<AnchoredTo>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
