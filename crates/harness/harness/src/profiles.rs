@@ -42,7 +42,17 @@ fn mcp_args() -> Vec<String> {
 
 fn common_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = mcp_env(ctx);
-    env.insert("TERM".into(), "xterm-256color".into());
+    // The terminal is Ghostty's core, so say so the way Ghostty does: xterm-ghostty with Ghostty's own terminfo
+    // (Ghostty sets TERMINFO to its bundle too), or xterm-256color where that terminfo is not installed.
+    let terminfo = PathBuf::from("/Applications/Ghostty.app/Contents/Resources/terminfo");
+    if terminfo.join("78/xterm-ghostty").exists() {
+        env.insert("TERM".into(), "xterm-ghostty".into());
+        env.insert("TERMINFO".into(), terminfo.display().to_string());
+    } else {
+        env.insert("TERM".into(), "xterm-256color".into());
+    }
+    env.insert("TERM_PROGRAM".into(), "ghostty".into());
+    env.insert("TERM_PROGRAM_VERSION".into(), harness_vt::ghostty_version().into());
     env.insert("COLORTERM".into(), "truecolor".into());
     env
 }
@@ -88,6 +98,9 @@ fn claude(ctx: &Ctx) -> Launch {
         ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),  // no CLAUDE.md / AGENTS.md from any level
         ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
         ("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1"),
+        // Show the real cursor at the input instead of hiding it (?25l) and painting an inverse block. Claude takes
+        // that from its `tengu_native_cursor` flag, which DISABLE_TELEMETRY / NONESSENTIAL_TRAFFIC leave at false.
+        ("CLAUDE_CODE_NATIVE_CURSOR", "1"),
     ] {
         env.insert(k.into(), v.into());
     }
