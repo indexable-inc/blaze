@@ -9,6 +9,8 @@ const DEFAULT_PAD: [f32; 4] = [18.0, 18.0, 16.0, 16.0];
 
 /// The prefabs whose Fill follows the theme, each with the scene's own Fill (kept for an appearance with no theme).
 const TINTED: [&str; 7] = ["Plate", "hn.Main", "hn.Palette.card", "hn.SideClip", "hn.TitleBar.title", "hn.TitleBar.back", "hn.TitleBar.sub"];
+/// The `export mut` token (scene/00-tokens.flecs) each of [`TINTED`] reads its Fill from.
+const TOKENS: [&str; 7] = ["tone_plate", "tone_term_ground", "tone_card", "tone_side_tint", "tone_term_ink", "tone_term_muted", "tone_term_muted"];
 
 /// What the app takes from the config.
 pub(super) struct Look {
@@ -54,11 +56,17 @@ fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 7] {
     [ground, ground, card, side, ink, muted, muted]
 }
 
-/// `f` on prefab `path` (what instances made from now on copy) and on every instance made from it so far.
-fn retint(w: WorldRef<'_>, path: &str, f: Fill) {
+/// Token `token` set to `f`: flecs re-runs what reads it (prefab `path`'s Fill, what instances made from now on copy), and
+/// the instances made from `path` so far, which copied the old Fill when they were made, take the new one.
+fn retint(w: WorldRef<'_>, token: &str, path: &str, f: Fill) {
+    let json = |c: Rgba| format!("{{\"r\": {}, \"g\": {}, \"b\": {}, \"a\": {}}}", c.r, c.g, c.b, c.a);
+    if !w.set_mut_var(token, &format!("{{\"dark\": {}, \"light\": {}}}", json(f.dark), json(f.light))) {
+        eprintln!("harness-native: no scene token {token} to tint");
+        return;
+    }
     let Some(pf) = view::prefab(w, path) else { return };
     let id = *pf.id();
-    pf.set(f);
+    let f = pf.try_cloned::<&Fill>().unwrap_or(f);
     let mut made = Vec::new();
     w.new_query::<&Fill>().each_entity(|e, _| {
         if e.owns((flecs::IsA::ID, id)) {
@@ -116,7 +124,7 @@ impl App {
             let s = scene[i];
             let f = Fill { light: if themed[0] { rgba(dl[i]) } else { s.light }, dark: if themed[1] { rgba(dd[i]) } else { s.dark } };
             if view::prefab(w, path).and_then(|e| e.try_cloned::<&Fill>()) != Some(f) {
-                retint(w, path, f);
+                retint(w, TOKENS[i], path, f);
             }
         }
     }

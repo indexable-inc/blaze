@@ -1,0 +1,44 @@
+// Rows inside a pane (src/app/panes.rs), as a template: the host sets props, flecs re-runs what reads a changed one.
+
+@tree ChildOf
+hn {
+  // A row of a pane's list (a run's stages, a group's runs): a status dot (`state`: running, lost, failed, else exited),
+  // its id, its command in the code face, and on the right how it ended and how long it ran (`meta`). Clicked, it
+  // selects that run or stage; lit while it is the one shown.
+  @tree ChildOf
+  template PaneRow : Row {
+    prop id: string = ""
+    prop state: string = ""
+    prop meta: string = ""
+    (IsA, ui.Row)
+    Pressable
+    Action: {name: "select:{obj}"}
+    if $selected {
+      Fill: $tone_select
+    } else {
+      Fill: $tone_clear
+    }
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 24, min: 0, max: 0}}
+    Padding: {l: 8, r: 8, t: 0, b: 0}
+    dot : hn.Dot {
+      Fill: match $state { "running": $tone_running; "lost": $tone_lost; "failed": $tone_failed; _: $tone_exited }
+    }
+    id : ui.Words, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}
+      Text: {s: $id}
+    }
+    name : ui.Words, Ink {
+      TextStyle: {size: $size_caption, line: 14, role: 9, bold: 0}
+      Text: {s: $name}
+    }
+    spacer : ui.Spacer {}
+    meta : ui.Words, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      Text: {s: $meta}
+    }
+  }
+}

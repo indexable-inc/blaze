@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use harness_native_ui_input_api::Pressable;
 use harness_native_ui_motion_api::{Motion, Reveal, Shown, Target};
 use harness_native_ui_node_api::Clip;
 
@@ -225,37 +224,4 @@ fn fold_key(e: EntityView<'_>) -> Option<String> {
         return None;
     }
     e.try_cloned::<&model::Run>().map(|r| format!("r{}", r.n))
-}
-
-/// Set a row's disclosure: a chevron that folds `e` (turned open or not) when it has rows under it, shown while the row
-/// is hovered or while it is folded; nothing, and no hit target (the row takes the press), when it has none.
-pub fn disclosure(row: View<'_>, e: Option<EntityView<'_>>) {
-    // In the sidebar it hangs in the row's `hang` layer (left of the icon); in the Archive it is in the row's flow.
-    let Some(p) = row.part("disclose").or_else(|| row.part("hang").and_then(|h| h.part("disclose"))) else { return };
-    let kids = e.filter(|e| has_kids(*e));
-    let pe = p.entity();
-    match kids {
-        Some(o) => {
-            let open = !o.has(model::Collapsed::id());
-            if !pe.has(Pressable::id()) {
-                pe.add(Pressable::id());
-            }
-            p.action(&format!("toggle:{}", *o.id()));
-            if let Some(i) = p.part("icon") {
-                i.icon(crate::look::CHEVRON);
-                crate::look::disclose(i.entity(), open);
-                crate::look::hover_show(i.entity(), row.id(), !open);
-            }
-        }
-        None => {
-            if pe.has(Pressable::id()) {
-                pe.remove(Pressable::id());
-                pe.remove(harness_native_ui_input_api::Hoverable::id());
-                pe.remove(harness_native_ui_input_api::Focusable::id());
-            }
-            if let Some(i) = p.part("icon") {
-                i.icon("");
-            }
-        }
-    }
 }

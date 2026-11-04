@@ -26,7 +26,7 @@ pub use checked::{FlecsError, checked, clear_error, set_message_source, take_err
 pub use entity::{Entity, EntityView};
 pub use query::{Query, QueryBuilder, QueryTuple, Term};
 pub use reflect::HOST_OWNED;
-pub use script::{ScriptBuilder, ScriptEntityView};
+pub use script::{Prop, ScriptBuilder, ScriptEntityView};
 pub use shared::{Json, Shared};
 pub use string::ScriptString;
 pub use system::{Event, ObserverBuilder, SystemBuilder, TableIter};
@@ -49,7 +49,7 @@ pub mod __private {
 pub mod prelude {
     pub use crate::flecs;
     pub use crate::{
-        Component, ComponentId, Entity, EntityView, Get, IntoId, Layout, Query, QueryBuilder, ScriptEntityView, ScriptString, Shared, TableIter, World, WorldRef,
+        Component, ComponentId, Entity, EntityView, Get, IntoId, Layout, Prop, Query, QueryBuilder, ScriptEntityView, ScriptString, Shared, TableIter, World, WorldRef,
     };
 }
 

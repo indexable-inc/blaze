@@ -250,19 +250,7 @@ impl App {
         s.tick = Some((self.pending, s.why));
         s.real = 0;
         s.spark = s.cpu.ordered().iter().zip(s.gpu.ordered()).map(|(c, g)| c + g).collect();
-        let text = self.stats_text(now);
-        let top = self.chrome.strip / self.zoom();
-        if let Some(n) = self.stats.node.map(|n| View::of(self.world.entity_from_id(n))) {
-            if let Some(t) = n.part("plate").and_then(|p| p.part("text")) {
-                t.text(&text);
-            }
-            // An Overlay child takes its parent's whole frame, not its safe area: pad it down past the title-bar strip.
-            let proto = view::prefab(self.world.world_ref(), "hn.Stats").and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()).unwrap_or_default();
-            let pad = harness_native_ui_layout_api::Padding { t: proto.t + top, ..proto };
-            if n.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
-                n.set(pad);
-            }
-        }
+        self.stats_props(now);
     }
 
     /// A frame was built into `d`: its CPU time, the last GPU time and its instances. A tick whose only redraw was its
@@ -289,18 +277,16 @@ impl App {
         }
     }
 
-    /// The caption: one fact a line, columns padded so it holds still in the monospace face.
-    fn stats_text(&mut self, now: Instant) -> String {
+    /// The overlay's measurements, as props of its template (hn.Stats, scene/widgets/stats.flecs), which formats the
+    /// caption: one fact a line, columns padded so it holds still in the monospace face.
+    fn stats_props(&mut self, now: Instant) {
         let w = self.world.world_ref();
-        let mut out = Vec::new();
+        let Some(node) = self.stats.node.map(|n| View::of(w.entity_from_id(n))) else { return };
         let nodes = self.world.new_query::<&Node>().count();
         let laid = self.world.new_query::<(&Node, &Laid)>().count();
         let s = &self.stats;
         let inst = s.dt.last();
         let fps_now = if inst > 0.0 { 1000.0 / inst } else { 0.0 };
-        out.push(format!("fps   {fps_now:>5.0} now  {:>5} in 1s", s.stamps.len()));
-        out.push(format!("cpu   {:>5.2} ms  p50 {:>5.2}  p99 {:>5.2}", s.cpu.last(), s.cpu.quantile(0.5), s.cpu.quantile(0.99)));
-        out.push(format!("gpu   {:>5.2} ms  p50 {:>5.2}  p99 {:>5.2}", s.gpu.last(), s.gpu.quantile(0.5), s.gpu.quantile(0.99)));
         // Redrawing while something other than this overlay's tick keeps asking for frames (20 or more in the last second:
         // an animation, a stream); the daemon's 400 ms list poll alone (3 frames each) reads as idle.
         let asked = s.stamps.iter().filter(|(_, a)| *a).count();
@@ -312,44 +298,38 @@ impl App {
         } else {
             "idle"
         };
-        out.push(format!("state {state}  ({asked} of {} frames asked for in 1s)", s.stamps.len()));
-        let last = match s.last_real {
+        let why = match s.last_real {
             Some((t, why)) => format!("{why}  {:.1}s ago", (now - t).as_secs_f32()),
             None => format!("{}", s.why),
         };
-        out.push(format!("why   {last}"));
-        out.push(format!("ecs  {} entities  {nodes} nodes  {laid} laid", w.alive_count()));
-        out.push(format!("draw  {} panels  {} glyphs  {} sprites", s.draws[0], s.draws[1], s.draws[2]));
         let glyph = (self.cache.hits, self.cache.misses);
         let shape = (self.grid.shape_hits, self.grid.shape_misses);
         let d = |a: (u64, u64), b: (u64, u64)| (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1));
-        out.push(format!("atlas {:.1}% full  glyph hit {}  shape hit {}", self.cache.fill() * 100.0, rate(d(glyph, s.prev.glyph)), rate(d(shape, s.prev.shape))));
+        let (glyph_hit, shape_hit) = (rate(d(glyph, s.prev.glyph)), rate(d(shape, s.prev.shape)));
         // The shown terminal: its object, grid, cell in device pixels, scrollback and stream rate.
         let mut pty = None;
-        let term = self.focused_term().map(|t| {
+        let mut term = (String::new(), 0.0, 0.0, 0.0, 0.0, String::new(), String::new());
+        let shown = self.focused_term().map(|t| {
             let te = w.entity_from_id(t);
             (te.try_cloned::<&TermGrid>().unwrap_or_default(), te.parent().and_then(|p| model::shows(w, *p.id())).map(|e| *e.id()))
         });
-        match term {
-            Some((g, Some(e))) if g.cols > 0 => {
-                let (label, key, bytes) = match (self.session_of(e), self.run_of(e)) {
-                    (Some(sid), _) => (format!("s{sid}"), sid, self.link.session_bytes(sid)),
-                    (None, Some((n, k))) => (k.map_or(format!("r{n}"), |k| format!("r{n}.{k}")), n << 8 | u64::from(k.map_or(255, |k| k.min(254) as u8)), self.link.run_bytes(n, k)),
-                    _ => ("-".into(), 0, 0),
-                };
-                let bps = match s.prev.pty {
-                    Some((k, b, t)) if k == key && now > t => bytes.saturating_sub(b) as f64 / (now - t).as_secs_f64(),
-                    _ => 0.0,
-                };
-                pty = Some((key, bytes, now));
-                let (cw, ch) = ((self.grid.cw * self.grid.scale).round(), (self.grid.ch * self.grid.scale).round());
-                out.push(format!("term  {label} {}x{}  cell {cw}x{ch}px  sb {}", g.cols, g.rows, s.history));
-                out.push(format!("pty   {}/s  ({} total)", mb(bps), mb(bytes as f64)));
-            }
-            _ => out.push("term  -".into()),
+        if let Some((g, Some(e))) = shown
+            && g.cols > 0
+        {
+            let (label, key, bytes) = match (self.session_of(e), self.run_of(e)) {
+                (Some(sid), _) => (format!("s{sid}"), sid, self.link.session_bytes(sid)),
+                (None, Some((n, k))) => (k.map_or(format!("r{n}"), |k| format!("r{n}.{k}")), n << 8 | u64::from(k.map_or(255, |k| k.min(254) as u8)), self.link.run_bytes(n, k)),
+                _ => ("-".into(), 0, 0),
+            };
+            let bps = match s.prev.pty {
+                Some((k, b, t)) if k == key && now > t => bytes.saturating_sub(b) as f64 / (now - t).as_secs_f64(),
+                _ => 0.0,
+            };
+            pty = Some((key, bytes, now));
+            term = (label, f64::from(g.cols), f64::from(g.rows), f64::from((self.grid.cw * self.grid.scale).round()), f64::from((self.grid.ch * self.grid.scale).round()), mb(bps), mb(bytes as f64));
         }
         let link = w.lookup(model::LOCAL).target(model::Link::id(), 0).map_or(0, |t| *t.id());
-        let state = if link == *w.component_id::<model::Up>() {
+        let link = if link == *w.component_id::<model::Up>() {
             "up"
         } else if link == *w.component_id::<model::Down>() {
             "down"
@@ -358,10 +338,49 @@ impl App {
         };
         let rtt = self.link.rtt_ms().map_or("-".into(), |r| format!("{r:.2} ms"));
         let pid = self.link.daemon_pid().map_or("-".into(), |p| p.to_string());
-        out.push(format!("link  {state}  rtt {rtt}  harnessd {pid}"));
-        out.push(format!("mem   rss {}", rss_bytes().map_or("-".into(), |b| mb(b as f64))));
+        let rss = rss_bytes().map_or("-".into(), |b| mb(b as f64));
+        let top = f64::from(self.chrome.strip / self.zoom());
+        let f = |v: f32| Prop::Float(f64::from(v));
+        let n = |v: usize| Prop::Float(v as f64);
+        node.props(
+            "hn.Stats",
+            &[
+                ("top", Prop::Float(top)),
+                ("fps", f(fps_now)),
+                ("frames", n(s.stamps.len())),
+                ("cpu", f(s.cpu.last())),
+                ("cpu50", f(s.cpu.quantile(0.5))),
+                ("cpu99", f(s.cpu.quantile(0.99))),
+                ("gpu", f(s.gpu.last())),
+                ("gpu50", f(s.gpu.quantile(0.5))),
+                ("gpu99", f(s.gpu.quantile(0.99))),
+                ("state", Prop::Str(state)),
+                ("asked", n(asked)),
+                ("why", Prop::Str(&why)),
+                ("ents", n(w.alive_count() as usize)),
+                ("nodes", n(nodes)),
+                ("laid", n(laid)),
+                ("panels", n(s.draws[0])),
+                ("glyphs", n(s.draws[1])),
+                ("sprites", n(s.draws[2])),
+                ("atlas", Prop::Float(f64::from(self.cache.fill()) * 100.0)),
+                ("glyph_hit", Prop::Str(&glyph_hit)),
+                ("shape_hit", Prop::Str(&shape_hit)),
+                ("term", Prop::Str(&term.0)),
+                ("cols", Prop::Float(term.1)),
+                ("rows", Prop::Float(term.2)),
+                ("cw", Prop::Float(term.3)),
+                ("ch", Prop::Float(term.4)),
+                ("sb", n(s.history)),
+                ("pty_rate", Prop::Str(&term.5)),
+                ("pty_total", Prop::Str(&term.6)),
+                ("link", Prop::Str(link)),
+                ("rtt", Prop::Str(&rtt)),
+                ("pid", Prop::Str(&pid)),
+                ("rss", Prop::Str(&rss)),
+            ],
+        );
         self.stats.prev = Prev { glyph, shape, pty };
-        out.join("\n")
     }
 
     /// The sparkline: one bar a frame (newest at the right), as tall as its CPU + GPU time against twice the budget, in

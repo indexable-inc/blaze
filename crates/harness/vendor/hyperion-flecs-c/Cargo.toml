@@ -19,6 +19,11 @@ pipeline = ["system", "cached_queries", "query_plans"]
 meta = []
 script = ["meta"]
 json = ["meta"]
+# flecs.script.input (the on.click / on.enter async events) and the async/await it needs.
+script_input = ["script"]
+# The REST API (flecs.dev/explorer, the Flecs Shell) with the world and pipeline statistics it reports, and the script shell
+# it runs commands in. Compiled in only; a host turns it on at run time.
+rest = ["pipeline", "json", "script"]
 
 [build-dependencies]
 cc = "1"

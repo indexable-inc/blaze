@@ -177,35 +177,33 @@ impl App {
             });
         }
         stages.sort_unstable();
-        let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
         if let Some(list) = info.part("stages") {
             for_each(list, "hn.PaneRow", stages.into_iter().map(|(_, c)| (format!("s{c}"), c)), |row, c, new| {
                 if new {
                     row.set(HoverAmt::default());
                 }
-                row.action(&format!("select:{c}"));
-                set_if(row, if c == e { chosen } else { clear });
-                self.fill_pane_row(row, c);
+                self.fill_pane_row(row, c, c == e);
             });
         }
     }
 
-    /// A pane row's dot, id, command (one line) and how it ended.
-    fn fill_pane_row(&self, row: View<'_>, e: u64) {
-        let o = self.world.entity_from_id(e);
+    /// A pane row (hn.PaneRow, scene/widgets/panes.flecs): its run's id, command (one line), how it stands and how it
+    /// ended, and whether it is the one shown.
+    fn fill_pane_row(&self, row: View<'_>, e: u64, shown: bool) {
+        let w = self.world.world_ref();
+        let o = w.entity_from_id(e);
         let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-        if let Some(p) = row.part("dot") {
-            set_if(p, self.dot_tone(e));
-        }
-        if let Some(p) = row.part("id") {
-            p.text(&self.run_id(e));
-        }
-        if let Some(p) = row.part("name") {
-            p.text(&clip_text(&name.split_whitespace().collect::<Vec<_>>().join(" "), 110));
-        }
-        if let Some(p) = row.part("meta") {
-            p.text(&self.run_meta(e));
-        }
+        let name = clip_text(&name.split_whitespace().collect::<Vec<_>>().join(" "), 110);
+        let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
+        let state = match self.status_of(e) {
+            "running" => "running",
+            "lost" => "lost",
+            "killed" => "failed",
+            _ if code.is_some_and(|c| c != 0) => "failed",
+            _ => "exited",
+        };
+        let (id, meta) = (self.run_id(e), self.run_meta(e));
+        row.props("hn.PaneRow", &[("obj", Prop::Uint(e)), ("name", Prop::Str(&name)), ("selected", Prop::Bool(shown)), ("id", Prop::Str(&id)), ("state", Prop::Str(state)), ("meta", Prop::Str(&meta))]);
     }
 
     /// Focus pane `p`: the selection follows what it shows.

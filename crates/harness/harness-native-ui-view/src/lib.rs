@@ -109,6 +109,38 @@ impl<'a> View<'a> {
         self.0.add(id);
         self
     }
+
+    /// Set the props of `template` (`hn.ObjRow`: the script template this row is an instance of) by name, SwiftUI's view
+    /// inputs: the first call instantiates the template on this node, a later one re-runs only what reads a prop that
+    /// changed. Nothing is written when the props are the ones written last. A prop the template lacks is a scene bug:
+    /// it panics in a debug build and is logged once otherwise.
+    pub fn props(self, template: &str, props: &[(&str, Prop<'_>)]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        template.hash(&mut h);
+        props.hash(&mut h);
+        let h = h.finish();
+        if self.0.try_cloned::<&PropsHash>().is_some_and(|p| p.h == h) {
+            return self;
+        }
+        let world = self.0.world();
+        let Some(t) = self::prefab(world, template) else {
+            debug_assert!(false, "the scene has no template {template}");
+            return self;
+        };
+        if let Err(e) = self.0.set_props(t.id(), props) {
+            debug_assert!(false, "{template}: {e}");
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("harness-native: {template}: {e}"));
+        }
+        self.0.set(PropsHash { h });
+        self
+    }
+}
+
+/// Register the view layer's own component.
+pub fn register(world: &World) {
+    world.component::<PropsHash>();
 }
 
 /// The prefab the scene calls `name`: a script's path (`ui.SessionRow`, `.` between its parts) as the world's (`ui::SessionRow`).
@@ -125,10 +157,28 @@ fn make<'a>(world: WorldRef<'a>, parent: Option<EntityView<'a>>, prefab: &str) -
         e.child_of(*p.id());
     }
     e.add(flecs::OrderedChildren::ID);
-    if let Some(pf) = self::prefab(world, prefab) {
+    // A template (`template hn.ObjRow { prop ... }`) is not inherited from: the first `View::props` instantiates it.
+    if let Some(pf) = self::prefab(world, prefab).filter(|p| !is_template(*p)) {
         e.is_a(*pf.id());
     }
     e.add(Node::id())
+}
+
+/// Whether `e` is a script template (a component whose body a script runs for each instance), not a prefab.
+#[must_use]
+pub fn is_template(e: EntityView<'_>) -> bool {
+    !e.has(flecs::Prefab::ID) && e.try_get::<&flecs::Script>(|_| ()).is_some()
+}
+
+/// Whether `row` was made from `base` (a prefab it inherits from directly, or a template it is an instance of).
+fn made_from(row: EntityView<'_>, base: Option<EntityView<'_>>) -> bool {
+    base.is_none_or(|b| if is_template(b) { row.has(*b.id()) } else { row.owns((flecs::IsA::ID, *b.id())) })
+}
+
+/// The hash of the props a [`View::props`] last wrote, so a frame that changes none writes nothing.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct PropsHash {
+    pub h: u64,
 }
 
 /// Keep `parent`'s rows in step with `rows`, SwiftUI's `ForEach`: one child per key, made from `prefab` and named by the key
@@ -153,10 +203,10 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
         if !seen.insert(key.to_owned()) {
             continue;
         }
-        let base = self::prefab(world, prefab).map(|p| *p.id());
+        let base = self::prefab(world, prefab);
         // The prefab it was made from, not one that prefab is made from: a lit toggle (`ui.CodeChangesOn`, made from
         // `ui.CodeChanges`) is made again when the unlit one is asked for.
-        let old = parent.part(key).filter(|row| base.is_none_or(|b| row.0.owns((flecs::IsA::ID, b))));
+        let old = parent.part(key).filter(|row| made_from(row.0, base));
         if old.is_none()
             && let Some(stale) = parent.part(key)
         {
@@ -228,8 +278,7 @@ pub fn lazy_for_each_of<'a, 'p, K: AsRef<str>>(
     let e = parent.0;
     let world = e.world();
     // The prefab a row was made from (not one that prefab is made from), as `for_each_of` tells them apart.
-    let base = |name: &str| self::prefab(world, name).map(|p| *p.id());
-    let made_from = |row: EntityView<'_>, b: Option<u64>| b.is_none_or(|b| row.owns((flecs::IsA::ID, b)));
+    let base = |name: &str| self::prefab(world, name);
     let mut lazy = e.try_cloned::<&Lazy>().unwrap_or_default();
     if lazy.count != count {
         lazy.count = count;

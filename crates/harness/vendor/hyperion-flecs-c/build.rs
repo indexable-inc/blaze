@@ -1,6 +1,7 @@
 //! flecs core (FLECS_CUSTOM_BUILD plus FLECS_LOG), always -O2, plus the addons whose features are on: `prefab`,
 //! `constraint_traits`, `cached_queries`, `query_plans` (core in flecs 4.1, addons since 4.2), `system`, `pipeline`, `meta`,
-//! `script`, `json` (never REST, HTTP or alerts). `json` is flecs's own serializer of type info, query results and values (den-flecs's `reflect`, the repl's
+//! `script`, `json`, `script_input` (flecs.script.input, with async) and `rest` (REST, HTTP, stats and the script shell, for
+//! flecs.dev/explorer; a host still has to import it at run time). Never alerts. `json` is flecs's own serializer of type info, query results and values (den-flecs's `reflect`, the repl's
 //! live types: docs/repl-live-types.md).
 //!
 //! wasm32-unknown-unknown has no C library: `wasm-libc/` is a declaration-only set of headers plus `libc.c` (strings, ctype,
@@ -51,6 +52,10 @@ fn main() {
         ("META", "FLECS_META"),
         ("SCRIPT", "FLECS_SCRIPT"),
         ("JSON", "FLECS_JSON"),
+        ("SCRIPT_INPUT", "FLECS_SCRIPT_INPUT"),
+        ("REST", "FLECS_REST"),
+        ("REST", "FLECS_STATS"),
+        ("REST", "FLECS_SCRIPT_SHELL"),
     ] {
         if env::var_os(format!("CARGO_FEATURE_{feature}")).is_some() {
             b.define(addon, None);

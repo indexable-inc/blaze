@@ -118,17 +118,17 @@ export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.
 export const tone_knob: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
-export const tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
+export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
 // The one hairline between the sidebar and the main card.
 export const tone_seam: Fill = {dark: {1, 1, 1, 0.035}, light: {0, 0, 0, 0.04}}
 // Nothing: a node that paints no fill.
 export const tone_clear: Fill = {dark: {0, 0, 0, 0}, light: {0, 0, 0, 0}}
 // The palette's scrim over the window and its card.
 export const tone_scrim: Fill = {dark: {0, 0, 0, 0.32}, light: {0, 0, 0, 0.12}}
-export const tone_card: Fill = {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
+export mut tone_card: Fill = {dark: {0.098, 0.098, 0.106, 1}, light: {1, 1, 1, 1}}
 // Offscreen shots only (src/shot.rs): a flat stand-in for the sidebar's vibrancy, which a texture cannot sample.
 export const tone_shot_ground: Fill = {dark: {0.165, 0.165, 0.180, 1}, light: {0.906, 0.906, 0.918, 1}}
-export const tone_plate: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {1, 1, 1, 1}}
+export mut tone_plate: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {1, 1, 1, 1}}
 export const tone_plate_line: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.09}}
 export const tone_switch_on: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 // With a Ghostty theme (src/app/ghostty.rs, read live from the user's Ghostty config) the tokens on the terminal's
@@ -136,10 +136,10 @@ export const tone_switch_on: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369
 // tone_term_ink and tone_term_muted (hn.TitleBar), tone_plate (Plate), tone_card (hn.Palette.card) and tone_side_tint
 // (hn.SideClip). The values here are the built-in theme's, kept for an appearance the config does not theme.
 // The terminal's ground (the built-in theme's bg, #121214): the main card and the title bar over it, in both appearances.
-export const tone_term_ground: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
+export mut tone_term_ground: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
 // Ink over the terminal's ground (always dark): the title bar's words.
-export const tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
-export const tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
+export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
+export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
 export const tone_running: Fill = {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
 export const tone_exited: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
