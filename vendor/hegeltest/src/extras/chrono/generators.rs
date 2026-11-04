@@ -48,10 +48,7 @@ fn total_nanos_to_time(total: i64) -> NaiveTime {
     let (secs, nanos) = if total >= 86_400 * 1_000_000_000 {
         (86_399, (total - 86_399 * 1_000_000_000) as u32)
     } else {
-        (
-            (total / 1_000_000_000) as u32,
-            (total % 1_000_000_000) as u32,
-        )
+        ((total / 1_000_000_000) as u32, (total % 1_000_000_000) as u32)
     };
     NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos).unwrap()
 }
@@ -71,9 +68,7 @@ impl Generator<WeekdaySet> for WeekdaySetGenerator {
     }
 
     fn do_draw(&self, tc: &TestCase) -> WeekdaySet {
-        let days = hashsets(integers::<u8>().min_value(0).max_value(6))
-            .max_size(7)
-            .do_draw(tc);
+        let days = hashsets(integers::<u8>().min_value(0).max_value(6)).max_size(7).do_draw(tc);
         let mut set = WeekdaySet::EMPTY;
         for n in days {
             set.insert(Weekday::try_from(n).unwrap());
@@ -136,10 +131,7 @@ impl Generator<FixedOffset> for FixedOffsetGenerator {
         if min_secs > max_secs {
             invalid_argument!("Cannot have max_value < min_value");
         }
-        let secs = integers::<i32>()
-            .min_value(min_secs)
-            .max_value(max_secs)
-            .do_draw(tc);
+        let secs = integers::<i32>().min_value(min_secs).max_value(max_secs).do_draw(tc);
         FixedOffset::east_opt(secs).unwrap()
     }
 }
@@ -250,10 +242,7 @@ impl PrintableGenerator<TimeDelta> for TimeDeltaGenerator {
 /// }
 /// ```
 pub fn time_deltas() -> TimeDeltaGenerator {
-    TimeDeltaGenerator {
-        min_value: TimeDelta::MIN,
-        max_value: TimeDelta::MAX,
-    }
+    TimeDeltaGenerator { min_value: TimeDelta::MIN, max_value: TimeDelta::MAX }
 }
 
 /// Generator for [`chrono::NaiveDate`] values. Created by [`naive_dates()`].
@@ -302,11 +291,7 @@ impl PrintableGenerator<NaiveDate> for NaiveDateGenerator {
 /// Convert a [`NaiveDate`] to the engine's date struct. Every `NaiveDate`
 /// fits: chrono spans years ±262143 and the engine accepts ±999999.
 fn hegel_date(d: NaiveDate) -> hegel_c::hegel_date_t {
-    hegel_c::hegel_date_t {
-        year: d.year(),
-        month: d.month() as u8,
-        day: d.day() as u8,
-    }
+    hegel_c::hegel_date_t { year: d.year(), month: d.month() as u8, day: d.day() as u8 }
 }
 
 /// Generate [`chrono::NaiveDate`] values.
@@ -326,10 +311,7 @@ fn hegel_date(d: NaiveDate) -> hegel_c::hegel_date_t {
 /// }
 /// ```
 pub fn naive_dates() -> NaiveDateGenerator {
-    NaiveDateGenerator {
-        min_value: NaiveDate::MIN,
-        max_value: NaiveDate::MAX,
-    }
+    NaiveDateGenerator { min_value: NaiveDate::MIN, max_value: NaiveDate::MAX }
 }
 
 /// Generator for [`chrono::NaiveTime`] values. Created by [`naive_times()`].
@@ -368,10 +350,7 @@ impl Generator<NaiveTime> for NaiveTimeGenerator {
         if min_nanos > max_nanos {
             invalid_argument!("Cannot have max_value < min_value");
         }
-        let n = integers::<i64>()
-            .min_value(min_nanos)
-            .max_value(max_nanos)
-            .do_draw(tc);
+        let n = integers::<i64>().min_value(min_nanos).max_value(max_nanos).do_draw(tc);
         total_nanos_to_time(n)
     }
 }
@@ -398,10 +377,7 @@ impl PrintableGenerator<NaiveTime> for NaiveTimeGenerator {
 /// }
 /// ```
 pub fn naive_times() -> NaiveTimeGenerator {
-    NaiveTimeGenerator {
-        min_value: NaiveTime::MIN,
-        max_value: naive_time_default_max(),
-    }
+    NaiveTimeGenerator { min_value: NaiveTime::MIN, max_value: naive_time_default_max() }
 }
 
 /// Generator for [`chrono::NaiveDateTime`] values. Created by [`naive_datetimes()`].
@@ -570,16 +546,8 @@ pub fn naive_weeks() -> NaiveWeekGenerator {
     let start_gen = Weekday::default_generator();
     NaiveWeekGenerator {
         date_gen: naive_dates()
-            .min_value(
-                NaiveDate::MIN
-                    .checked_add_days(chrono::Days::new(7))
-                    .unwrap(),
-            )
-            .max_value(
-                NaiveDate::MAX
-                    .checked_sub_days(chrono::Days::new(7))
-                    .unwrap(),
-            ),
+            .min_value(NaiveDate::MIN.checked_add_days(chrono::Days::new(7)).unwrap())
+            .max_value(NaiveDate::MAX.checked_sub_days(chrono::Days::new(7)).unwrap()),
         label: combine_labels(&[NAIVE_WEEK_LABEL, start_gen.label()]),
         start_gen,
     }
@@ -649,10 +617,8 @@ where
     }
 
     fn do_draw(&self, tc: &TestCase) -> DateTime<Tz> {
-        let naive = naive_datetimes()
-            .min_value(self.min_value)
-            .max_value(self.max_value)
-            .do_draw(tc);
+        let naive =
+            naive_datetimes().min_value(self.min_value).max_value(self.max_value).do_draw(tc);
         let tz = tc.draw_silent(&self.tz_gen);
         match tz.from_local_datetime(&naive).earliest() {
             Some(dt) => dt,

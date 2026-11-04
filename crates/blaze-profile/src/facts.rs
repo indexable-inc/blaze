@@ -4,10 +4,13 @@
 //! cost" are queries over the history like the rest. The daemon notes them with
 //! [`crate::history::History::linked`], [`crate::history::History::crate_graph`] and
 //! [`crate::history::History::query_counted`]; the next flush writes them. What a build
-//! computed again, and why (`misses`), is noted with [`crate::history::History::missed`].
+//! computed again, and why (`misses`), is noted with [`crate::history::History::missed`], the
+//! parts of each such key (`key_parts`) with [`crate::history::History::keyed`], and why the
+//! query engine ran each run (`provenance`) with [`crate::history::History::ran`].
 
 use arrow_array::{
-    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array, types::UInt32Type,
+    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    types::UInt32Type,
 };
 use arrow_schema::ArrowError;
 
@@ -85,6 +88,67 @@ pub struct QueryCountRow {
     pub reads_recorded: u64,
     pub reads_kept: u64,
     pub reads_most: u64,
+    /// Of an input: the times a setter wrote one of its fields.
+    pub written: u64,
+    /// Of `executed`, by cause: first runs, a read changed, an untracked read, a cycle.
+    pub ran_new: u64,
+    pub ran_changed: u64,
+    pub ran_untracked: u64,
+    pub ran_cycle: u64,
+}
+
+/// What a `provenance` row says happened ([`ProvenanceRow::outcome`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The memo ran.
+    Ran,
+    /// The memo's run made a read the engine can't see.
+    UntrackedRead,
+}
+
+impl RunOutcome {
+    pub const fn name(self) -> &'static str {
+        match self {
+            RunOutcome::Ran => "ran",
+            RunOutcome::UntrackedRead => "untracked read",
+        }
+    }
+}
+
+/// A row of the schema's `provenance` table: one entry of the query engine's run log
+/// (`blaze_query::db::LoggedRun`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenanceRow {
+    pub build_id: u64,
+    /// The memo, `` `query`(Id(n)) ``.
+    pub query_key: String,
+    pub kind: &'static str,
+    pub outcome: RunOutcome,
+    /// For a run: changed, evicted, untracked or cycle.
+    pub cause: Option<&'static str>,
+    pub view: u32,
+    /// For changed: the read that changed, named as `query_key` names a memo.
+    pub cause_key: Option<String>,
+    /// What `cause_key` is: input, tracked or function.
+    pub cause_kind: Option<&'static str>,
+    /// For an untracked read: its name.
+    pub what: Option<&'static str>,
+}
+
+/// A row of the schema's `key_parts` table: one part of the key of a thing a build computed
+/// again (`blaze_kernel::Part`), or the key alone when it exposes no parts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPartRow {
+    pub build_id: u64,
+    pub step: &'static str,
+    pub item: String,
+    /// The whole key, hex.
+    pub key: String,
+    pub part: Option<String>,
+    /// The part's hash, hex.
+    pub hash: Option<String>,
+    pub names: Option<String>,
+    pub beyond: Option<&'static str>,
 }
 
 /// A row of the schema's `misses` table: one thing a build computed again, and why.
@@ -131,7 +195,8 @@ pub fn crate_deps(rows: &[CrateDepRow]) -> Result<RecordBatch, ArrowError> {
 
 /// The `query_counts` rows of `rows`.
 pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
-    let count = |of: fn(&QueryCountRow) -> u64| column(UInt64Array::from_iter_values(rows.iter().map(of)));
+    let count =
+        |of: fn(&QueryCountRow) -> u64| column(UInt64Array::from_iter_values(rows.iter().map(of)));
     // alloc: a batch's columns, once a flush
     let columns: Vec<ArrayRef> = vec![
         count(|it| it.build_id),
@@ -145,13 +210,54 @@ pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.reads_recorded),
         count(|it| it.reads_kept),
         count(|it| it.reads_most),
+        count(|it| it.written),
+        count(|it| it.ran_new),
+        count(|it| it.ran_changed),
+        count(|it| it.ran_untracked),
+        count(|it| it.ran_cycle),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::QUERY_COUNTS), columns)
 }
 
+/// The `provenance` rows of `rows`.
+pub fn provenance(rows: &[ProvenanceRow]) -> Result<RecordBatch, ArrowError> {
+    // alloc: a batch's columns, once a flush
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
+        column(StringArray::from_iter_values(rows.iter().map(|it| it.query_key.as_str()))),
+        dict(rows.iter().map(|it| Some(it.kind))),
+        dict(rows.iter().map(|it| Some(it.outcome.name()))),
+        column(StringArray::from_iter(rows.iter().map(|it| it.cause))),
+        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.view))),
+        column(StringArray::from_iter(rows.iter().map(|it| it.cause_key.as_deref()))),
+        dict(rows.iter().map(|it| it.cause_kind)),
+        column(StringArray::from_iter(rows.iter().map(|it| it.what))),
+    ];
+    RecordBatch::try_new(batches::schema_of(&schema::PROVENANCE), columns)
+}
+
+/// The `key_parts` rows of `rows`.
+pub fn key_parts(rows: &[KeyPartRow]) -> Result<RecordBatch, ArrowError> {
+    let text =
+        |of: fn(&KeyPartRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
+    // alloc: a batch's columns, once a flush
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
+        dict(rows.iter().map(|it| Some(it.step))),
+        column(StringArray::from_iter_values(rows.iter().map(|it| it.item.as_str()))),
+        column(StringArray::from_iter_values(rows.iter().map(|it| it.key.as_str()))),
+        text(|it| it.part.as_deref()),
+        text(|it| it.hash.as_deref()),
+        text(|it| it.names.as_deref()),
+        text(|it| it.beyond),
+    ];
+    RecordBatch::try_new(batches::schema_of(&schema::KEY_PARTS), columns)
+}
+
 /// The `misses` rows of `rows`.
 pub fn misses(rows: &[MissRow]) -> Result<RecordBatch, ArrowError> {
-    let text = |of: fn(&MissRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
+    let text =
+        |of: fn(&MissRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
     // alloc: a batch's columns, once a flush
     let columns: Vec<ArrayRef> = vec![
         column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
@@ -194,18 +300,77 @@ mod tests {
                 outcome: LinkOutcome::Patched,
                 dur_ns: Some(40_000_000),
             },
-            LinkRow { build_id: 3, image: "app (test)".into(), krate: None, outcome: LinkOutcome::Placed, dur_ns: None },
+            LinkRow {
+                build_id: 3,
+                image: "app (test)".into(),
+                krate: None,
+                outcome: LinkOutcome::Placed,
+                dur_ns: None,
+            },
         ])
         .unwrap();
         let outcome = links.column(3).as_dictionary::<UInt32Type>();
         let names = outcome.values().as_string::<i32>();
-        let said: Vec<&str> = outcome.keys().iter().map(|it| names.value(it.unwrap() as usize)).collect();
+        let said: Vec<&str> =
+            outcome.keys().iter().map(|it| names.value(it.unwrap() as usize)).collect();
         assert_eq!(said, ["patched", "placed"]);
         assert!(links.column(2).is_null(1) && links.column(4).is_null(1));
 
-        let deps = crate_deps(&[CrateDepRow { build_id: 3, krate: "app".into(), dep: "cc".into(), kind: DepKind::Build }])
-            .unwrap();
+        let deps = crate_deps(&[CrateDepRow {
+            build_id: 3,
+            krate: "app".into(),
+            dep: "cc".into(),
+            kind: DepKind::Build,
+        }])
+        .unwrap();
         let kind = deps.column(3).as_dictionary::<UInt32Type>();
         assert_eq!(kind.values().as_string::<i32>().value(kind.keys().value(0) as usize), "build");
+    }
+
+    #[test]
+    fn a_provenance_row_names_its_cause_and_a_key_part_row_its_hash() {
+        let changed = ProvenanceRow {
+            build_id: 5,
+            query_key: "`infer_query`(Id(7))".into(),
+            kind: "infer_query",
+            outcome: RunOutcome::Ran,
+            cause: Some("changed"),
+            view: 3,
+            cause_key: Some("`FileText.text`(Id(2))".into()),
+            cause_kind: Some("input"),
+            what: None,
+        };
+        let read = ProvenanceRow {
+            outcome: RunOutcome::UntrackedRead,
+            cause: None,
+            cause_key: None,
+            cause_kind: None,
+            what: Some("the proc macro's output"),
+            ..changed.clone()
+        };
+        let batch = provenance(&[changed, read]).unwrap();
+        let at = |name: &str| schema::PROVENANCE.column(name).unwrap();
+        assert_eq!(
+            batch.column(at("cause_key")).as_string::<i32>().value(0),
+            "`FileText.text`(Id(2))"
+        );
+        assert!(batch.column(at("cause")).is_null(1) && batch.column(at("cause_key")).is_null(1));
+        assert_eq!(batch.column(at("what")).as_string::<i32>().value(1), "the proc macro's output");
+
+        let parts = key_parts(&[KeyPartRow {
+            build_id: 5,
+            step: "unit",
+            item: "app v0.1.0 (lib)".into(),
+            key: "ab".into(),
+            part: Some("env CC".into()),
+            hash: Some("cd".into()),
+            names: None,
+            beyond: Some("its process variables"),
+        }])
+        .unwrap();
+        assert_eq!(
+            parts.column(schema::KEY_PARTS.column("hash").unwrap()).as_string::<i32>().value(0),
+            "cd"
+        );
     }
 }

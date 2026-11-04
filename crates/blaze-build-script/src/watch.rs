@@ -7,13 +7,13 @@
 //!
 //! [`Rerun`]: crate::apply::Rerun
 
+use blaze_hash::hash_map::Entry;
 use std::{
     borrow::{Borrow, Cow},
     ffi::OsStr,
     hash::{BuildHasher, Hash},
     path::{Component, Path, PathBuf},
 };
-use blaze_hash::hash_map::Entry;
 
 use blaze_hash::{FixedState, HashMap};
 use std::alloc::Global;
@@ -127,11 +127,7 @@ enum Seen {
 
 impl Seen {
     fn for_len(len: usize) -> Seen {
-        if len <= SCAN {
-            Seen::Scan
-        } else {
-            Seen::Hashed(HashMap::with_capacity_in(len, Global))
-        }
+        if len <= SCAN { Seen::Scan } else { Seen::Hashed(HashMap::with_capacity_in(len, Global)) }
     }
 
     /// Whether `value` is not among `kept`, the values this has said so of, in order.

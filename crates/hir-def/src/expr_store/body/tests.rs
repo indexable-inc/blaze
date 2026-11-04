@@ -1,7 +1,7 @@
 //! [`BodySyntax::tree`] against the anchor it is of, and the thread's tree cache.
 
-use syntax::view;
 use hir_expand::fixture;
+use syntax::view;
 
 use crate::{
     AssocItemId, DefWithBodyId, ModuleDefId,
@@ -70,7 +70,10 @@ fn tree_is_the_anchor() {
         assert_eq!(root.text(), syntax.text(), "{def:?}");
         assert_eq!(root.text_range().start(), syntax::TextSize::new(0), "{def:?}");
         let item = syntax::view::to_node(syntax.item, root);
-        assert_eq!((item.kind(), item.text_range()), (syntax.item.kind(), syntax.item.text_range()));
+        assert_eq!(
+            (item.kind(), item.text_range()),
+            (syntax.item.kind(), syntax.item.text_range())
+        );
     }
 }
 

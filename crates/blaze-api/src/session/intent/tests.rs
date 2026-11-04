@@ -31,7 +31,11 @@ impl Builder for Calls {
 }
 
 fn opened(root: u8) -> Opened {
-    Opened { view: View { root: ContentId([root; 32]) }, files: Idx::from_raw(0), queries: Idx::from_raw(0) }
+    Opened {
+        view: View { root: ContentId([root; 32]) },
+        files: Idx::from_raw(0),
+        queries: Idx::from_raw(0),
+    }
 }
 
 /// The id the session's table gives a job in `slot`, its generation odd: the intents never

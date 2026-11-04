@@ -48,10 +48,7 @@ impl TypeInfo {
                 &mut self,
                 value: &WithCachedTypeInfo<T>,
             ) -> ControlFlow<Self::Break> {
-                let TypeInfo {
-                    max_de_bruijn_id,
-                    flags,
-                } = value.type_info();
+                let TypeInfo { max_de_bruijn_id, flags } = value.type_info();
                 self.info.flags |= flags;
                 if let Some(id) = max_de_bruijn_id {
                     self.visit_de_bruijn_id(&id);
@@ -61,12 +58,8 @@ impl TypeInfo {
 
             fn visit_de_bruijn_id(&mut self, &id: &DeBruijnId) -> ControlFlow<Self::Break> {
                 if let Some(id) = id.sub(self.binder_depth) {
-                    self.info.max_de_bruijn_id = Some(
-                        self.info
-                            .max_de_bruijn_id
-                            .unwrap_or(DeBruijnId::ZERO)
-                            .max(id),
-                    );
+                    self.info.max_de_bruijn_id =
+                        Some(self.info.max_de_bruijn_id.unwrap_or(DeBruijnId::ZERO).max(id));
                 }
                 Continue(())
             }
@@ -80,10 +73,9 @@ impl TypeInfo {
             fn enter_region(&mut self, region: &Region) {
                 self.info.flags.insert(TypeFlags::HAS_REGIONS);
                 match region {
-                    Region::Body(..) | Region::Erased => self
-                        .info
-                        .flags
-                        .insert(TypeFlags::HAS_ERASED_OR_BODY_REGIONS),
+                    Region::Body(..) | Region::Erased => {
+                        self.info.flags.insert(TypeFlags::HAS_ERASED_OR_BODY_REGIONS)
+                    }
                     Region::Static => self.info.flags.insert(TypeFlags::HAS_STATIC_REGION),
                     Region::Var(..) => self.info.flags.insert(TypeFlags::HAS_REGION_VAR),
                     Region::Lub(..) => {}
@@ -179,10 +171,8 @@ impl TypeInfo {
             }
         }
 
-        let mut visitor = TypeInfoVisitor {
-            info: Self::default(),
-            binder_depth: DeBruijnId::zero(),
-        };
+        let mut visitor =
+            TypeInfoVisitor { info: Self::default(), binder_depth: DeBruijnId::zero() };
         let Continue(()) = visitor.visit(value);
         visitor.info
     }
@@ -237,8 +227,7 @@ impl TypeInfo {
 }
 
 /// A wrapper that caches type-specific information about the contained value.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Drive, DriveTwo)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Drive, DriveTwo)]
 pub struct WithCachedTypeInfo<T> {
     value: T,
     info: TypeInfo,

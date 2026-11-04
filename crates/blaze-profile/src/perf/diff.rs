@@ -82,7 +82,9 @@ impl Cause {
             // alloc: a row's text
             Cause::CalleeChanged => "same code, a callee changed".to_owned(),
             // alloc: a row's text
-            Cause::SameCodeAndCallees => "same code and callees: layout, inlining or environment".to_owned(),
+            Cause::SameCodeAndCallees => {
+                "same code and callees: layout, inlining or environment".to_owned()
+            }
             // alloc: a row's text
             Cause::Added => "added".to_owned(),
             // alloc: a row's text
@@ -189,7 +191,10 @@ fn side(run: &RunRow) -> Result<Side, String> {
         host: run.host.clone(),
         cpu_period_ns: period,
         // alloc: once a diff
-        gaps: run.gaps.as_deref().map_or_else(Vec::new, |it| it.split("; ").map(str::to_owned).collect()),
+        gaps: run
+            .gaps
+            .as_deref()
+            .map_or_else(Vec::new, |it| it.split("; ").map(str::to_owned).collect()),
     })
 }
 
@@ -205,14 +210,20 @@ fn functions<'a>(run: &RunRow, rows: &'a [FnRow]) -> Result<BTreeMap<Join, Funct
         let rep = row.rep as usize;
         if rep >= reps {
             // alloc: an error
-            return Err(format!("run {} has {reps} repetitions, and {}'s row is of repetition {rep}", run.run, row.function));
+            return Err(format!(
+                "run {} has {reps} repetitions, and {}'s row is of repetition {rep}",
+                run.run, row.function
+            ));
         }
         let join = match &row.identity {
             // clone: once a row
             Some(identity) => Join::Identity(identity.clone()),
             None => Join::Named {
                 // alloc: once a row
-                module: row.module.as_deref().map(|it| it.rsplit('/').next().unwrap_or(it).to_owned()),
+                module: row
+                    .module
+                    .as_deref()
+                    .map(|it| it.rsplit('/').next().unwrap_or(it).to_owned()),
                 // clone: once a row
                 function: row.function.clone(),
             },
@@ -251,7 +262,8 @@ pub fn change(base: &[u64], base_period: u64, run: &[u64], run_period: u64) -> C
     let (run_mean, run_var) = stats(run);
     let (pb, pr) = (base_period as f64, run_period as f64);
     let per = |var: f64, n: usize| if n == 0 { 0.0 } else { var / n as f64 };
-    let bound = Z * (per(base_var, base.len()) * pb * pb + per(run_var, run.len()) * pr * pr).sqrt();
+    let bound =
+        Z * (per(base_var, base.len()) * pb * pb + per(run_var, run.len()) * pr * pr).sqrt();
     let (base, run) = (base_mean * pb, run_mean * pr);
     let delta = run - base;
     Change { base, run, delta, bound, within_noise: delta.abs() <= bound }
@@ -271,7 +283,10 @@ pub fn compare(run: (&RunRow, &[FnRow]), base: (&RunRow, &[FnRow])) -> Result<Di
         notes.push(format!("different hosts: {} against {}", run.0.host, base.0.host));
     }
     if (&run.0.arch, &run.0.os) != (&base.0.arch, &base.0.os) {
-        notes.push(format!("different machines: {}-{} against {}-{}", run.0.arch, run.0.os, base.0.arch, base.0.os));
+        notes.push(format!(
+            "different machines: {}-{} against {}-{}",
+            run.0.arch, run.0.os, base.0.arch, base.0.os
+        ));
     }
     if run_side.cpu_period_ns != base_side.cpu_period_ns {
         notes.push(format!(
@@ -312,7 +327,10 @@ pub fn compare(run: (&RunRow, &[FnRow]), base: (&RunRow, &[FnRow])) -> Result<Di
         let (r, b) = (run_fns.get(join), base_fns.get(join));
         let pick = |it: Option<&Function<'_>>, total: bool, zeros: &[u64]| -> Vec<u64> {
             // clone: once a row, a side's counts
-            it.map_or_else(|| zeros.to_vec(), |it| if total { it.total_samples.clone() } else { it.self_samples.clone() })
+            it.map_or_else(
+                || zeros.to_vec(),
+                |it| if total { it.total_samples.clone() } else { it.self_samples.clone() },
+            )
         };
         let self_ns = change(&pick(b, false, &base_zeros), pb, &pick(r, false, &run_zeros), pr);
         let total_ns = change(&pick(b, true, &base_zeros), pb, &pick(r, true, &run_zeros), pr);
@@ -384,7 +402,11 @@ pub fn compare(run: (&RunRow, &[FnRow]), base: (&RunRow, &[FnRow])) -> Result<Di
         within_noise: count(Verdict::WithinNoise),
         added: count(Verdict::Added),
         removed: count(Verdict::Removed),
-        within_noise_net_ns: rows.iter().filter(|it| it.verdict == Verdict::WithinNoise).map(|it| it.self_ns.delta).sum(),
+        within_noise_net_ns: rows
+            .iter()
+            .filter(|it| it.verdict == Verdict::WithinNoise)
+            .map(|it| it.self_ns.delta)
+            .sum(),
         cpu_ns: change(&per_rep(base.0, base.1), pb, &per_rep(run.0, run.1), pr),
     };
     Ok(Diff { run: run_side, base: base_side, notes, summary, rows })
@@ -400,7 +422,9 @@ fn cause(run: &FnRow, base: &FnRow) -> Cause {
     let missing = |it: &FnRow| it.code.is_none() || it.key.is_none() || it.deep.is_none();
     if missing(run) || missing(base) {
         // alloc: a row's cause
-        return Cause::Unknown { why: "a side's row has an identity but no code, key or deep hash".to_owned() };
+        return Cause::Unknown {
+            why: "a side's row has an identity but no code, key or deep hash".to_owned(),
+        };
     }
     if run.code != base.code {
         Cause::CodeChanged
@@ -502,7 +526,9 @@ impl Graphs<'_> {
         let mut fuel = nodes.len() + nodes.iter().map(|it| it.edges.len()).sum::<usize>() + 1;
         while let Some(at) = queue.pop_front() {
             for &callee in &nodes[at as usize].edges {
-                fuel = fuel.checked_sub(1).ok_or("the walk of changed callees ran past the code map's size")?;
+                fuel = fuel
+                    .checked_sub(1)
+                    .ok_or("the walk of changed callees ran past the code map's size")?;
                 let c = callee as usize;
                 if seen[c] || base_deeps.contains(&run.deep[c]) {
                     continue;
@@ -520,7 +546,10 @@ impl Graphs<'_> {
         let names: Vec<String> = found.into_iter().take(CALLEES).map(str::to_owned).collect();
         let note = match (names.is_empty(), more) {
             // alloc: a note
-            (true, _) => Some("no callee's own code or settings changed: what changed is outside the code map".to_owned()),
+            (true, _) => Some(
+                "no callee's own code or settings changed: what changed is outside the code map"
+                    .to_owned(),
+            ),
             (false, 0) => None,
             // alloc: a note
             (false, more) => Some(format!("and {more} more")),
@@ -600,7 +629,13 @@ pub fn render(diff: &Diff, all: bool) -> String {
         duration(cpu.run),
         signed(cpu.delta),
         duration(cpu.bound),
-        if cpu.within_noise { "within noise" } else if cpu.delta > 0.0 { "slower" } else { "faster" }
+        if cpu.within_noise {
+            "within noise"
+        } else if cpu.delta > 0.0 {
+            "slower"
+        } else {
+            "faster"
+        }
     );
     let s = &diff.summary;
     let _ = writeln!(
@@ -613,12 +648,17 @@ pub fn render(diff: &Diff, all: bool) -> String {
         s.within_noise,
         signed(s.within_noise_net_ns)
     );
-    let shown: Vec<&Row> = diff.rows.iter().filter(|it| all || it.verdict != Verdict::WithinNoise).collect();
+    let shown: Vec<&Row> =
+        diff.rows.iter().filter(|it| all || it.verdict != Verdict::WithinNoise).collect();
     if shown.is_empty() {
         out.push_str("no function changed beyond noise\n");
         return out;
     }
-    let _ = writeln!(out, "\n{:>11} {:>11}  {:>23}  {:<12}  function: cause", "self Δ", "± bound", "base -> run", "");
+    let _ = writeln!(
+        out,
+        "\n{:>11} {:>11}  {:>23}  {:<12}  function: cause",
+        "self Δ", "± bound", "base -> run", ""
+    );
     for row in shown {
         let _ = writeln!(
             out,

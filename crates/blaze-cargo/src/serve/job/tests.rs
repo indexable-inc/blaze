@@ -20,11 +20,27 @@ fn targets() -> Targets {
 }
 
 fn setup(runs: u64, runs_end: u64) -> Setup {
-    Setup { views: "/v".into(), std: "/s/std".into(), builds: "/s/build".into(), sources: "/s/sources".into(), store: "/s/v2/store".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
+    Setup {
+        views: "/v".into(),
+        std: "/s/std".into(),
+        builds: "/s/build".into(),
+        sources: "/s/sources".into(),
+        store: "/s/v2/store".into(),
+        host: "h".into(),
+        env: Vec::new(),
+        color: false,
+        tags: 6 << 32,
+        runs,
+        runs_end,
+    }
 }
 
 fn opened(root: u8) -> Opened {
-    Opened { view: View { root: ContentId([root; 32]) }, files: Idx::from_raw(0), queries: Idx::from_raw(0) }
+    Opened {
+        view: View { root: ContentId([root; 32]) },
+        files: Idx::from_raw(0),
+        queries: Idx::from_raw(0),
+    }
 }
 
 /// A job of nothing but its views, as [`Jobs::begin`] puts one in.
@@ -111,12 +127,16 @@ fn work_is_placed_whole_when_any_link_was() {
     assert_eq!(Linking::Spliced.how(), LinkHow::Spliced);
     assert_eq!(Linking::Unchanged.how(), LinkHow::Unchanged);
     assert_eq!(Linking::First.how(), LinkHow::First);
-    assert_eq!(Linking::Full(Full::NotIncremental).how(), LinkHow::Full { why: vec!["not incremental".to_owned()] });
+    assert_eq!(
+        Linking::Full(Full::NotIncremental).how(),
+        LinkHow::Full { why: vec!["not incremental".to_owned()] }
+    );
 }
 
 #[test]
 fn an_agents_targets_are_cargos_flags_at_the_root() {
-    let env = vec![("HOME".to_owned(), "/home/u".to_owned()), ("PATH".to_owned(), "/bin".to_owned())];
+    let env =
+        vec![("HOME".to_owned(), "/home/u".to_owned()), ("PATH".to_owned(), "/bin".to_owned())];
     let work = Work::Build(targets());
     let made = invocation(&work, targets_of(&work), "/w", &env);
     assert_eq!(made.command, Command::Build);
@@ -124,7 +144,16 @@ fn an_agents_targets_are_cargos_flags_at_the_root() {
     assert_eq!(
         args,
         [
-            "-p", "a", "-p", "b", "--profile", "release", "--target", "wasm32-unknown-unknown", "-F", "x,y",
+            "-p",
+            "a",
+            "-p",
+            "b",
+            "--profile",
+            "release",
+            "--target",
+            "wasm32-unknown-unknown",
+            "-F",
+            "x,y",
             "--no-default-features"
         ]
     );
@@ -148,7 +177,13 @@ fn cargos_own_invocation_is_kept_whole() {
         verbose: 0,
         refused: Some(16),
     });
-    let work = Work::Test { targets: targets.clone(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
+    let work = Work::Test {
+        targets: targets.clone(),
+        filter: Vec::new(),
+        all: false,
+        args: Vec::new(),
+        ub: None,
+    };
     let made = invocation(&work, Some(&targets), "/elsewhere", &[]);
     assert_eq!(made.command, Command::Test);
     assert_eq!(made.args, vec!["--workspace".to_owned()]);
@@ -200,10 +235,17 @@ fn diagnostics_are_short_as_cargos_message_format_says() {
 #[test]
 fn tests_under_the_evaluator_check_the_units_and_build_none() {
     let ub = Some(blaze_api::Ub { seed: Some(7), schedules: None });
-    let work = Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub };
+    let work =
+        Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub };
     assert_eq!(command_of(&work), Command::Test);
     assert_eq!(goal_of(&work), Goal::Check);
-    let compiled = Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub: None };
+    let compiled = Work::Test {
+        targets: targets(),
+        filter: Vec::new(),
+        all: true,
+        args: Vec::new(),
+        ub: None,
+    };
     assert_eq!(goal_of(&compiled), Goal::Test);
 }
 
@@ -234,9 +276,18 @@ fn a_fetchs_key_is_its_source() {
         kind: FetchKind::Crate { sha256: sha.into() },
         at: at.into(),
     };
-    assert_eq!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/r/serde-1.0.0", "aa")));
-    assert_ne!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/r/serde-1.0.0", "bb")));
-    assert_ne!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/s/serde-1.0.0", "aa")));
+    assert_eq!(
+        fetch_key(&fetch("/r/serde-1.0.0", "aa")),
+        fetch_key(&fetch("/r/serde-1.0.0", "aa"))
+    );
+    assert_ne!(
+        fetch_key(&fetch("/r/serde-1.0.0", "aa")),
+        fetch_key(&fetch("/r/serde-1.0.0", "bb"))
+    );
+    assert_ne!(
+        fetch_key(&fetch("/r/serde-1.0.0", "aa")),
+        fetch_key(&fetch("/s/serde-1.0.0", "aa"))
+    );
 }
 
 #[test]
@@ -285,7 +336,8 @@ fn a_full_slab_refuses_the_value() {
 
 #[test]
 fn a_slab_id_packs_into_its_bits_and_back() {
-    let mut slab: Tagged<u8> = Tagged::new(OWN_SLOT_BITS, OWN_GENERATION_BITS, MemTag::Other).unwrap();
+    let mut slab: Tagged<u8> =
+        Tagged::new(OWN_SLOT_BITS, OWN_GENERATION_BITS, MemTag::Other).unwrap();
     let (mut handle, mut packed) = slab.insert(1).unwrap();
     let first = packed;
     for reuse in 1..(1u32 << (OWN_GENERATION_BITS - 1)) + 3 {
@@ -324,7 +376,11 @@ fn a_table_holds_ids_handed_out_elsewhere() {
 #[test]
 fn a_node_finds_its_batchs_job_whatever_the_order_batches_came_in() {
     let mut batches = Batches::new();
-    let (a, b, c) = (JobId { slot: 0, generation: 0 }, JobId { slot: 1, generation: 0 }, JobId { slot: 0, generation: 1 });
+    let (a, b, c) = (
+        JobId { slot: 0, generation: 0 },
+        JobId { slot: 1, generation: 0 },
+        JobId { slot: 0, generation: 1 },
+    );
     batches.insert(10, 5, a);
     batches.insert(15, 1, b);
     batches.insert(u32::MAX - 1, 2, a);
@@ -440,7 +496,10 @@ fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
     let b = paths.intern("/w/target/debug/b");
     assert_eq!(paths.intern("/w/target/debug/a"), a);
     assert_ne!(a, b);
-    assert_eq!(paths.files[a as usize].as_ref().map(ToString::to_string).as_deref(), Some("w/target/debug/a"));
+    assert_eq!(
+        paths.files[a as usize].as_ref().map(ToString::to_string).as_deref(),
+        Some("w/target/debug/a")
+    );
     assert_eq!(paths.find(&[b, a], "/w/target/debug/a"), a);
     let c = paths.find(&[b], "/w/target/debug/c");
     assert_eq!(&*paths.names[c as usize], "/w/target/debug/c");
@@ -454,7 +513,10 @@ fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
 #[test]
 fn a_link_takes_its_kept_image_before_the_budget_evicts() {
     use crate::serve::tests::{Fake, FakeImage};
-    let image = |path: &str, held: u64| Image::<Fake> { path: path.into(), kept: FakeImage { held, live: false } };
+    let image = |path: &str, held: u64| Image::<Fake> {
+        path: path.into(),
+        kept: FakeImage { held, live: false },
+    };
     let mut paths = Paths::<Fake>::new(u64::MAX);
     paths.keep_one(&[], image("/w/target/debug/a", 60), true);
     paths.keep_one(&[], image("/w/target/debug/b", 30), true);
@@ -472,7 +534,10 @@ fn a_link_takes_its_kept_image_before_the_budget_evicts() {
     let got = paths.take_images_under(&[a], 50);
     let got: Vec<&str> = got.iter().map(|it| it.path.as_str()).collect(); // alloc: a test's one
     assert_eq!(got, ["/w/target/debug/a"], "the link gets the image it patches");
-    assert!(paths.images[b as usize].is_none(), "past the budget, the least recently linked image left is let go");
+    assert!(
+        paths.images[b as usize].is_none(),
+        "past the budget, the least recently linked image left is let go"
+    );
     assert!(paths.images[c as usize].is_some(), "the rest fit");
     assert_eq!((paths.kept, paths.weights.held()), (1, 40));
 }
@@ -512,9 +577,17 @@ fn a_builds_crate_graph_has_an_edge_for_each_table_a_dependency_is_in() {
     };
     let units = of_graph(root, String::new(), graph);
     let rows = crate_deps(7, &units, &[0, 1, 2, 3, 4]);
-    let edges: Vec<_> = rows.iter().map(|it| (it.build_id, it.krate.as_str(), it.dep.as_str(), it.kind)).collect();
+    let edges: Vec<_> =
+        rows.iter().map(|it| (it.build_id, it.krate.as_str(), it.dep.as_str(), it.kind)).collect();
     // The script's run, and the test's edge to its own library, are no table's.
-    assert_eq!(edges, [(7, "app", "dep", DepKind::Build), (7, "app", "dep", DepKind::Dev), (7, "app", "dep", DepKind::Normal)]);
+    assert_eq!(
+        edges,
+        [
+            (7, "app", "dep", DepKind::Build),
+            (7, "app", "dep", DepKind::Dev),
+            (7, "app", "dep", DepKind::Normal)
+        ]
+    );
     assert!(crate_deps(7, &units, &[0]).is_empty(), "a build of the dependency alone has no edge");
 }
 
@@ -525,7 +598,10 @@ fn a_diagnostic_of_no_unit_is_said_once_a_job_and_a_units_each_time() {
     let app = format!("path+file://{root}#app@0.1.0");
     let graph = blaze_units::schema::UnitGraph {
         version: 1,
-        units: vec![unit(&app, "custom-build", UnitMode::Build, &[]), unit(&app, "lib", UnitMode::Build, &[])],
+        units: vec![
+            unit(&app, "custom-build", UnitMode::Build, &[]),
+            unit(&app, "lib", UnitMode::Build, &[]),
+        ],
         roots: vec![1],
     };
     let units = of_graph(root, String::new(), graph);
@@ -541,14 +617,21 @@ fn a_diagnostic_of_no_unit_is_said_once_a_job_and_a_units_each_time() {
         explanation: None,
     };
     let report = "error: the front end fails on `std::f` in the toolchain's `std`, ...\n";
-    let line = "error: `app v0.1.0 (build script)` reaches 1 function blaze could not compile, ...\n";
+    let line =
+        "error: `app v0.1.0 (build script)` reaches 1 function blaze could not compile, ...\n";
     let mut said = HashSet::new_in(std::alloc::Global);
     // The first unit that reaches the toolchain's failed function carries the job's report
     // and its own error; the second carries the same two.
     for at in [0, 1] {
         let report_said = said_once(&mut said, &of(None, report));
         assert_eq!(report_said, at == 0, "the job's report is said by the first unit only");
-        assert!(said_once(&mut said, &of(unit_of(&units, at), line)), "unit {at}'s own error is always said");
+        assert!(
+            said_once(&mut said, &of(unit_of(&units, at), line)),
+            "unit {at}'s own error is always said"
+        );
     }
-    assert!(said_once(&mut said, &of(None, "error: the front end fails on `std::g` ...\n")), "another report is said");
+    assert!(
+        said_once(&mut said, &of(None, "error: the front end fails on `std::g` ...\n")),
+        "another report is said"
+    );
 }

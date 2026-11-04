@@ -20,10 +20,7 @@ fn main() {}
 "##;
     assert_reports(
         &ui("enum-and-module-in-same-scope.rs", "2015", source),
-        &[
-            error(5, &["`Foo`"]),
-            warning(7, &[]),
-        ],
+        &[error(5, &["`Foo`"]), warning(7, &[])],
     );
 }
 
@@ -40,8 +37,5 @@ const X: () = f(1); //~ ERROR reached the configured maximum number of stack fra
 
 fn main() {}
 "##;
-    assert_reports(
-        &ui("recursive.rs", "2015", source),
-        &[warning(3, &[]), error(7, &[])],
-    );
+    assert_reports(&ui("recursive.rs", "2015", source), &[warning(3, &[]), error(7, &[])]);
 }

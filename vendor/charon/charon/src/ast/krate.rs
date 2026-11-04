@@ -31,8 +31,7 @@ pub type TargetTriple = String;
 ///
 /// To get a `TranslatedCrate`, run `charon cargo` inside a Rust crate, then deserialize
 /// the resulting `crate_name.llbc` file using [`crate::deserialize_llbc`].
-#[derive(Default, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Default, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 #[serde_state(state_implements = DedupSerializerState)]
 pub struct TranslatedCrate {
     /// The name of the crate.
@@ -103,8 +102,9 @@ pub struct TranslatedCrate {
     pub ordered_decls: Option<Vec<DeclarationGroup>>,
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
-#[derive(Serialize, Deserialize, Drive, DriveMut, DriveTwo)]
+#[derive(
+    Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Drive, DriveMut, DriveTwo,
+)]
 pub struct RuntimeChecks {
     pub ub_checks: bool,
     pub overflow_checks: bool,
@@ -113,9 +113,7 @@ pub struct RuntimeChecks {
 
 /// A (group of) top-level declaration(s), properly reordered.
 /// "G" stands for "generic"
-#[derive(Debug, Clone)]
-#[derive(EnumAsInner)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, EnumAsInner, Serialize, Deserialize)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Group"))]
 pub enum GDeclarationGroup<Id> {
     /// A non-recursive declaration
@@ -125,9 +123,7 @@ pub enum GDeclarationGroup<Id> {
 }
 
 /// A (group of) top-level declaration(s), properly reordered.
-#[derive(Debug, Clone)]
-#[derive(EnumAsInner)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, EnumAsInner, Serialize, Deserialize)]
 #[cfg_attr(feature = "charon_on_charon", charon::variants_suffix("Group"))]
 pub enum DeclarationGroup {
     /// A type declaration group
@@ -142,8 +138,7 @@ pub enum DeclarationGroup {
     Mixed(GDeclarationGroup<ItemId>),
 }
 
-#[derive(Default, Clone)]
-#[derive(SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
+#[derive(Default, Clone, SerializeState, DeserializeState, Drive, DriveMut, DriveTwo)]
 pub struct AssocItemNames {
     pub types: IndexVec<AssocTypeId, TraitItemName>,
     pub methods: IndexVec<TraitMethodId, TraitItemName>,
@@ -171,9 +166,7 @@ impl TranslatedCrate {
 
     pub fn item_short_name(&self, id: impl Into<ItemId>) -> &Name {
         let id = id.into();
-        self.short_names
-            .get(&id)
-            .unwrap_or_else(|| self.item_name(id))
+        self.short_names.get(&id).unwrap_or_else(|| self.item_name(id))
     }
 
     pub fn get_item(&self, trans_id: impl Into<ItemId>) -> Option<ItemRef<'_>> {
@@ -206,8 +199,7 @@ impl TranslatedCrate {
     /// Insert a new item into a slot, and record its name in the name map.
     pub fn set_new_item_slot(&mut self, id: ItemId, item: impl Into<ItemByVal>) {
         let item = item.into();
-        self.item_names
-            .insert(id, item.as_ref().item_meta().name.clone());
+        self.item_names.insert(id, item.as_ref().item_meta().name.clone());
         self.put_item_back(id, item);
     }
     /// Remove this item from the crate without touching the name maps.
@@ -232,12 +224,12 @@ impl TranslatedCrate {
             ItemByVal::Type(decl) => self.type_decls.set_slot(*id.as_type().unwrap(), decl),
             ItemByVal::Fun(decl) => self.fun_decls.set_slot(*id.as_fun().unwrap(), decl),
             ItemByVal::Global(decl) => self.global_decls.set_slot(*id.as_global().unwrap(), decl),
-            ItemByVal::TraitDecl(decl) => self
-                .trait_decls
-                .set_slot(*id.as_trait_decl().unwrap(), decl),
-            ItemByVal::TraitImpl(decl) => self
-                .trait_impls
-                .set_slot(*id.as_trait_impl().unwrap(), decl),
+            ItemByVal::TraitDecl(decl) => {
+                self.trait_decls.set_slot(*id.as_trait_decl().unwrap(), decl)
+            }
+            ItemByVal::TraitImpl(decl) => {
+                self.trait_impls.set_slot(*id.as_trait_impl().unwrap(), decl)
+            }
         }
     }
 

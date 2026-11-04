@@ -28,8 +28,8 @@ use crate::{
     mir::{
         AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind, FieldIndex, Local,
         LocalId, MirBody, MirLowerError, MirSpan, Operand, OperandKind, Place, Projection,
-        ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, Terminator,
-        TerminatorKind, UnOp, framed::block_id, transform::Ctx,
+        ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, Terminator, TerminatorKind,
+        UnOp, framed::block_id, transform::Ctx,
     },
     next_solver::{AliasConst, Const, ConstExt, GenericArgs, IsRigid, Ty, TyKind},
 };
@@ -136,10 +136,7 @@ pub(super) enum Site {
 
 /// The sites of `block` in the order rustc visits them: backwards, so that a split leaves the
 /// sites still to come where they were. It doesn't borrow the body, which the splits change.
-pub(super) fn sites(
-    body: &MirBody<'_>,
-    block: BasicBlockId,
-) -> impl Iterator<Item = Site> + use<> {
+pub(super) fn sites(body: &MirBody<'_>, block: BasicBlockId) -> impl Iterator<Item = Site> + use<> {
     let data = &body.basic_blocks[block];
     let call = data.terminator.as_ref().and_then(|it| lowered_intrinsic(&it.kind));
     let statements = (0..data.statements.len()).rev().map(Site::Statement);
@@ -534,7 +531,8 @@ fn alignment_check<'db>(
     setup.push(assign(bits, Rvalue::BinaryOp(BinOp::BitAnd, copy_of(addr), copy_of(mask)), span));
     let is_ok = temp(body, consts.bool_ty);
     setup.push(assign(is_ok, Rvalue::BinaryOp(BinOp::Eq, copy_of(bits), consts.usize(0)), span));
-    let msg = AssertKind::MisalignedPointerDereference { required: alignment, found: copy_of(addr) };
+    let msg =
+        AssertKind::MisalignedPointerDereference { required: alignment, found: copy_of(addr) };
     Ok((copy_of(is_ok), msg))
 }
 

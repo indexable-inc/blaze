@@ -1,9 +1,8 @@
 //! Target dependent parameters needed for layouts
 
-use base_db::{Db, Crate, target::TargetLoadError};
+use base_db::{Crate, Db, target::TargetLoadError};
 use hir_def::layout::TargetDataLayout;
 use rustc_abi::{AddressSpace, AlignFromBytesError, TargetDataLayoutError};
-
 
 #[blaze_query::tracked(returns(as_ref), mem_tag = Infer)]
 pub fn target_data_layout_query(
@@ -11,7 +10,10 @@ pub fn target_data_layout_query(
     krate: Crate,
 ) -> Result<TargetDataLayout, TargetLoadError> {
     match &krate.workspace_data(db).target {
-        Ok(target) => match TargetDataLayout::parse_from_llvm_datalayout_string(&target.data_layout, AddressSpace::ZERO) {
+        Ok(target) => match TargetDataLayout::parse_from_llvm_datalayout_string(
+            &target.data_layout,
+            AddressSpace::ZERO,
+        ) {
             Ok(it) => Ok(it),
             Err(e) => {
                 Err(match e {

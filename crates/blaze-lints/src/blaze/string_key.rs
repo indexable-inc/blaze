@@ -44,8 +44,17 @@ const PLACE_DEPTH: u32 = 16;
 /// The writes of a key.
 const WRITES: &[&str] = &["insert", "entry", "get_or_insert", "get_or_insert_with"];
 /// The conversions a key is followed through, each keeping its text.
-const CONVERSIONS: &[&str] =
-    &["as_str", "to_string", "to_owned", "to_smolstr", "into", "clone", "as_ref", "borrow", "symbol"];
+const CONVERSIONS: &[&str] = &[
+    "as_str",
+    "to_string",
+    "to_owned",
+    "to_smolstr",
+    "into",
+    "clone",
+    "as_ref",
+    "borrow",
+    "symbol",
+];
 /// The constructors of a string key from another string, called with one argument.
 const CONSTRUCTORS: &[&str] = &["from", "new"];
 /// papaya's maps and sets and what their `pin()` lends.
@@ -115,7 +124,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let mut found = Vec::new();
     let db = cx.db();
     let krate = cx.krate();
-    if facts::crate_is(db, krate, "intern") || facts::dep_type(db, krate.base(), "intern", &["Symbol"]).is_none() {
+    if facts::crate_is(db, krate, "intern")
+        || facts::dep_type(db, krate.base(), "intern", &["Symbol"]).is_none()
+    {
         return found;
     }
     let Some(analysis) = cx.analysis() else { return found };
@@ -140,7 +151,14 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                     (map.first, map.receiver) = (range, receiver);
                 }
             }
-            None => maps.push(Map { place, key: key_type, first: range, receiver, from, all: from.is_some() }),
+            None => maps.push(Map {
+                place,
+                key: key_type,
+                first: range,
+                receiver,
+                from,
+                all: from.is_some(),
+            }),
         }
     }
     for map in maps {
@@ -176,7 +194,8 @@ impl<'db> Walk<'_, 'db, '_> {
             return None;
         }
         let adt = facts::impl_adt(db, f)?;
-        let papaya = facts::crate_is(db, adt.module(db).krate(db), "papaya") && PAPAYA.contains(&adt.name(db).as_str());
+        let papaya = facts::crate_is(db, adt.module(db).krate(db), "papaya")
+            && PAPAYA.contains(&adt.name(db).as_str());
         if !papaya && !facts::hash_adt(self.cx, adt) {
             return None;
         }
@@ -192,7 +211,9 @@ impl<'db> Walk<'_, 'db, '_> {
             return Some(Key::Str);
         }
         let adt = ty.as_adt()?;
-        let item = |name: &str| self.cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt);
+        let item = |name: &str| {
+            self.cx.krate().diagnostic_item_adt(db, &intern::Symbol::intern(name)) == Some(adt)
+        };
         if item("String") {
             return Some(Key::String);
         }
@@ -231,7 +252,9 @@ impl<'db> Walk<'_, 'db, '_> {
     fn identifier(&self, key: ExprId, depth: u32, lets: u32) -> Option<&'static str> {
         let depth = depth.checked_sub(1)?;
         match self.body.expr(key) {
-            Expr::Ref { expr, .. } | Expr::UnaryOp { expr, op: UnaryOp::Deref } => self.identifier(expr, depth, lets),
+            Expr::Ref { expr, .. } | Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
+                self.identifier(expr, depth, lets)
+            }
             Expr::MethodCall { receiver, args: [], .. } => {
                 if !CONVERSIONS.contains(&self.name(key)?) {
                     return None;
@@ -248,7 +271,10 @@ impl<'db> Walk<'_, 'db, '_> {
                 self.ident(&ty).or_else(|| self.identifier(arg, depth, lets))
             }
             Expr::Path(_) => {
-                let ValueNs::LocalBinding(binding) = value_of(self.db(), self.def, self.body, key)? else { return None };
+                let ValueNs::LocalBinding(binding) = value_of(self.db(), self.def, self.body, key)?
+                else {
+                    return None;
+                };
                 let lets = lets.checked_sub(1)?;
                 let init = self.initializer(binding)?;
                 self.identifier(init, depth, lets)

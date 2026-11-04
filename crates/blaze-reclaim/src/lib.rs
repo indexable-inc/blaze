@@ -50,7 +50,11 @@ struct Slot {
 
 impl Slot {
     const fn new() -> Slot {
-        Slot { since: AtomicU64::new(OUT), taken: AtomicBool::new(false), parked: AtomicUsize::new(0) }
+        Slot {
+            since: AtomicU64::new(OUT),
+            taken: AtomicBool::new(false),
+            parked: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -81,7 +85,10 @@ fn claim() -> &'static Slot {
     loop {
         for slot in &block.slots {
             if !slot.taken.load(Ordering::Relaxed)
-                && slot.taken.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+                && slot
+                    .taken
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
             {
                 return slot;
             }
@@ -90,7 +97,12 @@ fn claim() -> &'static Slot {
             Some(next) => next,
             None => {
                 let new = Box::into_raw(Box::new(Block::new()));
-                match block.next.compare_exchange(ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire) {
+                match block.next.compare_exchange(
+                    ptr::null_mut(),
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
                     // SAFETY: `new` is now linked on, so leaked for the process.
                     Ok(_) => unsafe { &*new },
                     Err(other) => {

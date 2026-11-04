@@ -237,9 +237,7 @@ impl<T, G, F, R> RecursiveGenerator<T, G, F, R> {
                 label,
             };
             let mut speculation = printer.speculate();
-            match catch_unwind(AssertUnwindSafe(|| {
-                root.draw_subtree(tc, speculation.printer())
-            })) {
+            match catch_unwind(AssertUnwindSafe(|| root.draw_subtree(tc, speculation.printer()))) {
                 Ok(value) => {
                     speculation.commit();
                     return value;

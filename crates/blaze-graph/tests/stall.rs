@@ -35,7 +35,11 @@ fn key(n: u32) -> Key {
 }
 
 fn message(panic: &(dyn std::any::Any + Send)) -> String {
-    panic.downcast_ref::<String>().cloned().or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned())).unwrap_or_default()
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+        .unwrap_or_default()
 }
 
 /// A test's deadline, watched from a thread of its own: declared first, it is dropped last,
@@ -51,7 +55,9 @@ impl Deadline {
                 // stderr itself: an abort ends nothing the harness keeps.
                 _ = std::io::Write::write_fmt(
                     &mut std::io::stderr(),
-                    format_args!("{test} ran past {TEST:?}: blocked where no bound of its own reaches\n"),
+                    format_args!(
+                        "{test} ran past {TEST:?}: blocked where no bound of its own reaches\n"
+                    ),
                 );
                 std::process::abort();
             }
@@ -101,12 +107,22 @@ fn a_job_waiting_on_a_key_nobody_will_finish_fails_naming_the_key() {
         text
     });
     for _ in 0..2 {
-        let failed = rx.recv_timeout(LONG).expect("a stalled job fails within LONG").expect_err("a stalled job fails");
+        let failed = rx
+            .recv_timeout(LONG)
+            .expect("a stalled job fails within LONG")
+            .expect_err("a stalled job fails");
         assert!(failed.starts_with("stalled: "), "{failed}");
-        assert!(failed.contains(&format!("key {named}, claimed by job ")), "the stall names the key: {failed}");
+        assert!(
+            failed.contains(&format!("key {named}, claimed by job ")),
+            "the stall names the key: {failed}"
+        );
     }
     pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
-    assert_eq!(rx.recv_timeout(LONG).expect("the pool runs a job after the stall"), Ok(()), "the pool ran no job after the stall");
+    assert_eq!(
+        rx.recv_timeout(LONG).expect("the pool runs a job after the stall"),
+        Ok(()),
+        "the pool ran no job after the stall"
+    );
 }
 
 /// A job waits inside a scope on a key whose claimer waits on nothing that ends: the stall
@@ -153,7 +169,8 @@ fn a_stall_inside_a_scope_fails_its_job_before_its_caller() {
                         move |it| _ = job_tx.send(it.map_err(|it| message(&*it))),
                     );
                 });
-                let failed = job_rx.try_recv().expect("the scope returned once its job ended").unwrap_err();
+                let failed =
+                    job_rx.try_recv().expect("the scope returned once its job ended").unwrap_err();
                 assert!(failed.starts_with("stalled: "), "{failed}");
                 assert_eq!(ended.load(Ordering::SeqCst), 0, "the scope's job failed at its wait");
             },
@@ -166,9 +183,16 @@ fn a_stall_inside_a_scope_fails_its_job_before_its_caller() {
     ];
     got.sort();
     assert!(got[0].is_ok(), "the scope's caller saw its job's stall: {got:?}");
-    assert!(got[1].as_ref().is_err_and(|it| it.starts_with("stalled: ")), "the key's claimer fails: {got:?}");
+    assert!(
+        got[1].as_ref().is_err_and(|it| it.starts_with("stalled: ")),
+        "the key's claimer fails: {got:?}"
+    );
     pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
-    assert_eq!(rx.recv_timeout(LONG).expect("the pool runs a job after the stall"), Ok(()), "the pool ran no job after the stall");
+    assert_eq!(
+        rx.recv_timeout(LONG).expect("the pool runs a job after the stall"),
+        Ok(()),
+        "the pool ran no job after the stall"
+    );
 }
 
 fn hex(key: Key) -> String {
@@ -186,7 +210,8 @@ fn hex(key: Key) -> String {
 /// is still found within the bound, naming the key and its claimer.
 #[test]
 fn a_client_thread_in_the_graph_does_not_hide_a_stall_of_the_pools_jobs() {
-    let _deadline = Deadline::new("a_client_thread_in_the_graph_does_not_hide_a_stall_of_the_pools_jobs");
+    let _deadline =
+        Deadline::new("a_client_thread_in_the_graph_does_not_hide_a_stall_of_the_pools_jobs");
     let (joined_tx, joined) = unbounded::<()>();
     let (stop_tx, stop) = unbounded::<()>();
     let client = std::thread::spawn(move || {
@@ -217,7 +242,11 @@ fn a_client_thread_in_the_graph_does_not_hide_a_stall_of_the_pools_jobs() {
     SpinWait::within("the key to be claimed", LONG, || claimed.load(Ordering::SeqCst) == 1);
     {
         let tx = tx.clone();
-        pool.submit(None, move || _ = sched::wait(Wait::Key(at)), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
+        pool.submit(
+            None,
+            move || _ = sched::wait(Wait::Key(at)),
+            move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+        );
     }
     for _ in 0..2 {
         let failed = rx
@@ -225,7 +254,10 @@ fn a_client_thread_in_the_graph_does_not_hide_a_stall_of_the_pools_jobs() {
             .expect("a stalled job fails within LONG though a client runs in the graph")
             .expect_err("a stalled job fails");
         assert!(failed.starts_with("stalled: "), "{failed}");
-        assert!(failed.contains(&format!("key {}, claimed by job ", hex(at))), "the stall names the key: {failed}");
+        assert!(
+            failed.contains(&format!("key {}, claimed by job ", hex(at))),
+            "the stall names the key: {failed}"
+        );
     }
     stop_tx.send(()).expect("the client waits to be stopped");
     client.join().expect("the client ends");
@@ -238,24 +270,41 @@ fn a_client_thread_in_the_graph_does_not_hide_a_stall_of_the_pools_jobs() {
 /// its claimer and the waiter.
 #[test]
 fn a_wait_on_a_key_a_still_client_holds_fails_once_the_outside_says_it_is_quiet() {
-    let _deadline = Deadline::new("a_wait_on_a_key_a_still_client_holds_fails_once_the_outside_says_it_is_quiet");
+    let _deadline = Deadline::new(
+        "a_wait_on_a_key_a_still_client_holds_fails_once_the_outside_says_it_is_quiet",
+    );
     let pool = Pool::new(&Topology::flat(2), false).unwrap();
     let (tx, rx) = unbounded::<Result<(), String>>();
     let at = key(7_300);
     assert!(sched::claim(at), "the key is new");
-    pool.submit(None, move || _ = sched::wait(Wait::Key(at)), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
+    pool.submit(
+        None,
+        move || _ = sched::wait(Wait::Key(at)),
+        move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+    );
     SpinWait::within("the waiter to park", LONG, || pool.parked() == 1);
     // Past the pool's own check (two seconds idle): a client's key is no stall to it.
-    assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Err(RecvTimeoutError::Timeout), "the pool's check failed a wait a client may end");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(3)),
+        Err(RecvTimeoutError::Timeout),
+        "the pool's check failed a wait a client may end"
+    );
     let mut waits = None;
     SpinWait::within("the quiet check to find the stall", LONG, || {
         waits = sched::stall_while_quiet();
         waits.is_some()
     });
     let said = waits.expect("found").to_string();
-    assert!(said.contains(&format!("waits for key {}, claimed by job ", hex(at))), "the stall names the key and its claimer: {said}");
-    let failed = rx.recv_timeout(LONG).expect("the waiter fails within LONG").expect_err("the waiter fails");
+    assert!(
+        said.contains(&format!("waits for key {}, claimed by job ", hex(at))),
+        "the stall names the key and its claimer: {said}"
+    );
+    let failed =
+        rx.recv_timeout(LONG).expect("the waiter fails within LONG").expect_err("the waiter fails");
     assert!(failed.starts_with("stalled: "), "{failed}");
-    assert!(failed.contains(&format!("key {}, claimed by job ", hex(at))), "the waiter's failure names the key: {failed}");
+    assert!(
+        failed.contains(&format!("key {}, claimed by job ", hex(at))),
+        "the waiter's failure names the key: {failed}"
+    );
     sched::key_done(at);
 }

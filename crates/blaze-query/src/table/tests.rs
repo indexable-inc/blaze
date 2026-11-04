@@ -9,7 +9,10 @@ use super::{Column, Edit, Free, Ids, Map, Rows};
 use crate::{QueryKey, QueryKind};
 
 fn key(n: u64) -> QueryKey {
-    QueryKey { kind: QueryKind(1), input: ContentId::of("blaze v2 db table test 1", &n.to_le_bytes()) }
+    QueryKey {
+        kind: QueryKind(1),
+        input: ContentId::of("blaze v2 db table test 1", &n.to_le_bytes()),
+    }
 }
 
 /// Waits for what a map unlinked to be freed: other tests' threads may still be in tasks that
@@ -71,7 +74,11 @@ fn a_parallel_edit_of_every_entry_is_the_serial_one() {
             _ => Edit::Keep,
         };
         let mut said = Vec::new();
-        serial.edit_all_with(&task, |_, &value| decide(value), |&old, new| said.push((old, new.copied())));
+        serial.edit_all_with(
+            &task,
+            |_, &value| decide(value),
+            |&old, new| said.push((old, new.copied())),
+        );
         let heard = parking_lot::Mutex::new(Vec::new());
         parallel.edit_all_parallel(
             Vec::new,
@@ -226,7 +233,9 @@ fn get_or_insert_keeps_the_first_value() {
         let spawned: Vec<_> = (0..8u64)
             .map(|thread| {
                 let map = &map;
-                scope.spawn(move || *map.get_or_insert_with(&blaze_reclaim::enter(), key(2), || thread))
+                scope.spawn(move || {
+                    *map.get_or_insert_with(&blaze_reclaim::enter(), key(2), || thread)
+                })
             })
             .collect();
         spawned.into_iter().map(|it| it.join().expect("a thread")).collect()
@@ -257,7 +266,10 @@ fn removed_entries_leave_tombs_reused_and_dropped_by_growth() {
         live += 1;
     });
     assert_eq!(live, 500, "the evens, each once, and no odd kept");
-    map.edit_all(&task, |_, value| if *value < 10 { Edit::Replace(value + 1000) } else { Edit::Keep });
+    map.edit_all(
+        &task,
+        |_, value| if *value < 10 { Edit::Replace(value + 1000) } else { Edit::Keep },
+    );
     assert_eq!(map.get(&task, &key(4)), Some(&1004));
     drop(task);
     freed(&map);
@@ -299,7 +311,9 @@ fn a_column_publishes_takes_and_restores_by_index() {
             .map(|thread| {
                 let column = &column;
                 scope.spawn(move || {
-                    (0..100).map(|n| column.push(|index| format!("{thread}:{n}:{index}"))).collect::<Vec<_>>()
+                    (0..100)
+                        .map(|n| column.push(|index| format!("{thread}:{n}:{index}")))
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -316,7 +330,9 @@ fn a_column_publishes_takes_and_restores_by_index() {
     drop(taken);
     let (next, values) = column.take_all();
     assert_eq!((next, values.len()), (400, 399));
-    column.restore(next, values, |value| value.rsplit(':').next().and_then(|it| it.parse().ok()).expect("an index"));
+    column.restore(next, values, |value| {
+        value.rsplit(':').next().and_then(|it| it.parse().ok()).expect("an index")
+    });
     assert_eq!(column.values_mut().count(), 399);
     assert_eq!(column.push(|index| index.to_string()), 400);
 }
@@ -383,7 +399,11 @@ mod model {
 
     impl Counts {
         fn balanced(&self) {
-            assert_eq!(self.made.load(Relaxed), self.dropped.load(Relaxed), "every value made is dropped, once");
+            assert_eq!(
+                self.made.load(Relaxed),
+                self.dropped.load(Relaxed),
+                "every value made is dropped, once"
+            );
         }
     }
 
@@ -465,10 +485,12 @@ mod model {
             let task = blaze_reclaim::enter();
             let (map, counts) = (&self.map, &self.counts);
             self.history.record(op, |op| match *op {
-                MapOp::Insert(n, value) => Some(map.insert(&task, key(n), Tracked::new(counts, value)).get()),
-                MapOp::GetOrInsert(n, value) => {
-                    Some(map.get_or_insert_with(&task, key(n), || Tracked::new(counts, value)).get())
+                MapOp::Insert(n, value) => {
+                    Some(map.insert(&task, key(n), Tracked::new(counts, value)).get())
                 }
+                MapOp::GetOrInsert(n, value) => Some(
+                    map.get_or_insert_with(&task, key(n), || Tracked::new(counts, value)).get(),
+                ),
                 MapOp::Add(n, value) => {
                     let mut replaced = None;
                     map.update(&task, key(n), |old| {
@@ -490,7 +512,11 @@ mod model {
     fn model_map_writers_linearize_while_a_shard_grows() {
         blaze_check::model(|| {
             let counts = Arc::new(Counts::default());
-            let writers = Arc::new(Writers { map: Map::new(), history: History::new(), counts: counts.clone() });
+            let writers = Arc::new(Writers {
+                map: Map::new(),
+                history: History::new(),
+                counts: counts.clone(),
+            });
             let mut init = Entries::default();
             {
                 let task = blaze_reclaim::enter();
@@ -556,7 +582,10 @@ mod model {
                     );
                     for n in [1, FULL, FULL + 1] {
                         let found = map.get(&task, &key(n)).map(Tracked::get);
-                        assert!(found.is_none_or(|it| it == u64::from(n)), "key {n} read as {found:?}");
+                        assert!(
+                            found.is_none_or(|it| it == u64::from(n)),
+                            "key {n} read as {found:?}"
+                        );
                     }
                 })
             };
@@ -612,9 +641,15 @@ mod model {
     /// Values a first chunk holds but one: the next pushes straddle a chunk no thread has made.
     const PUSHED: u32 = COLUMN_FIRST as u32 - 1;
 
-    fn push(column: &Column<Tracked>, history: &History<Values>, counts: &Arc<Counts>, value: u64) -> u32 {
-        let index =
-            history.record(ColumnOp::Push(value), |_| Some(u64::from(column.push(|_| Tracked::new(counts, value)))));
+    fn push(
+        column: &Column<Tracked>,
+        history: &History<Values>,
+        counts: &Arc<Counts>,
+        value: u64,
+    ) -> u32 {
+        let index = history.record(ColumnOp::Push(value), |_| {
+            Some(u64::from(column.push(|_| Tracked::new(counts, value))))
+        });
         u32::try_from(index.expect("a push gives its index")).expect("a u32 index")
     }
 
@@ -640,7 +675,8 @@ mod model {
             }
             let handed = Arc::new(AtomicU32::new(u32::MAX));
             let getter = {
-                let (column, history, counts, handed) = (column.clone(), history.clone(), counts.clone(), handed.clone());
+                let (column, history, counts, handed) =
+                    (column.clone(), history.clone(), counts.clone(), handed.clone());
                 thread::spawn(move || {
                     let index = push(&column, &history, &counts, 1000);
                     handed.store(index, Relaxed);

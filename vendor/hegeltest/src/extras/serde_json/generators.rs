@@ -119,20 +119,12 @@ pub fn values() -> ValueGenerator {
         gs::just(Value::Null).boxed_printable(),
         gs::booleans().map(Value::Bool).boxed_printable(),
         numbers().map(Value::Number).boxed_printable(),
-        <String as DefaultGenerator>::default_generator()
-            .map(Value::String)
-            .boxed_printable(),
-        gs::vecs(handle.clone())
+        <String as DefaultGenerator>::default_generator().map(Value::String).boxed_printable(),
+        gs::vecs(handle.clone()).max_size(3).map(Value::Array).boxed_printable(),
+        gs::hashmaps(<String as DefaultGenerator>::default_generator(), handle.clone())
             .max_size(3)
-            .map(Value::Array)
+            .map(|m: HashMap<String, Value>| Value::Object(m.into_iter().collect()))
             .boxed_printable(),
-        gs::hashmaps(
-            <String as DefaultGenerator>::default_generator(),
-            handle.clone(),
-        )
-        .max_size(3)
-        .map(|m: HashMap<String, Value>| Value::Object(m.into_iter().collect()))
-        .boxed_printable(),
     ])
     .boxed_printable();
 

@@ -6,11 +6,11 @@
 
 use std::{cell::RefCell, panic};
 
+use crate::{AbsPathBuf, FileId, FileSet, VfsPath};
 use blaze_dbsp::Work;
 use blaze_query::db::Durability;
 use span::Edition;
 use triomphe::Arc;
-use crate::{AbsPathBuf, FileId, FileSet, VfsPath};
 
 use crate::{
     CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, Env, SourceRoot, SourceRootId,
@@ -129,7 +129,9 @@ fn length(db: &Db, _: &Written<'_>, key: &mut (FileId, u32)) {
 }
 
 fn steps_reads(_: &Db, _: &Written<'_>, reads: &mut Reads) {
-    let Some(steps) = PROBE.with(|probe| probe.borrow().on.then_some(probe.borrow().steps)).flatten() else {
+    let Some(steps) =
+        PROBE.with(|probe| probe.borrow().on.then_some(probe.borrow().steps)).flatten()
+    else {
         return;
     };
     reads.each(blaze_mem::Tag::Other, (0..3).map(|n| (file(n), 0)), length);
@@ -203,7 +205,9 @@ fn a_batch_runs_each_maintainer_once_over_all_it_wrote() {
         db.batch(Trigger::named("the test's edit"), |db| {
             db.set_file_text(file(2), "fn b() {}\n");
             db.set_file_text(file(1), "fn a() {}\n");
-            db.batch(Trigger::named("the test's inner edit"), |db| db.set_file_text(file(2), "fn c() {}\n"));
+            db.batch(Trigger::named("the test's inner edit"), |db| {
+                db.set_file_text(file(2), "fn c() {}\n")
+            });
             db.set_file_text_with_durability(file(3), "", Durability::LOW);
         })
     });
@@ -229,10 +233,14 @@ fn one_batch_is_one_pass() {
 fn a_database_taking_batches_refuses_a_lone_write_naming_it() {
     let mut db = Db::for_tests();
     db.require_batches();
-    let lone = panic::catch_unwind(panic::AssertUnwindSafe(|| db.set_file_text(file(0), "fn a() {}\n")));
+    let lone =
+        panic::catch_unwind(panic::AssertUnwindSafe(|| db.set_file_text(file(0), "fn a() {}\n")));
     let panic = lone.expect_err("a write outside a batch is refused");
     let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
-    assert!(message.contains("`Db::set_file_text` wrote the database outside a `Db::batch`"), "{message}");
+    assert!(
+        message.contains("`Db::set_file_text` wrote the database outside a `Db::batch`"),
+        "{message}"
+    );
     // In a batch it is taken, and a maintainer's own write in the pass is too.
     let before = db.maintain_passes();
     let probe = probed(Some(file(9)), None, || {
@@ -332,7 +340,11 @@ fn a_source_root_notes_its_files_coming_and_going() {
     });
     assert_eq!(
         probe.seen,
-        vec![Seen { added: vec![file(0), file(1)], roots: vec![SourceRootId(0)], ..Seen::default() }]
+        vec![Seen {
+            added: vec![file(0), file(1)],
+            roots: vec![SourceRootId(0)],
+            ..Seen::default()
+        }]
     );
     let probe = probed(None, None, || {
         db.set_source_root_with_durability(SourceRootId(0), root(&[1, 2]), Durability::MEDIUM)
@@ -389,7 +401,9 @@ fn the_crate_graph_is_a_write_when_it_changes() {
     let probe = probed(None, None, || _ = graph.set_in_db(&mut db));
     assert!(probe.seen.is_empty(), "an equal graph is no write: {:?}", probe.seen);
     let krate = crate::all_crates(&db)[0];
-    let probe = probed(None, None, || krate.set_env(&mut db, Env::from_iter([("A".to_owned(), "1".to_owned())])));
+    let probe = probed(None, None, || {
+        krate.set_env(&mut db, Env::from_iter([("A".to_owned(), "1".to_owned())]))
+    });
     assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }]);
     let probe = probed(None, None, || db.note_crates_changed());
     assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }]);
@@ -400,27 +414,42 @@ fn the_crate_graph_is_a_write_when_it_changes() {
 /// systemd's `INVOCATION_ID`) maintains nothing, yet reads the new values.
 #[test]
 fn the_process_environment_is_a_write_only_where_a_crate_read_it() {
-    let vars = |pairs: &[(&str, &str)]| Env::from_iter(pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
+    let vars = |pairs: &[(&str, &str)]| {
+        Env::from_iter(pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())))
+    };
     let mut db = Db::for_tests();
     one_crate(&mut db).set_in_db(&mut db);
     let krate = crate::all_crates(&db)[0];
-    let probe = probed(None, None, || crate::set_process_env(&mut db, vars(&[("FOO", "1"), ("SHLVL", "1")])));
+    let probe = probed(None, None, || {
+        crate::set_process_env(&mut db, vars(&[("FOO", "1"), ("SHLVL", "1")]))
+    });
     assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }], "the first environment");
     db.files().env_is_read(krate, "FOO");
     assert_eq!(crate::process_env_reads(&db), vec![(krate, "FOO".to_owned())]);
     let probe = probed(None, None, || {
-        crate::set_process_env(&mut db, vars(&[("FOO", "1"), ("SHLVL", "2"), ("INVOCATION_ID", "4f2a")]))
+        crate::set_process_env(
+            &mut db,
+            vars(&[("FOO", "1"), ("SHLVL", "2"), ("INVOCATION_ID", "4f2a")]),
+        )
     });
     assert!(probe.seen.is_empty(), "no crate read what moved: {:?}", probe.seen);
-    assert_eq!(crate::process_env_var(&db, "SHLVL").as_deref(), Some("2"), "a later read reads the new value");
-    let probe = probed(None, None, || crate::set_process_env(&mut db, vars(&[("FOO", "2"), ("SHLVL", "2")])));
+    assert_eq!(
+        crate::process_env_var(&db, "SHLVL").as_deref(),
+        Some("2"),
+        "a later read reads the new value"
+    );
+    let probe = probed(None, None, || {
+        crate::set_process_env(&mut db, vars(&[("FOO", "2"), ("SHLVL", "2")]))
+    });
     assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }], "`FOO` was read");
     let probe = probed(None, None, || crate::set_process_env(&mut db, vars(&[("SHLVL", "2")])));
     assert_eq!(probe.seen, vec![Seen { crates: true, ..Seen::default() }], "`FOO` unset");
     // A crate with a `FOO` of its own reads none of the process's.
     krate.set_env(&mut db, vars(&[("FOO", "own")]));
     assert_eq!(crate::process_env_reads(&db), Vec::new());
-    let probe = probed(None, None, || crate::set_process_env(&mut db, vars(&[("FOO", "3"), ("SHLVL", "2")])));
+    let probe = probed(None, None, || {
+        crate::set_process_env(&mut db, vars(&[("FOO", "3"), ("SHLVL", "2")]))
+    });
     assert!(probe.seen.is_empty(), "the crate reads its own `FOO`: {:?}", probe.seen);
 }
 
@@ -467,7 +496,8 @@ fn work_is_kept_per_pass_while_asked_for() {
 /// Runs `f` with `steps` on for `count` steps, and returns what its apply took.
 fn stepped(count: u32, apply_reads: bool, f: impl FnOnce()) -> Vec<(u32, Vec<(FileId, u32)>)> {
     PROBE.with(|probe| {
-        *probe.borrow_mut() = Probe { on: true, steps: Some(count), apply_reads, ..Probe::default() };
+        *probe.borrow_mut() =
+            Probe { on: true, steps: Some(count), apply_reads, ..Probe::default() };
     });
     let ran = panic::catch_unwind(panic::AssertUnwindSafe(f));
     let probe = PROBE.with(|probe| std::mem::take(&mut *probe.borrow_mut()));

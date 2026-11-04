@@ -5,8 +5,8 @@
 use std::vec;
 
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use serde::de::{self, IntoDeserializer};
+use std::alloc::Global;
 
 use super::error::ConfigError;
 use super::key::{ArrayItemKeyPath, ConfigKey};
@@ -26,7 +26,11 @@ pub(crate) struct Deserializer<'c, F: Files> {
 
 impl<F: Files> Clone for Deserializer<'_, F> {
     fn clone(&self) -> Self {
-        Deserializer { config: self.config, key: self.key.clone(), env_prefix_ok: self.env_prefix_ok }
+        Deserializer {
+            config: self.config,
+            key: self.key.clone(),
+            env_prefix_ok: self.env_prefix_ok,
+        }
     }
 }
 

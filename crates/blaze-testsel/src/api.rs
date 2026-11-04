@@ -62,7 +62,11 @@ mod tests {
         let bytes = blaze_protocol::cbor::to_vec(&message).unwrap();
         let back: Envelope<Response> = blaze_protocol::cbor::from_slice(&bytes).unwrap();
         assert_eq!(back.schema, SCHEMA);
-        assert_eq!(blaze_protocol::cbor::to_vec(&back).unwrap(), bytes, "the encoding is deterministic");
+        assert_eq!(
+            blaze_protocol::cbor::to_vec(&back).unwrap(),
+            bytes,
+            "the encoding is deterministic"
+        );
         match back.body {
             Response::TestResult(it) => it,
             other => panic!("a test result came back as {other:?}"),
@@ -71,7 +75,9 @@ mod tests {
 
     #[test]
     fn a_cached_pass_round_trips_with_its_outcome_duration_and_basis() {
-        for basis in [Basis::Executed, Basis::Reached { why: "the test was killed after 60s".to_owned() }] {
+        for basis in
+            [Basis::Executed, Basis::Reached { why: "the test was killed after 60s".to_owned() }]
+        {
             let cached = Cached { took: Duration::from_millis(1234), basis };
             let sent = result("tests/parse", 3, "parse::nested", &cached);
             let back = round_trip(&sent);

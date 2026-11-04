@@ -93,9 +93,9 @@ pub struct ClauseRef {
 impl fmt::Display for ClauseRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let place = match self.kind {
-            SpecClauseKind::Invariant | SpecClauseKind::LoopEnsures | SpecClauseKind::LoopDecreases => {
-                " of a loop"
-            }
+            SpecClauseKind::Invariant
+            | SpecClauseKind::LoopEnsures
+            | SpecClauseKind::LoopDecreases => " of a loop",
             _ => "",
         };
         write!(f, "`{} {}`{place}", self.kind.keyword(), self.text)
@@ -288,7 +288,11 @@ pub fn verify_function(db: &Db, func: FunctionId, config: &Config) -> Verdict {
             };
         }
         Err(lower::Refused::Error(it)) => {
-            return Verdict { function: it.function.clone(), outcome: Outcome::Error(it), key: None };
+            return Verdict {
+                function: it.function.clone(),
+                outcome: Outcome::Error(it),
+                key: None,
+            };
         }
     };
     let key = driver::proof_key(&lowered, config);
@@ -303,7 +307,12 @@ pub fn verify_function(db: &Db, func: FunctionId, config: &Config) -> Verdict {
 /// This slice proves non-generic functions with Z3 from `BLAZE_Z3` and [`DEFAULT_RLIMIT`].
 /// [`Clause::Requires`] needs every call site lowered, which this slice does not do yet, so it
 /// is `None`.
-pub fn proved(db: &Db, func: FunctionId, args: StoredGenericArgs, clause: Clause) -> Option<ProofKey> {
+pub fn proved(
+    db: &Db,
+    func: FunctionId,
+    args: StoredGenericArgs,
+    clause: Clause,
+) -> Option<ProofKey> {
     if !args.as_ref().is_empty() {
         return None;
     }

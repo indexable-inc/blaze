@@ -56,7 +56,8 @@ const INCOMPATIBLE_OR_PATTERNS: LintId = LintId::named("rust_2021_incompatible_o
 const EXPR_FRAGMENT_SPECIFIER: LintId = LintId::named("edition_2024_expr_fragment_specifier");
 
 /// The lints of this module, each allowed by default.
-const LINTS: LintSet = LintSet::of(&[META_VARIABLE_MISUSE, INCOMPATIBLE_OR_PATTERNS, EXPR_FRAGMENT_SPECIFIER]);
+const LINTS: LintSet =
+    LintSet::of(&[META_VARIABLE_MISUSE, INCOMPATIBLE_OR_PATTERNS, EXPR_FRAGMENT_SPECIFIER]);
 
 /// The lints of the macro definition `node` (a `MACRO_RULES` or `MACRO_DEF` of `tree`), as the
 /// early pass's one walk (`super::super::lints`) comes to it; `krate` is [`crate_at`]. A
@@ -154,7 +155,8 @@ fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree<'_>, tokens: &Tokens<'_>, misuse: &M
     let span = |range: TextRange| cx.span(InFile::new(tree.file, range));
     match *misuse {
         Misuse::Duplicate { span: at, prev } => {
-            let mut diag = Diag::lint("meta_variable_misuse", "duplicate matcher binding", span(at));
+            let mut diag =
+                Diag::lint("meta_variable_misuse", "duplicate matcher binding", span(at));
             diag.span_label(span(at), "duplicate binding");
             diag.span_label(span(prev), "previous binding");
             diag
@@ -176,8 +178,11 @@ fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree<'_>, tokens: &Tokens<'_>, misuse: &M
             diag
         }
         Misuse::WrongOperator { span: at, binder, occurrence } => {
-            let mut diag =
-                Diag::lint("meta_variable_misuse", "meta-variable repeats with different Kleene operator", span(at));
+            let mut diag = Diag::lint(
+                "meta_variable_misuse",
+                "meta-variable repeats with different Kleene operator",
+                span(at),
+            );
             diag.span_label(span(binder), "expected repetition");
             diag.span_label(span(occurrence), "conflicting repetition");
             diag
@@ -190,11 +195,11 @@ fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree<'_>, tokens: &Tokens<'_>, misuse: &M
 fn printed(tokens: &Tokens<'_>, ident: Token) -> String {
     let name = tokens.name(ident.range);
     let reserved = match name {
-        "as" | "break" | "const" | "continue" | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if"
-        | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref" | "return"
-        | "static" | "struct" | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while"
-        | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override" | "priv" | "typeof"
-        | "unsized" | "virtual" | "yield" => true,
+        "as" | "break" | "const" | "continue" | "else" | "enum" | "extern" | "false" | "fn"
+        | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut"
+        | "pub" | "ref" | "return" | "static" | "struct" | "trait" | "true" | "type" | "unsafe"
+        | "use" | "where" | "while" | "abstract" | "become" | "box" | "do" | "final" | "macro"
+        | "override" | "priv" | "typeof" | "unsized" | "virtual" | "yield" => true,
         "async" | "await" | "dyn" | "try" => ident.edition >= Edition::Edition2018,
         "gen" => ident.edition >= Edition::Edition2024,
         _ => false,

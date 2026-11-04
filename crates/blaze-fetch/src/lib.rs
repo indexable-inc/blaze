@@ -37,6 +37,7 @@
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+mod casefold;
 pub mod decisions;
 pub mod digest;
 pub mod error;
@@ -46,6 +47,7 @@ pub mod graph;
 pub mod request;
 pub mod store;
 pub mod tree;
+pub mod unpack;
 
 #[cfg(test)]
 mod tests;
@@ -54,7 +56,9 @@ pub use crate::{
     decisions::{Failure, Policy},
     digest::{Algo, Blake3, Digest, DigestRefused, Hashed, Hashing},
     error::{FetchError, Producer, redact, scrub},
-    fetcher::{DEFAULT_MOST_BYTES, Fetcher, Git, Net, Source, StoreOf, Verified, is_commit, verify},
+    fetcher::{
+        DEFAULT_MOST_BYTES, Fetcher, Git, Net, Source, StoreOf, Verified, is_commit, verify,
+    },
     flight::Flights,
     graph::{StepError, Transform, Tree, TreeFile},
     request::Asked,

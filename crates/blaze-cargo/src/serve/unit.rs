@@ -63,27 +63,34 @@ use std::{
     time::Instant,
 };
 
-#[expect(clippy::disallowed_types, reason = "a job's slots, one per unit, each set once by the unit's task: per job, not global")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a job's slots, one per unit, each set once by the unit's task: per job, not global"
+)]
 use std::sync::OnceLock;
 
 use base_db::{FileId, Trigger};
-use blaze_api::{ApiError, Artifact, CrateType, Reach, Response, Table, TargetKind, TestResult, Ub, UnitOf, UnitTarget};
+use blaze_api::{
+    ApiError, Artifact, CrateType, Reach, Response, Table, TargetKind, TestResult, Ub, UnitOf,
+    UnitTarget,
+};
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
+use blaze_lower::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
 use blaze_units::{
     query::{BuildConfig, EnvMoved, EnvReads, Fetch, Units},
     schema::{Mode, Unit},
 };
-use blaze_lower::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
 use parking_lot::Mutex;
 
 use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut, Library, Phase, Put, RunPuts,
-        Runs, Selection, Source, SourceFile, Steps, Writer, applying, applying_fallible,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut,
+        Library, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying,
+        applying_fallible,
     },
 };
 
@@ -94,6 +101,13 @@ pub struct Real {
     /// blaze's sources directory ([`blaze_manifest::home::sources`]), the one place a fetched
     /// package is written on disk ([`crate::serve::fetch::keep_on_disk`]).
     sources: PathBuf,
+    /// Where the pinned native inputs are laid out, `<BLAZE_HOME>/native`
+    /// ([`crate::serve::native`]); none when the daemon has no home (neither `BLAZE_HOME` nor
+    /// the user's home is set), which only a build that names an input is refused for.
+    native: Option<PathBuf>,
+    /// The layouts this daemon has checked against their marks, each once
+    /// ([`crate::serve::native::Verified`]).
+    native_verified: crate::serve::native::Verified,
 }
 
 /// What every job's front shares: the daemon's paths, what was read of the machine's files,
@@ -127,15 +141,24 @@ impl Real {
             launcher: paths.launcher.clone(),
             tools,
             memos: memo::Memos::new(),
-            host_cpu: hir_ty_codegen::host_cpu().map(|(name, features)| blaze_units::stdlib::target::HostCpu {
-                arch: std::env::consts::ARCH.to_owned(),
-                name,
-                features,
+            host_cpu: hir_ty_codegen::host_cpu().map(|(name, features)| {
+                blaze_units::stdlib::target::HostCpu {
+                    arch: std::env::consts::ARCH.to_owned(),
+                    name,
+                    features,
+                }
             }),
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
         };
-        Ok(Real { fetcher, shared: Arc::new(shared), sources })
+        let native = crate::toolchain::home().map(|it| it.join(crate::serve::native::NATIVE));
+        Ok(Real {
+            fetcher,
+            shared: Arc::new(shared),
+            sources,
+            native,
+            native_verified: Default::default(),
+        })
     }
 }
 
@@ -148,12 +171,15 @@ fn stand_ins(dir: &std::path::Path, launcher: &std::path::Path) -> Result<(), St
         let at = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         match std::fs::read_link(&at) {
             Ok(to) if to == launcher => continue,
-            Ok(_) => std::fs::remove_file(&at).map_err(|error| format!("{}: {error}", at.display()))?,
+            Ok(_) => {
+                std::fs::remove_file(&at).map_err(|error| format!("{}: {error}", at.display()))?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("{}: {error}", at.display())),
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(launcher, &at).map_err(|error| format!("{}: {error}", at.display()))?;
+        std::os::unix::fs::symlink(launcher, &at)
+            .map_err(|error| format!("{}: {error}", at.display()))?;
         #[cfg(windows)]
         std::fs::hard_link(launcher, &at).map_err(|error| format!("{}: {error}", at.display()))?;
     }
@@ -174,9 +200,29 @@ impl Steps for Real {
         Ok(source)
     }
 
+    fn native(
+        &self,
+        input: &blaze_units::query::NativeInput,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<std::path::PathBuf, ApiError> {
+        let Some(native) = &self.native else {
+            return Err(ApiError::new(
+                format!(
+                    "pinned native input `{}` is laid out under blaze's home, and the daemon has none: \
+                     set BLAZE_HOME (or HOME) where it starts",
+                    input.name
+                ),
+                Some(input.pin.clone()), // clone: an error's place, once
+            ));
+        };
+        let fetcher = self.fetcher.pinned();
+        crate::serve::native::ensure(input, native, &fetcher, &self.native_verified, cancelled)
+    }
+
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
         let at = || Some("the standard library's sources".to_owned());
-        let library = crate::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
+        let library =
+            crate::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
         let in_dir = |what| ApiError::new(what, Some(library.dir.display().to_string()));
         let named = blaze_units::stdlib::library_at(&library.commit);
         let mut hasher = blaze_ids::Hasher::new("blaze v2 serve library fingerprint");
@@ -193,10 +239,18 @@ impl Steps for Real {
     }
 
     fn launch(&self, program: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, ApiError> {
-        self.shared.dev_runs.launch(program, pid).map_err(|what| ApiError::new(what, Some(program.to_owned())))
+        self.shared
+            .dev_runs
+            .launch(program, pid)
+            .map_err(|what| ApiError::new(what, Some(program.to_owned())))
     }
 
-    fn lease(&self, units: &blaze_units::query::Units, checkout: &str, builds: &str) -> crate::serve::work::Leased {
+    fn lease(
+        &self,
+        units: &blaze_units::query::Units,
+        checkout: &str,
+        builds: &str,
+    ) -> crate::serve::work::Leased {
         crate::serve::job::lease_build_dirs(units, checkout, builds)
     }
 
@@ -206,7 +260,9 @@ impl Steps for Real {
         }
         let later = std::mem::take(&mut kept.later);
         let deps = kept.deps.take();
-        let stored = cancellable(|| deps::store(&kept.lowered, deps.as_ref(), &mut kept.session, &later, &kept.root));
+        let stored = cancellable(|| {
+            deps::store(&kept.lowered, deps.as_ref(), &mut kept.session, &later, &kept.root)
+        });
         let (puts, flushes) = match stored {
             Ok(stored) => stored?,
             // A cancel of the front end's database or of the build graph, caught as the
@@ -233,129 +289,154 @@ impl Steps for Real {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
         }
-        let writer = cancellable(move || -> Result<(UnitWriter, Vec<Put>, Vec<blaze_kernel::Miss>), Failed> {
-            let mut kept = kept;
-            // Held until this job's front end is kept with its own: what the head's last build
-            // used stays in the memo for this one.
-            let held = kept.as_mut().and_then(|it| it.memo.take());
-            let puts = Vec::new(); // alloc: none
-            // What the head's last build left for the store was written as it was kept
-            // ([`Steps::store_kept`]), before that build answered; a front end that was not is
-            // never lowered into, as its images and outcomes would be lost (rule 3).
-            let mut flushed = None;
-            if let Some(it) = &mut kept {
-                if !it.stored {
-                    let what = "the head's last front end is lowered into, and what its build left for the store was never written (`Steps::store_kept`)";
-                    return Err(Failed::Error(ApiError::new(what, Some(it.root.clone())))); // clone: an error, once
-                }
-                flushed = it.flushed.take();
-            }
-            // Whether a record retracting a value verified across checkouts was published since
-            // the kept front end was lowered (rule 18): its database's tracked expansions and
-            // served images would keep such a value, so it is not lowered into, and the build
-            // lowers afresh, where `deps::serve` works every verified image's reads out again
-            // and an expansion is looked up again. Read before this job expands anything, so a
-            // record published while it runs moves the epoch past the one its front end is kept
-            // at. One atomic load (`Keeping::retractions_now`).
-            let retractions = input.macros.keeps().retractions_now();
-            // A kept front end that is not lowered into is let go by name: the build lowers
-            // anew, and the daemon's log and the profile say which part of its inputs moved.
-            let mut misses = Vec::new(); // alloc: none unless a kept front end is let go for a variable
-            let kept = match kept {
-                Some(it) => match unkept(&it, input, retractions) {
-                    None => Some(it),
-                    Some((why, moved)) => {
-                        if let Some(moved) = &moved {
-                            misses.push(env_miss(&it, moved));
-                        }
-                        let_go(it, &why, moved.as_ref().map(|it| it.name.as_str()));
-                        None
+        let writer = cancellable(
+            move || -> Result<(UnitWriter, Vec<Put>, Vec<blaze_kernel::Miss>), Failed> {
+                let mut kept = kept;
+                // Held until this job's front end is kept with its own: what the head's last build
+                // used stays in the memo for this one.
+                let held = kept.as_mut().and_then(|it| it.memo.take());
+                let puts = Vec::new(); // alloc: none
+                // What the head's last build left for the store was written as it was kept
+                // ([`Steps::store_kept`]), before that build answered; a front end that was not is
+                // never lowered into, as its images and outcomes would be lost (rule 3).
+                let mut flushed = None;
+                if let Some(it) = &mut kept {
+                    if !it.stored {
+                        let what = "the head's last front end is lowered into, and what its build left for the store was never written (`Steps::store_kept`)";
+                        return Err(Failed::Error(ApiError::new(what, Some(it.root.clone())))); // clone: an error, once
                     }
-                },
-                None => None,
-            };
-            let lower = || Lower {
-                units: &input.units,
-                config: &input.config,
-                files: &input.files,
-                root: input.root,
-                host_cpu: self.shared.host_cpu.as_ref(),
-            };
-            let failed = |error| Failed::Error(lower_error(error));
-            // A front end kept and moved to the view keeps what it was served, until a serve of
-            // this job finds a crate's key moved: moving reads again only the view's files, and
-            // the runs and proc macros applied again are served after as in a fresh job.
-            let (mut lowered, session, seeded) = match kept {
-                Some(KeptLowered { session, mut lowered, seeds, .. }) => match lowered
-                    .refresh(lower(), |db| seed(db, &seeds))
-                    .map_err(failed)?
-                {
-                    true => (lowered.into_inner(), Some(session), seeds),
-                    false => {
-                        let why = "the view moves the workspace's root or what its root manifest sets, which every crate is made with, or whether a crate of the macro host links proc_macro, which its cfg is made with";
-                        let checkout = input.config.invocation.root.as_str();
-                        {
-                            let variable = "";
-                            let _span =
+                    flushed = it.flushed.take();
+                }
+                // Whether a record retracting a value verified across checkouts was published since
+                // the kept front end was lowered (rule 18): its database's tracked expansions and
+                // served images would keep such a value, so it is not lowered into, and the build
+                // lowers afresh, where `deps::serve` works every verified image's reads out again
+                // and an expansion is looked up again. Read before this job expands anything, so a
+                // record published while it runs moves the epoch past the one its front end is kept
+                // at. One atomic load (`Keeping::retractions_now`).
+                let retractions = input.macros.keeps().retractions_now();
+                // A kept front end that is not lowered into is let go by name: the build lowers
+                // anew, and the daemon's log and the profile say which part of its inputs moved.
+                let mut misses = Vec::new(); // alloc: none unless a kept front end is let go for a variable
+                let kept = match kept {
+                    Some(it) => match unkept(&it, input, retractions) {
+                        None => Some(it),
+                        Some((why, moved)) => {
+                            if let Some(moved) = &moved {
+                                misses.push(env_miss(&it, moved));
+                            }
+                            let_go(it, &why, moved.as_ref().map(|it| it.name.as_str()));
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let lower = || Lower {
+                    units: &input.units,
+                    config: &input.config,
+                    files: &input.files,
+                    root: input.root,
+                    host_cpu: self.shared.host_cpu.as_ref(),
+                };
+                let failed = |error| Failed::Error(lower_error(error));
+                // A front end kept and moved to the view keeps what it was served, until a serve of
+                // this job finds a crate's key moved: moving reads again only the view's files, and
+                // the runs and proc macros applied again are served after as in a fresh job.
+                let (mut lowered, session, seeded) = match kept {
+                    Some(KeptLowered { session, mut lowered, seeds, .. }) => {
+                        match lowered.refresh(lower(), |db| seed(db, &seeds)).map_err(failed)? {
+                            true => (lowered.into_inner(), Some(session), seeds),
+                            false => {
+                                let why = "the view moves the workspace's root or what its root manifest sets, which every crate is made with, or whether a crate of the macro host links proc_macro, which its cfg is made with";
+                                let checkout = input.config.invocation.root.as_str();
+                                {
+                                    let variable = "";
+                                    let _span =
                                 tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable).entered();
-                            eprintln!("blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}");
-                            drop((session, lowered, seeds));
+                                    eprintln!(
+                                        "blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}"
+                                    );
+                                    drop((session, lowered, seeds));
+                                }
+                                (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
+                            }
                         }
-                        (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
                     }
-                },
-                None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
-            };
-            // Before any key is resolved: two crates of one key would take each other's items.
-            blaze_items::key::check_crate_keys(lowered.db())
-                .map_err(|clash| Failed::Error(ApiError::new(format!("blaze-items: {clash}"), None)))?; // alloc: an error, once
-            let fresh = session.is_none();
-            if fresh {
-                blaze_item_hash::impls::install(lowered.served_db());
-            }
-            let mut session = match session {
-                Some(session) => session,
-                None => deps::session(&lowered, &input.store, &input.macros, &input.config.invocation.env)?,
-            };
-            let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone(), held)?;
-            job._seeded = seeded;
-            let job = Arc::new(job);
-            let waits = graph::Waits::new(&job.graph);
-            // After the seeds (the root's parse is seeded as on disk), before any identity:
-            // a test crate is identified by its root with the harness.
-            // A unit refused here has no write to charge it to yet: the lowering fails, naming each.
-            harness::write(&mut lowered, &job, (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit))).map_err(|refused| harness::refused(&refused))?;
-            for unit in 0..job.graph.len() as u32 {
-                if unit % 64 == 0 && input.cancelled.load(Ordering::Relaxed) {
-                    return Err(Failed::Again);
+                    None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
+                };
+                // Before any key is resolved: two crates of one key would take each other's items.
+                blaze_items::key::check_crate_keys(lowered.db()).map_err(|clash| {
+                    Failed::Error(ApiError::new(format!("blaze-items: {clash}"), None))
+                })?; // alloc: an error, once
+                let fresh = session.is_none();
+                if fresh {
+                    blaze_item_hash::impls::install(lowered.served_db());
                 }
-                if waits.ready(unit) {
-                    identify(&mut lowered, &job, unit);
+                let mut session = match session {
+                    Some(session) => session,
+                    None => deps::session(
+                        &lowered,
+                        &input.store,
+                        &input.macros,
+                        &input.config.invocation.env,
+                    )?,
+                };
+                let mut job =
+                    Job::new(input.clone(), lowered.crates().clone(), self.shared.clone(), held)?;
+                job._seeded = seeded;
+                let job = Arc::new(job);
+                let waits = graph::Waits::new(&job.graph);
+                // After the seeds (the root's parse is seeded as on disk), before any identity:
+                // a test crate is identified by its root with the harness.
+                // A unit refused here has no write to charge it to yet: the lowering fails, naming each.
+                harness::write(
+                    &mut lowered,
+                    &job,
+                    (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit)),
+                )
+                .map_err(|refused| harness::refused(&refused))?;
+                for unit in 0..job.graph.len() as u32 {
+                    if unit % 64 == 0 && input.cancelled.load(Ordering::Relaxed) {
+                        return Err(Failed::Again);
+                    }
+                    if waits.ready(unit) {
+                        identify(&mut lowered, &job, unit);
+                    }
                 }
-            }
-            // Kept or fresh alike: the session's keys say which crates' keys moved, and a kept
-            // front end's serve of the units ready now finds none moved unless a write before
-            // this job's moved one.
-            let mut deps = None;
-            deps::serve(&mut lowered, &job, &deps::ready(&job, &waits), &mut session, &mut deps)?;
-            let release = release::Release::new(lowered.crates(), job.graph.len(), input.goal != Goal::Check);
-            let writer = UnitWriter {
-                session,
-                front: Held::new(Arc::new(lowered), "a job's front end"),
-                job,
-                waits,
-                ready: Vec::new(),
-                runs: Vec::new(),
-                macros: Vec::new(),
-                deps,
-                flushed,
-                broke: Vec::new(),
-                broken: false,
-                retractions,
-                release,
-            };
-            Ok((writer, puts, misses))
-        })??;
+                // Kept or fresh alike: the session's keys say which crates' keys moved, and a kept
+                // front end's serve of the units ready now finds none moved unless a write before
+                // this job's moved one.
+                let mut deps = None;
+                deps::serve(
+                    &mut lowered,
+                    &job,
+                    &deps::ready(&job, &waits),
+                    &mut session,
+                    &mut deps,
+                )?;
+                let release = release::Release::new(
+                    lowered.crates(),
+                    job.graph.len(),
+                    input.goal != Goal::Check,
+                );
+                let writer = UnitWriter {
+                    session,
+                    front: Held::new(Arc::new(lowered), "a job's front end"),
+                    job,
+                    waits,
+                    ready: Vec::new(),
+                    runs: Vec::new(),
+                    macros: Vec::new(),
+                    deps,
+                    flushed,
+                    broke: Vec::new(),
+                    broken: false,
+                    retractions,
+                    release,
+                };
+                Ok((writer, puts, misses))
+            },
+        )??;
         let (writer, puts, misses) = writer;
         let front = Arc::new(JobFront(writer.job.clone()));
         Ok(FrontEnd { front, writer, puts, misses })
@@ -366,18 +447,30 @@ impl Steps for Real {
 /// its inputs that moved, with the variable when that part is one the front end read of the
 /// environment ([`env_moved`]); `None` when it does. `retractions` is the epoch read now
 /// ([`proc_macro_api::kept::Keeping::retractions_now`]).
-fn unkept(kept: &KeptLowered, input: &JobInput, retractions: u64) -> Option<(String, Option<EnvMoved>)> {
+fn unkept(
+    kept: &KeptLowered,
+    input: &JobInput,
+    retractions: u64,
+) -> Option<(String, Option<EnvMoved>)> {
     if !Arc::ptr_eq(&kept.units, &input.units) && kept.units != input.units {
         // alloc: a reason, once per front end let go
-        return Some((format!("the plan's units moved ({})", units_differ(&kept.units, &input.units)), None));
+        return Some((
+            format!("the plan's units moved ({})", units_differ(&kept.units, &input.units)),
+            None,
+        ));
     }
     if let Some(part) = blaze_lower::config_differs(&kept.config, &input.config) {
         // alloc: a reason, once per front end let go
         return Some((format!("its build config's {part} moved"), None));
     }
-    if let Some(moved) = env_moved(&kept.lowered, kept.session.env_read(), &input.config.invocation.env) {
+    if let Some(moved) =
+        env_moved(&kept.lowered, kept.session.env_read(), &input.config.invocation.env)
+    {
         // alloc: a reason, once per front end let go
-        return Some((format!("{moved} (rule 18: a front end is keyed by the variables it read)"), Some(moved)));
+        return Some((
+            format!("{moved} (rule 18: a front end is keyed by the variables it read)"),
+            Some(moved),
+        ));
     }
     if kept.retractions != retractions {
         // alloc: a reason, once per front end let go
@@ -398,7 +491,11 @@ fn unkept(kept: &KeptLowered, input: &JobInput, retractions: u64) -> Option<(Str
 /// ([`blaze_lower::Lowered::env_moved`]), then what the daemon read into what it keeps with it
 /// (`read`, its stores' modes, [`deps::Session::env_read`]). Nothing else of the environment
 /// lets it go, so a no-op build from another shell or systemd unit lowers nothing again.
-pub(crate) fn env_moved(lowered: &Lowered, read: &EnvReads, now: &[(String, String)]) -> Option<EnvMoved> {
+pub(crate) fn env_moved(
+    lowered: &Lowered,
+    read: &EnvReads,
+    now: &[(String, String)],
+) -> Option<EnvMoved> {
     lowered.env_moved(now).or_else(|| read.moved(now))
 }
 
@@ -408,7 +505,8 @@ pub(crate) fn env_moved(lowered: &Lowered, read: &EnvReads, now: &[(String, Stri
 /// the name, would let whoever holds the build history try every short secret against it.
 fn env_miss(kept: &KeptLowered, moved: &EnvMoved) -> blaze_kernel::Miss {
     let (was, now) = env_seen(moved);
-    let read = base_db::process_env_reads(kept.lowered.db()).len() + kept.session.env_read().names().count();
+    let read = base_db::process_env_reads(kept.lowered.db()).len()
+        + kept.session.env_read().names().count();
     blaze_kernel::Miss {
         step: "front end",
         subject: ContentId::of("blaze v2 front end subject 1", kept.root.as_bytes()),
@@ -451,7 +549,19 @@ fn env_seen(moved: &EnvMoved) -> (blaze_kernel::Seen, blaze_kernel::Seen) {
 /// The first part of two plans' units that differs, by name. Every field is named, so one
 /// added to [`Units`] is named here too.
 fn units_differ(kept: &Units, now: &Units) -> &'static str {
-    let Units { graph, plans, packages, lock, warnings, target_dir, build_dir, finished, link_dirs, sandboxed_tests } = kept;
+    let Units {
+        graph,
+        plans,
+        packages,
+        lock,
+        warnings,
+        target_dir,
+        build_dir,
+        finished,
+        link_dirs,
+        sandboxed_tests,
+        native,
+    } = kept;
     if graph != &now.graph {
         "the unit graph"
     } else if plans != &now.plans {
@@ -472,6 +582,8 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the build-script link directories"
     } else if sandboxed_tests != &now.sandboxed_tests {
         "whether tests run sandboxed"
+    } else if native != &now.native {
+        "the pinned native inputs"
     } else {
         "nothing compared"
     }
@@ -484,8 +596,12 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
 fn let_go(kept: KeptLowered, why: &str, variable: Option<&str>) {
     let checkout = kept.root.as_str();
     let variable = variable.unwrap_or("");
-    let _span = tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable).entered();
-    eprintln!("blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}");
+    let _span =
+        tracing::info_span!(target: "blaze", "kept front end let go", checkout, why, variable)
+            .entered();
+    eprintln!(
+        "blaze serve: the kept front end of {checkout} is let go, and its build lowers anew: {why}"
+    );
     drop(kept);
 }
 
@@ -496,9 +612,13 @@ fn let_go(kept: KeptLowered, why: &str, variable: Option<&str>) {
 /// file, never a whole parse in its place.
 fn seed(db: &base_db::Db, seeds: &[blaze_intent::Seed]) -> Result<(), blaze_lower::LowerError> {
     for it in seeds {
-        if !base_db::EditionedFileId::new(db, it.file, it.edition).seed_parse(db, it.content, &it.parse) {
+        if !base_db::EditionedFileId::new(db, it.file, it.edition)
+            .seed_parse(db, it.content, &it.parse)
+        {
             // alloc: an error path.
-            let at = db.path_for_file(it.file).map_or_else(|| format!("{:?}", it.file), |path| path.to_string());
+            let at = db
+                .path_for_file(it.file)
+                .map_or_else(|| format!("{:?}", it.file), |path| path.to_string());
             let what = format!(
                 "the edit's parse of the file was not taken (its text is not {}, or it was parsed first): it would be parsed again whole",
                 it.content
@@ -519,7 +639,12 @@ fn lower_error(error: blaze_lower::LowerError) -> ApiError {
 /// and build scripts' runs before any answer that reads its def maps unbuilt is posted
 /// (`Jobs::next`, `reads_front_unbuilt`): an error here is a unit that order left out, never a
 /// read of a half-expanded crate. The one check every such answer makes.
-pub(crate) fn answer_macros_built(db: &Db, krate: base_db::Crate, target: &str, work: &str) -> Result<(), Failed> {
+pub(crate) fn answer_macros_built(
+    db: &Db,
+    krate: base_db::Crate,
+    target: &str,
+    work: &str,
+) -> Result<(), Failed> {
     blaze_items::macros_built(db, krate).map_err(|pending| {
         Failed::Error(ApiError::new(
             // alloc: error path
@@ -616,7 +741,9 @@ impl UnitReader {
             .map(|(&file, path)| (blaze_diagnostics::Files::relative(path, root), file))
             .filter(|(name, _)| names.iter().any(|it| blaze_diagnostics::emit::shown(it) == *name))
             // alloc: the few names of a unit's diagnostics
-            .map(|(name, file)| (blaze_diagnostics::Files::of_text(db, file, name.to_owned()), file))
+            .map(|(name, file)| {
+                (blaze_diagnostics::Files::of_text(db, file, name.to_owned()), file)
+            })
             .filter(|(name, _)| names.contains(&name.as_str()))
             .collect(); // alloc: as above
         // The first file of a name by ID, whatever order the map is in.
@@ -628,7 +755,7 @@ impl UnitReader {
                 continue;
             }
             let whole = match name.starts_with('/') {
-                true => name.to_owned(), // alloc: as above
+                true => name.to_owned(),                                   // alloc: as above
                 false => format!("{}/{name}", root.trim_end_matches('/')), // alloc: as above
             };
             let Ok(whole) = base_db::AbsPathBuf::try_from(whole.as_str()) else { continue };
@@ -684,7 +811,8 @@ fn broke_each(into: &mut Vec<Broke>, broke: &Broke, ready: &[u32], itself: bool)
 
 impl Writer<Real> for UnitWriter {
     fn reader(&self) -> Option<UnitReader> {
-        (!self.waiting()).then(|| UnitReader { front: Arc::clone(&self.front), checks: self.session.checks() })
+        (!self.waiting())
+            .then(|| UnitReader { front: Arc::clone(&self.front), checks: self.session.checks() })
     }
 
     fn ran(&mut self, run: usize, ran: Ran) -> Result<(), ApiError> {
@@ -735,9 +863,16 @@ impl Writer<Real> for UnitWriter {
         }
         self.ready.clear();
         // alloc: once an apply, the units it writes, named on its `maintain` span
-        let touched: Vec<u32> = self.macros.iter().map(|(unit, _)| *unit as u32).chain(self.runs.iter().map(|(run, _)| *run as u32)).collect();
-        let trigger_of = touched.iter().map(|&unit| lowered.what(unit as usize)).collect::<Vec<_>>().join(", "); // alloc: as `touched`
-        let trigger = Trigger::of("proc macros loaded and build scripts' runs applied", &trigger_of);
+        let touched: Vec<u32> = self
+            .macros
+            .iter()
+            .map(|(unit, _)| *unit as u32)
+            .chain(self.runs.iter().map(|(run, _)| *run as u32))
+            .collect();
+        let trigger_of =
+            touched.iter().map(|&unit| lowered.what(unit as usize)).collect::<Vec<_>>().join(", "); // alloc: as `touched`
+        let trigger =
+            Trigger::of("proc macros loaded and build scripts' runs applied", &trigger_of);
         // alloc: once an apply, the proc macros it loaded
         let mut loaded: Vec<u32> = Vec::with_capacity(self.macros.len());
         let (waits, ready, broke, macros, runs) =
@@ -748,7 +883,9 @@ impl Writer<Real> for UnitWriter {
         let applied = applying(first, "the proc macros' loads and build scripts' runs", || {
             lowered.batch(trigger, |lowered| {
                 for (unit, macros) in macros.drain(..) {
-                    match applying_fallible(unit, "a proc macro's load", || lowered.macros(unit, macros).map_err(lower_error)) {
+                    match applying_fallible(unit, "a proc macro's load", || {
+                        lowered.macros(unit, macros).map_err(lower_error)
+                    }) {
                         Ok(()) => loaded.push(unit as u32),
                         Err(it) => broke.push(it),
                     }
@@ -780,14 +917,19 @@ impl Writer<Real> for UnitWriter {
         let (job, waits, ready) = (&self.job, &self.waits, &self.ready);
         let mut written = harness::reached(job, waits, &loaded, ready);
         if let Some(&first) = written.first() {
-            match applying(first as usize, "the harness", || harness::write(lowered, job, written.iter().copied())) {
+            match applying(first as usize, "the harness", || {
+                harness::write(lowered, job, written.iter().copied())
+            }) {
                 Ok(Ok(())) => {}
                 // A root that can't be made is its unit's alone ([`harness::write`]): that unit
                 // is refused, and what depends on it, naming it; every other unit's harness was
                 // written, and it goes on.
                 Ok(Err(refused)) => {
                     for (unit, error) in refused {
-                        self.broke.push(Broke { itself: true, ..Broke::failed(unit, "the harness", error) });
+                        self.broke.push(Broke {
+                            itself: true,
+                            ..Broke::failed(unit, "the harness", error)
+                        });
                         written.retain(|&it| it as usize != unit);
                         self.ready.retain(|&it| it as usize != unit);
                     }
@@ -812,7 +954,9 @@ impl Writer<Real> for UnitWriter {
         // without keep-going, naming the units it served; no unit is built over it.
         if let Some(&first) = written.first() {
             let (job, session, kept) = (&self.job, &mut self.session, &mut self.deps);
-            let served = applying(first as usize, "serving dependencies", || deps::serve(lowered, job, &written, session, kept));
+            let served = applying(first as usize, "serving dependencies", || {
+                deps::serve(lowered, job, &written, session, kept)
+            });
             let failed = match served {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(error),
@@ -820,7 +964,11 @@ impl Writer<Real> for UnitWriter {
             };
             if let Some(error) = failed {
                 self.broken = true;
-                let units = written.iter().map(|&it| lowered.what(it as usize)).collect::<Vec<_>>().join(", "); // alloc: an error, once
+                let units = written
+                    .iter()
+                    .map(|&it| lowered.what(it as usize))
+                    .collect::<Vec<_>>()
+                    .join(", "); // alloc: an error, once
                 let at = error.at.as_deref().map(|at| format!(" at {at}")).unwrap_or_default(); // alloc: an error, once
                 let what = format!(
                     "serving from the store the dependencies of {units}, which a batch of build scripts' runs and \
@@ -842,22 +990,32 @@ impl Writer<Real> for UnitWriter {
 
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed> {
         let Some(lowered) = Arc::get_mut(&mut self.front) else {
-            let what = "the front end's tables are measured with no task reading it, and one still does";
+            let what =
+                "the front end's tables are measured with no task reading it, and one still does";
             return Err(ApiError::new(what, None).into());
         };
         cancellable(|| lowered.tables())
     }
 
-    fn finished(&mut self, ok: bool, built: &[u32]) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
+    fn finished(
+        &mut self,
+        ok: bool,
+        built: &[u32],
+    ) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
         self.deps.as_ref().map_or(Ok(()), deps::differences)?;
         deps::item_errors(&self.session)?;
-        let mut said: Vec<blaze_api::Diagnostic> = codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect();
+        let mut said: Vec<blaze_api::Diagnostic> =
+            codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect();
         said.extend(configs::report(&self.job, self.reader(), ok, built)?);
         Ok(said)
     }
 
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
         deps::served(self.front.db(), &self.job, &self.session)
+    }
+
+    fn ran(&self) -> blaze_query::db::Taken {
+        blaze_query::db::take_log_in(self.front.db())
     }
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
@@ -873,7 +1031,10 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
         }
-        // The build is over: what its finished crates keep goes before the front end is kept.
+        // The build is over: what its finished crates keep goes before the front end is kept,
+        // and every MIR it made, of a check as of any build, so the kept front end holds none
+        // of it into the next build (a check's MIR, kept, grew the heap by every check).
+        self.release.end();
         if let Some(lowered) = Arc::get_mut(&mut self.front) {
             self.release.release(lowered);
         }
@@ -885,7 +1046,8 @@ impl Writer<Real> for UnitWriter {
         let later = std::mem::take(&mut *job.later.lock());
         let seeds = std::mem::take(&mut *job.seeds.lock());
         // alloc: once per front end kept, every entry its units' builds used
-        let used: Vec<ContentId> = job.memo_used.iter().filter_map(|it| it.get()).flatten().copied().collect();
+        let used: Vec<ContentId> =
+            job.memo_used.iter().filter_map(|it| it.get()).flatten().copied().collect();
         let memo = Some(job.shared.memos.hold(used));
         Ok(KeptLowered {
             session,
@@ -945,7 +1107,8 @@ impl<T> Held<T> {
 
 /// Drops `it` inside a catch: the panic, if the drop panics.
 fn dropped<T>(it: T) -> Result<(), super::plane::Panic> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(it))).map_err(|payload| super::plane::panicked(&*payload))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(it)))
+        .map_err(|payload| super::plane::panicked(&*payload))
 }
 
 impl<T> std::ops::Deref for Held<T> {
@@ -985,15 +1148,21 @@ fn identify(lowered: &mut Lowered, job: &Job, unit: u32) {
 
 /// Every file under the library's `dir`, by its path from there. A link is its target's bytes:
 /// the library's digest (`library::digest_of`) was checked when it was found or fetched.
-fn library_files(dir: &std::path::Path, prefix: &str, into: &mut Vec<SourceFile>) -> Result<(), String> {
+fn library_files(
+    dir: &std::path::Path,
+    prefix: &str,
+    into: &mut Vec<SourceFile>,
+) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
         let full = entry.path();
         let name = entry.file_name();
-        let name = name.to_str().ok_or_else(|| format!("{}: a name that is not UTF-8", full.display()))?;
+        let name =
+            name.to_str().ok_or_else(|| format!("{}: a name that is not UTF-8", full.display()))?;
         let path = if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") };
-        let meta = std::fs::metadata(&full).map_err(|error| format!("{}: {error}", full.display()))?;
+        let meta =
+            std::fs::metadata(&full).map_err(|error| format!("{}: {error}", full.display()))?;
         if meta.is_dir() {
             library_files(&full, &path, into)?;
             continue;
@@ -1011,18 +1180,25 @@ fn library_files(dir: &std::path::Path, prefix: &str, into: &mut Vec<SourceFile>
 
 /// Every file under the library's `dir` as [`library_files`] reads it, but looked at only:
 /// its path, size, time of its last change and whether it is executable, in name order.
-fn library_fingerprint(dir: &std::path::Path, prefix: &str, into: &mut blaze_ids::Hasher) -> Result<(), String> {
+fn library_fingerprint(
+    dir: &std::path::Path,
+    prefix: &str,
+    into: &mut blaze_ids::Hasher,
+) -> Result<(), String> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
         let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
         let name = entry.file_name();
-        let name = name.to_str().ok_or_else(|| format!("{}: a name that is not UTF-8", entry.path().display()))?;
+        let name = name
+            .to_str()
+            .ok_or_else(|| format!("{}: a name that is not UTF-8", entry.path().display()))?;
         entries.push((name.to_owned(), entry.path()));
     }
     blaze_ids::names::sort_by_name(&mut entries, |it| it.0.as_bytes());
     for (name, full) in entries {
         let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
-        let meta = std::fs::metadata(&full).map_err(|error| format!("{}: {error}", full.display()))?;
+        let meta =
+            std::fs::metadata(&full).map_err(|error| format!("{}: {error}", full.display()))?;
         if meta.is_dir() {
             library_fingerprint(&full, &path, into)?;
             continue;
@@ -1056,7 +1232,8 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
     match caught {
         Ok(it) => Ok(it),
         Err(payload) => {
-            if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
+            if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>()
+            {
                 Err(Failed::Again)
             } else if let Some(it) = hir_def::nameres::stopped(&*payload) {
                 Err(Failed::Error(ApiError::new(it, None)))
@@ -1069,7 +1246,10 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
 
 /// One job's front: its units lowered, and what its build scripts and compiles found that
 /// later units read.
-#[expect(clippy::disallowed_types, reason = "a job's slots, one per unit, each set once by the unit's task: per job, not global")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a job's slots, one per unit, each set once by the unit's task: per job, not global"
+)]
 pub(crate) struct Job {
     pub(crate) input: JobInput,
     /// Each unit's crate in the front end.
@@ -1146,11 +1326,21 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    fn new(input: JobInput, crates: Arc<Crates>, shared: Arc<Shared>, held: Option<memo::Held>) -> Result<Job, ApiError> {
+    fn new(
+        input: JobInput,
+        crates: Arc<Crates>,
+        shared: Arc<Shared>,
+        held: Option<memo::Held>,
+    ) -> Result<Job, ApiError> {
         let memo = shared.memos.for_job();
         let graph = graph::Graph::new(&input.units)?;
         let config = &input.config;
-        let mounted = Arc::new(files::Mounted::new(input.files.clone(), input.root, &config.mounts, &config.invocation.root));
+        let mounted = Arc::new(files::Mounted::new(
+            input.files.clone(),
+            input.root,
+            &config.mounts,
+            &config.invocation.root,
+        ));
         let slots = graph.len();
         Ok(Job {
             input,
@@ -1217,7 +1407,10 @@ impl Job {
             .ok_or_else(|| ApiError::new(format!("the build has no plan of unit {unit}"), None))
     }
 
-    pub(crate) fn package(&self, unit: &Unit) -> Result<&blaze_units::query::PackagePlan, ApiError> {
+    pub(crate) fn package(
+        &self,
+        unit: &Unit,
+    ) -> Result<&blaze_units::query::PackagePlan, ApiError> {
         package_of(self.units(), unit)
     }
 
@@ -1226,11 +1419,13 @@ impl Job {
     pub(crate) fn unit_of(&self, at: usize) -> Result<UnitOf, ApiError> {
         let unit = self.unit(at)?;
         let package = self.package(unit)?;
-        let id = u32::try_from(at)
-            .map_err(|_| ApiError::new(format!("unit {at} is past the 2^32 units a request can name"), None))?;
+        let id = u32::try_from(at).map_err(|_| {
+            ApiError::new(format!("unit {at} is past the 2^32 units a request can name"), None)
+        })?;
         Ok(UnitOf {
             id,
-            test: matches!(unit.mode, Mode::Test) || (matches!(unit.mode, Mode::Check) && unit.checked_as_test),
+            test: matches!(unit.mode, Mode::Test)
+                || (matches!(unit.mode, Mode::Check) && unit.checked_as_test),
             doctest: matches!(unit.mode, Mode::Doctest),
             package_id: unit.pkg_id.clone(),
             manifest_path: package.manifest_path.clone(),
@@ -1271,7 +1466,10 @@ pub(crate) fn package_of<'a>(
 pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
     let target = &unit.target;
     let Some(first) = target.kind.first() else {
-        return Err(ApiError::new(format!("target `{}` has no kind in cargo's unit graph", target.name), None));
+        return Err(ApiError::new(
+            format!("target `{}` has no kind in cargo's unit graph", target.name),
+            None,
+        ));
     };
     let kind = TargetKind::named(first).unwrap_or(TargetKind::Lib);
     let crate_types = target
@@ -1280,7 +1478,13 @@ pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
         .map(|word| {
             CrateType::named(word).ok_or_else(|| {
                 // alloc: error path
-                ApiError::new(format!("target `{}` has the crate type `{word}`, which rustc doesn't know", target.name), None)
+                ApiError::new(
+                    format!(
+                        "target `{}` has the crate type `{word}`, which rustc doesn't know",
+                        target.name
+                    ),
+                    None,
+                )
             })
         })
         .collect::<Result<_, _>>()?;
@@ -1325,10 +1529,16 @@ pub(crate) fn phases(goal: Goal, unit: &Unit) -> &'static [Phase] {
 /// platform has the same key in every build and daemon.
 pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key> {
     // A wasm proc macro's units run in the macro host, never as a program of the client's.
-    if unit.target.is_custom_build() || unit.macro_wasm || !matches!(unit.mode, Mode::Build | Mode::Test) {
+    if unit.target.is_custom_build()
+        || unit.macro_wasm
+        || !matches!(unit.mode, Mode::Build | Mode::Test)
+    {
         return None;
     }
-    if !matches!(codegen::makes(unit), Ok(codegen::Makes::Executable | codegen::Makes::Shared { proc_macro: false })) {
+    if !matches!(
+        codegen::makes(unit),
+        Ok(codegen::Makes::Executable | codegen::Makes::Shared { proc_macro: false })
+    ) {
         return None;
     }
     let mut hasher = blaze_ids::Hasher::new("blaze v2 program build 2");
@@ -1354,7 +1564,11 @@ pub(crate) fn cost_key(unit: &Unit, phase: Option<Phase>) -> blaze_graph::Key {
     for part in parts.into_iter().chain(unit.target.kind.iter().map(String::as_str)) {
         hasher.update(&(part.len() as u64).to_le_bytes()).update(part.as_bytes());
     }
-    hasher.update(&[unit.mode as u8, u8::from(unit.macro_wasm), phase.map_or(u8::MAX, |it| it as u8)]);
+    hasher.update(&[
+        unit.mode as u8,
+        u8::from(unit.macro_wasm),
+        phase.map_or(u8::MAX, |it| it as u8),
+    ]);
     blaze_graph::Key(hasher.finish().0)
 }
 
@@ -1370,10 +1584,16 @@ const SOURCE_ENTRIES: usize = 50_000;
 /// prediction only, never an input of what is built: a directory that can't be read counts
 /// 0, and 0 in all predicts the unit as [`plane::Plane::push_learned`] does. `seen` keeps each
 /// directory's count for the build, so a package's many units read it once.
-pub(crate) fn source_bytes(unit: &Unit, seen: &mut blaze_hash::HashMap<PathBuf, u64, std::alloc::Global>) -> u64 {
+pub(crate) fn source_bytes(
+    unit: &Unit,
+    seen: &mut blaze_hash::HashMap<PathBuf, u64, std::alloc::Global>,
+) -> u64 {
     let root = unit.target.src_path.as_path();
     let Some(dir) = root.parent() else { return 0 };
-    let modules_beside = matches!(root.file_name().and_then(|it| it.to_str()), Some("lib.rs" | "main.rs" | "mod.rs"));
+    let modules_beside = matches!(
+        root.file_name().and_then(|it| it.to_str()),
+        Some("lib.rs" | "main.rs" | "mod.rs")
+    );
     if modules_beside {
         return dir_source_bytes(dir, seen);
     }
@@ -1385,7 +1605,10 @@ pub(crate) fn source_bytes(unit: &Unit, seen: &mut blaze_hash::HashMap<PathBuf, 
 
 /// The bytes of every `.rs` file under `dir`, at most [`SOURCE_ENTRIES`] entries read; once a
 /// build per directory, through `seen`.
-fn dir_source_bytes(dir: &std::path::Path, seen: &mut blaze_hash::HashMap<PathBuf, u64, std::alloc::Global>) -> u64 {
+fn dir_source_bytes(
+    dir: &std::path::Path,
+    seen: &mut blaze_hash::HashMap<PathBuf, u64, std::alloc::Global>,
+) -> u64 {
     if let Some(&bytes) = seen.get(dir) {
         return bytes;
     }
@@ -1427,7 +1650,13 @@ impl Front<Real> for JobFront {
         }
     }
 
-    fn compile(&self, reader: UnitReader, unit: usize, phase: Phase, images: &mut Vec<Image<Real>>) -> Result<Option<Compiled>, Failed> {
+    fn compile(
+        &self,
+        reader: UnitReader,
+        unit: usize,
+        phase: Phase,
+        images: &mut Vec<Image<Real>>,
+    ) -> Result<Option<Compiled>, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
@@ -1442,11 +1671,20 @@ impl Front<Real> for JobFront {
         script::start(&self.0, unit, tags).map(UnitRuns::Script)
     }
 
-    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<UnitRuns, ApiError> {
+    fn tests(
+        &self,
+        built: &[Artifact],
+        selection: Selection<'_>,
+        tags: u64,
+    ) -> Result<UnitRuns, ApiError> {
         test::start(&self.0, built, selection, tags).map(UnitRuns::Tests)
     }
 
-    fn ub_tests(&self, reader: UnitReader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+    fn ub_tests(
+        &self,
+        reader: UnitReader,
+        selection: Selection<'_>,
+    ) -> Result<Vec<String>, Failed> {
         cancellable(|| test::ub_tests(&self.0, &reader, selection))?
     }
 
@@ -1480,7 +1718,11 @@ impl Front<Real> for JobFront {
         cancellable(|| reach::reach(&from.0, before.db(), &self.0, after.db(), changes))?
     }
 
-    fn edit(&self, reader: UnitReader, edits: &[blaze_api::Edit]) -> Result<blaze_api::Edited, Failed> {
+    fn edit(
+        &self,
+        reader: UnitReader,
+        edits: &[blaze_api::Edit],
+    ) -> Result<blaze_api::Edited, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
@@ -1500,7 +1742,11 @@ impl Front<Real> for JobFront {
         cancellable(|| compile::codegen_inputs(&self.0))?
     }
 
-    fn tables(&self, mut writer: UnitWriter, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
+    fn tables(
+        &self,
+        mut writer: UnitWriter,
+        images: &[(&'static str, u64, u64)],
+    ) -> Result<Vec<Table>, Failed> {
         let mut counted = writer.tables()?;
         counted.extend_from_slice(images);
         Ok(summed(counted))
@@ -1521,16 +1767,23 @@ impl Front<Real> for JobFront {
         cancellable(|| pack::pack(&self.0, lowered, program))?.map_err(Failed::Error)
     }
 
-    fn doc(&self, mut writer: UnitWriter, no_deps: bool, private: bool) -> Result<Vec<Response>, Failed> {
+    fn doc(
+        &self,
+        mut writer: UnitWriter,
+        no_deps: bool,
+        private: bool,
+    ) -> Result<Vec<Response>, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
         if !writer.apply()? {
-            let what = "the documentation is made with no task reading the front end, and one still does";
+            let what =
+                "the documentation is made with no task reading the front end, and one still does";
             return Err(ApiError::new(what, None).into());
         }
         let Some(lowered) = Arc::get_mut(&mut writer.front) else {
-            let what = "the documentation is made with no task reading the front end, and one still does";
+            let what =
+                "the documentation is made with no task reading the front end, and one still does";
             return Err(ApiError::new(what, None).into());
         };
         cancellable(|| doc::doc(&self.0, lowered, no_deps, private))?.map_err(Failed::Error)

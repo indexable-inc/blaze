@@ -30,8 +30,8 @@ pub use text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
 pub use self::storage::{
-    IndexTable, SubtreeBuilderRestorePoint, TopSubtree, aligned, TopSubtreeBuilder, Tree, TreeWords, ViewWords,
-    WireError, WireLimits, WirePart,
+    IndexTable, SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder, Tree, TreeWords,
+    ViewWords, WireError, WireLimits, WirePart, aligned,
 };
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;
@@ -320,10 +320,20 @@ impl<'a> TokenTreesView<'a> {
 /// A token as [`TokenTreesView::for_each_token`] gives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlatToken {
-    Punct { char: char, spacing: Spacing },
-    Ident { sym: Symbol, is_raw: IdentIsRaw },
+    Punct {
+        char: char,
+        spacing: Spacing,
+    },
+    Ident {
+        sym: Symbol,
+        is_raw: IdentIsRaw,
+    },
     /// `sym` is the text then the suffix, its last `suffix_len` bytes.
-    Literal { sym: Symbol, kind: LitKind, suffix_len: u32 },
+    Literal {
+        sym: Symbol,
+        kind: LitKind,
+        suffix_len: u32,
+    },
     Open(DelimiterKind),
     Close(DelimiterKind),
 }

@@ -101,7 +101,10 @@ const BODY_SCHEMA: SchemaHash = schema_of(&[
     SchemaPart::Schema(<BodyRoot as Record>::SCHEMA),
 ]);
 
-#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback of every read, which hands it the error by value"
+)]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason of a refusal or a panic
     error.to_string()
@@ -213,7 +216,8 @@ fn body<'db>(
 ) -> R<Vec<u8>> {
     let result = InferenceResult::of(db, def);
     let mut table = Table::default();
-    let record = ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
+    let record =
+        ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
     let mut locs = TyTableWriter::new(interner);
     let words = ids::write(db, krate, &mut table, &mut locs, items)?;
 
@@ -330,7 +334,9 @@ impl<'a> PartRef<'a> {
         let at = self.left.binary_search(key).ok()?;
         let start = at.checked_sub(1).map_or(0, |it| self.left_ends[it] as usize);
         let end = self.left_ends[at] as usize;
-        Some(self.left_why.get(start..end).and_then(|it| std::str::from_utf8(it).ok()).unwrap_or(""))
+        Some(
+            self.left_why.get(start..end).and_then(|it| std::str::from_utf8(it).ok()).unwrap_or(""),
+        )
     }
 
     /// How many bodies the part has.

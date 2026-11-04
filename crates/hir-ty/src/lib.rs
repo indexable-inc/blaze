@@ -23,8 +23,8 @@ pub mod intrinsic;
 mod lower;
 pub mod next_solver;
 mod opaques;
-pub mod rpitit;
 mod representability;
+pub mod rpitit;
 mod specialization;
 mod target_feature;
 pub mod utils;
@@ -68,7 +68,6 @@ use std::{hash::Hash, ops::ControlFlow};
 
 use base_db::Db;
 use blaze_hash::{FixedState, HashMap, HashSet};
-use std::alloc::Global;
 use blaze_mem::Frame;
 use hir_def::{
     CallableDefId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
@@ -87,6 +86,7 @@ use rustc_type_ir::{
     BoundVarIndexKind, TypeSuperVisitable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
 };
+use std::alloc::Global;
 use stdx::impl_from;
 use traits::FnTrait;
 
@@ -118,9 +118,9 @@ pub use infer::{
 };
 pub use lower::{
     ElidedGroups, ElidedLifetimes, ElidedOutput, FieldType, FieldTypes, GenericDefaults,
-    GenericDefaultsRef, GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, Lowered, LoweringMode,
-    PredicateSource, SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringResult,
-    ValueTyDefId,
+    GenericDefaultsRef, GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, Lowered,
+    LoweringMode, PredicateSource, SelfAndAssocBounds, TyDefId, TyLoweringContext,
+    TyLoweringResult, ValueTyDefId,
     batch::{
         Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
     },
@@ -312,7 +312,11 @@ const _: () = assert!(size_of::<Extent>() == 2 * size_of::<usize>());
 
 impl MemoryPieces {
     /// Pieces from their columns: `addresses` strictly increasing, each extent in `bytes`.
-    pub(crate) fn from_columns(bytes: Vec<u8>, addresses: Vec<usize>, extents: Vec<Extent>) -> Self {
+    pub(crate) fn from_columns(
+        bytes: Vec<u8>,
+        addresses: Vec<usize>,
+        extents: Vec<Extent>,
+    ) -> Self {
         debug_assert!(addresses.is_sorted_by(|a, b| a < b) && addresses.len() == extents.len());
         debug_assert!(extents.iter().all(|it| it.start + it.len <= bytes.len()));
         let longest = extents.iter().map(|it| it.len).max().unwrap_or(0);
@@ -369,7 +373,8 @@ impl MemoryPieces {
             Ok(at) => return Some((address, self.piece(at))),
             Err(end) => end,
         };
-        let first = self.addresses[..end].partition_point(|&it| it.saturating_add(self.longest) <= address);
+        let first =
+            self.addresses[..end].partition_point(|&it| it.saturating_add(self.longest) <= address);
         (first..end)
             .find(|&index| address - self.addresses[index] < self.extents[index].len)
             .map(|index| (self.addresses[index], self.piece(index)))
@@ -381,7 +386,8 @@ impl MemoryPieces {
     /// into; this finds that memory.
     fn around(&self, address: usize) -> Option<(usize, &[u8])> {
         let end = self.addresses.partition_point(|&it| it <= address);
-        let first = self.addresses[..end].partition_point(|&it| it.saturating_add(self.longest) < address);
+        let first =
+            self.addresses[..end].partition_point(|&it| it.saturating_add(self.longest) < address);
         (first..end)
             .find(|&index| {
                 let len = self.extents[index].len;
@@ -643,8 +649,7 @@ impl<'db> MemoryMap<'db> {
                 map
             }),
             MemoryMap::Complex(cm) => {
-                let mut map =
-                    HashMap::with_capacity_in(cm.memory.len(), Global);
+                let mut map = HashMap::with_capacity_in(cm.memory.len(), Global);
                 for (addr, val) in cm.memory.iter() {
                     let (addr, new) = transform((addr, val))?;
                     map.insert(addr, new);
@@ -725,7 +730,10 @@ mod memory_map_tests {
             assert_ne!(hash(&a), hash(&other));
         }
         // The same bytes split differently are other pieces.
-        assert_ne!(hash(&pieces(&[(0, &[1]), (1, &[2, 3])])), hash(&pieces(&[(0, &[1, 2]), (1, &[3])])));
+        assert_ne!(
+            hash(&pieces(&[(0, &[1]), (1, &[2, 3])])),
+            hash(&pieces(&[(0, &[1, 2]), (1, &[3])]))
+        );
     }
 
     #[test]
@@ -779,7 +787,10 @@ mod memory_map_tests {
         assert_eq!(map, other);
         assert_eq!(hash(&map), hash(&other));
         let addresses: HashMap<usize, usize, Global> = map
-            .transform_addresses(|| "the test's map".to_owned(), |bytes, align| Ok(bytes.len() * 1000 + align))
+            .transform_addresses(
+                || "the test's map".to_owned(),
+                |bytes, align| Ok(bytes.len() * 1000 + align),
+            )
             .unwrap();
         assert_eq!(addresses.get(&64), Some(&8008));
     }
@@ -797,7 +808,10 @@ mod memory_map_tests {
         assert_ne!(empty, with_static);
         assert_ne!(hash(&empty), hash(&with_static));
         assert_ne!(hash(&MemoryMap::Empty), hash(&MemoryMap::simple(Box::new([0u8; 0]))));
-        assert_ne!(hash(&MemoryMap::simple(Box::new([1u8]))), hash(&MemoryMap::simple(Box::new([2u8]))));
+        assert_ne!(
+            hash(&MemoryMap::simple(Box::new([1u8]))),
+            hash(&MemoryMap::simple(Box::new([2u8])))
+        );
     }
 
     #[test]
@@ -1166,7 +1180,16 @@ impl Span {
 
 /// A [`DefWithBodyId`], or an anon const.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_query::Supertype, blaze_query::Value,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    blaze_query::Supertype,
+    blaze_query::Value,
 )]
 pub enum InferBodyId<'db> {
     DefWithBodyId(DefWithBodyId),

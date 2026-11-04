@@ -15,8 +15,8 @@ use blaze_bytes::{Bytes, le::get_u32 as u32_at};
 pub use syntax_tree::ImageError;
 
 use crate::{
-    Edition, FlatTree, Parse, RustLanguage, SourceFile, SyntaxError, SyntaxKind, Text,
-    TextRange, TextSize, Tree, parsing,
+    Edition, FlatTree, Parse, RustLanguage, SourceFile, SyntaxError, SyntaxKind, Text, TextRange,
+    TextSize, Tree, parsing,
 };
 
 /// What a stored tree depends on besides its text, its edition and the tree record's layout

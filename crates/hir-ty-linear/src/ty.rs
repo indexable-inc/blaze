@@ -10,15 +10,12 @@
 
 use base_db::Db;
 use blaze_mem::Frame;
-use hir_def::{
-    AdtId, AttrDefId, HasModule, VariantId,
-    attrs::AttrFlags,
-    signatures::StructFlags,
-};
+use hir_def::{AdtId, AttrDefId, HasModule, VariantId, attrs::AttrFlags, signatures::StructFlags};
 use hir_ty::{
-    FrameMap, FrameSet, frame_map, frame_set,
+    FrameMap, FrameSet,
     consteval::try_const_usize,
     db::HirDatabase,
+    frame_map, frame_set,
     layout::{enum_variant_ids, struct_flags},
     next_solver::{AliasTy, AssocTyId, DbInterner, ParamEnv, TermKind, Ty, TyKind},
 };
@@ -75,12 +72,14 @@ impl<'db> Walk<'_, '_, 'db> {
 pub(crate) fn is_marked(db: &Db, ty: Ty<'_>) -> bool {
     match ty.kind() {
         TyKind::Adt(def, _) => is_linear_adt(db, def.def_id()),
-        TyKind::Param(param) => AttrFlags::query_type_or_const_param(db, param.id.into())
-            .contains(AttrFlags::LINEAR),
+        TyKind::Param(param) => {
+            AttrFlags::query_type_or_const_param(db, param.id.into()).contains(AttrFlags::LINEAR)
+        }
         TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) => {
             match def_id.0 {
-                AssocTyId::TypeAliasId(alias) => AttrFlags::query(db, AttrDefId::TypeAliasId(alias))
-                    .contains(AttrFlags::LINEAR),
+                AssocTyId::TypeAliasId(alias) => {
+                    AttrFlags::query(db, AttrDefId::TypeAliasId(alias)).contains(AttrFlags::LINEAR)
+                }
                 // A trait method's `impl Trait` has no attributes of its own.
                 AssocTyId::RpititId(_) => false,
             }
@@ -130,9 +129,7 @@ fn parts<'db>(
         TyKind::Array(element, len) => try_const_usize(db, len) != Some(0) && part(element),
         TyKind::Slice(element) | TyKind::Pat(element, _) => part(element),
         TyKind::Closure(_, args) => part(args.as_closure().tupled_upvars_ty()),
-        TyKind::CoroutineClosure(_, args) => {
-            part(args.as_coroutine_closure().tupled_upvars_ty())
-        }
+        TyKind::CoroutineClosure(_, args) => part(args.as_coroutine_closure().tupled_upvars_ty()),
         TyKind::Coroutine(_, args) => part(args.as_coroutine().tupled_upvars_ty()),
         TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => {
             part(interner.type_of(def_id.into()).instantiate(interner, args).skip_norm_wip())
@@ -158,12 +155,7 @@ pub(crate) struct Types<'a, 'db> {
 }
 
 impl<'a, 'db> Types<'a, 'db> {
-    pub(crate) fn new(
-        db: &'db Db,
-        body: &MirBody<'db>,
-        kind: BodyKind,
-        frame: &'a Frame,
-    ) -> Self {
+    pub(crate) fn new(db: &'db Db, body: &MirBody<'db>, kind: BodyKind, frame: &'a Frame) -> Self {
         let krate = body.owner.krate(db);
         let interner = DbInterner::new_with(db, krate);
         let env = db.trait_environment(body.owner.generic_def(db));
@@ -234,12 +226,16 @@ impl<'a, 'db> Types<'a, 'db> {
             TyKind::FnPtr(sig, _) => {
                 sig.skip_binder().inputs_and_output.iter().any(|it| self.holds(it))
             }
-            TyKind::Closure(_, args) => {
-                args.as_closure().sig().skip_binder().inputs_and_output.iter().any(|it| self.holds(it))
-            }
-            TyKind::Dynamic(predicates, ..) => predicates.projection_bounds().into_iter().any(|it| {
-                matches!(it.skip_binder().term.kind(), TermKind::Ty(it) if self.holds(it))
-            }),
+            TyKind::Closure(_, args) => args
+                .as_closure()
+                .sig()
+                .skip_binder()
+                .inputs_and_output
+                .iter()
+                .any(|it| self.holds(it)),
+            TyKind::Dynamic(predicates, ..) => predicates.projection_bounds().into_iter().any(
+                |it| matches!(it.skip_binder().term.kind(), TermKind::Ty(it) if self.holds(it)),
+            ),
             _ => false,
         }
     }

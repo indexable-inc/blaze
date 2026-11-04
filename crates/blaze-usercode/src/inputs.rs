@@ -41,7 +41,12 @@ pub struct Unreadable {
 
 impl fmt::Display for Unreadable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} is an input of a build script or proc macro and can't be read: {}", self.path.display(), self.error)
+        write!(
+            f,
+            "{} is an input of a build script or proc macro and can't be read: {}",
+            self.path.display(),
+            self.error
+        )
     }
 }
 
@@ -135,13 +140,17 @@ impl Vouched {
             hash[at * 8..at * 8 + 8].copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
         }
         fence(Ordering::Acquire);
-        (self.sequence.load(Ordering::Relaxed) == sequence).then_some((generation, present.then_some(hash)))
+        (self.sequence.load(Ordering::Relaxed) == sequence)
+            .then_some((generation, present.then_some(hash)))
     }
 
     fn write(&self, generation: u64, answer: Option<[u8; 32]>) {
         let sequence = self.sequence.load(Ordering::Relaxed);
         if sequence & 1 == 1
-            || self.sequence.compare_exchange(sequence, sequence + 1, Ordering::Acquire, Ordering::Relaxed).is_err()
+            || self
+                .sequence
+                .compare_exchange(sequence, sequence + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
         {
             return;
         }
@@ -173,7 +182,9 @@ fn canonical(path: &Path, answer: Option<[u8; 32]>) -> bool {
     match answer {
         Some(_) => std::fs::canonicalize(path).is_ok_and(same),
         None => match (path.parent(), path.file_name()) {
-            (Some(parent), Some(name)) => std::fs::canonicalize(parent).is_ok_and(|it| same(it.join(name))),
+            (Some(parent), Some(name)) => {
+                std::fs::canonicalize(parent).is_ok_and(|it| same(it.join(name)))
+            }
             _ => false,
         },
     }
@@ -215,7 +226,10 @@ impl Files {
     }
 
     fn key(path: &Path, stamp: &Stamp) -> ContentId {
-        Hasher::new(crate::trace::os_domain!("blaze v2 disk stamp 1")).part(&os_bytes(path.as_os_str())).part(&stamp.bytes()).finish()
+        Hasher::new(crate::trace::os_domain!("blaze v2 disk stamp 1"))
+            .part(&os_bytes(path.as_os_str()))
+            .part(&stamp.bytes())
+            .finish()
     }
 
     fn file(&self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
@@ -270,7 +284,8 @@ impl Files {
     /// What `path` hashes as on the disk now, and whether that held while it was looked at.
     fn look(&self, path: &Path) -> Result<(Option<[u8; 32]>, bool), Unreadable> {
         // alloc: error path
-        let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
+        let unreadable =
+            |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok((None, true)),
@@ -309,7 +324,8 @@ impl Files {
         // alloc: error path
         let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
         // alloc: error path
-        let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
+        let unreadable =
+            |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         if path.file_name().is_some_and(|it| it.to_str().is_none()) {
             return Err(refused("its name is not UTF-8, which no view holds"));
         }
@@ -325,17 +341,23 @@ impl Files {
         if kind.is_symlink() {
             let target = std::fs::read_link(path).map_err(unreadable)?;
             #[cfg(unix)]
-            let id = ContentId::of(blaze_vfs::FILE_DOMAIN, std::os::unix::ffi::OsStrExt::as_bytes(target.as_os_str()));
+            let id = ContentId::of(
+                blaze_vfs::FILE_DOMAIN,
+                std::os::unix::ffi::OsStrExt::as_bytes(target.as_os_str()),
+            );
             #[cfg(not(unix))]
             let id = {
-                let target = target.to_str().ok_or_else(|| refused("its link's target is not UTF-8"))?;
+                let target =
+                    target.to_str().ok_or_else(|| refused("its link's target is not UTF-8"))?;
                 // alloc: a link off Unix, its target with `/` for each `\`, as a view has it.
                 ContentId::of(blaze_vfs::FILE_DOMAIN, target.replace('\\', "/").as_bytes())
             };
             return Ok(Entry::File(id, blaze_vfs::Mode::Symlink));
         }
         if !kind.is_file() {
-            return Err(refused("it is neither a file, a directory nor a link, which no view holds"));
+            return Err(refused(
+                "it is neither a file, a directory nor a link, which no view holds",
+            ));
         }
         #[cfg(unix)]
         let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
@@ -464,7 +486,8 @@ impl Inputs for Now<'_> {
 
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
         // alloc: error path
-        let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
+        let unreadable =
+            |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if missing(&error) => return Ok(false),
@@ -579,7 +602,8 @@ fn in_view<R>(root: &Path, path: &Path, f: impl FnOnce(Option<&str>) -> R) -> R 
     let Ok(rest) = path.strip_prefix(root) else { return f(None) };
     let named = |text: &str| {
         text.is_empty()
-            || (std::path::MAIN_SEPARATOR == '/' && text.split('/').all(|part| !matches!(part, "" | "." | "..")))
+            || (std::path::MAIN_SEPARATOR == '/'
+                && text.split('/').all(|part| !matches!(part, "" | "." | "..")))
     };
     if let Some(text) = rest.to_str()
         && named(text)
@@ -617,7 +641,10 @@ impl Inputs for ViewInputs<'_, '_> {
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ViewError> {
         in_view(self.root, path, |name| match name {
             None => Ok(self.now.dir(path)?),
-            Some(name) => Ok(self.cx.dir(name)?.map(|entries| listing(entries.iter().map(|it| OsStr::new(&it.0))))),
+            Some(name) => Ok(self
+                .cx
+                .dir(name)?
+                .map(|entries| listing(entries.iter().map(|it| OsStr::new(&it.0))))),
         })
     }
 
@@ -681,10 +708,7 @@ mod tests {
         assert_eq!(disk.file(&dir.join("sub")).unwrap(), Some(DIRECTORY));
         assert_eq!(disk.file(&dir.join("none")).unwrap(), None);
         assert_eq!(disk.file(&dir.join("a/below")).unwrap(), None);
-        assert_eq!(
-            disk.dir(&dir).unwrap(),
-            Some(listing(["a", "sub"].map(OsStr::new)))
-        );
+        assert_eq!(disk.dir(&dir).unwrap(), Some(listing(["a", "sub"].map(OsStr::new))));
         assert_eq!(disk.dir(&dir.join("none")).unwrap(), None);
         std::fs::write(dir.join("a"), b"two, longer").unwrap();
         assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
@@ -694,20 +718,29 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::write(dir.join("secret"), b"x").unwrap();
-            std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0))
+                .unwrap();
             // Root reads it anyway; anyone else is told it can't be read.
             if std::fs::read(dir.join("secret")).is_err() {
                 assert!(disk.file(&dir.join("secret")).is_err());
             }
-            std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
         }
         _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_environment_has_each_name_once_as_getenv_finds_it() {
-        let env = Env::new(vec![("B".into(), "2".into()), ("A".into(), "1".into()), ("B".into(), "3".into())]);
-        let expected = vec![(OsString::from("A"), OsString::from("1")), (OsString::from("B"), OsString::from("2"))];
+        let env = Env::new(vec![
+            ("B".into(), "2".into()),
+            ("A".into(), "1".into()),
+            ("B".into(), "3".into()),
+        ]);
+        let expected = vec![
+            (OsString::from("A"), OsString::from("1")),
+            (OsString::from("B"), OsString::from("2")),
+        ];
         assert_eq!(env.vars(), expected.as_slice());
         assert_eq!(env.get(OsStr::new("B")), Some(OsStr::new("2")));
         assert_eq!(env.get(OsStr::new("C")), None);
@@ -781,11 +814,14 @@ mod tests {
         let files = Files::watched_by(dirs);
         let hash = Some(blaze_ids::b3::hash(b"one"));
         assert_eq!(files.file(&path).unwrap(), hash);
-        let warm = blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path).unwrap());
+        let warm =
+            blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path).unwrap());
         assert_eq!(warm, hash);
         let missing = path.with_file_name("gone");
         assert_eq!(files.file(&missing).unwrap(), None);
-        let warm = blaze_alloc_count::assert_at_most(0, "a warm missing file", || files.file(&missing).unwrap());
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm missing file", || {
+            files.file(&missing).unwrap()
+        });
         assert_eq!(warm, None);
         _ = std::fs::remove_dir_all(&made);
     }
@@ -888,7 +924,9 @@ mod tests {
             let at = dir.join(path);
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
             match mode {
-                Mode::Symlink => std::os::unix::fs::symlink(std::str::from_utf8(bytes).unwrap(), &at).unwrap(),
+                Mode::Symlink => {
+                    std::os::unix::fs::symlink(std::str::from_utf8(bytes).unwrap(), &at).unwrap()
+                }
                 _ => std::fs::write(&at, bytes).unwrap(),
             }
             if *mode == Mode::Executable {
@@ -899,10 +937,15 @@ mod tests {
         for package in [false, true] {
             let (kept, walked) = db.pin().get::<ViewTree>(view, &package).expect("not cancelled");
             assert_eq!(walked, kept, "package {package}: the view walked and its own hash");
-            assert_eq!(disk.tree(&dir, package).unwrap(), Some(kept), "package {package}: the disk and the view");
+            assert_eq!(
+                disk.tree(&dir, package).unwrap(),
+                Some(kept),
+                "package {package}: the disk and the view"
+            );
         }
         let plain = disk.tree(&dir, false).unwrap();
-        std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
         assert_ne!(disk.tree(&dir, false).unwrap(), plain, "the executable bit is in the hash");
         assert_eq!(disk.tree(&dir.join("none"), false).unwrap(), None);
         _ = std::fs::remove_dir_all(&dir);

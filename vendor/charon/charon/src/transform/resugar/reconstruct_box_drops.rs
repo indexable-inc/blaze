@@ -26,12 +26,7 @@ impl UllbcPass for Transform {
     fn transform_body(&self, ctx: &mut TransformCtx, body: &mut ExprBody) {
         let krate: &TranslatedCrate = &ctx.translated;
         for block in &mut body.body {
-            if let TerminatorKind::Call {
-                call,
-                target,
-                on_unwind,
-                ..
-            } = &block.terminator.kind
+            if let TerminatorKind::Call { call, target, on_unwind, .. } = &block.terminator.kind
                 && let FnOperand::Regular(fn_ptr) = &call.func
                 && fn_ptr
                     .as_method_call(krate)
@@ -40,11 +35,7 @@ impl UllbcPass for Transform {
                 && let Some(statement) = block.statements.last()
                 && let StatementKind::Assign(
                     temporary,
-                    Rvalue::Ref {
-                        place,
-                        kind: BorrowKind::Mut,
-                        ..
-                    },
+                    Rvalue::Ref { place, kind: BorrowKind::Mut, .. },
                 ) = &statement.kind
                 && temporary.is_local()
                 && temporary == argument
@@ -54,11 +45,7 @@ impl UllbcPass for Transform {
                 let target = *target;
                 let on_unwind = *on_unwind;
                 block.statements.pop();
-                block.terminator.kind = TerminatorKind::DropEmptyBox {
-                    place,
-                    target,
-                    on_unwind,
-                };
+                block.terminator.kind = TerminatorKind::DropEmptyBox { place, target, on_unwind };
             }
         }
     }

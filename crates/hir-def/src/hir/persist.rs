@@ -24,7 +24,6 @@ use std::ops::{Deref, DerefMut};
 
 use blaze_format::{FormatError, Slice, Str, Writer};
 use blaze_hash::{HashMap, LazyKey};
-use std::alloc::Global;
 use cfg::{CfgAtom, CfgExpr};
 use hir_expand::{
     HirFileId, InFile, MacroCallId,
@@ -34,6 +33,7 @@ use hir_expand::{
 use intern::{Internable, Interned, Symbol};
 use smallvec::SmallVec;
 use span::{Edition, ErasedFileAstId, FileAstId, Span, SpanAnchor, SyntaxContext};
+use std::alloc::Global;
 use syntax::{TextRange, TextSize};
 use thin_vec::ThinVec;
 
@@ -627,7 +627,8 @@ impl<'a> Read<'a> {
     }
 
     pub(crate) fn u32(&mut self) -> Result<u32, FormatError> {
-        let word = *self.words.get(self.next).ok_or(FormatError::OutOfBounds { at: self.here() })?;
+        let word =
+            *self.words.get(self.next).ok_or(FormatError::OutOfBounds { at: self.here() })?;
         self.next += 1;
         Ok(word)
     }
@@ -965,7 +966,9 @@ impl Code for Name {
         }
         match symbol.as_str().as_bytes().first() {
             Some(b'\0') => Err(r.invalid("a keyed name written as its raw symbol")),
-            _ if symbol.as_str().starts_with("r#") => Err(r.invalid("a name written with its `r#`")),
+            _ if symbol.as_str().starts_with("r#") => {
+                Err(r.invalid("a name written with its `r#`"))
+            }
             _ => Ok(Name::new_symbol_root(symbol)),
         }
     }
@@ -1325,7 +1328,8 @@ mod tests {
         let mut out = Writer::new(SCHEMA);
         let placed = w.place(&mut out);
         let at = out.next::<Root>();
-        let root = out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first });
+        let root =
+            out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first });
         let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
         let root = blaze_format::open::<Root>(&buffer).expect("a buffer just written");
         let mut r = Read::new(&root.words, &buffer).from(root.first);
@@ -1346,7 +1350,10 @@ mod tests {
         round_trip(&(true, 7u16, Symbol::intern("sym")));
         round_trip(&ModPath::from_segments(
             PathKind::Super(2),
-            [Name::new_symbol_root(Symbol::intern("a")), Name::new_symbol_root(Symbol::intern("b"))],
+            [
+                Name::new_symbol_root(Symbol::intern("a")),
+                Name::new_symbol_root(Symbol::intern("b")),
+            ],
         ));
         round_trip(&CfgExpr::All(Box::new([
             CfgExpr::Atom(CfgAtom::Flag(Symbol::intern("test"))),
@@ -1380,7 +1387,8 @@ mod tests {
         let mut out = Writer::new(SCHEMA);
         let placed = w.place(&mut out);
         let at = out.next::<Root>();
-        let root = out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first });
+        let root =
+            out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first });
         let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
         let root = blaze_format::open::<Root>(&buffer).expect("a buffer just written");
         let read = |entries: Vec<(Kind, u64)>| {
@@ -1404,7 +1412,8 @@ mod tests {
         let mut out = Writer::new(SCHEMA);
         let placed = w.place(&mut out);
         let at = out.next::<Root>();
-        let root = out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first: 0 });
+        let root =
+            out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first: 0 });
         let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
         let root = blaze_format::open::<Root>(&buffer).unwrap();
         assert!(Read::new(&root.words, &buffer).get::<Vec<u32>>().is_err());
@@ -1415,7 +1424,8 @@ mod tests {
     #[test]
     fn names_are_one_index_per_text_on_warm_words() {
         let texts = ["a", "b", "a", "", "ab", "b", ""];
-        let indices = |w: &mut Words| -> Vec<u32> { texts.iter().map(|text| w.name(text)).collect() };
+        let indices =
+            |w: &mut Words| -> Vec<u32> { texts.iter().map(|text| w.name(text)).collect() };
         let mut cold = Words::new();
         assert_eq!(indices(&mut cold), [0, 1, 0, 2, 3, 1, 2]);
         cold.symbol(&Symbol::intern("ab"));
@@ -1466,7 +1476,8 @@ mod tests {
         let mut out = Writer::new(SCHEMA);
         let placed = w.place(&mut out);
         let at = out.next::<Root>();
-        let root = out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first: 0 });
+        let root =
+            out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first: 0 });
         let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
         let root = blaze_format::open::<Root>(&buffer).unwrap();
         relocating(table, || Read::new(&root.words, &buffer).get::<T>())
@@ -1588,21 +1599,32 @@ mod tests {
                 while waiting.load(Ordering::SeqCst) < count {
                     std::thread::yield_now();
                 }
-                run("the probe", Box::new(|| assert_eq!(scopes_here(), (None, 0), "a job came on in another's scopes")));
+                run(
+                    "the probe",
+                    Box::new(|| {
+                        assert_eq!(scopes_here(), (None, 0), "a job came on in another's scopes")
+                    }),
+                );
             };
             let job = |mine: u32, on: Key| {
-                let (flights, waiting, order, tx) = (flights.clone(), waiting.clone(), order.clone(), tx.clone());
+                let (flights, waiting, order, tx) =
+                    (flights.clone(), waiting.clone(), order.clone(), tx.clone());
                 pool.submit(
                     None,
                     move || {
                         let own = (Some(Some(u64::from(mine) + 100)), mine as usize + 1);
-                        let mut table = Relocation::of(vec![(Kind::Struct, own.0.unwrap().unwrap())]);
-                        let mut blank = Anonymous { blank: vec![own.1 as u16], ..Anonymous::default() };
+                        let mut table =
+                            Relocation::of(vec![(Kind::Struct, own.0.unwrap().unwrap())]);
+                        let mut blank =
+                            Anonymous { blank: vec![own.1 as u16], ..Anonymous::default() };
                         relocating(&mut table, || {
                             anonymous(&mut blank, || {
                                 assert_eq!(scopes_here(), own, "a job came on in another's scopes");
                                 waiting.fetch_add(1, Ordering::SeqCst);
-                                assert_eq!(flights.get_or_run(on, || panic!("the test holds the key")), Ok(round));
+                                assert_eq!(
+                                    flights.get_or_run(on, || panic!("the test holds the key")),
+                                    Ok(round)
+                                );
                                 assert_eq!(scopes_here(), own, "a job resumed in another's scopes");
                             })
                         });
@@ -1610,7 +1632,9 @@ mod tests {
                         order.lock().push(mine);
                         mine
                     },
-                    move |it| _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked"))),
+                    move |it| {
+                        _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked")))
+                    },
                 );
             };
             let held = flights.get_or_run(first, || {
@@ -1632,7 +1656,12 @@ mod tests {
             ended.sort();
             assert_eq!(ended, [Ok(0), Ok(1)]);
             assert_eq!(*order.lock(), [1, 0], "the jobs did not resume in the swapped order");
-            run("a later job", Box::new(|| assert_eq!(scopes_here(), (None, 0), "a job came on in its worker's scopes")));
+            run(
+                "a later job",
+                Box::new(|| {
+                    assert_eq!(scopes_here(), (None, 0), "a job came on in its worker's scopes")
+                }),
+            );
         }
     }
 }

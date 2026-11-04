@@ -75,7 +75,9 @@ impl Mode {
     fn allowed_options(self) -> &'static str {
         match self {
             Mode::RustcOnUnimplemented => RUSTC_DEV_GUIDE,
-            Mode::DiagnosticOnTypeError => "only `note` is allowed as option for `diagnostic::on_type_error`",
+            Mode::DiagnosticOnTypeError => {
+                "only `note` is allowed as option for `diagnostic::on_type_error`"
+            }
             _ => "only `message`, `note` and `label` are allowed as options",
         }
     }
@@ -85,21 +87,30 @@ impl Mode {
             Mode::RustcOnUnimplemented => {
                 "see <https://rustc-dev-guide.rust-lang.org/diagnostics.html#rustc_on_unimplemented> for allowed format arguments"
             }
-            Mode::DiagnosticOnUnimplemented => "only `Self` and generics of the trait are allowed as a format argument",
+            Mode::DiagnosticOnUnimplemented => {
+                "only `Self` and generics of the trait are allowed as a format argument"
+            }
             Mode::DiagnosticOnConst => {
                 "only `Self` and generics of the implementation are allowed as a format argument"
             }
-            Mode::DiagnosticOnMove => "only `this`, `Self` and generics of the type are allowed as a format argument",
-            Mode::DiagnosticOnUnknown => "only `this` is allowed as a format argument, referring to the failed import",
+            Mode::DiagnosticOnMove => {
+                "only `this`, `Self` and generics of the type are allowed as a format argument"
+            }
+            Mode::DiagnosticOnUnknown => {
+                "only `this` is allowed as a format argument, referring to the failed import"
+            }
             Mode::DiagnosticOnUnmatchedArgs => {
                 "only `this` is allowed as a format argument, referring to the macro's name"
             }
-            Mode::DiagnosticOnTypeError => "only `note` is allowed as option for `diagnostic::on_type_error`",
+            Mode::DiagnosticOnTypeError => {
+                "only `note` is allowed as option for `diagnostic::on_type_error`"
+            }
         }
     }
 }
 
-const RUSTC_DEV_GUIDE: &str = "see <https://rustc-dev-guide.rust-lang.org/diagnostics.html#rustc_on_unimplemented>";
+const RUSTC_DEV_GUIDE: &str =
+    "see <https://rustc-dev-guide.rust-lang.org/diagnostics.html#rustc_on_unimplemented>";
 
 /// The attributes of the `diagnostic` tool rustc knows, each with the feature it needs:
 /// rustc_resolve's `DIAGNOSTIC_ATTRIBUTES`.
@@ -187,7 +198,11 @@ struct State {
 }
 
 /// The lints of the diagnostic attributes of `owners`.
-pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, _walk: &Walk<'db>, owners: &[Owner<'db>]) -> Vec<Emitted> {
+pub(crate) fn lints<'db>(
+    cx: &Cx<'_, 'db>,
+    _walk: &Walk<'db>,
+    owners: &[Owner<'db>],
+) -> Vec<Emitted> {
     // alloc: empty, allocates nothing until a lint
     let mut out = Vec::new();
     let mut enabled: Option<[bool; KNOWN.len()]> = None;
@@ -196,7 +211,9 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, _walk: &Walk<'db>, owners: &[Owner<'d
         let mut any = false;
         for attr in &owner.attrs {
             let Some(path) = attr.meta().and_then(|it| it.path()) else { continue };
-            let Some(kind) = classify(cx, &mut enabled, owner, attr, path, &mut out) else { continue };
+            let Some(kind) = classify(cx, &mut enabled, owner, attr, path, &mut out) else {
+                continue;
+            };
             any = true;
             let mut sink = Sink { cx, owner, file: attr.file, out: &mut out };
             parse(&mut sink, &mut state, kind, attr, path);
@@ -227,7 +244,9 @@ fn classify<'db>(
     let first_name = first.name_ref()?;
     let second = segments.next();
     match (unraw(first_name.text()), &second) {
-        ("rustc_on_unimplemented", None) => return Some(Kind::Directive(Mode::RustcOnUnimplemented)),
+        ("rustc_on_unimplemented", None) => {
+            return Some(Kind::Directive(Mode::RustcOnUnimplemented));
+        }
         ("rustc_diagnostic_opaque", None) => return Some(Kind::Opaque),
         ("diagnostic", Some(_)) => {}
         _ => return None,
@@ -237,7 +256,9 @@ fn classify<'db>(
     let name = unraw(name_ref.text());
     let enabled = *enabled.get_or_insert_with(|| {
         KNOWN.map(|(_, feature)| {
-            feature.is_none_or(|it| cx.krate.is_unstable_feature_enabled(cx.db, &intern::Symbol::intern(it)))
+            feature.is_none_or(|it| {
+                cx.krate.is_unstable_feature_enabled(cx.db, &intern::Symbol::intern(it))
+            })
         })
     });
     let known = KNOWN.iter().position(|(it, _)| *it == name);
@@ -268,13 +289,17 @@ fn unknown<'db>(
     }
     let span = cx.span(attr.in_file(name_ref.syntax().text_range()));
     // clone: the diagnostic's span, as is all below
-    let mut diag = Diag::lint("unknown_diagnostic_attributes", "unknown diagnostic attribute", span.clone());
-    if let Some((_, Some(feature))) = KNOWN.iter().find(|(it, feature)| *it == name && feature.is_some()) {
+    let mut diag =
+        Diag::lint("unknown_diagnostic_attributes", "unknown diagnostic attribute", span.clone());
+    if let Some((_, Some(feature))) =
+        KNOWN.iter().find(|(it, feature)| *it == name && feature.is_some())
+    {
         // alloc: as above
         diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
     } else {
         // alloc: as above
-        let candidates: Vec<&str> = KNOWN.iter().zip(enabled).filter(|(_, on)| **on).map(|((it, _), _)| *it).collect();
+        let candidates: Vec<&str> =
+            KNOWN.iter().zip(enabled).filter(|(_, on)| **on).map(|((it, _), _)| *it).collect();
         if let Some(typo) = find_best_match_for_name(&candidates, name, None).copied() {
             let message = "an attribute with a similar name exists";
             diag.suggestion_verbose(span, message, typo, Applicability::MachineApplicable);
@@ -285,7 +310,13 @@ fn unknown<'db>(
 }
 
 /// The parser of `attr`, a `kind` attribute.
-fn parse(sink: &mut Sink<'_, '_, '_>, state: &mut State, kind: Kind, attr: &Attr<'_>, path: ast::Path<'_>) {
+fn parse(
+    sink: &mut Sink<'_, '_, '_>,
+    state: &mut State,
+    kind: Kind,
+    attr: &Attr<'_>,
+    path: ast::Path<'_>,
+) {
     let Some(args) = meta::args(attr.args(), path.qualifier().is_some()) else { return };
     let attr_range = attr.range();
     let mode = match kind {
@@ -307,7 +338,12 @@ fn parse(sink: &mut Sink<'_, '_, '_>, state: &mut State, kind: Kind, attr: &Attr
                 let span = sink.span(attr_range);
                 // clone: the diagnostic's span
                 let mut diag = Diag::lint("unused_attributes", "unused attribute", span.clone());
-                diag.suggestion(span, "remove this attribute", "", Applicability::MachineApplicable);
+                diag.suggestion(
+                    span,
+                    "remove this attribute",
+                    "",
+                    Applicability::MachineApplicable,
+                );
                 diag.span_note(sink.cx.span(earlier), "attribute also specified here");
                 sink.parsed(diag);
             }
@@ -361,7 +397,10 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: &State) {
             let mut diag = Diag::lint(
                 "malformed_diagnostic_format_literals",
                 // alloc: the diagnostic's text
-                format!("there is no parameter `{}` on trait `{name}`", printable(param, sink.cx.edition)),
+                format!(
+                    "there is no parameter `{}` on trait `{name}`",
+                    printable(param, sink.cx.edition)
+                ),
                 sink.cx.span(at),
             );
             if !directive.is_rustc_attr {
@@ -400,7 +439,9 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: &State) {
         if params.len() != 1 {
             let range = match adt.generic_param_list() {
                 Some(list) => list.syntax().text_range(),
-                None => adt.name().map_or(def_range_view(node), |it| TextRange::empty(it.syntax().text_range().end())),
+                None => adt.name().map_or(def_range_view(node), |it| {
+                    TextRange::empty(it.syntax().text_range().end())
+                }),
             };
             let diag = Diag::lint(
                 "malformed_diagnostic_attributes",
@@ -428,14 +469,21 @@ const SELF_HELP: &str = "expect either a generic argument name or `{Self}` as fo
 /// rustc's `OnConstMalformedFormatLiterals`, `OnMoveMalformedFormatLiterals` and
 /// `OnTypeErrorMalformedFormatLiterals`: each parameter `directive` names that is not one of
 /// `params` nor of `allowed`.
-fn unknown_params(sink: &mut Sink<'_, '_, '_>, directive: &Directive, params: &[String], allowed: &[&str], help: &str) {
+fn unknown_params(
+    sink: &mut Sink<'_, '_, '_>,
+    directive: &Directive,
+    params: &[String],
+    allowed: &[&str],
+    help: &str,
+) {
     directive.visit_params(&mut |param, at| {
         if params.iter().any(|it| it == param) || allowed.contains(&param) {
             return;
         }
         // alloc: the diagnostic's text
         let message = format!("unknown parameter `{}`", printable(param, sink.cx.edition));
-        let mut diag = Diag::lint("malformed_diagnostic_format_literals", message, sink.cx.span(at));
+        let mut diag =
+            Diag::lint("malformed_diagnostic_format_literals", message, sink.cx.span(at));
         diag.help(help);
         sink.checked(diag);
     });

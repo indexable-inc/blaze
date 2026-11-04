@@ -45,7 +45,9 @@ pub(super) fn private<'db>(
                 Some(it) => it,
                 None => *from.insert(current.take()?()?),
             };
-            if !def.is_visible_from(cx.db, module_of_path) && module.declarations_iter(cx.db).any(|it| it == def) {
+            if !def.is_visible_from(cx.db, module_of_path)
+                && module.declarations_iter(cx.db).any(|it| it == def)
+            {
                 return Some((at, def, module_of_path));
             }
         }
@@ -55,11 +57,17 @@ pub(super) fn private<'db>(
 }
 
 /// The E0603 of `segment`, which names `def`, an item the path's module can't see.
-pub(super) fn diag(cx: &Cx<'_, '_>, signature: &Signature<'_>, segment: &Segment, def: ModuleDef) -> Option<Diag> {
+pub(super) fn diag(
+    cx: &Cx<'_, '_>,
+    signature: &Signature<'_>,
+    segment: &Segment,
+    def: ModuleDef,
+) -> Option<Diag> {
     let descr = def_descr(cx, Ns::Type, def)?;
     let span = cx.span(InFile::new(signature.node.file_id, segment.range));
     // alloc: clone: the error's message and span
-    let mut diag = Diag::error(Some("E0603"), format!("{descr} `{}` is private", segment.name), span.clone());
+    let mut diag =
+        Diag::error(Some("E0603"), format!("{descr} `{}` is private", segment.name), span.clone());
     // alloc: the error's label
     diag.span_label(span, format!("private {descr}"));
     if let Some(at) = def_span(cx, Ns::Type, def) {

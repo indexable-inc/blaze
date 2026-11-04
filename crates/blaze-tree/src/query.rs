@@ -4,7 +4,6 @@
 
 use blaze_format::SchemaHash;
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
@@ -13,6 +12,7 @@ use blaze_units::load::{
 };
 use blaze_units::query::{Cbor, Fetch, LoadError, Versioned, producer};
 use serde::{Deserialize, Serialize};
+use std::alloc::Global;
 
 use crate::packages::Reads;
 use crate::{
@@ -155,7 +155,8 @@ impl Query for Tree {
             return Ok(Cbor(Printed::Failed(LoadError { what, at: None })));
         }
         // clone: the key's resolve, once per query.
-        let resolve = ResolveAsk { dev_units: ask.edges.contains(&Edge::Dev), ..ask.resolve.clone() };
+        let resolve =
+            ResolveAsk { dev_units: ask.edges.contains(&Edge::Dev), ..ask.resolve.clone() };
         Ok(Cbor(match resolve_view(cx, &resolve, |view| print_view(view, &opts))? {
             Resolving::Done((out, warnings)) => Printed::Ready { out, warnings },
             Resolving::Needs(fetches) => Printed::Needs(fetches),
@@ -164,20 +165,28 @@ impl Query for Tree {
     }
 }
 
-fn print_view<F: Files>(view: &ViewResolved<'_, F>, opts: &Options) -> Result<(String, Vec<String>), LoadError> {
+fn print_view<F: Files>(
+    view: &ViewResolved<'_, F>,
+    opts: &Options,
+) -> Result<(String, Vec<String>), LoadError> {
     let (input, kinds) = view_input(view, opts)?;
     // alloc: the text the query returns, one buffer sized for a line per package.
     let mut out = String::with_capacity(crate::LINE * view.resolve.len());
     // alloc: the warnings the query returns, the load's first.
     let mut warnings = view.warnings.to_vec();
     // alloc: a warning, rare.
-    crate::print_resolved(&input, opts, &kinds, &mut out, &mut |it: &str| warnings.push(it.to_owned()))
-        .map_err(|error| load_error(&error, None))?;
+    crate::print_resolved(&input, opts, &kinds, &mut out, &mut |it: &str| {
+        warnings.push(it.to_owned())
+    })
+    .map_err(|error| load_error(&error, None))?;
     Ok((out, warnings))
 }
 
 /// The view's workspace as [`crate::print_resolved`] reads it, and its platforms.
-fn view_input<'a, F: Files>(view: &ViewResolved<'a, F>, opts: &Options) -> Result<(Input<'a>, Kinds), LoadError> {
+fn view_input<'a, F: Files>(
+    view: &ViewResolved<'a, F>,
+    opts: &Options,
+) -> Result<(Input<'a>, Kinds), LoadError> {
     let targets: &[String] = match &opts.target {
         Target::Specific(triples) => triples,
         Target::Host | Target::All => &[],
@@ -187,7 +196,10 @@ fn view_input<'a, F: Files>(view: &ViewResolved<'a, F>, opts: &Options) -> Resul
         // alloc: a platform's triple, once per `cargo tree`.
         Ok(Platformed { triple: triple.to_owned(), cfg })
     };
-    let mut kinds = Kinds { host: platformed(view.host, targets.first().map(String::as_str))?, targets: Vec::with_capacity(targets.len()) };
+    let mut kinds = Kinds {
+        host: platformed(view.host, targets.first().map(String::as_str))?,
+        targets: Vec::with_capacity(targets.len()),
+    };
     for it in targets {
         kinds.targets.push(platformed(it, Some(it))?);
     }

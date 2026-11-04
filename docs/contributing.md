@@ -213,6 +213,11 @@ dependencies without a reason, small focused changes. Comments say what the code
 why, not what was changed. Messages printed to the user say what happened and what blaze
 did about it in one line.
 
+When a build is slow, reruns what it should reuse, holds too much memory or a cycle will not
+settle, find out from the profile, not by guessing: the `debugging` skill
+([.agents/skills/debugging/SKILL.md](../.agents/skills/debugging/SKILL.md)) says where its
+files are, what they hold, the DuckDB queries that answer each question and the method.
+
 ## What a change needs
 
 - A test that fails before and passes after: the real crate's own tests for a bug found in
@@ -230,7 +235,7 @@ did about it in one line.
   change through is not the harnesses passing on it.
 - blaze builds in the flake's dev shell, against the LLVM it pins:
   `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
-- `cargo fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
+- `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
   `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
   `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).
@@ -356,16 +361,21 @@ and pinned by its commit, version and per-target sha256 in `crates/hir-ty-codege
 Every native build of blaze links it (blaze-engine's default `native` feature, through
 hir-ty-codegen's `llvm`): std and every opt-level 2/3 unit are LLVM's, and `blaze-stencil`'s
 build script has it make the stencils. Only the seed (`--no-default-features --features seed`)
-has none. The flake's dev shell fetches it (the flake's `blaze-llvm`) and sets
-`LLVM_SYS_231_PREFIX` to it:
+has none. blaze fetches it itself: the root `Cargo.toml` declares it a pinned native input
+(`[workspace.metadata.blaze.native.llvm]`, [cargo.md](cargo.md#pinned-native-inputs)), so the
+first build downloads the archive `llvm.json` names for the target, checks its sha256, keeps it
+in blaze's store and unpacks it read-only under `~/.blaze/native/` (`BLAZE_HOME/native/`), and
+sets `LLVM_SYS_231_PREFIX` to it for llvm-sys's and blaze-stencil's build scripts. A plain
+build on a clean Mac or Linux machine needs no Nix and no variable:
 
-    nix develop -c cargo build -p blaze-engine --release
+    blaze build -p blaze-engine --release
 
-Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
-(`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
-prefix's `lib` to the linker, and a build script in blaze's sandbox may name only a system
-directory of libraries (`crates/blaze-cargo/src/directives.rs`, `SYSTEM`), so `blaze
-build` refuses a prefix in your home directory.
+The variable blaze sets wins over one your shell has (`nix develop` still sets it to the
+flake's `blaze-llvm`, the same bytes), so a build always links what the pin names. A stage 0
+older than the table (`.github/blaze-version` before this change) ignores it and still needs the
+variable, with the archive somewhere its sandbox lets llvm-sys search, below `/usr/local/lib`
+(`crates/blaze-cargo/src/directives.rs`, `SYSTEM`), as CI's merge gate does
+(`.github/actions/blaze`):
 
     sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
     python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>

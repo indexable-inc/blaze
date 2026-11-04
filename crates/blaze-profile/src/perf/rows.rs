@@ -187,7 +187,11 @@ pub fn runs(dir: &Path) -> Result<Vec<RunRow>, String> {
         let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.strip_prefix("perf-").and_then(|it| it.strip_suffix(suffix.as_str())).is_some_and(is_run) {
+        if name
+            .strip_prefix("perf-")
+            .and_then(|it| it.strip_suffix(suffix.as_str()))
+            .is_some_and(is_run)
+        {
             files.push(entry.path());
         }
     }
@@ -227,31 +231,41 @@ struct Columns<'a> {
 impl<'a> Columns<'a> {
     fn get(&self, name: &str) -> Result<&'a ArrayRef, String> {
         // alloc: an error
-        self.batch.column_by_name(name).ok_or_else(|| format!("{}: no column `{name}`", self.path.display()))
+        self.batch
+            .column_by_name(name)
+            .ok_or_else(|| format!("{}: no column `{name}`", self.path.display()))
     }
 
     fn text(&self, name: &str) -> Result<&'a StringArray, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_string_opt::<i32>().ok_or_else(|| format!("{}: `{name}` is {}, not text", self.path.display(), it.data_type()))
+        it.as_string_opt::<i32>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not text", self.path.display(), it.data_type())
+        })
     }
 
     fn u32(&self, name: &str) -> Result<&'a UInt32Array, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<UInt32Type>().ok_or_else(|| format!("{}: `{name}` is {}, not u32", self.path.display(), it.data_type()))
+        it.as_primitive_opt::<UInt32Type>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not u32", self.path.display(), it.data_type())
+        })
     }
 
     fn u64(&self, name: &str) -> Result<&'a UInt64Array, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<UInt64Type>().ok_or_else(|| format!("{}: `{name}` is {}, not u64", self.path.display(), it.data_type()))
+        it.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not u64", self.path.display(), it.data_type())
+        })
     }
 
     fn i64(&self, name: &str) -> Result<&'a Int64Array, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<Int64Type>().ok_or_else(|| format!("{}: `{name}` is {}, not i64", self.path.display(), it.data_type()))
+        it.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+            format!("{}: `{name}` is {}, not i64", self.path.display(), it.data_type())
+        })
     }
 
     /// A column no row may leave empty: an empty one is a damaged file, named.

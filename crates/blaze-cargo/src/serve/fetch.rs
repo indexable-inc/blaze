@@ -52,7 +52,12 @@ impl Fetcher<HyperHttp> {
 impl<H: Http + 'static> Fetcher<H> {
     /// The same over any `Http` (tests use a fake).
     pub fn with_http(http: Arc<H>, scratch: PathBuf) -> Fetcher<H> {
-        Fetcher { http, retry: Retry { quiet: true, ..Retry::default() }, scratch, store: StoreOf::Installed }
+        Fetcher {
+            http,
+            retry: Retry { quiet: true, ..Retry::default() },
+            scratch,
+            store: StoreOf::Installed,
+        }
     }
 
     /// The same, keeping `.crate` files in `store` in place of the process's (a test's own).
@@ -64,6 +69,16 @@ impl<H: Http + 'static> Fetcher<H> {
     /// is the daemon's log.
     pub fn retrying(self, retry: Retry) -> Fetcher<H> {
         Fetcher { retry: Retry { quiet: true, ..retry }, ..self }
+    }
+
+    /// blaze-fetch over this fetcher's HTTP, retries and store: what gets a `.crate` and a
+    /// pinned native input ([`super::native::ensure`]) by its digest, from the store first.
+    pub fn pinned(&self) -> blaze_fetch::Fetcher {
+        // dyn: the I/O driver, as blaze-fetch takes it
+        let http: Arc<dyn Http> = self.http.clone();
+        let net = Arc::new(blaze_registry::pinned::Net::new(http));
+        blaze_fetch::Fetcher::new(self.store, net, self.scratch.join("downloads"))
+            .with_policy(blaze_registry::pinned::policy(&self.retry))
     }
 
     /// `fetch`, fetched and checked, as the daemon puts it into the VFS.
@@ -83,11 +98,20 @@ impl<H: Http + 'static> Fetcher<H> {
     /// `finish_download` and `unpack_package`, and `LocalRegistry::download`).
     fn package(&self, fetch: &Fetch, sha256: &str) -> Result<Source, ApiError> {
         let pin = blaze_registry::pinned::crate_pin(sha256).ok_or_else(|| {
-            failed(fetch, &[format!("the lock file's checksum `{sha256}` of `{}` is not a sha256", fetch.what)], None)
+            failed(
+                fetch,
+                &[format!(
+                    "the lock file's checksum `{sha256}` of `{}` is not a sha256",
+                    fetch.what
+                )],
+                None,
+            )
         })?;
         let refused = |e: FetchError| {
             let first = match e {
-                FetchError::Mismatch { .. } => format!("failed to verify the checksum of `{}`", fetch.what),
+                FetchError::Mismatch { .. } => {
+                    format!("failed to verify the checksum of `{}`", fetch.what)
+                }
                 _ => format!("failed to download `{}`", fetch.what),
             };
             failed(fetch, &[first], Some(&anyhow::Error::new(e)))
@@ -97,17 +121,18 @@ impl<H: Http + 'static> Fetcher<H> {
         let body: &[u8] = match fetch.url.strip_prefix("file://") {
             Some(path) => {
                 read = std::fs::read(path).map_err(|e| {
-                    failed(fetch, &[format!("failed to read `{path}`")], Some(&anyhow::Error::new(e)))
+                    failed(
+                        fetch,
+                        &[format!("failed to read `{path}`")],
+                        Some(&anyhow::Error::new(e)),
+                    )
                 })?;
-                blaze_fetch::verify(Producer::Given(path.to_owned()), &pin, &read).map_err(refused)?;
+                blaze_fetch::verify(Producer::Given(path.to_owned()), &pin, &read)
+                    .map_err(refused)?;
                 &read
             }
             None => {
-                // dyn: the I/O driver, as blaze-fetch takes it
-                let http: Arc<dyn Http> = self.http.clone();
-                let net = Arc::new(blaze_registry::pinned::Net::new(http));
-                let fetcher = blaze_fetch::Fetcher::new(self.store, net, self.scratch.join("downloads"))
-                    .with_policy(blaze_registry::pinned::policy(&self.retry));
+                let fetcher = self.pinned();
                 // clone: once a package
                 let source = blaze_fetch::Source::Url { url: fetch.url.clone(), digest: pin };
                 let object = fetcher.get(&source).map_err(refused)?;
@@ -206,7 +231,9 @@ pub fn on_disk_id<'a>(files: impl Iterator<Item = (&'a str, Mode, ContentId)>) -
 /// [`on_disk_id`] of a fetched source's files.
 pub fn source_on_disk_id(source: &Source) -> ContentId {
     on_disk_id(
-        source.files.iter().map(|it| (it.path.as_str(), it.mode, ContentId::of(blaze_vfs::FILE_DOMAIN, &it.bytes))),
+        source.files.iter().map(|it| {
+            (it.path.as_str(), it.mode, ContentId::of(blaze_vfs::FILE_DOMAIN, &it.bytes))
+        }),
     )
 }
 
@@ -221,7 +248,9 @@ pub fn on_disk_mark(dir: &std::path::Path) -> Result<Option<ContentId>, String> 
     };
     let hex = text.trim_end();
     let bytes: Option<Vec<u8>> = (hex.len() == 64)
-        .then(|| (0..32).map(|at| u8::from_str_radix(hex.get(2 * at..2 * at + 2)?, 16).ok()).collect())
+        .then(|| {
+            (0..32).map(|at| u8::from_str_radix(hex.get(2 * at..2 * at + 2)?, 16).ok()).collect()
+        })
         .flatten();
     let bytes: [u8; 32] = bytes
         .and_then(|it| it.try_into().ok())
@@ -234,16 +263,24 @@ pub fn on_disk_mark(dir: &std::path::Path) -> Result<Option<ContentId>, String> 
 /// A lock file names the package (its name, a git commit), and nothing it says may move the
 /// write out of blaze's sources.
 fn outside_sources(at: &str, sources: &std::path::Path) -> Option<String> {
-    let Some(rest) = at.strip_prefix('/') else { return Some("it is not an absolute path".to_owned()) };
+    let Some(rest) = at.strip_prefix('/') else {
+        return Some("it is not an absolute path".to_owned());
+    };
     if let Some(part) = rest.split('/').find(|it| matches!(*it, "" | "." | "..")) {
         return Some(format!("it has a part `{part}`, which names no directory of its own"));
     }
     let sources = sources.to_string_lossy();
     let sources = sources.trim_end_matches('/');
     let under = ["registry/src/", "git/checkouts/"];
-    match under.iter().any(|it| at.strip_prefix(sources).and_then(|rest| rest.strip_prefix('/')).is_some_and(|rest| rest.starts_with(it))) {
+    match under.iter().any(|it| {
+        at.strip_prefix(sources)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|rest| rest.starts_with(it))
+    }) {
         true => None,
-        false => Some(format!("it is under neither {sources}/registry/src/ nor {sources}/git/checkouts/")),
+        false => Some(format!(
+            "it is under neither {sources}/registry/src/ nor {sources}/git/checkouts/"
+        )),
     }
 }
 
@@ -259,13 +296,20 @@ fn outside_sources(at: &str, sources: &std::path::Path) -> Option<String> {
 /// [`ON_DISK_MARK`] last, renamed into place. A directory already at `at` is kept only when its
 /// mark holds this source's [`on_disk_id`]; one with no mark or another id is an error naming
 /// both, never read as the package.
-pub fn keep_on_disk(fetch: &Fetch, source: &Source, sources: &std::path::Path) -> Result<(), ApiError> {
+pub fn keep_on_disk(
+    fetch: &Fetch,
+    source: &Source,
+    sources: &std::path::Path,
+) -> Result<(), ApiError> {
     if matches!(fetch.kind, FetchKind::IndexFile) {
         return Ok(());
     }
     let fail = |what: String| ApiError::new(what, Some(fetch.what.clone()));
     if let Some(why) = outside_sources(&fetch.at, sources) {
-        return Err(fail(format!("blaze will not write the package `{}` to {}: {why}", fetch.what, fetch.at)));
+        return Err(fail(format!(
+            "blaze will not write the package `{}` to {}: {why}",
+            fetch.what, fetch.at
+        )));
     }
     let at = std::path::Path::new(&fetch.at);
     let id = source_on_disk_id(source);
@@ -279,22 +323,28 @@ pub fn keep_on_disk(fetch: &Fetch, source: &Source, sources: &std::path::Path) -
         )));
     }
     let (Some(parent), Some(name)) = (at.parent(), last_part(&fetch.at)) else {
-        return Err(fail(format!("`{}` names no package directory to write the package into", fetch.at)));
+        return Err(fail(format!(
+            "`{}` names no package directory to write the package into",
+            fetch.at
+        )));
     };
-    std::fs::create_dir_all(parent).map_err(|e| fail(format!("creating {}: {e}", parent.display())))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| fail(format!("creating {}: {e}", parent.display())))?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let part = parent.join(format!(".{name}{PART}{}-{n}", std::process::id()));
     let written = write_tree(&part, &source.files)
         .and_then(|()| {
             let mark = part.join(ON_DISK_MARK);
-            std::fs::write(&mark, format!("{id:x}\n")).map_err(|e| format!("{}: {e}", mark.display()))
+            std::fs::write(&mark, format!("{id:x}\n"))
+                .map_err(|e| format!("{}: {e}", mark.display()))
         })
         .and_then(|()| match std::fs::rename(&part, at) {
             Ok(()) => Ok(()),
             // Another fetch of the same package put it there first: kept if it is the same.
             Err(_) if at.is_dir() => {
-                std::fs::remove_dir_all(&part).map_err(|e| format!("removing {}: {e}", part.display()))?;
+                std::fs::remove_dir_all(&part)
+                    .map_err(|e| format!("removing {}: {e}", part.display()))?;
                 same_on_disk(at, id)
             }
             Err(e) => Err(format!("renaming {} to {}: {e}", part.display(), at.display())),
@@ -342,7 +392,9 @@ pub fn sweep_parts(sources: &std::path::Path) -> Result<Vec<std::path::PathBuf>,
                 let name = name.to_string_lossy();
                 if name.starts_with('.') && name.contains(PART) {
                     let path = entry.path();
-                    std::fs::remove_dir_all(&path).map_err(|e| format!("removing the half-written package {}: {e}", path.display()))?;
+                    std::fs::remove_dir_all(&path).map_err(|e| {
+                        format!("removing the half-written package {}: {e}", path.display())
+                    })?;
                     removed.push(path);
                 }
             }
@@ -359,19 +411,27 @@ fn write_tree(dir: &std::path::Path, files: &[SourceFile]) -> Result<(), String>
     for file in files {
         let path = dir.join(&file.path);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
         match file.mode {
             Mode::Symlink => {
                 let to = String::from_utf8_lossy(&file.bytes);
                 #[cfg(unix)]
-                std::os::unix::fs::symlink(to.as_ref(), &path).map_err(|e| format!("{}: {e}", path.display()))?;
+                std::os::unix::fs::symlink(to.as_ref(), &path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
                 #[cfg(not(unix))]
-                return Err(format!("{} is a symlink to {to}, and this platform has none to write", path.display()));
+                return Err(format!(
+                    "{} is a symlink to {to}, and this platform has none to write",
+                    path.display()
+                ));
             }
             Mode::Regular | Mode::Executable => {
-                std::fs::write(&path, &file.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-                let mut permissions = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?.permissions();
+                std::fs::write(&path, &file.bytes)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                let mut permissions = std::fs::metadata(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?
+                    .permissions();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -379,7 +439,8 @@ fn write_tree(dir: &std::path::Path, files: &[SourceFile]) -> Result<(), String>
                 }
                 #[cfg(not(unix))]
                 permissions.set_readonly(true);
-                std::fs::set_permissions(&path, permissions).map_err(|e| format!("{}: {e}", path.display()))?;
+                std::fs::set_permissions(&path, permissions)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
     }
@@ -406,5 +467,5 @@ fn failed(fetch: &Fetch, texts: &[String], error: Option<&anyhow::Error>) -> Api
             what.push_str(text.trim_end());
         }
     }
-    ApiError { what: scrub(&what), at: Some(fetch.what.clone()) }
+    ApiError::new(scrub(&what), Some(fetch.what.clone()))
 }

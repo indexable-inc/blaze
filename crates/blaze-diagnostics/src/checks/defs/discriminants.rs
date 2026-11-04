@@ -48,8 +48,11 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
     if variants.is_empty() {
         if let Some(hint) = first_repr_hint(source.value) {
             let span = cx.span(source.with_value(hint));
-            let mut diag =
-                Diag::error(Some("E0084"), "unsupported representation for zero-variant enum", span);
+            let mut diag = Diag::error(
+                Some("E0084"),
+                "unsupported representation for zero-variant enum",
+                span,
+            );
             diag.span_label(enum_span(), "zero-variant enum");
             diag.fact(fact, what());
             found.push(Found::new(diag, Phase::Items));
@@ -72,7 +75,8 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
         let Some(node) = cx.vsema.source(variants[index]) else { continue };
         let name_span = name_span(cx, node);
         // clone: the error's span
-        let mut diag = Diag::error(Some("E0370"), "enum discriminant overflowed", name_span.clone());
+        let mut diag =
+            Diag::error(Some("E0370"), "enum discriminant overflowed", name_span.clone());
         let after = int.display(table.value(index - 1));
         // alloc: the error's label
         diag.span_label(name_span, format!("overflowed on value after {after}"));
@@ -148,7 +152,10 @@ fn needs_repr_int(
     );
     match (disr_non_unit, disr_unit, non_unit) {
         (Some(at), _, _) => {
-            diag.span_label(expr_span(at), "explicit discriminant on non-unit variant specified here");
+            diag.span_label(
+                expr_span(at),
+                "explicit discriminant on non-unit variant specified here",
+            );
         }
         (None, Some(at), Some(non_unit)) => {
             diag.span_label(expr_span(at), "explicit discriminant specified here");

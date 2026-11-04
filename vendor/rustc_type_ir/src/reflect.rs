@@ -85,8 +85,7 @@ pub fn first_reflected_var<I: Interner>(
 /// Whether any variable of `vars` is reflected.
 #[inline]
 pub fn has_reflected_vars<I: Interner>(vars: I::BoundVarKinds) -> bool {
-    vars.iter()
-        .any(|var| matches!(var, BoundVariableKind::Reflected(_)))
+    vars.iter().any(|var| matches!(var, BoundVariableKind::Reflected(_)))
 }
 
 /// `vars` with every reflected variable's container folded by `folder`, which is inside the
@@ -181,10 +180,7 @@ pub fn instantiate_reflected_var<I: Interner, T: TypeFoldable<I>>(
         Region::new_bound(
             cx,
             ty::INNERMOST,
-            ty::BoundRegion {
-                var: renumber(br.var),
-                kind: br.kind,
-            },
+            ty::BoundRegion { var: renumber(br.var), kind: br.kind },
         )
     };
     let mut types = |bt: ty::BoundTy<I>| {
@@ -194,10 +190,7 @@ pub fn instantiate_reflected_var<I: Interner, T: TypeFoldable<I>>(
             I::Ty::new_bound(
                 cx,
                 ty::INNERMOST,
-                ty::BoundTy {
-                    var: renumber(bt.var),
-                    kind: bt.kind,
-                },
+                ty::BoundTy { var: renumber(bt.var), kind: bt.kind },
             )
         }
     };
@@ -222,13 +215,7 @@ pub fn instantiate_reflected_var<I: Interner, T: TypeFoldable<I>>(
             var => var,
         })
         .collect::<SmallVec<[_; 4]>>();
-    let value = replace(
-        cx,
-        binder.skip_binder(),
-        &mut regions,
-        &mut types,
-        &mut consts,
-    );
+    let value = replace(cx, binder.skip_binder(), &mut regions, &mut types, &mut consts);
     Binder::bind_with_vars(value, I::BoundVarKinds::from_vars(cx, rest))
 }
 
@@ -243,10 +230,6 @@ fn replace<I: Interner, T: TypeFoldable<I>>(
     crate::fold::replace_escaping_bound_vars_uncached(
         cx,
         value,
-        FnMutDelegate {
-            regions,
-            types,
-            consts,
-        },
+        FnMutDelegate { regions, types, consts },
     )
 }

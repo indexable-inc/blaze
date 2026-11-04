@@ -20,7 +20,10 @@ use blaze_codegen::Arch;
 use blaze_fuzzer::Target;
 use blaze_link::{Format, NativeKind};
 use object::write::{Object as Builder, Relocation, StandardSection, Symbol, SymbolSection};
-use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope, pe};
+use object::{
+    Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
+    SymbolScope, pe,
+};
 
 const TARGET: Target = Target {
     name: "link_coff_archive",
@@ -60,8 +63,9 @@ fn check_case(data: &[u8], case: usize) {
     let (aligned, at) = copy_at(data, 0);
     let aligned = &aligned[at..][..data.len()];
     let bound = blaze_fuzz::allowed(data.len());
-    let (largest, read) =
-        blaze_fuzz::largest_allocation(|| blaze_link::fuzz_read(Format::Pe, Arch::X86_64, ARCHIVE, aligned));
+    let (largest, read) = blaze_fuzz::largest_allocation(|| {
+        blaze_link::fuzz_read(Format::Pe, Arch::X86_64, ARCHIVE, aligned)
+    });
     assert!(
         largest <= bound,
         "allocation bound: a read of {} bytes asked for {largest} bytes at once, past {bound}",
@@ -79,7 +83,10 @@ fn check_case(data: &[u8], case: usize) {
         }
         _ => {
             let whole = blaze_link::fuzz_read(Format::Pe, Arch::X86_64, WHOLE, aligned);
-            assert!(!read || whole, "whole archive: an archive accepted without `whole` is refused with it");
+            assert!(
+                !read || whole,
+                "whole archive: an archive accepted without `whole` is refused with it"
+            );
         }
     }
 }
@@ -98,7 +105,8 @@ fn seeds() -> Vec<Vec<u8>> {
 
 /// Each accepted with `whole`; all but the one without an index without it too.
 fn named() -> Vec<(&'static str, Vec<u8>)> {
-    let objects = [("a.obj", object(&["alpha"], &["beta"])), ("b.obj", object(&["beta", "gamma"], &[]))];
+    let objects =
+        [("a.obj", object(&["alpha"], &["beta"])), ("b.obj", object(&["beta", "gamma"], &[]))];
     let library = [
         ("foo.dll", descriptor("foo")),
         ("foo.dll", long_import("foo", "f", 0, 0)),
@@ -108,14 +116,30 @@ fn named() -> Vec<(&'static str, Vec<u8>)> {
         ("objects with a GNU index", ar(&objects, &[("alpha", 0), ("beta", 1), ("gamma", 1)])),
         (
             "an import library: a descriptor, a long and a short import",
-            ar(&library, &[("__IMPORT_DESCRIPTOR_foo", 0), ("__imp_f", 1), ("f", 1), ("__imp_g", 2), ("g", 2)]),
+            ar(
+                &library,
+                &[
+                    ("__IMPORT_DESCRIPTOR_foo", 0),
+                    ("__imp_f", 1),
+                    ("f", 1),
+                    ("__imp_g", 2),
+                    ("g", 2),
+                ],
+            ),
         ),
         ("objects without an index", ar(&objects, &[])),
         ("no member", ar(&[], &[])),
     ]
 }
 
-fn define(b: &mut Builder<'_>, name: &str, section: object::write::SectionId, value: u64, kind: SymbolKind, scope: SymbolScope) {
+fn define(
+    b: &mut Builder<'_>,
+    name: &str,
+    section: object::write::SectionId,
+    value: u64,
+    kind: SymbolKind,
+    scope: SymbolScope,
+) {
     b.add_symbol(Symbol {
         name: name.into(),
         value,
@@ -153,7 +177,8 @@ fn object(defines: &[&str], calls: &[&str]) -> Vec<u8> {
         let symbol = undefined(&mut b, name);
         let offset = 8 * (defines.len() + i) as u64 + 1;
         let flags = RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_REL32 };
-        b.add_relocation(text, Relocation { offset, symbol, addend: 0, flags }).expect("a COFF relocation");
+        b.add_relocation(text, Relocation { offset, symbol, addend: 0, flags })
+            .expect("a COFF relocation");
     }
     b.write().expect("a COFF object")
 }
@@ -165,7 +190,14 @@ fn descriptor(dll: &str) -> Vec<u8> {
     b.append_section_data(directory, &[0; 20], 4);
     let names = b.add_section(Vec::new(), b".idata$6".to_vec(), SectionKind::Data);
     b.append_section_data(names, format!("{dll}.dll\0").as_bytes(), 2);
-    define(&mut b, &format!("__IMPORT_DESCRIPTOR_{dll}"), directory, 0, SymbolKind::Data, SymbolScope::Linkage);
+    define(
+        &mut b,
+        &format!("__IMPORT_DESCRIPTOR_{dll}"),
+        directory,
+        0,
+        SymbolKind::Data,
+        SymbolScope::Linkage,
+    );
     b.write().expect("a COFF object")
 }
 
@@ -194,7 +226,8 @@ fn long_import(dll: &str, symbol: &str, thunk: u64, value: u64) -> Vec<u8> {
         flags: SymbolFlags::None,
     });
     let flags = RelocationFlags::Coff { typ: pe::IMAGE_REL_AMD64_ADDR32NB };
-    b.add_relocation(thunks, Relocation { offset: 0, symbol: name, addend: 0, flags }).expect("a COFF relocation");
+    b.add_relocation(thunks, Relocation { offset: 0, symbol: name, addend: 0, flags })
+        .expect("a COFF relocation");
     b.write().expect("a COFF object")
 }
 
@@ -208,13 +241,17 @@ fn short_import(symbol: &str, dll: &str) -> Vec<u8> {
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_NAME.0 << 2)).to_le_bytes());
+    out.extend_from_slice(
+        &(pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_NAME.0 << 2)).to_le_bytes(),
+    );
     out.extend_from_slice(&strings);
     out
 }
 
 fn header(out: &mut Vec<u8>, name: &str, size: usize) {
-    out.extend_from_slice(format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes());
+    out.extend_from_slice(
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes(),
+    );
 }
 
 /// `members` (names of at most 15 bytes) after a GNU `/` index naming `symbols` (name,
@@ -279,7 +316,10 @@ mod tests {
     #[test]
     fn seeds_read() {
         for (what, bytes) in named() {
-            assert!(blaze_link::fuzz_read(Format::Pe, Arch::X86_64, WHOLE, &bytes), "seed `{what}` is refused");
+            assert!(
+                blaze_link::fuzz_read(Format::Pe, Arch::X86_64, WHOLE, &bytes),
+                "seed `{what}` is refused"
+            );
             let indexed = !what.contains("without an index");
             assert_eq!(
                 blaze_link::fuzz_read(Format::Pe, Arch::X86_64, ARCHIVE, &bytes),

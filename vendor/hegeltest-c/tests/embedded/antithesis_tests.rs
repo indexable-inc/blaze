@@ -66,10 +66,7 @@ fn location() -> TestLocation {
 
 /// The JSON object Antithesis's SDKs write for one assertion event.
 fn expected_event(location: &TestLocation, hit: bool, condition: bool) -> serde_json::Value {
-    let id = format!(
-        "{}::{} passes properties",
-        location.class, location.function
-    );
+    let id = format!("{}::{} passes properties", location.class, location.function);
     serde_json::json!({
         "antithesis_assert": {
             "hit": hit,
@@ -91,9 +88,7 @@ fn expected_event(location: &TestLocation, hit: bool, condition: bool) -> serde_
 }
 
 fn parse_lines(text: &str) -> Vec<serde_json::Value> {
-    text.lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+    text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
 }
 
 #[test]
@@ -103,10 +98,7 @@ fn assertion_lines_declare_then_evaluate_the_assertion() {
         assert!(text.ends_with('\n'));
         assert_eq!(
             parse_lines(&text),
-            [
-                expected_event(&location(), false, false),
-                expected_event(&location(), true, passed),
-            ]
+            [expected_event(&location(), false, false), expected_event(&location(), true, passed),]
         );
     }
 }
@@ -121,10 +113,7 @@ fn assertion_lines_escape_the_location_strings() {
     };
     assert_eq!(
         parse_lines(&assertion_lines(&awkward, true)),
-        [
-            expected_event(&awkward, false, false),
-            expected_event(&awkward, true, true),
-        ]
+        [expected_event(&awkward, false, false), expected_event(&awkward, true, true),]
     );
 }
 

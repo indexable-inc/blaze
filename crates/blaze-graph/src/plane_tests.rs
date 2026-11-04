@@ -11,10 +11,10 @@ mod reference;
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Order, Record};
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use crate::{
     machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
@@ -112,9 +112,9 @@ fn moves(outputs: &[PlaneOutput]) -> Vec<(u32, NodeState)> {
     outputs
         .iter()
         .filter_map(|it| match it {
-            PlaneOutput::Said { record: Record { event: Event::Moved { id, state }, .. }, .. } => {
-                Some((*id, state.clone()))
-            }
+            PlaneOutput::Said {
+                record: Record { event: Event::Moved { id, state }, .. }, ..
+            } => Some((*id, state.clone())),
             _ => None,
         })
         .collect()
@@ -173,13 +173,9 @@ fn as_plane(input: Input) -> PlaneInput {
 }
 
 fn one_request(config: Config) -> Plane {
-    let mut plane = Plane::new(PlaneConfig {
-        io: config.io,
-        work: config.work,
-        budget: None,
-        starve_after: 0,
-    })
-    .unwrap();
+    let mut plane =
+        Plane::new(PlaneConfig { io: config.io, work: config.work, budget: None, starve_after: 0 })
+            .unwrap();
     let input = PlaneInput::Open {
         at_ns: 0,
         request: RequestId(0),
@@ -347,7 +343,19 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     at(&mut plane, done_at(3, 12));
     assert_eq!(finished(&at(&mut plane, done_at(2, 15))), [(1, true)]);
     let stats = plane.stats(RequestId(1)).unwrap();
-    assert_eq!(stats, codegen(RequestStats { ran: 3, cached: 0, joined: 0, critical_path_ns: 15, ..Default::default() }, 27));
+    assert_eq!(
+        stats,
+        codegen(
+            RequestStats {
+                ran: 3,
+                cached: 0,
+                joined: 0,
+                critical_path_ns: 15,
+                ..Default::default()
+            },
+            27
+        )
+    );
 
     // Request 3's node of key 7 joins request 2's, which runs 20..30; each then runs one
     // more: request 2's 30..38, request 3's 30..33.
@@ -364,9 +372,33 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     assert_eq!(finished(&at(&mut plane, done_at(7, 33))), [(3, true)]);
     assert_eq!(finished(&at(&mut plane, done_at(5, 38))), [(2, true)]);
     let two = plane.stats(RequestId(2)).unwrap();
-    assert_eq!(two, codegen(RequestStats { ran: 2, cached: 0, joined: 0, critical_path_ns: 18, ..Default::default() }, 18));
+    assert_eq!(
+        two,
+        codegen(
+            RequestStats {
+                ran: 2,
+                cached: 0,
+                joined: 0,
+                critical_path_ns: 18,
+                ..Default::default()
+            },
+            18
+        )
+    );
     let three = plane.stats(RequestId(3)).unwrap();
-    assert_eq!(three, codegen(RequestStats { ran: 1, cached: 0, joined: 1, critical_path_ns: 3, ..Default::default() }, 3));
+    assert_eq!(
+        three,
+        codegen(
+            RequestStats {
+                ran: 1,
+                cached: 0,
+                joined: 1,
+                critical_path_ns: 3,
+                ..Default::default()
+            },
+            3
+        )
+    );
 
     // Now the database has key 7: request 4's node of it is cached, and only 9 runs, 40..47.
     open(&mut plane, 4, 1, false);
@@ -374,7 +406,19 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     close(&mut plane, 4);
     assert_eq!(finished(&at(&mut plane, done_at(9, 47))), [(4, true)]);
     let four = plane.stats(RequestId(4)).unwrap();
-    assert_eq!(four, codegen(RequestStats { ran: 1, cached: 1, joined: 0, critical_path_ns: 7, ..Default::default() }, 7));
+    assert_eq!(
+        four,
+        codegen(
+            RequestStats {
+                ran: 1,
+                cached: 1,
+                joined: 0,
+                critical_path_ns: 7,
+                ..Default::default()
+            },
+            7
+        )
+    );
 
     assert_eq!(plane.stats(RequestId(99)), None);
     plane.release(RequestId(4)).unwrap();
@@ -480,10 +524,13 @@ fn nodes_as_columns_say_what_nodes_as_specs_say() {
                             _ => panic!("seed {seed}: {it:?} before the batch's record"),
                         });
                         assert!(matches!(first, Some(Event::Nodes { .. })), "seed {seed}");
-                        assert!(each.iter().all(|it| !matches!(it, PlaneOutput::Said {
-                            record: Record { event: Event::Nodes { .. }, .. },
-                            ..
-                        })));
+                        assert!(each.iter().all(|it| !matches!(
+                            it,
+                            PlaneOutput::Said {
+                                record: Record { event: Event::Nodes { .. }, .. },
+                                ..
+                            }
+                        )));
                     } else {
                         assert_eq!(each, together, "seed {seed}");
                     }
@@ -641,7 +688,8 @@ fn nodes_read_from_a_trace_are_checked() {
     assert!(refused.contains("3 nodes but 2 costs"), "{refused}");
     let refused = broken(&json, |it| it["deps_at"][1] = 3.into());
     assert!(refused.contains("deps_at goes back"), "{refused}");
-    let refused = broken(&json, |it| it["name_at"].as_array_mut().unwrap().pop().map(drop).unwrap());
+    let refused =
+        broken(&json, |it| it["name_at"].as_array_mut().unwrap().pop().map(drop).unwrap());
     assert!(refused.contains("name_at of 3 offsets"), "{refused}");
     let refused = broken(&json, |it| it["first"] = u32::MAX.into());
     assert!(refused.contains("past u32"), "{refused}");
@@ -745,16 +793,20 @@ fn a_cancelled_request_skips_what_has_not_started_and_lets_what_runs_finish() {
     assert!(finished(&out).is_empty());
     assert!(plane.cancel(6, RequestId(1)).unwrap().is_empty());
     assert_eq!(
-        plane.step(PlaneInput::Add { at_ns: 6, request: RequestId(1), nodes: vec![work(9, &[], 1)] }),
+        plane.step(PlaneInput::Add {
+            at_ns: 6,
+            request: RequestId(1),
+            nodes: vec![work(9, &[], 1)]
+        }),
         Err(Error::Closed)
     );
-    assert_eq!(plane.step(PlaneInput::Close { at_ns: 6, request: RequestId(1) }), Err(Error::Closed));
+    assert_eq!(
+        plane.step(PlaneInput::Close { at_ns: 6, request: RequestId(1) }),
+        Err(Error::Closed)
+    );
     // What the running task finds is added skipped; the request then finishes, not ok.
     let out = plane.step(done(1, Outcome::Built, vec![work(4, &[1], 1)])).unwrap();
-    assert_eq!(
-        moves(&out),
-        [(1, NodeState::Built), (4, NodeState::Skipped { because: 1 })]
-    );
+    assert_eq!(moves(&out), [(1, NodeState::Built), (4, NodeState::Skipped { because: 1 })]);
     assert_eq!(runs(&out), Vec::<u32>::new());
     assert_eq!(finished(&out), [(1, false)]);
     assert_eq!(plane.cancel(7, RequestId(1)), Err(Error::Over));
@@ -829,14 +881,20 @@ fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
     assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 2)])), [1]);
     // 2 granted, 8 held: 2 free, under the 7 asked. It waits for the grant, not the rest.
     plane.step(PlaneInput::Held { at_ns: 0, bytes: 8 }).unwrap();
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 7)])), Vec::<u32>::new());
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 7)])),
+        Vec::<u32>::new()
+    );
     assert_eq!(plane.short(), 5, "8 held less 2 granted is 6 besides; 7 wants 5 of them let go");
     let out = built(&mut plane, 1);
     assert_eq!(runs(&out), [2], "nothing granted memory runs: it starts though 8 are held");
     assert_eq!(plane.short(), 0);
     assert!(matches!(plane.state(NodeId(2)), Some(NodeState::Running)));
     // 7 granted, 8 held: 2 free. 3 waits for the grant of 7, then starts alone in turn.
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 3)])), Vec::<u32>::new());
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 3)])),
+        Vec::<u32>::new()
+    );
     assert_eq!(runs(&built(&mut plane, 2)), [3]);
 }
 
@@ -847,10 +905,8 @@ fn a_task_passed_over_starts_before_smaller_ones_behind_it() {
     let mut plane =
         Plane::new(PlaneConfig { io: 2, work: 4, budget: budget(10), starve_after: 2 }).unwrap();
     open(&mut plane, 1, 1, true);
-    let mut nodes = vec![
-        node(1, &[], Pool::Work, 1000, None, 5),
-        node(2, &[], Pool::Work, 100, None, 8),
-    ];
+    let mut nodes =
+        vec![node(1, &[], Pool::Work, 1000, None, 5), node(2, &[], Pool::Work, 100, None, 8)];
     nodes.extend((3..9).map(|id| node(id, &[], Pool::Work, 10 - u64::from(id), None, 2)));
     let out = add(&mut plane, 1, nodes);
     assert_eq!(runs(&out), [1, 3, 4]);
@@ -894,7 +950,11 @@ fn a_task_predicted_the_whole_budget_runs_alone() {
     assert_eq!(runs(&built(&mut plane, 1)), Vec::<u32>::new());
     assert_eq!(runs(&built(&mut plane, 3)), [2], "nothing granted memory runs: it starts");
     assert_eq!(plane.granted(), 10);
-    let out = add(&mut plane, 1, vec![node(5, &[], Pool::Work, 1, None, 1), node(6, &[], Pool::Work, 1, None, 0)]);
+    let out = add(
+        &mut plane,
+        1,
+        vec![node(5, &[], Pool::Work, 1, None, 1), node(6, &[], Pool::Work, 1, None, 0)],
+    );
     assert_eq!(runs(&out), [6], "beside it, only what holds no memory");
     assert_eq!(runs(&built(&mut plane, 2)), [5]);
 }
@@ -979,7 +1039,7 @@ struct Planned {
 struct Model {
     seed: u64,
     budget: Option<u64>,
-    specs: HashMap<u32, Spec, Global>, // alloc: a test's model
+    specs: HashMap<u32, Spec, Global>,     // alloc: a test's model
     request_of: HashMap<u32, u32, Global>, // alloc: a test's model
     nodes_of: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
     dependents: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
@@ -992,7 +1052,7 @@ struct Model {
     /// dropped since.
     db: Db,
     finished: HashMap<u32, bool, Global>, // alloc: a test's model
-    cancelled: HashSet<u32, Global>, // alloc: a test's model
+    cancelled: HashSet<u32, Global>,      // alloc: a test's model
     /// The requests idle now.
     idle: HashSet<u32, Global>, // alloc: a test's model
     /// The requests that keep going past a failure.
@@ -1017,7 +1077,8 @@ impl Model {
     }
 
     /// The longest path of expected cost from `id` to the end of its request.
-    fn priority(&self, id: u32, memo: &mut HashMap<u32, u64, Global>) -> u64 { // alloc: a test's model
+    fn priority(&self, id: u32, memo: &mut HashMap<u32, u64, Global>) -> u64 {
+        // alloc: a test's model
         if let Some(&it) = memo.get(&id) {
             return it;
         }
@@ -1036,7 +1097,9 @@ impl Model {
     fn done_well(&self, dep: u32, of: u32) -> bool {
         match self.states.get(&dep) {
             Some(NodeState::Built | NodeState::Cached { .. }) => true,
-            Some(NodeState::Failed { why }) => why == "open" && self.keep_going.contains(&self.request_of[&of]),
+            Some(NodeState::Failed { why }) => {
+                why == "open" && self.keep_going.contains(&self.request_of[&of])
+            }
             _ => false,
         }
     }
@@ -1060,7 +1123,10 @@ impl Model {
                         for node in batch.iter() {
                             let id = node.id;
                             assert_eq!(self.request_of[&id], request.0, "seed {seed}: #{id}");
-                            assert!(!self.states.contains_key(&id), "seed {seed}: #{id} moved first");
+                            assert!(
+                                !self.states.contains_key(&id),
+                                "seed {seed}: #{id} moved first"
+                            );
                             let spec = &self.specs[&id];
                             assert_eq!((node.kind, node.name), (spec.kind, spec.name.as_str()));
                             let deps = spec.deps.iter().map(|it| it.0);
@@ -1089,7 +1155,10 @@ impl Model {
                             // The one failure for memory: a prediction over the budget. One under
                             // it starts alone, never fails (memadmit).
                             let budget = self.budget.expect("a failure of memory has a budget");
-                            assert!(why.contains("more than blaze may use here"), "seed {seed}: {why}");
+                            assert!(
+                                why.contains("more than blaze may use here"),
+                                "seed {seed}: {why}"
+                            );
                             assert!(spec.memory > budget, "seed {seed}: {why}");
                         }
                         if state.settled() && holding == Some(NodeId(*id)) {
@@ -1121,14 +1190,24 @@ impl Model {
                     let most = self.nodes_of[&self.request_of[&id.0]]
                         .iter()
                         .filter(|it| {
-                            matches!(self.states.get(*it), Some(NodeState::Ready | NodeState::Running))
+                            matches!(
+                                self.states.get(*it),
+                                Some(NodeState::Ready | NodeState::Running)
+                            )
                         })
                         .map(|it| self.priority(*it, &mut memo))
                         .max()
                         .unwrap_or(0);
-                    assert_eq!(*critical, mine >= most, "seed {seed}: #{id} at {mine}, most {most}");
+                    assert_eq!(
+                        *critical,
+                        mine >= most,
+                        "seed {seed}: #{id} at {mine}, most {most}"
+                    );
                     for dep in &spec.deps {
-                        assert!(self.done_well(dep.0, id.0), "seed {seed}: #{id} runs before #{dep}");
+                        assert!(
+                            self.done_well(dep.0, id.0),
+                            "seed {seed}: #{id} runs before #{dep}"
+                        );
                     }
                     if let Some(key) = spec.key {
                         assert!(self.running_keys.insert(key), "seed {seed}: {key:?} runs twice");
@@ -1147,8 +1226,8 @@ impl Model {
                             && !held_settled
                         {
                             let held = &self.specs[&held.0];
-                            let same = held.id == spec.id
-                                || (held.key.is_some() && held.key == spec.key);
+                            let same =
+                                held.id == spec.id || (held.key.is_some() && held.key == spec.key);
                             assert!(same, "seed {seed}: #{id} starts while {} is held", held.id);
                         }
                     }
@@ -1195,9 +1274,8 @@ impl Model {
                     assert!(self.finished.insert(r, *ok).is_none(), "seed {seed}: twice");
                     let nodes = self.nodes_of.get(&r).map_or(&[][..], Vec::as_slice);
                     assert!(nodes.iter().all(|it| self.states[it].settled()), "seed {seed}");
-                    let failed = nodes
-                        .iter()
-                        .any(|it| matches!(self.states[it], NodeState::Failed { .. }));
+                    let failed =
+                        nodes.iter().any(|it| matches!(self.states[it], NodeState::Failed { .. }));
                     assert_eq!(*ok, !failed && !self.cancelled.contains(&r), "seed {seed}");
                     // Released, it is gone once finished; kept, it says what it ran.
                     if let Some(stats) = plane.stats(*request) {
@@ -1232,7 +1310,8 @@ impl Model {
         self.granted -= spec.memory;
         let key = spec.key?;
         self.running_keys.remove(&key);
-        (keep_failure || !matches!(outcome, Outcome::Failed { .. } | Outcome::FailedOpen { .. })).then(|| (key, outcome.clone()))
+        (keep_failure || !matches!(outcome, Outcome::Failed { .. } | Outcome::FailedOpen { .. }))
+            .then(|| (key, outcome.clone()))
     }
 
     /// A running task gave way: it holds nothing, runs no key, and was no start.
@@ -1413,9 +1492,10 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     let mut at = 0u64;
     let mut steps = 0u64;
     loop {
-        let all_over = planned.iter().enumerate().all(|(r, it)| {
-            it.opened && model.finished.contains_key(&(r as u32))
-        });
+        let all_over = planned
+            .iter()
+            .enumerate()
+            .all(|(r, it)| it.opened && model.finished.contains_key(&(r as u32)));
         if all_over {
             break;
         }
@@ -1434,7 +1514,8 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             driver.act(Act::Cancel(at, RequestId(r)), next_id)
         } else if roll < 8 && budget.is_some() {
             let budget = budget.unwrap_or(0);
-            let bytes = if random.one_in(10) { random.below(budget * 2) } else { random.below(budget / 3) };
+            let bytes =
+                if random.one_in(10) { random.below(budget * 2) } else { random.below(budget / 3) };
             driver.act(Act::Step(PlaneInput::Held { at_ns: at, bytes }), next_id)
         } else if roll < 10 && !model.db.lock().is_empty() {
             let dropped = {
@@ -1444,10 +1525,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
                 kept[random.below(kept.len() as u64) as usize]
             };
             driver.act(Act::Drop(dropped), next_id)
-        } else if idle
-            && (45..48).contains(&roll)
-            && live.iter().any(|r| model.idle.contains(r))
-        {
+        } else if idle && (45..48).contains(&roll) && live.iter().any(|r| model.idle.contains(r)) {
             let idle: Vec<u32> = live.iter().copied().filter(|r| model.idle.contains(r)).collect();
             let r = idle[random.below(idle.len() as u64) as usize];
             model.idle.remove(&r);
@@ -1617,7 +1695,8 @@ fn releasing_requests_changes_no_output() {
 /// same to each act and of itself after it.
 fn replay(seed: u64, simulated: &Simulated) {
     let db = Db::default();
-    let mut model = reference::Plane::with_memo(simulated.config.clone(), DbMemo(Arc::clone(&db))).unwrap();
+    let mut model =
+        reference::Plane::with_memo(simulated.config.clone(), DbMemo(Arc::clone(&db))).unwrap();
     assert_eq!(model.config(), &simulated.config);
     let requests = simulated.acts.first().map_or(0, |(_, _, seen)| seen.stats.len() as u32);
     for (at, (act, said, seen)) in simulated.acts.iter().enumerate() {
@@ -1755,8 +1834,14 @@ fn batches_in_any_order_and_refused_ones_match_the_reference() {
                 } else {
                     (Vec::new(), Vec::new())
                 };
-                let input =
-                    PlaneInput::Done { at_ns: at, id: NodeId(id), outcome, added, group: None, peak: 0 };
+                let input = PlaneInput::Done {
+                    at_ns: at,
+                    id: NodeId(id),
+                    outcome,
+                    added,
+                    group: None,
+                    peak: 0,
+                };
                 match both(&mut plane, &mut model, input) {
                     Ok(out) => {
                         known.extend(fresh);
@@ -1810,7 +1895,8 @@ fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
             assert_eq!(got, want, "round {round}");
             got
         };
-        let open = PlaneInput::Open { at_ns: at, request, weight: 1, keep_going: true, idle: false };
+        let open =
+            PlaneInput::Open { at_ns: at, request, weight: 1, keep_going: true, idle: false };
         both(open, &mut fresh);
         let mut running = runs(&both(PlaneInput::Add { at_ns: at, request, nodes }, &mut fresh));
         both(PlaneInput::Close { at_ns: at, request }, &mut fresh);
@@ -2055,7 +2141,10 @@ fn an_open_failure_runs_its_dependents_only_under_keep_going() {
     close(&mut plane, 1);
     let out = plane.step(done(1, open_failure(), Vec::new())).unwrap();
     assert_eq!(runs(&out), [2]);
-    assert_eq!(plane.state(NodeId(1)), Some(&NodeState::Failed { why: "bodies failed".to_owned() }));
+    assert_eq!(
+        plane.state(NodeId(1)),
+        Some(&NodeState::Failed { why: "bodies failed".to_owned() })
+    );
     let out = plane.step(done(2, Outcome::Built, vec![work(3, &[1], 1)])).unwrap();
     assert_eq!(runs(&out), [3]);
     assert_eq!(finished(&built(&mut plane, 3)), [(1, false)]);

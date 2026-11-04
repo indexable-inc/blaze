@@ -231,8 +231,8 @@ pub(crate) fn encode(
     // alloc: the error's message
     let size = postcard::experimental::serialized_size(&side).map_err(|e| e.to_string())?;
     // alloc: the side table's bytes, kept in the store: one allocation of their exact size
-    let bytes = postcard::to_extend(&side, Vec::<u8>::with_capacity(size))
-        .map_err(|e| e.to_string())?; // alloc: the error's message
+    let bytes =
+        postcard::to_extend(&side, Vec::<u8>::with_capacity(size)).map_err(|e| e.to_string())?; // alloc: the error's message
     let id = ContentId::of(SIDE_DOMAIN, &bytes);
     Ok(Some((bytes, id)))
 }
@@ -273,7 +273,9 @@ fn ranges<'f>(
             Some(SpanScope::Outside) => scope = None,
             Some(&SpanScope::In(it)) => scope = Some(it),
             // alloc: the error's message
-            None => return Err(format!("a line row of statement {}, which has no scope", row.span)),
+            None => {
+                return Err(format!("a line row of statement {}, which has no scope", row.span));
+            }
         }
         let len = out.len();
         extend(&mut out, |it| (it.parent, &mut it.ranges), scope, (row.offset, to))
@@ -433,7 +435,12 @@ mod tests {
     fn a_scope_is_the_code_of_its_rows() {
         let scopes = Scopes {
             parents: vec![None, Some(0)],
-            of_span: vec![SpanScope::Outside, SpanScope::In(0), SpanScope::In(1), SpanScope::Before],
+            of_span: vec![
+                SpanScope::Outside,
+                SpanScope::In(0),
+                SpanScope::In(1),
+                SpanScope::Before,
+            ],
             ..Scopes::default()
         };
         let row = |offset, span| LineRow { offset, span };
@@ -470,10 +477,13 @@ mod tests {
         .expect("a table of the inlined code");
         let side = decode(&bytes).expect("decoded");
         assert!(side.variables.is_empty() && side.scopes.is_empty());
-        assert_eq!(side.inlined, [
-            Inlined { parent: None, call_site: site(1), ranges: vec![(4, 16)] },
-            Inlined { parent: Some(0), call_site: site(2), ranges: vec![(8, 12)] },
-        ]);
+        assert_eq!(
+            side.inlined,
+            [
+                Inlined { parent: None, call_site: site(1), ranges: vec![(4, 16)] },
+                Inlined { parent: Some(0), call_site: site(2), ranges: vec![(8, 12)] },
+            ]
+        );
         let unknown = [row(0, 9)];
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
             assert!(inlined_ranges(&scopes, &unknown, 4, frame).is_err());
@@ -517,10 +527,13 @@ mod tests {
         let (bytes, id) = encoded().expect("encoded").expect("a table");
         let side = decode(&bytes).expect("decoded");
         assert_eq!(postcard::to_allocvec(&side).expect("postcard"), bytes);
-        assert_eq!(side.scopes, [
-            Scope { parent: None, ranges: vec![(4, 12)] },
-            Scope { parent: Some(0), ranges: vec![(8, 12)] },
-        ]);
+        assert_eq!(
+            side.scopes,
+            [
+                Scope { parent: None, ranges: vec![(4, 12)] },
+                Scope { parent: Some(0), ranges: vec![(8, 12)] },
+            ]
+        );
         assert_eq!(side.variables[1].place, Place::Ranges(vec![(0, 8, vec![0x50])]));
         let (warm, warm_id) =
             blaze_alloc_count::assert_at_most(1, "a warm side table: its bytes", encoded)

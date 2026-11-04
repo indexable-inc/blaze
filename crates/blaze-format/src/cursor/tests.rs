@@ -266,14 +266,14 @@ fn a_short_read_names_where_and_what_and_moves_nothing() {
     read.skip(3).unwrap();
     assert_eq!(read.u32(), Err(Error { at: 3, wanted: Wanted::Bytes { len: 4, left: 3 } }));
     assert_eq!(read.take(7), Err(Error { at: 3, wanted: Wanted::Bytes { len: 7, left: 3 } }));
-    assert_eq!(read.take(usize::MAX), Err(Error { at: 3, wanted: Wanted::Bytes { len: usize::MAX, left: 3 } }));
+    assert_eq!(
+        read.take(usize::MAX),
+        Err(Error { at: 3, wanted: Wanted::Bytes { len: usize::MAX, left: 3 } })
+    );
     assert_eq!(read.at(), 3);
     assert_eq!(read.array::<3>(), Ok(&[4, 5, 6]));
     assert_eq!(read.u8(), Err(Error { at: 6, wanted: Wanted::Bytes { len: 1, left: 0 } }));
-    assert_eq!(
-        read.u64().unwrap_err().to_string(),
-        "at byte 6: 8 bytes wanted, 0 left"
-    );
+    assert_eq!(read.u64().unwrap_err().to_string(), "at byte 6: 8 bytes wanted, 0 left");
     let message: String = read.u16().unwrap_err().into();
     assert_eq!(message, "at byte 6: 2 bytes wanted, 0 left");
     assert_eq!(read.u16().unwrap_err().as_str(), "bytes that end early");
@@ -290,7 +290,10 @@ fn a_prefix_past_the_end_is_refused_and_unread() {
     let mut out = Vec::new();
     out.put_u64(u64::MAX);
     let mut read = Reader::new(&out);
-    assert!(matches!(read.bytes_u64(), Err(Error { at: 8, wanted: Wanted::Bytes { left: 0, .. } })));
+    assert!(matches!(
+        read.bytes_u64(),
+        Err(Error { at: 8, wanted: Wanted::Bytes { left: 0, .. } })
+    ));
     assert_eq!(read.at(), 0);
     let mut out = Vec::new();
     out.put_bytes_u32(&[0xff, 0xfe]);
@@ -308,12 +311,18 @@ fn a_count_is_checked_against_the_bytes_left() {
     assert_eq!(Reader::new(&out).count_u32(4), Ok(3));
     assert_eq!(Reader::new(&out).count_u32(0), Ok(3), "each is at least a byte");
     let mut read = Reader::new(&out);
-    assert_eq!(read.count_u32(5), Err(Error { at: 4, wanted: Wanted::Count { count: 3, left: 12 } }));
+    assert_eq!(
+        read.count_u32(5),
+        Err(Error { at: 4, wanted: Wanted::Count { count: 3, left: 12 } })
+    );
     assert_eq!(read.at(), 0);
     let mut out = Vec::new();
     out.put_u64(u64::MAX / 2);
     out.put_bytes(&[0; 8]);
-    assert!(matches!(Reader::new(&out).count_u64(4), Err(Error { wanted: Wanted::Count { .. }, .. })));
+    assert!(matches!(
+        Reader::new(&out).count_u64(4),
+        Err(Error { wanted: Wanted::Count { .. }, .. })
+    ));
     let mut out = Vec::new();
     out.put_uleb(2);
     out.put_bytes(&[7, 7]);
@@ -372,7 +381,10 @@ fn uleb_limits() {
     assert_eq!(read.uleb(), Ok(u64::MAX));
     assert!(read.is_done());
     let over = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
-    assert_eq!(Reader::new(&over).uleb(), Err(Error { at: 0, wanted: Wanted::Leb(LebError::Overflow) }));
+    assert_eq!(
+        Reader::new(&over).uleb(),
+        Err(Error { at: 0, wanted: Wanted::Leb(LebError::Overflow) })
+    );
 }
 
 #[test]

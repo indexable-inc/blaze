@@ -1,4 +1,7 @@
-use object::read::elf::{Dyn as _, ElfFile64, FileHeader as _, ProgramHeader as _, Rela as _, SectionHeader as _, Sym as _};
+use object::read::elf::{
+    Dyn as _, ElfFile64, FileHeader as _, ProgramHeader as _, Rela as _, SectionHeader as _,
+    Sym as _,
+};
 use object::{Endianness, SymbolIndex, elf};
 
 use super::dynamic::{elf_hash, gnu_hash};
@@ -9,8 +12,8 @@ use parking_lot::Mutex;
 
 use crate::cow::CowBytes;
 use crate::model::{
-    Bind, Class, Counts, Delta, Export, Function, GotEntry, Holds, Import, Library, Pages, Placed, Plan, Region, Reserve,
-    Special, Splice, SymbolKind, Tls, Writer,
+    Bind, Class, Counts, Delta, Export, Function, GotEntry, Holds, Import, Library, Pages, Placed,
+    Plan, Region, Reserve, Special, Splice, SymbolKind, Tls, Writer,
 };
 use crate::output::Debug;
 use crate::{DevRun, Format, Output, OutputKind};
@@ -32,7 +35,11 @@ fn output(arch: blaze_codegen::Arch, kind: OutputKind, interpreter: Option<&str>
         exec_log: false,
         sanitize: blaze_codegen::settings::Sanitize::default(),
         rpaths: Vec::new(),
-        triple: match arch { blaze_codegen::Arch::Aarch64 => "aarch64-unknown-linux-gnu", _ => "x86_64-unknown-linux-gnu" }.into(),
+        triple: match arch {
+            blaze_codegen::Arch::Aarch64 => "aarch64-unknown-linux-gnu",
+            _ => "x86_64-unknown-linux-gnu",
+        }
+        .into(),
     }
 }
 
@@ -88,8 +95,10 @@ impl Fixture {
             regions.push(Region { class, addr, capacity: size, size, prot, align });
             addr += size;
         }
-        let contents =
-            regions.iter().map(|it| if !zeroed(&it.class) { vec![0; it.size as usize] } else { Vec::new() }).collect();
+        let contents = regions
+            .iter()
+            .map(|it| if !zeroed(&it.class) { vec![0; it.size as usize] } else { Vec::new() })
+            .collect();
         Fixture {
             writer,
             plan,
@@ -109,7 +118,10 @@ impl Fixture {
     }
 
     fn index(&self, class: &Class) -> usize {
-        self.regions.iter().position(|it| &it.class == class).unwrap_or_else(|| panic!("no {class:?}"))
+        self.regions
+            .iter()
+            .position(|it| &it.class == class)
+            .unwrap_or_else(|| panic!("no {class:?}"))
     }
 
     fn at(&self, class: &Class) -> u64 {
@@ -146,9 +158,12 @@ impl Fixture {
         delta: Option<&Delta<'_>>,
         then: impl FnOnce(&Placed<'_>) -> R,
     ) -> R {
-        let contents: Vec<&[u8]> = (contents.iter().enumerate())
-            .map(|(at, it)| if paged.get(at).is_some_and(Option::is_some) { &[][..] } else { it.as_slice() })
-            .collect();
+        let contents: Vec<&[u8]> =
+            (contents.iter().enumerate())
+                .map(|(at, it)| {
+                    if paged.get(at).is_some_and(Option::is_some) { &[][..] } else { it.as_slice() }
+                })
+                .collect();
         then(&Placed {
             output: &self.writer.output,
             name: "image",
@@ -178,13 +193,23 @@ impl Fixture {
 
     /// Synthesizes with `writer`, then makes the file's parts with the synthetic regions'
     /// bytes where the core puts them, both of synthesis `synthesis` with `delta`.
-    fn build(&self, writer: &Elf, synthesis: u64, delta: Option<&Delta<'_>>) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
+    fn build(
+        &self,
+        writer: &Elf,
+        synthesis: u64,
+        delta: Option<&Delta<'_>>,
+    ) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
         let (tables, parts) = self.shared(writer, synthesis, delta);
         (flat(tables), flat(parts))
     }
 
     /// [`Fixture::build`]'s tables and parts as the writer hands them over.
-    fn shared(&self, writer: &Elf, synthesis: u64, delta: Option<&Delta<'_>>) -> (Vec<(Class, CowBytes)>, Vec<(u64, CowBytes)>) {
+    fn shared(
+        &self,
+        writer: &Elf,
+        synthesis: u64,
+        delta: Option<&Delta<'_>>,
+    ) -> (Vec<(Class, CowBytes)>, Vec<(u64, CowBytes)>) {
         self.shared_in(writer, synthesis, delta, &[])
     }
 
@@ -201,13 +226,18 @@ impl Fixture {
         for (class, bytes) in held {
             paged[self.index(class)] = Some(Pages::all(bytes));
         }
-        let tables =
-            self.with_pages(&self.contents, &paged, synthesis, delta, |placed| writer.synthesize(placed)).unwrap();
+        let tables = self
+            .with_pages(&self.contents, &paged, synthesis, delta, |placed| {
+                writer.synthesize(placed)
+            })
+            .unwrap();
         let mut contents = self.contents.clone();
         for (class, bytes) in &tables {
             contents[self.index(class)] = bytes.contiguous().into_owned();
         }
-        let file = self.with_pages(&contents, &paged, synthesis, delta, |placed| writer.file(placed)).unwrap();
+        let file = self
+            .with_pages(&contents, &paged, synthesis, delta, |placed| writer.file(placed))
+            .unwrap();
         (tables, file.parts)
     }
 
@@ -220,14 +250,22 @@ impl Fixture {
     fn link(&mut self) -> Vec<u8> {
         for (class, bytes) in self.synthesize().unwrap() {
             let index = self.index(&class);
-            assert!(bytes.len() as u64 <= self.regions[index].capacity, "{class:?} outgrew the size it asked for");
+            assert!(
+                bytes.len() as u64 <= self.regions[index].capacity,
+                "{class:?} outgrew the size it asked for"
+            );
             self.contents[index] = bytes;
         }
         for (class, bytes) in self.synthesize().unwrap() {
-            assert_eq!(self.contents[self.index(&class)], bytes, "{class:?} is not a function of the image");
+            assert_eq!(
+                self.contents[self.index(&class)],
+                bytes,
+                "{class:?} is not a function of the image"
+            );
         }
         let (file, offsets) = self.with(|placed| {
-            let offsets: Vec<Option<u64>> = self.regions.iter().map(|it| self.writer.offset(placed, it)).collect();
+            let offsets: Vec<Option<u64>> =
+                self.regions.iter().map(|it| self.writer.offset(placed, it)).collect();
             (self.writer.file(placed).unwrap(), offsets)
         });
         let again = self.with(|placed| self.writer.file(placed).unwrap());
@@ -264,25 +302,44 @@ fn the_debug_sections_are_the_cores_not_copies() {
     let counts = Counts { functions: 1, function_names: 4, ..Counts::default() };
     let mut image = Fixture::new(executable(), &[(Class::Text, 64, 16)], &counts);
     let text = image.at(&Class::Text);
-    image.functions = vec![Function { addr: text, size: 64, fde: None, windows: None, name: Some("main".into()) }];
+    image.functions = vec![Function {
+        addr: text,
+        size: 64,
+        fde: None,
+        windows: None,
+        name: Some("main".into()),
+    }];
     image.entry = Some(text);
     for (class, bytes) in image.synthesize().unwrap() {
         let index = image.index(&class);
         image.contents[index] = bytes;
     }
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let used = [3usize, 1 << 20].map(|len| {
         let line: Vec<u8> = (0..len).map(|it| (it * 7 % 251) as u8).collect();
-        image.debug = vec![(".debug_line", line), (".debug_str", Vec::new()), (".debug_info", vec![9; len / 3 + 1])];
-        let (file, used) = pool.install(|| blaze_alloc_count::measure(|| image.with(|placed| image.writer.file(placed))));
+        image.debug = vec![
+            (".debug_line", line),
+            (".debug_str", Vec::new()),
+            (".debug_info", vec![9; len / 3 + 1]),
+        ];
+        let (file, used) = pool.install(|| {
+            blaze_alloc_count::measure(|| image.with(|placed| image.writer.file(placed)))
+        });
         let file = file.unwrap();
-        assert_eq!(file.debug.iter().map(|it| it.1).collect::<Vec<_>>(), [0, 2], "an empty section is not laid");
+        assert_eq!(
+            file.debug.iter().map(|it| it.1).collect::<Vec<_>>(),
+            [0, 2],
+            "an empty section is not laid"
+        );
         let bytes = image.link();
         let parsed = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
         let endian = parsed.endian();
         let shdrs = parsed.elf_section_table();
         for (name, data) in &image.debug {
-            let (_, shdr) = shdrs.section_by_name(endian, name.as_bytes()).unwrap_or_else(|| panic!("no {name}"));
+            let (_, shdr) = shdrs
+                .section_by_name(endian, name.as_bytes())
+                .unwrap_or_else(|| panic!("no {name}"));
             assert_eq!(shdr.data(endian, &bytes[..]).unwrap(), &data[..], "{name}");
         }
         used
@@ -297,7 +354,9 @@ fn c_string(data: &[u8], at: u64) -> &str {
 }
 
 fn eh_frame(fdes: &[(u64, u32)]) -> Vec<u8> {
-    use gimli::write::{Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable};
+    use gimli::write::{
+        Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable,
+    };
     let mut table = FrameTable::default();
     let encoding = gimli::Encoding { address_size: 8, format: gimli::Format::Dwarf32, version: 1 };
     let cie = table.add_cie(CommonInformationEntry::new(encoding, 1, -8, gimli::Register(16)));
@@ -389,7 +448,13 @@ fn an_executable_reads_back() {
     ];
     image.functions = vec![
         Function { addr: text, size: 32, fde: None, windows: None, name: Some("main".into()) },
-        Function { addr: text + 32, size: 32, fde: None, windows: None, name: Some("_start".into()) },
+        Function {
+            addr: text + 32,
+            size: 32,
+            fde: None,
+            windows: None,
+            name: Some("_start".into()),
+        },
     ];
     image.entry = Some(text + 32);
     image.tls = Some(Tls { addr: tdata, init: 8, size: 24, align: 8 });
@@ -418,10 +483,16 @@ fn an_executable_reads_back() {
         let end = region.addr + region.size;
         let load = loads
             .iter()
-            .find(|it| it.p_vaddr(endian) <= region.addr && end <= it.p_vaddr(endian) + it.p_memsz(endian))
+            .find(|it| {
+                it.p_vaddr(endian) <= region.addr && end <= it.p_vaddr(endian) + it.p_memsz(endian)
+            })
             .unwrap_or_else(|| panic!("{:?} in no PT_LOAD", region.class));
         if !zeroed(&region.class) {
-            assert!(end <= load.p_vaddr(endian) + load.p_filesz(endian), "{:?} past the file", region.class);
+            assert!(
+                end <= load.p_vaddr(endian) + load.p_filesz(endian),
+                "{:?} past the file",
+                region.class
+            );
         }
         let flags = load.p_flags(endian).0;
         assert_eq!(flags, Segment::of(&region.class).flags(), "{:?}", region.class);
@@ -432,9 +503,15 @@ fn an_executable_reads_back() {
     let relro_phdr = phdr(elf::PT_GNU_RELRO);
     for class in [Class::RelRo, Class::Got, Class::InitArray, Class::Synthetic(super::DYNAMIC)] {
         let addr = image.at(&class);
-        assert!(relro_phdr.p_vaddr(endian) <= addr && addr < relro_phdr.p_vaddr(endian) + relro_phdr.p_memsz(endian));
+        assert!(
+            relro_phdr.p_vaddr(endian) <= addr
+                && addr < relro_phdr.p_vaddr(endian) + relro_phdr.p_memsz(endian)
+        );
     }
-    assert!(relro_phdr.p_vaddr(endian) + relro_phdr.p_memsz(endian) <= data, "relro ends before the writable data");
+    assert!(
+        relro_phdr.p_vaddr(endian) + relro_phdr.p_memsz(endian) <= data,
+        "relro ends before the writable data"
+    );
     let tls = phdr(elf::PT_TLS);
     assert_eq!((tls.p_vaddr(endian), tls.p_filesz(endian), tls.p_memsz(endian)), (tdata, 8, 24));
     assert!(tdata < bss);
@@ -443,7 +520,9 @@ fn an_executable_reads_back() {
     assert_eq!(&note[16..], b"blaze build id!!");
     let hdr = image.at(&Class::Synthetic(super::EH_FRAME_HDR));
     assert_eq!(phdr(elf::PT_GNU_EH_FRAME).p_vaddr(endian), hdr);
-    assert!(phdrs.iter().any(|it| it.p_type(endian) == elf::PT_GNU_STACK && it.p_flags(endian).0 == 6));
+    assert!(
+        phdrs.iter().any(|it| it.p_type(endian) == elf::PT_GNU_STACK && it.p_flags(endian).0 == 6)
+    );
 
     // `.eh_frame_hdr`: both FDEs, sorted by the address they cover.
     let table = &bytes[hdr as usize..];
@@ -456,7 +535,8 @@ fn an_executable_reads_back() {
 
     // `.dynamic`.
     let dynamic = phdr(elf::PT_DYNAMIC).dynamic(endian, data_bytes).unwrap().unwrap();
-    let entries: Vec<(u64, u64)> = dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect();
+    let entries: Vec<(u64, u64)> =
+        dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect();
     let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
     let strtab = tag(elf::DT_STRTAB).unwrap();
     let needed: Vec<&str> = entries
@@ -464,7 +544,11 @@ fn an_executable_reads_back() {
         .filter(|it| it.0 == elf::DT_NEEDED.0 as u64)
         .map(|it| c_string(data_bytes, strtab + it.1))
         .collect();
-    assert_eq!(needed, ["libc.so.6", "libm.so.6"], "an as-needed library nothing imports from is left out");
+    assert_eq!(
+        needed,
+        ["libc.so.6", "libm.so.6"],
+        "an as-needed library nothing imports from is left out"
+    );
     assert_eq!(tag(elf::DT_FLAGS), Some(elf::DF_BIND_NOW.0));
     assert_eq!(tag(elf::DT_FLAGS_1), Some((elf::DF_1_NOW | elf::DF_1_PIE).0));
     assert_eq!(tag(elf::DT_DEBUG), Some(0));
@@ -483,7 +567,14 @@ fn an_executable_reads_back() {
     let (relas, _) = rela.rela(endian, data_bytes).unwrap().unwrap();
     let relas: Vec<(u64, u32, u32, i64)> = relas
         .iter()
-        .map(|it| (it.r_offset(endian), it.r_type(endian, false).0, it.r_sym(endian, false), it.r_addend(endian)))
+        .map(|it| {
+            (
+                it.r_offset(endian),
+                it.r_type(endian, false).0,
+                it.r_sym(endian, false),
+                it.r_addend(endian),
+            )
+        })
         .collect();
     let mut relative = vec![
         (data, elf::R_X86_64_RELATIVE.0, 0, rodata as i64),
@@ -506,9 +597,14 @@ fn an_executable_reads_back() {
     let dynsyms = sections.symbols(endian, data_bytes, elf::SHT_DYNSYM).unwrap();
     let versions = sections.versions(endian, data_bytes).unwrap().unwrap();
     let version = |index: usize| {
-        versions.version(versions.version_index(endian, SymbolIndex(index)).index()).unwrap().map(|it| it.name().to_vec())
+        versions
+            .version(versions.version_index(endian, SymbolIndex(index)).index())
+            .unwrap()
+            .map(|it| it.name().to_vec())
     };
-    let name = |index: usize| dynsyms.symbol(SymbolIndex(index)).unwrap().name(endian, dynsyms.strings()).unwrap();
+    let name = |index: usize| {
+        dynsyms.symbol(SymbolIndex(index)).unwrap().name(endian, dynsyms.strings()).unwrap()
+    };
     assert_eq!(name(1), b"malloc");
     assert_eq!(version(1).as_deref(), Some(&b"GLIBC_2.2.5"[..]));
     assert_eq!(name(2), b"realpath");
@@ -526,7 +622,9 @@ fn an_executable_reads_back() {
         assert_eq!(symbol.st_value(endian), export.addr);
         assert!(!symbol.is_undefined(endian));
     }
-    assert!(hash.find(endian, b"malloc", elf::gnu_hash(b"malloc"), None, &dynsyms, &versions).is_none());
+    assert!(
+        hash.find(endian, b"malloc", elf::gnu_hash(b"malloc"), None, &dynsyms, &versions).is_none()
+    );
 
     // `.symtab` names the functions; every region has its section header.
     let symtab = sections.symbols(endian, data_bytes, elf::SHT_SYMTAB).unwrap();
@@ -573,7 +671,13 @@ fn relro_is_protected_whole_and_only_where_its_load_maps_on_every_page_size() {
     );
     let mut image = Fixture::new(output, &pieces, &counts);
     let text = image.at(&Class::Text);
-    image.functions = vec![Function { addr: text, size: 64, fde: None, windows: None, name: Some("_start".into()) }];
+    image.functions = vec![Function {
+        addr: text,
+        size: 64,
+        fde: None,
+        windows: None,
+        name: Some("_start".into()),
+    }];
     image.entry = Some(text);
     let relro_classes = [Class::RelRo, Class::InitArray, Class::Synthetic(super::DYNAMIC)];
     let relro_bytes: Vec<(u64, u64)> = image
@@ -591,7 +695,10 @@ fn relro_is_protected_whole_and_only_where_its_load_maps_on_every_page_size() {
     let relro = phdrs.iter().find(|it| it.p_type(endian) == elf::PT_GNU_RELRO).unwrap();
     let (start, end) = (relro.p_vaddr(endian), relro.p_vaddr(endian) + relro.p_memsz(endian));
     let loads: Vec<_> = phdrs.iter().filter(|it| it.p_type(endian) == elf::PT_LOAD).collect();
-    let at = loads.iter().position(|it| it.p_vaddr(endian) == start).expect("relro starts its own PT_LOAD");
+    let at = loads
+        .iter()
+        .position(|it| it.p_vaddr(endian) == start)
+        .expect("relro starts its own PT_LOAD");
     let load = loads[at];
     assert!(at + 1 < loads.len(), "writable data follows relro");
     assert!(end <= loads[at + 1].p_vaddr(endian), "relro ends before the next PT_LOAD");
@@ -599,9 +706,15 @@ fn relro_is_protected_whole_and_only_where_its_load_maps_on_every_page_size() {
         let down = |it: u64| it / page * page;
         let mapped = load.p_vaddr(endian) + (load.p_memsz(endian)).next_multiple_of(page);
         let (from, to) = (down(start), down(end));
-        assert!(to <= mapped, "{page:#x} pages: relro is protected to {to:#x}, its PT_LOAD maps to {mapped:#x}");
+        assert!(
+            to <= mapped,
+            "{page:#x} pages: relro is protected to {to:#x}, its PT_LOAD maps to {mapped:#x}"
+        );
         for &(first, past) in &relro_bytes {
-            assert!(from <= first && past <= to, "{page:#x} pages: {first:#x}..{past:#x} is outside {from:#x}..{to:#x}");
+            assert!(
+                from <= first && past <= to,
+                "{page:#x} pages: {first:#x}..{past:#x} is outside {from:#x}..{to:#x}"
+            );
         }
     }
 }
@@ -621,7 +734,12 @@ fn a_shared_library_exports_through_its_hash_table() {
     image.exports = names
         .iter()
         .enumerate()
-        .map(|(at, name)| Export { name: name.clone(), addr: text + 4 * at as u64, size: 4, kind: SymbolKind::Function })
+        .map(|(at, name)| Export {
+            name: name.clone(),
+            addr: text + 4 * at as u64,
+            size: 4,
+            kind: SymbolKind::Function,
+        })
         .collect();
 
     let bytes = image.link();
@@ -636,9 +754,13 @@ fn a_shared_library_exports_through_its_hash_table() {
         assert_eq!(load.p_align(endian), 0x10000);
     }
     let dynamic = phdrs.iter().find_map(|it| it.dynamic(endian, data).unwrap()).unwrap();
-    let entries: Vec<(u64, u64)> = dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect();
+    let entries: Vec<(u64, u64)> =
+        dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect();
     let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
-    assert_eq!(c_string(data, tag(elf::DT_STRTAB).unwrap() + tag(elf::DT_SONAME).unwrap()), "libblaze.so");
+    assert_eq!(
+        c_string(data, tag(elf::DT_STRTAB).unwrap() + tag(elf::DT_SONAME).unwrap()),
+        "libblaze.so"
+    );
     assert_eq!(tag(elf::DT_FLAGS), Some((elf::DF_BIND_NOW | elf::DF_SYMBOLIC).0));
     assert_eq!(tag(elf::DT_FLAGS_1), Some(elf::DF_1_NOW.0));
     assert_eq!(tag(elf::DT_DEBUG), None);
@@ -656,15 +778,26 @@ fn a_shared_library_exports_through_its_hash_table() {
         assert_eq!(symbol.st_value(endian), export.addr);
         assert_eq!(symbol.st_type(), elf::STT_FUNC);
     }
-    assert!(hash.find(endian, b"blaze_export_100", elf::gnu_hash(b"blaze_export_100"), None, &dynsyms, &versions).is_none());
+    assert!(
+        hash.find(
+            endian,
+            b"blaze_export_100",
+            elf::gnu_hash(b"blaze_export_100"),
+            None,
+            &dynsyms,
+            &versions
+        )
+        .is_none()
+    );
 }
 
 #[test]
 fn a_pointer_in_read_only_data_is_a_text_relocation() {
-    let mut image = Fixture::new(executable(), &[(Class::Text, 16, 16), (Class::Rodata, 8, 8)], &Counts {
-        absolute: 1,
-        ..Counts::default()
-    });
+    let mut image = Fixture::new(
+        executable(),
+        &[(Class::Text, 16, 16), (Class::Rodata, 8, 8)],
+        &Counts { absolute: 1, ..Counts::default() },
+    );
     let rodata = image.at(&Class::Rodata);
     image.rebase = vec![rodata];
     image.entry = Some(image.at(&Class::Text));
@@ -678,10 +811,16 @@ fn a_pointer_in_read_only_data_is_a_text_relocation() {
 fn a_shared_librarys_initial_exec_cell_is_relocated_against_the_module() {
     use blaze_codegen::Arch::{Aarch64, X86_64};
     // The thread pointer offset of the variable at 4 in a 24-byte template aligned to 16.
-    for (arch, tp, r_type) in [(X86_64, 4 - 32, elf::R_X86_64_TPOFF64), (Aarch64, 16 + 4, elf::R_AARCH64_TLS_TPREL)] {
+    for (arch, tp, r_type) in
+        [(X86_64, 4 - 32, elf::R_X86_64_TPOFF64), (Aarch64, 16 + 4, elf::R_AARCH64_TLS_TPREL)]
+    {
         let kind = OutputKind::Shared { name: "libx.so".into(), exports: Vec::new() };
         let pieces = [(Class::Text, 16, 16), (Class::Got, 8, 8), (Class::Tdata, 24, 16)];
-        let mut image = Fixture::new(output(arch, kind, None), &pieces, &Counts { got: 1, ..Counts::default() });
+        let mut image = Fixture::new(
+            output(arch, kind, None),
+            &pieces,
+            &Counts { got: 1, ..Counts::default() },
+        );
         let got = image.at(&Class::Got);
         image.got = vec![GotEntry { addr: got, holds: Holds::TpOff(tp) }];
         image.tls = Some(Tls { addr: image.at(&Class::Tdata), init: 24, size: 24, align: 16 });
@@ -695,11 +834,23 @@ fn a_shared_librarys_initial_exec_cell_is_relocated_against_the_module() {
         let (relas, _) = rela.rela(endian, data).unwrap().unwrap();
         let relas: Vec<(u64, u32, u32, i64)> = relas
             .iter()
-            .map(|it| (it.r_offset(endian), it.r_type(endian, false).0, it.r_sym(endian, false), it.r_addend(endian)))
+            .map(|it| {
+                (
+                    it.r_offset(endian),
+                    it.r_type(endian, false).0,
+                    it.r_sym(endian, false),
+                    it.r_addend(endian),
+                )
+            })
             .collect();
         assert_eq!(relas, [(got, r_type.0, 0, 4)], "{arch:?}");
-        let dynamic = file.elf_program_headers().iter().find_map(|it| it.dynamic(endian, data).unwrap()).unwrap();
-        let flags = dynamic.iter().find(|it| it.d_tag(endian) == elf::DT_FLAGS).unwrap().d_val(endian);
+        let dynamic = file
+            .elf_program_headers()
+            .iter()
+            .find_map(|it| it.dynamic(endian, data).unwrap())
+            .unwrap();
+        let flags =
+            dynamic.iter().find(|it| it.d_tag(endian) == elf::DT_FLAGS).unwrap().d_val(endian);
         assert_eq!(flags, (elf::DF_BIND_NOW | elf::DF_SYMBOLIC | elf::DF_STATIC_TLS).0, "{arch:?}");
     }
 }
@@ -730,7 +881,11 @@ fn hashes_are_the_elf_ones() {
 
 #[test]
 fn sections_are_placed_as_lld_places_them() {
-    let named = |name: &str, write: bool, exec: bool| Class::Named { name: crate::model::SectionName::new(name), write, exec };
+    let named = |name: &str, write: bool, exec: bool| Class::Named {
+        name: crate::model::SectionName::new(name),
+        write,
+        exec,
+    };
     let cases = [
         (".text", false, true, false, Class::Text, 0),
         (".text.unlikely._ZN3foo3barE", false, true, false, Class::Text, 0),
@@ -806,7 +961,10 @@ fn specials() {
         writer.special("__start_linkme_ITEMS"),
         Some(Special::Section { name: "linkme_ITEMS".into(), end: false })
     );
-    assert_eq!(writer.special("__stop_linkme_ITEMS"), Some(Special::Section { name: "linkme_ITEMS".into(), end: true }));
+    assert_eq!(
+        writer.special("__stop_linkme_ITEMS"),
+        Some(Special::Section { name: "linkme_ITEMS".into(), end: true })
+    );
     assert_eq!(writer.special("__start_.data"), None);
     assert_eq!(writer.special("__start_"), None);
     assert_eq!(writer.special("malloc"), None);
@@ -870,11 +1028,15 @@ fn native_relocations() {
     apply(X86_64, elf::R_X86_64_PC8.0, &mut bytes, 0x1000, 0x1000, -2).unwrap();
     assert_eq!(bytes, [0xfe]);
     assert!(apply(X86_64, elf::R_X86_64_PC8.0, &mut bytes, 0x1000, 0x1080, 0).is_err());
-    assert!(apply(X86_64, elf::R_X86_64_PC32.0, &mut [0; 4], 0, 0, 0).is_err(), "not a native type");
+    assert!(
+        apply(X86_64, elf::R_X86_64_PC32.0, &mut [0; 4], 0, 0, 0).is_err(),
+        "not a native type"
+    );
 
     // ADRP x0, page(S) with no range check.
     let mut bytes = insn(0x9000_0000);
-    apply(Aarch64, elf::R_AARCH64_ADR_PREL_PG_HI21_NC.0, &mut bytes, 0x1_0000, 0x1_3456, 0).unwrap();
+    apply(Aarch64, elf::R_AARCH64_ADR_PREL_PG_HI21_NC.0, &mut bytes, 0x1_0000, 0x1_3456, 0)
+        .unwrap();
     let w = word(&bytes);
     let imm = ((w >> 29) & 3) | (((w >> 5) & 0x7_ffff) << 2);
     assert_eq!(imm, 3);
@@ -884,7 +1046,10 @@ fn native_relocations() {
     let mut bytes = insn(0x5800_0001);
     apply(Aarch64, elf::R_AARCH64_LD_PREL_LO19.0, &mut bytes, 0x1000, 0x900, 0).unwrap();
     assert_eq!((word(&bytes) >> 5) & 0x7_ffff, ((-0x700i32 >> 2) as u32) & 0x7_ffff);
-    assert!(apply(Aarch64, elf::R_AARCH64_LD_PREL_LO19.0, &mut insn(0x5800_0001), 0x1000, 0x1002, 0).is_err());
+    assert!(
+        apply(Aarch64, elf::R_AARCH64_LD_PREL_LO19.0, &mut insn(0x5800_0001), 0x1000, 0x1002, 0)
+            .is_err()
+    );
 
     // A negative MOVZ becomes MOVN of the inverted bits; a MOVK keeps its opcode.
     let movz = 0xd280_0000u32;
@@ -894,7 +1059,9 @@ fn native_relocations() {
     let mut bytes = insn(movz);
     apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0.0, &mut bytes, 0, 0x1234, 0).unwrap();
     assert_eq!(word(&bytes), movz | (0x1234 << 5));
-    assert!(apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0.0, &mut insn(movz), 0, 0x1_0000, 0).is_err());
+    assert!(
+        apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0.0, &mut insn(movz), 0, 0x1_0000, 0).is_err()
+    );
     let movk = 0xf2a0_0000u32;
     let mut bytes = insn(movk);
     apply(Aarch64, elf::R_AARCH64_MOVW_PREL_G1_NC.0, &mut bytes, 0x1000, 0x1_2345_1000, 0).unwrap();
@@ -936,7 +1103,8 @@ fn gnu_hash_model(names: &[String], symoffset: u32) -> (Vec<u8>, Vec<usize>) {
     }
     let mut bloom = vec![0u64; mask_words as usize];
     for &(_, hash, _) in &exports {
-        bloom[((hash as u64 / 64) % mask_words) as usize] |= (1 << (hash % 64)) | (1 << ((hash >> 26) % 64));
+        bloom[((hash as u64 / 64) % mask_words) as usize] |=
+            (1 << (hash % 64)) | (1 << ((hash >> 26) % 64));
     }
     for word in bloom {
         out.extend_from_slice(&word.to_le_bytes());
@@ -959,7 +1127,9 @@ fn gnu_hash_model(names: &[String], symoffset: u32) -> (Vec<u8>, Vec<usize>) {
 /// stable sort gave, and every export is found.
 #[test]
 fn many_exports_hash_as_the_model_does() {
-    let names: Vec<String> = (0..3 * super::dynamic::CHUNK).map(|it| format!("_ZN5blaze6export{it}17h{it:016x}E")).collect();
+    let names: Vec<String> = (0..3 * super::dynamic::CHUNK)
+        .map(|it| format!("_ZN5blaze6export{it}17h{it:016x}E"))
+        .collect();
     let counts = Counts {
         imports: 2,
         import_names: 6 + 4 + 2 * 11,
@@ -974,11 +1144,19 @@ fn many_exports_hash_as_the_model_does() {
     let mut image = Fixture::new(output, &[(Class::Text, 4 * names.len() as u64, 4)], &counts);
     let text = image.at(&Class::Text);
     image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: true }];
-    image.imports = vec![import("malloc", Some(0), Some("GLIBC_2.2.5"), false), import("free", Some(0), Some("GLIBC_2.2.5"), false)];
+    image.imports = vec![
+        import("malloc", Some(0), Some("GLIBC_2.2.5"), false),
+        import("free", Some(0), Some("GLIBC_2.2.5"), false),
+    ];
     image.exports = names
         .iter()
         .enumerate()
-        .map(|(at, name)| Export { name: name.clone(), addr: text + 4 * at as u64, size: 4, kind: SymbolKind::Function })
+        .map(|(at, name)| Export {
+            name: name.clone(),
+            addr: text + 4 * at as u64,
+            size: 4,
+            kind: SymbolKind::Function,
+        })
         .collect();
     let bytes = image.link();
 
@@ -1005,7 +1183,14 @@ fn many_exports_hash_as_the_model_does() {
     let (hash, _) = sections.gnu_hash(endian, data).unwrap().unwrap();
     for (at, name) in names.iter().enumerate() {
         let (_, symbol) = hash
-            .find(endian, name.as_bytes(), elf::gnu_hash(name.as_bytes()), None, &dynsyms, &versions)
+            .find(
+                endian,
+                name.as_bytes(),
+                elf::gnu_hash(name.as_bytes()),
+                None,
+                &dynsyms,
+                &versions,
+            )
             .unwrap_or_else(|| panic!("`{name}` is not in the hash table"));
         assert_eq!(symbol.st_value(endian), text + 4 * at as u64);
     }
@@ -1016,7 +1201,14 @@ fn many_exports_hash_as_the_model_does() {
 #[test]
 fn many_slid_addresses_are_relocated_as_the_model_does() {
     let n = 3 * super::dynamic::CHUNK + 17;
-    let counts = Counts { absolute: n as u64 + 1, imports: 1, import_names: 6, libraries: 1, library_names: 9, ..Counts::default() };
+    let counts = Counts {
+        absolute: n as u64 + 1,
+        imports: 1,
+        import_names: 6,
+        libraries: 1,
+        library_names: 9,
+        ..Counts::default()
+    };
     let pieces = [(Class::Text, 16, 16), (Class::Data, 8 * n as u64 + 8, 8)];
     let mut image = Fixture::new(executable(), &pieces, &counts);
     let data = image.at(&Class::Data);
@@ -1030,8 +1222,9 @@ fn many_slid_addresses_are_relocated_as_the_model_does() {
     image.binds = vec![Bind { addr: data + 8 * n as u64, import: 0, addend: 0 }];
     let sorted: Vec<u64> = (0..n as u64).map(|at| data + 8 * at).collect();
 
-    let mut expected: Vec<(u64, elf::RelocationType, u32, i64)> =
-        (0..n as u64).map(|at| (data + 8 * at, elf::R_X86_64_RELATIVE, 0, (text + at * 3) as i64)).collect();
+    let mut expected: Vec<(u64, elf::RelocationType, u32, i64)> = (0..n as u64)
+        .map(|at| (data + 8 * at, elf::R_X86_64_RELATIVE, 0, (text + at * 3) as i64))
+        .collect();
     expected.sort();
     expected.push((data + 8 * n as u64, elf::R_X86_64_64, 1, 0));
     let mut model = Vec::new();
@@ -1044,12 +1237,16 @@ fn many_slid_addresses_are_relocated_as_the_model_does() {
     for (rebase, what) in [(sorted.clone(), "sorted"), (shuffled(sorted.clone(), 7), "shuffled")] {
         image.rebase = rebase;
         let synthesized = image.synthesize().unwrap();
-        let rela = &synthesized.iter().find(|it| it.0 == Class::Synthetic(super::RELA_DYN)).unwrap().1;
+        let rela =
+            &synthesized.iter().find(|it| it.0 == Class::Synthetic(super::RELA_DYN)).unwrap().1;
         assert_eq!(*rela, model, "{what}");
-        let dynamic = &synthesized.iter().find(|it| it.0 == Class::Synthetic(super::DYNAMIC)).unwrap().1;
+        let dynamic =
+            &synthesized.iter().find(|it| it.0 == Class::Synthetic(super::DYNAMIC)).unwrap().1;
         let count = dynamic
             .chunks(16)
-            .find(|it| u64::from_le_bytes(it[..8].try_into().unwrap()) == elf::DT_RELACOUNT.0 as u64)
+            .find(|it| {
+                u64::from_le_bytes(it[..8].try_into().unwrap()) == elf::DT_RELACOUNT.0 as u64
+            })
             .map(|it| u64::from_le_bytes(it[8..].try_into().unwrap()));
         assert_eq!(count, Some(n as u64), "{what}");
     }
@@ -1090,7 +1287,12 @@ fn many_functions_are_named_in_the_symbol_table() {
             },
         })
         .collect();
-    image.exports = vec![Export { name: "_ZN4test8function1E".into(), addr: text + 16, size: 16, kind: SymbolKind::Function }];
+    image.exports = vec![Export {
+        name: "_ZN4test8function1E".into(),
+        addr: text + 16,
+        size: 16,
+        kind: SymbolKind::Function,
+    }];
     image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
     image.imports = vec![import("malloc", Some(0), None, false)];
     let bytes = image.link();
@@ -1106,13 +1308,20 @@ fn many_functions_are_named_in_the_symbol_table() {
     let (_, shdr) = sections.section_by_name(endian, b".symtab").unwrap();
     assert_eq!(shdr.sh_info(endian) as usize, 1 + named.len());
     for (symbol, function) in symbols[1..].iter().zip(&named) {
-        assert_eq!(symbol.name(endian, symtab.strings()).unwrap(), function.name.as_deref().unwrap().as_bytes());
+        assert_eq!(
+            symbol.name(endian, symtab.strings()).unwrap(),
+            function.name.as_deref().unwrap().as_bytes()
+        );
         assert_eq!(symbol.st_value(endian), function.addr);
         assert_eq!(symbol.st_size(endian), 16);
         assert_eq!(symbol.st_bind(), elf::STB_LOCAL);
         assert_eq!(symbol.st_shndx(endian).0, 1 + image.index(&Class::Text) as u16);
     }
-    assert_eq!(symbols[1 + named.iter().position(|it| it.name.as_deref() == Some("")).unwrap()].st_name(endian), 0);
+    assert_eq!(
+        symbols[1 + named.iter().position(|it| it.name.as_deref() == Some("")).unwrap()]
+            .st_name(endian),
+        0
+    );
     let export = &symbols[1 + named.len()];
     assert_eq!(export.name(endian, symtab.strings()).unwrap(), b"_ZN4test8function1E");
     assert_eq!(export.st_bind(), elf::STB_GLOBAL);
@@ -1124,7 +1333,9 @@ fn many_functions_are_named_in_the_symbol_table() {
 /// FDEs of two CIEs, each CIE parsed once: every FDE in the table, sorted by address.
 #[test]
 fn eh_frame_hdr_indexes_fdes_of_every_cie() {
-    use gimli::write::{Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable};
+    use gimli::write::{
+        Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable,
+    };
     let encoding = gimli::Encoding { address_size: 8, format: gimli::Format::Dwarf32, version: 1 };
     let build = |text: u64| {
         let mut table = FrameTable::default();
@@ -1132,7 +1343,10 @@ fn eh_frame_hdr_indexes_fdes_of_every_cie() {
         let b = table.add_cie(CommonInformationEntry::new(encoding, 4, -8, gimli::Register(16)));
         for at in 0..40u64 {
             let cie = if at % 3 == 0 { b } else { a };
-            table.add_fde(cie, FrameDescriptionEntry::new(Address::Constant(text + 16 * ((at * 17) % 40)), 16));
+            table.add_fde(
+                cie,
+                FrameDescriptionEntry::new(Address::Constant(text + 16 * ((at * 17) % 40)), 16),
+            );
         }
         let mut section = EhFrame(EndianVec::new(gimli::LittleEndian));
         table.write_eh_frame(&mut section).unwrap();
@@ -1140,7 +1354,11 @@ fn eh_frame_hdr_indexes_fdes_of_every_cie() {
     };
     let len = build(0).len() as u64;
     let counts = Counts { fdes: 40, ..Counts::default() };
-    let mut image = Fixture::new(executable(), &[(Class::Text, 16 * 40, 16), (Class::EhFrame, len, 8)], &counts);
+    let mut image = Fixture::new(
+        executable(),
+        &[(Class::Text, 16 * 40, 16), (Class::EhFrame, len, 8)],
+        &counts,
+    );
     let text = image.at(&Class::Text);
     image.entry = Some(text);
     image.put(&Class::EhFrame, 0, &build(text));
@@ -1157,7 +1375,10 @@ fn eh_frame_hdr_indexes_fdes_of_every_cie() {
 /// undefined symbols, every one named in `.data` by an absolute relocation.
 fn object_of(n: usize) -> Vec<u8> {
     use object::write::{Object as Builder, Relocation, Symbol as Def, SymbolSection};
-    use object::{Architecture, BinaryFormat, RelocationFlags, SectionKind, SymbolFlags, SymbolKind as Type, SymbolScope};
+    use object::{
+        Architecture, BinaryFormat, RelocationFlags, SectionKind, SymbolFlags, SymbolKind as Type,
+        SymbolScope,
+    };
     let mut builder = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
     let data = builder.add_section(Vec::new(), b".data".to_vec(), SectionKind::Data);
     builder.append_section_data(data, &vec![0; 16 * n], 8);
@@ -1172,13 +1393,19 @@ fn object_of(n: usize) -> Vec<u8> {
         flags: SymbolFlags::None,
     };
     for at in 0..n {
-        let text = builder.add_section(Vec::new(), format!(".text.f{at}").into_bytes(), SectionKind::Text);
+        let text =
+            builder.add_section(Vec::new(), format!(".text.f{at}").into_bytes(), SectionKind::Text);
         builder.append_section_data(text, &[0xc3], 16);
         let function = builder.add_symbol(symbol(format!("f{at}"), SymbolSection::Section(text)));
         let external = builder.add_symbol(symbol(format!("ext{at}"), SymbolSection::Undefined));
         for (slot, target) in [(2 * at, function), (2 * at + 1, external)] {
             let flags = RelocationFlags::Elf { r_type: elf::R_X86_64_64 };
-            builder.add_relocation(data, Relocation { offset: 8 * slot as u64, symbol: target, addend: 0, flags }).unwrap();
+            builder
+                .add_relocation(
+                    data,
+                    Relocation { offset: 8 * slot as u64, symbol: target, addend: 0, flags },
+                )
+                .unwrap();
         }
     }
     builder.write().unwrap()
@@ -1194,16 +1421,30 @@ fn an_object_read_allocates_a_constant_number_of_buffers() {
     let read = |n: usize| {
         let bytes = object_of(n);
         let (read, used) = blaze_alloc_count::measure(|| {
-            super::read::read(blaze_codegen::Arch::X86_64, "f.o", &bytes, &crate::NativeKind::Object)
+            super::read::read(
+                blaze_codegen::Arch::X86_64,
+                "f.o",
+                &bytes,
+                &crate::NativeKind::Object,
+            )
         });
-        let Ok(crate::model::NativeFile::Object(object)) = read else { panic!("not read as an object") };
+        let Ok(crate::model::NativeFile::Object(object)) = read else {
+            panic!("not read as an object")
+        };
         assert_eq!(object.symbols.len(), 1 + 2 * n, "the null symbol and the object's own");
         assert_eq!(object.fixups.len(), 2 * n);
         used
     };
     let (small, large) = (read(8), read(1000));
-    assert_eq!(small.allocations, large.allocations, "an object read allocates per symbol, section or relocation");
-    assert!(large.allocations <= 13, "an object read: {} allocations, budget 13", large.allocations);
+    assert_eq!(
+        small.allocations, large.allocations,
+        "an object read allocates per symbol, section or relocation"
+    );
+    assert!(
+        large.allocations <= 13,
+        "an object read: {} allocations, budget 13",
+        large.allocations
+    );
 }
 
 /// A shared library this writer made, exporting `n` functions: what its reader reads back.
@@ -1221,7 +1462,12 @@ fn shared_library(n: usize) -> Vec<u8> {
     image.exports = names
         .iter()
         .enumerate()
-        .map(|(at, name)| Export { name: name.clone(), addr: text + 4 * at as u64, size: 4, kind: SymbolKind::Function })
+        .map(|(at, name)| Export {
+            name: name.clone(),
+            addr: text + 4 * at as u64,
+            size: 4,
+            kind: SymbolKind::Function,
+        })
         .collect();
     image.link()
 }
@@ -1242,25 +1488,34 @@ fn a_shared_library_read_allocates_a_constant_number_of_buffers() {
                 &crate::NativeKind::Shared { as_needed: false },
             )
         });
-        let Ok(crate::model::NativeFile::Shared(shared)) = read else { panic!("not read as a shared library") };
+        let Ok(crate::model::NativeFile::Shared(shared)) = read else {
+            panic!("not read as a shared library")
+        };
         assert_eq!(shared.name, "libblaze.so");
         assert_eq!(shared.symbols.len(), n);
         for (at, symbol) in shared.symbols.iter().enumerate() {
             assert!(shared.symbol_name(symbol).starts_with("blaze_export_"), "symbol {at}");
         }
-        let names = n * "blaze_export_".len() + (0..n).map(|it| it.to_string().len()).sum::<usize>();
+        let names =
+            n * "blaze_export_".len() + (0..n).map(|it| it.to_string().len()).sum::<usize>();
         assert_eq!(shared.names.bytes(), names, "each name pushed once");
         used
     };
     let (small, large) = (read(16), read(2000));
     assert_eq!(small.allocations, large.allocations, "a shared library read allocates per symbol");
-    assert!(large.allocations <= 9, "a shared library read: {} allocations, budget 9", large.allocations);
+    assert!(
+        large.allocations <= 9,
+        "a shared library read: {} allocations, budget 9",
+        large.allocations
+    );
 }
 
 /// An executable importing `n` versioned functions from one library, exporting `n` and with
 /// `n` slid addresses: every per-symbol table scales with `n`.
 fn many_symbols(n: usize) -> Fixture {
-    let imports: Vec<Import> = (0..n).map(|at| import(&format!("import_{at}"), Some(0), Some("GLIBC_2.2.5"), false)).collect();
+    let imports: Vec<Import> = (0..n)
+        .map(|at| import(&format!("import_{at}"), Some(0), Some("GLIBC_2.2.5"), false))
+        .collect();
     let exports: Vec<String> = (0..n).map(|at| format!("export_{at}")).collect();
     let counts = Counts {
         imports: n as u64,
@@ -1284,7 +1539,12 @@ fn many_symbols(n: usize) -> Fixture {
     image.exports = exports
         .into_iter()
         .enumerate()
-        .map(|(at, name)| Export { name, addr: text + 4 * at as u64, size: 4, kind: SymbolKind::Function })
+        .map(|(at, name)| Export {
+            name,
+            addr: text + 4 * at as u64,
+            size: 4,
+            kind: SymbolKind::Function,
+        })
         .collect();
     image.rebase = (0..n as u64).map(|at| data + 8 * at).collect();
     image
@@ -1301,7 +1561,8 @@ fn many_symbols(n: usize) -> Fixture {
 /// `Arc` of each region's `CowBytes`, which the core no longer makes when it takes them.
 #[test]
 fn dynamic_tables_allocate_nothing_per_symbol() {
-    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let used = |n: usize| {
         let image = many_symbols(n);
         pool.install(|| {
@@ -1309,7 +1570,9 @@ fn dynamic_tables_allocate_nothing_per_symbol() {
                 image.writer.synthesize(placed).unwrap();
                 let (tables, used) = blaze_alloc_count::measure(|| image.writer.synthesize(placed));
                 let tables = tables.unwrap();
-                let region = |name: &'static str| &tables.iter().find(|it| it.0 == Class::Synthetic(name)).unwrap().1;
+                let region = |name: &'static str| {
+                    &tables.iter().find(|it| it.0 == Class::Synthetic(name)).unwrap().1
+                };
                 assert_eq!(region(super::DYNSYM).len(), 24 * (1 + 2 * n));
                 assert_eq!(region(super::RELA_DYN).len(), 24 * n);
                 assert_eq!(region(super::VERSYM).len(), 2 * (1 + 2 * n));
@@ -1319,7 +1582,11 @@ fn dynamic_tables_allocate_nothing_per_symbol() {
     };
     let (small, large) = (used(64), used(2000));
     assert_eq!(small.allocations, large.allocations, "the dynamic tables allocate per symbol");
-    assert!(large.allocations <= 32, "the dynamic tables: {} allocations, budget 32", large.allocations);
+    assert!(
+        large.allocations <= 32,
+        "the dynamic tables: {} allocations, budget 32",
+        large.allocations
+    );
 }
 
 /// The functions of [`relinked`].
@@ -1369,7 +1636,13 @@ fn relinked_of(n: usize) -> Fixture {
     let (text, data, got) = (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::Got));
     image.entry = Some(text);
     image.functions = (names.iter().enumerate())
-        .map(|(at, name)| Function { addr: text + 16 * at as u64, size: 16, fde: None, windows: None, name: Some(name.as_str().into()) })
+        .map(|(at, name)| Function {
+            addr: text + 16 * at as u64,
+            size: 16,
+            fde: None,
+            windows: None,
+            name: Some(name.as_str().into()),
+        })
         .collect();
     for at in 0..n {
         image.put(&Class::Data, 16 * at, &(text + 16 * at as u64).to_le_bytes());
@@ -1396,7 +1669,16 @@ fn delta<'a>(
     got: &'a [Splice],
     written: &'a [(u64, u64)],
 ) -> Delta<'a> {
-    Delta { functions, rebase, got, binds: &[], same_names: true, same_regions: true, written, from }
+    Delta {
+        functions,
+        rebase,
+        got,
+        binds: &[],
+        same_names: true,
+        same_regions: true,
+        written,
+        from,
+    }
 }
 
 /// How many builds of `.rela.dyn`, `.eh_frame_hdr` and the symbol table the image's writer
@@ -1420,7 +1702,11 @@ fn changed(old: &[u8], new: &[u8], at: u64) -> (u64, u64) {
 /// Builds the image with its own writer, which kept its last tables, as synthesis
 /// `synthesis` with `delta`, and with a fresh writer from nothing: the same tables and
 /// file. The first's.
-fn relinks_as_built(image: &Fixture, synthesis: u64, delta: &Delta<'_>) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
+fn relinks_as_built(
+    image: &Fixture,
+    synthesis: u64,
+    delta: &Delta<'_>,
+) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
     let relinked = image.build(&image.writer, synthesis, Some(delta));
     let fresh = Elf { output: image.writer.output.clone(), last: None };
     let built = image.build(&fresh, synthesis, None);
@@ -1483,7 +1769,9 @@ fn a_relink_patches_eh_frame_hdr_as_a_build_makes_it() {
     let (first, _) = image.build(&image.writer, 1, None);
     let (text, eh) = (image.at(&Class::Text), image.at(&Class::EhFrame));
     let fdes = |moved: usize, to: u64| -> Vec<(u64, u32)> {
-        (0..RELINKED).map(|at| if at == moved { (to, 12) } else { (text + 16 * at as u64, 16) }).collect()
+        (0..RELINKED)
+            .map(|at| if at == moved { (to, 12) } else { (text + 16 * at as u64, 16) })
+            .collect()
     };
     let old = image.contents[image.index(&Class::EhFrame)].clone();
     let new = eh_frame(&fdes(12, text + 16 * 12 + 4));
@@ -1556,7 +1844,8 @@ fn a_one_function_relink_copies_only_the_pages_it_writes() {
     const N: usize = 4098;
     let mut image = relinked_of(N);
     let (first, first_parts) = image.shared(&image.writer, 1, None);
-    let (text, data, eh) = (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::EhFrame));
+    let (text, data, eh) =
+        (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::EhFrame));
     // Function `k` starts 4 bytes on and is 4 shorter: its FDE and its pointer in `.data`
     // move with it.
     let k = 2000;
@@ -1564,7 +1853,8 @@ fn a_one_function_relink_copies_only_the_pages_it_writes() {
     (image.functions[k].addr, image.functions[k].size) = (moved, 12);
     image.put(&Class::Data, 16 * k, &moved.to_le_bytes());
     let old = image.contents[image.index(&Class::EhFrame)].clone();
-    let fdes: Vec<(u64, u32)> = (0..N).map(|at| if at == k { (moved, 12) } else { (text + 16 * at as u64, 16) }).collect();
+    let fdes: Vec<(u64, u32)> =
+        (0..N).map(|at| if at == k { (moved, 12) } else { (text + 16 * at as u64, 16) }).collect();
     let new = eh_frame(&fdes);
     image.put(&Class::EhFrame, 0, &new);
     let mut written = vec![(data + 16 * k as u64, 8), changed(&old, &new, eh)];
@@ -1574,7 +1864,11 @@ fn a_one_function_relink_copies_only_the_pages_it_writes() {
     let (tables, parts) = image.shared(&image.writer, 2, Some(&since));
     assert_eq!(patched(&image), [1, 1, 1], "every table patched");
     let fresh = Elf { output: image.writer.output.clone(), last: None };
-    assert_eq!((flat(tables.clone()), flat(parts.clone())), image.build(&fresh, 2, None), "a build's tables and parts");
+    assert_eq!(
+        (flat(tables.clone()), flat(parts.clone())),
+        image.build(&fresh, 2, None),
+        "a build's tables and parts"
+    );
 
     let region = |tables: &[(Class, CowBytes)], name: &'static str| {
         tables.iter().find(|it| it.0 == Class::Synthetic(name)).unwrap().1.clone()
@@ -1582,19 +1876,26 @@ fn a_one_function_relink_copies_only_the_pages_it_writes() {
     let tail = |parts: &[(u64, CowBytes)]| parts.iter().find(|it| it.0 != 0).unwrap().1.clone();
     let kept = [
         (".rela.dyn", region(&tables, super::RELA_DYN), region(&first, super::RELA_DYN)),
-        (".eh_frame_hdr", region(&tables, super::EH_FRAME_HDR), region(&first, super::EH_FRAME_HDR)),
+        (
+            ".eh_frame_hdr",
+            region(&tables, super::EH_FRAME_HDR),
+            region(&first, super::EH_FRAME_HDR),
+        ),
         ("the symbol table's tail", tail(&parts), tail(&first_parts)),
     ];
     let (mut total, mut all_copied) = (0, 0);
     for (what, new, old) in &kept {
-        let (copied, differing) = (copied(new, old), differing(&new.contiguous(), &old.contiguous()));
+        let (copied, differing) =
+            (copied(new, old), differing(&new.contiguous(), &old.contiguous()));
         assert!(copied <= differing, "{what}: {copied} pages copied, {differing} changed");
         assert!((1..=2).contains(&differing), "{what}: {differing} pages changed by one function");
         total += new.len().div_ceil(CowBytes::PAGE);
         all_copied += copied;
     }
     assert!(total >= 16, "{total} pages of kept tables: the image is not large");
-    eprintln!("a one-function relink among {N} functions copies {all_copied} of its kept tables' {total} pages");
+    eprintln!(
+        "a one-function relink among {N} functions copies {all_copied} of its kept tables' {total} pages"
+    );
 }
 
 /// The same relink with the code and data regions as the core holds them after it: the full
@@ -1608,26 +1909,35 @@ fn a_one_function_relink_reads_its_code_regions_in_pages() {
     let mut image = relinked_of(N);
     let classes = [Class::Text, Class::Data, Class::EhFrame];
     // clone: the full link's bytes of each region, which the test's own buffers are
-    let full: Vec<CowBytes> = classes.iter().map(|it| CowBytes::from_vec(image.contents[image.index(it)].clone())).collect();
+    let full: Vec<CowBytes> = classes
+        .iter()
+        .map(|it| CowBytes::from_vec(image.contents[image.index(it)].clone()))
+        .collect();
     image.shared(&image.writer, 1, None);
-    let (text, data, eh) = (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::EhFrame));
+    let (text, data, eh) =
+        (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::EhFrame));
     let k = 2000;
     let moved = text + 16 * k as u64 + 4;
     (image.functions[k].addr, image.functions[k].size) = (moved, 12);
     image.put(&Class::Text, 16 * k + 4, &[0xcc; 12]);
     image.put(&Class::Data, 16 * k, &moved.to_le_bytes());
     let old = image.contents[image.index(&Class::EhFrame)].clone();
-    let fdes: Vec<(u64, u32)> = (0..N).map(|at| if at == k { (moved, 12) } else { (text + 16 * at as u64, 16) }).collect();
+    let fdes: Vec<(u64, u32)> =
+        (0..N).map(|at| if at == k { (moved, 12) } else { (text + 16 * at as u64, 16) }).collect();
     let new = eh_frame(&fdes);
     image.put(&Class::EhFrame, 0, &new);
     let mut written = vec![(moved, 12), (data + 16 * k as u64, 8), changed(&old, &new, eh)];
     written.sort_unstable();
 
-    let mut held: Vec<(Class, CowBytes)> = classes.iter().cloned().zip(full.iter().cloned()).collect();
+    let mut held: Vec<(Class, CowBytes)> =
+        classes.iter().cloned().zip(full.iter().cloned()).collect();
     for (class, bytes) in &mut held {
         let index = image.index(class);
         let region = &image.regions[index];
-        for &(addr, len) in written.iter().filter(|it| it.0 >= region.addr && it.0 + it.1 <= region.addr + region.size) {
+        for &(addr, len) in written
+            .iter()
+            .filter(|it| it.0 >= region.addr && it.0 + it.1 <= region.addr + region.size)
+        {
             let at = (addr - region.addr) as usize;
             bytes.write(at, &image.contents[index][at..at + len as usize]);
         }
@@ -1650,15 +1960,29 @@ fn a_one_function_relink_reads_its_code_regions_in_pages() {
     let (tables, parts) = image.shared_in(&image.writer, 2, Some(&since), &held);
     assert_eq!(patched(&image), [1, 1, 1], "every table patched");
     let fresh = Elf { output: image.writer.output.clone(), last: None };
-    assert_eq!((flat(tables), flat(parts)), image.build(&fresh, 2, None), "a build's tables and parts");
+    assert_eq!(
+        (flat(tables), flat(parts)),
+        image.build(&fresh, 2, None),
+        "a build's tables and parts"
+    );
     let (tables, parts) = image.shared_in(&fresh, 3, None, &held);
-    assert_eq!((flat(tables), flat(parts)), image.build(&fresh, 3, None), "a build from pages is a build from flat bytes");
-    eprintln!("a one-function relink among {N} functions copies {all_copied} of its code and data's {total} pages");
+    assert_eq!(
+        (flat(tables), flat(parts)),
+        image.build(&fresh, 3, None),
+        "a build from pages is a build from flat bytes"
+    );
+    eprintln!(
+        "a one-function relink among {N} functions copies {all_copied} of its code and data's {total} pages"
+    );
 }
 
 /// The architecture `blaze_inproc::image` reads ELF images of: this machine's.
 fn host_arch() -> blaze_codegen::Arch {
-    if cfg!(target_arch = "aarch64") { blaze_codegen::Arch::Aarch64 } else { blaze_codegen::Arch::X86_64 }
+    if cfg!(target_arch = "aarch64") {
+        blaze_codegen::Arch::Aarch64
+    } else {
+        blaze_codegen::Arch::X86_64
+    }
 }
 
 /// A dev executable of this machine reserving `pages` pages (arena, cells, fixed), its page
@@ -1670,7 +1994,8 @@ fn dev_executable(pages: [u64; 3]) -> (Output, u64, [u64; 3]) {
         _ => 0x1000,
     };
     let sizes = pages.map(|it| it * page);
-    let mut output = output(arch, OutputKind::Executable { entry: "_start".into() }, Some("/lib/ld.so"));
+    let mut output =
+        output(arch, OutputKind::Executable { entry: "_start".into() }, Some("/lib/ld.so"));
     output.dev_run = Some(DevRun { arena: sizes[0], cells: sizes[1], fixed: sizes[2] });
     (output, page, sizes)
 }
@@ -1681,7 +2006,15 @@ fn loads(bytes: &[u8]) -> Vec<(u32, u64, u64, u64, u64)> {
     let endian = file.endian();
     (file.elf_program_headers().iter())
         .filter(|it| it.p_type(endian) == elf::PT_LOAD)
-        .map(|it| (it.p_flags(endian).0, it.p_offset(endian), it.p_vaddr(endian), it.p_filesz(endian), it.p_memsz(endian)))
+        .map(|it| {
+            (
+                it.p_flags(endian).0,
+                it.p_offset(endian),
+                it.p_vaddr(endian),
+                it.p_filesz(endian),
+                it.p_memsz(endian),
+            )
+        })
         .collect()
 }
 
@@ -1689,7 +2022,11 @@ fn loads(bytes: &[u8]) -> Vec<(u32, u64, u64, u64, u64)> {
 fn dynamic_entries(bytes: &[u8]) -> Vec<(u64, u64)> {
     let file = ElfFile64::<Endianness>::parse(bytes).unwrap();
     let endian = file.endian();
-    let dynamic = file.elf_program_headers().iter().find_map(|it| it.dynamic(endian, bytes).unwrap()).unwrap();
+    let dynamic = file
+        .elf_program_headers()
+        .iter()
+        .find_map(|it| it.dynamic(endian, bytes).unwrap())
+        .unwrap();
     dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect()
 }
 
@@ -1736,18 +2073,34 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
     let classes: Vec<&Class> = image.regions.iter().map(|it| &it.class).collect();
     assert_eq!(
         classes[classes.len() - 4..],
-        [&Class::Bss, &Class::Reserve(Reserve::Arena), &Class::Reserve(Reserve::Cells), &Class::Reserve(Reserve::Fixed)]
+        [
+            &Class::Bss,
+            &Class::Reserve(Reserve::Arena),
+            &Class::Reserve(Reserve::Cells),
+            &Class::Reserve(Reserve::Fixed)
+        ]
     );
-    for class in [Class::Reserve(Reserve::Arena), Class::Reserve(Reserve::Cells), Class::Reserve(Reserve::Fixed)] {
+    for class in [
+        Class::Reserve(Reserve::Arena),
+        Class::Reserve(Reserve::Cells),
+        Class::Reserve(Reserve::Fixed),
+    ] {
         assert_eq!(image.writer.prot(&class), crate::model::Prot::NONE);
         assert!(zeroed(&class));
     }
-    let (text, preinit, init) = (image.at(&Class::Text), image.at(&Class::PreinitArray), image.at(&Class::InitArray));
+    let (text, preinit, init) =
+        (image.at(&Class::Text), image.at(&Class::PreinitArray), image.at(&Class::InitArray));
     image.put(&Class::PreinitArray, 0, &text.to_le_bytes());
     image.put(&Class::PreinitArray, 8, &(text + 16).to_le_bytes());
     image.put(&Class::InitArray, 0, &(text + 32).to_le_bytes());
     image.rebase = vec![preinit, preinit + 8, init];
-    image.functions = vec![Function { addr: text, size: 64, fde: None, windows: None, name: Some("main".into()) }];
+    image.functions = vec![Function {
+        addr: text,
+        size: 64,
+        fde: None,
+        windows: None,
+        name: Some("main".into()),
+    }];
     image.entry = Some(text);
     let bss_end = image.at(&Class::Bss) + 32;
     let at = |name: &str| match image.writer.special(name) {
@@ -1763,12 +2116,22 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
     let endian = file.endian();
     let sections = file.elf_section_table();
     let (_, shdr) = sections.section_by_name(endian, b".preinit_array").unwrap();
-    assert_eq!((shdr.sh_type(endian), shdr.sh_addr(endian), shdr.sh_size(endian)), (elf::SHT_PREINIT_ARRAY, preinit, 16));
+    assert_eq!(
+        (shdr.sh_type(endian), shdr.sh_addr(endian), shdr.sh_size(endian)),
+        (elf::SHT_PREINIT_ARRAY, preinit, 16)
+    );
     assert_eq!(shdr.sh_entsize(endian), 8);
-    assert_eq!(bytes[preinit as usize..][..8], text.to_le_bytes(), "the start hook's pointer is first");
+    assert_eq!(
+        bytes[preinit as usize..][..8],
+        text.to_le_bytes(),
+        "the start hook's pointer is first"
+    );
     let entries = dynamic_entries(&bytes);
     let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
-    assert_eq!((tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)), (Some(preinit), Some(16)));
+    assert_eq!(
+        (tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)),
+        (Some(preinit), Some(16))
+    );
     assert_eq!(tag(elf::DT_INIT_ARRAY), Some(init));
     assert_ne!(tag(elf::DT_FLAGS).unwrap() & elf::DF_BIND_NOW.0, 0);
     assert_ne!(tag(elf::DT_FLAGS_1).unwrap() & elf::DF_1_NOW.0, 0);
@@ -1784,17 +2147,25 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
     assert_eq!(code.len(), 1);
     for &&(flags, offset, vaddr, filesz, memsz) in &code {
         assert_eq!(flags & elf::PF_W.0, 0, "code is never writable");
-        assert_eq!((offset % page, vaddr % page), (0, 0), "code starts on a page in the file and in memory");
+        assert_eq!(
+            (offset % page, vaddr % page),
+            (0, 0),
+            "code starts on a page in the file and in memory"
+        );
         assert_eq!(offset, vaddr);
         assert_eq!(filesz, memsz, "code is all file bytes");
         let end = (vaddr + memsz).next_multiple_of(page);
         for other in loads.iter().filter(|it| it.2 != vaddr) {
             let other_end = (other.2 + other.4).next_multiple_of(page);
-            assert!(other_end <= vaddr || other.2 >= end, "the code at {vaddr:#x} shares a page with {other:x?}");
+            assert!(
+                other_end <= vaddr || other.2 >= end,
+                "the code at {vaddr:#x} shares a page with {other:x?}"
+            );
         }
     }
     let others_end = loads[..4].iter().map(|it| it.2 + it.4).max().unwrap();
-    let reserved: Vec<std::ops::Range<u64>> = loads[4..].iter().map(|it| it.2..it.2 + it.4).collect();
+    let reserved: Vec<std::ops::Range<u64>> =
+        loads[4..].iter().map(|it| it.2..it.2 + it.4).collect();
     for (nth, (&(flags, _, vaddr, filesz, memsz), reserve)) in
         loads[4..].iter().zip([Reserve::Arena, Reserve::Cells, Reserve::Fixed]).enumerate()
     {
@@ -1804,16 +2175,26 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
         assert!(vaddr >= others_end, "{reserve:?} is after every other segment");
     }
     assert!(reserved.is_sorted_by_key(|it| it.start));
-    for (name, size) in [&b".blaze.reserve.arena"[..], b".blaze.reserve.cells", b".blaze.reserve.fixed"].into_iter().zip(sizes) {
+    for (name, size) in
+        [&b".blaze.reserve.arena"[..], b".blaze.reserve.cells", b".blaze.reserve.fixed"]
+            .into_iter()
+            .zip(sizes)
+    {
         let (_, shdr) = sections.section_by_name(endian, name).unwrap();
-        assert_eq!((shdr.sh_type(endian), shdr.sh_flags(endian).0, shdr.sh_size(endian)), (elf::SHT_NOBITS, 0, size));
+        assert_eq!(
+            (shdr.sh_type(endian), shdr.sh_flags(endian).0, shdr.sh_size(endian)),
+            (elf::SHT_NOBITS, 0, size)
+        );
     }
 
     // What the start hook reads of the same bytes.
     let layout = blaze_inproc::image::layout(blaze_inproc::Format::Elf, &bytes, page).unwrap();
     let &(_, offset, vaddr, _, memsz) = code[0];
     assert_eq!(layout.header, 0);
-    assert_eq!(layout.code, [blaze_inproc::Segment { offset, linked: vaddr, len: memsz.next_multiple_of(page) }]);
+    assert_eq!(
+        layout.code,
+        [blaze_inproc::Segment { offset, linked: vaddr, len: memsz.next_multiple_of(page) }]
+    );
     assert_eq!(layout.reserved, reserved);
 }
 
@@ -1825,10 +2206,20 @@ fn an_image_without_a_dev_run_keeps_its_layout() {
     let writer = Elf { output: executable(), last: None };
     assert_eq!(writer.plan().headers, 64 + 56 * 12);
     let counts = Counts { absolute: 1, ..Counts::default() };
-    let pieces = [(Class::Text, 16, 16), (Class::RelRo, 8, 8), (Class::PreinitArray, 8, 8), (Class::InitArray, 8, 8), (Class::Data, 8, 8)];
+    let pieces = [
+        (Class::Text, 16, 16),
+        (Class::RelRo, 8, 8),
+        (Class::PreinitArray, 8, 8),
+        (Class::InitArray, 8, 8),
+        (Class::Data, 8, 8),
+    ];
     let mut image = Fixture::new(executable(), &pieces, &counts);
-    let (text, relro, preinit, init) =
-        (image.at(&Class::Text), image.at(&Class::RelRo), image.at(&Class::PreinitArray), image.at(&Class::InitArray));
+    let (text, relro, preinit, init) = (
+        image.at(&Class::Text),
+        image.at(&Class::RelRo),
+        image.at(&Class::PreinitArray),
+        image.at(&Class::InitArray),
+    );
     assert!(relro < preinit && preinit < init);
     assert_eq!(Segment::of(&Class::PreinitArray), Segment::Relro);
     image.put(&Class::PreinitArray, 0, &text.to_le_bytes());
@@ -1838,7 +2229,10 @@ fn an_image_without_a_dev_run_keeps_its_layout() {
     assert_eq!(loads(&bytes).iter().map(|it| it.0).collect::<Vec<_>>(), [4, 5, 6, 6]);
     let entries = dynamic_entries(&bytes);
     let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
-    assert_eq!((tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)), (Some(preinit), Some(8)));
+    assert_eq!(
+        (tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)),
+        (Some(preinit), Some(8))
+    );
     let file = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
     let endian = file.endian();
     let (_, shdr) = file.elf_section_table().section_by_name(endian, b".preinit_array").unwrap();
@@ -1875,24 +2269,48 @@ fn a_reservation_of_part_of_a_page_is_an_error() {
 /// function holding a slid address, the import of a bind.
 #[test]
 fn a_text_relocation_names_its_symbol_and_section() {
-    let counts = Counts { absolute: 2, imports: 1, import_names: 6, libraries: 1, library_names: 9, ..Counts::default() };
-    let mut image = Fixture::new(executable(), &[(Class::Text, 64, 16), (Class::Data, 8, 8)], &counts);
+    let counts = Counts {
+        absolute: 2,
+        imports: 1,
+        import_names: 6,
+        libraries: 1,
+        library_names: 9,
+        ..Counts::default()
+    };
+    let mut image =
+        Fixture::new(executable(), &[(Class::Text, 64, 16), (Class::Data, 8, 8)], &counts);
     let text = image.at(&Class::Text);
     image.entry = Some(text);
     image.functions = vec![
         Function { addr: text, size: 32, fde: None, windows: None, name: Some("main".into()) },
-        Function { addr: text + 32, size: 32, fde: None, windows: None, name: Some("helper".into()) },
+        Function {
+            addr: text + 32,
+            size: 32,
+            fde: None,
+            windows: None,
+            name: Some("helper".into()),
+        },
     ];
     image.rebase = vec![text + 40];
     let error = image.synthesize().unwrap_err().what;
-    assert!(error.contains("`helper`") && error.contains("`.text`") && error.contains("text relocation"), "{error}");
+    assert!(
+        error.contains("`helper`")
+            && error.contains("`.text`")
+            && error.contains("text relocation"),
+        "{error}"
+    );
 
     image.rebase.clear();
     image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
     image.imports = vec![import("malloc", Some(0), None, false)];
     image.binds = vec![Bind { addr: text + 8, import: 0, addend: 0 }];
     let error = image.synthesize().unwrap_err().what;
-    assert!(error.contains("`malloc`") && error.contains("`.text`") && error.contains("text relocation"), "{error}");
+    assert!(
+        error.contains("`malloc`")
+            && error.contains("`.text`")
+            && error.contains("text relocation"),
+        "{error}"
+    );
 }
 
 #[test]

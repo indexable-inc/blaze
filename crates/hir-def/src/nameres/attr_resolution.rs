@@ -1,6 +1,6 @@
 //! Post-nameres attribute resolution.
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use hir_expand::{
     AttrMacroAttrIds, MacroCallId, MacroCallKind, MacroDefId,
     attrs::{Attr, AttrId, AttrInput},

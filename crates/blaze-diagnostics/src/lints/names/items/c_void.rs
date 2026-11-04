@@ -55,7 +55,15 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate) -> Ve
                 }
             };
             let Some(ret) = f.ret_type() else { continue };
-            check(cx, node.with_value(ret), f.param_list().map(|it| it.syntax().text_range().end()), extern_, c_void, at, &mut found);
+            check(
+                cx,
+                node.with_value(ret),
+                f.param_list().map(|it| it.syntax().text_range().end()),
+                extern_,
+                c_void,
+                at,
+                &mut found,
+            );
         } else if kind == SyntaxKind::CLOSURE_EXPR
             && let Some(closure) = ast::ClosureExpr::cast(node.value)
         {
@@ -83,7 +91,10 @@ fn check<'db>(
 ) {
     let Some(ast::Type::PathType(ty)) = ret.value.ty() else { return };
     let Some(path) = ty.path() else { return };
-    let Some(PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(it)))) = cx.vsema.resolve_path(path) else { return };
+    let Some(PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(it)))) = cx.vsema.resolve_path(path)
+    else {
+        return;
+    };
     if it != c_void {
         return;
     }
@@ -98,10 +109,17 @@ fn check<'db>(
             span,
         ),
     };
-    diag.suggestion(cx.span(suggestion), "remove the return type to implicitly return `()`", "", Applicability::MaybeIncorrect);
+    diag.suggestion(
+        cx.span(suggestion),
+        "remove the return type to implicitly return `()`",
+        "",
+        Applicability::MaybeIncorrect,
+    );
     diag.help("returning `()` in Rust is equivalent to returning `void` in C");
     if extern_ {
-        diag.note("`c_void` is only used through raw pointers for compatibility with `void` pointers");
+        diag.note(
+            "`c_void` is only used through raw pointers for compatibility with `void` pointers",
+        );
     }
     crate::lints::code_fact(cx, &mut diag, at);
     found.push(Found::lint(diag, Phase::Late, at));
@@ -110,7 +128,11 @@ fn check<'db>(
 /// `span_extend_to_prev_char(range, ')', true)`: `range` from just after the `)` before it; when
 /// the parameters' `)` is right before it (but for white space and `->`), that one, without
 /// reading the file.
-fn extend_to_prev_paren(ret: ast::RetType<'_>, range: TextRange, params_end: Option<TextSize>) -> TextRange {
+fn extend_to_prev_paren(
+    ret: ast::RetType<'_>,
+    range: TextRange,
+    params_end: Option<TextSize>,
+) -> TextRange {
     if let Some(end) = params_end {
         return TextRange::new(end, range.end());
     }

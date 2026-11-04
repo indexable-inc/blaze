@@ -42,6 +42,10 @@
   // Who is on the site right now (worker/presence.ts): one object, holding a hibernating WebSocket per open tab.
   "durable_objects": { "bindings": [{ "name": "PRESENCE", "class_name": "Presence" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Presence"] }],
+  // blaze's release metadata (docs/release.md, "latest.json"): `latest.json`, which release.yaml, promote.yaml and
+  // yank.yaml put with `wrangler r2 object put` and worker/index.ts serves at /latest.json. Made once by hand:
+  // `wrangler r2 bucket create blaze-releases`.
+  "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "blaze-releases" }],
   "d1_databases": [
     {
       "binding": "DB",

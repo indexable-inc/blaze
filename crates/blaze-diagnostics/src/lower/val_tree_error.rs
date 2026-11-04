@@ -25,7 +25,9 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ValTreeError<'db>) -> Vec<Fo
     };
     let message = match &d.error {
         // alloc: the error's text, for an error hir found
-        hir::ValTreeErrorKind::NodesOverflow => format!("maximum number of nodes exceeded in constant {konst}"),
+        hir::ValTreeErrorKind::NodesOverflow => {
+            format!("maximum number of nodes exceeded in constant {konst}")
+        }
         // alloc: the error's text, for an error hir found
         hir::ValTreeErrorKind::NonSupportedType(ty) => format!(
             "blaze: constant {konst} holds a value of `{}`, which has no value tree",

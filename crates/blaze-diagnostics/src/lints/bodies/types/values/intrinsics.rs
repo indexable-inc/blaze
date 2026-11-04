@@ -14,7 +14,7 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, ExprKinds, ExprKind, LatePass, LintSet, lint_set, types::util},
+    lints::bodies::{BodyCx, ExprKind, ExprKinds, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -47,7 +47,8 @@ impl LatePass for EnumIntrinsicsNonEnums {
         if !is_non_enum(ty_param) {
             return;
         }
-        let (Some(span), Some(node), Some(ty)) = (util::span(b, expr), b.expr_node(expr), super::print(b, expr, ty_param))
+        let (Some(span), Some(node), Some(ty)) =
+            (util::span(b, expr), b.expr_node(expr), super::print(b, expr, ty_param))
         else {
             return;
         };

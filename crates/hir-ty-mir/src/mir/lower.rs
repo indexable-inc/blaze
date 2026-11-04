@@ -5,7 +5,6 @@ use std::{borrow::Cow, iter, mem};
 use arrayvec::ArrayVec;
 use base_db::{Crate, Db};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
@@ -31,6 +30,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
 use span::Edition;
+use std::alloc::Global;
 
 use crate::{
     Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, LoweringMode, ParamEnvAndCrate,
@@ -104,7 +104,11 @@ struct DropScope<'f> {
 
 impl<'f> DropScope<'f> {
     fn new_in(frame: &'f Frame) -> Self {
-        DropScope { locals: ScopeLocals::new_in(frame), temporaries: false, exits: Vec::new_in(frame) }
+        DropScope {
+            locals: ScopeLocals::new_in(frame),
+            temporaries: false,
+            exits: Vec::new_in(frame),
+        }
     }
 
     /// Appends the locals in the order they were declared, which is the reverse of the order
@@ -579,7 +583,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     /// The body lowering built, each list of it allocated once at its length, with what
     /// `mark_moves` asks for.
-    fn finish(mut self) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, HashMap<Ty<'db>, bool, Global>) {
+    fn finish(
+        mut self,
+    ) -> (MirBody<'db>, InferCtxt<'db>, ParamEnv<'db>, HashMap<Ty<'db>, bool, Global>) {
         let Building {
             blocks,
             locals,
@@ -683,8 +689,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         let Some((p, current)) = self.lower_expr_as_place(current, expr_id, true)? else {
             return Ok(None);
         };
-        let fresh =
-            p.projection.as_slice().is_empty() && framed::local_index(p.local) >= locals;
+        let fresh = p.projection.as_slice().is_empty() && framed::local_index(p.local) >= locals;
         if fresh {
             return Ok(Some((p, current)));
         }
@@ -1827,8 +1832,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             current,
                         )
                     } else {
-                        let Some((it, current)) =
-                            self.lower_expr_to_some_operand(expr, current)?
+                        let Some((it, current)) = self.lower_expr_to_some_operand(expr, current)?
                         else {
                             return Ok(None);
                         };
@@ -2086,10 +2090,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         return Ok(None);
                     };
                     let current = scope.pop_and_drop(self, c, lhs.into());
-                    let operand = Operand {
-                        kind: OperandKind::Copy(result.store()),
-                        span: Some(lhs.into()),
-                    };
+                    let operand =
+                        Operand { kind: OperandKind::Copy(result.store()), span: Some(lhs.into()) };
                     (operand, current)
                 } else if compares_scalars {
                     let Some(it) = self.lower_scalar_operand(lhs, current)? else {
@@ -2378,7 +2380,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     }
                 }
             },
-            Expr::Literal(_) if self.is_line_slot(expr_id) => self.lower_line(expr_id, place, current),
+            Expr::Literal(_) if self.is_line_slot(expr_id) => {
+                self.lower_line(expr_id, place, current)
+            }
             Expr::Literal(l) => {
                 let ty = self.expr_ty_without_adjust(expr_id);
                 let mut op = self.lower_literal_to_operand(ty, l)?;
@@ -2431,7 +2435,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         ));
         let temp = self.temp(reference, current, span)?;
         // alloc: the call's arguments, none
-        let Some(current) = self.lower_call(func, Box::new([]), temp.into(), current, false, span)?
+        let Some(current) =
+            self.lower_call(func, Box::new([]), temp.into(), current, false, span)?
         else {
             return Ok(None);
         };
@@ -2473,8 +2478,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         (AdtId::EnumId(it), None) => {
                             // Looked up hygienically, as inference does (`variant_written`).
                             let ctxt = offset.field_hygiene(index).syntax_context();
-                            let id = hir_def::signatures::EnumVariants::variant_written(self.db, it, name, ctxt)
-                                .ok_or(no_field)?;
+                            let id = hir_def::signatures::EnumVariants::variant_written(
+                                self.db, it, name, ctxt,
+                            )
+                            .ok_or(no_field)?;
                             place = place.project(ProjectionElem::Downcast(id.into()));
                             variant = Some(id);
                             continue;
@@ -2485,8 +2492,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     // Looked up hygienically, as a field access is (rustc's
                     // `check_expr_offset_of`); positional fields by their index alone.
                     let hygiene = offset.field_hygiene(index);
-                    let field =
-                        of.fields(self.db).field_written(self.db, of, name, hygiene).ok_or(no_field)?;
+                    let field = of
+                        .fields(self.db)
+                        .field_written(self.db, of, name, hygiene)
+                        .ok_or(no_field)?;
                     let field_ty = self.db.field_types(of)[field]
                         .ty()
                         .instantiate(interner, args)
@@ -2588,10 +2597,13 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         // A reference to `len` bytes, whose address the memory map gives: two words of the
         // target.
         let word = self.word()?;
-        let fat = |len: usize| -> Box<[u8]> { [word_bytes(0, word), word_bytes(len, word)].concat().into() };
+        let fat = |len: usize| -> Box<[u8]> {
+            [word_bytes(0, word), word_bytes(len, word)].concat().into()
+        };
         // A scalar's bytes are borrowed from the stack: a literal already interned allocates
         // nothing.
-        let scalar = |bytes: &[u8]| -> Result<'db, Operand> { Ok(Operand::from_scalar_bytes(bytes, ty)) };
+        let scalar =
+            |bytes: &[u8]| -> Result<'db, Operand> { Ok(Operand::from_scalar_bytes(bytes, ty)) };
         match l {
             hir_def::hir::Literal::String(b) => {
                 let b = b.as_str();
@@ -2624,7 +2636,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 8 => scalar(&f.to_f64().to_bits().to_le_bytes()),
                 4 => scalar(&f.to_f32().to_bits().to_le_bytes()),
                 2 => scalar(&u16::try_from(f.to_f16().to_bits()).unwrap().to_le_bytes()),
-                _ => Err(MirLowerError::TypeError("float with size other than 2, 4, 8 or 16 bytes")),
+                _ => {
+                    Err(MirLowerError::TypeError("float with size other than 2, 4, 8 or 16 bytes"))
+                }
             },
         }
     }
@@ -2672,8 +2686,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 not_supported!("the static {id:?} as a constant: a static is `Operand::Static`")
             }
         };
-        let konst =
-            Const::new_alias(interner, IsRigid::No, AliasConst::new(interner, kind, subst));
+        let konst = Const::new_alias(interner, IsRigid::No, AliasConst::new(interner, kind, subst));
         let ty = ty.instantiate(interner, subst).skip_norm_wip();
         Ok(Operand {
             kind: OperandKind::Constant { konst: konst.store(), ty: ty.store() },
@@ -3050,7 +3063,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         span: MirSpan,
     ) {
         let Some(scope) = self.drop_scopes.last_mut() else { return };
-        if declared > scope.locals.len() || !scope.locals[declared..].iter().any(|it| temps.contains(it))
+        if declared > scope.locals.len()
+            || !scope.locals[declared..].iter().any(|it| temps.contains(it))
         {
             return;
         }
@@ -3321,10 +3335,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             Expr::Ref { expr, mutability, .. } => {
                 (mutability.is_shared() || self.is_empty_array(expr)) && self.is_promotable(expr)
             }
-            Expr::UnaryOp {
-                expr,
-                op: hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg,
-            } => scalar(self, expr) && self.is_promotable(expr),
+            Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg } => {
+                scalar(self, expr) && self.is_promotable(expr)
+            }
             Expr::Cast { expr: inner, .. } => {
                 let from = self.expr_ty_without_adjust(inner);
                 let to = self.expr_ty_without_adjust(expr);
@@ -3849,8 +3862,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     self.extend_temporaries(initializer, pat, scope);
                 }
                 self.declare_bindings(pat);
-                let Some((init_place, c)) =
-                    self.lower_expr_as_place(current, initializer, true)?
+                let Some((init_place, c)) = self.lower_expr_as_place(current, initializer, true)?
                 else {
                     return Ok(None);
                 };
@@ -3946,11 +3958,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         self.push_fake_read(current, init_place, MirSpan::PatId(pat));
                         // Using the initializer for the resolver scope is good enough for us, as it cannot create new declarations
                         // and has all declarations of the `let`.
-                        let resolver_guard = self.resolver.update_to_inner_scope(
-                            self.db,
-                            self.store_owner,
-                            expr_id,
-                        );
+                        let resolver_guard =
+                            self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
                         self.super_let = enclosing.filter(|_| is_super);
                         let matched = match else_branch {
                             Some(_) => self
@@ -4278,7 +4287,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         let interner = self.interner();
         let span = MirSpan::from(expr_id);
         let awaitee_ty = self.expr_ty_after_adjustments(awaitee);
-        let future_ty = Ty::new_projection(interner, IsRigid::No, future_alias.into(), [awaitee_ty]);
+        let future_ty =
+            Ty::new_projection(interner, IsRigid::No, future_alias.into(), [awaitee_ty]);
         // rustc's `into_future(e)` writes to a temporary made before what `e` makes.
         let future = self.alloc_local(Local { ty: future_ty.store() });
         let Some((awaitee_value, current)) = self.lower_expr_to_some_operand(awaitee, current)?
@@ -4810,11 +4820,7 @@ fn convert_closure_capture_projections(
     })
 }
 
-fn cast_kind<'db>(
-    db: &'db Db,
-    source_ty: Ty<'db>,
-    target_ty: Ty<'db>,
-) -> Result<'db, CastKind> {
+fn cast_kind<'db>(db: &'db Db, source_ty: Ty<'db>, target_ty: Ty<'db>) -> Result<'db, CastKind> {
     let from = CastTy::from_ty(db, source_ty);
     let cast = CastTy::from_ty(db, target_ty);
     Ok(match (from, cast) {
@@ -5187,8 +5193,9 @@ fn lower_closure_body_in<'db>(
             AdtId::StructId(context),
             GenericArgs::new_from_slice(&[erased.into()]),
         );
-        let context = ctx
-            .alloc_local(Local { ty: Ty::new_ref(interner, erased, context, Mutability::Mut).store() });
+        let context = ctx.alloc_local(Local {
+            ty: Ty::new_ref(interner, erased, context, Mutability::Mut).store(),
+        });
         ctx.building.param_locals.push(context);
         let output = ctx.local(return_slot()).ty.as_ref();
         let poll = Ty::new_adt(
@@ -5246,10 +5253,11 @@ fn lower_closure_body_in<'db>(
 
         let local = capture.captured_local();
         let local = ctx.binding_local(local)?;
-        upvar_map
-            .entry(local)
-            .or_insert_with(|| Vec::new_in(frame))
-            .push((capture, capture_local, capture_idx));
+        upvar_map.entry(local).or_insert_with(|| Vec::new_in(frame)).push((
+            capture,
+            capture_local,
+            capture_idx,
+        ));
 
         let count = upvar_counts.get(&capture.captured_local()).copied().unwrap_or(0);
         ctx.result
@@ -5518,7 +5526,16 @@ pub fn lower_with_early_drops<'db>(
     let owner = InferBodyId::DefWithBodyId(def);
     let infer = InferenceResult::of(db, owner);
     let self_param = body.self_param.map(|param| param.formal);
-    lower_body_dropping(db, owner, &**body, infer, body.root_expr(), self_param, &*body.params, drops)
+    lower_body_dropping(
+        db,
+        owner,
+        &**body,
+        infer,
+        body.root_expr(),
+        self_param,
+        &*body.params,
+        drops,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

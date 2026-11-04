@@ -37,7 +37,11 @@ fn type_args_with_no_lifetime_args_infer_the_lifetimes() {
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
-                ModuleDefId::FunctionId(it) if FunctionSignature::of(&db, it).name.as_str() == "main" => Some(it),
+                ModuleDefId::FunctionId(it)
+                    if FunctionSignature::of(&db, it).name.as_str() == "main" =>
+                {
+                    Some(it)
+                }
                 _ => None,
             })
             .expect("the fixture's `main`");
@@ -56,6 +60,9 @@ fn type_args_with_no_lifetime_args_infer_the_lifetimes() {
         let args = args.skip_binder();
         assert_eq!(args.len(), 3, "`S::<Mode>::size` is {ty:?}");
         assert!(args.types().all(|it| !it.references_error()), "`S::<Mode>::size` is {ty:?}");
-        assert!(args.types().next().is_some_and(|it| it.as_adt().is_some()), "`S::<Mode>::size` is {ty:?}");
+        assert!(
+            args.types().next().is_some_and(|it| it.as_adt().is_some()),
+            "`S::<Mode>::size` is {ty:?}"
+        );
     });
 }

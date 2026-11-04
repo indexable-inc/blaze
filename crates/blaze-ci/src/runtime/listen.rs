@@ -45,7 +45,8 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const ID_ROOM: usize = 64;
 
 /// What every answer says besides its status and words.
-const HEADERS: [(&str, &str); 2] = [("Content-Type", "text/plain; charset=utf-8"), ("Connection", "close")];
+const HEADERS: [(&str, &str); 2] =
+    [("Content-Type", "text/plain; charset=utf-8"), ("Connection", "close")];
 
 /// The last `most` delivery ids, in a ring of strings reused in place: once every slot has held
 /// an id, remembering another moves no memory unless it is longer than the slot's room. Each
@@ -63,9 +64,17 @@ pub(crate) struct Seen {
 
 impl Seen {
     pub(crate) fn new(most: usize) -> Seen {
-        assert!(most > 0 && u32::try_from(most).is_ok(), "remember between 1 and 2^32 ids, not {most}");
+        assert!(
+            most > 0 && u32::try_from(most).is_ok(),
+            "remember between 1 and 2^32 ids, not {most}"
+        );
         // alloc: once, at start
-        Seen { ids: Vec::with_capacity(most), next: 0, most, slots: HashTable::with_capacity(2 * most) }
+        Seen {
+            ids: Vec::with_capacity(most),
+            next: 0,
+            most,
+            slots: HashTable::with_capacity(2 * most),
+        }
     }
 
     /// Whether `id` is new; it is remembered either way.
@@ -94,7 +103,8 @@ impl Seen {
             slot
         };
         let ids = &self.ids;
-        self.slots.insert_unique(hash, slot as u32, |&it| FixedState.hash_one(ids[it as usize].as_str()));
+        self.slots
+            .insert_unique(hash, slot as u32, |&it| FixedState.hash_one(ids[it as usize].as_str()));
         true
     }
 }
@@ -124,7 +134,13 @@ impl Listener {
         most: usize,
     ) -> Listener {
         let verifier = Verifier::new(secret.expose());
-        Listener { verifier, repo, service, seen: Mutex::new(Seen::new(most)), open: AtomicUsize::new(0) }
+        Listener {
+            verifier,
+            repo,
+            service,
+            seen: Mutex::new(Seen::new(most)),
+            open: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -136,7 +152,12 @@ impl Listener {
     }
 }
 
-pub(crate) fn run(listener: &TcpListener, secret: &Secret, repo: String, service: crossbeam_channel::Sender<Input>) {
+pub(crate) fn run(
+    listener: &TcpListener,
+    secret: &Secret,
+    repo: String,
+    service: crossbeam_channel::Sender<Input>,
+) {
     // alloc: once, at start
     serve(listener, &Arc::new(Listener::new(secret, repo, service)));
 }
@@ -275,7 +296,11 @@ pub(crate) fn accept(shared: &Listener, delivery: DeliveryRef<'_>, said: &mut St
         return 202;
     };
     if *delivery.repo != *shared.repo {
-        let _ = write!(said, "a delivery for {}, and this service is for {}", delivery.repo, shared.repo);
+        let _ = write!(
+            said,
+            "a delivery for {}, and this service is for {}",
+            delivery.repo, shared.repo
+        );
         return 403;
     }
     if !shared.seen.lock().first(delivery.id) {

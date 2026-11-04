@@ -53,8 +53,7 @@ mod tests;
 /// rows and the changed items', or a whole lowering ([`self`]).
 pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Arc<ItemTree> {
     let db_nonce = db.nonce_and_revision().0;
-    let kept =
-        with_slot(db_nonce, file, krate, |it| it.lock().take());
+    let kept = with_slot(db_nonce, file, krate, |it| it.lock().take());
     let kept = kept.filter(|it| (it.db, it.file, it.krate) == (db_nonce, file, krate));
     // Read on every path, so the query depends on it even where nothing lowered reads it.
     let cfg = krate.cfg_options(db);
@@ -74,8 +73,7 @@ pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Ar
         }
     };
     let replaced = with_slot(db_nonce, file, krate, |it| {
-        (it.lock())
-            .replace(Kept { db: db_nonce, file, krate, keyed })
+        (it.lock()).replace(Kept { db: db_nonce, file, krate, keyed })
     });
     // Dropped after the lock: a tree let go of may be a whole file's columns.
     drop(replaced);
@@ -290,7 +288,7 @@ fn lower_keyed(
     ctx.lower_top_attrs(source_file, crate_attrs_of(db, file, krate));
     let tree = ctx.lower_module_items_marked(source_file, &mut scratch.marks);
     let keyed = Keyed {
-        cfg: cfg.clone(), // clone: once a file's first edit or a new `cfg` set
+        cfg: cfg.clone(),     // clone: once a file's first edit or a new `cfg` set
         tree: Arc::new(tree), // alloc: the tree's handle, once a lowering
         text: text_of(source_file).clone(), // clone: one count of the file's text
         top,
@@ -516,8 +514,12 @@ fn item_keys(
                 feed.fingerprint()
             }
         };
-        keys.items[at] =
-            ItemKey { range, syntax, ids_end: id(keys.ids.len()), anchors_end: id(keys.anchors.len()) };
+        keys.items[at] = ItemKey {
+            range,
+            syntax,
+            ids_end: id(keys.ids.len()),
+            anchors_end: id(keys.anchors.len()),
+        };
     }
     entries.clear();
     entries.extend_from_slice(ast_id_map.entries());
@@ -624,7 +626,8 @@ impl Unchanged {
         let root = ROOT_ERASED_FILE_AST_ID.into_raw();
         let old = (last.anchors.iter().filter(|it| it[1] != root))
             .filter_map(|&[s, id]| Some([self.moved(s, s + 1)?[0], id]));
-        let new = (starts.iter().zip(pairs)).filter(|it| it.1[0] != root).map(|(&s, &[id, _])| [s, id]);
+        let new =
+            (starts.iter().zip(pairs)).filter(|it| it.1[0] != root).map(|(&s, &[id, _])| [s, id]);
         compare(old, new.filter(|&[s, _]| self.keeps(s, s + 1)), &mut mark);
     }
 }

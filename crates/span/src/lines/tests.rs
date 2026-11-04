@@ -8,8 +8,27 @@ use super::{Kernel, LineIndex, char_width, display_width, simd};
 /// enough to cross a 512-byte rank block with no newline in it.
 fn random_text(rng: &mut Rng) -> String {
     const PIECES: &[&str] = &[
-        "\n", "\n", "\n\n", "\r\n", "\r", "\r\r\n", "\t", "a", "fn f() {}", " ", "é", "名", "🦀",
-        "\u{feff}", "\u{202a}", "\u{2066}", "\0", "\x7f", "\u{85}", "\u{300}", "\u{200d}",
+        "\n",
+        "\n",
+        "\n\n",
+        "\r\n",
+        "\r",
+        "\r\r\n",
+        "\t",
+        "a",
+        "fn f() {}",
+        " ",
+        "é",
+        "名",
+        "🦀",
+        "\u{feff}",
+        "\u{202a}",
+        "\u{2066}",
+        "\0",
+        "\x7f",
+        "\u{85}",
+        "\u{300}",
+        "\u{200d}",
     ];
     let mut text = String::new();
     if rng.index(4) == 0 {
@@ -215,7 +234,9 @@ fn places_match_the_old_line_starts() {
             continue;
         }
         let starts: Vec<u32> = std::iter::once(0)
-            .chain(text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(at, _)| at as u32 + 1))
+            .chain(
+                text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(at, _)| at as u32 + 1),
+            )
             .collect();
         let index = LineIndex::new(&text);
         for at in (0..=text.len()).filter(|&at| text.is_char_boundary(at)) {
@@ -248,7 +269,11 @@ fn rows_are_newlines_before() {
         let index = LineIndex::new(&text);
         let (mut row, mut start) = (0u32, 0u32);
         for at in 0..=text.len() {
-            assert_eq!(index.row(TextSize::new(at as u32)), Some((row, TextSize::new(start))), "at {at}");
+            assert_eq!(
+                index.row(TextSize::new(at as u32)),
+                Some((row, TextSize::new(start))),
+                "at {at}"
+            );
             if text.as_bytes().get(at) == Some(&b'\n') {
                 (row, start) = (row + 1, at as u32 + 1);
             }

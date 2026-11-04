@@ -15,7 +15,10 @@ use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
     InferBodyId,
-    mir::{BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, PlaceElem, ProjectionElem},
+    mir::{
+        BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, PlaceElem,
+        ProjectionElem,
+    },
     next_solver::TyKind,
 };
 
@@ -446,8 +449,7 @@ impl<'a> Loans<'a> {
         // rustc promotes no call, not even of a `const fn` in a `const` block.
         let promotes = |&(local, expr): &(LocalId, hir_def::hir::ExprId)| {
             item || (!is_call(ctx, expr)
-                && (ctx.is_plain(body.locals[local].ty.as_ref())
-                    || plain_value(ctx, body, expr)))
+                && (ctx.is_plain(body.locals[local].ty.as_ref()) || plain_value(ctx, body, expr)))
         };
         let mut promoted: FVec<'_, &(LocalId, hir_def::hir::ExprId)> = Vec::new_in(frame);
         let mut rejected = mem::set(frame);
@@ -543,11 +545,7 @@ impl<'a> Loans<'a> {
                 location,
                 span: borrow.span,
                 assigned: borrow.assigned,
-                activation: if two {
-                    Activation::NotActivated
-                } else {
-                    Activation::NotTwoPhase
-                },
+                activation: if two { Activation::NotActivated } else { Activation::NotTwoPhase },
             });
             facts.push(MADE_AT, cfg.point(location), id);
             facts.push(OF_LOCAL, raw(borrow.local), id);
@@ -705,7 +703,12 @@ impl<'a> Loans<'a> {
     }
 
     /// The loans in scope at the start of each block, a row per block: rustc's `Borrows`.
-    pub(super) fn entry_sets(&self, ctx: &Ctx<'a, '_>, body: &MirBody<'_>, cfg: &Cfg<'_>) -> Rows<'a> {
+    pub(super) fn entry_sets(
+        &self,
+        ctx: &Ctx<'a, '_>,
+        body: &MirBody<'_>,
+        cfg: &Cfg<'_>,
+    ) -> Rows<'a> {
         let frame = ctx.frame;
         let blocks = body.basic_blocks.len();
         let count = self.loans.len();

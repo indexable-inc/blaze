@@ -134,7 +134,11 @@ fn fetch_crate(entries: &[Entry<'_>]) -> Result<Source, blaze_api::ApiError> {
 }
 
 fn file(path: &str, bytes: &[u8], mode: Mode) -> SourceFile {
-    SourceFile { path: path.to_owned(), bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes), mode }
+    SourceFile {
+        path: path.to_owned(),
+        bytes: blaze_vfs::Bytes::copy_kept(blaze_mem::Tag::Vfs, bytes),
+        mode,
+    }
 }
 
 /// A fetched package is written on disk where it is mounted, whole, modes kept: a build script
@@ -160,17 +164,27 @@ fn a_fetched_package_is_on_disk_where_it_is_mounted() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = |path: &str| std::fs::metadata(at.join(path)).unwrap().permissions().mode() & 0o777;
+        let mode =
+            |path: &str| std::fs::metadata(at.join(path)).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode("build.sh"), 0o555, "executable, and read-only");
         assert_eq!(mode("src/lib.c"), 0o444, "read-only");
     }
-    let siblings: Vec<_> = std::fs::read_dir(at.parent().unwrap()).unwrap().map(|it| it.unwrap().file_name()).collect();
+    let siblings: Vec<_> = std::fs::read_dir(at.parent().unwrap())
+        .unwrap()
+        .map(|it| it.unwrap().file_name())
+        .collect();
     assert_eq!(siblings, ["serde-1.0.219"], "nothing left of the write beside the package");
     // Written once: a second fetch of the same package keeps it.
     super::keep_on_disk(&fetch, &source, &sources).unwrap();
     let index_at = sources.join("registry/index/x/.cache/se/rd/serde");
-    let index = Fetch { at: index_at.to_str().unwrap().to_owned(), kind: FetchKind::IndexFile, ..fetch };
-    super::keep_on_disk(&index, &Source { files: vec![file("serde", b"{}", Mode::Regular)], under: "serde".into() }, &sources).unwrap();
+    let index =
+        Fetch { at: index_at.to_str().unwrap().to_owned(), kind: FetchKind::IndexFile, ..fetch };
+    super::keep_on_disk(
+        &index,
+        &Source { files: vec![file("serde", b"{}", Mode::Regular)], under: "serde".into() },
+        &sources,
+    )
+    .unwrap();
     assert!(!index_at.exists());
 }
 
@@ -181,7 +195,10 @@ fn a_fetched_package_is_on_disk_where_it_is_mounted() {
 fn a_lock_files_traversal_name_is_refused_before_anything_is_written() {
     let dir = tempfile::tempdir().unwrap();
     let sources = dir.path().join("sources");
-    let source = Source { files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)], under: String::new() };
+    let source = Source {
+        files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)],
+        under: String::new(),
+    };
     let root = sources.to_str().unwrap();
     for at in [
         format!("{root}/registry/src/index.crates.io-1949cf8c6b5b557f/../../../../escaped/x-1.0.0"),
@@ -193,7 +210,11 @@ fn a_lock_files_traversal_name_is_refused_before_anything_is_written() {
     ] {
         let fetch = Fetch { at: at.clone(), ..crate_fetch(&"0".repeat(64)) };
         let error = super::keep_on_disk(&fetch, &source, &sources).unwrap_err();
-        assert!(error.what.contains("serde v1.0.219") && error.what.contains(&at), "{at}: {}", error.what);
+        assert!(
+            error.what.contains("serde v1.0.219") && error.what.contains(&at),
+            "{at}: {}",
+            error.what
+        );
     }
     assert!(!dir.path().join("escaped").exists() && !sources.exists(), "nothing written");
 }
@@ -204,16 +225,29 @@ fn a_lock_files_traversal_name_is_refused_before_anything_is_written() {
 fn a_copy_on_disk_that_is_not_the_fetched_package_is_refused_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let sources = dir.path().join("sources");
-    let at = sources.join("git/checkouts/repo-0123456789abcdef/0123456789abcdef0123456789abcdef01234567");
+    let at = sources
+        .join("git/checkouts/repo-0123456789abcdef/0123456789abcdef0123456789abcdef01234567");
     let fetch = Fetch { at: at.to_str().unwrap().to_owned(), ..crate_fetch(&"0".repeat(64)) };
-    let one = Source { files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)], under: String::new() };
-    let two = Source { files: vec![file("Cargo.toml", b"[package] # two\n", Mode::Regular)], under: String::new() };
+    let one = Source {
+        files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)],
+        under: String::new(),
+    };
+    let two = Source {
+        files: vec![file("Cargo.toml", b"[package] # two\n", Mode::Regular)],
+        under: String::new(),
+    };
     super::keep_on_disk(&fetch, &one, &sources).unwrap();
     let error = super::keep_on_disk(&fetch, &two, &sources).unwrap_err();
     let (one, two) = (super::source_on_disk_id(&one), super::source_on_disk_id(&two));
-    assert!(error.what.contains(&format!("{one:x}")) && error.what.contains(&format!("{two:x}")), "{}", error.what);
+    assert!(
+        error.what.contains(&format!("{one:x}")) && error.what.contains(&format!("{two:x}")),
+        "{}",
+        error.what
+    );
     std::fs::remove_file(at.join(super::ON_DISK_MARK)).unwrap();
-    let error = super::keep_on_disk(&fetch, &Source { files: Vec::new(), under: String::new() }, &sources).unwrap_err();
+    let error =
+        super::keep_on_disk(&fetch, &Source { files: Vec::new(), under: String::new() }, &sources)
+            .unwrap_err();
     assert!(error.what.contains("without the .blaze-ok"), "{}", error.what);
 }
 
@@ -268,7 +302,11 @@ fn a_crate_of_another_sha256_is_refused_naming_both() {
     let locked = "ab".repeat(32);
     let fake = Fake::new(vec![Answer::Status(200, bytes)]);
     let error = fetcher(&fake).fetch(&crate_fetch(&locked)).unwrap_err();
-    assert!(error.what.starts_with("failed to verify the checksum of `serde v1.0.219`"), "{}", error.what);
+    assert!(
+        error.what.starts_with("failed to verify the checksum of `serde v1.0.219`"),
+        "{}",
+        error.what
+    );
     assert!(error.what.contains(&locked), "{}", error.what);
     assert!(error.what.contains(&actual), "{}", error.what);
     assert_eq!(error.at.as_deref(), Some(SERDE));
@@ -280,27 +318,43 @@ fn a_local_registrys_crate_is_read_in_place_and_checked() {
     let bytes = tarball(&[Entry::File("serde-1.0.219/Cargo.toml", b"[package]\n", 0o644)]);
     let at = dir.path().join("serde-1.0.219.crate");
     std::fs::write(&at, &bytes).unwrap();
-    let local = |sha256: &str| Fetch { url: format!("file://{}", at.display()), ..crate_fetch(sha256) };
+    let local =
+        |sha256: &str| Fetch { url: format!("file://{}", at.display()), ..crate_fetch(sha256) };
     let fake = Fake::new(Vec::new());
     let source = fetcher(&fake).fetch(&local(&blaze_registry::download::checksum(&bytes))).unwrap();
     assert_eq!(
         source.files,
-        vec![file(".cargo-ok", br#"{"v":1}"#, Mode::Regular), file("Cargo.toml", b"[package]\n", Mode::Regular)]
+        vec![
+            file(".cargo-ok", br#"{"v":1}"#, Mode::Regular),
+            file("Cargo.toml", b"[package]\n", Mode::Regular)
+        ]
     );
     let error = fetcher(&fake).fetch(&local(&"ab".repeat(32))).unwrap_err();
-    assert!(error.what.starts_with("failed to verify the checksum of `serde v1.0.219`"), "{}", error.what);
+    assert!(
+        error.what.starts_with("failed to verify the checksum of `serde v1.0.219`"),
+        "{}",
+        error.what
+    );
     std::fs::remove_file(&at).unwrap();
     let error = fetcher(&fake).fetch(&local(&"ab".repeat(32))).unwrap_err();
-    assert!(error.what.starts_with(&format!("failed to read `{}`", at.display())), "{}", error.what);
+    assert!(
+        error.what.starts_with(&format!("failed to read `{}`", at.display())),
+        "{}",
+        error.what
+    );
     assert!(fake.asked().is_empty());
 }
 
 #[test]
 fn entries_that_leave_the_package_are_refused_by_name() {
     let refused = |entry: Entry<'_>, named: &str| {
-        let error = fetch_crate(&[Entry::File("serde-1.0.219/Cargo.toml", b"", 0o644), entry])
-            .unwrap_err();
-        assert!(error.what.starts_with("failed to unpack package `serde v1.0.219`"), "{}", error.what);
+        let error =
+            fetch_crate(&[Entry::File("serde-1.0.219/Cargo.toml", b"", 0o644), entry]).unwrap_err();
+        assert!(
+            error.what.starts_with("failed to unpack package `serde v1.0.219`"),
+            "{}",
+            error.what
+        );
         assert!(error.what.contains(named), "{named}: {}", error.what);
         assert_eq!(error.at.as_deref(), Some(SERDE));
     };
@@ -345,7 +399,10 @@ fn an_index_file_is_kept_as_served_under_its_name() {
     let line = br#"{"name":"serde","vers":"1.0.219","deps":[],"cksum":"00","features":{}}"#;
     let fake = Fake::new(vec![Answer::Status(200, line.to_vec())]);
     let source = fetcher(&fake).fetch(&index_fetch()).unwrap();
-    assert_eq!(source, Source { files: vec![file("serde", line, Mode::Regular)], under: "serde".to_owned() });
+    assert_eq!(
+        source,
+        Source { files: vec![file("serde", line, Mode::Regular)], under: "serde".to_owned() }
+    );
     let asked = fake.asked();
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].0, "https://index.crates.io/se/rd/serde");
@@ -369,7 +426,8 @@ fn an_index_without_the_file_gives_no_file() {
 fn a_transient_failure_is_tried_again_and_a_permanent_one_is_not() {
     let bytes = tarball(&[Entry::File("serde-1.0.219/Cargo.toml", b"", 0o644)]);
     let sha256 = blaze_registry::download::checksum(&bytes);
-    let fake = Fake::new(vec![Answer::Reset, Answer::Status(503, Vec::new()), Answer::Status(200, bytes)]);
+    let fake =
+        Fake::new(vec![Answer::Reset, Answer::Status(503, Vec::new()), Answer::Status(200, bytes)]);
     fetcher(&fake).fetch(&crate_fetch(&sha256)).unwrap();
     assert_eq!(fake.asked().len(), 3);
 

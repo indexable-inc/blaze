@@ -21,7 +21,10 @@ use hir::{InFile, LangItem};
 use rustc_type_ir::inherent::Ty as _;
 use syntax::{
     AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, ast as tag,
-    view::{self as ast, ArithOp, AstNode as _, BinaryOp, CmpOp, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    view::{
+        self as ast, ArithOp, AstNode as _, BinaryOp, CmpOp, HasGenericParams as _, HasName as _,
+        HasTypeBounds as _,
+    },
 };
 
 use crate::{
@@ -44,9 +47,8 @@ pub(crate) fn lower<'db>(
     };
     let lhs_expr = bin.and_then(|it| it.lhs());
     let rhs_expr = bin.and_then(|it| it.rhs());
-    let op_span = bin
-        .and_then(|it| it.op_token())
-        .map_or_else(|| whole.clone(), |it| at(it.text_range())); // clone: the error's span
+    let op_span =
+        bin.and_then(|it| it.op_token()).map_or_else(|| whole.clone(), |it| at(it.text_range())); // clone: the error's span
     let lhs_span = lhs_expr.map(|it| at(it.syntax().text_range()));
     let rhs_span = rhs_expr.map(|it| at(it.syntax().text_range()));
     // clone: the types as rustc prints them as it reports, before integer fallback
@@ -90,7 +92,11 @@ pub(crate) fn lower<'db>(
                     format!("cannot calculate the remainder of `{lhs}` divided by `{rhs}`")
                 }
                 BinaryOp::ArithOp(
-                    ArithOp::BitAnd | ArithOp::BitXor | ArithOp::BitOr | ArithOp::Shl | ArithOp::Shr,
+                    ArithOp::BitAnd
+                    | ArithOp::BitXor
+                    | ArithOp::BitOr
+                    | ArithOp::Shl
+                    | ArithOp::Shr,
                 ) => {
                     // alloc: the error's message
                     format!("no implementation for `{lhs} {op_str} {rhs}`")
@@ -231,7 +237,10 @@ pub(crate) fn note_unmet_impl<'db>(
         // clone: the label's span; alloc: the note's label
         span.labels.push((adt_span.clone(), format!("must implement `{sugared}`")));
         // alloc: the note
-        diag.span_note(span, format!("an implementation of `{sugared}` might be missing for `{ty}`"));
+        diag.span_note(
+            span,
+            format!("an implementation of `{sugared}` might be missing for `{ty}`"),
+        );
     } else {
         let mut span = MultiSpan::of(adt_span.clone()); // clone: the note's span
         // clone: the label's span; alloc: the note's label
@@ -362,7 +371,7 @@ pub(crate) fn restrict_param(
         (
             at(last.syntax().text_range()).shrink_to_hi(),
             "consider further restricting this bound".to_owned(), // alloc: the message
-            format!(" + {constraint}"),                            // alloc: the suggestion's text
+            format!(" + {constraint}"),                           // alloc: the suggestion's text
         )
     } else if let Some(last) = where_clause.and_then(|it| it.predicates().last()) {
         (
@@ -478,15 +487,15 @@ pub(crate) fn is_syntactic_place<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) ->
         ast::Expr::ParenExpr(it) => it.expr().is_some_and(|it| is_syntactic_place(cx, it)),
         ast::Expr::PrefixExpr(it) => it.op_kind() == Some(ast::UnaryOp::Deref),
         ast::Expr::FieldExpr(_) | ast::Expr::IndexExpr(_) => true,
-        ast::Expr::PathExpr(it) => it.path().and_then(|it| cx.vsema.resolve_path(it)).is_some_and(
-            |it| {
+        ast::Expr::PathExpr(it) => {
+            it.path().and_then(|it| cx.vsema.resolve_path(it)).is_some_and(|it| {
                 matches!(
                     it,
                     hir::PathResolution::Local(_)
                         | hir::PathResolution::Def(hir::ModuleDef::Static(_))
                 )
-            },
-        ),
+            })
+        }
         _ => false,
     }
 }
@@ -522,7 +531,8 @@ fn suggest_deref_or_borrow<'db>(
 ) {
     let at = |expr: ast::Expr<'_>| cx.span(InFile::new(file, expr.syntax().text_range()));
     // clone: the type, for the trait query on the error path
-    let works = |lhs: &hir::Type<'db>, rhs: &hir::Type<'db>| lhs.impls_trait(cx.db, trait_, &[rhs.clone()]);
+    let works =
+        |lhs: &hir::Type<'db>, rhs: &hir::Type<'db>| lhs.impls_trait(cx.db, trait_, &[rhs.clone()]);
     let deref_binop = |diag: &mut Diag, lhs_deref: &hir::Type<'db>| {
         if works(lhs_deref, &d.rhs) {
             diag.suggestion_verbose(
@@ -554,44 +564,47 @@ fn suggest_deref_or_borrow<'db>(
     };
     let lhs_inv = invert(lhs_mut);
     let lhs_inv_ty = lhs_deref.add_reference(cx.db, lhs_inv);
-    let different_borrow =
-        |diag: &mut Diag, lhs: &hir::Type<'db>, lhs_new: Option<hir::Mutability>, rhs: &hir::Type<'db>, rhs_new: Option<hir::Mutability>| {
-            if !works(lhs, rhs) {
-                return;
-            }
-            // alloc: the note
-            diag.note(format!("an implementation for `{} {op_str} {}` exists", cx.ty(lhs), cx.ty(rhs)));
-            if lhs_new == Some(hir::Mutability::Shared) && rhs_new == Some(hir::Mutability::Shared) {
-                diag.multipart_suggestion(
-                    "consider reborrowing both sides",
-                    // alloc: the suggestion's parts
-                    vec![
-                        // alloc: the suggestion's text
-                        (at(lhs_expr).shrink_to_lo(), "&*".to_owned()),
-                        // alloc: the suggestion's text
-                        (at(rhs_expr).shrink_to_lo(), "&*".to_owned()),
-                    ],
-                    Applicability::MachineApplicable,
-                );
-                return;
-            }
-            for (new, expr) in [(lhs_new, lhs_expr), (rhs_new, rhs_expr)] {
-                match new {
-                    Some(hir::Mutability::Shared) => {
-                        diag.suggestion_verbose(
-                            at(expr).shrink_to_lo(),
-                            "consider reborrowing this side",
-                            "&*",
-                            Applicability::MachineApplicable,
-                        );
-                    }
-                    Some(hir::Mutability::Mut) => {
-                        diag.span_help(at(expr), "consider making this expression a mutable borrow");
-                    }
-                    None => {}
+    let different_borrow = |diag: &mut Diag,
+                            lhs: &hir::Type<'db>,
+                            lhs_new: Option<hir::Mutability>,
+                            rhs: &hir::Type<'db>,
+                            rhs_new: Option<hir::Mutability>| {
+        if !works(lhs, rhs) {
+            return;
+        }
+        // alloc: the note
+        diag.note(format!("an implementation for `{} {op_str} {}` exists", cx.ty(lhs), cx.ty(rhs)));
+        if lhs_new == Some(hir::Mutability::Shared) && rhs_new == Some(hir::Mutability::Shared) {
+            diag.multipart_suggestion(
+                "consider reborrowing both sides",
+                // alloc: the suggestion's parts
+                vec![
+                    // alloc: the suggestion's text
+                    (at(lhs_expr).shrink_to_lo(), "&*".to_owned()),
+                    // alloc: the suggestion's text
+                    (at(rhs_expr).shrink_to_lo(), "&*".to_owned()),
+                ],
+                Applicability::MachineApplicable,
+            );
+            return;
+        }
+        for (new, expr) in [(lhs_new, lhs_expr), (rhs_new, rhs_expr)] {
+            match new {
+                Some(hir::Mutability::Shared) => {
+                    diag.suggestion_verbose(
+                        at(expr).shrink_to_lo(),
+                        "consider reborrowing this side",
+                        "&*",
+                        Applicability::MachineApplicable,
+                    );
                 }
+                Some(hir::Mutability::Mut) => {
+                    diag.span_help(at(expr), "consider making this expression a mutable borrow");
+                }
+                None => {}
             }
-        };
+        }
+    };
     different_borrow(diag, &lhs_inv_ty, Some(lhs_inv), &d.rhs, None);
     if let Some((rhs_deref, rhs_mut)) = d.rhs.as_reference() {
         let rhs_inv = invert(rhs_mut);
@@ -621,7 +634,9 @@ fn str_addition<'db>(
     // Where the left side is made owned: the borrow removed, or `.to_owned()` after it.
     let owned = || match lhs_expr {
         ast::Expr::RefExpr(it) => {
-            let inner = it.expr().map_or(it.syntax().text_range().end(), |it| it.syntax().text_range().start());
+            let inner = it
+                .expr()
+                .map_or(it.syntax().text_range().end(), |it| it.syntax().text_range().start());
             (at(TextRange::new(it.syntax().text_range().start(), inner)), None)
         }
         // alloc: the suggestion's text
@@ -637,7 +652,10 @@ fn str_addition<'db>(
     {
         if !assign {
             // clone: the label's span
-            diag.span_label(op_span.clone(), "`+` cannot be used to concatenate two `&str` strings");
+            diag.span_label(
+                op_span.clone(),
+                "`+` cannot be used to concatenate two `&str` strings",
+            );
             diag.note(STR_CONCAT_NOTE);
             let (span, replacement) = owned();
             let (message, replacement) = match replacement {
@@ -651,13 +669,18 @@ fn str_addition<'db>(
     }
     if rhs_ref.is_none() && is_string(&d.rhs) {
         // clone: the label's span
-        diag.span_label(op_span.clone(), "`+` cannot be used to concatenate a `&str` with a `String`");
+        diag.span_label(
+            op_span.clone(),
+            "`+` cannot be used to concatenate a `&str` with a `String`",
+        );
         if !assign {
             let (span, replacement) = owned();
             let (message, replacement) = match replacement {
                 // alloc: empty, allocates nothing
                 None => ("remove the borrow on the left and add one on the right", String::new()),
-                Some(it) => ("create an owned `String` on the left and add a borrow on the right", it),
+                Some(it) => {
+                    ("create an owned `String` on the left and add a borrow on the right", it)
+                }
             };
             diag.multipart_suggestion(
                 message,
@@ -706,7 +729,10 @@ fn raw_ptr_arithmetic<'db>(
                 diag.multipart_suggestion(
                     "consider using `wrapping_sub` or `sub` for pointer - {integer}",
                     // clone: the suggestion's spans; alloc: its parts
-                    vec![(between.clone(), ".wrapping_sub(".to_owned()), (rhs_end.clone(), ")".to_owned())],
+                    vec![
+                        (between.clone(), ".wrapping_sub(".to_owned()),
+                        (rhs_end.clone(), ")".to_owned()),
+                    ],
                     Applicability::MaybeIncorrect,
                 );
             }
@@ -723,10 +749,18 @@ fn raw_ptr_arithmetic<'db>(
                 );
             }
         }
-        BinaryOp::Assignment { op: Some(op @ (ArithOp::Add | ArithOp::Sub)) } if lhs_ptr && rhs_integral => {
+        BinaryOp::Assignment { op: Some(op @ (ArithOp::Add | ArithOp::Sub)) }
+            if lhs_ptr && rhs_integral =>
+        {
             let (message, method) = match op {
-                ArithOp::Add => ("consider using `add` or `wrapping_add` to do pointer arithmetic", "wrapping_add"),
-                _ => ("consider using `sub` or `wrapping_sub` to do pointer arithmetic", "wrapping_sub"),
+                ArithOp::Add => (
+                    "consider using `add` or `wrapping_add` to do pointer arithmetic",
+                    "wrapping_add",
+                ),
+                _ => (
+                    "consider using `sub` or `wrapping_sub` to do pointer arithmetic",
+                    "wrapping_sub",
+                ),
             };
             let name = match lhs_expr {
                 ast::Expr::PathExpr(it) => it

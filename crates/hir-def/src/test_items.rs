@@ -12,7 +12,10 @@ use crate::{
 /// Every item declared in `krate`'s modules, module by module, each in the order written.
 pub fn declarations(db: &Db, krate: Crate) -> Vec<ModuleDefId> {
     // alloc: a test helper's list, what its callers index and count.
-    crate_def_map(db, krate).modules(db).flat_map(|(_, module)| module.scope(db).declarations()).collect()
+    crate_def_map(db, krate)
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).declarations())
+        .collect()
 }
 
 /// Every impl in `krate`'s modules, module by module, each in the order written.
@@ -25,7 +28,9 @@ pub fn impls(db: &Db, krate: Crate) -> Vec<ImplId> {
 #[track_caller]
 pub fn function(db: &Db, krate: Crate, name: &str) -> FunctionId {
     one(db, krate, "functions", name, |def| match def {
-        ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => Some(it),
+        ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
+            Some(it)
+        }
         _ => None,
     })
 }
@@ -34,7 +39,9 @@ pub fn function(db: &Db, krate: Crate, name: &str) -> FunctionId {
 #[track_caller]
 pub fn type_alias(db: &Db, krate: Crate, name: &str) -> TypeAliasId {
     one(db, krate, "type aliases", name, |def| match def {
-        ModuleDefId::TypeAliasId(it) if TypeAliasSignature::of(db, it).name.as_str() == name => Some(it),
+        ModuleDefId::TypeAliasId(it) if TypeAliasSignature::of(db, it).name.as_str() == name => {
+            Some(it)
+        }
         _ => None,
     })
 }
@@ -62,7 +69,13 @@ pub fn constant(db: &Db, krate: Crate, name: &str) -> ConstId {
 }
 
 #[track_caller]
-fn one<T: Copy>(db: &Db, krate: Crate, what: &str, name: &str, pick: impl FnMut(ModuleDefId) -> Option<T>) -> T {
+fn one<T: Copy>(
+    db: &Db,
+    krate: Crate,
+    what: &str,
+    name: &str,
+    pick: impl FnMut(ModuleDefId) -> Option<T>,
+) -> T {
     // alloc: a test helper; the count is in the panic.
     let found: Vec<T> = declarations(db, krate).into_iter().filter_map(pick).collect();
     match found[..] {

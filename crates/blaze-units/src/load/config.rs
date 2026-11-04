@@ -11,10 +11,12 @@ use blaze_manifest::Config;
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
-use super::files::{FixedFile, FixedPath, Found, MountTable, Snap, ancestors, read_file, read_through};
+use super::files::{
+    FixedFile, FixedPath, Found, MountTable, Snap, ancestors, read_file, read_through,
+};
 use super::invocation::Asking;
-use super::load_error;
 use super::key_id;
+use super::load_error;
 use crate::query::{Cbor, LoadError, Mount, Versioned, producer};
 
 /// Which configuration a workspace is read with.
@@ -47,7 +49,8 @@ impl ConfigOf {
         match self {
             ConfigOf::View => read_file(cx, path),
             ConfigOf::Fixed { mounts, cwd, env } => {
-                let key = FixedPath { table: ConfigOf::table(mounts, cwd, env), path: path.to_owned() };
+                let key =
+                    FixedPath { table: ConfigOf::table(mounts, cwd, env), path: path.to_owned() };
                 Ok(cx.get::<FixedFile>(&key)?.get())
             }
         }
@@ -83,7 +86,10 @@ impl Query for ConfigChain {
         key_id("blaze v2 cargo config key 2", key)
     }
 
-    fn execute(cx: &mut Cx<'_>, key: &ConfigOf) -> Result<Cbor<Result<ConfigRead, LoadError>>, Cancelled> {
+    fn execute(
+        cx: &mut Cx<'_>,
+        key: &ConfigOf,
+    ) -> Result<Cbor<Result<ConfigRead, LoadError>>, Cancelled> {
         let (cwd, env, command, cli, unstable) = match key {
             ConfigOf::View => match cx.get::<Asking>(&())?.get() {
                 Ok(asked) => (
@@ -95,10 +101,14 @@ impl Query for ConfigChain {
                 ),
                 Err(error) => return Ok(Cbor(Err(error))),
             },
-            ConfigOf::Fixed { cwd, env, .. } => (cwd.clone(), env.clone(), "build".to_owned(), Vec::new(), Vec::new()),
+            ConfigOf::Fixed { cwd, env, .. } => {
+                (cwd.clone(), env.clone(), "build".to_owned(), Vec::new(), Vec::new())
+            }
         };
         let read = ConfigRead { cwd, env, command, cli, unstable, warnings: Vec::new() };
-        let loaded = read_through(cx, key, |files| Ok(build(&read, files).map(|config| config.take_warnings())))?;
+        let loaded = read_through(cx, key, |files| {
+            Ok(build(&read, files).map(|config| config.take_warnings()))
+        })?;
         Ok(Cbor(match loaded {
             Ok(Ok(warnings)) => Ok(ConfigRead { warnings, ..read }),
             Ok(Err(error)) => Err(load_error(&error, None)),
@@ -109,7 +119,10 @@ impl Query for ConfigChain {
 
 /// The configuration `read` describes, reading its files through `files`: every file read at
 /// once, as cargo's `GlobalContext` does.
-pub(crate) fn build<'r, 'db>(read: &ConfigRead, files: Snap<'r, 'db>) -> anyhow::Result<Config<Snap<'r, 'db>>> {
+pub(crate) fn build<'r, 'db>(
+    read: &ConfigRead,
+    files: Snap<'r, 'db>,
+) -> anyhow::Result<Config<Snap<'r, 'db>>> {
     // clone: the variables, which the configuration takes owned.
     let mut config = Config::load_with(Path::new(&read.cwd), read.env.clone(), files)?;
     config.start(&read.command, &read.cli)?;

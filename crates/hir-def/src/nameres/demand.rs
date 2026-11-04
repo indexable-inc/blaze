@@ -15,9 +15,9 @@ use std::ops::ControlFlow;
 
 use base_db::{Crate, Db};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use hir_expand::{ErasedAstId, InFile, name::Name};
 use intern::Symbol;
+use std::alloc::Global;
 use syntax::{
     SmolStr, SyntaxKind, T, TextRange, ast as tag,
     view::{self as ast, AstNode},
@@ -48,11 +48,7 @@ pub fn scope_body_owners(db: &Db, scope: &ItemScope) -> Vec<DefWithBodyId> {
     owners
 }
 
-fn push_scope_body_owners(
-    db: &Db,
-    scope: &ItemScope,
-    owners: &mut Vec<DefWithBodyId>,
-) {
+fn push_scope_body_owners(db: &Db, scope: &ItemScope, owners: &mut Vec<DefWithBodyId>) {
     let _ = visit_scope_body_owners(db, scope, |it| {
         owners.push(it);
         ControlFlow::Continue(())
@@ -169,8 +165,7 @@ pub fn walk_bodies<'db>(
     mut each: impl FnMut(DefWithBodyId, &BodyBlocks<'db>),
 ) {
     // alloc: once per walk, at the roots' count
-    let mut seen: HashSet<DefWithBodyId, Global> =
-        HashSet::with_capacity_in(roots.len(), Global);
+    let mut seen: HashSet<DefWithBodyId, Global> = HashSet::with_capacity_in(roots.len(), Global);
     seen.extend(roots.iter().copied());
     let mut queue = roots;
     queue.reverse();
@@ -275,11 +270,7 @@ fn owner_ast_id(db: &Db, owner: DefWithBodyId) -> ErasedAstId {
     }
 }
 
-fn owner_in_module(
-    db: &Db,
-    module: ModuleId,
-    item: ErasedAstId,
-) -> Option<DefWithBodyId> {
+fn owner_in_module(db: &Db, module: ModuleId, item: ErasedAstId) -> Option<DefWithBodyId> {
     let scope = module.def_map(db).module(db, module).scope(db);
     visit_scope_body_owners(db, scope, |it| {
         if owner_ast_id(db, it) == item {
@@ -294,10 +285,7 @@ fn owner_in_module(
 /// The innermost item with a body whose body holds `block`: a function, a const, a static or
 /// an enum variant's discriminant. Inside a macro's expansion with no such item, the call is
 /// where the expansion is, and the search goes on from there in the file of the call.
-fn owning_item(
-    db: &Db,
-    block: AstId<tag::BlockExpr>,
-) -> Result<ErasedAstId, String> {
+fn owning_item(db: &Db, block: AstId<tag::BlockExpr>) -> Result<ErasedAstId, String> {
     fn range<'t, N: AstNode<'t> + Copy>(it: N) -> TextRange {
         it.syntax().text_range()
     }
@@ -398,12 +386,7 @@ impl Look {
     /// Whether the body of `owner` may declare such an item: its text says a word this looks
     /// for, or names a macro of its crate, of a crate it depends on (`Look::macros`) or of the
     /// blocks around it (`local`) that may write one. Reads the body's syntax and lowers no body.
-    fn may_say(
-        self,
-        db: &Db,
-        owner: DefWithBodyId,
-        local: &HashSet<SmolStr, Global>,
-    ) -> bool {
+    fn may_say(self, db: &Db, owner: DefWithBodyId, local: &HashSet<SmolStr, Global>) -> bool {
         let Some(body) = body_syntax(db, owner) else { return false };
         let declaring = self.macros(db, owner.module(db).krate(db));
         any_word(body, |word| {

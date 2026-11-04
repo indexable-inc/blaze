@@ -204,11 +204,7 @@ pub(crate) fn reflect_container_of<'db>(
                 },
                 _ => return ReflectContainer::Not,
             };
-            if i < count {
-                ReflectContainer::Of(container)
-            } else {
-                ReflectContainer::Not
-            }
+            if i < count { ReflectContainer::Of(container) } else { ReflectContainer::Not }
         }
         ReflectedDomain::Variants => {
             if Some(id) != lang.ReflectVariantRepresentingType {

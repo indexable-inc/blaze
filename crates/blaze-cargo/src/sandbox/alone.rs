@@ -39,7 +39,11 @@ enum Job {
     Launch(confine::Spec),
     /// [`super::linux::run`], or with why namespaces can't be made [`super::linux::run_as`].
     #[cfg(target_os = "linux")]
-    Run { spec: super::Spec, program: Option<Vec<OsString>>, unshared: Option<String> },
+    Run {
+        spec: super::Spec,
+        program: Option<Vec<OsString>>,
+        unshared: Option<String>,
+    },
 }
 
 impl Job {
@@ -108,7 +112,10 @@ pub(super) fn run_as_said(
 
 /// [`run`], and also what it and the sandbox wrote, which is not written to this test's stderr.
 #[cfg(target_os = "linux")]
-pub(super) fn run_said(spec: &super::Spec, program: Option<&[OsString]>) -> (Result<i32, String>, String) {
+pub(super) fn run_said(
+    spec: &super::Spec,
+    program: Option<&[OsString]>,
+) -> (Result<i32, String>, String) {
     let program = program.map(<[OsString]>::to_vec);
     // clone: once per sandbox a test makes, the job it is sent as.
     said(Job::Run { spec: spec.clone(), program, unshared: None })
@@ -142,7 +149,8 @@ fn said(job: Job) -> (Result<i32, String>, String) {
         .output()
         .unwrap();
     // alloc: once per sandbox a test makes, what it wrote, read as text.
-    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let said =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let answered = std::fs::read(&answer);
     _ = std::fs::remove_file(&answer);
     match answered.ok().and_then(|it| serde_json::from_slice(&it).ok()) {

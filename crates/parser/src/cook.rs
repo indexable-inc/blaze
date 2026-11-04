@@ -219,9 +219,15 @@ pub fn escaped_char(c: char, out: &mut String) {
 
 /// The primary message `emit_unescape_error` emits for `error` at `range` of `lit` (the
 /// literal between its quotes), or `None` for the two that are warnings.
-pub fn escape_message(lit: &str, mode: Mode, range: Range<usize>, error: &EscapeError) -> Option<String> {
-    let last_char =
-        || lit[range.start..range.end].chars().next_back().expect("an escape error covers a character");
+pub fn escape_message(
+    lit: &str,
+    mode: Mode,
+    range: Range<usize>,
+    error: &EscapeError,
+) -> Option<String> {
+    let last_char = || {
+        lit[range.start..range.end].chars().next_back().expect("an escape error covers a character")
+    };
     // The message, and the character it ends with between backquotes.
     let (head, shown): (&str, Option<char>) = match error {
         EscapeError::LoneSurrogateUnicodeEscape | EscapeError::OutOfRangeUnicodeEscape => {
@@ -255,7 +261,9 @@ pub fn escape_message(lit: &str, mode: Mode, range: Range<usize>, error: &Escape
             _ => panic!("non-is_byte literal paired with NonAsciiCharInByte"),
         },
         EscapeError::OutOfRangeHexEscape => ("out of range hex escape", None),
-        EscapeError::LeadingUnderscoreUnicodeEscape => ("invalid start of unicode escape: `_`", None),
+        EscapeError::LeadingUnderscoreUnicodeEscape => {
+            ("invalid start of unicode escape: `_`", None)
+        }
         EscapeError::OverlongUnicodeEscape => ("overlong unicode escape", None),
         EscapeError::UnclosedUnicodeEscape => ("unterminated unicode escape", None),
         EscapeError::NoBraceInUnicodeEscape => ("incorrect unicode escape sequence", None),

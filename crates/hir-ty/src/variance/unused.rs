@@ -45,12 +45,14 @@ pub fn adt_unused_params(db: &Db, adt: AdtId) -> Vec<GenericParamId> {
         }
 
         let mut projections = Vec::new_in(frame);
-        projections.extend(GenericPredicates::query_own_explicit(db, def).iter_identity().filter_map(
-            |it| match it.skip_norm_wip().kind().skip_binder() {
-                ClauseKind::Projection(projection) => Some(projection),
-                _ => None,
-            },
-        ));
+        projections.extend(
+            GenericPredicates::query_own_explicit(db, def).iter_identity().filter_map(
+                |it| match it.skip_norm_wip().kind().skip_binder() {
+                    ClauseKind::Projection(projection) => Some(projection),
+                    _ => None,
+                },
+            ),
+        );
         let mut inputs = frame_set(frame);
         loop {
             let before = constrained.len();

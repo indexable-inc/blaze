@@ -75,8 +75,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
             None => (None, None),
         };
         let message = match &operation {
-            Some(name) => format!("this `{name}` orders by `Ordering::SeqCst` with no `// seqcst: <why>` saying why it needs a total order"),
-            None => "`Ordering::SeqCst` with no `// seqcst: <why>` saying why it needs a total order".to_owned(), // alloc: a message's part
+            Some(name) => format!(
+                "this `{name}` orders by `Ordering::SeqCst` with no `// seqcst: <why>` saying why it needs a total order"
+            ),
+            None => {
+                "`Ordering::SeqCst` with no `// seqcst: <why>` saying why it needs a total order"
+                    .to_owned()
+            } // alloc: a message's part
         };
         let note = match (&operation, instead) {
             (Some(name), Some(instead)) => format!(
@@ -97,7 +102,11 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 fn variant_of(db: &Db, def: DefWithBodyId, body: &Body, expr: ExprId) -> Option<EnumVariantId> {
     let Expr::Path(path) = body.expr(expr) else { return None };
     let scope = ExprScopes::of(db, def).scope_for(expr);
-    match resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(db, path, body.expr_path_hygiene(expr)) {
+    match resolver_for_scope(db, def, scope).resolve_path_in_value_ns_fully(
+        db,
+        path,
+        body.expr_path_hygiene(expr),
+    ) {
         Some(ValueNs::EnumVariantId(it)) => Some(it),
         _ => None,
     }
@@ -127,7 +136,9 @@ fn used_by<'db>(
 ) -> Option<(String, usize)> {
     let parent = parents.of_expr(expr)?;
     let at = match body.expr(parent) {
-        Expr::MethodCall { args, .. } | Expr::Call { args, .. } => args.iter().position(|&it| it == expr)?,
+        Expr::MethodCall { args, .. } | Expr::Call { args, .. } => {
+            args.iter().position(|&it| it == expr)?
+        }
         _ => return None,
     };
     let (f, _) = written_callee(infer, body, parent)?;
@@ -182,7 +193,10 @@ pub fn bump(a: &AtomicU64) -> u64 {
         assert_eq!(found.matches(FOUND).count(), 3, "{found}");
         assert!(found.contains("this `store` orders by `Ordering::SeqCst`"), "{found}");
         assert!(found.contains("`store` takes `Ordering::Release`"), "{found}");
-        assert!(found.contains("`load` takes `Ordering::Acquire`"), "the renamed `SeqCst` is resolved:\n{found}");
+        assert!(
+            found.contains("`load` takes `Ordering::Acquire`"),
+            "the renamed `SeqCst` is resolved:\n{found}"
+        );
         assert!(found.contains("`fetch_add` takes `Ordering::AcqRel`"), "{found}");
     }
 

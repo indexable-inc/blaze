@@ -82,7 +82,11 @@ impl<'db> ExprCollector<'db> {
     /// `while`), onto the statements of the block being lowered, ahead of its own.
     /// `has_contract_markers` is whether the block is a function body with nightly contract
     /// markers.
-    pub(super) fn collect_spec_head(&mut self, block: ast::BlockExpr<'_>, has_contract_markers: bool) {
+    pub(super) fn collect_spec_head(
+        &mut self,
+        block: ast::BlockExpr<'_>,
+        has_contract_markers: bool,
+    ) {
         let Some(parent) = block.syntax().parent() else { return };
         let ptr = ExprPtr::of(ast::Expr::BlockExpr(block));
         if let Some(function) = ast::Fn::cast(parent)
@@ -147,7 +151,8 @@ impl<'db> ExprCollector<'db> {
                     let ty = ret.ty().map(|it| this.lower_type_ref_disallow_impl_trait(it));
                     this.store.push_list_pat(pat);
                     this.store.push_list_opt_type(ty);
-                    let prev_is_lowering_coroutine = std::mem::take(&mut this.is_lowering_coroutine);
+                    let prev_is_lowering_coroutine =
+                        std::mem::take(&mut this.is_lowering_coroutine);
                     let prev_try_block = this.current_try_block.take();
                     let body = this
                         .with_awaitable_block(Awaitable::No("specification clause"), |this| {

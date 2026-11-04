@@ -2,6 +2,7 @@
 //! instances of one body are one, which are not and why, and that equal identities mean the
 //! same monomorphized MIR up to the argument types' names.
 
+use hir_def::CallableDefId;
 use hir_def::{
     DefWithBodyId, FunctionId, ModuleDefId, TypeAliasId,
     expr_store::Body as HirBody,
@@ -10,6 +11,7 @@ use hir_def::{
     signatures::{FunctionSignature, TypeAliasSignature},
 };
 use hir_expand::fixture;
+use hir_ty::next_solver::{DbInterner, Region, RegionExt as _, RegionKind, TyKind};
 use hir_ty::{
     InferBodyId, InferenceResult, ParamEnvAndCrate, TyDefId,
     consteval::usize_const,
@@ -17,20 +19,25 @@ use hir_ty::{
     mir::{MirOptLevel, MirOptions, MirOwner, MirStage},
     next_solver::{GenericArg, GenericArgs, ParamEnv},
 };
-use hir_def::CallableDefId;
-use hir_ty::next_solver::{DbInterner, Region, RegionExt as _, RegionKind, TyKind};
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use hir_ty_mir::mir::{
     OperandKind, TerminatorKind, dispatch::Body, monomorphized, monomorphized_args, print_mir_body,
 };
 use hir_ty_share::{Through, Unshared};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 
 use crate::{CompileIdentity, Compiled, Instance, OptionsSet, Shim, Subject, instance_identity};
 
 type TestDB = base_db::Db;
 
 const fn options(level: MirOptLevel, ub_checks: bool, inline: bool) -> MirOptions {
-    MirOptions { level, ub_checks, lifetime_markers: true, inline, heap_to_stack: false, world: None }
+    MirOptions {
+        level,
+        ub_checks,
+        lifetime_markers: true,
+        inline,
+        heap_to_stack: false,
+        world: None,
+    }
 }
 
 const OFF: MirOptions = options(MirOptLevel::Off, false, false);
@@ -40,8 +47,7 @@ const RELEASE: MirOptions = options(MirOptLevel::Release, false, false);
 /// A body of the library's crates: always at release, inlined, as shipped (`Build::options`).
 const LANG: MirOptions = options(MirOptLevel::Release, false, true);
 
-const RUNTIME: Compiled =
-    Compiled { lang: OptionsSet::of(&[OFF]), other: OptionsSet::of(&[OFF]) };
+const RUNTIME: Compiled = Compiled { lang: OptionsSet::of(&[OFF]), other: OptionsSet::of(&[OFF]) };
 
 /// What a build of debug units with and without debug assertions and release units asks.
 const EVERY_LEVEL: Compiled = Compiled {
@@ -53,7 +59,8 @@ const UB_CHECKED: Compiled =
     Compiled { lang: OptionsSet::of(&[LANG]), other: OptionsSet::of(&[DEBUG_CHECKED]) };
 
 /// A unit whose bodies are optimized for release with the inliner on, as std's are.
-const INLINED: Compiled = Compiled { lang: OptionsSet::of(&[LANG]), other: OptionsSet::of(&[LANG]) };
+const INLINED: Compiled =
+    Compiled { lang: OptionsSet::of(&[LANG]), other: OptionsSet::of(&[LANG]) };
 
 const MINICORE: &str =
     "sized, copy, clone, drop, size_of, unsize, coerce_unsized, dispatch_from_dyn, fn";
@@ -221,7 +228,9 @@ fn alias(db: &TestDB, name: &str) -> TypeAliasId {
     let found: Vec<TypeAliasId> = declarations(db)
         .into_iter()
         .filter_map(|def| match def {
-            ModuleDefId::TypeAliasId(it) if TypeAliasSignature::of(db, it).name.as_str() == name => {
+            ModuleDefId::TypeAliasId(it)
+                if TypeAliasSignature::of(db, it).name.as_str() == name =>
+            {
                 Some(it)
             }
             _ => None,
@@ -252,11 +261,15 @@ fn instance<'db>(db: &'db TestDB, func: &str, args: &[Arg]) -> Instance {
         .iter()
         .map(|arg| match *arg {
             Arg::Ty(name) => aliased(name).into(),
-            Arg::TyErased(name) => rustc_type_ir::fold_regions(interner, aliased(name), |region, _| match region.kind() {
-                RegionKind::ReBound(..) => region,
-                _ => Region::new_erased(interner),
-            })
-            .into(),
+            Arg::TyErased(name) => {
+                rustc_type_ir::fold_regions(interner, aliased(name), |region, _| {
+                    match region.kind() {
+                        RegionKind::ReBound(..) => region,
+                        _ => Region::new_erased(interner),
+                    }
+                })
+                .into()
+            }
             Arg::Lifetime => Region::new_erased(interner).into(),
             Arg::Usize(value) => usize_const(db, Some(value), krate).into(),
         })
@@ -446,10 +459,16 @@ fn an_inlined_callees_promoted_constant_is_its_value() {
         let body = db
             .mir(owner, MirStage::compiled(owner, LANG))
             .unwrap_or_else(|error| panic!("`read_n` does not lower: {error:?}"));
-        assert!(!body.inlined.promoted.is_empty(), "`n_ref`'s `&T::N` is inlined as a promoted constant");
+        assert!(
+            !body.inlined.promoted.is_empty(),
+            "`n_ref`'s `&T::N` is inlined as a promoted constant"
+        );
         assert!(body.promoted_locals.is_empty(), "`read_n` promotes nothing of its own");
     });
-    let at = |ty| key_at(&db, INLINED, "read_n", &[Ty(ty)]).unwrap_or_else(|why| panic!("`read_n::<{ty}>`: {why}"));
+    let at = |ty| {
+        key_at(&db, INLINED, "read_n", &[Ty(ty)])
+            .unwrap_or_else(|why| panic!("`read_n::<{ty}>`: {why}"))
+    };
     assert_ne!(at("RefP"), at("RefQ"), "`N` is 1 for one and 2 for the other");
     assert_eq!(at("RefP"), at("RefS"), "`N` is 1 for both");
 }
@@ -513,8 +532,11 @@ fn two_closures_of_one_signature_are_two_callees() {
             .filter(|(_, expr)| matches!(expr, Expr::Closure { .. }))
             .map(|(expr, _)| {
                 let args = GenericArgs::new_from_slice(&[infer.expr_ty(expr).into()]).store();
-                let instance = Instance { subject: Subject::Body(Body::Fn(function(&db, "apply"))), args };
-                instance_identity(&db, &instance, &env(&db), RUNTIME).clone().unwrap_or_else(|why| panic!("{why}"))
+                let instance =
+                    Instance { subject: Subject::Body(Body::Fn(function(&db, "apply"))), args };
+                instance_identity(&db, &instance, &env(&db), RUNTIME)
+                    .clone()
+                    .unwrap_or_else(|why| panic!("{why}"))
             })
             .collect();
         assert_eq!(keys.len(), 2);
@@ -588,7 +610,8 @@ fn equal_keys_mean_one_monomorphized_body() {
                     continue;
                 }
                 shared += 1;
-                let ((raw_a, named_a), (raw_b, named_b)) = (printed(&db, body, a), printed(&db, body, b));
+                let ((raw_a, named_a), (raw_b, named_b)) =
+                    (printed(&db, body, a), printed(&db, body, b));
                 // Renaming `u32` also renames a `u32` the body names itself (`counter`'s), so
                 // bodies that print the same as written are one body too.
                 if raw_a != raw_b {
@@ -628,18 +651,25 @@ fn sites_are_filled_as_the_body_is() {
         for body in bodies {
             let owner = hir_ty::InferBodyId::DefWithBodyId(function(&db, body).into());
             let generic = db.runtime_mir_body(owner).expect("a body");
-            let sites = crate::instance::sites(&db, Subject::Body(Body::Fn(function(&db, body))), OFF)
-                .as_ref()
-                .unwrap_or_else(|why| panic!("`{body}` has no sites: {why}"));
+            let sites =
+                crate::instance::sites(&db, Subject::Body(Body::Fn(function(&db, body))), OFF)
+                    .as_ref()
+                    .unwrap_or_else(|why| panic!("`{body}` has no sites: {why}"));
             for arg in pool {
                 let instance = instance(&db, body, &[Ty(arg)]);
-                let whole = monomorphized(&db, generic, &instance.args, &env(&db)).expect("monomorphized");
-                let filled = monomorphized_args(&db, sites.filled.as_ref(), &instance.args, &env(&db))
-                    .expect("the sites filled");
+                let whole =
+                    monomorphized(&db, generic, &instance.args, &env(&db)).expect("monomorphized");
+                let filled =
+                    monomorphized_args(&db, sites.filled.as_ref(), &instance.args, &env(&db))
+                        .expect("the sites filled");
                 let locals = filled.as_slice();
                 assert!(locals.len() >= whole.locals.len(), "`{body}`: every local is a site");
                 for (at, (_, local)) in whole.locals.iter().enumerate() {
-                    assert_eq!(locals[at].ty(), Some(local.ty.as_ref()), "`{body}` of `{arg}`, local {at}");
+                    assert_eq!(
+                        locals[at].ty(),
+                        Some(local.ty.as_ref()),
+                        "`{body}` of `{arg}`, local {at}"
+                    );
                 }
             }
         }
@@ -701,7 +731,10 @@ fn crate_of(source: &str) -> TestDB {
 fn chain(alias: &str, levels: u32, base: &str, wrap: impl Fn(&str) -> String) -> String {
     let mut out = format!("pub type {alias}0 = {base};\n");
     for level in 1..=levels {
-        out.push_str(&format!("pub type {alias}{level} = {};\n", wrap(&format!("{alias}{}", level - 1))));
+        out.push_str(&format!(
+            "pub type {alias}{level} = {};\n",
+            wrap(&format!("{alias}{}", level - 1))
+        ));
     }
     out
 }
@@ -712,7 +745,8 @@ fn chain(alias: &str, levels: u32, base: &str, wrap: impl Fn(&str) -> String) ->
 #[test]
 fn a_body_calling_itself_with_growing_arguments_has_an_identity() {
     for attrs in ["", "#![recursion_limit = \"16\"]"] {
-        let db = crate_of(&format!("{attrs}\npub type U32 = u32;\npub fn f<T>(x: T) {{ f((x,)) }}"));
+        let db =
+            crate_of(&format!("{attrs}\npub type U32 = u32;\npub fn f<T>(x: T) {{ f((x,)) }}"));
         let result = key_at(&db, RUNTIME, "f", &[Ty("U32")]);
         assert!(result.is_ok(), "`f::<u32>` with {attrs:?}: {result:?}");
     }
@@ -786,16 +820,25 @@ fn a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth() {
         let interner = DbInterner::new_with(&db, krate);
         let infcx = hir_ty::next_solver::infer::DbInternerInferExt::infer_ctxt(interner)
             .build(hir_ty::next_solver::TypingMode::Codegen);
-        let deep = db.ty(TyDefId::TypeAliasId(alias(&db, &format!("D{ALIAS_DEPTH}")))).skip_binder();
+        let deep =
+            db.ty(TyDefId::TypeAliasId(alias(&db, &format!("D{ALIAS_DEPTH}")))).skip_binder();
         let normalized = hir_ty_share::deeply_normalize(&infcx, ParamEnv::empty(), deep)
             .unwrap_or_else(|why| panic!("`D{ALIAS_DEPTH}` does not normalize: {why}"));
         // The other two folds, each down the same depth: an alias made rigid and back (the
         // `RigidnessFolder` both ways), and a type variable at the bottom resolved (the resolver).
         // Their frames are smaller, so these are built by hand, `BUILT_DEPTH` deep.
         let TyKind::Adt(option, _) = deep.kind() else { panic!("`{deep:?}` is no `Option`") };
-        fn built<'db>(interner: DbInterner<'db>, option: hir_def::AdtId, bottom: hir_ty::next_solver::Ty<'db>) -> hir_ty::next_solver::Ty<'db> {
+        fn built<'db>(
+            interner: DbInterner<'db>,
+            option: hir_def::AdtId,
+            bottom: hir_ty::next_solver::Ty<'db>,
+        ) -> hir_ty::next_solver::Ty<'db> {
             (0..BUILT_DEPTH).fold(bottom, |inner, _| {
-                hir_ty::next_solver::Ty::new_adt(interner, option, GenericArgs::new_from_slice(&[inner.into()]))
+                hir_ty::next_solver::Ty::new_adt(
+                    interner,
+                    option,
+                    GenericArgs::new_from_slice(&[inner.into()]),
+                )
             })
         }
         let wrapped = |bottom| built(interner, option.def_id(), bottom);
@@ -804,7 +847,10 @@ fn a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth() {
         let back = rustc_type_ir::set_aliases_to_non_rigid(interner, rigid).skip_normalization();
         assert!(back == alias_at_bottom, "made rigid and back");
         let var_at_bottom = wrapped(infcx.next_ty_var(hir_ty::Span::Dummy));
-        assert!(infcx.deeply_resolve_ignoring_regions(var_at_bottom) == var_at_bottom, "an unresolved variable stays");
+        assert!(
+            infcx.deeply_resolve_ignoring_regions(var_at_bottom) == var_at_bottom,
+            "an unresolved variable stays"
+        );
         let mut levels = 0;
         let mut at = normalized;
         while let TyKind::Adt(_, args) = at.kind() {
@@ -812,7 +858,10 @@ fn a_type_with_an_alias_at_the_bottom_normalizes_at_any_depth() {
             at = args.type_at(0);
         }
         assert_eq!(levels, ALIAS_DEPTH, "`{at:?}` at the bottom");
-        assert!(matches!(at.kind(), TyKind::Uint(rustc_type_ir::UintTy::U8)), "`{at:?}` at the bottom");
+        assert!(
+            matches!(at.kind(), TyKind::Uint(rustc_type_ir::UintTy::U8)),
+            "`{at:?}` at the bottom"
+        );
     });
 }
 
@@ -842,7 +891,8 @@ const BODY_STEP: u32 = 50;
 /// it 2000 deep; its 8 MiB main thread overflows in the solver.)
 #[test]
 fn a_body_naming_a_deep_type_has_an_identity() {
-    let wrapped = format!("{}T{}", "Option<".repeat(BODY_STEP as usize), ">".repeat(BODY_STEP as usize));
+    let wrapped =
+        format!("{}T{}", "Option<".repeat(BODY_STEP as usize), ">".repeat(BODY_STEP as usize));
     let made = format!("{}x{}", "Some(".repeat(BODY_STEP as usize), ")".repeat(BODY_STEP as usize));
     let mut lets = String::from("let a0 = x;\n");
     for step in 1..=BODY_DEPTH / BODY_STEP {
@@ -872,16 +922,26 @@ fn a_callee_without_an_identity_fails_its_caller() {
          pub fn uses<T>() -> u32 { not_in_the_table::<T>() }\npub fn above<T>() -> u32 { uses::<T>() }",
     );
     let uses = key_at(&db, RUNTIME, "uses", &[Ty("U32")]);
-    let Err(Unshared::UnknownIntrinsic { name, body, through: Through::Own }) = &uses else { panic!("`uses`: {uses:?}") };
+    let Err(Unshared::UnknownIntrinsic { name, body, through: Through::Own }) = &uses else {
+        panic!("`uses`: {uses:?}")
+    };
     assert_eq!(name, "not_in_the_table");
     assert!(body.ends_with("uses`"), "the body that calls it: {body}");
     let above = key_at(&db, RUNTIME, "above", &[Ty("U32")]);
-    let Err(Unshared::UnknownIntrinsic { name: above_name, body: above_body, through: Through::Calls }) = &above else {
+    let Err(Unshared::UnknownIntrinsic {
+        name: above_name,
+        body: above_body,
+        through: Through::Calls,
+    }) = &above
+    else {
         panic!("`above`: {above:?}")
     };
     assert_eq!((above_name, above_body), (name, body), "`above` calls `uses`, which calls it");
     let said = above.as_ref().unwrap_err().to_string();
-    assert_eq!(said, format!("it calls {body}, which calls the unclassified intrinsic `not_in_the_table`"));
+    assert_eq!(
+        said,
+        format!("it calls {body}, which calls the unclassified intrinsic `not_in_the_table`")
+    );
     let said = uses.as_ref().unwrap_err().to_string();
     assert_eq!(said, format!("{body} calls the unclassified intrinsic `not_in_the_table`"));
 }
@@ -899,15 +959,26 @@ fn a_closure_s_lowering_error_is_its_own() {
     let got = blaze_query::db::attach(&db, || {
         let owner = DefWithBodyId::from(function(&db, "f"));
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(owner));
-        let (expr, _) = HirBody::of(&db, owner).exprs().find(|(_, expr)| matches!(expr, Expr::Closure { .. })).expect("a closure");
-        let TyKind::Closure(id, args) = infer.expr_ty(expr).kind() else { panic!("a closure's type") };
+        let (expr, _) = HirBody::of(&db, owner)
+            .exprs()
+            .find(|(_, expr)| matches!(expr, Expr::Closure { .. }))
+            .expect("a closure");
+        let TyKind::Closure(id, args) = infer.expr_ty(expr).kind() else {
+            panic!("a closure's type")
+        };
         let parent = GenericArgs::new_from_slice(args.as_closure().parent_args()).store();
-        let instance = Instance { subject: Subject::Body(Body::Closure(id.0.as_id())), args: parent };
+        let instance =
+            Instance { subject: Subject::Body(Body::Closure(id.0.as_id())), args: parent };
         instance_identity(&db, &instance, &env(&db), RUNTIME).clone()
     });
-    let Err(Unshared::UnknownIntrinsic { name, body, through: Through::Own }) = &got else { panic!("the closure: {got:?}") };
+    let Err(Unshared::UnknownIntrinsic { name, body, through: Through::Own }) = &got else {
+        panic!("the closure: {got:?}")
+    };
     assert_eq!(name, "not_in_the_table");
-    assert!(body.starts_with("a closure in `") && body.ends_with("f`"), "names the closure, not its owner: {body}");
+    assert!(
+        body.starts_with("a closure in `") && body.ends_with("f`"),
+        "names the closure, not its owner: {body}"
+    );
 }
 
 /// Two bodies with one path (`Foo::m` of `impl Foo<u8>` and of `impl Foo<u16>`) are told apart
@@ -922,7 +993,8 @@ fn a_caller_two_calls_away_reaches_a_body_of_its_callee_s_path() {
          pub fn top<T>() -> u32 { Foo::<u16, T>::m() }",
     );
     let got = key_at(&db, RUNTIME, "top", &[Ty("U32")]);
-    let Err(Unshared::UnknownIntrinsic { body, through: Through::Reaches(callee), .. }) = &got else {
+    let Err(Unshared::UnknownIntrinsic { body, through: Through::Reaches(callee), .. }) = &got
+    else {
         panic!("`top`: {got:?}")
     };
     assert_eq!(callee, body, "one path for both bodies");
@@ -940,9 +1012,14 @@ fn an_owner_failing_at_its_closure_names_the_closure() {
          pub fn f() -> u32 { let c = || not_in_the_table::<u8>(); c() }",
     );
     let got = key_at(&db, RUNTIME, "f", &[]);
-    let Err(Unshared::UnknownIntrinsic { name, body, through: Through::Nested }) = &got else { panic!("`f`: {got:?}") };
+    let Err(Unshared::UnknownIntrinsic { name, body, through: Through::Nested }) = &got else {
+        panic!("`f`: {got:?}")
+    };
     assert_eq!(name, "not_in_the_table");
-    assert!(body.starts_with("a closure in `") && body.ends_with("f`"), "names the closure, not its owner: {body}");
+    assert!(
+        body.starts_with("a closure in `") && body.ends_with("f`"),
+        "names the closure, not its owner: {body}"
+    );
 }
 
 /// rust#37311's shape: each call doubles its argument (`(&T, &T)`), so the instance at step k is
@@ -1201,20 +1278,26 @@ pub fn root_wide(word: &u16) -> u64 {
     match ctx.find_frames(7).skip_all_loads() { Res2::Ok(it) => it, Res2::Err(()) => 0 }
 }
 "#;
-    let db = fixture::db(&format!("//- minicore: {MINICORE}, phantom_data, option, derive\n{source}\n")).into_db();
+    let db =
+        fixture::db(&format!("//- minicore: {MINICORE}, phantom_data, option, derive\n{source}\n"))
+            .into_db();
     // Each generic instance a root calls (`find_frames::<Slice>`, `skip_all_loads::<{the
     // opaque}>`), as the code generator asks them; their own callees are asked through them.
     blaze_query::db::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let calls = |root: &str| -> Vec<(String, Instance)> {
             let owner = InferBodyId::DefWithBodyId(function(&db, root).into());
-            let generic = db.runtime_mir_body(owner).unwrap_or_else(|error| panic!("`{root}` lowers: {error:?}"));
+            let generic = db
+                .runtime_mir_body(owner)
+                .unwrap_or_else(|error| panic!("`{root}` lowers: {error:?}"));
             // As the code generator compiles it: the opaque types revealed, lifetimes erased.
             let empty = GenericArgs::new_from_slice(&[]).store();
             let body = monomorphized(&db, generic, &empty, &env(&db)).expect("monomorphized");
             let mut calls = Vec::new();
             for (_, block) in body.basic_blocks.iter() {
-                let Some(TerminatorKind::Call { func, .. }) = block.terminator.as_ref().map(|it| &it.kind) else {
+                let Some(TerminatorKind::Call { func, .. }) =
+                    block.terminator.as_ref().map(|it| &it.kind)
+                else {
                     continue;
                 };
                 let fn_ty = match &func.kind {
@@ -1223,32 +1306,51 @@ pub fn root_wide(word: &u16) -> u64 {
                     _ => continue,
                 };
                 let TyKind::FnDef(def, args) = fn_ty.kind() else { continue };
-                let args = rustc_type_ir::fold_regions(interner, args.skip_binder(), |region, _| match region.kind() {
-                    RegionKind::ReBound(..) => region,
-                    _ => Region::new_erased(interner),
-                });
+                let args =
+                    rustc_type_ir::fold_regions(interner, args.skip_binder(), |region, _| {
+                        match region.kind() {
+                            RegionKind::ReBound(..) => region,
+                            _ => Region::new_erased(interner),
+                        }
+                    });
                 let CallableDefId::FunctionId(callee) = def.0 else { continue };
                 if args.is_empty() {
                     continue;
                 }
                 let name = FunctionSignature::of(&db, callee).name.as_str().to_owned();
-                calls.push((name, Instance { subject: Subject::Body(Body::Fn(callee)), args: args.store() }));
+                calls.push((
+                    name,
+                    Instance { subject: Subject::Body(Body::Fn(callee)), args: args.store() },
+                ));
             }
             calls
         };
         let (narrow, wide) = (calls("root"), calls("root_wide"));
         for (name, instance) in narrow.iter().chain(&wide) {
-            for (options_name, options) in [("RUNTIME", RUNTIME), ("INLINED", INLINED), ("EVERY_LEVEL", EVERY_LEVEL)] {
+            for (options_name, options) in
+                [("RUNTIME", RUNTIME), ("INLINED", INLINED), ("EVERY_LEVEL", EVERY_LEVEL)]
+            {
                 let key = instance_identity(&db, instance, &env(&db), options).clone();
                 assert!(key.is_ok(), "`{name}` under {options_name}: {key:?}");
             }
         }
-        assert!(narrow.len() >= 2, "`root` calls `find_frames` and `skip_all_loads`: {} generic calls", narrow.len());
+        assert!(
+            narrow.len() >= 2,
+            "`root` calls `find_frames` and `skip_all_loads`: {} generic calls",
+            narrow.len()
+        );
         let find_frames = |calls: &[(String, Instance)]| {
-            let (_, instance) = calls.iter().find(|(name, _)| name == "find_frames").expect("a call of `find_frames`");
+            let (_, instance) = calls
+                .iter()
+                .find(|(name, _)| name == "find_frames")
+                .expect("a call of `find_frames`");
             instance_identity(&db, instance, &env(&db), RUNTIME).clone().expect("an identity")
         };
-        assert_ne!(find_frames(&narrow), find_frames(&wide), "`find_frames` over two `Buf` types is two bodies");
+        assert_ne!(
+            find_frames(&narrow),
+            find_frames(&wide),
+            "`find_frames` over two `Buf` types is two bodies"
+        );
     });
 }
 
@@ -1302,7 +1404,10 @@ fn a_branching_growing_chain_answers_from_a_bounded_number_of_keys() {
         let db = crate_of(&source);
         let (got, made) = identities_made(|| key_at(&db, RUNTIME, func, &[Ty(root)]));
         assert!(got.is_ok(), "`{func}::<{root}>`: {got:?}");
-        assert!((1..=most).contains(&made), "`{func}::<{root}>` made {made} identities, past {most}");
+        assert!(
+            (1..=most).contains(&made),
+            "`{func}::<{root}>` made {made} identities, past {most}"
+        );
     }
 }
 
@@ -1358,7 +1463,9 @@ fn a_counter_held_in_separate_parameters_answers_from_a_bounded_number_of_keys()
         }
         let stepped = stepped.join(", ");
         let (params, passed, stepped) = match top_level {
-            true => (format!("{params}, X, Y"), format!("{passed}, X, Y"), format!("{stepped}, X, Y")),
+            true => {
+                (format!("{params}, X, Y"), format!("{passed}, X, Y"), format!("{stepped}, X, Y"))
+            }
             false => (params, passed, stepped),
         };
         let source = format!(
@@ -1378,7 +1485,10 @@ fn a_counter_held_in_separate_parameters_answers_from_a_bounded_number_of_keys()
         root.push(Ty("BALLAST"));
         let (got, made) = identities_made(|| key_at(&db, RUNTIME, "a", &root));
         assert!(got.is_ok(), "`a` over {digits} digits (`Z`, `O` top-level: {top_level}): {got:?}");
-        assert!((1..=2).contains(&made), "`a` over {digits} digits (`Z`, `O` top-level: {top_level}) made {made} identities");
+        assert!(
+            (1..=2).contains(&made),
+            "`a` over {digits} digits (`Z`, `O` top-level: {top_level}) made {made} identities"
+        );
     }
 }
 
@@ -1414,7 +1524,10 @@ fn listed(f: impl Fn(usize) -> String) -> String {
 fn callees_differing_only_in_lifetimes_answer_from_a_bounded_number_of_keys() {
     let lifetime = |i: usize| format!("'l{i}");
     let params = format!("{}, T", listed(lifetime));
-    let seeded = format!("{}, T", listed(|i| if SEEDED.contains(&i) { "'static".to_owned() } else { lifetime(i) }));
+    let seeded = format!(
+        "{}, T",
+        listed(|i| if SEEDED.contains(&i) { "'static".to_owned() } else { lifetime(i) })
+    );
     let permuted = format!("{}, T", listed(|i| lifetime(PERMUTED[i - 1])));
     let bounds = format!("where {}", listed(|i| format!("{}: {}", lifetime(i), lifetime(i))));
     let db = crate_of(&region_cycle(&params, &bounds, &seeded, &permuted));
@@ -1455,9 +1568,14 @@ fn a_permutation_of_the_caller_s_distinct_arguments_is_not_passed_on() {
     let params = listed(ty);
     let permuted = listed(|i| ty(PERMUTED[i - 1]));
     let distinct = ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64"];
-    let aliases: String = distinct.iter().enumerate().map(|(i, it)| format!("pub type P{} = {it};\n", i + 1)).collect();
+    let aliases: String = distinct
+        .iter()
+        .enumerate()
+        .map(|(i, it)| format!("pub type P{} = {it};\n", i + 1))
+        .collect();
     let db = crate_of(&format!("{aliases}{}", region_cycle(&params, "", &params, &permuted)));
-    let root: Vec<Arg> = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"].into_iter().map(Ty).collect();
+    let root: Vec<Arg> =
+        ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"].into_iter().map(Ty).collect();
     let (got, made) = identities_made(|| key_at(&db, RUNTIME, "a", &root));
     assert_eq!(made, 2, "`a` over 8 distinct types made {made} identities ({got:?})");
     assert!(got.is_ok(), "`a` over 8 distinct types: {got:?}");

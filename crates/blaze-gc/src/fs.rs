@@ -85,7 +85,8 @@ impl Gate {
     /// Whether a decision of `run` is not done, with the wall and boot clocks reading
     /// `wall_ns` and `boot_ns`: its run ended, or the collector's clock is past its deadline.
     pub fn cancelled_at(&self, run: u64, wall_ns: u64, boot_ns: Option<u64>) -> bool {
-        self.ended.load(Ordering::SeqCst) >= run || self.clock.read(wall_ns, boot_ns) >= self.deadline_ns
+        self.ended.load(Ordering::SeqCst) >= run
+            || self.clock.read(wall_ns, boot_ns) >= self.deadline_ns
     }
 }
 
@@ -113,7 +114,10 @@ pub fn execute(
     match decision {
         Decision::Scan { run, after, dirs, until_ns } => {
             if cancelled(*run) {
-                return Some(Answer::Scanned { run: *run, found: Err("its run ended before the scan began".to_owned()) });
+                return Some(Answer::Scanned {
+                    run: *run,
+                    found: Err("its run ended before the scan began".to_owned()),
+                });
             }
             let span = tracing::info_span!(
                 target: "blaze",
@@ -144,7 +148,9 @@ pub fn execute(
             let pressure = gate.map_or(0, |it| it.pressure);
             let span = tracing::info_span!(target: "blaze", "gc unlink", run, pressure, path = %path, bytes = tracing::field::Empty).entered();
             let done = match cancelled(*run) {
-                true => Err("its run ended before the unlink began; the next run unlinks it".to_owned()),
+                true => {
+                    Err("its run ended before the unlink began; the next run unlinks it".to_owned())
+                }
                 false => unlink(Path::new(path), Vec::new()),
             };
             if let Ok(bytes) = &done {
@@ -162,7 +168,11 @@ pub fn execute(
 /// collector's, an area another collector holds given as `""`). Bounded: the planner asks for
 /// at most its fuel in renames and unlinks, and this stops after that many rounds and a few
 /// more, naming how far it got.
-pub fn run_now(collector: &mut Collector, dry_run: bool, areas: &[String]) -> Result<crate::RunReport, String> {
+pub fn run_now(
+    collector: &mut Collector,
+    dry_run: bool,
+    areas: &[String],
+) -> Result<crate::RunReport, String> {
     collector.advance_clocks(record::now_ns(), record::boot_ns());
     // An area that does not measure is named in the report; the rest are collected (review N12).
     measure(collector);
@@ -187,7 +197,9 @@ pub fn run_now(collector: &mut Collector, dry_run: bool, areas: &[String]) -> Re
             }
         }
     }
-    Err(format!("the collection asked for more than the {bound} rounds its fuel allows and did not end"))
+    Err(format!(
+        "the collection asked for more than the {bound} rounds its fuel allows and did not end"
+    ))
 }
 
 /// Each area's volume measured into `collector` ([`crate::space::volume`]); one that does not
@@ -203,7 +215,9 @@ pub fn measure(collector: &mut Collector) -> Vec<String> {
         match crate::space::volume(Path::new(area)) {
             Ok(volume) => collector.volume(at, volume),
             Err(why) => {
-                let why = format!("the volume of {area} was not measured, so its free space does not pace this run: {why}");
+                let why = format!(
+                    "the volume of {area} was not measured, so its free space does not pace this run: {why}"
+                );
                 collector.note(why.clone()); // clone: the report's copy and the caller's
                 problems.push(why);
             }
@@ -243,23 +257,24 @@ pub fn scan(
             continue;
         }
         check_local(root)?;
-        let mut listed = |sub: &str, class: Class, inventory: &mut Inventory| -> Result<(), String> {
-            let dir = root.join(sub);
-            if dir.exists() {
-                check_local(&dir)?;
-                // Its trash is the area's: a `build/` or `std/` on another file system (a
-                // symlink to another disk) could not be renamed into it, nor measured as the
-                // area's volume.
-                if let Some(why) = other_device(root, &dir)? {
-                    inventory.problems.push(why);
-                    return Ok(());
+        let mut listed =
+            |sub: &str, class: Class, inventory: &mut Inventory| -> Result<(), String> {
+                let dir = root.join(sub);
+                if dir.exists() {
+                    check_local(&dir)?;
+                    // Its trash is the area's: a `build/` or `std/` on another file system (a
+                    // symlink to another disk) could not be renamed into it, nor measured as the
+                    // area's volume.
+                    if let Some(why) = other_device(root, &dir)? {
+                        inventory.problems.push(why);
+                        return Ok(());
+                    }
                 }
-            }
-            for it in dirs(&dir, &mut inventory.problems) {
-                units.push((text(&it), area, class));
-            }
-            Ok(())
-        };
+                for it in dirs(&dir, &mut inventory.problems) {
+                    units.push((text(&it), area, class));
+                }
+                Ok(())
+            };
         if at == 0 {
             listed("build", Class::Workspace, &mut inventory)?;
         }
@@ -294,7 +309,13 @@ pub fn scan(
     Ok(inventory)
 }
 
-fn std_store(area: u16, dir: &Path, mounts: &[PathBuf], sizes: &mut Sizes, inventory: &mut Inventory) {
+fn std_store(
+    area: u16,
+    dir: &Path,
+    mounts: &[PathBuf],
+    sizes: &mut Sizes,
+    inventory: &mut Inventory,
+) {
     let mut refused = (!lease::has_lease(dir)).then(|| no_lease(dir));
     if refused.is_none() {
         refused = mount_in(mounts, dir);
@@ -325,14 +346,16 @@ fn trash_entries(area: u16, root: &Path, mounts: &[PathBuf], inventory: &mut Inv
         return;
     }
     if !trash.join(TRASH_MARK).is_file() {
-        inventory
-            .problems
-            .push(format!("{} has no {TRASH_MARK}: it is not blaze's trash, and nothing in it is touched", trash.display()));
+        inventory.problems.push(format!(
+            "{} has no {TRASH_MARK}: it is not blaze's trash, and nothing in it is touched",
+            trash.display()
+        ));
         return;
     }
     let mut foreign = 0u32;
     for entry in entries(&trash, &mut inventory.problems) {
-        let name = entry.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+        let name =
+            entry.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
         if !is_trash_name(&name) {
             foreign += u32::from(name != TRASH_MARK);
             continue;
@@ -340,7 +363,9 @@ fn trash_entries(area: u16, root: &Path, mounts: &[PathBuf], inventory: &mut Inv
         // `<moved ns, 20 digits>-<seq>-<name>`: when it was moved there.
         let used_ns = name[..20].parse().unwrap_or_else(|_| modified_ns(&entry));
         // Trash is unlinked whatever its age says: one with a mount inside is left, named.
-        let bytes = match mount_in(mounts, &entry).map_or_else(|| size(&entry, &mut inventory.problems), Err) {
+        let bytes = match mount_in(mounts, &entry)
+            .map_or_else(|| size(&entry, &mut inventory.problems), Err)
+        {
             Ok(bytes) => bytes,
             Err(why) => {
                 inventory.problems.push(format!("{} is left in trash: {why}", entry.display()));
@@ -350,7 +375,10 @@ fn trash_entries(area: u16, root: &Path, mounts: &[PathBuf], inventory: &mut Inv
         inventory.objects.push(object(area, &entry, Class::Trash, bytes, used_ns, false, None));
     }
     if foreign > 0 {
-        inventory.problems.push(format!("{foreign} entries of {} are not named as blaze names trash: left alone", trash.display()));
+        inventory.problems.push(format!(
+            "{foreign} entries of {} are not named as blaze names trash: left alone",
+            trash.display()
+        ));
     }
 }
 
@@ -363,7 +391,9 @@ pub fn is_trash_name(name: &str) -> bool {
         && bytes[20] == b'-'
         && bytes[21..27].iter().all(u8::is_ascii_alphanumeric)
         && bytes[27] == b'-'
-        && bytes[28..].iter().all(|it| it.is_ascii_alphanumeric() || matches!(it, b'-' | b'_' | b'.'))
+        && bytes[28..]
+            .iter()
+            .all(|it| it.is_ascii_alphanumeric() || matches!(it, b'-' | b'_' | b'.'))
 }
 
 /// `area`'s trash, made with blaze's marker when it is not there; refused, naming it, when it
@@ -377,13 +407,21 @@ pub fn trash_dir(area: &Path) -> Result<PathBuf, String> {
         return Ok(dir);
     }
     if dir.exists() {
-        return Err(format!("{} is there without {TRASH_MARK}: it is not blaze's trash, so nothing is moved there", dir.display()));
+        return Err(format!(
+            "{} is there without {TRASH_MARK}: it is not blaze's trash, so nothing is moved there",
+            dir.display()
+        ));
     }
     std::fs::create_dir_all(area).map_err(|error| format!("making {}: {error}", area.display()))?;
     let temporary = area.join(record::temporary_name(TRASH));
-    std::fs::create_dir(&temporary).map_err(|error| format!("making {}: {error}", temporary.display()))?;
-    let made = record::write_whole(&temporary.join(TRASH_MARK), TRASH_TEXT.as_bytes())
-        .and_then(|()| std::fs::rename(&temporary, &dir).map_err(|error| format!("renaming {} to {}: {error}", temporary.display(), dir.display())));
+    std::fs::create_dir(&temporary)
+        .map_err(|error| format!("making {}: {error}", temporary.display()))?;
+    let made =
+        record::write_whole(&temporary.join(TRASH_MARK), TRASH_TEXT.as_bytes()).and_then(|()| {
+            std::fs::rename(&temporary, &dir).map_err(|error| {
+                format!("renaming {} to {}: {error}", temporary.display(), dir.display())
+            })
+        });
     if made.is_err() {
         _ = std::fs::remove_file(temporary.join(TRASH_MARK));
         _ = std::fs::remove_dir(&temporary);
@@ -407,7 +445,13 @@ pub fn check_local(path: &Path) -> Result<(), String> {
     }
 }
 
-fn workspace(area: u16, dir: &Path, mounts: &[PathBuf], sizes: &mut Sizes, inventory: &mut Inventory) {
+fn workspace(
+    area: u16,
+    dir: &Path,
+    mounts: &[PathBuf],
+    sizes: &mut Sizes,
+    inventory: &mut Inventory,
+) {
     let problems = &mut inventory.problems;
     let read = record::read(dir);
     let record = read.as_ref().ok().and_then(Option::as_ref);
@@ -431,7 +475,8 @@ fn workspace(area: u16, dir: &Path, mounts: &[PathBuf], sizes: &mut Sizes, inven
     let mut own = 0u64;
     for entry in entries(dir, problems) {
         let Ok(meta) = std::fs::symlink_metadata(&entry) else { continue };
-        let name = entry.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+        let name =
+            entry.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
         let mut refused = refused.as_ref().map(|_| "its workspace is refused".to_owned());
         if meta.is_dir() {
             let bytes = match sizes.of(&entry, problems) {
@@ -451,7 +496,15 @@ fn workspace(area: u16, dir: &Path, mounts: &[PathBuf], sizes: &mut Sizes, inven
         } else if name.ends_with(".tmp") {
             // A temporary of a workspace in use may be one a build writes now: it stays, and it
             // is renamed only under its workspace's lease.
-            let mut temp = object(area, &entry, Class::Temp, disk_bytes(&meta), modified_ns(&entry), leased, refused);
+            let mut temp = object(
+                area,
+                &entry,
+                Class::Temp,
+                disk_bytes(&meta),
+                modified_ns(&entry),
+                leased,
+                refused,
+            );
             temp.workspace = Some(text(dir));
             temp.checkout = checkout.clone(); // clone: each temporary names its checkout
             inventory.objects.push(temp);
@@ -474,7 +527,11 @@ fn checkout_of(path: &str) -> Result<Checkout, String> {
             let parent = Path::new(path).parent();
             match parent.map(std::fs::metadata) {
                 Some(Ok(meta)) if meta.is_dir() => false,
-                _ => return Err(format!("its checkout {path} is not found, nor is the directory it was in")),
+                _ => {
+                    return Err(format!(
+                        "its checkout {path} is not found, nor is the directory it was in"
+                    ));
+                }
             }
         }
         Err(error) => return Err(format!("its checkout {path} cannot be read: {error}")),
@@ -493,8 +550,26 @@ fn text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn object(area: u16, path: &Path, class: Class, bytes: u64, used_ns: u64, leased: bool, refused: Option<String>) -> Object {
-    Object { path: text(path), area, class, bytes, used_ns, workspace: None, checkout: None, leased, refused }
+fn object(
+    area: u16,
+    path: &Path,
+    class: Class,
+    bytes: u64,
+    used_ns: u64,
+    leased: bool,
+    refused: Option<String>,
+) -> Object {
+    Object {
+        path: text(path),
+        area,
+        class,
+        bytes,
+        used_ns,
+        workspace: None,
+        checkout: None,
+        leased,
+        refused,
+    }
 }
 
 /// Whether `dir`'s lease is held now; a probe that fails is a problem, and the dir counts as
@@ -659,7 +734,9 @@ fn disk_bytes(meta: &Metadata) -> u64 {
 /// Why `sub` (an area's `build/` or `std/`) is not listed: on another device than its area.
 fn other_device(area: &Path, sub: &Path) -> Result<Option<String>, String> {
     let device = |path: &Path| {
-        std::fs::metadata(path).map(|it| device_of(&it)).map_err(|error| format!("reading {}: {error}", path.display()))
+        std::fs::metadata(path)
+            .map(|it| device_of(&it))
+            .map_err(|error| format!("reading {}: {error}", path.display()))
     };
     if device(area)? == device(sub)? {
         return Ok(None);
@@ -722,7 +799,9 @@ impl Sizes {
         let bytes = size(dir, problems);
         match &bytes {
             // alloc: one entry a directory measured
-            Ok(bytes) => _ = self.known.insert(key, Measured { inode, stamp, bytes: *bytes, at_ns: now }),
+            Ok(bytes) => {
+                _ = self.known.insert(key, Measured { inode, stamp, bytes: *bytes, at_ns: now })
+            }
             Err(_) => _ = self.known.remove(&key),
         }
         bytes
@@ -737,7 +816,10 @@ impl Sizes {
 fn mount_in(mounts: &[PathBuf], path: &Path) -> Option<String> {
     let canonical = std::fs::canonicalize(path).ok()?;
     mounts.iter().find(|it| it.starts_with(&canonical)).map(|it| {
-        format!("{} is a mount point at or under it: nothing of blaze's removes across a mount", it.display())
+        format!(
+            "{} is a mount point at or under it: nothing of blaze's removes across a mount",
+            it.display()
+        )
     })
 }
 
@@ -767,7 +849,11 @@ pub fn remove_tree(path: &Path) -> Result<u64, String> {
         return remove_entry(path, &root).map(|()| disk_bytes(&root));
     }
     if let Some(mount) = mount_inside(path)? {
-        return Err(format!("{} is a mount point at or under {}: it is not removed", mount.display(), path.display()));
+        return Err(format!(
+            "{} is a mount point at or under {}: it is not removed",
+            mount.display(),
+            path.display()
+        ));
     }
     let device = device_of(&root);
     let failed = |at: &Path, error: io::Error| format!("removing {}: {error}", at.display());
@@ -822,7 +908,11 @@ fn remove_entry(path: &Path, meta: &Metadata) -> Result<(), String> {
     #[cfg(windows)]
     let removed = {
         use std::os::windows::fs::FileTypeExt as _;
-        if meta.file_type().is_symlink_dir() { std::fs::remove_dir(path) } else { std::fs::remove_file(path) }
+        if meta.file_type().is_symlink_dir() {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        }
     };
     #[cfg(not(windows))]
     let removed = {
@@ -869,7 +959,9 @@ impl Protected {
         root: &Path,
         machine: Option<&Path>,
     ) -> Result<Protected, String> {
-        let real = |what: &str, path: &Path| resolve(path).map_err(|why| format!("{what} {}: {why}", path.display()));
+        let real = |what: &str, path: &Path| {
+            resolve(path).map_err(|why| format!("{what} {}: {why}", path.display()))
+        };
         // alloc: once per check, a few paths
         let mut it = Protected::default();
         it.holds.push(PathBuf::from("/"));
@@ -908,16 +1000,17 @@ impl Protected {
     /// clean` makes it once a run.
     pub fn of_env(root: &Path, machine: Option<&Path>) -> Result<Protected, String> {
         let absolute = |what: &str, path: PathBuf| {
-            std::path::absolute(&path).map_err(|error| format!("{what} {} against the current directory: {error}", path.display()))
+            std::path::absolute(&path).map_err(|error| {
+                format!("{what} {} against the current directory: {error}", path.display())
+            })
         };
         let home = std::env::home_dir().map(|it| absolute("$HOME", it)).transpose()?;
-        let set = |name: &str| std::env::var_os(name).filter(|it| !it.is_empty()).map(PathBuf::from);
+        let set =
+            |name: &str| std::env::var_os(name).filter(|it| !it.is_empty()).map(PathBuf::from);
         // A default home that cannot be searched (`HOME` another user's, `EACCES`): nothing in
         // it is reachable by this process, so no target dir it names can be in it, and there is
         // nothing to protect; nothing is said. A set one is always protected (review round 7, C2).
-        let reachable = |it: &PathBuf| {
-            !matches!(std::fs::symlink_metadata(it), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
-        };
+        let reachable = |it: &PathBuf| !matches!(std::fs::symlink_metadata(it), Err(error) if error.kind() == io::ErrorKind::PermissionDenied);
         let cargo_home = match set("CARGO_HOME") {
             Some(path) => Some(absolute("CARGO_HOME", path)?),
             None => home.as_ref().map(|it| it.join(".cargo")).filter(reachable),
@@ -936,7 +1029,8 @@ impl Protected {
     /// `path` added to what may not be removed or held; a path that cannot be resolved is an
     /// error naming it.
     pub fn hold(&mut self, path: &Path) -> Result<(), String> {
-        let resolved = resolve(path).map_err(|why| format!("{} is not checked against: {why}", path.display()))?;
+        let resolved = resolve(path)
+            .map_err(|why| format!("{} is not checked against: {why}", path.display()))?;
         self.holds.push(resolved);
         Ok(())
     }
@@ -1049,9 +1143,18 @@ pub(crate) enum Step {
 }
 
 /// [`trash`], with `at` run at each [`Step`] (review round 8, C1 and M2).
-pub(crate) fn trash_between(path: &Path, to: &Path, class: Class, gate: Option<(&Gate, u64)>, at: &mut dyn FnMut(Step)) -> Swept {
+pub(crate) fn trash_between(
+    path: &Path,
+    to: &Path,
+    class: Class,
+    gate: Option<(&Gate, u64)>,
+    at: &mut dyn FnMut(Step),
+) -> Swept {
     let Some(dir) = lease_dir(path, class) else {
-        return Swept::Failed(format!("{} is trash already: it is unlinked, never moved", path.display()));
+        return Swept::Failed(format!(
+            "{} is trash already: it is unlinked, never moved",
+            path.display()
+        ));
     };
     // The leases inside, found before any lock is taken (review round 6, P1); one made since is
     // found by the unlink's walk ([`unlink`]).
@@ -1068,7 +1171,9 @@ pub(crate) fn trash_between(path: &Path, to: &Path, class: Class, gate: Option<(
         Ok(Taken::Moved) => return Swept::Leased,
         Ok(Taken::Missing) if !path.exists() => return Swept::Gone,
         // The scan found one: a lease gone since is no lease to trust.
-        Ok(Taken::Missing) => return Swept::Failed(format!("{} is gone", lease::lease_of(dir).display())),
+        Ok(Taken::Missing) => {
+            return Swept::Failed(format!("{} is gone", lease::lease_of(dir).display()));
+        }
         Err(why) => return Swept::Failed(why),
     };
     // Another build's directory inside it (a `--target-dir` named inside this one): its lease
@@ -1092,7 +1197,11 @@ pub(crate) fn trash_between(path: &Path, to: &Path, class: Class, gate: Option<(
     match mount_inside(path) {
         Ok(None) => {}
         Ok(Some(mount)) => {
-            return Swept::Failed(format!("{} is a mount point at or under {}: it is not moved to trash", mount.display(), path.display()));
+            return Swept::Failed(format!(
+                "{} is a mount point at or under {}: it is not moved to trash",
+                mount.display(),
+                path.display()
+            ));
         }
         Err(why) => return Swept::Failed(why),
     }
@@ -1106,7 +1215,9 @@ pub(crate) fn trash_between(path: &Path, to: &Path, class: Class, gate: Option<(
                 Ok(()) => Swept::Moved,
                 Err(Nested::Held { dir, .. }) => Swept::NestedLeased { dir: text(&dir) },
                 // In trash, not moved back (review round 8, M1).
-                Err(stuck @ Nested::NotBack { .. }) => Swept::LeftInTrash { why: stuck.to_string() },
+                Err(stuck @ Nested::NotBack { .. }) => {
+                    Swept::LeftInTrash { why: stuck.to_string() }
+                }
                 Err(other) => Swept::Failed(other.to_string()),
             }
         }
@@ -1128,17 +1239,31 @@ pub(crate) fn trash_between(path: &Path, to: &Path, class: Class, gate: Option<(
 /// unlinked. When the rename back fails too (`from` made again meanwhile), it is
 /// [`Nested::NotBack`], naming both paths: the tree stays at `to`, whose unlink takes the same
 /// leases first and so refuses it while that build runs ([`unlink`]) (review round 7, C1).
-pub fn recheck_renamed(from: &Path, to: &Path, held: &mut Vec<stdx::file_lock::Locked>) -> Result<(), Nested> {
+pub fn recheck_renamed(
+    from: &Path,
+    to: &Path,
+    held: &mut Vec<stdx::file_lock::Locked>,
+) -> Result<(), Nested> {
     let found = match take_nested_leases(to, None, held) {
         Ok(()) => return Ok(()),
         Err(found) => found,
     };
     let back = rename_no_replace(to, from);
-    let at_home = |dir: &Path| dir.strip_prefix(to).map_or_else(|_| dir.to_path_buf(), |rest| from.join(rest));
+    let at_home = |dir: &Path| {
+        dir.strip_prefix(to).map_or_else(|_| dir.to_path_buf(), |rest| from.join(rest))
+    };
     match (found, back) {
-        (Nested::Held { dir, .. }, Ok(())) => Err(Nested::Held { tree: from.to_path_buf(), dir: at_home(&dir) }),
-        (Nested::Changed { dir, .. }, Ok(())) => Err(Nested::Changed { tree: from.to_path_buf(), dir: at_home(&dir) }),
-        (Nested::Io(why), Ok(())) => Err(Nested::Io(format!("{why}; {} was renamed back to {}", to.display(), from.display()))),
+        (Nested::Held { dir, .. }, Ok(())) => {
+            Err(Nested::Held { tree: from.to_path_buf(), dir: at_home(&dir) })
+        }
+        (Nested::Changed { dir, .. }, Ok(())) => {
+            Err(Nested::Changed { tree: from.to_path_buf(), dir: at_home(&dir) })
+        }
+        (Nested::Io(why), Ok(())) => Err(Nested::Io(format!(
+            "{why}; {} was renamed back to {}",
+            to.display(),
+            from.display()
+        ))),
         // `take_nested_leases` never renames, so never says `NotBack`; passed on as it is.
         (found @ Nested::NotBack { .. }, Ok(())) => Err(found),
         (found, Err(error)) => Err(Nested::NotBack {
@@ -1218,8 +1343,11 @@ pub fn nested_lease_dirs(tree: &Path, skip: Option<&Path>) -> Result<Vec<PathBuf
         };
         let mut leased = false;
         for entry in read {
-            let entry = entry.map_err(|error| Nested::Io(format!("listing {}: {error}", dir.display())))?;
-            let kind = entry.file_type().map_err(|error| Nested::Io(format!("the type of {}: {error}", entry.path().display())))?;
+            let entry =
+                entry.map_err(|error| Nested::Io(format!("listing {}: {error}", dir.display())))?;
+            let kind = entry.file_type().map_err(|error| {
+                Nested::Io(format!("the type of {}: {error}", entry.path().display()))
+            })?;
             if kind.is_dir() {
                 let path = entry.path();
                 match std::fs::symlink_metadata(&path) {
@@ -1235,7 +1363,9 @@ pub fn nested_lease_dirs(tree: &Path, skip: Option<&Path>) -> Result<Vec<PathBuf
                         )));
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(Nested::Io(format!("reading {}: {error}", path.display()))),
+                    Err(error) => {
+                        return Err(Nested::Io(format!("reading {}: {error}", path.display())));
+                    }
                 }
             } else if kind.is_file() && entry.file_name() == lease::LEASE {
                 leased = true;
@@ -1253,7 +1383,11 @@ pub fn nested_lease_dirs(tree: &Path, skip: Option<&Path>) -> Result<Vec<PathBuf
 /// (the same lease file, [`lease::verified`], as after the tree's rename) is not taken twice. A
 /// held one, or one that moved, is a [`Nested`] naming its directory; the locks taken before it
 /// stay in `held`, for the caller to drop.
-pub fn take_leases(tree: &Path, dirs: &[PathBuf], held: &mut Vec<stdx::file_lock::Locked>) -> Result<(), Nested> {
+pub fn take_leases(
+    tree: &Path,
+    dirs: &[PathBuf],
+    held: &mut Vec<stdx::file_lock::Locked>,
+) -> Result<(), Nested> {
     for dir in dirs {
         let mut have = false;
         for file in held.iter_mut() {
@@ -1287,7 +1421,11 @@ pub fn take_leases(tree: &Path, dirs: &[PathBuf], held: &mut Vec<stdx::file_lock
 /// it meanwhile (review round 5, B1: a `--target-dir` named inside another build's directory, or
 /// `<root>/build` itself). Run again on the renamed tree, with the locks held, before anything
 /// is unlinked, it covers a lease made inside after the first walk (review round 6, C1).
-pub fn take_nested_leases(tree: &Path, skip: Option<&Path>, held: &mut Vec<stdx::file_lock::Locked>) -> Result<(), Nested> {
+pub fn take_nested_leases(
+    tree: &Path,
+    skip: Option<&Path>,
+    held: &mut Vec<stdx::file_lock::Locked>,
+) -> Result<(), Nested> {
     let dirs = nested_lease_dirs(tree, skip)?;
     take_leases(tree, &dirs, held)
 }
@@ -1316,7 +1454,9 @@ pub fn rename_into_trash(path: &Path, to: &Path) -> Swept {
             path.display()
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Swept::Gone,
-        Err(error) => Swept::Failed(format!("renaming {} to {}: {error}", path.display(), to.display())),
+        Err(error) => {
+            Swept::Failed(format!("renaming {} to {}: {error}", path.display(), to.display()))
+        }
     }
 }
 
@@ -1332,14 +1472,24 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     {
         use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
         let c = |path: &Path| {
-            CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{} has a NUL in it", path.display())))
+            CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} has a NUL in it", path.display()),
+                )
+            })
         };
         let (c_from, c_to) = (c(from)?, c(to)?);
         // SAFETY: both names are NUL-terminated and alive across the call, which only reads them.
         #[cfg(target_os = "linux")]
         let done = unsafe {
-            libc::renameat2(libc::AT_FDCWD, c_from.as_ptr(), libc::AT_FDCWD, c_to.as_ptr(), libc::RENAME_NOREPLACE)
+            libc::renameat2(
+                libc::AT_FDCWD,
+                c_from.as_ptr(),
+                libc::AT_FDCWD,
+                c_to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
         };
         // SAFETY: as above.
         #[cfg(target_os = "macos")]
@@ -1358,7 +1508,8 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
                     from.display(),
                     to.display(),
                     match errno {
-                        libc::EINVAL => "the file system may not support it, or the rename is invalid",
+                        libc::EINVAL =>
+                            "the file system may not support it, or the rename is invalid",
                         _ => "the file system or kernel does not support it",
                     }
                 ),
@@ -1369,7 +1520,12 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         match std::fs::symlink_metadata(to) {
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} is there", to.display()))),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} is there", to.display()),
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -1385,9 +1541,14 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 /// the locks are held through the removal (review round 6, C1).
 pub fn unlink(path: &Path, mut held: Vec<stdx::file_lock::Locked>) -> Result<u64, String> {
     let name = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-    let in_trash = path.parent().is_some_and(|it| it.file_name().is_some_and(|it| it == TRASH) && it.join(TRASH_MARK).is_file());
+    let in_trash = path.parent().is_some_and(|it| {
+        it.file_name().is_some_and(|it| it == TRASH) && it.join(TRASH_MARK).is_file()
+    });
     if !in_trash || !is_trash_name(&name) {
-        return Err(format!("{} is not an entry of blaze's trash: it is not removed", path.display()));
+        return Err(format!(
+            "{} is not an entry of blaze's trash: it is not removed",
+            path.display()
+        ));
     }
     take_nested_leases(path, None, &mut held).map_err(|why| format!("{why}: it stays in trash"))?;
     // [`remove_tree`] refuses a mount inside before it removes anything, and checks each

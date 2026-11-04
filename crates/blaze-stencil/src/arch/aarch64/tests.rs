@@ -255,7 +255,13 @@ fn whole(func: &ir::Function, target: &Target) -> Out {
     on_frame(|temp| whole_on(func, target, frame, temp, SLOTS))
 }
 
-fn whole_on(func: &ir::Function, target: &Target, frame: Frame, temp: &blaze_mem::Frame, slots: u32) -> Out {
+fn whole_on(
+    func: &ir::Function,
+    target: &Target,
+    frame: Frame,
+    temp: &blaze_mem::Frame,
+    slots: u32,
+) -> Out {
     let mut run = Run::new(func, target, &frame, temp);
     run.slots = slots;
     glue::prologue(&mut run).unwrap_or_else(|e| panic!("{e}"));
@@ -553,10 +559,7 @@ fn probes_are_cranelifts() {
 /// What the epilogue frees before the last `ldp x29, x30, [sp], #16` and `ret`: its `add sp`
 /// immediates and its restores' post-index steps, the distance from `x29` down to `sp`.
 fn freed(words: &[u32]) -> u32 {
-    let end = words
-        .windows(2)
-        .rposition(|w| w == [0xa8c1_7bfd, inst::RET])
-        .expect("an epilogue");
+    let end = words.windows(2).rposition(|w| w == [0xa8c1_7bfd, inst::RET]).expect("an epilogue");
     let mut bytes = 0;
     for &w in words[..end].iter().rev() {
         if w & 0xffc0_03e0 == 0xa8c0_03e0 || w & 0xffc0_03e0 == 0x6cc0_03e0 {
@@ -578,7 +581,11 @@ fn freed(words: &[u32]) -> u32 {
 /// A leaf whose frame is one stack slot of `bytes`.
 fn leaf_with_slot(conv: CallConv, bytes: u32) -> ir::Function {
     build(sig(conv, &[], &[]), |b, _| {
-        b.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, bytes, 4));
+        b.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            bytes,
+            4,
+        ));
         b.ins().return_(&[]);
     })
 }
@@ -808,7 +815,12 @@ fn a_value_in_x16_stored_to_a_far_slot_is_the_value_not_the_slots_offset() {
         });
         let frame = Aarch64::frame(&func, &target, AREA).unwrap_or_else(|e| panic!("{e}"));
         let ours = on_frame(|temp| whole_on(&func, &target, frame, temp, FAR));
-        for opcode in [ir::Opcode::SymbolValue, ir::Opcode::FuncAddr, ir::Opcode::GetStackPointer, ir::Opcode::GetReturnAddress] {
+        for opcode in [
+            ir::Opcode::SymbolValue,
+            ir::Opcode::FuncAddr,
+            ir::Opcode::GetStackPointer,
+            ir::Opcode::GetReturnAddress,
+        ] {
             let span = ours.span(opcode, &func);
             let store = span.last().copied();
             assert_eq!(
@@ -916,7 +928,11 @@ fn tail_calls_outside_tail_and_other_conventions_are_errors() {
     let inst =
         func.layout.first_inst(func.layout.entry_block().expect("a block")).expect("an inst");
     let error = Aarch64::frame(&func, &LINUX, AREA).map(drop).map_err(|e| e.inst);
-    assert_eq!(error, Err(Some(inst)), "a `system_v` function's return call to a `tail` one is refused");
+    assert_eq!(
+        error,
+        Err(Some(inst)),
+        "a `system_v` function's return call to a `tail` one is refused"
+    );
     assert!(Aarch64::frame(&leaf(CallConv::Tail), &LINUX, AREA).is_ok());
     assert!(Aarch64::frame(&leaf(CallConv::Winch), &LINUX, AREA).is_err());
 }
@@ -947,11 +963,9 @@ fn a_return_call_of_more_stack_arguments_grows_the_frame_as_cranelift_does() {
 fn a_native_return_call_writes_over_the_callers_own_stack_arguments() {
     // Ten `i32`s, two on the stack: the callee's go where the caller's caller put the
     // caller's (8 bytes each in AAPCS64, packed in Apple's), and `sp` stays at them.
-    for (target, expect) in [
-        (LINUX, [(2, 16), (2, 24)]),
-        (WINDOWS, [(2, 16), (2, 24)]),
-        (MACOS, [(2, 16), (2, 20)]),
-    ] {
+    for (target, expect) in
+        [(LINUX, [(2, 16), (2, 24)]), (WINDOWS, [(2, 16), (2, 24)]), (MACOS, [(2, 16), (2, 20)])]
+    {
         let ten = sig(conv(&target), &[I32; 10], &[I32]);
         let func = build(ten.clone(), |b, p| {
             let f = import(b, 1, ten.clone(), true);
@@ -1032,7 +1046,11 @@ fn fields(shape: Shape) -> Vec<(HoleKind, Form, u32)> {
         _ => {
             for (n, src) in shape.srcs.into_iter().enumerate() {
                 if src == Src::Slot {
-                    out.push(([HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2][n], Form::A64Ldst64Lo12, LDR));
+                    out.push((
+                        [HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2][n],
+                        Form::A64Ldst64Lo12,
+                        LDR,
+                    ));
                 }
             }
         }
@@ -1050,7 +1068,9 @@ fn fields(shape: Shape) -> Vec<(HoleKind, Form, u32)> {
 fn stencil(shape: Shape) -> (Vec<u8>, Vec<Hole>) {
     let mut code = shape.key().to_le_bytes().to_vec();
     let mut holes = Vec::new();
-    for (kind, form, word) in fields(shape).into_iter().chain([(HoleKind::Next, Form::A64Jump26, B)]) {
+    for (kind, form, word) in
+        fields(shape).into_iter().chain([(HoleKind::Next, Form::A64Jump26, B)])
+    {
         holes.push(Hole { at: code.len() as u16, form, kind, addend: 0 });
         code.extend_from_slice(&word.to_le_bytes());
     }
@@ -1101,7 +1121,8 @@ fn a_warm_compile_through_the_glue_into_a_reused_code_allocates_nothing() {
             target.os
         );
         assert!(!code.relocs.is_empty());
-        let fresh = compile_in::<Aarch64, _>(&func, &target, &library, |it, _| it.to_code()).unwrap();
+        let fresh =
+            compile_in::<Aarch64, _>(&func, &target, &library, |it, _| it.to_code()).unwrap();
         assert_eq!(code, fresh, "the reused code is the fresh one");
         match (&code.unwind, target.os) {
             (Some(Unwind::WindowsArm64 { codes, .. }), Os::Windows) => {

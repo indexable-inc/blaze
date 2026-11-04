@@ -55,9 +55,7 @@ impl FirstChars {
     }
 
     fn chars(&self) -> impl Iterator<Item = char> + '_ {
-        self.0
-            .iter()
-            .flat_map(|&(lo, hi)| (lo..=hi).filter_map(char::from_u32))
+        self.0.iter().flat_map(|&(lo, hi)| (lo..=hi).filter_map(char::from_u32))
     }
 
     fn contains(&self, c: char) -> bool {
@@ -166,11 +164,8 @@ pub fn first_chars(parsed: &ParsedPattern) -> Option<FirstChars> {
     if parsed.flags & SRE_FLAG_IGNORECASE != 0 {
         return None;
     }
-    let mut walk = FirstWalk {
-        ranges: Vec::new(),
-        any: false,
-        version: unicode_version(parsed.flags),
-    };
+    let mut walk =
+        FirstWalk { ranges: Vec::new(), any: false, version: unicode_version(parsed.flags) };
     let nullable = walk.seq(&parsed.pattern);
     if walk.any || nullable {
         return None;
@@ -283,11 +278,7 @@ struct Outcome {
 
 impl Outcome {
     fn fixed(result: Result<Option<usize>, MatchError>) -> Outcome {
-        Outcome {
-            result,
-            edge: Edge::Fixed,
-            anchored: false,
-        }
+        Outcome { result, edge: Edge::Fixed, anchored: false }
     }
 }
 
@@ -297,10 +288,7 @@ impl TermPattern {
             .then(|| pattern.value.chars().collect());
         TermPattern {
             first: first_chars(&parsed),
-            literals: literal
-                .is_none()
-                .then(|| literal_sequence(&parsed))
-                .flatten(),
+            literals: literal.is_none().then(|| literal_sequence(&parsed)).flatten(),
             program: literal
                 .is_none()
                 .then(|| Program::compile(&parsed).ok())
@@ -341,11 +329,7 @@ impl TermPattern {
                     return Outcome::fixed(Ok(None));
                 }
                 None => {
-                    return Outcome {
-                        result: Ok(None),
-                        edge: Edge::Lost,
-                        anchored: false,
-                    };
+                    return Outcome { result: Ok(None), edge: Edge::Lost, anchored: false };
                 }
             }
         }
@@ -357,11 +341,7 @@ impl TermPattern {
                 } else {
                     Edge::Fixed
                 };
-                return Outcome {
-                    result: Ok(None),
-                    edge,
-                    anchored: false,
-                };
+                return Outcome { result: Ok(None), edge, anchored: false };
             }
             return Outcome::fixed(Ok(rest.starts_with(literal).then(|| pos + literal.len())));
         }
@@ -382,11 +362,7 @@ impl TermPattern {
                 Err(e) => (Err(e), Edge::Lost),
             }
         };
-        Outcome {
-            result,
-            edge,
-            anchored: self.anchored,
-        }
+        Outcome { result, edge, anchored: self.anchored }
     }
 
     /// How far the unit of the tail run `run_id` (from a [`Touch::Tail`]
@@ -421,10 +397,7 @@ impl TermPattern {
     fn fullmatch_pattern(&self, text: &[char]) -> Result<bool, MatchError> {
         if let Some((literals, flags)) = &self.literals {
             return Ok(text.len() == literals.len()
-                && literals
-                    .iter()
-                    .zip(text)
-                    .all(|(&cp, &c)| literal_eq(cp, c, *flags)));
+                && literals.iter().zip(text).all(|(&cp, &c)| literal_eq(cp, c, *flags)));
         }
         Matcher::new(&self.parsed).fullmatch(text)
     }
@@ -638,21 +611,13 @@ impl Lexer {
             .into_iter()
             .zip(unless_lists)
             .filter(|((id, _, _), _)| !embedded.contains(id))
-            .map(|((id, _, pattern), unless)| LexTerminal {
-                id,
-                pattern,
-                unless,
-            })
+            .map(|((id, _, pattern), unless)| LexTerminal { id, pattern, unless })
             .collect();
         let mut positions = alloc::vec![None; patterns.len()];
         for (i, term) in terminals.iter().enumerate() {
             positions[term.id] = Some(i);
         }
-        Lexer {
-            terminals,
-            patterns,
-            positions,
-        }
+        Lexer { terminals, patterns, positions }
     }
 
     /// Match terminal `id`'s own pattern at `pos`, as the dynamic lexer
@@ -683,9 +648,8 @@ impl Lexer {
     /// the candidate can start with, so that it would read on into the
     /// candidate and past it just the same.
     pub fn can_stop(&self, scan: &Scan, candidate: TermId) -> bool {
-        let Some(first) = self.patterns[candidate]
-            .as_ref()
-            .and_then(|pattern| pattern.first.as_ref())
+        let Some(first) =
+            self.patterns[candidate].as_ref().and_then(|pattern| pattern.first.as_ref())
         else {
             return true;
         };
@@ -693,21 +657,19 @@ impl Lexer {
             return true;
         }
         scan.steps.as_slice().iter().all(|(id, carry)| {
-            self.patterns[*id]
-                .as_ref()
-                .is_none_or(|pattern| match carry {
-                    Carry::Tail(run_id) => first
-                        .chars()
-                        .any(|c| pattern.run_len(*run_id, &[c], 0) != Some(1)),
-                    Carry::Unless(probes) => first
-                        .chars()
-                        .any(|c| pattern.probed(probes, c) != Some(true)),
-                    Carry::Resume(resume) => pattern
-                        .program
-                        .as_ref()
-                        .is_none_or(|program| first.chars().any(|c| !program.swallows(resume, c))),
-                    Carry::Literal => true,
-                })
+            self.patterns[*id].as_ref().is_none_or(|pattern| match carry {
+                Carry::Tail(run_id) => {
+                    first.chars().any(|c| pattern.run_len(*run_id, &[c], 0) != Some(1))
+                }
+                Carry::Unless(probes) => {
+                    first.chars().any(|c| pattern.probed(probes, c) != Some(true))
+                }
+                Carry::Resume(resume) => pattern
+                    .program
+                    .as_ref()
+                    .is_none_or(|program| first.chars().any(|c| !program.swallows(resume, c))),
+                Carry::Literal => true,
+            })
         })
     }
 
@@ -902,10 +864,7 @@ impl Starters {
             let bit = 1u64 << n.min(63);
             for (c, word) in ascii.iter_mut().enumerate() {
                 let c = char::from(c as u8);
-                if lexer.patterns[id]
-                    .as_ref()
-                    .is_none_or(|pattern| pattern.may_start(c))
-                {
+                if lexer.patterns[id].as_ref().is_none_or(|pattern| pattern.may_start(c)) {
                     *word |= bit;
                 }
             }

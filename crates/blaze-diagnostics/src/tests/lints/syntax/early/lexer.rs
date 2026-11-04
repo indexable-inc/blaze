@@ -33,7 +33,8 @@ macro_rules! println {
 /// of more than one file.
 fn stderr(fixture: &str) -> String {
     let options = compiletest(Mode::Other, &Options::default());
-    let stderr = checked_with(fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = checked_with(fixture, "$DIR/", &options)
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
 }
 
@@ -59,7 +60,8 @@ fn codepoints(source: &str) -> String {
     while let Some(at) = rest.find("<U+") {
         out.push_str(&rest[..at]);
         let end = rest[at..].find('>').map(|it| at + it).expect("a `<U+XXXX>` is closed");
-        let code = u32::from_str_radix(&rest[at + 3..end], 16).expect("a `<U+XXXX>` is hexadecimal");
+        let code =
+            u32::from_str_radix(&rest[at + 3..end], 16).expect("a `<U+XXXX>` is hexadecimal");
         out.push(char::from_u32(code).expect("a `<U+XXXX>` is a codepoint"));
         rest = &rest[end + 1..];
     }
@@ -99,7 +101,10 @@ LL | /// �א�, �ב�, �ג�, �ד�, �ה�
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("unicode-control-doc-comment-issue-153096.rs", "2024", &codepoints(source)), expected);
+    assert_eq!(
+        ui("unicode-control-doc-comment-issue-153096.rs", "2024", &codepoints(source)),
+        expected
+    );
 }
 
 #[test]
@@ -196,7 +201,14 @@ fn main() {
 }
 "#;
     let expected = "";
-    assert_eq!(ui("issue-90614-accept-allow-text-direction-codepoint-in-comment-lint.rs", "2015", &codepoints(source)), expected);
+    assert_eq!(
+        ui(
+            "issue-90614-accept-allow-text-direction-codepoint-in-comment-lint.rs",
+            "2015",
+            &codepoints(source)
+        ),
+        expected
+    );
 }
 
 #[test]
@@ -422,7 +434,30 @@ fn main() {
 "####;
     assert_reports(
         &ui_with_std("reserved-guarded-strings-migration.rs", "2021", source),
-        &[warning(40, &[]), warning(43, &[]), warning(43, &[]), warning(48, &[]), warning(51, &[]), warning(51, &[]), warning(51, &[]), warning(59, &[]), warning(59, &[]), warning(65, &[]), warning(68, &[]), warning(71, &[]), warning(71, &[]), warning(76, &[]), warning(79, &[]), warning(79, &[]), warning(84, &[]), warning(87, &[]), warning(87, &[]), warning(92, &[]), warning(92, &[]), warning(92, &[])],
+        &[
+            warning(40, &[]),
+            warning(43, &[]),
+            warning(43, &[]),
+            warning(48, &[]),
+            warning(51, &[]),
+            warning(51, &[]),
+            warning(51, &[]),
+            warning(59, &[]),
+            warning(59, &[]),
+            warning(65, &[]),
+            warning(68, &[]),
+            warning(71, &[]),
+            warning(71, &[]),
+            warning(76, &[]),
+            warning(79, &[]),
+            warning(79, &[]),
+            warning(84, &[]),
+            warning(87, &[]),
+            warning(87, &[]),
+            warning(92, &[]),
+            warning(92, &[]),
+            warning(92, &[]),
+        ],
     );
 }
 

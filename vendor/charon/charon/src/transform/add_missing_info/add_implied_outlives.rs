@@ -44,11 +44,7 @@ impl<'a> OutlivesGatherer<'a> {
         item_params: &'a mut GenericParams,
         type_decls: &'a IndexMap<TypeDeclId, TypeDecl>,
     ) -> Self {
-        Self {
-            type_decls,
-            item_params,
-            binders: BindingStack::new(OutlivesAtBinder::default()),
-        }
+        Self { type_decls, item_params, binders: BindingStack::new(OutlivesAtBinder::default()) }
     }
 
     fn finish(mut self) {
@@ -99,10 +95,7 @@ impl VisitAstMut for OutlivesGatherer<'_> {
     ) -> ControlFlow<Self::Break> {
         self.binders.push(OutlivesAtBinder::default());
         let result = self.visit_inner(binder);
-        self.binders
-            .pop()
-            .unwrap()
-            .finish(&mut binder.params.outlives);
+        self.binders.pop().unwrap().finish(&mut binder.params.outlives);
         result
     }
 
@@ -165,10 +158,7 @@ impl<'a> ClosureOutlivesComputer<'a> {
             .filter(|decl| matches!(decl.src, TypeSource::Closure { .. }))
             .map(|decl| (decl.def_id, CycleDetector::Unprocessed))
             .collect();
-        Self {
-            type_decls,
-            closure_tys,
-        }
+        Self { type_decls, closure_tys }
     }
 
     fn compute_all(mut self) {
@@ -180,13 +170,11 @@ impl<'a> ClosureOutlivesComputer<'a> {
     fn compute(&mut self, type_id: TypeDeclId) {
         if self.closure_tys[&type_id].start_processing() {
             let mut dependencies = Vec::new();
-            self.type_decls[type_id]
-                .kind
-                .dyn_visit(|type_ref: &TypeDeclRef| {
-                    if self.closure_tys.get(&type_ref.id).is_some() {
-                        dependencies.push(type_ref.id);
-                    }
-                });
+            self.type_decls[type_id].kind.dyn_visit(|type_ref: &TypeDeclRef| {
+                if self.closure_tys.get(&type_ref.id).is_some() {
+                    dependencies.push(type_ref.id);
+                }
+            });
             for dependency in dependencies {
                 self.compute(dependency);
             }

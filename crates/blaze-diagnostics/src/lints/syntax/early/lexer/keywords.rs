@@ -38,7 +38,9 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, tree: &Tree<'db>, out: &mut Vec<Emitt
     let edition = tree.file.edition(cx.db);
     let may_fire = match edition {
         _ if edition.at_least_2024() => false,
-        Edition::Edition2015 => cx.lint_may_fire(KEYWORD_IDENTS_2018) || cx.lint_may_fire(KEYWORD_IDENTS_2024),
+        Edition::Edition2015 => {
+            cx.lint_may_fire(KEYWORD_IDENTS_2018) || cx.lint_may_fire(KEYWORD_IDENTS_2024)
+        }
         _ => cx.lint_may_fire(KEYWORD_IDENTS_2024),
     };
     if !may_fire {
@@ -78,7 +80,12 @@ impl Keywords<'_, '_, '_> {
                     }
                     SyntaxKind::TOKEN_TREE => {
                         if let Some(owner) = node.parent()
-                            && matches!(owner.kind(), SyntaxKind::MACRO_CALL | SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)
+                            && matches!(
+                                owner.kind(),
+                                SyntaxKind::MACRO_CALL
+                                    | SyntaxKind::MACRO_RULES
+                                    | SyntaxKind::MACRO_DEF
+                            )
                         {
                             self.tokens(node, owner);
                         }
@@ -168,12 +175,20 @@ impl Keywords<'_, '_, '_> {
 
     /// `check_ident_token` of the identifier `name` at `range` (a lifetime's when `prefix` is
     /// `'`, its span the lifetime's), which a later edition makes the keyword `keyword`.
-    fn check(&mut self, name: &str, range: TextRange, prefix: &str, keyword: Keyword, at: ast::Node<'_>) {
+    fn check(
+        &mut self,
+        name: &str,
+        range: TextRange,
+        prefix: &str,
+        keyword: Keyword,
+        at: ast::Node<'_>,
+    ) {
         let (_, lint, year) = keyword;
         let cx = self.cx;
         let span = cx.span(InFile::new(self.tree.file, range));
         // alloc: the diagnostic's text and span, as is all of `check`
-        let mut diag = Diag::lint(lint, format!("`{name}` is a keyword in the {year} edition"), span.clone());
+        let mut diag =
+            Diag::lint(lint, format!("`{name}` is a keyword in the {year} edition"), span.clone());
         diag.suggestion(
             span,
             "you can use a raw identifier to stay compatible",

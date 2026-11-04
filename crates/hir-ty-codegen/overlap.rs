@@ -13,7 +13,6 @@
 #![forbid(unsafe_code)]
 
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::bits::BitMatrix;
 use blaze_mem::Frame;
 use cranelift_codegen::{
@@ -21,6 +20,7 @@ use cranelift_codegen::{
     ir::{self, InstructionData},
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 
 use super::fragment::Named;
 
@@ -237,13 +237,13 @@ fn slot_mut(inst: &mut InstructionData) -> Option<&mut ir::StackSlot> {
 #[cfg(test)]
 mod tests {
     use blaze_hash::HashSet;
-    use std::alloc::Global;
     use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{
         InstBuilder, StackSlotData, StackSlotKind,
         types::{I32, I64},
     };
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use std::alloc::Global;
 
     use super::*;
 
@@ -420,7 +420,9 @@ mod tests {
         let returned = returned.unwrap_or_else(|| builder.ins().iconst(I64, 0));
         builder.ins().return_(&[returned]);
         builder.seal_all_blocks();
-        builder.finalize(super::super::isa_for(super::super::Target::for_host()).unwrap().frontend_config());
+        builder.finalize(
+            super::super::isa_for(super::super::Target::for_host()).unwrap().frontend_config(),
+        );
         let registers = random.below(4) as usize;
         let frame_slots: Vec<_> = slots
             .iter()
@@ -451,13 +453,19 @@ mod tests {
                 let (mut dense_named, mut listed_named) = (named.clone(), named.clone());
                 let dense_escaping = escaping(&func);
                 let model = escaping_model(&func);
-                let ours: Vec<_> =
-                    func.sized_stack_slots.keys().filter(|&it| dense_escaping.contains(it)).collect();
+                let ours: Vec<_> = func
+                    .sized_stack_slots
+                    .keys()
+                    .filter(|&it| dense_escaping.contains(it))
+                    .collect();
                 let mut theirs: Vec<_> = model.iter().copied().collect();
                 theirs.sort();
                 assert_eq!(ours, theirs, "seed {seed}");
-                let (only, only_model) =
-                    if escaping_only { (Some(&dense_escaping), Some(&model)) } else { (None, None) };
+                let (only, only_model) = if escaping_only {
+                    (Some(&dense_escaping), Some(&model))
+                } else {
+                    (None, None)
+                };
                 share_slots(&mut dense, &frame, &mut dense_named, only);
                 share_model(&mut listed, &frame, &mut listed_named, only_model);
                 let (dense, listed) = (dense.display().to_string(), listed.display().to_string());

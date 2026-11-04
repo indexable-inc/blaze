@@ -31,13 +31,13 @@ use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
 use blaze_cas::{Key, Kind};
 use blaze_diagnostics::{Diag, cache};
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_lower::Lowered;
 use blaze_units::query::EnvReads;
 use hir_def::deps::{Held, ImageBuf, ImageStore, Mode, Served};
 use hir_ty::{body_store, next_solver::goal_store};
 use parking_lot::Mutex;
+use std::alloc::Global;
 
 use super::{Job, compile, graph};
 use crate::serve::work::{KeptPut, Put};
@@ -104,20 +104,25 @@ pub(crate) fn serve(
     let mode = mode_in(&mut session.env, &job.input.config.invocation.env)?;
     let build = front_end()?;
     // alloc: once per serve, one entry per unit's crate
-    let crates: Vec<Crate> = units.iter().filter_map(|&unit| job.crates.krate(unit as usize)).collect();
+    let crates: Vec<Crate> =
+        units.iter().filter_map(|&unit| job.crates.krate(unit as usize)).collect();
     let Some(served) = images(lowered, &crates, build, session, mode)? else { return Ok(()) };
     match kept {
         Some(kept) => kept.add(served),
         None => *kept = Some(Kept { served, mode }),
     }
     let Some(checks) = Arc::get_mut(&mut session.checks) else {
-        return Err(ApiError::new("the dependencies' checks are served while a task still reads them", None));
+        return Err(ApiError::new(
+            "the dependencies' checks are served while a task still reads them",
+            None,
+        ));
     };
     let db = lowered.db();
     let flags = imaged(job, units.iter().map(|&unit| unit as usize), &session.keyed)?;
     let asked: Vec<(Crate, cache::Inputs<'_>)> =
         flags.iter().map(|(krate, flags)| (*krate, cache::Inputs::of(db, flags))).collect(); // alloc: once per serve
-    cache::serve(lowered.served_db(), &asked, &*session.images, checks).map_err(|why| ApiError::new(why, None))?;
+    cache::serve(lowered.served_db(), &asked, &*session.images, checks)
+        .map_err(|why| ApiError::new(why, None))?;
     let db = lowered.db();
     let consts = (0..job.graph.len())
         .filter_map(|unit| job.crates.krate(unit))
@@ -166,15 +171,19 @@ pub(crate) fn images(
         session.walked.walks += 1;
         hir_def::deps::keys(lowered.db(), crates, build)
     };
-    let mut moved: Vec<Crate> =
-        keys.iter().filter(|&(krate, key)| session.keyed.get(krate) != Some(key)).map(|(&krate, _)| krate).collect(); // alloc: once per serve, one per crate whose key moved
+    let mut moved: Vec<Crate> = keys
+        .iter()
+        .filter(|&(krate, key)| session.keyed.get(krate) != Some(key))
+        .map(|(&krate, _)| krate)
+        .collect(); // alloc: once per serve, one per crate whose key moved
     if moved.is_empty() {
         // `keyed` holds every key walked already.
         session.walked.note(at, build, crates.iter().chain(keys.keys()));
         return Ok(None);
     }
     moved.sort_unstable();
-    let served = lowered.serve_deps(&moved, build, &*session.images, mode).map_err(super::lower_error)?;
+    let served =
+        lowered.serve_deps(&moved, build, &*session.images, mode).map_err(super::lower_error)?;
     debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
     // The walk is noted only once `keyed` holds its keys: a serve that failed above leaves no
     // record that a later serve at this view could skip on with the old keys (rule 18).
@@ -208,7 +217,10 @@ fn imaged(
         .collect(); // alloc: once per serve
     crates.sort_by_key(|it| it.0);
     crates.dedup_by_key(|it| it.0);
-    crates.into_iter().map(|(krate, unit)| Ok((krate, compile::unit_lint_flags(job, unit)?))).collect() // alloc: as above
+    crates
+        .into_iter()
+        .map(|(krate, unit)| Ok((krate, compile::unit_lint_flags(job, unit)?)))
+        .collect() // alloc: as above
 }
 
 /// What a front end's database keeps of the store for its life: one adapter over it, its goal
@@ -275,13 +287,23 @@ impl Walked {
     }
 
     /// Whether every crate of `crates` was keyed at `at` by `build`.
-    fn covers(&self, at: (base_db::Nonce, blaze_query::db::View), build: ContentId, crates: &[Crate]) -> bool {
+    fn covers(
+        &self,
+        at: (base_db::Nonce, blaze_query::db::View),
+        build: ContentId,
+        crates: &[Crate],
+    ) -> bool {
         self.at == Some((at.0, at.1, build)) && crates.iter().all(|it| self.crates.contains(it))
     }
 
     /// `crates` (those asked and the dependencies keyed with them) keyed at `at` by `build`:
     /// added to those keyed there, or in place of those keyed at another view.
-    fn note<'a>(&mut self, at: (base_db::Nonce, blaze_query::db::View), build: ContentId, crates: impl Iterator<Item = &'a Crate>) {
+    fn note<'a>(
+        &mut self,
+        at: (base_db::Nonce, blaze_query::db::View),
+        build: ContentId,
+        crates: impl Iterator<Item = &'a Crate>,
+    ) {
         let at = Some((at.0, at.1, build));
         if self.at != at {
             self.at = at;
@@ -337,19 +359,33 @@ pub(crate) fn session(
             let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
             // dyn: hir-ty's item store takes its facts as `dyn` (blaze-item-hash depends on hir-ty); made once per database
             let facts: Arc<dyn body_store::BodyFacts> = Arc::new(blaze_item_hash::Bodies); // alloc: setup, once per database
-            Some(body_store::install(lowered.db(), adapter, facts, front_end()?, mode).map_err(|why| {
-                ApiError::new(format!("the item store: {why}"), None) // alloc: error path
-            })?)
+            Some(body_store::install(lowered.db(), adapter, facts, front_end()?, mode).map_err(
+                |why| {
+                    ApiError::new(format!("the item store: {why}"), None) // alloc: error path
+                },
+            )?)
         }
     };
     let checks = Arc::new(cache::Served::default()); // alloc: setup, once per database
-    Ok(Session { installed, items, images, checks, refused: HashMap::new_in(Global), env: read, keyed: HashMap::new_in(Global), walked: Walked::new() })
+    Ok(Session {
+        installed,
+        items,
+        images,
+        checks,
+        refused: HashMap::new_in(Global),
+        env: read,
+        keyed: HashMap::new_in(Global),
+        walked: Walked::new(),
+    })
 }
 
 /// What the job's `BLAZE_ITEM_STORE` asks of the item store: unset serves what it holds,
 /// `verify` runs each step it holds as well and stops the build on a difference, `off`
 /// installs none; any other value is an error naming it.
-fn items_in(read: &mut EnvReads, env: &[(String, String)]) -> Result<Option<body_store::Mode>, ApiError> {
+fn items_in(
+    read: &mut EnvReads,
+    env: &[(String, String)],
+) -> Result<Option<body_store::Mode>, ApiError> {
     match read.var(env, ITEMS, "the item store's mode").map_err(|why| ApiError::new(why, None))? {
         None => Ok(Some(body_store::Mode::Serve)),
         Some("verify") => Ok(Some(body_store::Mode::Verify)),
@@ -392,7 +428,10 @@ impl Session {
 /// resolves its crate as well, `verify` writes again what was read; any other value is an
 /// error naming it.
 fn mode_in(read: &mut EnvReads, env: &[(String, String)]) -> Result<Mode, ApiError> {
-    match read.var(env, IMAGES, "the dependency images' mode").map_err(|why| ApiError::new(why, None))? {
+    match read
+        .var(env, IMAGES, "the dependency images' mode")
+        .map_err(|why| ApiError::new(why, None))?
+    {
         None => Ok(Mode::Serve),
         Some("check") => Ok(Mode::Check),
         Some("verify") => Ok(Mode::Verify),
@@ -457,21 +496,32 @@ pub(crate) fn store(
     for put in images.take_puts() {
         let what = match filed.get(&put.key.0) {
             // alloc: once per image put
-            Some(krate) => Arc::from(format!("the def-map image of dependency crate {}", krate.named(db))),
+            Some(krate) => {
+                Arc::from(format!("the def-map image of dependency crate {}", krate.named(db)))
+            }
             None => Arc::clone(&filing),
         };
         puts.push(KeptPut { put, what });
     }
     let mut stage = |what: &'static str| {
         let what: Arc<str> = Arc::from(what);
-        puts.extend(images.take_puts().into_iter().map(|put| KeptPut { put, what: Arc::clone(&what) }));
+        puts.extend(
+            images.take_puts().into_iter().map(|put| KeptPut { put, what: Arc::clone(&what) }),
+        );
     };
     let checked: Vec<cache::Checked<'_>> = later
         .iter()
         .filter_map(|it| {
             // None: its image was refused, and its outcome is for the same reason.
-            let image = cache::image_key(db, it.krate).or_else(|| stored.as_ref()?.filed.get(&it.krate).copied())?;
-            Some(cache::Checked { krate: it.krate, image, inputs: cache::Inputs::of(db, &it.flags), diags: &it.diags, items_broken: it.items_broken })
+            let image = cache::image_key(db, it.krate)
+                .or_else(|| stored.as_ref()?.filed.get(&it.krate).copied())?;
+            Some(cache::Checked {
+                krate: it.krate,
+                image,
+                inputs: cache::Inputs::of(db, &it.flags),
+                diags: &it.diags,
+                items_broken: it.items_broken,
+            })
         })
         .collect(); // alloc: once per front end stored, one per crate checked
     let error = |why: String| ApiError::new(why, Some(root.to_owned())); // alloc: error path
@@ -481,9 +531,13 @@ pub(crate) fn store(
     bases.extend(kept_checks.keys);
     hir_ty::consteval::deps::drain(db, &bases).map_err(error)?;
     stage("a constant's value a dependency crate evaluated in this build");
-    let goals = session.installed.flush().map_err(|why| error(format!("the persistent goal cache: {why}")))?; // alloc: error path
+    let goals = session
+        .installed
+        .flush()
+        .map_err(|why| error(format!("the persistent goal cache: {why}")))?; // alloc: error path
     stage("a goal of the persistent goal cache");
-    let items = session.items.as_ref().map(body_store::Installed::flush).transpose().map_err(error)?;
+    let items =
+        session.items.as_ref().map(body_store::Installed::flush).transpose().map_err(error)?;
     stage("a body's steps of the item store");
     if let Some(stored) = &stored {
         for krate in &stored.written {
@@ -505,7 +559,10 @@ pub(crate) struct Flushes {
 /// lowered into (`flushes`: the goals' ([`flushed`]), then the bodies' steps the head's last
 /// build offered, and why any were kept out), then what this build's item store lookups
 /// found, step by step (`steps`, from [`Session::item_steps`]). None when there is neither.
-pub(crate) fn noted(flushes: Option<&Flushes>, steps: Option<&[body_store::StepCounts; 3]>) -> Option<Diagnostic> {
+pub(crate) fn noted(
+    flushes: Option<&Flushes>,
+    steps: Option<&[body_store::StepCounts; 3]>,
+) -> Option<Diagnostic> {
     let note = flushes.map(|it| flushed(&it.goals));
     let mut message = String::new();
     if let Some(items) = flushes.and_then(|it| it.items.as_ref()) {
@@ -514,7 +571,9 @@ pub(crate) fn noted(flushes: Option<&Flushes>, steps: Option<&[body_store::StepC
     }
     if let Some(steps) = steps {
         message.push_str("; the item store, this build:");
-        for (at, (counts, step)) in steps.iter().zip(["inference", "MIR", "borrow check"]).enumerate() {
+        for (at, (counts, step)) in
+            steps.iter().zip(["inference", "MIR", "borrow check"]).enumerate()
+        {
             let body_store::StepCounts { hits, ran, refused } = counts;
             let sep = if at == 0 { "" } else { ";" };
             message.push_str(&format!("{sep} {step} {hits} hit, {ran} ran, {refused} refused")); // alloc: under `-v`, once per build
@@ -559,9 +618,12 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
         steps: _,
     } = items;
     // alloc: under `-v`, once per build that stored a front end
-    message.push_str(&format!("the item store: {written} written, {kept} kept, {slots_full} with every slot full"));
+    message.push_str(&format!(
+        "the item store: {written} written, {kept} kept, {slots_full} with every slot full"
+    ));
     if !refused.is_empty() {
-        let by: Vec<String> = refused.iter().map(|(read, count)| format!("`{read}` ({count})")).collect(); // alloc: as above
+        let by: Vec<String> =
+            refused.iter().map(|(read, count)| format!("`{read}` ({count})")).collect(); // alloc: as above
         message.push_str(&format!("; steps kept out by reads of {}", by.join(", "))); // alloc: as above
     }
     for (count, why) in [
@@ -580,13 +642,22 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
 /// The `-v` note of what [`store`]'s flush of the persistent goal cache did with the goals the
 /// head's last build offered, and why any were kept out.
 pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
-    let goal_store::Flushed { written, kept, slots_full, inexpressible, unhashable, too_long, dropped } = flushed;
+    let goal_store::Flushed {
+        written,
+        kept,
+        slots_full,
+        inexpressible,
+        unhashable,
+        too_long,
+        dropped,
+    } = flushed;
     // alloc: under `-v`, once per build that stored a front end
     let mut message = format!(
         "the persistent goal cache, of the last build: {written} written, {kept} kept, {slots_full} with every slot full"
     );
     if !inexpressible.is_empty() {
-        let by: Vec<String> = inexpressible.iter().map(|(query, count)| format!("`{query}` ({count})")).collect(); // alloc: as above
+        let by: Vec<String> =
+            inexpressible.iter().map(|(query, count)| format!("`{query}` ({count})")).collect(); // alloc: as above
         message.push_str(&format!("; goals kept out by {}", by.join(", "))); // alloc: as above
     }
     for (count, why) in [
@@ -619,7 +690,8 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
 pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<ServedCrate>, ApiError> {
     let later = job.later.lock();
     // alloc: once per build, one entry per dependency crate checked
-    let outcomes: HashMap<Crate, Option<&str>, Global> = later.iter().map(|it| (it.krate, it.refused.as_deref())).collect();
+    let outcomes: HashMap<Crate, Option<&str>, Global> =
+        later.iter().map(|it| (it.krate, it.refused.as_deref())).collect();
     let mut seen = HashSet::new_in(Global);
     let mut lines = Vec::new(); // alloc: once per build, one line per dependency library
     for unit in 0..job.graph.len() {
@@ -639,7 +711,12 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
                     Some(why) => why.clone(), // clone: once per line refused
                     None => cache::Refused::NoImage.to_string(),
                 };
-                ServedCrate { package, outcome: ServedPart::Refused, bodies: ServedPart::Refused, why: Some(why) }
+                ServedCrate {
+                    package,
+                    outcome: ServedPart::Refused,
+                    bodies: ServedPart::Refused,
+                    why: Some(why),
+                }
             }
             Some(_) => {
                 // What is not served of a crate built as its programs reach it is not checked either.
@@ -657,7 +734,9 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
                 };
                 let why = match refused {
                     Some(why) => Some(why.to_owned()), // alloc: once per line refused
-                    None if reached && (outcome, bodies) != (ServedPart::Served, ServedPart::Served) => {
+                    None if reached
+                        && (outcome, bodies) != (ServedPart::Served, ServedPart::Served) =>
+                    {
                         Some(super::compile::REACHED_ONLY.to_owned()) // alloc: as above
                     }
                     None => None,
@@ -776,7 +855,10 @@ impl ImageStore for Images {
 fn on_pool(count: usize, task: &(dyn Fn(usize) + Sync)) {
     let task = |at: usize| blaze_mem::frame::task(blaze_mem::Tag::Query, |_| task(at));
     let again = blaze_graph::par::for_each_giving_way(count, task, |panic| {
-        matches!(panic.downcast_ref::<blaze_query::db::Cancelled>(), Some(blaze_query::db::Cancelled::WouldWaitOnItself { .. }))
+        matches!(
+            panic.downcast_ref::<blaze_query::db::Cancelled>(),
+            Some(blaze_query::db::Cancelled::WouldWaitOnItself { .. })
+        )
     });
     for at in again {
         task(at);

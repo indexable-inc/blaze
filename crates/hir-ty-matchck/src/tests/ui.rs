@@ -189,10 +189,7 @@ fn main() {
 }
 "#,
         &[
-            (
-                "(1, (Some(1), 2..=3))",
-                "E0005 function argument: (..=0_isize, _) | (2_isize.., _)",
-            ),
+            ("(1, (Some(1), 2..=3))", "E0005 function argument: (..=0_isize, _) | (2_isize.., _)"),
             (
                 "(1, (Some(1), 2..=3))",
                 "E0005 local binding: (i32::MIN..=0_i32, _) | (2_i32..=i32::MAX, _)",

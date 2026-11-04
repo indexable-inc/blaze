@@ -108,7 +108,10 @@ pub struct B;
     let root = root_of(db, file_id(&fixture, 0));
     assert!((0..3).all(|at| root_of(db, file_id(&fixture, at)) == root));
     assert_eq!(root, SourceRootId(0));
-    assert_eq!(LocalRoots::get(db).roots(db).iter().copied().collect::<Vec<_>>(), [SourceRootId(0)]);
+    assert_eq!(
+        LocalRoots::get(db).roots(db).iter().copied().collect::<Vec<_>>(),
+        [SourceRootId(0)]
+    );
     assert!(LibraryRoots::get(db).roots(db).is_empty());
     // The default crate's root is `/lib.rs`.
     assert_eq!(fixture.krate().data(db).root_file_id, file_id(&fixture, 0));
@@ -260,7 +263,10 @@ fn toolchain_target_data_layout_and_arch() {
 "#);
     let db = fixture.db();
     let workspace = fixture.krate().workspace_data(db);
-    assert_eq!(workspace.toolchain.as_ref().map(|it| it.to_string()).as_deref(), Some("1.76.0-nightly"));
+    assert_eq!(
+        workspace.toolchain.as_ref().map(|it| it.to_string()).as_deref(),
+        Some("1.76.0-nightly")
+    );
     let target = workspace.target.as_ref().expect("the fixture's target");
     assert_eq!(&*target.data_layout, "e-m:e-p:32:32-i64:64-n32:64-S128");
     assert_eq!(target.arch, Arch::Wasm32);
@@ -269,7 +275,10 @@ fn toolchain_target_data_layout_and_arch() {
 
     let stable = super::db("//- /main.rs\n");
     let workspace = stable.krate().workspace_data(stable.db());
-    assert_eq!(workspace.toolchain.as_ref().map(|it| it.to_string()).as_deref(), Some("1.76.0-stable"));
+    assert_eq!(
+        workspace.toolchain.as_ref().map(|it| it.to_string()).as_deref(),
+        Some("1.76.0-stable")
+    );
     assert_eq!(workspace.target.as_ref().expect("a target").arch, Arch::Other);
 }
 
@@ -363,7 +372,8 @@ fn extra_proc_macros_are_named_like_the_test_ones() {
     );
     let db = fixture.db();
     let loaded = ProcMacros::get_for_crate(db, named(db, "proc_macros")).expect("macros");
-    let names: Vec<&str> = loaded.macros().expect("loaded").iter().map(|it| it.name.as_str()).collect();
+    let names: Vec<&str> =
+        loaded.macros().expect("loaded").iter().map(|it| it.name.as_str()).collect();
     assert_eq!(names, ["MyExtra"]);
     assert_eq!(text(db, fixture.sysroot_files()[0]), "pub fn my_extra() {}\n");
 }
@@ -380,7 +390,8 @@ fn a_fixture_proc_macro_crate_has_the_macros_it_is_given() {
     fixture.set_proc_macros(macros, vec![ProcMacro { name: Symbol::intern("Given"), ..identity }]);
     let db = fixture.db();
     let loaded = ProcMacros::get_for_crate(db, macros).expect("the crate was given macros");
-    let names: Vec<&str> = loaded.macros().expect("loaded").iter().map(|it| it.name.as_str()).collect();
+    let names: Vec<&str> =
+        loaded.macros().expect("loaded").iter().map(|it| it.name.as_str()).collect();
     assert_eq!(names, ["Given"]);
     assert!(ProcMacros::get_for_crate(db, named(db, "main")).is_none());
 }
@@ -407,7 +418,10 @@ fn f$0() {}
 
     let fixture = db(r#"fn main() { let _ = "\$0"; }"#);
     assert!(fixture.marked().is_none());
-    assert_eq!(text(fixture.db(), file_id(&fixture, 0)).trim_end(), r#"fn main() { let _ = "$0"; }"#);
+    assert_eq!(
+        text(fixture.db(), file_id(&fixture, 0)).trim_end(),
+        r#"fn main() { let _ = "$0"; }"#
+    );
 }
 
 #[test]
@@ -429,7 +443,9 @@ fn a_path_twice_is_refused() {
 #[test]
 fn stable_ids_renumber_by_first_use() {
     assert_eq!(
-        stable_ids("Crate(Id(10240)) FileId(EditionedFileId(Id(13312))) Crate(Id(10240)) FunctionId(8c03) Idx::<FieldData>(0) FunctionId(\"f\")"),
+        stable_ids(
+            "Crate(Id(10240)) FileId(EditionedFileId(Id(13312))) Crate(Id(10240)) FunctionId(8c03) Idx::<FieldData>(0) FunctionId(\"f\")"
+        ),
         "Crate(Id(#0)) FileId(EditionedFileId(Id(#1))) Crate(Id(#0)) FunctionId(#0) Idx::<FieldData>(0) FunctionId(\"f\")",
     );
 }

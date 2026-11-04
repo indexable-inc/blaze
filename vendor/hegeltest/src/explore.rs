@@ -151,10 +151,7 @@ impl Integer {
     }
 
     fn from_magnitude(negative: bool, magnitude: u128) -> Self {
-        Integer {
-            negative: negative && magnitude != 0,
-            magnitude,
-        }
+        Integer { negative: negative && magnitude != 0, magnitude }
     }
 
     fn to_le_bytes(self) -> [u8; 17] {
@@ -453,15 +450,7 @@ fn parse_report(bytes: &[u8]) -> Option<Report> {
     let (nodes, spans) = r.stream()?;
     let targets = r.list(|r| Some((r.str()?, r.f64()?)))?;
     let events = r.list(|r| Some((r.str()?, r.opt(Reader::f64)?)))?;
-    (r.pos == bytes.len()).then_some(Report {
-        id,
-        status,
-        origin,
-        nodes,
-        spans,
-        targets,
-        events,
-    })
+    (r.pos == bytes.len()).then_some(Report { id, status, origin, nodes, spans, targets, events })
 }
 
 struct Reader<'a> {
@@ -519,11 +508,7 @@ impl<'a> Reader<'a> {
     }
 
     fn opt<T>(&mut self, read: impl FnOnce(&mut Self) -> Option<T>) -> Option<Option<T>> {
-        if self.bool()? {
-            read(self).map(Some)
-        } else {
-            Some(None)
-        }
+        if self.bool()? { read(self).map(Some) } else { Some(None) }
     }
 
     fn list<T>(&mut self, mut read: impl FnMut(&mut Self) -> Option<T>) -> Option<Vec<T>> {
@@ -556,10 +541,7 @@ impl<'a> Reader<'a> {
                 shrink_towards: self.int()?,
                 value: self.int()?,
             },
-            1 => Draw::Boolean {
-                p: self.f64()?,
-                value: self.bool()?,
-            },
+            1 => Draw::Boolean { p: self.f64()?, value: self.bool()? },
             2 => Draw::Float {
                 min: self.f64()?,
                 max: self.f64()?,

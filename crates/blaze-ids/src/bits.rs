@@ -531,7 +531,11 @@ impl<S: WordsMut, I: BitIndex> Bits<S, I> {
     pub fn copy_from<T: Words>(&mut self, other: &Bits<T, I>) {
         let (ours, theirs) = (self.words_mut(), other.words());
         let shared = ours.len().min(theirs.len());
-        assert!(is_zero(&theirs[shared..]), "a copy of a set with a member past {} bits", ours.len() * 64);
+        assert!(
+            is_zero(&theirs[shared..]),
+            "a copy of a set with a member past {} bits",
+            ours.len() * 64
+        );
         ours[..shared].copy_from_slice(&theirs[..shared]);
         ours[shared..].fill(0);
     }
@@ -823,7 +827,8 @@ impl<I: BitIndex> Iterator for Ones<'_, I> {
     }
 
     fn count(self) -> usize {
-        (self.front.count_ones() + self.back.count_ones()) as usize + count_words(self.middle.as_slice())
+        (self.front.count_ones() + self.back.count_ones()) as usize
+            + count_words(self.middle.as_slice())
     }
 }
 
@@ -1001,7 +1006,11 @@ impl<I: BitIndex, S: WordsMut> BitMatrix<I, S> {
 
     /// Row `into` gains the members of row `from`; whether it gained any.
     pub fn union_rows(&mut self, into: usize, from: usize) -> bool {
-        assert!(into < self.rows && from < self.rows, "rows {into} and {from} of a matrix of {}", self.rows);
+        assert!(
+            into < self.rows && from < self.rows,
+            "rows {into} and {from} of a matrix of {}",
+            self.rows
+        );
         if into == from {
             return false;
         }
@@ -1035,13 +1044,19 @@ impl<I: BitIndex, S: WordsMut> BitMatrix<I, S> {
 impl<I, S: Clone> Clone for BitMatrix<I, S> {
     fn clone(&self) -> Self {
         // clone: a matrix's buffer, where its owner copies the analysis
-        BitMatrix { rows: self.rows, row_words: self.row_words, data: self.data.clone(), index: PhantomData }
+        BitMatrix {
+            rows: self.rows,
+            row_words: self.row_words,
+            data: self.data.clone(),
+            index: PhantomData,
+        }
     }
 }
 
 impl<I, S: Words> PartialEq for BitMatrix<I, S> {
     fn eq(&self, other: &Self) -> bool {
-        (self.rows, self.row_words) == (other.rows, other.row_words) && self.data.words() == other.data.words()
+        (self.rows, self.row_words) == (other.rows, other.row_words)
+            && self.data.words() == other.data.words()
     }
 }
 
@@ -1057,7 +1072,8 @@ impl<I, S: Words> fmt::Debug for BitMatrix<I, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let words = self.row_words;
         let data = self.data.words();
-        let rows = (0..self.rows).map(|row| DebugOnes(Ones::new(&data[row * words..(row + 1) * words])));
+        let rows =
+            (0..self.rows).map(|row| DebugOnes(Ones::new(&data[row * words..(row + 1) * words])));
         f.debug_list().entries(rows).finish()
     }
 }
@@ -1319,7 +1335,12 @@ impl<'a> AtomicBitSlice<'a> {
     /// swap's and the store's, so `Relaxed`, `Release` or `SeqCst`. Panics when `to` is
     /// shorter.
     pub fn move_into(&self, to: AtomicBitSlice<'_>, order: Ordering) {
-        assert!(to.words.len() >= self.words.len(), "a move of {} words into {}", self.words.len(), to.words.len());
+        assert!(
+            to.words.len() >= self.words.len(),
+            "a move of {} words into {}",
+            self.words.len(),
+            to.words.len()
+        );
         for (from, to) in self.words.iter().zip(to.words) {
             to.store(from.swap(0, order), order);
         }

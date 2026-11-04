@@ -30,3 +30,54 @@ pub fn get() -> &'static Release {
 pub fn for_tests() {
     set(Release { version: "0.0.0-dev", line: "blaze 0.0.0-dev" });
 }
+
+/// What the daemon runs off its loop to keep blaze's update state fresh, handed over by the
+/// program's main (blaze-engine's `update.rs`, which owns the network, the files and the
+/// decisions): it checks `latest.json` when due and says how long until it is due again.
+#[expect(
+    clippy::disallowed_types,
+    reason = "a function handed over once by the program's main, so that this crate has no update code"
+)]
+static UPDATES: std::sync::OnceLock<fn() -> std::time::Duration> = std::sync::OnceLock::new();
+
+pub fn set_updates(check: fn() -> std::time::Duration) {
+    let _ = UPDATES.set(check);
+}
+
+/// How long the update thread waits after a check that panicked, which failed that check alone.
+const AFTER_PANIC: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The daemon's update thread, which ends when this is dropped (the daemon ends).
+pub struct Updates {
+    _stop: crossbeam_channel::Sender<()>,
+}
+
+/// Starts the daemon's update thread when the program handed over a check ([`set_updates`]):
+/// it runs the check, then waits as long as the check said, or until the returned [`Updates`]
+/// is dropped. Each check and each wait is a span naming it. A check that panics fails only
+/// itself; the thread goes on after [`AFTER_PANIC`].
+pub fn watch_updates() -> std::io::Result<Option<Updates>> {
+    let Some(&check) = UPDATES.get() else { return Ok(None) };
+    let (stop, stopped) = crossbeam_channel::bounded::<()>(0);
+    std::thread::Builder::new()
+        .name("blaze-update-check".to_owned()) // alloc: once a daemon
+        .spawn(move || {
+            loop {
+                let wait = {
+                    let _span = tracing::info_span!("update check: reading latest.json").entered();
+                    std::panic::catch_unwind(check).unwrap_or(AFTER_PANIC)
+                };
+                let _span = tracing::info_span!(
+                    "update check: waiting for the next",
+                    secs = wait.as_secs()
+                )
+                .entered();
+                match stopped.recv_timeout(wait) {
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    // The daemon ended: its `Updates` was dropped.
+                    Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })?;
+    Ok(Some(Updates { _stop: stop }))
+}

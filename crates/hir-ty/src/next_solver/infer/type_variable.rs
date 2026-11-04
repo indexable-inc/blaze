@@ -302,10 +302,7 @@ impl<'db> TypeVariableTable<'_, 'db> {
 
     /// An always-inlined variant of `probe_with_root_vid`, for very hot call sites.
     #[inline(always)]
-    pub(crate) fn inlined_probe_with_vid(
-        &mut self,
-        vid: TyVid,
-    ) -> (TyVid, TypeVariableValue<'db>) {
+    pub(crate) fn inlined_probe_with_vid(&mut self, vid: TyVid) -> (TyVid, TypeVariableValue<'db>) {
         self.storage.eq_relations.inlined_probe_key_value(vid)
     }
 

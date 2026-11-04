@@ -191,7 +191,13 @@ mod tests {
 
     #[test]
     fn a_file_s_versions_are_the_ones_whole_lines_give() {
-        for file in [FILE, "", "\n", "\n\n{\"name\":\"a\",\"vers\":\"1.0.0\"}", "{\"name\":\"a\",\"vers\":\"1.0.0\"}\n"] {
+        for file in [
+            FILE,
+            "",
+            "\n",
+            "\n\n{\"name\":\"a\",\"vers\":\"1.0.0\"}",
+            "{\"name\":\"a\",\"vers\":\"1.0.0\"}\n",
+        ] {
             let new = Summaries::from_index_file(file.as_bytes().to_vec());
             assert_eq!(new.versions, old_from_index_file(file.as_bytes()), "{file:?}");
         }

@@ -56,7 +56,11 @@ pub enum Access {
     /// An atomic load, store, or read-modify-write (the read and the write of one RMW are one
     /// `read` then one `write` with this, with nothing between them). A failed compare-exchange
     /// is one `read` with its failure ordering and `cxchg_failed`, and no write.
-    Atomic { ord: AtomicOrd, rmw: bool, cxchg_failed: bool },
+    Atomic {
+        ord: AtomicOrd,
+        rmw: bool,
+        cxchg_failed: bool,
+    },
 }
 
 /// `core::sync::atomic::Ordering`.
@@ -163,8 +167,14 @@ pub trait Machine<'db> {
 
     /// A new allocation; returns its root provenance, which the evaluator puts on every
     /// pointer it makes to it itself (a local's place, a constant's address).
-    fn alloc(&mut self, addr: u64, size: u64, align: u64, kind: MemKind, zeroed: bool)
-    -> MResult<Self::Prov>;
+    fn alloc(
+        &mut self,
+        addr: u64,
+        size: u64,
+        align: u64,
+        kind: MemKind,
+        zeroed: bool,
+    ) -> MResult<Self::Prov>;
     fn free(
         &mut self,
         ptr: Ptr<Self::Prov>,
@@ -175,8 +185,13 @@ pub trait Machine<'db> {
     /// The root provenance of the allocation `addr` is in (for pointers inside a constant's
     /// memory the evaluator lays out itself).
     fn root(&mut self, addr: u64) -> Option<Self::Prov>;
-    fn read(&mut self, ptr: Ptr<Self::Prov>, size: u64, align: u64, access: Access)
-    -> MResult<Self::Shadow>;
+    fn read(
+        &mut self,
+        ptr: Ptr<Self::Prov>,
+        size: u64,
+        align: u64,
+        access: Access,
+    ) -> MResult<Self::Shadow>;
     fn write(
         &mut self,
         ptr: Ptr<Self::Prov>,
@@ -221,8 +236,12 @@ pub trait Machine<'db> {
     fn fence(&mut self, ord: AtomicOrd, compiler_only: bool) -> MResult<()>;
     /// `ptr_offset_from(a, b)` (`unsigned`: `ptr_offset_from_unsigned`): both in bounds of one
     /// allocation, as rustc's evaluation requires.
-    fn offset_from(&mut self, a: Ptr<Self::Prov>, b: Ptr<Self::Prov>, unsigned: bool)
-    -> MResult<()>;
+    fn offset_from(
+        &mut self,
+        a: Ptr<Self::Prov>,
+        b: Ptr<Self::Prov>,
+        unsigned: bool,
+    ) -> MResult<()>;
 
     /// After every typed copy into `place`: checks the value at `ty` and retags what it holds
     /// by `mode`. `bytes` are the value's bytes, already written.

@@ -19,11 +19,13 @@ use super::{args::Flags, say};
 /// holds the build to them.
 pub fn pick<'a>(artifacts: &'a [Artifact], flags: &Flags) -> Result<&'a Artifact, String> {
     let specific = !flags.bins.is_empty() || !flags.examples.is_empty();
-    let runnable =
-        |it: &&Artifact| !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example);
+    let runnable = |it: &&Artifact| {
+        !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example)
+    };
     let named = |it: &&Artifact| {
         let kind = it.target.kind;
-        let among = |names: &[Option<String>]| names.iter().flatten().any(|name| *name == it.target.name);
+        let among =
+            |names: &[Option<String>]| names.iter().flatten().any(|name| *name == it.target.name);
         // `--bin` without a name is cargo's to answer with the list; any bin is it here.
         let any = |names: &[Option<String>]| !names.is_empty() && names.iter().all(Option::is_none);
         let bins = any(&flags.bins) || among(&flags.bins);
@@ -34,7 +36,13 @@ pub fn pick<'a>(artifacts: &'a [Artifact], flags: &Flags) -> Result<&'a Artifact
     match bins.as_slice() {
         [] if !specific => Err("a bin target must be available for `cargo run`".to_owned()),
         [] => {
-            let names: Vec<String> = flags.bins.iter().chain(&flags.examples).flatten().map(|it| format!("`{it}`")).collect();
+            let names: Vec<String> = flags
+                .bins
+                .iter()
+                .chain(&flags.examples)
+                .flatten()
+                .map(|it| format!("`{it}`"))
+                .collect();
             Err(format!("the build has no program {} to run", names.join(" or ")))
         }
         [one] if one.executable.is_none() => {
@@ -65,7 +73,9 @@ pub fn pick<'a>(artifacts: &'a [Artifact], flags: &Flags) -> Result<&'a Artifact
 /// The executable as cargo runs it from `cwd`: below it, relative, and `./foo` for one in it.
 pub fn shown_exe(path: &Path, cwd: &Path) -> PathBuf {
     match path.strip_prefix(cwd) {
-        Ok(relative) if relative.file_name() == Some(relative.as_os_str()) => Path::new(".").join(relative),
+        Ok(relative) if relative.file_name() == Some(relative.as_os_str()) => {
+            Path::new(".").join(relative)
+        }
         Ok(relative) => relative.to_owned(),
         Err(_) => path.to_owned(),
     }
@@ -83,9 +93,16 @@ pub struct Exec {
 
 impl Exec {
     /// `executable` run by `artifact`'s runner when it has one.
-    pub fn of(artifact: &Artifact, executable: PathBuf, args: impl IntoIterator<Item = OsString>, cwd: PathBuf) -> Exec {
+    pub fn of(
+        artifact: &Artifact,
+        executable: PathBuf,
+        args: impl IntoIterator<Item = OsString>,
+        cwd: PathBuf,
+    ) -> Exec {
         let (program, mut before) = match artifact.runner.split_first() {
-            Some((runner, rest)) => (PathBuf::from(runner), rest.iter().map(OsString::from).collect::<Vec<_>>()),
+            Some((runner, rest)) => {
+                (PathBuf::from(runner), rest.iter().map(OsString::from).collect::<Vec<_>>())
+            }
             None => (executable.clone(), Vec::new()),
         };
         if !artifact.runner.is_empty() {
@@ -103,14 +120,18 @@ impl Exec {
     /// As cargo shows it under `verbose` `-v`s: with the variables it sets from `-vv`
     /// (`display_env_vars`, which `run` and `test` turn on under `extra_verbose`).
     pub fn shown_at(&self, verbose: u32) -> String {
-        let args: Vec<String> = self.args.iter().map(|it| it.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> =
+            self.args.iter().map(|it| it.to_string_lossy().into_owned()).collect();
         let env: &[(String, String)] = if verbose >= 2 { &self.env } else { &[] };
         say::command_line_with(env, &self.program.to_string_lossy(), &args)
     }
 
     pub fn command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
-        command.args(&self.args).envs(self.env.iter().map(|(name, value)| (name, value))).current_dir(&self.cwd);
+        command
+            .args(&self.args)
+            .envs(self.env.iter().map(|(name, value)| (name, value)))
+            .current_dir(&self.cwd);
         command
     }
 }
@@ -118,7 +139,10 @@ impl Exec {
 /// What `run` runs: the program, from the command's directory, with the arguments after it.
 pub fn planned(artifact: &Artifact, program_args: &[OsString], cwd: &Path) -> Result<Exec, String> {
     let Some(executable) = artifact.executable.as_deref() else {
-        return Err(format!("example target `{}` is a library and cannot be executed", artifact.target.name));
+        return Err(format!(
+            "example target `{}` is a library and cannot be executed",
+            artifact.target.name
+        ));
     };
     let shown = shown_exe(Path::new(executable), cwd);
     Ok(Exec::of(artifact, shown, program_args.iter().cloned(), cwd.to_owned()))
@@ -150,7 +174,8 @@ pub fn launch(artifact: &Artifact, exec: &mut Exec) -> Result<(), String> {
 /// The daemon's answer to starting `executable` as this process (`Request::Launch`): the start
 /// hook's variables when it runs on the daemon's code memory, `None` when it runs its file.
 fn launched(executable: &str) -> Result<Option<Vec<(String, String)>>, String> {
-    let request = blaze_api::Request::Launch { program: executable.to_owned(), pid: std::process::id() };
+    let request =
+        blaze_api::Request::Launch { program: executable.to_owned(), pid: std::process::id() };
     let mut launched = None;
     super::observe::ask(request, super::daemon::Start::Never, |response| {
         if let blaze_api::ResponseRef::Launched { live, env } = response {
@@ -183,7 +208,8 @@ pub fn through_trampoline(artifact: &Artifact, exec: Exec) -> Result<Exec, Strin
     if !artifact.runner.is_empty() {
         return Ok(exec);
     }
-    let blaze = std::env::current_exe().map_err(|why| format!("starting {executable}: this blaze's own path: {why}"))?;
+    let blaze = std::env::current_exe()
+        .map_err(|why| format!("starting {executable}: this blaze's own path: {why}"))?;
     // alloc: once per test executable run, its command line
     let mut args = Vec::with_capacity(exec.args.len() + 2);
     args.push(OsString::from(TRAMPOLINE));
@@ -198,11 +224,16 @@ pub fn through_trampoline(artifact: &Artifact, exec: Exec) -> Result<Exec, Strin
 pub fn trampoline(words: impl Iterator<Item = OsString>, color: bool) -> i32 {
     let mut words = words;
     let Some(program) = words.next() else {
-        let _ = std::io::stderr().write_all(say::error(&format!("blaze {TRAMPOLINE}: no program to start"), color).as_bytes());
+        let _ = std::io::stderr().write_all(
+            say::error(&format!("blaze {TRAMPOLINE}: no program to start"), color).as_bytes(),
+        );
         return Exit::Usage.code();
     };
     let Some(executable) = program.to_str() else {
-        let what = format!("blaze {TRAMPOLINE}: the program's path {} is not UTF-8", program.to_string_lossy());
+        let what = format!(
+            "blaze {TRAMPOLINE}: the program's path {} is not UTF-8",
+            program.to_string_lossy()
+        );
         let _ = std::io::stderr().write_all(say::error(&what, color).as_bytes());
         return Exit::Failed.code();
     };
@@ -214,7 +245,12 @@ pub fn trampoline(words: impl Iterator<Item = OsString>, color: bool) -> i32 {
         }
     };
     // alloc: once, the program's command
-    let program = Exec { program: PathBuf::from(&program), args: words.collect(), env, cwd: PathBuf::from(".") };
+    let program = Exec {
+        program: PathBuf::from(&program),
+        args: words.collect(),
+        env,
+        cwd: PathBuf::from("."),
+    };
     exec(&program, &mut std::io::stderr(), Told { color, quiet: false, verbose: 0 })
 }
 
@@ -245,7 +281,11 @@ pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
                 say::Ended::Code(0) => 0,
                 say::Ended::Code(code) if told.quiet => code,
                 ended => {
-                    let what = format!("process didn't exit successfully: {} ({})", exec.shown_at(told.verbose), say::ended(ended));
+                    let what = format!(
+                        "process didn't exit successfully: {} ({})",
+                        exec.shown_at(told.verbose),
+                        say::ended(ended)
+                    );
                     let _ = err.write_all(say::error(&what, told.color).as_bytes());
                     match ended {
                         say::Ended::Code(code) => code,
@@ -261,7 +301,8 @@ pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
 /// `-q` too.
 // dyn: the CLI's output writer, written once per program that could not start.
 fn never_executed(exec: &Exec, error: &std::io::Error, err: &mut dyn Write, told: Told) -> i32 {
-    let what = format!("could not execute process {} (never executed)", exec.shown_at(told.verbose));
+    let what =
+        format!("could not execute process {} (never executed)", exec.shown_at(told.verbose));
     let _ = err.write_all(caused(&what, &[error.to_string()], told.color).as_bytes());
     Exit::Failed.code()
 }

@@ -267,9 +267,8 @@ impl CfgInfo {
             }
         }
 
-        let reachable_without_unwind: HashSet<BlockId> = Dfs::new(&cfg_without_unwind, start_block)
-            .iter(&cfg_without_unwind)
-            .collect();
+        let reachable_without_unwind: HashSet<BlockId> =
+            Dfs::new(&cfg_without_unwind, start_block).iter(&cfg_without_unwind).collect();
 
         // Finish filling in information.
         for block_id in DfsPostOrder::new(&fwd_cfg, start_block).iter(&fwd_cfg) {
@@ -370,14 +369,8 @@ impl CfgInfo {
             block_data[block_id].within_loops = within_loops;
         }
 
-        let mut cfg = CfgInfo {
-            cfg,
-            fwd_cfg,
-            loop_entries,
-            switch_blocks,
-            dominator_tree,
-            block_data,
-        };
+        let mut cfg =
+            CfgInfo { cfg, fwd_cfg, loop_entries, switch_blocks, dominator_tree, block_data };
 
         // Pick an exit block for each loop, if we find one.
         ExitInfo::compute_loop_exits(ctx, &mut cfg);
@@ -405,9 +398,7 @@ impl CfgInfo {
 
     /// Check if the node is within the given loop.
     fn is_within_loop(&self, loop_header: src::BlockId, block_id: src::BlockId) -> bool {
-        self.block_data[block_id]
-            .within_loops
-            .contains(&loop_header)
+        self.block_data[block_id].within_loops.contains(&loop_header)
     }
 
     /// Check if all paths from `src` to nodes in `target_set` go through `through_node`. If `src`
@@ -431,8 +422,7 @@ impl BlockData {
         self.shortest_paths.iter().map(|(bid, d)| (*bid, *d))
     }
     fn shortest_paths_excluding_self(&self) -> impl Iterator<Item = (BlockId, usize)> {
-        self.shortest_paths_including_self()
-            .filter(move |&(bid, _)| bid != self.id)
+        self.shortest_paths_including_self().filter(move |&(bid, _)| bid != self.id)
     }
     fn reachable_including_self(&self) -> impl Iterator<Item = BlockId> {
         self.shortest_paths_including_self().map(|(bid, _)| bid)
@@ -825,12 +815,7 @@ impl ExitInfo {
 /// Iter over the last non-switch statements that may be executed on any branch of this block.
 /// Skips over `Nop`s.
 fn iter_tail_statements(block: &mut tgt::Block, f: &mut impl FnMut(&mut tgt::Statement)) {
-    let Some(st) = block
-        .statements
-        .iter_mut()
-        .rev()
-        .find(|st| !st.kind.is_nop())
-    else {
+    let Some(st) = block.statements.iter_mut().rev().find(|st| !st.kind.is_nop()) else {
         return;
     };
     if let tgt::StatementKind::Switch { branches, .. } = &mut st.kind {
@@ -968,9 +953,9 @@ impl<'a> ReconstructCtx<'a> {
                     {
                         mk_block(tgt::StatementKind::Nop)
                     }
-                    SpecialJumpKind::LoopContinue(depth) => mk_block(tgt::StatementKind::Continue(
-                        self.break_context_depth - depth,
-                    )),
+                    SpecialJumpKind::LoopContinue(depth) => {
+                        mk_block(tgt::StatementKind::Continue(self.break_context_depth - depth))
+                    }
                     SpecialJumpKind::ForwardBreak(depth) | SpecialJumpKind::LoopBreak(depth) => {
                         mk_block(tgt::StatementKind::Break(self.break_context_depth - depth))
                     }
@@ -992,10 +977,7 @@ impl<'a> ReconstructCtx<'a> {
                 let on_unwind = self.translate_block(*on_unwind);
                 tgt::Statement::new(
                     src_span,
-                    tgt::StatementKind::Panic {
-                        name: name.clone(),
-                        on_unwind,
-                    },
+                    tgt::StatementKind::Panic { name: name.clone(), on_unwind },
                 )
                 .into_block()
             }
@@ -1011,32 +993,17 @@ impl<'a> ReconstructCtx<'a> {
             src::TerminatorKind::UnwindResume => {
                 tgt::Statement::new(src_span, tgt::StatementKind::UnwindResume).into_block()
             }
-            src::TerminatorKind::Call {
-                call,
-                dest,
-                target,
-                on_unwind,
-            } => {
+            src::TerminatorKind::Call { call, dest, target, on_unwind } => {
                 let on_unwind = self.translate_block(*on_unwind);
                 let st = tgt::Statement::new(
                     src_span,
-                    tgt::StatementKind::Call {
-                        call: call.clone(),
-                        dest: dest.clone(),
-                        on_unwind,
-                    },
+                    tgt::StatementKind::Call { call: call.clone(), dest: dest.clone(), on_unwind },
                 );
                 let mut block = self.translate_jump(terminator.span, *target);
                 block.statements.insert(0, st);
                 block
             }
-            src::TerminatorKind::Drop {
-                kind,
-                place,
-                fn_ptr,
-                target,
-                on_unwind,
-            } => {
+            src::TerminatorKind::Drop { kind, place, fn_ptr, target, on_unwind } => {
                 let on_unwind = self.translate_block(*on_unwind);
                 let st = tgt::Statement::new(
                     src_span,
@@ -1051,28 +1018,17 @@ impl<'a> ReconstructCtx<'a> {
                 block.statements.insert(0, st);
                 block
             }
-            src::TerminatorKind::DropEmptyBox {
-                place,
-                target,
-                on_unwind,
-            } => {
+            src::TerminatorKind::DropEmptyBox { place, target, on_unwind } => {
                 let on_unwind = self.translate_block(*on_unwind);
                 let st = tgt::Statement::new(
                     src_span,
-                    tgt::StatementKind::DropEmptyBox {
-                        place: place.clone(),
-                        on_unwind,
-                    },
+                    tgt::StatementKind::DropEmptyBox { place: place.clone(), on_unwind },
                 );
                 let mut block = self.translate_jump(terminator.span, *target);
                 block.statements.insert(0, st);
                 block
             }
-            src::TerminatorKind::Assert {
-                assert,
-                target,
-                on_unwind,
-            } => {
+            src::TerminatorKind::Assert { assert, target, on_unwind } => {
                 let on_unwind = self.translate_block(*on_unwind);
                 let st = tgt::StatementKind::Assert {
                     assert: assert.clone(),
@@ -1082,12 +1038,7 @@ impl<'a> ReconstructCtx<'a> {
                 let target = self.translate_jump(terminator.span, *target);
                 tgt::Statement::new(src_span, st).into_block().merge(target)
             }
-            src::TerminatorKind::InlineAsm {
-                asm,
-                fallthrough,
-                labels,
-                on_unwind,
-            } => {
+            src::TerminatorKind::InlineAsm { asm, fallthrough, labels, on_unwind } => {
                 let fallthrough =
                     fallthrough.map(|target| self.translate_jump(terminator.span, target));
                 let labels = labels.map_ref(|target| self.translate_jump(terminator.span, *target));
@@ -1120,10 +1071,7 @@ impl<'a> ReconstructCtx<'a> {
                 // Return
                 let span = combine_span_iter(branches.iter().map(|branch| &branch.span));
                 let span = combine_span(&src_span, &span);
-                let st = tgt::StatementKind::Switch {
-                    data: data.clone(),
-                    branches,
-                };
+                let st = tgt::StatementKind::Switch { data: data.clone(), branches };
                 tgt::Statement::new(span, st).into_block()
             }
         }
@@ -1133,11 +1081,8 @@ impl<'a> ReconstructCtx<'a> {
     fn translate_block_itself(&mut self, block_id: BlockId) -> tgt::Block {
         let block = &self.body.body[block_id];
         // Translate the statements inside the block
-        let statements = block
-            .statements
-            .iter()
-            .map(|st| self.translate_statement(st))
-            .collect_vec();
+        let statements =
+            block.statements.iter().map(|st| self.translate_statement(st)).collect_vec();
         // Translate the terminator.
         let terminator = self.translate_terminator(&block.terminator);
         // Prepend the statements to the terminator.
@@ -1201,8 +1146,7 @@ impl<'a> ReconstructCtx<'a> {
         {
             // Move some code that would be inside one or several switch branches to be after the
             // switch intead.
-            self.special_jump_stack
-                .push(SpecialJump::new(bid, SpecialJumpKind::NextBlock));
+            self.special_jump_stack.push(SpecialJump::new(bid, SpecialJumpKind::NextBlock));
         }
 
         // Translate this block. Any jumps to a loop header or a merge node will be replaced with
@@ -1221,9 +1165,7 @@ impl<'a> ReconstructCtx<'a> {
                         // behavior at the end of a loop block is `continue`. Not needed for
                         // `Duplicate` mode because we use explicit `continue`s there. TODO: clean
                         // that up.
-                        block
-                            .statements
-                            .push(new_statement(tgt::StatementKind::Continue(0)));
+                        block.statements.push(new_statement(tgt::StatementKind::Continue(0)));
                     }
                     block = new_statement(tgt::StatementKind::Loop(block)).into_block();
                 }
@@ -1236,9 +1178,7 @@ impl<'a> ReconstructCtx<'a> {
                         }
                     });
                     // We add a `loop { ...; break }` so that we can use `break` to jump forward.
-                    block
-                        .statements
-                        .push(new_statement(tgt::StatementKind::Break(0)));
+                    block.statements.push(new_statement(tgt::StatementKind::Break(0)));
                     block = new_statement(tgt::StatementKind::Loop(block)).into_block();
                     // We must translate the merge nodes after the block used for forward jumps to
                     // them.
@@ -1305,18 +1245,13 @@ fn remove_useless_jump_blocks(body: &mut tgt::ExprBody) {
                     let counts = &self.counts[&st.id];
                     let remove = counts.continue_count == 0
                         && counts.break_count == 1
-                        && matches!(
-                            block.statements.last().unwrap().kind,
-                            StatementKind::Break(0)
-                        );
+                        && matches!(block.statements.last().unwrap().kind, StatementKind::Break(0));
                     self.loop_stack.push(!remove);
                 }
                 self.visit(&mut st)?;
                 if st.kind.is_loop() && !self.loop_stack.pop().unwrap() {
                     // Remove the loop.
-                    let StatementKind::Loop(mut inner_block) = st.kind else {
-                        unreachable!()
-                    };
+                    let StatementKind::Loop(mut inner_block) = st.kind else { unreachable!() };
                     inner_block.statements.last_mut().unwrap().kind = StatementKind::Nop;
                     block.statements.extend(inner_block.statements);
                 } else {
@@ -1348,10 +1283,7 @@ fn remove_useless_jump_blocks(body: &mut tgt::ExprBody) {
 
     let mut v = CountJumpsVisitor::default();
     body.body.drive_body_mut(&mut v);
-    let mut v = RemoveUselessJumpsVisitor {
-        counts: v.counts,
-        loop_stack: Default::default(),
-    };
+    let mut v = RemoveUselessJumpsVisitor { counts: v.counts, loop_stack: Default::default() };
     body.body.drive_body_mut(&mut v);
 }
 
@@ -1363,10 +1295,7 @@ fn translate_body(ctx: &mut TransformCtx, body: &mut Body) {
     trace!("About to translate to ullbc: {:?}", src_body.span);
     // Report the time spent per body size, since this pass is superlinear in the number of blocks.
     let _guard = crate::timing::scope_lazy("ullbc_to_llbc-body", || {
-        format!(
-            "{:05} blocks or less",
-            src_body.body.len().next_power_of_two()
-        )
+        format!("{:05} blocks or less", src_body.body.len().next_power_of_two())
     });
 
     // Calculate info about the graph and heuristically determine loop and switch exit blocks.
@@ -1375,11 +1304,7 @@ fn translate_body(ctx: &mut TransformCtx, body: &mut Body) {
         Ok(ctx) => ctx,
         Err(Irreducible(bid)) => {
             let span = src_body.body[bid].terminator.span;
-            register_error!(
-                ctx,
-                span,
-                "the control-flow graph of this function is not reducible"
-            );
+            register_error!(ctx, span, "the control-flow graph of this function is not reducible");
             panic!("can't reconstruct irreducible control-flow")
         }
     };

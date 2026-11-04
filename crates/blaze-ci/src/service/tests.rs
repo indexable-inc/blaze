@@ -150,7 +150,10 @@ fn error(message: &str, file: &str) -> Response {
         }],
         children: Vec::new(),
         facts: vec![FactRead {
-            key: blaze_query::QueryKey { kind: blaze_query::QueryKind(3), input: ContentId([4; 32]) },
+            key: blaze_query::QueryKey {
+                kind: blaze_query::QueryKind(3),
+                input: ContentId([4; 32]),
+            },
             what: "the signature of `parser::Token::new`".to_owned(),
         }],
         rendered: String::new(),
@@ -191,7 +194,10 @@ fn a_push_end_to_end() {
     let out = sim.step(Input::CheckedOut { job: started.job, result: Ok(root("c1")) });
     assert!(out.contains(&Output::Save), "no save in {out:?}");
     let state = sim.service.state();
-    assert_eq!(state.checkouts["branch/main"].checkout, Checkout { commit: "c1".to_owned(), root: root("c1") });
+    assert_eq!(
+        state.checkouts["branch/main"].checkout,
+        Checkout { commit: "c1".to_owned(), root: root("c1") }
+    );
     let sent = sends(&out);
     assert_eq!(sent.len(), 2);
     let view = ViewRef::Root(View { root: root("c1") });
@@ -223,13 +229,22 @@ fn a_push_end_to_end() {
     assert_eq!(sim.status(check_run), CheckStatus::Success);
     assert!(sim.posted[&check_run].summary.starts_with("0 errors, 1 warning"));
 
-    sim.step(Input::Response { job, run: test_run, response: test_result("a", TestOutcome::Passed, "") });
-    sim.step(Input::Response { job, run: test_run, response: test_result("b", TestOutcome::Unreached, "") });
+    sim.step(Input::Response {
+        job,
+        run: test_run,
+        response: test_result("a", TestOutcome::Passed, ""),
+    });
+    sim.step(Input::Response {
+        job,
+        run: test_run,
+        response: test_result("b", TestOutcome::Unreached, ""),
+    });
     let out = sim.step(Input::Ended { job, run: test_run, ok: true });
     assert_eq!(sim.status(test_run), CheckStatus::Success);
     assert!(sim.posted[&test_run].summary.contains("1 passed, 0 failed, 0 ignored, 1 not reached"));
     assert!(out.contains(&Output::EndJob { job }));
-    let Some(Output::Snapshot { name }) = out.iter().find(|it| matches!(it, Output::Snapshot { .. }))
+    let Some(Output::Snapshot { name }) =
+        out.iter().find(|it| matches!(it, Output::Snapshot { .. }))
     else {
         panic!("a green run of the default branch snapshots: {out:?}")
     };
@@ -255,7 +270,10 @@ fn a_push_end_to_end() {
         ended.extend(sim.step(Input::Ended { job, run, ok: true }));
     }
     assert!(ended.iter().any(|it| matches!(it, Output::EndJob { .. })));
-    assert!(!ended.iter().any(|it| matches!(it, Output::Snapshot { .. })), "the last is a minute old");
+    assert!(
+        !ended.iter().any(|it| matches!(it, Output::Snapshot { .. })),
+        "the last is a minute old"
+    );
 }
 
 #[test]
@@ -267,7 +285,11 @@ fn a_failed_request_lists_errors_with_their_place_facts_and_test_output() {
     let sent = sends(&sim.step(Input::CheckedOut { job: started.job, result: Ok(root("f1")) }));
     let (job, check_run, _) = sent[0];
     let (_, test_run, _) = sent[1];
-    sim.step(Input::Response { job, run: check_run, response: error("mismatched types", "src/lib.rs") });
+    sim.step(Input::Response {
+        job,
+        run: check_run,
+        response: error("mismatched types", "src/lib.rs"),
+    });
     sim.step(Input::Ended { job, run: check_run, ok: false });
     let summary = &sim.posted[&check_run].summary;
     assert_eq!(sim.status(check_run), CheckStatus::Failure);
@@ -277,11 +299,18 @@ fn a_failed_request_lists_errors_with_their_place_facts_and_test_output() {
     assert!(summary.contains("read: the signature of `parser::Token::new`"), "{summary}");
 
     let output: String = (0..100).map(|n| format!("line {n}\n")).collect();
-    sim.step(Input::Response { job, run: test_run, response: test_result("t", TestOutcome::Failed, &output) });
     sim.step(Input::Response {
         job,
         run: test_run,
-        response: Response::Error(ApiError::new("the test binary crashed", Some("blaze_ci".to_owned()))),
+        response: test_result("t", TestOutcome::Failed, &output),
+    });
+    sim.step(Input::Response {
+        job,
+        run: test_run,
+        response: Response::Error(ApiError::new(
+            "the test binary crashed",
+            Some("blaze_ci".to_owned()),
+        )),
     });
     let out = sim.step(Input::Ended { job, run: test_run, ok: false });
     let summary = &sim.posted[&test_run].summary;
@@ -300,7 +329,9 @@ fn a_pull_request_diffs_from_its_bases_checkout() {
     let mut sim = Sim::new(0);
     let out = sim.event(Event::Push { branch: "main".to_owned(), commit: "c1".to_owned() });
     let started = checkout(&out).unwrap();
-    for (job, run, _) in sends(&sim.step(Input::CheckedOut { job: started.job, result: Ok(root("c1")) })) {
+    for (job, run, _) in
+        sends(&sim.step(Input::CheckedOut { job: started.job, result: Ok(root("c1")) }))
+    {
         sim.step(Input::Ended { job, run, ok: true });
     }
 
@@ -371,7 +402,11 @@ fn a_second_push_to_a_pull_request_cancels_the_first() {
     // The cancelled requests end; nothing more is posted for them.
     let mut out = Vec::new();
     for (job, run, _) in &sent {
-        out.extend(sim.step(Input::Response { job: *job, run: *run, response: error("late", "a.rs") }));
+        out.extend(sim.step(Input::Response {
+            job: *job,
+            run: *run,
+            response: error("late", "a.rs"),
+        }));
         out.extend(sim.step(Input::Ended { job: *job, run: *run, ok: false }));
     }
     assert!(!out.iter().any(|it| matches!(it, Output::Update { .. })));
@@ -391,7 +426,10 @@ fn a_push_during_a_checkout_waits_for_it_and_diffs_from_it() {
     assert!(!out.contains(&Output::Cancel { job: first.job }), "no request is running yet");
 
     let out = sim.step(Input::CheckedOut { job: first.job, result: Ok(root("c1")) });
-    assert!(sends(&out).iter().all(|(job, _, _)| *job != first.job), "the replaced job sends nothing");
+    assert!(
+        sends(&out).iter().all(|(job, _, _)| *job != first.job),
+        "the replaced job sends nothing"
+    );
     assert!(out.contains(&Output::EndJob { job: first.job }));
     let second = checkout(&out).unwrap();
     assert_eq!(second.commit, "c2");
@@ -425,7 +463,10 @@ fn three_tags_the_latest_wins() {
     assert!(!out.iter().any(|it| matches!(it, Output::Save)), "a tag's root is the job's own");
     let out = sim.step(Input::Ended { job: sent[0].0, run: sent[0].1, ok: true });
     assert!(out.contains(&Output::Unpin { root: root("v1") }));
-    assert!(out.iter().any(|it| matches!(it, Output::Snapshot { .. })), "a green release snapshots");
+    assert!(
+        out.iter().any(|it| matches!(it, Output::Snapshot { .. })),
+        "a green release snapshots"
+    );
     let v3_started = checkout(&out).unwrap();
     assert_eq!(v3_started.commit, "commit-v3");
     assert_eq!(sim.status(v3[0]), CheckStatus::Queued);
@@ -451,7 +492,10 @@ fn an_oracle_sampled_view_is_verified_and_names_the_fact_that_missed() {
     else {
         panic!("no verify in {sent:?}")
     };
-    let key = |kind| blaze_query::QueryKey { kind: blaze_query::QueryKind(kind), input: ContentId([kind as u8; 32]) };
+    let key = |kind| blaze_query::QueryKey {
+        kind: blaze_query::QueryKind(kind),
+        input: ContentId([kind as u8; 32]),
+    };
     let mismatch = Mismatch {
         query: key(5),
         incremental: Fingerprint(1),
@@ -486,8 +530,11 @@ fn an_oracle_sampled_view_is_verified_and_names_the_fact_that_missed() {
     let out = sim.event(Event::Push { branch: "feature".to_owned(), commit: "s3".to_owned() });
     let started = checkout(&out).unwrap();
     let sent = sends(&sim.step(Input::CheckedOut { job: started.job, result: Ok(root("s3")) }));
-    let (job, run, _) =
-        sent.iter().find(|(_, _, request)| matches!(request, Request::Verify { .. })).cloned().unwrap();
+    let (job, run, _) = sent
+        .iter()
+        .find(|(_, _, request)| matches!(request, Request::Verify { .. }))
+        .cloned()
+        .unwrap();
     sim.step(Input::Ended { job, run, ok: true });
     assert_eq!(sim.status(run), CheckStatus::Failure);
 }
@@ -514,15 +561,19 @@ fn a_failed_checkout_posts_failure_naming_it() {
 #[test]
 fn updates_before_github_answers_are_posted_once_it_does() {
     let mut sim = Sim::new(0);
-    let out = sim.step(Input::Event(Event::Push { branch: "b".to_owned(), commit: "c".to_owned() }));
+    let out =
+        sim.step(Input::Event(Event::Push { branch: "b".to_owned(), commit: "c".to_owned() }));
     let runs = creates(&out);
     let started = checkout(&out).unwrap();
     let out = sim.step(Input::CheckedOut { job: started.job, result: Err("no".to_owned()) });
     assert!(!out.iter().any(|it| matches!(it, Output::Update { .. })));
     assert_eq!(sim.service.jobs(), 0);
     let out = sim.step(Input::Created { run: runs[0].0, result: Ok(github_id(runs[0].0)) });
-    assert!(matches!(&out[..], [Output::Update { check, .. }] if check.status == CheckStatus::Failure));
-    let out = sim.step(Input::Created { run: runs[1].0, result: Err("502 from GitHub".to_owned()) });
+    assert!(
+        matches!(&out[..], [Output::Update { check, .. }] if check.status == CheckStatus::Failure)
+    );
+    let out =
+        sim.step(Input::Created { run: runs[1].0, result: Err("502 from GitHub".to_owned()) });
     assert!(matches!(&out[..], [Output::Log(line)] if line.contains("502")));
     assert!(sim.service.runs.is_empty());
 }
@@ -571,7 +622,9 @@ fn held_checkouts_are_bounded() {
         sim.now += 1;
         let out = sim.event(Event::Push { branch: format!("b{n}"), commit: format!("c{n}") });
         let started = checkout(&out).unwrap();
-        for (job, run, _) in sends(&sim.step(Input::CheckedOut { job: started.job, result: Ok(root(&started.commit)) })) {
+        for (job, run, _) in sends(
+            &sim.step(Input::CheckedOut { job: started.job, result: Ok(root(&started.commit)) }),
+        ) {
             sim.step(Input::Ended { job, run, ok: true });
         }
     }
@@ -618,11 +671,16 @@ impl World {
                     };
                     self.queue(vec![Input::Created { run, result }]);
                 }
-                Output::Update { check, .. } => assert!(self.named.contains(&check.commit), "{check:?}"),
+                Output::Update { check, .. } => {
+                    assert!(self.named.contains(&check.commit), "{check:?}")
+                }
                 Output::Checkout { job, commit, .. } => {
                     assert!(self.named.contains(&commit));
-                    let result =
-                        if self.rng.index(8) == 0 { Err("git failed".to_owned()) } else { Ok(root(&commit)) };
+                    let result = if self.rng.index(8) == 0 {
+                        Err("git failed".to_owned())
+                    } else {
+                        Ok(root(&commit))
+                    };
                     self.queue(vec![Input::CheckedOut { job, result }]);
                 }
                 Output::Send { job, run, .. } => {
@@ -640,8 +698,12 @@ impl World {
                     self.of_run.insert(run, key);
                 }
                 Output::Cancel { job } => {
-                    let runs: Vec<RunId> =
-                        sim.job_of.iter().filter(|(_, it)| **it == job).map(|(run, _)| *run).collect();
+                    let runs: Vec<RunId> = sim
+                        .job_of
+                        .iter()
+                        .filter(|(_, it)| **it == job)
+                        .map(|(run, _)| *run)
+                        .collect();
                     for run in runs {
                         if let Some(key) = self.of_run.get(&run)
                             && let Some(queue) = self.queues.get_mut(key)
@@ -659,7 +721,9 @@ impl World {
                                 || self.never_created.contains(run)
                                 || matches!(
                                     completed,
-                                    CheckStatus::Success | CheckStatus::Failure | CheckStatus::Cancelled
+                                    CheckStatus::Success
+                                        | CheckStatus::Failure
+                                        | CheckStatus::Cancelled
                                 ),
                             "{run:?} of ended {job:?} is {completed:?}"
                         );
@@ -764,12 +828,21 @@ fn random_orders_complete_every_check_run_and_post_only_to_named_commits() {
                 continue;
             }
             assert!(
-                matches!(check.status, CheckStatus::Success | CheckStatus::Failure | CheckStatus::Cancelled),
+                matches!(
+                    check.status,
+                    CheckStatus::Success | CheckStatus::Failure | CheckStatus::Cancelled
+                ),
                 "seed {seed}: {run:?} left {check:?}"
             );
         }
         for (root, count) in &world.pins {
-            let held = sim.service.state().checkouts.values().filter(|it| it.checkout.root == *root).count();
+            let held = sim
+                .service
+                .state()
+                .checkouts
+                .values()
+                .filter(|it| it.checkout.root == *root)
+                .count();
             assert_eq!(*count, held as i64, "seed {seed}: {root:x}");
         }
         assert_eq!(sim.service.train, Train::default(), "seed {seed}");
@@ -826,7 +899,9 @@ fn the_tail_of_a_test_output_is_the_tail_of_the_whole_output() {
         }
         assert_eq!(tail(&output), tail_of_whole(&output), "round {round}: {output:?}");
     }
-    let long: Vec<u8> = (0..10_000).flat_map(|line| format!("line {line} of a long output\n").into_bytes()).collect();
+    let long: Vec<u8> = (0..10_000)
+        .flat_map(|line| format!("line {line} of a long output\n").into_bytes())
+        .collect();
     assert_eq!(tail(&long), tail_of_whole(&long));
     assert_eq!(tail(b""), tail_of_whole(b""));
     let wide: Vec<u8> = "é```".repeat(3000).into_bytes();
@@ -917,11 +992,13 @@ impl OldReport {
             plural(self.warnings)
         );
         match kind {
-            CheckKind::Test => text += &format!(
-                "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
+            CheckKind::Test => {
+                text += &format!(
+                    "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
                  last results stand)",
-                self.passed, self.failed, self.ignored, self.unreached
-            ),
+                    self.passed, self.failed, self.ignored, self.unreached
+                )
+            }
             CheckKind::Build => text += &format!("; {} artifacts built", self.artifacts),
             CheckKind::Check => {}
         }
@@ -968,7 +1045,8 @@ impl OldReport {
 #[test]
 fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
     let mut rng = SplitMix64::new(0x5eed_0f_5e1f);
-    let outputs = ["", "ok\n", "a```b\nline two\r\n\n", "é\u{ff}\n", "panicked at src/lib.rs:3:5\n"];
+    let outputs =
+        ["", "ok\n", "a```b\nline two\r\n\n", "é\u{ff}\n", "panicked at src/lib.rs:3:5\n"];
     for round in 0..300 {
         let (mut new, mut old) = (Report::default(), OldReport::default());
         let count = if round % 10 == 0 { 2 * MOST_LISTED + 20 } else { rng.index(30) };
@@ -987,8 +1065,12 @@ fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
                     explanation: None,
                 }),
                 3 | 4 => {
-                    let outcome = [TestOutcome::Passed, TestOutcome::Failed, TestOutcome::Ignored, TestOutcome::Unreached]
-                        [rng.index(4)];
+                    let outcome = [
+                        TestOutcome::Passed,
+                        TestOutcome::Failed,
+                        TestOutcome::Ignored,
+                        TestOutcome::Unreached,
+                    ][rng.index(4)];
                     let output = outputs[rng.index(outputs.len())].repeat(1 + rng.index(40));
                     Response::TestResult(TestResult {
                         binary: "blaze_ci".to_owned(),
@@ -1001,10 +1083,15 @@ fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
                         executable: 0,
                     })
                 }
-                5 => Response::Error(ApiError::new(format!("lost {at}"), (at % 2 == 0).then(|| "a.sock".to_owned()))),
+                5 => Response::Error(ApiError::new(
+                    format!("lost {at}"),
+                    (at % 2 == 0).then(|| "a.sock".to_owned()),
+                )),
                 6 => Response::Done { ok: at % 2 == 0 },
                 7 => Response::Snapshotted { heads: vec![("é".repeat(150), ContentId([5; 32]))] },
-                _ => Response::Built { members: 1, profile: "dev".to_owned(), artifacts: Vec::new() },
+                _ => {
+                    Response::Built { members: 1, profile: "dev".to_owned(), artifacts: Vec::new() }
+                }
             };
             old.add(&response);
             new.add(response);
@@ -1019,7 +1106,12 @@ fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
 /// A pull request's job with its checkout done and its two requests sent, each run with its id
 /// from GitHub.
 fn running_pull(sim: &mut Sim) -> Vec<(JobId, RunId, Request)> {
-    let event = Event::PullRequest { number: 7, head: "h1".repeat(20), base: "b1".repeat(20), from_fork: false };
+    let event = Event::PullRequest {
+        number: 7,
+        head: "h1".repeat(20),
+        base: "b1".repeat(20),
+        from_fork: false,
+    };
     let started = checkout(&sim.event(event)).unwrap();
     sends(&sim.step(Input::CheckedOut { job: started.job, result: Ok(root("h1")) }))
 }
@@ -1058,7 +1150,8 @@ fn a_warm_service_step_allocates_only_what_it_posts() {
     let input = Input::Response { job, run: check_run, response: warning };
     blaze_alloc_count::assert_at_most(0, "a warning", || step(&mut sim.service, input, &mut out));
     for at in 0..MOST_LISTED + 50 {
-        let input = Input::Response { job, run: check_run, response: error(&format!("e{at}"), "a.rs") };
+        let input =
+            Input::Response { job, run: check_run, response: error(&format!("e{at}"), "a.rs") };
         let budget = u64::from(at < MOST_LISTED);
         blaze_alloc_count::assert_at_most(
             budget,
@@ -1075,11 +1168,18 @@ fn a_warm_service_step_allocates_only_what_it_posts() {
          commit and summary)",
         || step(&mut sim.service, ended, &mut out),
     );
-    assert!(matches!(&out[..], [Output::Update { check, .. }] if check.status == CheckStatus::Success), "{out:?}");
+    assert!(
+        matches!(&out[..], [Output::Update { check, .. }] if check.status == CheckStatus::Success),
+        "{out:?}"
+    );
 
     let ignored = Input::Ended { job, run: test_run, ok: true };
-    blaze_alloc_count::assert_at_most(0, "an end already ended", || step(&mut sim.service, ignored, &mut out));
+    blaze_alloc_count::assert_at_most(0, "an end already ended", || {
+        step(&mut sim.service, ignored, &mut out)
+    });
     let late = Input::Created { run: test_run, result: Ok(github_id(test_run)) };
-    blaze_alloc_count::assert_at_most(0, "a creation already answered", || step(&mut sim.service, late, &mut out));
+    blaze_alloc_count::assert_at_most(0, "a creation already answered", || {
+        step(&mut sim.service, late, &mut out)
+    });
     assert!(out.is_empty(), "{out:?}");
 }

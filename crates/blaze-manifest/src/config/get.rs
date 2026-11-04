@@ -10,8 +10,8 @@ use anyhow::{anyhow, bail};
 use serde_json::json;
 
 use super::{Config, ConfigKey, ConfigValue as CV, Definition};
-use crate::files::Disk;
 use crate::diagnostic::report;
+use crate::files::Disk;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigFormat {
@@ -241,7 +241,11 @@ pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Outpu
     Ok(out)
 }
 
-fn maybe_env<'a>(config: &'a Config<Disk>, key: &ConfigKey, cv: &CV) -> Option<Vec<(&'a str, &'a str)>> {
+fn maybe_env<'a>(
+    config: &'a Config<Disk>,
+    key: &ConfigKey,
+    cv: &CV,
+) -> Option<Vec<(&'a str, &'a str)>> {
     if !matches!(cv, CV::Table(..)) {
         return None;
     }

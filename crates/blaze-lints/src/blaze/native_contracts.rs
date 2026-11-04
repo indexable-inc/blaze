@@ -108,13 +108,18 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, function: ast::Fn<'t>) {
         "`fn {name}` states its contract with nightly's {} in a crate with `#![feature(blaze_verify)]`, whose native clauses say it in the signature",
         written.join(" and ")
     );
-    let fix = plan(cx, function, item, &calls)
-        .map(|parts| parts.into_iter().map(|(range, text)| (cx.span(range), text)).collect::<Vec<_>>()); // alloc: the fix's parts
+    let fix = plan(cx, function, item, &calls).map(|parts| {
+        parts.into_iter().map(|(range, text)| (cx.span(range), text)).collect::<Vec<_>>()
+    }); // alloc: the fix's parts
     let span = cx.span(at);
     let diagnostic = cx.blaze(LINT, function.syntax(), span, message);
     match fix {
         Ok(parts) => {
-            diagnostic.multipart_suggestion("write the contract as native clauses", parts, Applicability::MachineApplicable);
+            diagnostic.multipart_suggestion(
+                "write the contract as native clauses",
+                parts,
+                Applicability::MachineApplicable,
+            );
         }
         Err(why) => {
             diagnostic.note(format!("no fix is offered: {why}"));
@@ -162,7 +167,10 @@ fn plan<'t>(
             return Err("another attribute macro rewrites it too, so its clauses can't be put back where it is written".into());
         };
         let Some(written) = call.written else {
-            return Err(format!("its `{}` attribute is made by a macro or held in a `cfg_attr`", clause.name()));
+            return Err(format!(
+                "its `{}` attribute is made by a macro or held in a `cfg_attr`",
+                clause.name()
+            ));
         };
         let slot = &mut attrs[clause as usize];
         if slot.is_some() {
@@ -170,7 +178,8 @@ fn plan<'t>(
         }
         *slot = Some(written);
     }
-    let source = ast::Fn::cast(item).ok_or("the item the attributes are on is not a function as written")?;
+    let source =
+        ast::Fn::cast(item).ok_or("the item the attributes are on is not a function as written")?;
     if source.spec_clauses().next().is_some() {
         return Err("it has native clauses too".into());
     }
@@ -182,17 +191,26 @@ fn plan<'t>(
     for stmt in body.statements() {
         let Some((block, clause)) = marker(stmt) else { break };
         let Some((attr, args)) = attrs[clause as usize] else {
-            return Err(format!("its body has a `{}` clause no attribute on it wrote", clause.name()));
+            return Err(format!(
+                "its body has a `{}` clause no attribute on it wrote",
+                clause.name()
+            ));
         };
         let inner = block.stmt_list().and_then(|it| cx.range(it.syntax()));
         if inner != Some(args) || clauses[clause as usize].is_some() {
-            return Err(format!("its `{}` clause is not where its attribute's arguments are", clause.name()));
+            return Err(format!(
+                "its `{}` clause is not where its attribute's arguments are",
+                clause.name()
+            ));
         }
         clauses[clause as usize] = Some(Written { block, attr, args });
     }
     for clause in [Clause::Requires, Clause::Ensures] {
         if attrs[clause as usize].is_some() && clauses[clause as usize].is_none() {
-            return Err(format!("its `{}` attribute left no clause in the body it expands to", clause.name()));
+            return Err(format!(
+                "its `{}` attribute left no clause in the body it expands to",
+                clause.name()
+            ));
         }
     }
     let [requires, ensures] = clauses;
@@ -205,7 +223,10 @@ fn plan<'t>(
             return Err("its `requires` has no condition after its declarations".into());
         }
         if escapes(cx, requires.block.syntax(), 0)? {
-            return Err("its `requires` can leave through `return` or `?`, which a native clause can't".into());
+            return Err(
+                "its `requires` can leave through `return` or `?`, which a native clause can't"
+                    .into(),
+            );
         }
         let has_decls = requires.block.statements().next().is_some();
         declares_items = requires.block.statements().any(|it| matches!(it, ast::Stmt::Item(_)));
@@ -233,18 +254,32 @@ fn plan<'t>(
                 check_captures(cx, function, closure)?;
                 let call_form = closure.for_binder().is_some()
                     || closure.ret_type().is_some()
-                    || escapes(cx, closure.body().ok_or("its `ensures` closure has no body")?.syntax(), 0)?;
+                    || escapes(
+                        cx,
+                        closure.body().ok_or("its `ensures` closure has no body")?.syntax(),
+                        0,
+                    )?;
                 let list = closure.param_list().ok_or("its `ensures` closure has no parameters")?;
-                let param = list.params().next().ok_or("its `ensures` closure takes no parameter")?;
+                let param =
+                    list.params().next().ok_or("its `ensures` closure takes no parameter")?;
                 if call_form {
                     format!("({})({reads})", written_text(cx, closure.syntax())?)
                 } else {
-                    let pat = written_text(cx, param.pat().ok_or("its `ensures` closure's parameter has no pattern")?.syntax())?;
+                    let pat = written_text(
+                        cx,
+                        param
+                            .pat()
+                            .ok_or("its `ensures` closure's parameter has no pattern")?
+                            .syntax(),
+                    )?;
                     let ty = match param.ty() {
                         Some(ty) => format!(": {}", written_text(cx, ty.syntax())?),
                         None => String::new(),
                     };
-                    let body = written_text(cx, closure.body().ok_or("its `ensures` closure has no body")?.syntax())?;
+                    let body = written_text(
+                        cx,
+                        closure.body().ok_or("its `ensures` closure has no body")?.syntax(),
+                    )?;
                     format!("{{ let {pat}{ty} = {reads}; {body} }}")
                 }
             }
@@ -252,7 +287,9 @@ fn plan<'t>(
                 let resolved = path.path().and_then(|it| cx.path(it));
                 if !matches!(
                     resolved,
-                    Some(hir::PathResolution::Def(hir::ModuleDef::Function(_) | hir::ModuleDef::Const(_)))
+                    Some(hir::PathResolution::Def(
+                        hir::ModuleDef::Function(_) | hir::ModuleDef::Const(_)
+                    ))
                 ) {
                     return Err("its `ensures` names neither a function nor a `const`, so read at the function's end it may not be what it was at its start".into());
                 }
@@ -274,10 +311,14 @@ fn plan<'t>(
     for written in requires.iter().chain(ensures.iter()) {
         let end = usize::from(written.attr.end());
         let space = text[end..].len() - text[end..].trim_start().len();
-        parts.push((TextRange::new(written.attr.start(), written.attr.end() + TextSize::new(space as u32)), String::new()));
+        parts.push((
+            TextRange::new(written.attr.start(), written.attr.end() + TextSize::new(space as u32)),
+            String::new(),
+        ));
     }
     // The clauses go between the signature and the body, each on its own lines.
-    let body_at = cx.range(source_body.syntax()).ok_or("its body is not where it is written")?.start();
+    let body_at =
+        cx.range(source_body.syntax()).ok_or("its body is not where it is written")?.start();
     let before = &text[..usize::from(body_at)];
     let gap_at = TextSize::new(before.trim_end().len() as u32);
     let fn_at = usize::from(source.fn_token().ok_or("it has no `fn`")?.text_range().start());
@@ -323,7 +364,8 @@ fn return_value<'t>(
         let ast::Pat::IdentPat(pat) = pat else {
             return Err("its named return is a pattern, not a name".into());
         };
-        let name = pat.name().filter(|_| plain(pat)).ok_or("its named return is a pattern, not a name")?;
+        let name =
+            pat.name().filter(|_| plain(pat)).ok_or("its named return is a pattern, not a name")?;
         return Ok(Value::Named(name.text().to_owned()));
     }
     let ty = ret.ty().ok_or("its return type is missing")?;
@@ -367,18 +409,30 @@ fn return_value<'t>(
         .chain(numbered)
         .find(|it| !used.contains(&it.as_str()))
         .map(|name| Value::Fresh(name, ty_at))
-        .ok_or_else(|| format!("each of `ret`, `result`, `ret_` and `ret0` .. `ret{}` is used in it", FRESH - 1))
+        .ok_or_else(|| {
+            format!(
+                "each of `ret`, `result`, `ret_` and `ret0` .. `ret{}` is used in it",
+                FRESH - 1
+            )
+        })
 }
 
 /// Whether `pat` binds only its name: no `ref`, `mut` or `@`.
 fn plain(pat: ast::IdentPat<'_>) -> bool {
-    pat.ref_token().is_none() && pat.mut_token().is_none() && pat.at_token().is_none() && pat.pat().is_none()
+    pat.ref_token().is_none()
+        && pat.mut_token().is_none()
+        && pat.at_token().is_none()
+        && pat.pat().is_none()
 }
 
 /// That the `ensures` closure reads nothing that may differ between the function's start, where
 /// nightly builds it, and its end, where a native `ensures` reads it: only parameters (`self`
 /// included) that are not `mut` and are `Copy`.
-fn check_captures<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>, closure: ast::ClosureExpr<'t>) -> Result<(), String> {
+fn check_captures<'t>(
+    cx: &Cx<'_, 't>,
+    function: ast::Fn<'t>,
+    closure: ast::ClosureExpr<'t>,
+) -> Result<(), String> {
     let db = cx.db();
     if closure.async_token().is_some()
         || closure.const_token().is_some()
@@ -432,7 +486,10 @@ fn escapes<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, depth: u32) -> Result<bool,
                 return Err(format!("its clauses call macros more than {MACRO_DEPTH} deep"));
             }
             let Some(expansion) = cx.expand(call) else {
-                return Err(format!("the macro call `{}` in a clause can't be expanded", call.syntax().text()));
+                return Err(format!(
+                    "the macro call `{}` in a clause can't be expanded",
+                    call.syntax().text()
+                ));
             };
             if escapes(cx, expansion, depth + 1)? {
                 return Ok(true);
@@ -444,7 +501,9 @@ fn escapes<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, depth: u32) -> Result<bool,
             && (ast::ClosureExpr::cast(it).is_some()
                 || ast::Item::cast(it).is_some()
                 || ast::BlockExpr::cast(it).is_some_and(|block| {
-                    block.async_token().is_some() || block.const_token().is_some() || block.gen_token().is_some()
+                    block.async_token().is_some()
+                        || block.const_token().is_some()
+                        || block.gen_token().is_some()
                 }));
         if nested {
             events.skip_subtree();
@@ -452,7 +511,10 @@ fn escapes<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, depth: u32) -> Result<bool,
         }
         if matches!(
             it.kind(),
-            SyntaxKind::RETURN_EXPR | SyntaxKind::TRY_EXPR | SyntaxKind::YEET_EXPR | SyntaxKind::BECOME_EXPR
+            SyntaxKind::RETURN_EXPR
+                | SyntaxKind::TRY_EXPR
+                | SyntaxKind::YEET_EXPR
+                | SyntaxKind::BECOME_EXPR
         ) {
             return Ok(true);
         }
@@ -462,14 +524,19 @@ fn escapes<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, depth: u32) -> Result<bool,
 
 /// The source of `node` of the expansion as written in the file.
 fn written_text<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Result<&'t str, String> {
-    let range = cx.range(node).ok_or_else(|| format!("`{}` in a clause is made by a macro", node.text()))?;
+    let range = cx
+        .range(node)
+        .ok_or_else(|| format!("`{}` in a clause is made by a macro", node.text()))?;
     Ok(cx.snippet(range))
 }
 
 /// What is inside the attribute's `(..)`, trimmed.
 fn inner_text<'q>(cx: &Cx<'q, '_>, args: TextRange) -> Result<&'q str, String> {
     let text = cx.snippet(args);
-    let inner = text.strip_prefix('(').and_then(|it| it.strip_suffix(')')).ok_or("its attribute's arguments are not in `(..)`")?;
+    let inner = text
+        .strip_prefix('(')
+        .and_then(|it| it.strip_suffix(')'))
+        .ok_or("its attribute's arguments are not in `(..)`")?;
     Ok(inner.trim())
 }
 
@@ -480,10 +547,11 @@ fn as_clause(cx: &Cx<'_, '_>, text: &str) -> Result<String, String> {
     let fits = |text: &str| {
         let probe = format!("fn f() requires {text}, {{}}");
         let parse = syntax::SourceFile::parse(&probe, cx.edition());
-        let one = parse.root().descendants().find_map(ast::SpecClause::cast).is_some_and(|clause| {
-            let mut exprs = clause.exprs();
-            exprs.next().is_some_and(|it| it.syntax().text() == text) && exprs.next().is_none()
-        });
+        let one =
+            parse.root().descendants().find_map(ast::SpecClause::cast).is_some_and(|clause| {
+                let mut exprs = clause.exprs();
+                exprs.next().is_some_and(|it| it.syntax().text() == text) && exprs.next().is_none()
+            });
         one && parse.errors().is_empty()
     };
     if fits(text) {
@@ -557,15 +625,21 @@ pub fn next(x: u32) -> u32 {
         let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
         names.insert(file, "src/lib.rs".to_owned());
         let name_of = |file: FileId| names.get(&file).cloned();
-        let flags: Vec<String> = ["-A", "clippy::all", "--allow=blaze::general", "--warn=blaze::native_contracts"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() };
+        let flags: Vec<String> =
+            ["-A", "clippy::all", "--allow=blaze::general", "--warn=blaze::native_contracts"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+        let setup = Setup {
+            command_line: CommandLine::parse(&flags).expect("the flags read"),
+            conf: Conf::default(),
+        };
         let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(made.applied, 1, "one fix, of `next`");
         let after = db.file_text(file).text(&db).to_string();
-        let source = |text: &str| text.split_once("use contracts::").map(|(_, it)| it.to_owned()).unwrap_or_default();
+        let source = |text: &str| {
+            text.split_once("use contracts::").map(|(_, it)| it.to_owned()).unwrap_or_default()
+        };
         assert_eq!(
             source(&after),
             "{ensures, requires as pre};

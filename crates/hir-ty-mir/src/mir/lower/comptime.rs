@@ -30,7 +30,10 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
     ///
     /// so every block of the iteration (`next` too) is dominated by `first`, which is what the
     /// expansion copies per field.
-    #[expect(clippy::too_many_arguments, reason = "the expression's parts, as `lower_loop` has them")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the expression's parts, as `lower_loop` has them"
+    )]
     pub(super) fn lower_comptime_for(
         &mut self,
         current: BasicBlockId,
@@ -213,9 +216,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
     ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
         let field_ty = self.infer.expr_ty(field);
         let binder = ComptimeBinder::of(field_ty).filter(|binder| {
-            self.infer
-                .comptime_loops()
-                .any(|(_, it)| it.universe().as_u32() == binder.0)
+            self.infer.comptime_loops().any(|(_, it)| it.universe().as_u32() == binder.0)
         });
         let Some(binder) = binder else {
             // A generic `F: Field<B>` parameter, or any other type: monomorphization has no

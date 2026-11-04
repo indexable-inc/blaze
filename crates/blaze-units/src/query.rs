@@ -290,7 +290,12 @@ impl EnvReads {
     /// The variable `name` of `env`, noted read by `by` (what a person is told read it: "the
     /// item store's mode"). A name read before with another value is an error naming it: what
     /// is kept would be made from two values of one variable, and its key would hold one.
-    pub fn var<'e>(&mut self, env: &'e [(String, String)], name: &str, by: &'static str) -> Result<Option<&'e str>, String> {
+    pub fn var<'e>(
+        &mut self,
+        env: &'e [(String, String)],
+        name: &str,
+        by: &'static str,
+    ) -> Result<Option<&'e str>, String> {
         let value = env_var(env, name);
         match self.read.binary_search_by(|it| it.0.as_str().cmp(name)) {
             Ok(at) if self.read[at].1.as_deref() == value => Ok(value),
@@ -314,9 +319,9 @@ impl EnvReads {
         self.read.iter().find_map(|(name, was, by)| {
             let value = env_var(now, name);
             (value != was.as_deref()).then(|| EnvMoved {
-                name: name.clone(),       // clone: a reason, once per front end let go
-                by: (*by).to_owned(),     // alloc: as above
-                was: was.clone(),         // clone: as above
+                name: name.clone(),            // clone: a reason, once per front end let go
+                by: (*by).to_owned(),          // alloc: as above
+                was: was.clone(),              // clone: as above
                 now: value.map(str::to_owned), // alloc: as above
             })
         })
@@ -331,7 +336,9 @@ impl EnvReads {
 /// Never the values: a variable may hold a secret.
 impl std::fmt::Debug for EnvReads {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.read.iter().map(|(name, value, by)| (name, value.is_some(), by))).finish()
+        f.debug_list()
+            .entries(self.read.iter().map(|(name, value, by)| (name, value.is_some(), by)))
+            .finish()
     }
 }
 
@@ -439,11 +446,56 @@ pub struct Units {
     /// `[workspace.metadata.blaze]`: every member's tests run sandboxed but those
     /// [`TestSandbox`] takes out.
     pub sandboxed_tests: bool,
+    /// The pinned native inputs (`[workspace.metadata.blaze.native.<name>]`, docs/cargo.md,
+    /// "Pinned native inputs") some build script run of this graph is given: one per input and
+    /// target, sorted by name then target. The daemon fetches and lays out each before any
+    /// script runs.
+    pub native: Vec<NativeInput>,
 }
 
 impl Versioned for Units {
     // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 13");
+    // 14: the pinned native inputs ([`Units::native`]).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 14");
+}
+
+/// One pinned native input for one target: an archive named by its digest, which blaze fetches,
+/// unpacks read-only under its home, and hands to the build scripts of `packages` in the
+/// variable `env` (docs/cargo.md, "Pinned native inputs").
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct NativeInput {
+    /// The table's name, `llvm` of `[workspace.metadata.blaze.native.llvm]`.
+    pub name: String,
+    /// The target triple whose archive this is: the platform of the script runs that get it.
+    pub target: String,
+    /// The variable the scripts read the unpacked directory from.
+    pub env: String,
+    /// The packages whose build scripts are given it, sorted: each a name, or `name/feature`
+    /// for that package's script only when the run has the feature on.
+    pub packages: Vec<String>,
+    /// Where the archive is downloaded from: `https://`.
+    pub url: String,
+    /// The archive's sha256, 64 lowercase hex digits, as the pin file says.
+    pub sha256: String,
+    /// The pin file the URL and digest were read from, absolute: what errors name.
+    pub pin: String,
+}
+
+impl NativeInput {
+    /// Whether the build script of the package named `package`, run with `features` on, is
+    /// given this input.
+    pub fn gives(&self, package: &str, features: &[String]) -> bool {
+        names_script(&self.packages, package, features)
+    }
+}
+
+/// Whether `packages`, as [`NativeInput::packages`] lists them (`name` or `name/feature`), name
+/// the build script of `package` run with `features` on.
+pub fn names_script(packages: &[String], package: &str, features: &[String]) -> bool {
+    packages.iter().any(|it| match it.split_once('/') {
+        Some((name, feature)) => name == package && features.iter().any(|on| on == feature),
+        None => it == package,
+    })
 }
 
 impl Units {
@@ -461,7 +513,10 @@ impl Units {
     /// is primary ([`Units::is_primary`]): how a record's reads, which name a crate by its
     /// package's manifest, are valued with no front end.
     pub fn is_primary_manifest(&self, manifest_path: &str) -> bool {
-        self.packages.iter().find(|it| it.manifest_path == manifest_path).is_some_and(|it| self.primary_package(&it.id))
+        self.packages
+            .iter()
+            .find(|it| it.manifest_path == manifest_path)
+            .is_some_and(|it| self.primary_package(&it.id))
     }
 
     fn primary_package(&self, pkg_id: &str) -> bool {
@@ -720,20 +775,45 @@ mod tests {
     fn env_reads_move_only_with_a_variable_read() {
         let first = env(&[("BLAZE_ITEM_STORE", "verify"), ("SHLVL", "1"), ("SECRET", "hunter2")]);
         let mut reads = EnvReads::default();
-        assert_eq!(reads.var(&first, "BLAZE_ITEM_STORE", "the item store's mode"), Ok(Some("verify")));
+        assert_eq!(
+            reads.var(&first, "BLAZE_ITEM_STORE", "the item store's mode"),
+            Ok(Some("verify"))
+        );
         assert_eq!(reads.var(&first, "BLAZE_DEP_IMAGES", "the dependency images' mode"), Ok(None));
-        let unrelated = env(&[("BLAZE_ITEM_STORE", "verify"), ("SHLVL", "3"), ("INVOCATION_ID", "9f"), ("OLDPWD", "/x")]);
+        let unrelated = env(&[
+            ("BLAZE_ITEM_STORE", "verify"),
+            ("SHLVL", "3"),
+            ("INVOCATION_ID", "9f"),
+            ("OLDPWD", "/x"),
+        ]);
         assert_eq!(reads.moved(&unrelated), None);
         let other = env(&[("BLAZE_ITEM_STORE", "off"), ("SECRET", "hunter3")]);
         let moved = reads.moved(&other).expect("a variable read has another value");
-        assert_eq!((moved.name.as_str(), moved.by.as_str()), ("BLAZE_ITEM_STORE", "the item store's mode"));
+        assert_eq!(
+            (moved.name.as_str(), moved.by.as_str()),
+            ("BLAZE_ITEM_STORE", "the item store's mode")
+        );
         let said = format!("{moved} {moved:?} {reads:?}");
-        assert!(said.contains("has another value now") && !said.contains("verify") && !said.contains("off"), "{said}");
+        assert!(
+            said.contains("has another value now")
+                && !said.contains("verify")
+                && !said.contains("off"),
+            "{said}"
+        );
         let set = env(&[("BLAZE_ITEM_STORE", "verify"), ("BLAZE_DEP_IMAGES", "check")]);
-        assert_eq!(reads.moved(&set).map(|it| it.name), Some("BLAZE_DEP_IMAGES".to_owned()), "set where it was unset");
+        assert_eq!(
+            reads.moved(&set).map(|it| it.name),
+            Some("BLAZE_DEP_IMAGES".to_owned()),
+            "set where it was unset"
+        );
         assert!(reads.moved(&env(&[])).is_some_and(|it| it.to_string().contains("is unset now")));
-        let refused = reads.var(&other, "BLAZE_ITEM_STORE", "a later serve").expect_err("two values of one variable");
-        assert!(refused.contains("`BLAZE_ITEM_STORE`") && refused.contains("the item store's mode"), "{refused}");
+        let refused = reads
+            .var(&other, "BLAZE_ITEM_STORE", "a later serve")
+            .expect_err("two values of one variable");
+        assert!(
+            refused.contains("`BLAZE_ITEM_STORE`") && refused.contains("the item store's mode"),
+            "{refused}"
+        );
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -791,7 +871,11 @@ mod tests {
                 files: vec![("/home/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())],
             },
             mounts: vec![
-                Mount { at: "/rustc/0123/library".to_owned(), origin: Origin::Root(ContentId([7; 32])), under: String::new() },
+                Mount {
+                    at: "/rustc/0123/library".to_owned(),
+                    origin: Origin::Root(ContentId([7; 32])),
+                    under: String::new(),
+                },
                 Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
             ],
             host: "aarch64-unknown-linux-gnu".to_owned(),
@@ -807,7 +891,11 @@ mod tests {
     #[test]
     fn std_keys_differ_by_what_they_ask() {
         let key = StdKey {
-            library: Mount { at: "/rustc/0123/library".to_owned(), origin: Origin::Root(ContentId([7; 32])), under: String::new() },
+            library: Mount {
+                at: "/rustc/0123/library".to_owned(),
+                origin: Origin::Root(ContentId([7; 32])),
+                under: String::new(),
+            },
             triple: "x86_64-unknown-linux-gnu".to_owned(),
             profile: "dev".to_owned(),
             panic: "unwind".to_owned(),

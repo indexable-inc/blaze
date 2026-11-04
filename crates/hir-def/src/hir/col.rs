@@ -297,7 +297,10 @@ impl SlabWriter {
         }
         let at = self.at.next_multiple_of(align_of::<T>());
         let bytes = size_of_val(elements);
-        assert!(at.checked_add(bytes).is_some_and(|end| end <= self.room), "a column past its slab");
+        assert!(
+            at.checked_add(bytes).is_some_and(|end| end <= self.room),
+            "a column past its slab"
+        );
         let slab = self.slab.as_ref().expect("a slab with room has an allocation");
         // SAFETY: `at + bytes <= room` (asserted), and `base` is the start of the slab's `room`
         // bytes (`new`), so `base + at` stays inside that allocation. Out of it, the offset is UB.
@@ -358,7 +361,10 @@ mod tests {
                 writer.take(&mut more),
             );
             drop(writer);
-            assert!(bytes.is_empty() && bytes.capacity() == bytes_room, "the source keeps its room");
+            assert!(
+                bytes.is_empty() && bytes.capacity() == bytes_room,
+                "the source keeps its room"
+            );
             assert!(words.is_empty() && words.capacity() == words_room);
             drop((bytes, words, wides, more));
 
@@ -423,7 +429,10 @@ mod tests {
 
         let outside = [1u32, 2];
         assert!(Col::borrowed(&image, &outside).is_none(), "a column outside its image");
-        assert!(!Col::borrowed(&image, &all[..0]).expect("empty").in_image(), "empty holds nothing");
+        assert!(
+            !Col::borrowed(&image, &all[..0]).expect("empty").in_image(),
+            "empty holds nothing"
+        );
 
         let copy = col.clone();
         drop((col, image));

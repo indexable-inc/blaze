@@ -96,7 +96,11 @@ impl Images {
 
     /// The end of making `key`, claimed by [`Images::want`] or [`Images::claim`]: it becomes
     /// its graph's newest image, and the image it replaces is closed once no run maps it.
-    pub fn finish(&mut self, key: ImageKey, made: Result<Ready, PremapError>) -> Result<Arc<Ready>, PremapError> {
+    pub fn finish(
+        &mut self,
+        key: ImageKey,
+        made: Result<Ready, PremapError>,
+    ) -> Result<Arc<Ready>, PremapError> {
         assert!(self.making.remove(&key), "finishing a dependency image nothing claimed");
         let ready = match made {
             Ok(ready) => Arc::new(ready), // alloc: setup, once per image opened

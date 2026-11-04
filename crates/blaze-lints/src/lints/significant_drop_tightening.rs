@@ -91,11 +91,15 @@ impl Significant {
     /// What its drop does, so why holding it matters.
     fn why(self) -> String {
         match self {
-            Significant::Guard(Kind::Lock) => "other threads wait for the lock until it is dropped".to_owned(), // alloc: message
+            Significant::Guard(Kind::Lock) => {
+                "other threads wait for the lock until it is dropped".to_owned()
+            } // alloc: message
             Significant::Guard(Kind::Cell) => {
                 "a conflicting borrow of the `RefCell` panics until it is dropped".to_owned() // alloc: message
             }
-            Significant::Marked(attr) => format!("its type is marked `{attr}`, so its drop does work that matters"),
+            Significant::Marked(attr) => {
+                format!("its type is marked `{attr}`, so its drop does work that matters")
+            }
         }
     }
 
@@ -145,7 +149,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         let call = cx.span(it.call);
         let fix = it.fix.map(|(at, text)| (cx.span(at), text));
         let diagnostic = cx.lint(LINT, node, span, it.message);
-        diagnostic.span_note(call, format!("this call runs with {}", it.significant.held(&it.name)));
+        diagnostic
+            .span_note(call, format!("this call runs with {}", it.significant.held(&it.name)));
         diagnostic.help(format!(
             "drop `{0}` after its last use (`drop({0});`), or end its scope with a block, {1}",
             it.name,
@@ -191,11 +196,14 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
                 continue;
             }
             let ty = analysis.ty(mir.locals[local].ty.as_ref());
-            let Some(significant) = ty.as_adt().and_then(|adt| Significant::of(cx, &guards, adt)) else {
+            let Some(significant) = ty.as_adt().and_then(|adt| Significant::of(cx, &guards, adt))
+            else {
                 continue;
             };
             let Some(call) = held_through(mir, local) else { continue };
-            let Some(at) = guards::first_assigned(mir, local).and_then(|it| guards::range_of(analysis, it)) else {
+            let Some(at) =
+                guards::first_assigned(mir, local).and_then(|it| guards::range_of(analysis, it))
+            else {
                 continue;
             };
             let Some(call) = guards::range_of(analysis, call) else { continue };
@@ -208,7 +216,9 @@ fn find<'t>(cx: &Cx<'_, 't>, function: ast::Fn<'t>) -> Vec<Held> {
             // A closure's or `async` block's body is lowered on its own: the fix is the
             // function's own body's.
             let fix = match body.expr {
-                None if *checked.get_or_insert_with(|| passes(hir_ty_borrowck::borrowck(db, def))) => {
+                None if *checked
+                    .get_or_insert_with(|| passes(hir_ty_borrowck::borrowck(db, def))) =>
+                {
                     fix(cx, analysis, def, binding, name, call)
                 }
                 _ => None,
@@ -259,7 +269,9 @@ fn fix(
         NodeOrToken::Node(node) => node,
         NodeOrToken::Token(token) => token.parent()?,
     };
-    let statement = node.ancestors().find(|it| matches!(it.kind(), SyntaxKind::LET_STMT | SyntaxKind::EXPR_STMT))?;
+    let statement = node
+        .ancestors()
+        .find(|it| matches!(it.kind(), SyntaxKind::LET_STMT | SyntaxKind::EXPR_STMT))?;
     // One of the block's own statements, and the call held through after it.
     let list = statement.parent().filter(|it| it.kind() == SyntaxKind::STMT_LIST)?;
     if list.parent()?.text_range() != block || call.start() < statement.text_range().end() {
@@ -279,7 +291,9 @@ fn fix(
 
 /// Whether a borrow check found no error and checked the whole body.
 fn passes(result: &BorrowckResult) -> bool {
-    result.skipped.is_none() && result.not_checked.is_none() && !result.diagnostics.iter().any(|it| it.is_error())
+    result.skipped.is_none()
+        && result.not_checked.is_none()
+        && !result.diagnostics.iter().any(|it| it.is_error())
 }
 
 /// The first call, by its span, that `guard` is held through: one written in the source,
@@ -342,7 +356,9 @@ fn held_through(mir: &MirBody<'_>, guard: LocalId) -> Option<MirSpan> {
     let mut found = None;
     for (id, block) in mir.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };
-        let TerminatorKind::Call { target: Some(target), from_hir_call: true, .. } = &terminator.kind else {
+        let TerminatorKind::Call { target: Some(target), from_hir_call: true, .. } =
+            &terminator.kind
+        else {
             continue;
         };
         if block.is_cleanup
@@ -423,7 +439,10 @@ pub fn count(m: &Mutex<Vec<u32>>) -> usize {
 }
 "#,
         );
-        assert!(after.contains("    let n = guard.len();\n    drop(guard);\n    work();\n"), "{after}");
+        assert!(
+            after.contains("    let n = guard.len();\n    drop(guard);\n    work();\n"),
+            "{after}"
+        );
     }
 
     /// Used again on one branch and held through a call on the other: the drop could go only
@@ -505,12 +524,22 @@ pub fn owned(b: Buf) -> usize {
 "#,
         );
         assert_eq!(found.matches(FOUND).count(), 3, "{found}");
-        assert!(found.contains("holds the `RefCell` borrow in `cell` after its last use: a conflicting borrow"), "{found}");
+        assert!(
+            found.contains(
+                "holds the `RefCell` borrow in `cell` after its last use: a conflicting borrow"
+            ),
+            "{found}"
+        );
         assert!(
             found.contains("is kept alive in `marked` after its last use: its type is marked `#[clippy::has_significant_drop]`"),
             "{found}"
         );
-        assert!(found.contains("in `suspends` after its last use: its type is marked `#[must_not_suspend]`"), "{found}");
+        assert!(
+            found.contains(
+                "in `suspends` after its last use: its type is marked `#[must_not_suspend]`"
+            ),
+            "{found}"
+        );
         assert!(!found.contains("in `plain`") && !found.contains("in `owned`"), "{found}");
     }
 

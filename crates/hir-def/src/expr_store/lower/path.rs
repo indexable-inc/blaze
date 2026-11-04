@@ -186,8 +186,12 @@ fn lower_path_on_stacks(
                         let num_segments = mod_path.segments().len();
                         kind = mod_path.kind;
 
-                        collector.stacks.path_segments.extend(mod_path.segments().iter().cloned().rev());
-                        contexts.extend((0..num_segments).rev().map(|i| mod_path.context_of(i, root)));
+                        collector
+                            .stacks
+                            .path_segments
+                            .extend(mod_path.segments().iter().cloned().rev());
+                        contexts
+                            .extend((0..num_segments).rev().map(|i| mod_path.context_of(i, root)));
                         #[cfg(test)]
                         {
                             ast_segments_offset = mod_path.segments().len();
@@ -200,7 +204,8 @@ fn lower_path_on_stacks(
                             Some(trait_args) => {
                                 collector.stacks.path_generic_args.resize(first, 0);
                                 collector
-                                    .stacks.path_generic_args
+                                    .stacks
+                                    .path_generic_args
                                     .extend(trait_args.slot_words().iter().rev().copied());
                             }
                             None => collector.stacks.path_generic_args.resize(g0 + segments, 0),
@@ -209,8 +214,10 @@ fn lower_path_on_stacks(
 
                         // Insert the type reference (T in the above example) as Self parameter for the trait
                         let last_segment = *collector.stacks.path_generic_args.get(first)?;
-                        let with_self =
-                            collector.store.paths_mut().with_self_type(unslot(last_segment), self_type);
+                        let with_self = collector
+                            .store
+                            .paths_mut()
+                            .with_self_type(unslot(last_segment), self_type);
                         collector.stacks.path_generic_args[first] = slot(Some(with_self));
                     }
                 }
@@ -299,7 +306,8 @@ fn lower_path_on_stacks(
     if let Some(old_lifetimes_constrained_by_input) = old_lifetimes_constrained_by_input {
         // The lifetime arguments of the last segment, copied out of the columns so the
         // resolution below can borrow the collector.
-        let last_args = collector.stacks.path_generic_args[g0..].last().and_then(|&word| unslot(word));
+        let last_args =
+            collector.stacks.path_generic_args[g0..].last().and_then(|&word| unslot(word));
         let lifetime_args: Option<SmallVec<[LifetimeRefId; 4]>> = last_args.map(|args| {
             let args = collector.store.paths().generic_args_at(args).args;
             args.iter()
@@ -309,8 +317,8 @@ fn lower_path_on_stacks(
                 })
                 .collect() // alloc: inline up to 4 lifetimes, and only in an argument-bound scope
         });
-        let type_alias_constrained_lifetimes = collector
-            .get_constrained_lifetimes_if_type_alias(&mod_path, lifetime_args.as_deref());
+        let type_alias_constrained_lifetimes =
+            collector.get_constrained_lifetimes_if_type_alias(&mod_path, lifetime_args.as_deref());
         if let Some(lifetimes) = type_alias_constrained_lifetimes {
             collector.named_lifetime_store.lifetimes_constrained_by_input =
                 old_lifetimes_constrained_by_input;
@@ -333,7 +341,11 @@ fn lower_path_on_stacks(
     if type_anchor.is_none() && collector.stacks.path_generic_args.len() == g0 {
         Some(paths.push_bare(mod_path))
     } else {
-        Some(paths.push_normal(mod_path, type_anchor, collector.stacks.path_generic_args.drain(g0..)))
+        Some(paths.push_normal(
+            mod_path,
+            type_anchor,
+            collector.stacks.path_generic_args.drain(g0..),
+        ))
     }
 }
 
@@ -429,7 +441,8 @@ impl ExprCollector<'_> {
                                 assoc_type_arg.type_bound_list(),
                                 impl_trait_lower_fn,
                             );
-                            let binding = this.store.binding_with_bounds(name, args, type_ref, bounds);
+                            let binding =
+                                this.store.binding_with_bounds(name, args, type_ref, bounds);
                             this.stacks.assoc_bindings.push(binding);
                         });
                     }
@@ -447,7 +460,9 @@ impl ExprCollector<'_> {
             }
         }
 
-        if self.stacks.generic_args.len() == args_base && self.stacks.assoc_bindings.len() == bindings_base {
+        if self.stacks.generic_args.len() == args_base
+            && self.stacks.assoc_bindings.len() == bindings_base
+        {
             return None;
         }
         Some(self.store.paths_mut().push_generic_args(
@@ -465,8 +480,10 @@ fn qualifier(path: ast::Path<'_>) -> Option<ast::Path<'_>> {
     }
     // FIXME: this bottom up traversal is not too precise.
     // Should we handle do a top-down analysis, recording results?
-    let use_tree_list =
-        path.syntax().ancestor_where(ast::UseTreeList::can_cast).and_then(ast::UseTreeList::cast)?;
+    let use_tree_list = path
+        .syntax()
+        .ancestor_where(ast::UseTreeList::can_cast)
+        .and_then(ast::UseTreeList::cast)?;
     let use_tree = use_tree_list.parent_use_tree();
     use_tree.path()
 }

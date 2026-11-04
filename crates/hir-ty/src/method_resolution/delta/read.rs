@@ -90,8 +90,10 @@ pub(in crate::method_resolution) fn body_part(db: &Db, module: ModuleId) -> Body
         let mut heads: Vec<Head, &Frame> = Vec::new_in(frame);
         heads.extend(inherent_bodies(db, module).iter().map(|(self_ty, _)| {
             try_head(self_ty).unwrap_or_else(|| {
-                panic!("impls: an inherent impl in a body of {module:?} has the self type \
-                        {self_ty:?}, which no impl header names")
+                panic!(
+                    "impls: an inherent impl in a body of {module:?} has the self type \
+                        {self_ty:?}, which no impl header names"
+                )
             })
         }));
         heads.sort_unstable();
@@ -215,9 +217,9 @@ pub(in crate::method_resolution) fn inherent_impls_for<'db>(
         for &(_, part, i) in order.iter() {
             let i = i as usize;
             match part {
-                Part::Bodies => found.extend_from_slice(
-                    inherent_bodies(db, bodies[i]).for_self_ty(&self_ty.0),
-                ),
+                Part::Bodies => {
+                    found.extend_from_slice(inherent_bodies(db, bodies[i]).for_self_ty(&self_ty.0))
+                }
                 _ => found.push(own[i].1),
             }
         }

@@ -6,9 +6,9 @@
 
 use std::{fmt::Write as _, time::Instant};
 
-use hir_firewall::Harness;
 use blaze_query::db::{Database as _, Durability};
 use hir_expand::fixture;
+use hir_firewall::Harness;
 
 const MODULES: usize = 10;
 const PER_MODULE: usize = 20;
@@ -49,7 +49,9 @@ fn main() {
     let executed = harness.ask_all(&db).expect("a pass");
     let warm = started.elapsed();
     if executed != 0 {
-        println!("  a revision that changed nothing executed {executed} keys again: they are volatile");
+        println!(
+            "  a revision that changed nothing executed {executed} keys again: they are volatile"
+        );
     }
 
     let bodies = harness.body_count() as u32;
@@ -62,7 +64,8 @@ fn main() {
     let bound = 2 * (warm + per_body);
 
     let ratio = per_edit.as_secs_f64() / bound.as_secs_f64();
-    let verdict = if ratio <= 1.1 { "within 10% of the bound" } else { "OVER the bound by more than 10%" };
+    let verdict =
+        if ratio <= 1.1 { "within 10% of the bound" } else { "OVER the bound by more than 10%" };
     println!(
         "firewall edit: {bodies} bodies, {} edits; cold body {per_body:?}, warm pass {warm:?}; \
          per edit {per_edit:?} against a bound of {bound:?} ({ratio:.2}x): {verdict}",

@@ -88,27 +88,44 @@ impl Default for Summary {
 
 #[derive(Debug)]
 pub enum DiffError {
-    Read { path: PathBuf, error: io::Error },
+    Read {
+        path: PathBuf,
+        error: io::Error,
+    },
     Sql(SqlError),
     /// The history has no build of that number.
-    NoBuild { build: u64, history: PathBuf },
+    NoBuild {
+        build: u64,
+        history: PathBuf,
+    },
     /// DuckDB's answer is not of the columns asked.
     Answer(String),
     /// A side is a build of the history, and no DuckDB was given.
-    NoDuckdb { side: Side },
+    NoDuckdb {
+        side: Side,
+    },
 }
 
 impl fmt::Display for DiffError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DiffError::Read { path, error } => write!(f, "blaze debug diff: reading {}: {error}", path.display()),
+            DiffError::Read { path, error } => {
+                write!(f, "blaze debug diff: reading {}: {error}", path.display())
+            }
             DiffError::Sql(error) => write!(f, "blaze debug diff: {error}"),
             DiffError::NoBuild { build, history } => {
-                write!(f, "blaze debug diff: the history in {} has no build {build}", history.display())
+                write!(
+                    f,
+                    "blaze debug diff: the history in {} has no build {build}",
+                    history.display()
+                )
             }
             DiffError::Answer(what) => write!(f, "blaze debug diff: DuckDB's answer {what}"),
             DiffError::NoDuckdb { side } => {
-                write!(f, "blaze debug diff: {side} is read from the history, which needs the pinned DuckDB")
+                write!(
+                    f,
+                    "blaze debug diff: {side} is read from the history, which needs the pinned DuckDB"
+                )
             }
         }
     }
@@ -159,7 +176,11 @@ pub fn run(a: &Side, b: &Side, duckdb: Option<&Path>, history: &Path) -> Result<
 /// The summaries of `builds` of the history in `history`, in one run of `duckdb`, each with
 /// its number and in their order (the last field: the history has its `builds` row). A build
 /// the history has no `builds` row of is an error.
-pub fn of_builds(duckdb: &Path, history: &Path, builds: &[u64]) -> Result<Vec<(u64, Summary, bool)>, DiffError> {
+pub fn of_builds(
+    duckdb: &Path,
+    history: &Path,
+    builds: &[u64],
+) -> Result<Vec<(u64, Summary, bool)>, DiffError> {
     // alloc: a query, once a diff
     let list = builds.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
     // alloc: a query, once a diff
@@ -182,7 +203,8 @@ pub fn of_builds(duckdb: &Path, history: &Path, builds: &[u64]) -> Result<Vec<(u
     );
     let batches = sql::run(&Query { duckdb, history, sql: &sql }).map_err(DiffError::Sql)?;
     // alloc: two summaries, once a diff
-    let mut out: Vec<(u64, Summary, bool)> = builds.iter().map(|it| (*it, Summary::default(), false)).collect();
+    let mut out: Vec<(u64, Summary, bool)> =
+        builds.iter().map(|it| (*it, Summary::default(), false)).collect();
     for batch in &batches {
         read_answer(batch, &mut out)?;
     }
@@ -200,7 +222,8 @@ fn read_answer(batch: &RecordBatch, out: &mut [(u64, Summary, bool)]) -> Result<
             // alloc: an error
             .ok_or_else(|| DiffError::Answer(format!("has no column {name}")))
     };
-    let (part, build, key, count, ns) = (column("part")?, column("build")?, column("key")?, column("count")?, column("ns")?);
+    let (part, build, key, count, ns) =
+        (column("part")?, column("build")?, column("key")?, column("count")?, column("ns")?);
     // dyn: an Arrow column, as DuckDB's answer gives it, once a diff
     let text = |array: &dyn Array, name: &str, row: usize| -> Result<Option<String>, DiffError> {
         if array.is_null(row) {
@@ -212,7 +235,10 @@ fn read_answer(batch: &RecordBatch, out: &mut [(u64, Summary, bool)]) -> Result<
             // alloc: a row of DuckDB's answer, once a diff
             (None, Some(it)) => Ok(Some(it.value(row).to_owned())),
             // alloc: an error
-            (None, None) => Err(DiffError::Answer(format!("has column {name} of type {}, not text", array.data_type()))),
+            (None, None) => Err(DiffError::Answer(format!(
+                "has column {name} of type {}, not text",
+                array.data_type()
+            ))),
         }
     };
     // dyn: an Arrow column, as DuckDB's answer gives it, once a diff
@@ -223,7 +249,10 @@ fn read_answer(batch: &RecordBatch, out: &mut [(u64, Summary, bool)]) -> Result<
         match array.as_primitive_opt::<Int64Type>() {
             Some(it) => Ok(Some(it.value(row))),
             // alloc: an error
-            None => Err(DiffError::Answer(format!("has column {name} of type {}, not BIGINT", array.data_type()))),
+            None => Err(DiffError::Answer(format!(
+                "has column {name} of type {}, not BIGINT",
+                array.data_type()
+            ))),
         }
     };
     for row in 0..batch.num_rows() {
@@ -233,7 +262,9 @@ fn read_answer(batch: &RecordBatch, out: &mut [(u64, Summary, bool)]) -> Result<
         let ns = int(ns.as_ref(), "ns", row)?.unwrap_or(0);
         let Some((_, summary, known)) = out.iter_mut().find(|it| it.0 == build) else {
             // alloc: an error
-            return Err(DiffError::Answer(format!("has a row of build {build}, which was not asked")));
+            return Err(DiffError::Answer(format!(
+                "has a row of build {build}, which was not asked"
+            )));
         };
         match text(part.as_ref(), "part", row)?.as_deref() {
             Some("build") => *known = true,
@@ -290,8 +321,13 @@ fn phases_tsv(text: &str) -> BTreeMap<String, Cost> {
     let mut out = BTreeMap::new();
     for line in text.lines().skip(1) {
         let mut cells = line.split('\t');
-        let (Some(name), Some(count), Some(wall_ms)) = (cells.next(), cells.next(), cells.next()) else { continue };
-        let (Ok(count), Ok(wall_ms)) = (count.parse::<u64>(), wall_ms.parse::<f64>()) else { continue };
+        let (Some(name), Some(count), Some(wall_ms)) = (cells.next(), cells.next(), cells.next())
+        else {
+            continue;
+        };
+        let (Ok(count), Ok(wall_ms)) = (count.parse::<u64>(), wall_ms.parse::<f64>()) else {
+            continue;
+        };
         // alloc: a row, once a diff
         out.insert(name.to_owned(), Cost { count, ns: (wall_ms * 1e6).round() as i64 });
     }
@@ -307,17 +343,24 @@ pub fn render(a: &Side, of_a: &Summary, b: &Side, of_b: &Summary, limit: usize) 
     match (&of_a.phases, &of_b.phases) {
         (Ok(pa), Ok(pb)) => {
             let rows = changed(pa, pb, |it| it.ns, |x, y| x.count != y.count);
-            table(&mut out, "phases", "every span of each name, wall time", &rows, limit, |out, (_, x, y)| {
-                let _ = write!(
-                    out,
-                    "{:>10.1} ms -> {:>10.1} ms {:>+10.1} ms   {} -> {} times",
-                    ms(x.ns),
-                    ms(y.ns),
-                    ms(y.ns - x.ns),
-                    x.count,
-                    y.count
-                );
-            });
+            table(
+                &mut out,
+                "phases",
+                "every span of each name, wall time",
+                &rows,
+                limit,
+                |out, (_, x, y)| {
+                    let _ = write!(
+                        out,
+                        "{:>10.1} ms -> {:>10.1} ms {:>+10.1} ms   {} -> {} times",
+                        ms(x.ns),
+                        ms(y.ns),
+                        ms(y.ns - x.ns),
+                        x.count,
+                        y.count
+                    );
+                },
+            );
         }
         (Err(why), _) => _ = writeln!(out, "phases: not recorded for {a}: {why}"),
         (_, Err(why)) => _ = writeln!(out, "phases: not recorded for {b}: {why}"),
@@ -326,7 +369,13 @@ pub fn render(a: &Side, of_a: &Summary, b: &Side, of_b: &Summary, limit: usize) 
         (Ok(ua), Ok(ub)) => {
             let rows = changed(ua, ub, |it| *it, |_, _| false);
             table(&mut out, "units", "their unit phases' time", &rows, limit, |out, (_, x, y)| {
-                let _ = write!(out, "{:>10.1} ms -> {:>10.1} ms {:>+10.1} ms", ms(*x), ms(*y), ms(y - x));
+                let _ = write!(
+                    out,
+                    "{:>10.1} ms -> {:>10.1} ms {:>+10.1} ms",
+                    ms(*x),
+                    ms(*y),
+                    ms(y - x)
+                );
             });
         }
         (Err(why), _) => _ = writeln!(out, "units: not recorded for {a}: {why}"),
@@ -334,9 +383,14 @@ pub fn render(a: &Side, of_a: &Summary, b: &Side, of_b: &Summary, limit: usize) 
     }
     let kinds = |from: &BTreeMap<String, u64>, to: &BTreeMap<String, u64>| -> Vec<(String, u64)> {
         // clone: an error kind's name, once a diff
-        from.iter().filter(|(kind, _)| !to.contains_key(*kind)).map(|(kind, n)| (kind.clone(), *n)).collect()
+        from.iter()
+            .filter(|(kind, _)| !to.contains_key(*kind))
+            .map(|(kind, n)| (kind.clone(), *n))
+            .collect()
     };
-    for (what, rows) in [("added", kinds(&of_b.errors, &of_a.errors)), ("gone", kinds(&of_a.errors, &of_b.errors))] {
+    for (what, rows) in
+        [("added", kinds(&of_b.errors, &of_a.errors)), ("gone", kinds(&of_a.errors, &of_b.errors))]
+    {
         if rows.is_empty() {
             let _ = writeln!(out, "errors {what}: none");
             continue;
@@ -363,11 +417,19 @@ fn changed<'a, T: Default + Copy>(
     let mut rows: Vec<(&str, T, T)> = a
         .keys()
         .chain(b.keys().filter(|it| !a.contains_key(*it)))
-        .map(|key| (key.as_str(), a.get(key).copied().unwrap_or_default(), b.get(key).copied().unwrap_or_default()))
+        .map(|key| {
+            (
+                key.as_str(),
+                a.get(key).copied().unwrap_or_default(),
+                b.get(key).copied().unwrap_or_default(),
+            )
+        })
         .filter(|(_, x, y)| ns(x) != ns(y) || also(x, y))
         // alloc: the diff's rows, once a diff
         .collect();
-    rows.sort_by(|x, y| (ns(&y.2) - ns(&y.1)).abs().cmp(&(ns(&x.2) - ns(&x.1)).abs()).then(x.0.cmp(y.0)));
+    rows.sort_by(|x, y| {
+        (ns(&y.2) - ns(&y.1)).abs().cmp(&(ns(&x.2) - ns(&x.1)).abs()).then(x.0.cmp(y.0))
+    });
     rows
 }
 
@@ -461,7 +523,10 @@ errors gone:
     #[test]
     fn a_side_is_a_build_or_a_log() {
         assert_eq!(Side::parse("12"), Side::Build(12));
-        assert_eq!(Side::parse("/tmp/self-0151.log"), Side::Log(PathBuf::from("/tmp/self-0151.log")));
+        assert_eq!(
+            Side::parse("/tmp/self-0151.log"),
+            Side::Log(PathBuf::from("/tmp/self-0151.log"))
+        );
     }
 
     /// A log's errors and the phases of the profile it names; it has no unit's time.
@@ -470,7 +535,11 @@ errors gone:
         let dir = std::env::temp_dir().join(format!("blaze-diff-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("profile")).unwrap();
-        fs::write(dir.join("profile/phases.tsv"), "phase\tcount\twall_ms\tcpu_ms\nmir\t3\t12.500\t10.000\n").unwrap();
+        fs::write(
+            dir.join("profile/phases.tsv"),
+            "phase\tcount\twall_ms\tcpu_ms\nmir\t3\t12.500\t10.000\n",
+        )
+        .unwrap();
         let log = format!(
             "error: proc-macro derive panicked\n\nerror: could not compile `app` (lib) due to 1 previous error\n\
              blaze: profile of 1 processes in {}: trace.json (ui.perfetto.dev), phases.tsv, functions.tsv, passes.tsv\n",
@@ -485,9 +554,22 @@ errors gone:
         let bare = of_log(&dir.join("bare.log")).unwrap();
         assert_eq!(bare.errors, map(&[("E0411", 1)]));
         assert_eq!(bare.phases, Err("its log names no BLAZE_PROFILE directory".to_owned()));
-        let said = render(&Side::Log(dir.join("build.log")), &summary, &Side::Log(dir.join("bare.log")), &bare, LIMIT);
-        assert!(said.contains("phases: not recorded for ") && said.contains("bare.log: its log names no"), "{said}");
-        assert!(said.contains("errors added:\n  E0411 1\nerrors gone:\n  derive-panic 1\n"), "{said}");
+        let said = render(
+            &Side::Log(dir.join("build.log")),
+            &summary,
+            &Side::Log(dir.join("bare.log")),
+            &bare,
+            LIMIT,
+        );
+        assert!(
+            said.contains("phases: not recorded for ")
+                && said.contains("bare.log: its log names no"),
+            "{said}"
+        );
+        assert!(
+            said.contains("errors added:\n  E0411 1\nerrors gone:\n  derive-panic 1\n"),
+            "{said}"
+        );
         _ = fs::remove_dir_all(&dir);
     }
 
@@ -497,7 +579,9 @@ errors gone:
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn two_builds_of_the_history_diff_through_duckdb() {
         use crate::history::{BuildRow, CAP_BYTES, History, Outcome};
-        let duckdb = PathBuf::from(std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"));
+        let duckdb = PathBuf::from(
+            std::env::var_os("BLAZE_DUCKDB").expect("BLAZE_DUCKDB names the pinned DuckDB CLI"),
+        );
         crate::install();
         let dir = std::env::temp_dir().join(format!("blaze-diff-duckdb-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
@@ -505,7 +589,8 @@ errors gone:
         for (build, ms) in [(81u32, 1), (82, 30)] {
             std::thread::spawn(move || {
                 let _build = crate::flight::building(build);
-                let _unit = tracing::info_span!(target: "blaze", "unit codegen", krate = "app").entered();
+                let _unit =
+                    tracing::info_span!(target: "blaze", "unit codegen", krate = "app").entered();
                 blaze_graph::spin::busy(std::time::Duration::from_millis(ms));
             })
             .join()
@@ -528,8 +613,20 @@ errors gone:
             history.build_ended(row);
             if build == 82 {
                 let mut rows = Vec::new();
-                let of = errors::Of { build_id: 82, krate: Some("app"), unit: Some("app (lib)"), ..errors::Of::default() };
-                errors::rows(errors::Said { message: "proc-macro derive panicked", ..errors::Said::default() }, of, &mut rows);
+                let of = errors::Of {
+                    build_id: 82,
+                    krate: Some("app"),
+                    unit: Some("app (lib)"),
+                    ..errors::Of::default()
+                };
+                errors::rows(
+                    errors::Said {
+                        message: "proc-macro derive panicked",
+                        ..errors::Said::default()
+                    },
+                    of,
+                    &mut rows,
+                );
                 history.errored(rows);
             }
             history.flush(Some(u64::from(build))).unwrap();
@@ -548,7 +645,10 @@ errors gone:
     #[test]
     #[ignore = "reads /tmp/blaze-lanes/self-0151.log and self-0209PST.log; run with --ignored --nocapture"]
     fn the_self_build_logs_diff() {
-        let (a, b) = (Side::parse("/tmp/blaze-lanes/self-0151.log"), Side::parse("/tmp/blaze-lanes/self-0209PST.log"));
+        let (a, b) = (
+            Side::parse("/tmp/blaze-lanes/self-0151.log"),
+            Side::parse("/tmp/blaze-lanes/self-0209PST.log"),
+        );
         println!("{}", run(&a, &b, None, Path::new("/nowhere")).unwrap());
     }
 }

@@ -123,7 +123,13 @@ impl<'a, R: Recent> Mutator<'a, R> {
     }
 
     /// One mutation; false when it doesn't apply to `data`.
-    pub(crate) fn apply(&mut self, mutation: Mutation, data: &mut Vec<u8>, other: &[u8], limit: usize) -> bool {
+    pub(crate) fn apply(
+        &mut self,
+        mutation: Mutation,
+        data: &mut Vec<u8>,
+        other: &[u8],
+        limit: usize,
+    ) -> bool {
         let r = &mut self.random;
         let len = data.len();
         match mutation {
@@ -210,7 +216,9 @@ impl<'a, R: Recent> Mutator<'a, R> {
                     let head = r.below(len + 1);
                     let tail = r.below(other.len());
                     data.truncate(head);
-                    data.extend_from_slice(&other[tail..other.len().min(tail + limit.saturating_sub(head))]);
+                    data.extend_from_slice(
+                        &other[tail..other.len().min(tail + limit.saturating_sub(head))],
+                    );
                     return true;
                 }
                 return part_of(r, data, other, limit);
@@ -256,7 +264,13 @@ impl<'a, R: Recent> Mutator<'a, R> {
 
 /// Where `from` is in `data` (from a random place on), `to` over it; else `to` put anywhere.
 /// `from` and `to` are as long as each other.
-fn replace_or_put(r: &mut Random, data: &mut Vec<u8>, from: &[u8], to: &[u8], limit: usize) -> bool {
+fn replace_or_put(
+    r: &mut Random,
+    data: &mut Vec<u8>,
+    from: &[u8],
+    to: &[u8],
+    limit: usize,
+) -> bool {
     if !from.is_empty() && data.len() >= from.len() {
         let last = data.len() - from.len();
         let start = r.below(last + 1);
@@ -324,7 +338,9 @@ fn ascii_integer(r: &mut Random, data: &mut Vec<u8>, limit: usize) -> bool {
         return false;
     };
     let end = (start..data.len()).find(|&at| !data[at].is_ascii_digit()).unwrap_or(data.len());
-    let value = data[start..end].iter().fold(0u64, |n, &d| n.wrapping_mul(10).wrapping_add((d - b'0') as u64));
+    let value = data[start..end]
+        .iter()
+        .fold(0u64, |n, &d| n.wrapping_mul(10).wrapping_add((d - b'0') as u64));
     let value = match r.below(5) {
         0 => value.wrapping_add(1),
         1 => value.wrapping_sub(1),

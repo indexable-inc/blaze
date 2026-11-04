@@ -91,8 +91,19 @@ const ANSWER_SCHEMA: SchemaHash = schema("blaze v2 item store 1 answer record");
 
 /// What every shape of `step` of the body whose identity is `identity` is filed under, before
 /// its slot: `schema` is the schema of the step's answers, `version` the solver version.
-pub(super) fn base_key(identity: &ContentId, step: Step, schema: &SchemaHash, version: &ContentId) -> ContentId {
-    Hasher::new(BASE_DOMAIN).id(identity).update(&[step as u8]).id(&RECORDS.0).id(&schema.0).id(version).finish()
+pub(super) fn base_key(
+    identity: &ContentId,
+    step: Step,
+    schema: &SchemaHash,
+    version: &ContentId,
+) -> ContentId {
+    Hasher::new(BASE_DOMAIN)
+        .id(identity)
+        .update(&[step as u8])
+        .id(&RECORDS.0)
+        .id(&schema.0)
+        .id(version)
+        .finish()
 }
 
 /// The key of the shape in slot `n` of `base`.
@@ -158,7 +169,10 @@ fn fact_of(row: &FactRow) -> Result<FactRef, &'static str> {
     Ok(FactRef { kind: QueryKind(row.kind), subject: row.subject, object })
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "the `map_err` callback of every read, which hands it the error by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `map_err` callback of every read, which hands it the error by value"
+)]
 fn format_error(error: FormatError) -> String {
     // alloc: the reason a record does not open
     error.to_string()

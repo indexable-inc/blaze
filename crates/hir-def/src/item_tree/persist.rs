@@ -272,8 +272,9 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
     let name = |id: NameId| (id.raw as usize) < tree.names().len();
     let path = |id: PathId| (id.raw as usize) < tree.paths().len();
     let path_or_none = |id: PathId| id == PathId::NONE || path(id);
-    let alias =
-        |id: AliasId| matches!(id, AliasId::NONE | AliasId::UNDERSCORE) || name(NameId { raw: id.raw });
+    let alias = |id: AliasId| {
+        matches!(id, AliasId::NONE | AliasId::UNDERSCORE) || name(NameId { raw: id.raw })
+    };
     let named = |name_id: NameId, vis_id: RawVisibilityId| name(name_id) && vis(vis_id);
     // A list of items, each before the item `holder` that holds the list.
     let list = |range: IdRange, holder: usize| {
@@ -944,11 +945,11 @@ pub(crate) fn assert_round_trip(tree: &ItemTree) {
 
 #[cfg(test)]
 mod tests {
+    use hir_expand::fixture;
     use span::{
         Edition, EditionedFileId, ErasedFileAstId, FileId, ROOT_ERASED_FILE_AST_ID, SpanAnchor,
         SyntaxContext, TextRange, TextSize,
     };
-    use hir_expand::fixture;
 
     use super::*;
 
@@ -1070,10 +1071,8 @@ fn f() {}
         let mut out = Writer::new(<TestRoot as Record>::SCHEMA);
         let placed = w.place(&mut out);
         let at = out.next::<TestRoot>();
-        let root = out.push(&TestRoot {
-            words: placed.rec(at + offset_of!(TestRoot, words) as u64),
-            first,
-        });
+        let root = out
+            .push(&TestRoot { words: placed.rec(at + offset_of!(TestRoot, words) as u64), first });
         let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
         let root = blaze_format::open::<TestRoot>(&buffer).expect("a buffer just written");
         let mut r = Read::new(&root.words, &buffer).from(root.first);
@@ -1138,7 +1137,8 @@ fn f() {}
 
     #[test]
     fn a_token_tree_with_an_invisible_top_it_dropped_rebuilds_equal() {
-        let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span(0, 0, 0)));
+        let mut builder =
+            tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span(0, 0, 0)));
         builder.open(tt::DelimiterKind::Invisible, span(0, 9, 1));
         builder.push(tt::Leaf::Ident(tt::Ident::new("x", span(0, 1, 1))));
         builder.open(tt::DelimiterKind::Parenthesis, span(2, 1, 2));
@@ -1155,14 +1155,16 @@ fn f() {}
     #[test]
     fn a_token_tree_of_many_spans_and_symbols_rebuilds_equal() {
         // More span parts than 15 and symbols than 63: the tables sorted by frequency.
-        let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span(0, 0, 0)));
+        let mut builder =
+            tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span(0, 0, 0)));
         builder.open(tt::DelimiterKind::Brace, span(0, 1, 0));
         for index in 0..200u32 {
             if index % 17 == 0 {
                 builder.open(tt::DelimiterKind::Bracket, span(index * 4, 1, index % 23));
             }
             let name = format!("ident{}", index % 80);
-            builder.push(tt::Leaf::Ident(tt::Ident::new(&name, span(index * 4 + 1, 2, index % 29))));
+            builder
+                .push(tt::Leaf::Ident(tt::Ident::new(&name, span(index * 4 + 1, 2, index % 29))));
             if index % 17 == 16 {
                 builder.close(span(index * 4 + 3, 1, index % 31));
             }
@@ -1172,7 +1174,8 @@ fn f() {}
         let tree = builder.build_skip_top_subtree();
         round_trip(&tree);
 
-        let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span(0, 0, 3)));
+        let mut builder =
+            tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(span(0, 0, 3)));
         for index in 0..100u32 {
             let name = format!("sym{index}");
             builder.push(tt::Leaf::Ident(tt::Ident::new(&name, span(index, 1, index % 40))));
@@ -1309,7 +1312,8 @@ use a::{b, c};
     /// path read back with each context it was written with.
     #[test]
     fn a_visibility_context_round_trips() {
-        let path = hir_expand::mod_path::ModPath::from_kind(hir_expand::mod_path::PathKind::Super(1));
+        let path =
+            hir_expand::mod_path::ModPath::from_kind(hir_expand::mod_path::PathKind::Super(1));
         for edition in [Edition::Edition2015, Edition::Edition2024] {
             let ctxt = SyntaxContext::root(edition);
             round_trip(&RawVisibility::Module(path, VisibilityExplicitness::Explicit, ctxt));

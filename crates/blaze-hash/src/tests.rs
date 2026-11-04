@@ -182,7 +182,12 @@ fn sip_is_siphash() {
     use crate::sip::{SipKey, sip};
     let key = SipKey::new(0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908);
     let message: Vec<u8> = (0..64u8).collect(); // alloc: a test's message
-    let reference = [0x726f_db47_dd0e_0e31, 0x74f8_39c5_93dc_67fd, 0x0d6c_8009_d9a9_4f5a, 0x8567_6696_d7fb_7e2d];
+    let reference = [
+        0x726f_db47_dd0e_0e31,
+        0x74f8_39c5_93dc_67fd,
+        0x0d6c_8009_d9a9_4f5a,
+        0x8567_6696_d7fb_7e2d,
+    ];
     for (len, expected) in reference.into_iter().enumerate() {
         assert_eq!(sip::<2, 4>(key, &message[..len]), expected, "SipHash-2-4 of {len} bytes");
     }
@@ -270,9 +275,18 @@ fn the_streaming_hasher_is_siphash_of_the_bytes_written() {
                     bytes.extend_from_slice(&wide.to_le_bytes());
                 }
             }
-            assert_eq!(ours.finish(), key.hash(&bytes), "round {round}: a prefix of {} bytes", bytes.len());
+            assert_eq!(
+                ours.finish(),
+                key.hash(&bytes),
+                "round {round}: a prefix of {} bytes",
+                bytes.len()
+            );
         }
-        assert_eq!(ours.finish(), std13.finish(), "round {round}: std's SipHash-1-3 of the same writes");
+        assert_eq!(
+            ours.finish(),
+            std13.finish(),
+            "round {round}: std's SipHash-1-3 of the same writes"
+        );
         assert_eq!(ours.finish(), key.hash(&bytes), "round {round}: {} bytes", bytes.len());
     }
     // A derived `Hash` goes through it: `hash_one` is the hasher's.
@@ -303,9 +317,14 @@ fn hash_cost() {
         Adt(u32, u32),
         Array(u32, u64),
     }
-    let kinds: Vec<Kind> = (0..1u32 << 16) // alloc: a bench's inputs
-        .map(|i| if i % 2 == 0 { Kind::Adt(i, i / 3) } else { Kind::Array(i, u64::from(i) << 7) })
-        .collect();
+    let kinds: Vec<Kind> =
+        (0..1u32 << 16) // alloc: a bench's inputs
+            .map(
+                |i| {
+                    if i % 2 == 0 { Kind::Adt(i, i / 3) } else { Kind::Array(i, u64::from(i) << 7) }
+                },
+            )
+            .collect();
     let murmur = |hash: u64| {
         let hash = (hash ^ (hash >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
         let hash = (hash ^ (hash >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
@@ -344,7 +363,10 @@ fn hash_cost() {
 fn honest_keys_never_walk_the_refused_run() {
     use crate::adaptive::refused_run;
     assert_eq!([refused_run(4), refused_run(9), refused_run(27)], [169, 187, 252]);
-    assert!((4..40).all(|log| refused_run(log) < refused_run(log + 1)), "the bound grows with the table");
+    assert!(
+        (4..40).all(|log| refused_run(log) < refused_run(log + 1)),
+        "the bound grows with the table"
+    );
     for log in [10u32, 13, 16] {
         for base in [0u64, 1 << 32, 0x5eed << 40] {
             let len = 1usize << log;

@@ -79,18 +79,17 @@ impl File {
     pub fn restore(dir: &Path) -> (File, Said) {
         let _span = tracing::info_span!(target: "blaze", "restore blaze why's ledger").entered();
         let path = dir.join(LEDGER);
-        let mut file =
-            File {
-                dir: dir.to_path_buf(),
-                path,
-                ledger: Ledger::default(),
-                len: 0,
-                live: 0,
-                writable: true,
-                behind: None,
-                compact: false,
-                torn_at: None,
-            };
+        let mut file = File {
+            dir: dir.to_path_buf(),
+            path,
+            ledger: Ledger::default(),
+            len: 0,
+            live: 0,
+            writable: true,
+            behind: None,
+            compact: false,
+            torn_at: None,
+        };
         let mut said = Said { torn: None, said: None };
         // alloc: once a daemon start, the notes a restore makes
         let mut notes: Vec<String> = Vec::new();
@@ -151,7 +150,12 @@ impl File {
 
     /// `build`'s misses explained ([`Ledger::explain`]): its answer's items and the history's
     /// rows, and the record to write after the answer is sent ([`File::write`]).
-    pub fn explain(&mut self, build: u64, ended_well: bool, misses: Vec<blaze_kernel::Miss>) -> (Vec<Rebuild>, Vec<MissRow>, Vec<u8>) {
+    pub fn explain(
+        &mut self,
+        build: u64,
+        ended_well: bool,
+        misses: Vec<blaze_kernel::Miss>,
+    ) -> (Vec<Rebuild>, Vec<MissRow>, Vec<u8>) {
         let _span = tracing::info_span!(target: "blaze", "explain a build's misses", build, misses = misses.len()).entered();
         let explained = self.ledger.explain(build, ended_well, misses);
         (explained.rebuilt, explained.rows, explained.record)
@@ -211,7 +215,7 @@ impl File {
             },
             Some(Fault::Tail { keep, why }) => {
                 if !self.ledger.is_empty() {
-                    // The cut record was a build's that ended well: its subjects' last computes
+                    // The cut record was a build's: its subjects' last computes
                     // are lost, so every record before it is compared with nothing. The ledger
                     // is written whole with that gap at the restore, so a second restart keeps it.
                     let after = self.ledger.after_newest();
@@ -291,7 +295,10 @@ impl File {
 
     /// The file cut to its first `len` bytes in place, and synced.
     fn cut(&mut self, len: u64) -> Result<(), String> {
-        let cut = fs::OpenOptions::new().write(true).open(&self.path).and_then(|it| it.set_len(len).and_then(|()| it.sync_all()));
+        let cut = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .and_then(|it| it.set_len(len).and_then(|()| it.sync_all()));
         match cut {
             Ok(()) => {
                 (self.len, self.live) = (len, len);
@@ -300,7 +307,9 @@ impl File {
             Err(error) => {
                 self.writable = false;
                 // alloc: error path
-                Err(format!("cutting it back to {len} bytes: {error}, so no build's record is written to it"))
+                Err(format!(
+                    "cutting it back to {len} bytes: {error}, so no build's record is written to it"
+                ))
             }
         }
     }
@@ -329,40 +338,56 @@ impl File {
             })
             .and_then(|()| fs::File::open(&self.dir).and_then(|it| it.sync_all()));
         match marked {
-            Ok(()) => (format!("{error}; build {build} is marked a gap in {}, and the next build writes the ledger whole", gap.display()), true), // alloc: error path
-            Err(it) if it.kind() == std::io::ErrorKind::AlreadyExists => match fs::read_to_string(&gap).map(|it| it.trim().parse::<u64>().ok()) {
-                Ok(Some(held)) if held < build => match write_whole(&self.dir, &gap, build.to_string().as_bytes()) {
-                    Ok(()) => (format!("{error}; build {build} is marked a gap in {}, over build {held}", gap.display()), true), // alloc: error path
-                    Err(failed) => (
+            Ok(()) => (
+                format!(
+                    "{error}; build {build} is marked a gap in {}, and the next build writes the ledger whole",
+                    gap.display()
+                ),
+                true,
+            ), // alloc: error path
+            Err(it) if it.kind() == std::io::ErrorKind::AlreadyExists => {
+                match fs::read_to_string(&gap).map(|it| it.trim().parse::<u64>().ok()) {
+                    Ok(Some(held)) if held < build => {
+                        match write_whole(&self.dir, &gap, build.to_string().as_bytes()) {
+                            Ok(()) => (
+                                format!(
+                                    "{error}; build {build} is marked a gap in {}, over build {held}",
+                                    gap.display()
+                                ),
+                                true,
+                            ), // alloc: error path
+                            Err(failed) => (
+                                format!(
+                                    "{error}; and marking build {build} a gap in {} over build {held}: {}, so a restart before the ledger is written whole compares with records older than build {build}'s",
+                                    gap.display(),
+                                    failed.why
+                                ),
+                                false,
+                            ), // alloc: error path
+                        }
+                    }
+                    // One naming no build is a gap after every record, and one naming this build or
+                    // a later one is this gap or a later one: either covers this one, once it is on
+                    // disk. An earlier process may have died before syncing it, so it is synced
+                    // with its directory before the cut trusts it.
+                    Ok(_) => match sync_held(&self.dir, &gap) {
+                        Ok(()) => (error, true),
+                        Err(failed) => (
+                            format!(
+                                "{error}; and {failed}, so it may not survive a power loss and the ledger is not cut on its word"
+                            ),
+                            false,
+                        ), // alloc: error path
+                    },
+                    Err(read) => (
                         format!(
-                            "{error}; and marking build {build} a gap in {} over build {held}: {}, so a restart before the ledger is written whole compares with records older than build {build}'s",
-                            gap.display(),
-                            failed.why
+                            "{error}; and reading {} to mark build {build} a gap: {read}, so a restart before the ledger is written whole may compare with records older than build {build}'s",
+                            gap.display()
                         ),
                         false,
                     ), // alloc: error path
-                },
-                // One naming no build is a gap after every record, and one naming this build or
-                // a later one is this gap or a later one: either covers this one, once it is on
-                // disk. An earlier process may have died before syncing it, so it is synced
-                // with its directory before the cut trusts it.
-                Ok(_) => match sync_held(&self.dir, &gap) {
-                    Ok(()) => (error, true),
-                    Err(failed) => (
-                        format!(
-                            "{error}; and {failed}, so it may not survive a power loss and the ledger is not cut on its word"
-                        ),
-                        false,
-                    ), // alloc: error path
-                },
-                Err(read) => (
-                    format!(
-                        "{error}; and reading {} to mark build {build} a gap: {read}, so a restart before the ledger is written whole may compare with records older than build {build}'s",
-                        gap.display()
-                    ),
-                    false,
-                ), // alloc: error path
-            },
+                }
+            }
             Err(it) => (
                 format!(
                     "{error}; and marking build {build} a gap in {}: {it}, so a restart before the ledger is written whole compares with records older than build {build}'s",
@@ -392,7 +417,13 @@ impl File {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             // alloc: error path
-            Err(error) => Err(Unwritten { why: format!("removing {} after writing the ledger whole: {error}", self.dir.join(GAP).display()), replaced: true }),
+            Err(error) => Err(Unwritten {
+                why: format!(
+                    "removing {} after writing the ledger whole: {error}",
+                    self.dir.join(GAP).display()
+                ),
+                replaced: true,
+            }),
         }
     }
 
@@ -402,8 +433,14 @@ impl File {
     fn append(&self, record: &[u8]) -> Result<u64, String> {
         use std::io::Write as _;
         let path = &self.path;
-        let fail = |doing: &str, error: std::io::Error| format!("{doing} blaze why's ledger {}: {error}", path.display()); // alloc: error path
-        let mut file = fs::OpenOptions::new().append(true).create(true).open(path).map_err(|it| fail("opening", it))?;
+        let fail = |doing: &str, error: std::io::Error| {
+            format!("{doing} blaze why's ledger {}: {error}", path.display())
+        }; // alloc: error path
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(|it| fail("opening", it))?;
         let len = file.metadata().map_err(|it| fail("reading", it))?.len();
         let magic = super::magic();
         let mut wrote = Ok(());
@@ -456,7 +493,10 @@ impl File {
             Ok(it) => it,
             Err(error) => {
                 // alloc: error path
-                notes.push(format!("listing {} for hidden files of a whole write of blaze why's ledger: {error}", self.dir.display()));
+                notes.push(format!(
+                    "listing {} for hidden files of a whole write of blaze why's ledger: {error}",
+                    self.dir.display()
+                ));
                 return;
             }
         };
@@ -518,9 +558,13 @@ fn next_aside(dir: &Path, kind: &str) -> Result<(PathBuf, u64, Vec<u64>), String
     let taken: Vec<u64> = match fs::read_dir(dir) {
         Ok(entries) => entries
             .flatten()
-            .filter_map(|it| it.file_name().to_str().and_then(|name| name.strip_prefix(&prefix)?.parse().ok()))
+            .filter_map(|it| {
+                it.file_name().to_str().and_then(|name| name.strip_prefix(&prefix)?.parse().ok())
+            })
             .collect(),
-        Err(error) => return Err(format!("listing {} to set the ledger aside: {error}", dir.display())), // alloc: error path
+        Err(error) => {
+            return Err(format!("listing {} to set the ledger aside: {error}", dir.display()));
+        } // alloc: error path
     };
     let n = match taken.iter().max() {
         None => 1,
@@ -569,7 +613,11 @@ fn write_whole(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Unwritten> {
     written.map_err(|(doing, error)| {
         _ = fs::remove_file(&hidden);
         // alloc: error path
-        let why = format!("writing {} whole through {}, {doing}: {error}", path.display(), hidden.display());
+        let why = format!(
+            "writing {} whole through {}, {doing}: {error}",
+            path.display(),
+            hidden.display()
+        );
         Unwritten { why, replaced: doing == SYNC_DIR }
     })
 }
@@ -581,9 +629,13 @@ fn sync_held(dir: &Path, gap: &Path) -> Result<(), String> {
         .and_then(|it| it.sync_all())
         .map_err(|error| format!("syncing the gap file {} already there: {error}", gap.display())) // alloc: error path
         .and_then(|()| {
-            fs::File::open(dir)
-                .and_then(|it| it.sync_all())
-                .map_err(|error| format!("syncing {}, the directory of the gap file {} already there: {error}", dir.display(), gap.display())) // alloc: error path
+            fs::File::open(dir).and_then(|it| it.sync_all()).map_err(|error| {
+                format!(
+                    "syncing {}, the directory of the gap file {} already there: {error}",
+                    dir.display(),
+                    gap.display()
+                )
+            }) // alloc: error path
         })
 }
 
@@ -597,7 +649,13 @@ mod tests {
 
     fn miss(subject: u8, code: u8) -> Miss {
         let parts = vec![Part::new("its code", Some(ContentId([code; 32])))];
-        Miss::of_parts("codegen dev template", ContentId([subject; 32]), "app::f".to_owned(), ContentId([code; 32]), parts)
+        Miss::of_parts(
+            "codegen dev template",
+            ContentId([subject; 32]),
+            "app::f".to_owned(),
+            ContentId([code; 32]),
+            parts,
+        )
     }
 
     /// One build's record written, as a daemon writes it.
@@ -609,8 +667,10 @@ mod tests {
 
     fn names(dir: &Path) -> Vec<String> {
         // alloc: a test's listing
-        let mut out: Vec<String> =
-            fs::read_dir(dir).unwrap().map(|it| it.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut out: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         out.sort();
         out
     }
@@ -647,8 +707,16 @@ mod tests {
         let (_, said) = File::restore(dir);
         assert!(said.torn.is_none());
         assert!(said.said.unwrap().contains("cut short"));
-        assert_eq!(names(dir), [LEDGER, "why.ledger.tail.1"], "a torn tail is cut in place, not moved aside");
-        assert_eq!(fs::read(dir.join("why.ledger.tail.1")).unwrap().as_slice(), &torn[keep..], "what was cut is copied aside first");
+        assert_eq!(
+            names(dir),
+            [LEDGER, "why.ledger.tail.1"],
+            "a torn tail is cut in place, not moved aside"
+        );
+        assert_eq!(
+            fs::read(dir.join("why.ledger.tail.1")).unwrap().as_slice(),
+            &torn[keep..],
+            "what was cut is copied aside first"
+        );
         // A restart before the next build: the gap the cut marked went into the file with the
         // ledger, so the second restore still compares build 3's record with nothing.
         let (mut file, said) = File::restore(dir);
@@ -669,7 +737,11 @@ mod tests {
         let (file, said) = File::restore(dir);
         assert!(file.ledger.is_empty());
         assert!(said.torn.unwrap().contains("why.ledger.version.1"));
-        assert_eq!(fs::read(dir.join("why.ledger.version.1")).unwrap(), other, "moved aside untouched");
+        assert_eq!(
+            fs::read(dir.join("why.ledger.version.1")).unwrap(),
+            other,
+            "moved aside untouched"
+        );
         assert!(!path.exists() || fs::metadata(&path).unwrap().len() <= 32);
 
         // An append that fails (the ledger's path is a directory) marks a gap that a restart
@@ -698,11 +770,15 @@ mod tests {
                     build: 7,
                     parts: Vec::new(),
                     beyond: None,
+                    unfinished: false,
                     subject: ContentId([1; 32]),
                 },
             );
             let (rebuilt, _, _) = file.explain(9, true, vec![miss(1, 3)]);
-            assert!(matches!(&rebuilt[0].cause, RebuildCause::NotExplained { what } if what.contains("before build 8")), "{rebuilt:?}");
+            assert!(
+                matches!(&rebuilt[0].cause, RebuildCause::NotExplained { what } if what.contains("before build 8")),
+                "{rebuilt:?}"
+            );
         }
     }
 
@@ -729,7 +805,11 @@ mod tests {
         let (mut file, said) = File::restore(dir);
         let torn = said.torn.unwrap();
         assert!(torn.contains("record 0") && torn.contains("why.ledger.corrupt.1"), "{torn}");
-        assert_eq!(fs::read(dir.join("why.ledger.corrupt.1")).unwrap(), bytes, "moved aside untouched");
+        assert_eq!(
+            fs::read(dir.join("why.ledger.corrupt.1")).unwrap(),
+            bytes,
+            "moved aside untouched"
+        );
         assert!(file.ledger.is_empty() && file.ledger.gap.is_none());
         assert_eq!(built(&mut file, 5, 9)[0].cause, RebuildCause::First);
 
@@ -799,7 +879,11 @@ mod tests {
         let (file, said) = File::restore(dir);
         let said = said.said.unwrap();
         assert!(said.contains("making the hidden file") && said.contains("over build 2"), "{said}");
-        assert_eq!(fs::read_to_string(dir.join(GAP)).unwrap(), "4", "the later gap is the one on disk");
+        assert_eq!(
+            fs::read_to_string(dir.join(GAP)).unwrap(),
+            "4",
+            "the later gap is the one on disk"
+        );
         assert_eq!(fs::metadata(&path).unwrap().len(), keep as u64, "cut once the gap is on disk");
         assert!(file.writable && file.behind.is_some());
         fs::remove_dir(&hidden).unwrap();

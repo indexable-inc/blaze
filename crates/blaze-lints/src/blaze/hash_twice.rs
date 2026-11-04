@@ -77,7 +77,8 @@ const CONCURRENT_CHANGES: &[&str] = &[
     "shrink_to_fit",
 ];
 /// The conversions a key is followed through: each keeps the value it is called on.
-const CONVERSIONS: &[&str] = &["clone", "to_owned", "to_string", "into", "as_str", "as_ref", "borrow"];
+const CONVERSIONS: &[&str] =
+    &["clone", "to_owned", "to_string", "into", "as_str", "as_ref", "borrow"];
 /// papaya's map and set, and what their `pin()` lends.
 const PAPAYA: &[&str] = &["HashMap", "HashSet", "HashMapRef", "HashSetRef"];
 
@@ -127,7 +128,11 @@ impl Place {
     /// any step.
     fn overlaps(&self, other: &Place) -> bool {
         self.root == other.root
-            && self.steps.iter().zip(&other.steps).all(|(a, b)| a == b || *a == Step::Index || *b == Step::Index)
+            && self
+                .steps
+                .iter()
+                .zip(&other.steps)
+                .all(|(a, b)| a == b || *a == Step::Index || *b == Step::Index)
     }
 
     /// Whether `self` and `other` are surely one place: equal, with no index.
@@ -184,7 +189,11 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
         match fix {
             Some(part) => {
                 // alloc: the fix's one part
-                diagnostic.multipart_suggestion("look the key up once", vec![part], Applicability::MachineApplicable);
+                diagnostic.multipart_suggestion(
+                    "look the key up once",
+                    vec![part],
+                    Applicability::MachineApplicable,
+                );
             }
             None => {
                 diagnostic.help(it.help);
@@ -211,7 +220,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return found };
     let walk = Walk { cx, def, body: analysis.body(), analysis };
     // alloc: the map calls of one body, a few
-    let mut calls: Vec<MapCall> = walk.body.exprs().filter_map(|(id, _)| walk.map_call(id)).collect();
+    let mut calls: Vec<MapCall> =
+        walk.body.exprs().filter_map(|(id, _)| walk.map_call(id)).collect();
     if !calls.iter().any(|it| it.op == Op::Lookup) {
         return found;
     }
@@ -296,7 +306,9 @@ impl<'db> Walk<'_, 'db, '_> {
             Op::Write
         } else if match family {
             Family::Owned => self.changes_self(f),
-            Family::Concurrent | Family::Papaya => CONCURRENT_CHANGES.contains(&method_name) || self.changes_self(f),
+            Family::Concurrent | Family::Papaya => {
+                CONCURRENT_CHANGES.contains(&method_name) || self.changes_self(f)
+            }
         } {
             Op::Change
         } else {
@@ -357,7 +369,9 @@ impl<'db> Walk<'_, 'db, '_> {
     fn key_core(&self, key: ExprId, depth: u32) -> ExprId {
         let Some(depth) = depth.checked_sub(1) else { return key };
         match self.body.expr(key) {
-            Expr::Ref { expr, .. } | Expr::UnaryOp { expr, op: UnaryOp::Deref } => self.key_core(expr, depth),
+            Expr::Ref { expr, .. } | Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
+                self.key_core(expr, depth)
+            }
             Expr::MethodCall { receiver, args: [], .. } => {
                 let converts = written_callee(self.analysis.infer(), self.body, key)
                     .is_some_and(|(f, _)| CONVERSIONS.contains(&self.name(f)));
@@ -377,10 +391,16 @@ impl<'db> Walk<'_, 'db, '_> {
         match (self.body.expr(a), self.body.expr(b)) {
             (Expr::Literal(x), Expr::Literal(y)) => x == y,
             (Expr::Path(_), Expr::Path(_)) => {
-                let (x, y) = (value_of(self.db(), self.def, self.body, a), value_of(self.db(), self.def, self.body, b));
+                let (x, y) = (
+                    value_of(self.db(), self.def, self.body, a),
+                    value_of(self.db(), self.def, self.body, b),
+                );
                 x.is_some()
                     && x == y
-                    && matches!(x, Some(ValueNs::LocalBinding(_) | ValueNs::ConstId(_) | ValueNs::StaticId(_)))
+                    && matches!(
+                        x,
+                        Some(ValueNs::LocalBinding(_) | ValueNs::ConstId(_) | ValueNs::StaticId(_))
+                    )
             }
             _ => match (self.place_of(a, PLACE_DEPTH), self.place_of(b, PLACE_DEPTH)) {
                 (Some(x), Some(y)) => x.same(&y),
@@ -394,7 +414,8 @@ impl<'db> Walk<'_, 'db, '_> {
     /// to one (or to what is not a place it can tell apart).
     fn changed_between(&self, from: TextSize, to: TextSize, watched: &[Place]) -> bool {
         let overlaps = |expr: ExprId| {
-            self.place_of(expr, PLACE_DEPTH).is_some_and(|it| watched.iter().any(|w| w.overlaps(&it)))
+            self.place_of(expr, PLACE_DEPTH)
+                .is_some_and(|it| watched.iter().any(|w| w.overlaps(&it)))
         };
         for (id, expr) in self.body.exprs() {
             let Some(range) = self.analysis.expr_range(id) else { continue };
@@ -405,16 +426,23 @@ impl<'db> Walk<'_, 'db, '_> {
                 Expr::Ref { expr, mutability: Mutability::Mut, .. } => overlaps(expr),
                 Expr::BinaryOp { lhs, op: Some(BinaryOp::Assignment { .. }), .. } => overlaps(lhs),
                 Expr::MethodCall { receiver, .. } => {
-                    written_callee(self.analysis.infer(), self.body, id).is_some_and(|(f, _)| self.changes_self(f))
+                    written_callee(self.analysis.infer(), self.body, id)
+                        .is_some_and(|(f, _)| self.changes_self(f))
                         && overlaps(receiver)
                 }
                 Expr::Assignment { target, .. } => {
                     let mut hit = false;
                     self.body.walk_pats(target, &mut |pat| match self.body.pat(pat) {
-                        Pat::Expr(it) => hit |= self.place_of(it, PLACE_DEPTH).is_none_or(|place| {
-                            watched.iter().any(|w| w.overlaps(&place))
-                        }),
-                        Pat::Wild | Pat::Tuple { .. } | Pat::Slice { .. } | Pat::Rest | Pat::Missing => {}
+                        Pat::Expr(it) => {
+                            hit |= self
+                                .place_of(it, PLACE_DEPTH)
+                                .is_none_or(|place| watched.iter().any(|w| w.overlaps(&place)))
+                        }
+                        Pat::Wild
+                        | Pat::Tuple { .. }
+                        | Pat::Slice { .. }
+                        | Pat::Rest
+                        | Pat::Missing => {}
                         _ => hit = true,
                     });
                     hit
@@ -439,8 +467,12 @@ impl<'db> Walk<'_, 'db, '_> {
         // `contains_key(&k)` and `insert(k.clone(), ..)`): what is hashed twice.
         let key_text = snippet(self.key_core(key, KEY_DEPTH)).unwrap_or("the key");
         let message = match map {
-            Some(map) => format!("`{map}` hashes and looks up `{key_text}` twice: `{looked}` here, then `{wrote}`"),
-            None => format!("this map hashes and looks up `{key_text}` twice: `{looked}` here, then `{wrote}`"),
+            Some(map) => format!(
+                "`{map}` hashes and looks up `{key_text}` twice: `{looked}` here, then `{wrote}`"
+            ),
+            None => format!(
+                "this map hashes and looks up `{key_text}` twice: `{looked}` here, then `{wrote}`"
+            ),
         };
         Found {
             range: lookup.range,
@@ -453,10 +485,19 @@ impl<'db> Walk<'_, 'db, '_> {
 
     /// The fix of `if !map.contains_key(&k) { map.insert(k, v); }` (and of a set's
     /// `contains` and `insert`): the `if`'s range and what replaces it.
-    fn classic_fix(&self, parents: &Parents, lookup: &MapCall, write: &MapCall) -> Option<(TextRange, String)> {
+    fn classic_fix(
+        &self,
+        parents: &Parents,
+        lookup: &MapCall,
+        write: &MapCall,
+    ) -> Option<(TextRange, String)> {
         let body = self.body;
         let wanted = if write.set { "contains" } else { "contains_key" };
-        if write.family != Family::Owned || !write.method || !lookup.method || self.name(lookup.f) != wanted {
+        if write.family != Family::Owned
+            || !write.method
+            || !lookup.method
+            || self.name(lookup.f) != wanted
+        {
             return None;
         }
         if self.name(write.f) != "insert" {
@@ -465,12 +506,16 @@ impl<'db> Walk<'_, 'db, '_> {
         let not = parents.of_expr(lookup.id)?;
         let Expr::UnaryOp { op: UnaryOp::Not, .. } = body.expr(not) else { return None };
         let if_ = parents.of_expr(not)?;
-        let Expr::If { condition, then_branch, else_branch: None } = body.expr(if_) else { return None };
+        let Expr::If { condition, then_branch, else_branch: None } = body.expr(if_) else {
+            return None;
+        };
         if condition != not {
             return None;
         }
         // The `if`'s block is the write alone.
-        let Expr::Block { statements, tail, label: None, .. } = body.expr(then_branch) else { return None };
+        let Expr::Block { statements, tail, label: None, .. } = body.expr(then_branch) else {
+            return None;
+        };
         let alone = match (statements.len(), tail) {
             (0, Some(it)) => it == write.id,
             (1, None) => statements
@@ -483,7 +528,9 @@ impl<'db> Walk<'_, 'db, '_> {
             return None;
         }
         // The `if` is a statement of a block, or its tail.
-        let Expr::Block { statements: around, tail: around_tail, .. } = body.expr(parents.of_expr(if_)?) else {
+        let Expr::Block { statements: around, tail: around_tail, .. } =
+            body.expr(parents.of_expr(if_)?)
+        else {
             return None;
         };
         let semi = match around.into_iter().find_map(|it| match it {
@@ -505,7 +552,8 @@ impl<'db> Walk<'_, 'db, '_> {
         }
         let Expr::MethodCall { receiver, args, .. } = body.expr(write.id) else { return None };
         let Root::Local(map_root) = write.place.root else { return None };
-        let movable = |it: ExprId| !self.flows(it) && !mentions(self.db(), self.def, body, it, &[map_root]);
+        let movable =
+            |it: ExprId| !self.flows(it) && !mentions(self.db(), self.def, body, it, &[map_root]);
         if !args.iter().all(|&it| movable(it)) {
             return None;
         }
@@ -604,7 +652,8 @@ fn exclusive(body: &Body, parents: &Parents, a: ExprId, b: ExprId) -> bool {
             branch(child_a) && branch(child_b)
         }
         Expr::Match { arms, .. } => {
-            let arm = |it: ExprId| arms.iter().position(|arm| arm.expr == it || arm.guard == Some(it));
+            let arm =
+                |it: ExprId| arms.iter().position(|arm| arm.expr == it || arm.guard == Some(it));
             matches!((arm(child_a), arm(child_b)), (Some(x), Some(y)) if x != y)
         }
         _ => false,

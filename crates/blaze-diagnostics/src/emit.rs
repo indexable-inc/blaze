@@ -124,7 +124,10 @@ impl fmt::Display for Unplaced {
                 write!(f, "a diagnostic's span at byte {byte} of `{file}`, whose text was not read")
             }
             Unplaced::PastEnd { file, byte, len } => {
-                write!(f, "a diagnostic's span at byte {byte} of `{file}`, which is {len} bytes long")
+                write!(
+                    f,
+                    "a diagnostic's span at byte {byte} of `{file}`, which is {len} bytes long"
+                )
             }
         }
     }
@@ -208,7 +211,10 @@ impl File {
     /// The bytes of 0-based line `line`, from its start to the start of the next one.
     fn line_bounds(&self, line: usize) -> std::ops::Range<usize> {
         let start_of = |line: usize| {
-            u32::try_from(line).ok().and_then(|line| self.lines.line_start(line)).map_or(self.text.len(), usize::from)
+            u32::try_from(line)
+                .ok()
+                .and_then(|line| self.lines.line_start(line))
+                .map_or(self.text.len(), usize::from)
         };
         start_of(line)..start_of(line + 1)
     }
@@ -303,7 +309,8 @@ impl Sources {
         let mut unplaced = None;
         each_span(diag, &mut |span| {
             if unplaced.is_none() {
-                unplaced = [span.lo, span.hi].into_iter().find_map(|byte| self.unplaced(&span.file, byte));
+                unplaced =
+                    [span.lo, span.hi].into_iter().find_map(|byte| self.unplaced(&span.file, byte));
             }
         });
         unplaced.map_or(Ok(()), Err)
@@ -346,7 +353,11 @@ impl Sources {
         };
         if at > file.len {
             // alloc: as above
-            return Err(Unplaced::PastEnd { file: shown(name).to_owned(), byte: at, len: file.len });
+            return Err(Unplaced::PastEnd {
+                file: shown(name).to_owned(),
+                byte: at,
+                len: file.len,
+            });
         }
         let (line, column) = file.position(file.norm(at));
         Ok((line as u32, column as u32 + 1))
@@ -451,9 +462,12 @@ fn each_file<'a>(diag: &'a Diag, f: &mut impl FnMut(&'a str)) {
 /// Each span `diag` writes: its own, its children's and its suggestions', and each macro call
 /// and definition they are in.
 fn each_span<'a>(diag: &'a Diag, f: &mut impl FnMut(&'a Span)) {
-    let spans = spans_of(&diag.span)
-        .chain(diag.children.iter().flat_map(|it| spans_of(&it.span)))
-        .chain(diag.suggestions.iter().flat_map(|it| it.substitutions.iter().flatten().map(|(span, _)| span)));
+    let spans =
+        spans_of(&diag.span).chain(diag.children.iter().flat_map(|it| spans_of(&it.span))).chain(
+            diag.suggestions
+                .iter()
+                .flat_map(|it| it.substitutions.iter().flatten().map(|(span, _)| span)),
+        );
     for span in spans {
         meet(span, f);
     }
@@ -550,8 +564,12 @@ fn explains(diag: &Diag) -> bool {
     diag.level == Level::FailureNote
         && diag.code.is_none()
         && (diag.message.starts_with("Some errors have detailed explanations: ")
-            || diag.message.starts_with("For more information about this error, try `rustc --explain ")
-            || diag.message.starts_with("For more information about an error, try `rustc --explain "))
+            || diag
+                .message
+                .starts_with("For more information about this error, try `rustc --explain ")
+            || diag
+                .message
+                .starts_with("For more information about an error, try `rustc --explain "))
 }
 
 /// rustc's closing diagnostics after a crate's: "aborting due to N previous errors; M warnings
@@ -569,8 +587,8 @@ pub fn summary<'d>(diags: impl IntoIterator<Item = &'d Diag> + Clone) -> Vec<Dia
         return Vec::new(); // alloc: empty, allocates nothing
     }
     let warned = match warnings {
-        0 => String::new(), // alloc: empty, allocates nothing
-        1 => "1 warning emitted".to_owned(), // alloc: a closing line written, the edge
+        0 => String::new(),                           // alloc: empty, allocates nothing
+        1 => "1 warning emitted".to_owned(),          // alloc: a closing line written, the edge
         count => format!("{count} warnings emitted"), // alloc: a closing line written, the edge
     };
     let aborted = match errors {
@@ -652,7 +670,8 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
     if let Some(code) = diag.code.as_ref().and_then(Code::error) {
         title = title.id(code);
     }
-    let mut report: Vec<Group<'a>> = Vec::with_capacity(2 + diag.children.len() + suggestions.len());
+    let mut report: Vec<Group<'a>> =
+        Vec::with_capacity(2 + diag.children.len() + suggestions.len());
     let mut group = Group::with_title(title);
 
     if diag.span.primary_span().is_some() {
@@ -671,11 +690,13 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
             group = group.element(level.message(message));
             continue;
         }
-        report.push(std::mem::replace(&mut group, Group::with_title(level.secondary_title(message))));
+        report
+            .push(std::mem::replace(&mut group, Group::with_title(level.secondary_title(message))));
         if child.span.primary_span().is_some() {
             let mut extra: Labels<'a> = SmallVec::new();
             macro_labels(&child.span, &mut extra);
-            let unshown = Unshown { level: sublevel_of(child.level), short: style.short, pad_last: false };
+            let unshown =
+                Unshown { level: sublevel_of(child.level), short: style.short, pad_last: false };
             group = snippets(group, &child.span, extra, placed, &mut report, &unshown);
         }
     }
@@ -708,7 +729,8 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
                         message.to_mut().push_str(confusion.label_text());
                     }
                     let fold = !attribute_suggestion(file, &mut parts);
-                    let Some((start, end, line)) = shrink_file(file, parts.iter().map(|it| (it.lo, it.hi)))
+                    let Some((start, end, line)) =
+                        shrink_file(file, parts.iter().map(|it| (it.lo, it.hi)))
                     else {
                         continue;
                     };
@@ -864,15 +886,21 @@ fn unannotated<'a>(
         let (hi_line, hi_column) = file.position(annotation.hi);
         if !lines.contains(&lo_line) && (i == 0 || hi_line <= lo_line) {
             lines.push(lo_line);
-            group = group.element(annotate_snippets::Origin::path(path).line(lo_line).char_column(lo_column));
+            group = group.element(
+                annotate_snippets::Origin::path(path).line(lo_line).char_column(lo_column),
+            );
         }
         let label = annotation.label.filter(|it| !it.is_empty());
         if hi_line > lo_line && label.is_some() && !lines.contains(&hi_line) {
             lines.push(hi_line);
-            group = group.element(annotate_snippets::Origin::path(path).line(hi_line).char_column(hi_column));
+            group = group.element(
+                annotate_snippets::Origin::path(path).line(hi_line).char_column(hi_column),
+            );
         }
         if let Some(label) = label {
-            group = group.element(annotate_snippets::Padding).element(annotate_snippets::Level::NOTE.message(label));
+            group = group
+                .element(annotate_snippets::Padding)
+                .element(annotate_snippets::Level::NOTE.message(label));
         }
     }
     group
@@ -881,10 +909,15 @@ fn unannotated<'a>(
 /// rustc's `collect_annotations` of `MultiSpan::span_labels`: the labelled spans in the order
 /// they were labelled, then the primary spans with no label, by file in the order they are
 /// met, each file's by line, leaving out those not in their file.
-fn collect_annotations<'a>(span: &'a MultiSpan, extra: Labels<'a>, placed: &Placed<'a>) -> Annotated<'a> {
+fn collect_annotations<'a>(
+    span: &'a MultiSpan,
+    extra: Labels<'a>,
+    placed: &Placed<'a>,
+) -> Annotated<'a> {
     let mut unlabelled: SmallVec<[&'a Span; 2]> = SmallVec::new();
     for at in &span.primary {
-        let labelled = span.labels.iter().any(|(it, _)| it == at) || extra.iter().any(|(it, _)| *it == at);
+        let labelled =
+            span.labels.iter().any(|(it, _)| it == at) || extra.iter().any(|(it, _)| *it == at);
         if !labelled && !unlabelled.contains(&at) {
             unlabelled.push(at);
         }
@@ -941,7 +974,10 @@ fn annotated_snippet<'a>(
 
 /// rustc's `shrink_file`: where the whole lines `ranges` are on start and end, and the line
 /// number of the first.
-fn shrink_file(file: &File, ranges: impl Iterator<Item = (usize, usize)>) -> Option<(usize, usize, usize)> {
+fn shrink_file(
+    file: &File,
+    ranges: impl Iterator<Item = (usize, usize)>,
+) -> Option<(usize, usize, usize)> {
     let (lo, hi) = ranges.reduce(|(lo, hi), (a, b)| (lo.min(a), hi.max(b)))?;
     let lo_line = file.line_of(lo);
     let start = file.line_bounds(lo_line).start;
@@ -1020,7 +1056,8 @@ fn attribute_suggestion(file: &File, parts: &mut [Part<'_>]) -> bool {
 /// whose definition rustc knows.
 fn macro_labels<'a>(span: &'a MultiSpan, labels: &mut Labels<'a>) {
     for primary in &span.primary {
-        let Some(expansion) = primary.macro_backtrace().filter(|it| it.def_site.is_some()).last() else {
+        let Some(expansion) = primary.macro_backtrace().filter(|it| it.def_site.is_some()).last()
+        else {
             continue;
         };
         let call = &expansion.call_site;
@@ -1217,7 +1254,9 @@ mod tests {
     use super::*;
 
     fn starts(file: &File) -> Vec<u32> {
-        (0..file.lines.line_count()).map(|line| file.lines.line_start(line).unwrap().into()).collect()
+        (0..file.lines.line_count())
+            .map(|line| file.lines.line_start(line).unwrap().into())
+            .collect()
     }
 
     #[test]
@@ -1298,7 +1337,8 @@ mod tests {
         assert_eq!(sources.position("a.rs", 4), Some((1, 5)));
         assert_eq!(sources.position("b.rs", 0), None);
         assert_eq!(sources.position("c.rs", 0), None);
-        let diag = Diag::error(None, "x", Span { file: "b.rs".to_owned(), lo: 0, hi: 0, expansion: None });
+        let diag =
+            Diag::error(None, "x", Span { file: "b.rs".to_owned(), lo: 0, hi: 0, expansion: None });
         assert!(sources.unread([&diag]).is_empty());
     }
 
@@ -1313,7 +1353,10 @@ mod tests {
 
     #[test]
     fn text_without_chars_to_replace_is_borrowed() {
-        assert!(matches!(normalize_whitespace(Cow::Borrowed("expected `u32`, 中文")), Cow::Borrowed(_)));
+        assert!(matches!(
+            normalize_whitespace(Cow::Borrowed("expected `u32`, 中文")),
+            Cow::Borrowed(_)
+        ));
         assert_eq!(normalize_whitespace(Cow::Borrowed("a\tb\u{200d}c")), "a    bc");
         // `’` starts with 0xE2 too and is kept as it is.
         assert_eq!(normalize_whitespace(Cow::Borrowed("it’s")), "it’s");
@@ -1327,21 +1370,41 @@ mod tests {
     #[test]
     fn a_text_not_on_disk_and_the_file_at_its_path_are_two_names() {
         let on_disk = "pub fn f() {}\n";
-        let appended = format!("{on_disk}pub mod __blaze_test_harness {{\n    extern crate test;\n}}\n");
+        let appended =
+            format!("{on_disk}pub mod __blaze_test_harness {{\n    extern crate test;\n}}\n");
         let lo = appended.find("extern").unwrap() as u32;
         let named = name_with_id("src/lib.rs", "0f3a");
         assert_ne!(named, "src/lib.rs");
-        assert!(names_text(&named) && !names_text("src/lib.rs") && !names_text(&name_with_text("<crate attribute>", "\u{1}")));
+        assert!(
+            names_text(&named)
+                && !names_text("src/lib.rs")
+                && !names_text(&name_with_text("<crate attribute>", "\u{1}"))
+        );
         assert_eq!(shown(&named), "src/lib.rs");
-        let diag = Diag::error(Some("E0463"), "can't find crate for `test`", Span { file: named.clone(), lo, hi: lo + 18, expansion: None });
+        let diag = Diag::error(
+            Some("E0463"),
+            "can't find crate for `test`",
+            Span { file: named.clone(), lo, hi: lo + 18, expansion: None },
+        );
         let mut sources = Sources::default();
         sources.add("src/lib.rs", Some(on_disk.to_owned()));
-        assert_eq!(sources.unread([&diag]), [named.as_str()], "the file on disk is not the text the span names");
-        assert_eq!(sources.check(&diag), Err(Unplaced::Unread { file: "src/lib.rs".to_owned(), byte: lo }));
+        assert_eq!(
+            sources.unread([&diag]),
+            [named.as_str()],
+            "the file on disk is not the text the span names"
+        );
+        assert_eq!(
+            sources.check(&diag),
+            Err(Unplaced::Unread { file: "src/lib.rs".to_owned(), byte: lo })
+        );
         sources.add(&named, Some(appended));
         assert_eq!(sources.check(&diag), Ok(()));
         assert_eq!(sources.position(&named, lo), Some((3, 5)));
-        assert_eq!(sources.position("src/lib.rs", lo), None, "the file on disk ends before the module");
+        assert_eq!(
+            sources.position("src/lib.rs", lo),
+            None,
+            "the file on disk ends before the module"
+        );
     }
 
     /// Two files with no path shown by one name: each span reads its own file's text from its
@@ -1351,9 +1414,13 @@ mod tests {
         let a = name_with_text("<crate attribute>", "#![(]");
         let b = name_with_text("<crate attribute>", "#![feature(foo),feature(bar)]");
         assert_ne!(a, b);
-        assert_eq!((shown(&a), shown(&b), shown("src/lib.rs")), ("<crate attribute>", "<crate attribute>", "src/lib.rs"));
+        assert_eq!(
+            (shown(&a), shown(&b), shown("src/lib.rs")),
+            ("<crate attribute>", "<crate attribute>", "src/lib.rs")
+        );
         let first = Diag::error(None, "x", Span { file: a.clone(), lo: 3, hi: 4, expansion: None });
-        let second = Diag::error(None, "y", Span { file: b.clone(), lo: 15, hi: 16, expansion: None });
+        let second =
+            Diag::error(None, "y", Span { file: b.clone(), lo: 15, hi: 16, expansion: None });
         let sources = Sources::default();
         assert!(sources.unread([&first, &second]).is_empty());
         assert_eq!(sources.position(&a, 3), Some((1, 4)));
@@ -1363,8 +1430,14 @@ mod tests {
         assert!(line.contains(r#""file_name":"<crate attribute>""#), "{line}");
         assert!(line.contains(r##""text":"#![feature(foo),feature(bar)]""##), "{line}");
         let style = Style { ui_testing: true, ..Style::default() };
-        let (first, second) = (rendered(&first, &sources, style).unwrap(), rendered(&second, &sources, style).unwrap());
-        assert!(first.contains("--> <crate attribute>:1:4\n") && first.contains("LL | #![(]\n"), "{first}");
+        let (first, second) = (
+            rendered(&first, &sources, style).unwrap(),
+            rendered(&second, &sources, style).unwrap(),
+        );
+        assert!(
+            first.contains("--> <crate attribute>:1:4\n") && first.contains("LL | #![(]\n"),
+            "{first}"
+        );
         assert!(!first.contains("feature"), "{first}");
         assert!(second.contains("--> <crate attribute>:1:16\n"), "{second}");
         assert!(second.contains("LL | #![feature(foo),feature(bar)]\n"), "{second}");

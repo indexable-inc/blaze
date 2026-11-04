@@ -37,7 +37,10 @@ pub enum CheckKind {
     BoundsCheck,
     /// An arithmetic overflow check; `optional` when a unit built without overflow checks
     /// drops it (`AssertKind::is_optional_overflow_check`).
-    Overflow { op: BinOp, optional: bool },
+    Overflow {
+        op: BinOp,
+        optional: bool,
+    },
     NegOverflow,
     DivisionByZero,
     RemainderByZero,
@@ -55,8 +58,8 @@ impl CheckKind {
             CheckKind::BoundsCheck => "a bounds check".to_owned(), // alloc: a message's part
             CheckKind::Overflow { op, .. } => format!("an overflow check of `{op:?}`"),
             CheckKind::NegOverflow => "an overflow check of a negation".to_owned(), // alloc: as above
-            CheckKind::DivisionByZero => "a division-by-zero check".to_owned(),     // alloc: as above
-            CheckKind::RemainderByZero => "a remainder-by-zero check".to_owned(),   // alloc: as above
+            CheckKind::DivisionByZero => "a division-by-zero check".to_owned(), // alloc: as above
+            CheckKind::RemainderByZero => "a remainder-by-zero check".to_owned(), // alloc: as above
             CheckKind::UbCheck(it) => format!("a UB check ({it})"),
             CheckKind::Panics(it) => format!("a call of `{it}`, which panics"),
         }
@@ -112,13 +115,19 @@ pub fn checks(db: &Db, body: &MirBody<'_>) -> Result<Vec<Check>, UnnamedPanickin
 fn assert_kind(msg: &AssertKind) -> CheckKind {
     match msg {
         AssertKind::BoundsCheck { .. } => CheckKind::BoundsCheck,
-        AssertKind::Overflow(op, ..) => CheckKind::Overflow { op: op.clone(), optional: msg.is_optional_overflow_check() },
+        AssertKind::Overflow(op, ..) => {
+            CheckKind::Overflow { op: op.clone(), optional: msg.is_optional_overflow_check() }
+        }
         AssertKind::OverflowNeg(_) => CheckKind::NegOverflow,
         AssertKind::DivisionByZero(_) => CheckKind::DivisionByZero,
         AssertKind::RemainderByZero(_) => CheckKind::RemainderByZero,
-        AssertKind::MisalignedPointerDereference { .. } => CheckKind::UbCheck("a misaligned pointer dereference"),
+        AssertKind::MisalignedPointerDereference { .. } => {
+            CheckKind::UbCheck("a misaligned pointer dereference")
+        }
         AssertKind::NullPointerDereference => CheckKind::UbCheck("a null pointer dereference"),
-        AssertKind::NullReferenceConstructed => CheckKind::UbCheck("a reference made from a null pointer"),
+        AssertKind::NullReferenceConstructed => {
+            CheckKind::UbCheck("a reference made from a null pointer")
+        }
         AssertKind::InvalidEnumConstruction(_) => CheckKind::UbCheck("an invalid enum value"),
     }
 }
@@ -158,7 +167,8 @@ fn panicking(db: &Db, f: FunctionId) -> Result<Option<String>, UnnamedPanicking>
     }
     let Some(top) = top else { return Ok(None) };
     let top = top.as_str();
-    let listed = PANICKING.iter().any(|(m, names)| *m == top && (names.is_empty() || names.contains(&name)));
+    let listed =
+        PANICKING.iter().any(|(m, names)| *m == top && (names.is_empty() || names.contains(&name)));
     let index = matches!(name, "index" | "index_mut");
     let slice_fail = top == "slice" && name.ends_with("_fail");
     if !(listed || index || slice_fail) {
@@ -180,7 +190,9 @@ pub fn source_span(body: &MirBody<'_>, span: MirSpan) -> (MirSpan, bool) {
         let MirSpan::Inlined(n) = at else { return (at, inlined) };
         inlined = true;
         let Some(it) = body.inlined.spans.get(n as usize) else { return (MirSpan::Unknown, true) };
-        let Some(scope) = body.inlined.scopes.get(it.scope as usize) else { return (MirSpan::Unknown, true) };
+        let Some(scope) = body.inlined.scopes.get(it.scope as usize) else {
+            return (MirSpan::Unknown, true);
+        };
         at = scope.call_site;
     }
     (MirSpan::Unknown, inlined)
@@ -189,7 +201,10 @@ pub fn source_span(body: &MirBody<'_>, span: MirSpan) -> (MirSpan, bool) {
 /// The checks of `body` by the line each is on: `line_of` gives the line of a span of the
 /// body's source (`None` for one it can't place, counted under line 0), lines in order and each
 /// line's checks in the body's block order. For `--bce-lines`.
-pub fn by_line(checks: &[Check], mut line_of: impl FnMut(MirSpan) -> Option<u32>) -> Vec<(u32, Vec<CheckKind>)> {
+pub fn by_line(
+    checks: &[Check],
+    mut line_of: impl FnMut(MirSpan) -> Option<u32>,
+) -> Vec<(u32, Vec<CheckKind>)> {
     // alloc: one function's checks with their lines, sorted so the output is the same every run
     let mut placed: Vec<(u32, usize)> =
         checks.iter().enumerate().map(|(at, it)| (line_of(it.span).unwrap_or(0), at)).collect();

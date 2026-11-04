@@ -17,7 +17,8 @@ pub fn check_slide(grant: &Grant, slide: u64) -> Result<(), Error> {
     }
     match grant.overlays.iter().find(|it| it.image) {
         None => Ok(()),
-        Some(map) => Err(Error::new(format!( // alloc: error path, the start fails
+        Some(map) => Err(Error::new(format!(
+            // alloc: error path, the start fails
             "this run's executable is slid by {slide:#x}, and the dependency image mapped at {:#x}..{:#x} is linked at \
              its base with its own addresses unlisted for rebasing: it runs only unslid (ASLR off for the executable, \
              or an executable linked at a fixed address)",
@@ -68,7 +69,9 @@ pub fn bind(
     for lookup in &grant.lookups {
         let name = grant.name(lookup);
         match find(c_name(grant.format, name)?)? {
-            Some(address) => store(lookup.place.wrapping_add(slide), address.wrapping_add_signed(lookup.addend)),
+            Some(address) => {
+                store(lookup.place.wrapping_add(slide), address.wrapping_add_signed(lookup.addend))
+            }
             None if lookup.weak => store(lookup.place.wrapping_add(slide), 0),
             None => {
                 missing += 1;
@@ -84,7 +87,8 @@ pub fn bind(
             true => format!(" and {} more", missing - MOST_LISTED), // alloc: error path, the start fails
             false => String::new(), // alloc: error path, the start fails
         };
-        return Err(Error::new(format!( // alloc: error path, the start fails
+        return Err(Error::new(format!(
+            // alloc: error path, the start fails
             "the dependency image needs {listed}`{more}, which nothing this run's executable loaded defines: a strong \
              reference to it would call or read through 0"
         )));

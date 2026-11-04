@@ -39,10 +39,9 @@ impl std::fmt::Display for Error {
             Error::Hash { table } => {
                 write!(f, ".ixprof table `{table}`: its bytes do not match the manifest's blake3")
             }
-            Error::Version(v) => write!(
-                f,
-                ".ixprof format_version {v} is newer than this reader's {FORMAT_VERSION}"
-            ),
+            Error::Version(v) => {
+                write!(f, ".ixprof format_version {v} is newer than this reader's {FORMAT_VERSION}")
+            }
         }
     }
 }
@@ -170,10 +169,7 @@ pub const TABLES: [(&str, Columns); 8] = [
             ("fields", Ty::Utf8, true),
         ],
     ),
-    (
-        "stacks",
-        &[("parent", Ty::U32, true), ("frame", Ty::U32, false), ("depth", Ty::U16, false)],
-    ),
+    ("stacks", &[("parent", Ty::U32, true), ("frame", Ty::U32, false), ("depth", Ty::U16, false)]),
     (
         "threads",
         &[
@@ -227,9 +223,9 @@ impl Col {
             (Col::I64(it), _) => Arc::new(Int64Array::from(it.clone())),
             (Col::F64(it), _) => Arc::new(Float64Array::from(it.clone())),
             (Col::Bool(it), _) => Arc::new(BooleanArray::from(it.clone())),
-            (Col::Str(it), Ty::Dict) => Arc::new(
-                it.iter().map(|it| it.as_deref()).collect::<DictionaryArray<UInt32Type>>(),
-            ),
+            (Col::Str(it), Ty::Dict) => {
+                Arc::new(it.iter().map(|it| it.as_deref()).collect::<DictionaryArray<UInt32Type>>())
+            }
             (Col::Str(it), _) => Arc::new(StringArray::from(it.clone())),
         }
     }
@@ -282,7 +278,10 @@ impl Col {
                         }
                         let key = keys.value(i) as usize;
                         if key >= values.len() {
-                            return Err(format!("dictionary key {key} past its {} values", values.len()));
+                            return Err(format!(
+                                "dictionary key {key} past its {} values",
+                                values.len()
+                            ));
                         }
                         Ok((!values.is_null(key)).then(|| values.value(key).to_owned()))
                     })
@@ -310,8 +309,10 @@ impl Table {
             table: self.name.to_owned(),
             why: "is not a table of the format".to_owned(),
         })?;
-        let fields: Vec<Field> =
-            spec.iter().map(|(name, ty, nullable)| Field::new(*name, ty.arrow(), *nullable)).collect();
+        let fields: Vec<Field> = spec
+            .iter()
+            .map(|(name, ty, nullable)| Field::new(*name, ty.arrow(), *nullable))
+            .collect();
         let arrays: Vec<ArrayRef> =
             self.cols.iter().zip(spec).map(|(col, (_, ty, _))| col.array(*ty)).collect();
         #[allow(clippy::disallowed_types, reason = "arrow's schema metadata is a std HashMap")]
@@ -594,7 +595,10 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn err(&self, why: &str) -> Error {
-        Error::Table { table: self.table.name.to_owned(), why: format!("column {}: {why}", self.next) }
+        Error::Table {
+            table: self.table.name.to_owned(),
+            why: format!("column {}: {why}", self.next),
+        }
     }
 
     fn take(&mut self) -> Result<&'a Col, Error> {
@@ -665,7 +669,8 @@ fn rows_into(p: &mut Profile, t: &Table) -> Result<(), Error> {
     let mut r = Reader { table: t, next: 0 };
     match name {
         "alloc_events" => {
-            let (pr, th, ts, st, by, sp) = (r.u32()?, r.u64()?, r.i64()?, r.u32()?, r.i64()?, r.u64()?);
+            let (pr, th, ts, st, by, sp) =
+                (r.u32()?, r.u64()?, r.i64()?, r.u32()?, r.i64()?, r.u64()?);
             for i in 0..n {
                 p.alloc_events.push(AllocEvent {
                     process: req(pr, i, name, "process")?,
@@ -866,7 +871,9 @@ pub(crate) fn meta_json(m: &Meta) -> Json {
 pub(crate) fn meta_from(j: &Json) -> Result<Meta, Error> {
     let s = |k: &str| j.get(k).and_then(Json::as_str).unwrap_or_default().to_owned();
     let i = |k: &str| {
-        j.get(k).and_then(Json::as_i64).ok_or_else(|| Error::Manifest(format!("meta.{k} is not an integer")))
+        j.get(k)
+            .and_then(Json::as_i64)
+            .ok_or_else(|| Error::Manifest(format!("meta.{k} is not an integer")))
     };
     let labels = match j.get("labels") {
         Some(Json::Obj(map)) => map
@@ -924,7 +931,9 @@ impl Profile {
             let manifest = manifest(&id, &meta, &sections, &hashes, base);
             let start = (12 + manifest.len()).next_multiple_of(8);
             if start == base {
-                let mut out = Vec::with_capacity(start + sections.iter().map(|it| it.2.len() + 8).sum::<usize>());
+                let mut out = Vec::with_capacity(
+                    start + sections.iter().map(|it| it.2.len() + 8).sum::<usize>(),
+                );
                 out.extend_from_slice(&MAGIC);
                 out.extend_from_slice(&(manifest.len() as u32).to_le_bytes());
                 out.extend_from_slice(manifest.as_bytes());
@@ -964,7 +973,8 @@ impl Profile {
         if version > u64::from(FORMAT_VERSION) {
             return Err(Error::Version(version));
         }
-        let meta = meta_from(manifest.get("meta").ok_or_else(|| Error::Manifest("no meta".to_owned()))?)?;
+        let meta =
+            meta_from(manifest.get("meta").ok_or_else(|| Error::Manifest("no meta".to_owned()))?)?;
         let mut p = Profile { meta, ..Profile::default() };
         let Some(Json::Arr(list)) = manifest.get("tables") else {
             return Err(Error::Manifest("no tables list".to_owned()));
@@ -976,8 +986,11 @@ impl Profile {
                 continue;
             };
             let err = |why: &str| Error::Table { table: name.to_owned(), why: why.to_owned() };
-            let offset = entry.get("offset").and_then(Json::as_u64).ok_or_else(|| err("no offset"))? as usize;
-            let len = entry.get("len").and_then(Json::as_u64).ok_or_else(|| err("no len"))? as usize;
+            let offset =
+                entry.get("offset").and_then(Json::as_u64).ok_or_else(|| err("no offset"))?
+                    as usize;
+            let len =
+                entry.get("len").and_then(Json::as_u64).ok_or_else(|| err("no len"))? as usize;
             let section = bytes
                 .get(offset..offset.saturating_add(len))
                 .ok_or_else(|| err("its section runs past the end of the file"))?;

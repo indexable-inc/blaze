@@ -21,7 +21,9 @@
 //! changed since a cursor, so nothing is stat-ed to find out). Test code is not checked.
 
 use base_db::Db;
-use hir_def::{DefWithBodyId, FunctionId, HasModule as _, hir::Expr, signatures::FunctionSignature};
+use hir_def::{
+    DefWithBodyId, FunctionId, HasModule as _, hir::Expr, signatures::FunctionSignature,
+};
 use hir_ty::{ParamEnvAndCrate, db::HirDatabase as _};
 
 use super::{
@@ -50,11 +52,28 @@ const STD_FS_METHODS: &[(&str, &[&str])] = &[
     ("DirEntry", &["metadata"]),
 ];
 /// std's modules no stat or open is reached through.
-const STD_STOPS: &[&str] = &["sync", "panicking", "rt", "alloc", "fmt", "collections", "hash", "thread", "time"];
+const STD_STOPS: &[&str] =
+    &["sync", "panicking", "rt", "alloc", "fmt", "collections", "hash", "thread", "time"];
 /// The stat and open calls of `libc`, `rustix` and `nix`.
 const SYSCALLS: &[&str] = &[
-    "stat", "stat64", "lstat", "lstat64", "fstat", "fstat64", "fstatat", "fstatat64", "statat", "statx", "open",
-    "open64", "openat", "openat64", "openat2", "access", "faccessat", "realpath",
+    "stat",
+    "stat64",
+    "lstat",
+    "lstat64",
+    "fstat",
+    "fstat64",
+    "fstatat",
+    "fstatat64",
+    "statat",
+    "statx",
+    "open",
+    "open64",
+    "openat",
+    "openat64",
+    "openat2",
+    "access",
+    "faccessat",
+    "realpath",
 ];
 /// The crates no stat or open is reached through.
 const STOP_CRATES: &[&str] =
@@ -139,12 +158,17 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
         return found;
     }
     let db = cx.db();
-    let env = ParamEnvAndCrate { param_env: db.trait_environment(def.generic_def(db)), krate: def.krate(db) };
+    let env = ParamEnvAndCrate {
+        param_env: db.trait_environment(def.generic_def(db)),
+        krate: def.krate(db),
+    };
     let body = analysis.body();
     let infer = analysis.infer();
     let mut parents = None;
     for (id, expr) in body.exprs() {
-        if !matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. }) || !written_call(analysis, id) {
+        if !matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. })
+            || !written_call(analysis, id)
+        {
             continue;
         }
         let parents = parents.get_or_insert_with(|| Parents::of(body));

@@ -6,9 +6,9 @@ use std::hint::black_box;
 
 use base_db::{Crate, relevant_crates};
 use either::Either;
+use hir_expand::fixture;
 use hir_expand::{Intern, Lookup};
 use intern::{Symbol, sym};
-use hir_expand::fixture;
 
 use crate::{
     AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
@@ -209,7 +209,11 @@ fn attribute_flag_reads_allocate_nothing() {
         }
     };
     read();
-    blaze_alloc_count::assert_at_most(0, "reading the attribute flags of every item and field", read);
+    blaze_alloc_count::assert_at_most(
+        0,
+        "reading the attribute flags of every item and field",
+        read,
+    );
 }
 
 /// Budget: a value query gated by a flag is a bit test for an item without the attribute and a
@@ -243,7 +247,10 @@ fn gated_value_reads_allocate_nothing() {
     };
     read();
     let named = |name: &str| {
-        defs.items.iter().filter_map(|&it| AttrFlags::export_name(&db, it)).any(|it| it.as_str() == name)
+        defs.items
+            .iter()
+            .filter_map(|&it| AttrFlags::export_name(&db, it))
+            .any(|it| it.as_str() == name)
     };
     assert!(named("exported"), "`#[export_name]` was not read");
     let sections: Vec<Symbol> =
@@ -270,14 +277,18 @@ fn interning_a_known_loc_allocates_nothing() {
     let functions: Vec<_> = defs.functions.iter().map(|&it| (it, *it.lookup(&db))).collect();
     // alloc: test setup, outside the measure
     let structs: Vec<_> = defs.structs.iter().map(|&it| (it, *it.lookup(&db))).collect();
-    blaze_alloc_count::assert_at_most(0, "interning every function's and struct's loc again", || {
-        for &(id, loc) in &functions {
-            assert_eq!(loc.intern(&db), id);
-        }
-        for &(id, loc) in &structs {
-            assert_eq!(loc.intern(&db), id);
-        }
-    });
+    blaze_alloc_count::assert_at_most(
+        0,
+        "interning every function's and struct's loc again",
+        || {
+            for &(id, loc) in &functions {
+                assert_eq!(loc.intern(&db), id);
+            }
+            for &(id, loc) in &structs {
+                assert_eq!(loc.intern(&db), id);
+            }
+        },
+    );
 }
 
 /// Budget: a lang item is a memo hit of the crate's table and a field load; a symbol to a lang

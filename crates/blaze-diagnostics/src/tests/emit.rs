@@ -64,8 +64,11 @@ fn ui(style: Style) -> Style {
 /// What rustc writes to stderr for `diags`: each, then its closing ones.
 fn stderr(diags: &[Diag], sources: &Sources, style: Style) -> String {
     let closing = emit::summary(diags);
-    let out: String =
-        diags.iter().chain(&closing).map(|it| emit::written(it, sources, ui(style)).unwrap()).collect();
+    let out: String = diags
+        .iter()
+        .chain(&closing)
+        .map(|it| emit::written(it, sources, ui(style)).unwrap())
+        .collect();
     compiletest(&out, false)
 }
 
@@ -100,7 +103,8 @@ fn ansi(json: &str) -> String {
         rest = &rest[at..];
         let mut codes = false;
         while let Some(after) = rest.strip_prefix(ESCAPE) {
-            let digits = after.find(|c: char| !(c.is_ascii_digit() || c == ';')).unwrap_or(after.len());
+            let digits =
+                after.find(|c: char| !(c.is_ascii_digit() || c == ';')).unwrap_or(after.len());
             if digits == 0 || !after[digits..].starts_with('m') {
                 break;
             }
@@ -130,7 +134,8 @@ fn explained(code: &str) -> String {
 fn one_span_with_a_label() {
     let file = File::new("E0412.rs", "impl Something {} //~ ERROR E0425\n\nfn main() {\n}\n");
     let at = file.span("Something");
-    let mut diag = Diag::error(Some("E0425"), "cannot find type `Something` in this scope", at.clone());
+    let mut diag =
+        Diag::error(Some("E0425"), "cannot find type `Something` in this scope", at.clone());
     diag.span_label(at, "not found in this scope");
     let expected = text(
         r#"
@@ -164,7 +169,8 @@ fn primary_and_secondary_labels_on_one_line() {
 "#,
     );
     let none = file.within("Some(y) | None", "None");
-    let mut diag = Diag::error(Some("E0408"), "variable `y` is not bound in all patterns", none.clone());
+    let mut diag =
+        Diag::error(Some("E0408"), "variable `y` is not bound in all patterns", none.clone());
     diag.span_label(none, "pattern doesn't bind `y`");
     diag.span_label(file.within("Some(y) | None", "y"), "variable not in all patterns");
     let expected = text(
@@ -204,7 +210,10 @@ fn main () {
     let redefined = file.at(second, second + "struct Bar;".len());
     let mut diag =
         Diag::error(Some("E0428"), "the name `Bar` is defined multiple times", redefined.clone());
-    diag.span_label(file.at(first, first + "struct Bar;".len()), "previous definition of the type `Bar` here");
+    diag.span_label(
+        file.at(first, first + "struct Bar;".len()),
+        "previous definition of the type `Bar` here",
+    );
     diag.span_label(redefined, "`Bar` redefined here");
     diag.note("`Bar` must be defined only once in the type namespace of this module");
     let expected = text(
@@ -446,7 +455,8 @@ fn main() {
             .to_owned(),
     };
     let at = main.span("Some(1)");
-    let mut diag = Diag::error(Some("E0004"), "non-exhaustive patterns: `Some(_)` not covered", at.clone());
+    let mut diag =
+        Diag::error(Some("E0004"), "non-exhaustive patterns: `Some(_)` not covered", at.clone());
     diag.span_label(at, "pattern `Some(_)` not covered");
     let mut defined = MultiSpan::of(option.span("pub enum Option<T>"));
     defined.labels.push((option.span("Some(T)"), "not covered".to_owned()));
@@ -519,7 +529,10 @@ fn a_file_whose_source_is_not_shown_is_placed_but_neither_quoted_nor_spliced() {
     let line = emit::json(&diag, &sources, Style::default()).unwrap();
     let json: serde_json::Value = serde_json::from_str(&line).unwrap();
     let defined = &json["spans"][1];
-    assert_eq!((&defined["line_start"], &defined["column_start"]), (&serde_json::json!(2), &serde_json::json!(5)));
+    assert_eq!(
+        (&defined["line_start"], &defined["column_start"]),
+        (&serde_json::json!(2), &serde_json::json!(5))
+    );
     assert_eq!(defined["text"], serde_json::json!([]));
 }
 
@@ -559,7 +572,9 @@ fn main() {}
         call.clone(),
     );
     first.span_label(call, "call to unsafe function");
-    first.note("consult the function's documentation for information on how to avoid undefined behavior");
+    first.note(
+        "consult the function's documentation for information on how to avoid undefined behavior",
+    );
     let static_ = file.within("test1(TEST1)", "TEST1");
     let mut second = Diag::error(
         Some("E0133"),
@@ -603,7 +618,8 @@ fn helps_with_and_without_a_span() {
         "#[derive(inline)] //~ ERROR expected derive macro, found built-in attribute `inline`\nstruct S;\n\nfn main() {}\n",
     );
     let at = file.span("inline");
-    let mut diag = Diag::error(None, "expected derive macro, found built-in attribute `inline`", at.clone());
+    let mut diag =
+        Diag::error(None, "expected derive macro, found built-in attribute `inline`", at.clone());
     diag.span_label(at.clone(), "not a derive macro");
     diag.span_help(at, "remove from the surrounding `derive()`");
     diag.help("add as non-Derive macro\n`#[inline]`");
@@ -879,7 +895,12 @@ fn a_macro_expansion_in_json() {
     assert_eq!(def["text"][0]["text"], "macro_rules! g {");
     assert_eq!(def["column_start"], 1);
     assert_eq!(def["column_end"], 15);
-    assert!(value["rendered"].as_str().unwrap().contains("= note: this error originates in the macro `g`"));
+    assert!(
+        value["rendered"]
+            .as_str()
+            .unwrap()
+            .contains("= note: this error originates in the macro `g`")
+    );
 }
 
 // tests/ui/diagnostic-flags/error-format-short.rs
@@ -951,8 +972,12 @@ fn main() {
 "#,
     );
     assert_eq!(file.text.len(), 567);
-    let mut diag = Diag::lint("unused_mut", "variable does not need to be mutable", file.span("mut x"));
-    diag.span_note(file.within("#![warn(unused_mut)]", "unused_mut"), "the lint level is defined here");
+    let mut diag =
+        Diag::lint("unused_mut", "variable does not need to be mutable", file.span("mut x"));
+    diag.span_note(
+        file.within("#![warn(unused_mut)]", "unused_mut"),
+        "the lint level is defined here",
+    );
     diag.suggestion_with_style(
         vec![(file.span("mut "), String::new())],
         "remove this `mut`",
@@ -993,7 +1018,8 @@ fn main() {
 fn colour_codes_are_rustcs() {
     let file = File::new("E0412.rs", "impl Something {} //~ ERROR E0425\n\nfn main() {\n}\n");
     let at = file.span("Something");
-    let mut diag = Diag::error(Some("E0425"), "cannot find type `Something` in this scope", at.clone());
+    let mut diag =
+        Diag::error(Some("E0425"), "cannot find type `Something` in this scope", at.clone());
     diag.span_label(at.clone(), "not found in this scope");
     diag.span_note(at, "here");
     let style = ui(Style { ansi: true, ..Style::default() });
@@ -1005,12 +1031,23 @@ fn colour_codes_are_rustcs() {
     );
     assert_eq!(lines[1], "  \x1b[1m\x1b[94m--> \x1b[0m$DIR/E0412.rs:1:6");
     assert!(lines.iter().any(|it| *it == "\x1b[1m\x1b[92mnote\x1b[0m: here"), "{rendered:?}");
-    let warned =
-        emit::written(&Diag::new(Level::Warning, None, "1 warning emitted"), &File::sources(&[]), style).unwrap();
+    let warned = emit::written(
+        &Diag::new(Level::Warning, None, "1 warning emitted"),
+        &File::sources(&[]),
+        style,
+    )
+    .unwrap();
     assert_eq!(warned, "\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: 1 warning emitted\x1b[0m\n\n");
-    let failure = Diag::new(Level::FailureNote, None, "For more information about this error, try `rustc --explain E0425`.");
+    let failure = Diag::new(
+        Level::FailureNote,
+        None,
+        "For more information about this error, try `rustc --explain E0425`.",
+    );
     let written = emit::written(&failure, &File::sources(&[]), style).unwrap();
-    assert_eq!(written, "\x1b[1mFor more information about this error, try `rustc --explain E0425`.\x1b[0m\n");
+    assert_eq!(
+        written,
+        "\x1b[1mFor more information about this error, try `rustc --explain E0425`.\x1b[0m\n"
+    );
 }
 
 // tests/ui/lint/future-incompat-json-test.rs, its diagnostic: a lint's JSON with an inline
@@ -1063,7 +1100,8 @@ fn json_short_at_the_end_of_a_file() {
     );
     assert_eq!(file.text.len(), 122);
     let end = file.at(122, 122);
-    let mut diag = Diag::error(Some("E0601"), "`main` function not found in crate `json_short`", end.clone());
+    let mut diag =
+        Diag::error(Some("E0601"), "`main` function not found in crate `json_short`", end.clone());
     diag.span_label(end, "consider adding a `main` function to `$DIR/json-short.rs`");
     let expected = text(
         r#"
@@ -1197,7 +1235,9 @@ fn json_of_children_without_spans_and_of_a_failure_note() {
     assert_eq!(keys.len(), 7);
     assert!(line.starts_with(r#"{"$message_type":"diagnostic","message":"mismatched types","code":{"code":"E0308","explanation":"#));
     assert_eq!(value["rendered"], written.as_str());
-    assert!(line.ends_with(&format!(r#""rendered":{}}}"#, serde_json::to_string(&written).unwrap())));
+    assert!(
+        line.ends_with(&format!(r#""rendered":{}}}"#, serde_json::to_string(&written).unwrap()))
+    );
 
     let failure = &emit::summary(&[diag])[1];
     assert_eq!(
@@ -1210,7 +1250,10 @@ fn json_of_children_without_spans_and_of_a_failure_note() {
     // Only the notes naming codes to explain are left out of short; another failure note is
     // written as one.
     let other = Diag::new(Level::FailureNote, None, "query stack during panic:");
-    assert_eq!(emit::written(&other, &File::sources(&[]), short).unwrap(), "query stack during panic:\n");
+    assert_eq!(
+        emit::written(&other, &File::sources(&[]), short).unwrap(),
+        "query stack during panic:\n"
+    );
 }
 
 /// A suggestion to remove a whole line removes its newline too, in JSON.
@@ -1240,7 +1283,11 @@ fn error(code: Option<&str>) -> Diag {
 }
 
 fn warning() -> Diag {
-    Diag::lint("unused_variables", "w", Span { file: "lib.rs".to_owned(), lo: 0, hi: 1, expansion: None })
+    Diag::lint(
+        "unused_variables",
+        "w",
+        Span { file: "lib.rs".to_owned(), lo: 0, hi: 1, expansion: None },
+    )
 }
 
 fn closing(diags: &[Diag]) -> Vec<(Level, String)> {
@@ -1302,9 +1349,8 @@ fn the_closing_lines_name_the_codes_with_explanations() {
         closing(&[error(Some("E9999")), error(Some("E0599"))])[1].1,
         "For more information about this error, try `rustc --explain E0599`."
     );
-    let ten = [
-        "E0599", "E0308", "E0425", "E0277", "E0061", "E0106", "E0382", "E0499", "E0502", "E0433",
-    ];
+    let ten =
+        ["E0599", "E0308", "E0425", "E0277", "E0061", "E0106", "E0382", "E0499", "E0502", "E0433"];
     let diags: Vec<Diag> = ten.iter().map(|it| error(Some(it))).collect();
     assert_eq!(
         closing(&diags)[1].1,
@@ -1338,8 +1384,14 @@ fn rendered_is_written_without_its_empty_line() {
     let diag = Diag::error(Some("E0308"), "mismatched types", file.at(3, 4));
     let sources = File::sources(&[&file]);
     let rendered = emit::rendered(&diag, &sources, Style::default()).unwrap();
-    assert_eq!(rendered, "error[E0308]: mismatched types\n --> $DIR/lib.rs:1:4\n  |\n1 | fn f() {}\n  |    ^");
-    assert_eq!(emit::written(&diag, &sources, Style::default()).unwrap(), format!("{rendered}\n\n"));
+    assert_eq!(
+        rendered,
+        "error[E0308]: mismatched types\n --> $DIR/lib.rs:1:4\n  |\n1 | fn f() {}\n  |    ^"
+    );
+    assert_eq!(
+        emit::written(&diag, &sources, Style::default()).unwrap(),
+        format!("{rendered}\n\n")
+    );
 }
 
 #[test]

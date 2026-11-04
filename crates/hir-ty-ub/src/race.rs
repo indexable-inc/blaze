@@ -344,7 +344,9 @@ impl Global {
         let clocks = &mut self.vector_clocks[index.index()];
         for (cell_range, cell) in cells.iter_mut(range) {
             let res = match access {
-                AccessType::NaRead(read_type) => cell.non_atomic_read_detect(clocks, index, read_type, site),
+                AccessType::NaRead(read_type) => {
+                    cell.non_atomic_read_detect(clocks, index, read_type, site)
+                }
                 AccessType::NaWrite(write_type) => {
                     cell.non_atomic_write_detect(clocks, index, write_type, site)
                 }
@@ -371,7 +373,11 @@ impl Global {
         range: Span,
         access: AccessType,
         site: SiteId,
-        mut op: impl FnMut(&mut MemoryCellClocks, &mut ThreadClockSet, VectorIdx) -> Result<(), cells::DataRace>,
+        mut op: impl FnMut(
+            &mut MemoryCellClocks,
+            &mut ThreadClockSet,
+            VectorIdx,
+        ) -> Result<(), cells::DataRace>,
     ) -> Result<(), RaceError> {
         debug_assert!(access.is_atomic());
         if !self.multi_threaded {
@@ -409,41 +415,41 @@ impl Global {
         // `Some`: a race of mixed sizes.
         let mut other_size = None;
         let write_clock;
-        let (other_access, other_index, other_clock): (AccessType, VectorIdx, &VClock) =
-            if !access.is_atomic()
-                && let Some(atomic) = cell.atomic()
-                && let Some(idx) = atomic.write_vector.find_gt_index(&active_clocks.clock)
-            {
+        let (other_access, other_index, other_clock): (AccessType, VectorIdx, &VClock) = if !access
+            .is_atomic()
+            && let Some(atomic) = cell.atomic()
+            && let Some(idx) = atomic.write_vector.find_gt_index(&active_clocks.clock)
+        {
+            (AccessType::AtomicStore, idx, &atomic.write_vector)
+        } else if !access.is_atomic()
+            && !access.is_read()
+            && let Some(atomic) = cell.atomic()
+            && let Some(idx) = atomic.read_vector.find_gt_index(&active_clocks.clock)
+        {
+            (AccessType::AtomicLoad, idx, &atomic.read_vector)
+        } else if cell.write.1 > active_clocks.clock[cell.write.0] {
+            write_clock = cell.write();
+            (AccessType::NaWrite(cell.write_type), cell.write.0, &write_clock)
+        } else if !access.is_read()
+            && let Some(idx) = cell.read.find_gt_index(&active_clocks.clock)
+        {
+            (AccessType::NaRead(cell.read[idx].read_type()), idx, &cell.read)
+        } else if access.is_atomic()
+            && let Some(atomic) = cell.atomic()
+            && atomic.size != Some(access_size)
+        {
+            // A race only if some atomic access is unsynchronized: find it.
+            other_size = Some(atomic.size.unwrap_or(0));
+            if let Some(idx) = atomic.write_vector.find_gt_index(&active_clocks.clock) {
                 (AccessType::AtomicStore, idx, &atomic.write_vector)
-            } else if !access.is_atomic()
-                && !access.is_read()
-                && let Some(atomic) = cell.atomic()
-                && let Some(idx) = atomic.read_vector.find_gt_index(&active_clocks.clock)
-            {
+            } else if let Some(idx) = atomic.read_vector.find_gt_index(&active_clocks.clock) {
                 (AccessType::AtomicLoad, idx, &atomic.read_vector)
-            } else if cell.write.1 > active_clocks.clock[cell.write.0] {
-                write_clock = cell.write();
-                (AccessType::NaWrite(cell.write_type), cell.write.0, &write_clock)
-            } else if !access.is_read()
-                && let Some(idx) = cell.read.find_gt_index(&active_clocks.clock)
-            {
-                (AccessType::NaRead(cell.read[idx].read_type()), idx, &cell.read)
-            } else if access.is_atomic()
-                && let Some(atomic) = cell.atomic()
-                && atomic.size != Some(access_size)
-            {
-                // A race only if some atomic access is unsynchronized: find it.
-                other_size = Some(atomic.size.unwrap_or(0));
-                if let Some(idx) = atomic.write_vector.find_gt_index(&active_clocks.clock) {
-                    (AccessType::AtomicStore, idx, &atomic.write_vector)
-                } else if let Some(idx) = atomic.read_vector.find_gt_index(&active_clocks.clock) {
-                    (AccessType::AtomicLoad, idx, &atomic.read_vector)
-                } else {
-                    unreachable!("Failed to report data-race for mixed-size access: no race found")
-                }
             } else {
-                unreachable!("Failed to report data-race")
-            };
+                unreachable!("Failed to report data-race for mixed-size access: no race found")
+            }
+        } else {
+            unreachable!("Failed to report data-race")
+        };
 
         let involves_non_atomic = !access.is_atomic() || !other_access.is_atomic();
         assert!(
@@ -498,7 +504,9 @@ enum Slot {
     /// Never made, or freed.
     Absent,
     /// Made while nothing could race and not accessed since threads exist.
-    Lazy { size: u64 },
+    Lazy {
+        size: u64,
+    },
     Live(AllocClocks),
 }
 
@@ -537,7 +545,8 @@ fn load_op(
     acquire: bool,
     size: u64,
     sync_clock: Option<&VClock>,
-) -> impl FnMut(&mut MemoryCellClocks, &mut ThreadClockSet, VectorIdx) -> Result<(), cells::DataRace> + '_ {
+) -> impl FnMut(&mut MemoryCellClocks, &mut ThreadClockSet, VectorIdx) -> Result<(), cells::DataRace> + '_
+{
     move |cell: &mut MemoryCellClocks, clocks: &mut ThreadClockSet, index: VectorIdx| {
         if acquire {
             cell.load_acquire(clocks, index, size, sync_clock)
@@ -669,7 +678,11 @@ impl Races {
     /// runnable unless it yielded or is preempted, at `Config::preemption_rate`; otherwise the
     /// next runnable thread after it in id order, round robin, so a yield moves on whenever
     /// another thread can run. `runnable` holds every thread that is neither blocked nor ended.
-    pub fn schedule(&mut self, running: ThreadId, runnable: &[ThreadId]) -> Result<ThreadId, Deadlock> {
+    pub fn schedule(
+        &mut self,
+        running: ThreadId,
+        runnable: &[ThreadId],
+    ) -> Result<ThreadId, Deadlock> {
         if runnable.is_empty() {
             let threads = (0..self.global.threads.state.len() as u32)
                 .map(ThreadId)
@@ -800,13 +813,19 @@ impl Races {
             Some(ord) => {
                 let size = range.len;
                 let release = ord.releases();
-                self.atomic(alloc, range, AccessType::AtomicStore, site, move |cell, clocks, index| {
-                    if release {
-                        cell.store_release(clocks, index, size)
-                    } else {
-                        cell.store_relaxed(clocks, index, size)
-                    }
-                })
+                self.atomic(
+                    alloc,
+                    range,
+                    AccessType::AtomicStore,
+                    site,
+                    move |cell, clocks, index| {
+                        if release {
+                            cell.store_release(clocks, index, size)
+                        } else {
+                            cell.store_relaxed(clocks, index, size)
+                        }
+                    },
+                )
             }
         }
     }
@@ -814,7 +833,13 @@ impl Races {
     /// An atomic read-modify-write of `range` of `alloc` that succeeded (a compare-exchange that
     /// failed is [`Races::failed_cxchg`]): it reads the latest store, and its bytes go to
     /// [`Races::store_value`] next (Miri: `validate_atomic_rmw`).
-    pub fn rmw(&mut self, alloc: AllocId, range: Span, ord: AtomicOrd, site: SiteId) -> Result<(), RaceError> {
+    pub fn rmw(
+        &mut self,
+        alloc: AllocId,
+        range: Span,
+        ord: AtomicOrd,
+        site: SiteId,
+    ) -> Result<(), RaceError> {
         self.pending_load = None;
         self.pending_rmw = None;
         let size = range.len;
@@ -847,7 +872,13 @@ impl Races {
     ) -> Result<(), RaceError> {
         self.pending_load = None;
         self.pending_rmw = None;
-        self.atomic(alloc, range, AccessType::AtomicLoad, site, load_op(ord.acquires(), range.len, None))?;
+        self.atomic(
+            alloc,
+            range,
+            AccessType::AtomicLoad,
+            site,
+            load_op(ord.acquires(), range.len, None),
+        )?;
         if self.weak_memory {
             let is_seqcst = ord == AtomicOrd::SeqCst;
             if is_seqcst {
@@ -870,7 +901,13 @@ impl Races {
 
     /// The implicit read or write of a retag of `range` of `alloc` (Miri: Tree Borrows'
     /// `reborrow`, which tells the race detector of the access it does).
-    pub fn retag(&mut self, alloc: AllocId, range: Span, kind: AccessKind, site: SiteId) -> Result<(), RaceError> {
+    pub fn retag(
+        &mut self,
+        alloc: AllocId,
+        range: Span,
+        kind: AccessKind,
+        site: SiteId,
+    ) -> Result<(), RaceError> {
         let access = match kind {
             AccessKind::Read => AccessType::NaRead(NaReadType::Retag),
             AccessKind::Write => AccessType::NaWrite(NaWriteType::Retag),
@@ -903,7 +940,14 @@ impl Races {
     /// for later weak loads (Miri: `buffered_atomic_write` and `buffered_atomic_rmw`). `old` is
     /// what the location held before (`None`: not all initialized): a location's first atomic
     /// store keeps it as the store before it.
-    pub fn store_value(&mut self, alloc: AllocId, range: Span, ord: AtomicOrd, bytes: &[u8], old: Option<&[u8]>) {
+    pub fn store_value(
+        &mut self,
+        alloc: AllocId,
+        range: Span,
+        ord: AtomicOrd,
+        bytes: &[u8],
+        old: Option<&[u8]>,
+    ) {
         let is_rmw = self.pending_rmw.take() == Some((alloc, range));
         self.pending_load = None;
         if !self.weak_memory || range.is_empty() {
@@ -966,7 +1010,13 @@ impl Races {
     }
 
     /// A non-atomic access, when races are possible.
-    fn na(&mut self, alloc: AllocId, range: Span, access: AccessType, site: SiteId) -> Result<(), RaceError> {
+    fn na(
+        &mut self,
+        alloc: AllocId,
+        range: Span,
+        access: AccessType,
+        site: SiteId,
+    ) -> Result<(), RaceError> {
         if !self.global.multi_threaded || range.is_empty() {
             return Ok(());
         }
@@ -981,7 +1031,11 @@ impl Races {
         range: Span,
         access: AccessType,
         site: SiteId,
-        op: impl FnMut(&mut MemoryCellClocks, &mut ThreadClockSet, VectorIdx) -> Result<(), cells::DataRace>,
+        op: impl FnMut(
+            &mut MemoryCellClocks,
+            &mut ThreadClockSet,
+            VectorIdx,
+        ) -> Result<(), cells::DataRace>,
     ) -> Result<(), RaceError> {
         if !self.global.multi_threaded || range.is_empty() {
             return Ok(());
@@ -993,7 +1047,13 @@ impl Races {
     /// An atomic load (Miri: `read_scalar_atomic` and `buffered_atomic_read`): under weak memory,
     /// with a store buffer for exactly `range`, pick the store it reads first and acquire that
     /// store's clock; otherwise read the latest.
-    fn atomic_load(&mut self, alloc: AllocId, range: Span, ord: AtomicOrd, site: SiteId) -> Result<(), RaceError> {
+    fn atomic_load(
+        &mut self,
+        alloc: AllocId,
+        range: Span,
+        ord: AtomicOrd,
+        site: SiteId,
+    ) -> Result<(), RaceError> {
         let size = range.len;
         let acquire = ord.acquires();
         let is_seqcst = ord == AtomicOrd::SeqCst;
@@ -1010,13 +1070,29 @@ impl Races {
                 let index = self.global.active_index();
                 // The store is picked with the clocks before this load's own acquire, as in the
                 // paper's ATOMIC LOAD rule.
-                let (chosen, latest) =
-                    buffer.fetch_store(is_seqcst, &self.global.vector_clocks[index.index()], &mut self.rng);
+                let (chosen, latest) = buffer.fetch_store(
+                    is_seqcst,
+                    &self.global.vector_clocks[index.index()],
+                    &mut self.rng,
+                );
                 let sync_clock = &buffer.element(chosen).sync_clock;
-                self.global.atomic_op(cells, alloc, range, AccessType::AtomicLoad, site, load_op(acquire, size, Some(sync_clock)))?;
+                self.global.atomic_op(
+                    cells,
+                    alloc,
+                    range,
+                    AccessType::AtomicLoad,
+                    site,
+                    load_op(acquire, size, Some(sync_clock)),
+                )?;
                 let index = self.global.active_index();
-                let elem = buffer.load(chosen, index, &self.global.vector_clocks[index.index()], is_seqcst);
-                let value = if latest { Loaded::Latest } else { Loaded::Outdated(elem.val.clone()) };
+                let elem = buffer.load(
+                    chosen,
+                    index,
+                    &self.global.vector_clocks[index.index()],
+                    is_seqcst,
+                );
+                let value =
+                    if latest { Loaded::Latest } else { Loaded::Outdated(elem.val.clone()) };
                 self.pending_load = Some(PendingLoad { alloc, range, value });
                 return Ok(());
             }

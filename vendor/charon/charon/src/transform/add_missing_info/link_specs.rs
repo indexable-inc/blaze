@@ -10,10 +10,7 @@ impl TransformPass for Transform {
                 if let Attribute::IsContract { kind, target } = attr {
                     attrs.push((
                         *target,
-                        Attribute::HasContract {
-                            kind: kind.clone(),
-                            contract: spec_id,
-                        },
+                        Attribute::HasContract { kind: kind.clone(), contract: spec_id },
                     ));
                 }
             }

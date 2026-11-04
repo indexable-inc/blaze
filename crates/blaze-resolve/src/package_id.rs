@@ -1,11 +1,11 @@
 //! A package at a version in a source: `src/workspace/package_id.rs` of cargo 1.99.0
 //! (5f94df4789).
 
+use anyhow::{Result, anyhow};
+use blaze_ids::{Domain, Interner, Sharded};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr;
-use anyhow::{Result, anyhow};
-use blaze_ids::{Domain, Interner, Sharded};
 
 use crate::interning::InternedString;
 use crate::package_id_spec::PackageIdSpec;

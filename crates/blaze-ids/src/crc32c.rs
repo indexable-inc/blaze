@@ -291,7 +291,8 @@ mod tests {
 
     /// Every path this CPU can run, the portable one first, for the differential tests.
     fn paths() -> Vec<(&'static str, fn(u32, &[u8]) -> u32)> {
-        let mut out: Vec<(&'static str, fn(u32, &[u8]) -> u32)> = vec![("portable", extend_portable)];
+        let mut out: Vec<(&'static str, fn(u32, &[u8]) -> u32)> =
+            vec![("portable", extend_portable)];
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("sse4.2") {
             out.push(("sse4.2", extend_sse42));
@@ -349,8 +350,23 @@ mod tests {
     #[test]
     fn every_path_agrees_on_groups() {
         let lens = [
-            1535, 1536, 1537, 3072 + 9, 4096, 10_000, 12_287, 12_288, 12_289, 12_288 + 1536, 16_384,
-            24_576 + 5, 40_000, 65_536, 65_536 + 3, 100_001, 1 << 20,
+            1535,
+            1536,
+            1537,
+            3072 + 9,
+            4096,
+            10_000,
+            12_287,
+            12_288,
+            12_289,
+            12_288 + 1536,
+            16_384,
+            24_576 + 5,
+            40_000,
+            65_536,
+            65_536 + 3,
+            100_001,
+            1 << 20,
         ];
         let buffer = noise((1 << 20) + 16, 3);
         let mut rng = SplitMix64::new(4);
@@ -393,7 +409,8 @@ mod tests {
         let mut rng = SplitMix64::new(7);
         for (stream, table) in ROUNDS {
             let zeros = vec![0u8; stream];
-            for state in [0, 1, !0, 0x8000_0000].into_iter().chain((0..100).map(|_| rng.next_u32())) {
+            for state in [0, 1, !0, 0x8000_0000].into_iter().chain((0..100).map(|_| rng.next_u32()))
+            {
                 assert_eq!(shift(table, state), portable(state, &zeros), "{stream}: {state:#x}");
             }
         }

@@ -55,20 +55,13 @@ fn tree_difference(ours: &TokenTree, theirs: &TokenTree) -> Option<String> {
                 .or_else(|| {
                     (ours.len != theirs.len).then(|| {
                         // alloc: the message of a difference, made only when there is one.
-                        format!(
-                            "it holds {} token trees first and {} second",
-                            ours.len, theirs.len
-                        )
+                        format!("it holds {} token trees first and {} second", ours.len, theirs.len)
                     })
                 })
         }
         (TokenTree::Leaf(ours), TokenTree::Leaf(theirs)) => leaf_difference(ours, theirs),
         // alloc: the message of a difference, made only when there is one.
-        _ => Some(format!(
-            "it is {} first and {} second",
-            tree_kind(ours),
-            tree_kind(theirs)
-        )),
+        _ => Some(format!("it is {} first and {} second", tree_kind(ours), tree_kind(theirs))),
     }
 }
 
@@ -110,11 +103,7 @@ fn leaf_difference(ours: &Leaf, theirs: &Leaf) -> Option<String> {
             span_difference("its", a.span, b.span)
         }
         // alloc: the message of a difference, made only when there is one.
-        _ => Some(format!(
-            "it is {} first and {} second",
-            leaf_kind(ours),
-            leaf_kind(theirs)
-        )),
+        _ => Some(format!("it is {} first and {} second", leaf_kind(ours), leaf_kind(theirs))),
     }
 }
 

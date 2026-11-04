@@ -107,22 +107,28 @@ impl Spec for Map {
                 }
             },
             MapOp::Get(key) => MapRet::Got(self.0.get(&key).copied()),
-            MapOp::Replace(key, n) => MapRet::Replaced(self.0.get_mut(&key).map(|it| std::mem::replace(it, n))),
+            MapOp::Replace(key, n) => {
+                MapRet::Replaced(self.0.get_mut(&key).map(|it| std::mem::replace(it, n)))
+            }
         }
     }
 }
 
 fn insert(table: &Table<Val>, history: &History<Map>, key: u64, n: u64, drops: &Arc<AtomicUsize>) {
     let guard = enter();
-    history.record(MapOp::Insert(key, n), |_| match table.insert(Held::task(&guard), Val::new(key, n, drops)) {
-        Ok(_) => MapRet::Inserted(Ok(())),
-        Err((_, (_, kept))) => MapRet::Inserted(Err(kept.n())),
+    history.record(MapOp::Insert(key, n), |_| {
+        match table.insert(Held::task(&guard), Val::new(key, n, drops)) {
+            Ok(_) => MapRet::Inserted(Ok(())),
+            Err((_, (_, kept))) => MapRet::Inserted(Err(kept.n())),
+        }
     });
 }
 
 fn get(table: &Table<Val>, history: &History<Map>, key: u64) {
     let guard = enter();
-    history.record(MapOp::Get(key), |_| MapRet::Got(table.get(Held::task(&guard), &key).map(|(_, it)| it.n())));
+    history.record(MapOp::Get(key), |_| {
+        MapRet::Got(table.get(Held::task(&guard), &key).map(|(_, it)| it.n()))
+    });
 }
 
 /// Inserts and lookups from three threads, two keys racing for one slot (1 and 65 both start
@@ -135,14 +141,16 @@ fn model_table_inserts_and_gets_are_a_map() {
         let table = Arc::new(Table::<Val>::new(64, 0));
         let history = Arc::new(History::<Map>::new());
         let other = {
-            let (table, history, drops) = (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
+            let (table, history, drops) =
+                (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
             thread::spawn(move || {
                 insert(&table, &history, 1, 10, &drops);
                 get(&table, &history, 65);
             })
         };
         let third = {
-            let (table, history, drops) = (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
+            let (table, history, drops) =
+                (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
             thread::spawn(move || {
                 insert(&table, &history, 1, 11, &drops);
                 insert(&table, &history, 65, 20, &drops);
@@ -173,9 +181,11 @@ fn model_table_replace_frees_the_old_value_after_its_readers() {
                 get(&table, &history, 5);
             })
         };
-        history.record(MapOp::Replace(5, 2), |_| match table.replace(Held::writer(&*table), Val::new(5, 2, &drops)) {
-            Ok(old) => MapRet::Replaced(Some(old.n())),
-            Err(_) => MapRet::Replaced(None),
+        history.record(MapOp::Replace(5, 2), |_| {
+            match table.replace(Held::writer(&*table), Val::new(5, 2, &drops)) {
+                Ok(old) => MapRet::Replaced(Some(old.n())),
+                Err(_) => MapRet::Replaced(None),
+            }
         });
         table.collect();
         reader.join().unwrap();
@@ -204,7 +214,8 @@ fn model_table_racing_inserts_of_a_key_across_a_new_level_keep_one() {
             }
         }
         let other = {
-            let (table, history, drops) = (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
+            let (table, history, drops) =
+                (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
             thread::spawn(move || insert(&table, &history, 3, 1, &drops))
         };
         insert(&table, &history, 3, 2, &drops);
@@ -408,8 +419,9 @@ fn model_a_segment_chunk_is_read_whole_below_what_it_published() {
                 for n in 1..=2 {
                     let (header, payload) = record_of(n);
                     history.record(ChunkOp::Put, |_| {
-                        let (_, span) =
-                            own.write(Unit::SHARED, &header, &payload, 0).expect("a test record is under the bound");
+                        let (_, span) = own
+                            .write(Unit::SHARED, &header, &payload, 0)
+                            .expect("a test record is under the bound");
                         own.keep(span);
                         None
                     });

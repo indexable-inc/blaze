@@ -5,14 +5,13 @@
 use std::hint::black_box;
 
 use blaze_alloc_count::assert_at_most;
+use hir_expand::fixture;
 use hir_expand::{HirFileId, InFile};
 use span::Edition;
 use syntax::{
-    AstPtr, SourceFile,
-    ast as tag,
+    AstPtr, SourceFile, ast as tag,
     view::{self as ast, AstNode as _},
 };
-use hir_expand::fixture;
 
 use crate::{
     DefWithBodyId, ModuleDefId,

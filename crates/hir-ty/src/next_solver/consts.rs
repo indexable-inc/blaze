@@ -8,8 +8,8 @@ use hir_def::ConstParamId;
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
     DebruijnIndex, FlagComputation, GenericTypeVisitable, TypeFlags, TypeFoldable as _,
-    TypeVisitable as _, TypeVisitableExt, WithCachedTypeInfo, inherent::IntoKind,
-    intern::Interned, relate::Relate,
+    TypeVisitable as _, TypeVisitableExt, WithCachedTypeInfo, inherent::IntoKind, intern::Interned,
+    relate::Relate,
 };
 
 use crate::{
@@ -184,7 +184,9 @@ impl<'db> ConstExt<'db> for Const<'db> {
 
     fn from_index(_interner: DbInterner<'db>, index: u32) -> Self {
         match NonZeroU32::new(index) {
-            Some(index) if CONSTS.published(index) => rustc_type_ir::Const(InternedConst::at(index)),
+            Some(index) if CONSTS.published(index) => {
+                rustc_type_ir::Const(InternedConst::at(index))
+            }
             _ => panic!("{index} is not the index of an interned constant"),
         }
     }
@@ -314,7 +316,8 @@ mod tests {
     use crate::next_solver::{ErrorGuaranteed, FreeConstAliasId, TyKind};
 
     fn free_const_alias(is_rigid: IsRigid) -> ConstKind<'static> {
-        let def_id = FreeConstAliasId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)));
+        let def_id =
+            FreeConstAliasId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)));
         ConstKind::Alias(
             is_rigid,
             AliasConst::from_checked_parts(AliasConstKind::Free { def_id }, GenericArgs::empty()),

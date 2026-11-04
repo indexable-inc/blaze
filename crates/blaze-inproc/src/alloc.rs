@@ -284,7 +284,11 @@ mod tests {
         }
 
         fn take(&mut self, offset: u64, len: u64) {
-            let index = self.free.iter().position(|&(at, n)| offset >= at && offset + len <= at + n).unwrap();
+            let index = self
+                .free
+                .iter()
+                .position(|&(at, n)| offset >= at && offset + len <= at + n)
+                .unwrap();
             let (at, n) = self.free.remove(index);
             if offset > at {
                 self.free.push((at, offset - at));
@@ -316,7 +320,10 @@ mod tests {
                         taken.push(range);
                     } else {
                         let need = want.next_multiple_of(GRAIN) + align.max(GRAIN) - GRAIN;
-                        assert!(model.free.iter().all(|it| it.1 < need), "a range of {need} was free and not found");
+                        assert!(
+                            model.free.iter().all(|it| it.1 < need),
+                            "a range of {need} was free and not found"
+                        );
                     }
                 } else {
                     let index = rng.index(taken.len());
@@ -348,7 +355,10 @@ mod tests {
             } else {
                 (1u64 << first) | ((second as u64) << (first - SECOND_BITS as usize))
             };
-            assert!(smallest_of >= len, "class ({first}, {second}) holds ranges shorter than {len}");
+            assert!(
+                smallest_of >= len,
+                "class ({first}, {second}) holds ranges shorter than {len}"
+            );
         }
     }
 }

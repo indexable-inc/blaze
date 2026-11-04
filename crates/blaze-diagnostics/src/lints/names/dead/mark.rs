@@ -26,7 +26,6 @@
 mod body;
 
 use blaze_hash::{HashMap, HashSet};
-use std::alloc::Global;
 use either::Either;
 use hir::{HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::{
@@ -34,6 +33,7 @@ use hir_def::{
     builtin_derive::BuiltinDeriveImplTrait, expr_store::Body,
 };
 use smallvec::SmallVec;
+use std::alloc::Global;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, T,
     view::{self as ast, AstNode as _, BinaryOp, HasArgList as _, RangeItem as _},
@@ -208,7 +208,8 @@ impl<'db> Mark<'_, '_, '_, 'db> {
         }
         match res {
             Res::Def(def) => {
-                let in_pat_used = matches!(self.k.defs[def].kind, Kind::Const | Kind::AssocConst | Kind::TyAlias);
+                let in_pat_used =
+                    matches!(self.k.defs[def].kind, Kind::Const | Kind::AssocConst | Kind::TyAlias);
                 if !self.in_pat || in_pat_used {
                     self.check_def_id(def);
                 }
@@ -246,7 +247,8 @@ impl<'db> Mark<'_, '_, '_, 'db> {
     fn extract_live(&self, unsolved: &mut Vec<Unsolved>, out: &mut Vec<DefIdx>) {
         let live = &self.live.live;
         unsolved.retain(|it| {
-            let is_live = it.trait_def.is_none_or(|it| live.contains(it)) && it.self_adt.is_none_or(|it| live.contains(it));
+            let is_live = it.trait_def.is_none_or(|it| live.contains(it))
+                && it.self_adt.is_none_or(|it| live.contains(it));
             if is_live {
                 out.push(it.def);
             }
@@ -341,14 +343,22 @@ impl<'db> Mark<'_, '_, '_, 'db> {
     /// The walk of a definition's signature, over its syntax. The body of a function, a
     /// constant or a static, when one is written, is left out and its owner given, for
     /// [`Mark::body`].
-    fn signature(&mut self, file: HirFileId, node: ast::Node<'db>, id: Id) -> Option<DefWithBodyId> {
+    fn signature(
+        &mut self,
+        file: HirFileId,
+        node: ast::Node<'db>,
+        id: Id,
+    ) -> Option<DefWithBodyId> {
         let written = |kind: fn(SyntaxKind) -> bool| node.children().find(|it| kind(it.kind()));
         let found = match id {
-            Id::Fn(it) => {
-                written(|kind| kind == SyntaxKind::BLOCK_EXPR).map(|body| (DefWithBodyId::FunctionId(it), body))
+            Id::Fn(it) => written(|kind| kind == SyntaxKind::BLOCK_EXPR)
+                .map(|body| (DefWithBodyId::FunctionId(it), body)),
+            Id::Const(it) => {
+                written(ast::Expr::can_cast).map(|body| (DefWithBodyId::ConstId(it), body))
             }
-            Id::Const(it) => written(ast::Expr::can_cast).map(|body| (DefWithBodyId::ConstId(it), body)),
-            Id::Static(it) => written(ast::Expr::can_cast).map(|body| (DefWithBodyId::StaticId(it), body)),
+            Id::Static(it) => {
+                written(ast::Expr::can_cast).map(|body| (DefWithBodyId::StaticId(it), body))
+            }
             _ => None,
         };
         let Some((owner, body)) = found else {
@@ -442,10 +452,13 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             },
             BuiltinDeriveImplTrait::Default => {
                 let db = self.k.cx.db;
-                let default = defs.children(adt).iter().copied().find(|&variant| match defs[variant].id {
-                    Id::Variant(id) => AttrFlags::has_word(db, AttrDefId::EnumVariantId(id), "default"),
-                    _ => false,
-                });
+                let default =
+                    defs.children(adt).iter().copied().find(|&variant| match defs[variant].id {
+                        Id::Variant(id) => {
+                            AttrFlags::has_word(db, AttrDefId::EnumVariantId(id), "default")
+                        }
+                        _ => false,
+                    });
                 match default {
                     Some(variant) => self.handle_res(Res::Variant(variant)),
                     None => self.check_def_id(adt),
@@ -492,7 +505,9 @@ impl<'db> Mark<'_, '_, '_, 'db> {
                 if let Some(call) = ast::MacroCall::cast(node)
                     && let Some(expansion) = self.k.cx.vsema.expand_macro_call(call)
                 {
-                    stdx::ensure_sufficient_stack(|| self.walk(expansion.file_id, expansion.value, false));
+                    stdx::ensure_sufficient_stack(|| {
+                        self.walk(expansion.file_id, expansion.value, false)
+                    });
                 }
                 return;
             }
@@ -533,7 +548,8 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             SyntaxKind::OFFSET_OF_EXPR => {
                 if let Some(expr) = ast::OffsetOfExpr::cast(node) {
                     for name in expr.fields() {
-                        if let Some((Either::Right(field), _)) = self.k.cx.vsema.resolve_offset_of_field(name)
+                        if let Some((Either::Right(field), _)) =
+                            self.k.cx.vsema.resolve_offset_of_field(name)
                             && let Some(field) = self.k.defs.get(Id::Field(FieldId::from(field)))
                         {
                             self.insert_def_id(field);
@@ -599,7 +615,12 @@ impl<'db> Mark<'_, '_, '_, 'db> {
         let parent = path.syntax().parent().map(|it| it.kind());
         if matches!(
             parent,
-            Some(SyntaxKind::MACRO_CALL | SyntaxKind::PATH_META | SyntaxKind::KEY_VALUE_META | SyntaxKind::TOKEN_TREE_META)
+            Some(
+                SyntaxKind::MACRO_CALL
+                    | SyntaxKind::PATH_META
+                    | SyntaxKind::KEY_VALUE_META
+                    | SyntaxKind::TOKEN_TREE_META
+            )
         ) {
             return Res::None;
         }
@@ -720,7 +741,13 @@ impl<'db> Mark<'_, '_, '_, 'db> {
 
     /// The fields of `variant` that the subpatterns of a tuple pattern bind: whether each of its
     /// `bound` subpatterns other than `..` is a `_`, in order, and how many come before its `..`.
-    fn tuple_fields(&mut self, variant: DefIdx, wildcard: impl Iterator<Item = bool>, bound: usize, dotdot: Option<usize>) {
+    fn tuple_fields(
+        &mut self,
+        variant: DefIdx,
+        wildcard: impl Iterator<Item = bool>,
+        bound: usize,
+        dotdot: Option<usize>,
+    ) {
         let defs = self.k.defs;
         let fields = defs.children(variant);
         let dotdot = dotdot.unwrap_or(bound);
@@ -753,11 +780,14 @@ impl<'db> Mark<'_, '_, '_, 'db> {
         let path = match node.kind() {
             SyntaxKind::OR_PAT => return,
             SyntaxKind::PATH_PAT => ast::PathPat::cast(node).and_then(|it| it.path()),
-            SyntaxKind::TUPLE_STRUCT_PAT => ast::TupleStructPat::cast(node).and_then(|it| it.path()),
+            SyntaxKind::TUPLE_STRUCT_PAT => {
+                ast::TupleStructPat::cast(node).and_then(|it| it.path())
+            }
             SyntaxKind::RECORD_PAT => ast::RecordPat::cast(node).and_then(|it| it.path()),
             SyntaxKind::IDENT_PAT => {
                 if let Some(pat) = ast::IdentPat::cast(node)
-                    && let Some(ModuleDef::EnumVariant(it)) = cx.vsema.resolve_bind_pat_to_const(pat)
+                    && let Some(ModuleDef::EnumVariant(it)) =
+                        cx.vsema.resolve_bind_pat_to_const(pat)
                     && let Some(variant) = self.k.defs.get(Id::Variant(it.into()))
                     && !out[from..].contains(&variant)
                 {
@@ -825,13 +855,11 @@ impl<'db> Mark<'_, '_, '_, 'db> {
 
     fn handle_assign(&mut self, file: HirFileId, place: ast::Expr<'db>) {
         let through_field = matches!(place, ast::Expr::FieldExpr(_) | ast::Expr::ParenExpr(_));
-        let derefs = through_field
-            && self
-                .k
-                .cx
-                .vsema
-                .expr_adjustments(place)
-                .is_some_and(|it| it.iter().any(|it| matches!(it.kind, hir_ty::Adjust::Deref(_))));
+        let derefs =
+            through_field
+                && self.k.cx.vsema.expr_adjustments(place).is_some_and(|it| {
+                    it.iter().any(|it| matches!(it.kind, hir_ty::Adjust::Deref(_)))
+                });
         match place {
             ast::Expr::FieldExpr(field) if !derefs => {
                 if let Some(base) = field.expr() {
@@ -908,7 +936,9 @@ impl<'db> Mark<'_, '_, '_, 'db> {
                 if let Some(variant) = self.variant_of(res, adt) {
                     let rest = args().position(is_rest);
                     let bound = args().count() - usize::from(rest.is_some());
-                    let wildcard = args().filter(|&it| !is_rest(it)).map(|it| matches!(it, ast::Expr::UnderscoreExpr(_)));
+                    let wildcard = args()
+                        .filter(|&it| !is_rest(it))
+                        .map(|it| matches!(it, ast::Expr::UnderscoreExpr(_)));
                     self.tuple_fields(variant, wildcard, bound, rest);
                 }
                 for arg in args() {
@@ -917,9 +947,13 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             }
             ast::Expr::PathExpr(it) => {
                 let path = it.path();
-                let constructs = path.and_then(|path| cx.vsema.resolve_path(path)).is_some_and(|it| {
-                    matches!(it, PathResolution::Def(ModuleDef::Adt(_) | ModuleDef::EnumVariant(_)))
-                });
+                let constructs =
+                    path.and_then(|path| cx.vsema.resolve_path(path)).is_some_and(|it| {
+                        matches!(
+                            it,
+                            PathResolution::Def(ModuleDef::Adt(_) | ModuleDef::EnumVariant(_))
+                        )
+                    });
                 match (constructs, path) {
                     (true, Some(path)) => {
                         self.expr_adt(lhs);
@@ -943,7 +977,13 @@ impl<'db> Mark<'_, '_, '_, 'db> {
 
     /// rustc's `check_for_self_assign`: `x = x` or `a.b = a.b`, not from a macro's expansion.
     /// The two sides' shapes and names are compared before anything is resolved.
-    fn self_assign(&mut self, file: HirFileId, expr: ast::BinExpr<'db>, lhs: ast::Expr<'db>, rhs: ast::Expr<'db>) {
+    fn self_assign(
+        &mut self,
+        file: HirFileId,
+        expr: ast::BinExpr<'db>,
+        lhs: ast::Expr<'db>,
+        rhs: ast::Expr<'db>,
+    ) {
         let cx = self.k.cx;
         if !same_place(cx, lhs, rhs) {
             return;
@@ -961,7 +1001,8 @@ impl<'db> Mark<'_, '_, '_, 'db> {
             _ => "variable",
         };
         // alloc: the edge, a lint that fires
-        let message = format!("useless assignment of {what} of type `{}` to itself", cx.ty(&ty.original));
+        let message =
+            format!("useless assignment of {what} of type `{}` to itself", cx.ty(&ty.original));
         let mut diag = Diag::lint("dead_code", message, cx.span_of(at));
         crate::lints::code_fact(cx, &mut diag, at);
         self.found.push(Found::lint(diag, Phase::Late, at));

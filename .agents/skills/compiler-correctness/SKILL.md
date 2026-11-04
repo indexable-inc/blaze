@@ -96,7 +96,7 @@ be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run 
 then a random `SipKey` for good. Anything iterated into output is sorted or ordered by construction;
 a test builds twice and compares bytes.
 
-## semantics-in-front-end (rule 29)
+## semantics-in-front-end (rule 30)
 
 Language semantics (MIR building and passes, borrow checking, const eval, layout, code-identity
 hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the rest, derived from
@@ -108,7 +108,7 @@ end.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 
-## library-over-language (rule 30)
+## library-over-language (rule 31)
 
 Before adding an attribute, intrinsic or special case to the compiler, write the feature as library
 code on what the language already has: traits, generics, const eval, compile-time reflection

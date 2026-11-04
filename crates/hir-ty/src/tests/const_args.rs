@@ -40,11 +40,18 @@ fn diagnostics(name: &str) -> Vec<InferenceDiagnostic> {
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
-                ModuleDefId::FunctionId(it) if FunctionSignature::of(&db, it).name.as_str() == name => Some(it),
+                ModuleDefId::FunctionId(it)
+                    if FunctionSignature::of(&db, it).name.as_str() == name =>
+                {
+                    Some(it)
+                }
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the fixture's `{name}`"));
-        let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)));
+        let infer = InferenceResult::of(
+            &db,
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)),
+        );
         infer.diagnostics().to_vec()
     })
 }
@@ -113,7 +120,9 @@ struct V {
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
-                ModuleDefId::AdtId(AdtId::StructId(it)) if StructSignature::of(&db, it).name.as_str() == "V" => {
+                ModuleDefId::AdtId(AdtId::StructId(it))
+                    if StructSignature::of(&db, it).name.as_str() == "V" =>
+                {
                     Some(it)
                 }
                 _ => None,
@@ -131,6 +140,10 @@ struct V {
             "only `W<S>` is an error of lowering: {:?}",
             lowered.diagnostics(),
         );
-        assert_eq!(lowered.defined_anon_consts().len(), 2, "`W<true>` and `[u8; S]` are anon consts");
+        assert_eq!(
+            lowered.defined_anon_consts().len(),
+            2,
+            "`W<true>` and `[u8; S]` are anon consts"
+        );
     });
 }

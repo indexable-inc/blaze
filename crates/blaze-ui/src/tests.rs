@@ -348,10 +348,7 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
         fits(&screen);
     }
     assert_eq!(live.drawn(), 0);
-    assert_eq!(
-        screen.lines().last().unwrap(),
-        "    Compiled 5351 fns in 1 crate, 2 kept; 1m14s"
-    );
+    assert_eq!(screen.lines().last().unwrap(), "    Compiled 5351 fns in 1 crate, 2 kept; 1m14s");
     // In the middle of the compile: the step, the crate under way, its count.
     assert_eq!(
         middle,
@@ -542,18 +539,20 @@ fn a_record_of_nodes_is_its_nodes() {
             (Std, "std", &[]),
         ],
     ));
-    let shape = |records: &[Record]| {
-        let mut build = Build::default();
-        for record in records {
-            build.apply(record);
-        }
-        let row = |at: usize| build.crates[build.graph[at].row as usize].name.clone();
-        let deps =
-            |at: usize| -> Vec<String> { build.deps(at).iter().map(|&it| row(it as usize)).collect() };
-        (0..build.graph.len())
-            .map(|at| (row(at), build.graph[at].kind, deps(at)))
-            .collect::<Vec<(String, NodeKind, Vec<String>)>>()
-    };
+    let shape =
+        |records: &[Record]| {
+            let mut build = Build::default();
+            for record in records {
+                build.apply(record);
+            }
+            let row = |at: usize| build.crates[build.graph[at].row as usize].name.clone();
+            let deps = |at: usize| -> Vec<String> {
+                build.deps(at).iter().map(|&it| row(it as usize)).collect()
+            };
+            (0..build.graph.len())
+                .map(|at| (row(at), build.graph[at].kind, deps(at)))
+                .collect::<Vec<(String, NodeKind, Vec<String>)>>()
+        };
     let each = graphed();
     assert_eq!(shape(&in_order), shape(&each));
     assert_eq!(shape(&backwards), shape(&each));
@@ -1147,14 +1146,22 @@ fn records_faster_than_frames_are_drawn_once_a_frame() {
             if !out.is_empty() {
                 let finished = capped.build().finished.is_some();
                 if let Some(last) = last_write {
-                    assert!(finished || now - last >= crate::FRAME_NS, "seed {seed}, record {at}: drawn {}ns after the last", now - last);
+                    assert!(
+                        finished || now - last >= crate::FRAME_NS,
+                        "seed {seed}, record {at}: drawn {}ns after the last",
+                        now - last
+                    );
                 }
                 writes += 1;
                 last_write = Some(now);
                 held.feed(&out);
             }
             if capped.due_ns().is_none() {
-                assert_eq!(held.lines(), alone.lines(), "seed {seed}, record {at}: drawn, the screens agree");
+                assert_eq!(
+                    held.lines(),
+                    alone.lines(),
+                    "seed {seed}, record {at}: drawn, the screens agree"
+                );
             }
         }
         if let Some(due) = capped.due_ns() {
@@ -1231,7 +1238,8 @@ fn finished_whole(rng: &mut Rng) -> Finished {
     };
     let busy = |rng: &mut Rng| rng.chance(2).then(|| rng.below(1600) as f64 / 100.0);
     let cores = summary.slowest.iter().map(|_| busy(rng)).collect();
-    let unnamed = |rng: &mut Rng| Unnamed { took_ns: rng.below(4) * S / 2, after: rng.pick(&STEPS) };
+    let unnamed =
+        |rng: &mut Rng| Unnamed { took_ns: rng.below(4) * S / 2, after: rng.pick(&STEPS) };
     Finished {
         ok: !rng.chance(4),
         summary,
@@ -1255,7 +1263,11 @@ fn the_last_lines_written_in_place_are_the_old_ones() {
         for color in [false, true] {
             let (now, was) = (summary_line(&finished, color), old::summary_line(&finished, color));
             assert_eq!(now, was, "seed {seed}");
-            assert_eq!(why_lines(&finished, color), old::why_lines(&finished, color), "seed {seed}");
+            assert_eq!(
+                why_lines(&finished, color),
+                old::why_lines(&finished, color),
+                "seed {seed}"
+            );
         }
         let text = "x::\u{e9}".repeat(rng.below(30) as usize);
         let most = rng.below(60) as usize;
@@ -1327,9 +1339,13 @@ fn a_warm_record_to_the_terminal_allocates_nothing() {
         };
         play(&mut live, &mut out);
         play(&mut live, &mut out);
-        blaze_alloc_count::assert_at_most(0, "a warm record to the terminal, drawn and diffed", || {
-            play(&mut live, &mut out);
-        });
+        blaze_alloc_count::assert_at_most(
+            0,
+            "a warm record to the terminal, drawn and diffed",
+            || {
+                play(&mut live, &mut out);
+            },
+        );
         assert!(live.drawn() > 0, "graph {graph}: the region is drawn");
     }
 }

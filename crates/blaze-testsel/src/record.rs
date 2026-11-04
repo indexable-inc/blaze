@@ -51,11 +51,15 @@ impl Record {
         for &hit in &hits {
             if hit >= slots {
                 // alloc: error path, the reason the record keeps
-                return Record::incomplete(format!("its execution record names slot {hit} of a binary with {slots}"));
+                return Record::incomplete(format!(
+                    "its execution record names slot {hit} of a binary with {slots}"
+                ));
             }
             if last.is_some_and(|it| it >= hit) {
                 // alloc: error path, the reason the record keeps
-                return Record::incomplete(format!("its execution record names slot {hit} out of order"));
+                return Record::incomplete(format!(
+                    "its execution record names slot {hit} out of order"
+                ));
             }
             last = Some(hit);
         }
@@ -83,7 +87,9 @@ impl Record {
         }
         let Some(map) = map.get(..slots as usize) else {
             // alloc: error path, the reason the record keeps
-            return Record::incomplete(format!("its execution record holds fewer than its {slots} slots"));
+            return Record::incomplete(format!(
+                "its execution record holds fewer than its {slots} slots"
+            ));
         };
         // alloc: once per run, the hits the record owns
         let mut hits = Vec::new();

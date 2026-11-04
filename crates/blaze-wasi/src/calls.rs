@@ -36,7 +36,8 @@ pub fn put(mem: &mut [u8], ptr: u64, bytes: &[u8]) -> Result<(), Stop> {
 /// `ptr + by`, or why it is past every memory.
 fn offset(ptr: u64, by: u64) -> Result<u64, Stop> {
     // alloc: error path
-    ptr.checked_add(by).ok_or_else(|| Stop(format!("passed the host an address past 2^64 ({ptr:#x} + {by})")))
+    ptr.checked_add(by)
+        .ok_or_else(|| Stop(format!("passed the host an address past 2^64 ({ptr:#x} + {by})")))
 }
 
 /// A guest's memory, as a guest of width `W` lays its arguments out, in the call `call`, which
@@ -84,7 +85,10 @@ impl<W: Width> Mem<'_, W> {
         let bytes = value.to_le_bytes();
         if W::BYTES < 8 && value >> (8 * W::BYTES) != 0 {
             // alloc: error path
-            return Err(self.named(&Stop(format!("was to be given the size {value}, past its {}-bit pointers", 8 * W::BYTES))));
+            return Err(self.named(&Stop(format!(
+                "was to be given the size {value}, past its {}-bit pointers",
+                8 * W::BYTES
+            ))));
         }
         self.put(ptr, &bytes[..W::BYTES as usize])
     }
@@ -129,7 +133,10 @@ impl<W: Width> Mem<'_, W> {
 }
 
 /// The `errno` of `answer`, with `ok` run on its value first.
-pub(crate) fn answered<T>(answer: Result<T, Errno>, ok: impl FnOnce(T) -> Result<(), Stop>) -> Result<i32, Stop> {
+pub(crate) fn answered<T>(
+    answer: Result<T, Errno>,
+    ok: impl FnOnce(T) -> Result<(), Stop>,
+) -> Result<i32, Stop> {
     match answer {
         Ok(value) => {
             ok(value)?;
@@ -162,7 +169,9 @@ pub fn link<W: Width, T: Embed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
         })
     })?;
     l.func_wrap(m, "args_get", |mut c: Caller<'_, T>, argv: W::Ptr, buf: W::Ptr| {
-        call::<W, T, _>(&mut c, "args_get", |mem, sys| mem.strings(sys.args()?.0, argv.into(), buf.into()))
+        call::<W, T, _>(&mut c, "args_get", |mem, sys| {
+            mem.strings(sys.args()?.0, argv.into(), buf.into())
+        })
     })?;
     l.func_wrap(m, "environ_sizes_get", |mut c: Caller<'_, T>, count: W::Ptr, size: W::Ptr| {
         call::<W, T, _>(&mut c, "environ_sizes_get", |mem, sys| {
@@ -174,28 +183,50 @@ pub fn link<W: Width, T: Embed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
         })
     })?;
     l.func_wrap(m, "environ_get", |mut c: Caller<'_, T>, pointers: W::Ptr, buf: W::Ptr| {
-        call::<W, T, _>(&mut c, "environ_get", |mem, sys| mem.strings(sys.environ()?.0, pointers.into(), buf.into()))
+        call::<W, T, _>(&mut c, "environ_get", |mem, sys| {
+            mem.strings(sys.environ()?.0, pointers.into(), buf.into())
+        })
     })?;
     l.func_wrap(m, "clock_res_get", |mut c: Caller<'_, T>, id: u32, out: W::Ptr| {
-        call::<W, T, _>(&mut c, "clock_res_get", |mem, sys| answered(sys.clock_res(id)?, |ns| mem.put_u64(out.into(), ns)))
+        call::<W, T, _>(&mut c, "clock_res_get", |mem, sys| {
+            answered(sys.clock_res(id)?, |ns| mem.put_u64(out.into(), ns))
+        })
     })?;
-    l.func_wrap(m, "clock_time_get", |mut c: Caller<'_, T>, id: u32, _precision: u64, out: W::Ptr| {
-        // A store that counts no fuel says so with an error: then there is none to give.
-        let fuel_left = c.get_fuel().ok();
-        call::<W, T, _>(&mut c, "clock_time_get", |mem, sys| answered(sys.clock_time(id, fuel_left)?, |ns| mem.put_u64(out.into(), ns)))
-    })?;
+    l.func_wrap(
+        m,
+        "clock_time_get",
+        |mut c: Caller<'_, T>, id: u32, _precision: u64, out: W::Ptr| {
+            // A store that counts no fuel says so with an error: then there is none to give.
+            let fuel_left = c.get_fuel().ok();
+            call::<W, T, _>(&mut c, "clock_time_get", |mem, sys| {
+                answered(sys.clock_time(id, fuel_left)?, |ns| mem.put_u64(out.into(), ns))
+            })
+        },
+    )?;
     l.func_wrap(m, "random_get", |mut c: Caller<'_, T>, buf: W::Ptr, len: W::Ptr| {
         call::<W, T, _>(&mut c, "random_get", |mem, sys| {
             sys.random(mem.get_mut(buf.into(), len.into())?)?;
             Ok(SUCCESS)
         })
     })?;
-    l.func_wrap(m, "fd_write", |mut c: Caller<'_, T>, fd: u32, iovs: W::Ptr, count: W::Ptr, written: W::Ptr| {
-        call::<W, T, _>(&mut c, "fd_write", |mem, sys| fd_write(mem, sys, fd, (iovs.into(), count.into()), written.into()))
-    })?;
-    l.func_wrap(m, "fd_read", |mut c: Caller<'_, T>, fd: u32, iovs: W::Ptr, count: W::Ptr, read: W::Ptr| {
-        call::<W, T, _>(&mut c, "fd_read", |mem, sys| fd_read(mem, sys, fd, (iovs.into(), count.into()), read.into()))
-    })?;
+    l.func_wrap(
+        m,
+        "fd_write",
+        |mut c: Caller<'_, T>, fd: u32, iovs: W::Ptr, count: W::Ptr, written: W::Ptr| {
+            call::<W, T, _>(&mut c, "fd_write", |mem, sys| {
+                fd_write(mem, sys, fd, (iovs.into(), count.into()), written.into())
+            })
+        },
+    )?;
+    l.func_wrap(
+        m,
+        "fd_read",
+        |mut c: Caller<'_, T>, fd: u32, iovs: W::Ptr, count: W::Ptr, read: W::Ptr| {
+            call::<W, T, _>(&mut c, "fd_read", |mem, sys| {
+                fd_read(mem, sys, fd, (iovs.into(), count.into()), read.into())
+            })
+        },
+    )?;
     l.func_wrap(m, "fd_prestat_get", |mut c: Caller<'_, T>, fd: u32, out: W::Ptr| {
         call::<W, T, _>(&mut c, "fd_prestat_get", |mem, _| {
             if fd != ROOT_FD {
@@ -208,19 +239,23 @@ pub fn link<W: Width, T: Embed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
             Ok(SUCCESS)
         })
     })?;
-    l.func_wrap(m, "fd_prestat_dir_name", |mut c: Caller<'_, T>, fd: u32, path: W::Ptr, len: W::Ptr| {
-        call::<W, T, _>(&mut c, "fd_prestat_dir_name", |mem, _| {
-            if fd != ROOT_FD {
-                return Ok(i32::from(Errno::BADF.0));
-            }
-            let len: u64 = len.into();
-            if len < ROOT.len() as u64 {
-                return Ok(i32::from(Errno::INVAL.0));
-            }
-            mem.put(path.into(), ROOT)?;
-            Ok(SUCCESS)
-        })
-    })?;
+    l.func_wrap(
+        m,
+        "fd_prestat_dir_name",
+        |mut c: Caller<'_, T>, fd: u32, path: W::Ptr, len: W::Ptr| {
+            call::<W, T, _>(&mut c, "fd_prestat_dir_name", |mem, _| {
+                if fd != ROOT_FD {
+                    return Ok(i32::from(Errno::BADF.0));
+                }
+                let len: u64 = len.into();
+                if len < ROOT.len() as u64 {
+                    return Ok(i32::from(Errno::INVAL.0));
+                }
+                mem.put(path.into(), ROOT)?;
+                Ok(SUCCESS)
+            })
+        },
+    )?;
     l.func_wrap(m, "fd_fdstat_get", |mut c: Caller<'_, T>, fd: u32, out: W::Ptr| {
         call::<W, T, _>(&mut c, "fd_fdstat_get", |mem, sys| {
             answered(sys.fd_filetype(fd)?, |filetype| {
@@ -234,26 +269,40 @@ pub fn link<W: Width, T: Embed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
         })
     })?;
     l.func_wrap(m, "fd_fdstat_set_flags", |mut c: Caller<'_, T>, fd: u32, flags: u32| {
-        call::<W, T, _>(&mut c, "fd_fdstat_set_flags", |_, sys| answered(sys.set_fd_flags(fd, flags)?, |()| Ok(())))
+        call::<W, T, _>(&mut c, "fd_fdstat_set_flags", |_, sys| {
+            answered(sys.set_fd_flags(fd, flags)?, |()| Ok(()))
+        })
     })?;
     l.func_wrap(m, "fd_close", |mut c: Caller<'_, T>, fd: u32| {
         call::<W, T, _>(&mut c, "fd_close", |_, sys| answered(sys.close(fd)?, |()| Ok(())))
     })?;
-    l.func_wrap(m, "fd_seek", |mut c: Caller<'_, T>, fd: u32, by: i64, whence: u32, out: W::Ptr| {
-        call::<W, T, _>(&mut c, "fd_seek", |mem, sys| answered(sys.seek(fd, by, whence)?, |at| mem.put_u64(out.into(), at)))
-    })?;
+    l.func_wrap(
+        m,
+        "fd_seek",
+        |mut c: Caller<'_, T>, fd: u32, by: i64, whence: u32, out: W::Ptr| {
+            call::<W, T, _>(&mut c, "fd_seek", |mem, sys| {
+                answered(sys.seek(fd, by, whence)?, |at| mem.put_u64(out.into(), at))
+            })
+        },
+    )?;
     // `fd_tell` is a seek by 0 from where it is.
     l.func_wrap(m, "fd_tell", |mut c: Caller<'_, T>, fd: u32, out: W::Ptr| {
-        call::<W, T, _>(&mut c, "fd_tell", |mem, sys| answered(sys.seek(fd, 0, 1)?, |at| mem.put_u64(out.into(), at)))
+        call::<W, T, _>(&mut c, "fd_tell", |mem, sys| {
+            answered(sys.seek(fd, 0, 1)?, |at| mem.put_u64(out.into(), at))
+        })
     })?;
     l.func_wrap(m, "fd_filestat_get", |mut c: Caller<'_, T>, fd: u32, out: W::Ptr| {
-        call::<W, T, _>(&mut c, "fd_filestat_get", |mem, sys| answered(sys.fd_stat(fd)?, |stat| mem.put_filestat(out.into(), &stat)))
+        call::<W, T, _>(&mut c, "fd_filestat_get", |mem, sys| {
+            answered(sys.fd_stat(fd)?, |stat| mem.put_filestat(out.into(), &stat))
+        })
     })?;
     l.func_wrap(
         m,
         "fd_readdir",
         |mut c: Caller<'_, T>, fd: u32, buf: W::Ptr, len: W::Ptr, cookie: u64, out: W::Ptr| {
-            call::<W, T, _>(&mut c, "fd_readdir", |mem, sys| fd_readdir(mem, sys, fd, (buf.into(), len.into()), cookie, out.into()))
+            call::<W, T, _>(&mut c, "fd_readdir", |mem, sys| {
+                fd_readdir(mem, sys, fd, (buf.into(), len.into()), cookie, out.into())
+            })
         },
     )?;
     l.func_wrap(
@@ -289,7 +338,13 @@ pub fn link<W: Width, T: Embed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
     l.func_wrap(
         m,
         "path_readlink",
-        |mut c: Caller<'_, T>, fd: u32, path: W::Ptr, len: W::Ptr, buf: W::Ptr, buf_len: W::Ptr, out: W::Ptr| {
+        |mut c: Caller<'_, T>,
+         fd: u32,
+         path: W::Ptr,
+         len: W::Ptr,
+         buf: W::Ptr,
+         buf_len: W::Ptr,
+         out: W::Ptr| {
             call::<W, T, _>(&mut c, "path_readlink", |mem, sys| {
                 let target = sys.readlink(fd, mem.get(path.into(), len.into())?)?;
                 answered(target, |target| {
@@ -302,17 +357,29 @@ pub fn link<W: Width, T: Embed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
             })
         },
     )?;
-    l.func_wrap(m, "poll_oneoff", |mut c: Caller<'_, T>, _in: W::Ptr, _out: W::Ptr, _n: W::Ptr, _events: W::Ptr| {
-        call::<W, T, _>(&mut c, "poll_oneoff", |_, sys| Err::<i32, _>(sys.poll_oneoff()))
+    l.func_wrap(
+        m,
+        "poll_oneoff",
+        |mut c: Caller<'_, T>, _in: W::Ptr, _out: W::Ptr, _n: W::Ptr, _events: W::Ptr| {
+            call::<W, T, _>(&mut c, "poll_oneoff", |_, sys| Err::<i32, _>(sys.poll_oneoff()))
+        },
+    )?;
+    l.func_wrap(m, "proc_exit", |mut c: Caller<'_, T>, code: u32| {
+        call::<W, T, _>(&mut c, "proc_exit", |_, sys| Err::<(), _>(sys.exit(code)))
     })?;
-    l.func_wrap(m, "proc_exit", |mut c: Caller<'_, T>, code: u32| call::<W, T, _>(&mut c, "proc_exit", |_, sys| Err::<(), _>(sys.exit(code))))?;
     l.func_wrap(m, "sched_yield", |_: Caller<'_, T>| SUCCESS)?;
     Ok(())
 }
 
 /// `fd_write(fd, iovs, iovs_len, written)`: each buffer to the system in turn, until one is
 /// written short. An error after some bytes were written ends the call with those counted.
-fn fd_write<W: Width>(mem: &mut Mem<'_, W>, sys: &mut dyn System, fd: u32, (iovs, count): (u64, u64), written: u64) -> Result<i32, Stop> {
+fn fd_write<W: Width>(
+    mem: &mut Mem<'_, W>,
+    sys: &mut dyn System,
+    fd: u32,
+    (iovs, count): (u64, u64),
+    written: u64,
+) -> Result<i32, Stop> {
     // No buffers still asks the system, so a bad descriptor is refused as with some.
     if count == 0
         && let Err(errno) = sys.write(fd, &[])?
@@ -338,7 +405,13 @@ fn fd_write<W: Width>(mem: &mut Mem<'_, W>, sys: &mut dyn System, fd: u32, (iovs
 }
 
 /// `fd_read(fd, iovs, iovs_len, read)`: each buffer filled in turn, until one is filled short.
-fn fd_read<W: Width>(mem: &mut Mem<'_, W>, sys: &mut dyn System, fd: u32, (iovs, count): (u64, u64), read: u64) -> Result<i32, Stop> {
+fn fd_read<W: Width>(
+    mem: &mut Mem<'_, W>,
+    sys: &mut dyn System,
+    fd: u32,
+    (iovs, count): (u64, u64),
+    read: u64,
+) -> Result<i32, Stop> {
     // As in `fd_write`: no buffers still asks the system about the descriptor.
     if count == 0
         && let Err(errno) = sys.read(fd, &mut [])?
@@ -405,4 +478,3 @@ fn fd_readdir<W: Width>(
     mem.put_size(out, used)?;
     Ok(SUCCESS)
 }
-

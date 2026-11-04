@@ -117,9 +117,7 @@ pub fn is_question(args: &[OsString]) -> bool {
             },
             "-" => from_stdin = true,
             _ if !flag.starts_with('-') => inputs += 1,
-            _ if joined.is_none()
-                && (VALUED.contains(&flag) || ALSO_VALUED.contains(&flag)) =>
-            {
+            _ if joined.is_none() && (VALUED.contains(&flag) || ALSO_VALUED.contains(&flag)) => {
                 words.next();
             }
             _ => {}
@@ -214,7 +212,8 @@ mod tests {
         let spec_of = |target: &str, deployment: Option<&str>| {
             let mut vars = vec![("RUSTC_BOOTSTRAP", "1"), ("RUSTUP_AUTO_INSTALL", "0")];
             vars.extend(deployment.map(|it| ("MACOSX_DEPLOYMENT_TARGET", it)));
-            let args = ["-Z", "unstable-options", "--print", "target-spec-json", "--target", target];
+            let args =
+                ["-Z", "unstable-options", "--print", "target-spec-json", "--target", target];
             let args: Vec<OsString> = args.iter().map(OsString::from).collect();
             own::answered(&args, &[], own::Vars::Only(&vars))
         };

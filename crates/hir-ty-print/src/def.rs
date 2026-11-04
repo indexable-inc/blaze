@@ -6,9 +6,9 @@
 
 use base_db::Db;
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, BlockIdLt, ConstId, DefWithBodyId, EnumVariantId,
-    ExternCrateId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId,
-    ModuleId, ModuleIdLt, StaticId, TraitId, TypeAliasId,
+    AdtId, AssocItemId, AttrDefId, BlockIdLt, ConstId, DefWithBodyId, EnumVariantId, ExternCrateId,
+    FunctionId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
+    ModuleIdLt, StaticId, TraitId, TypeAliasId,
     attrs::AttrFlags,
     expr_store::{Body, BodySourceMap, StoreVisitor},
     hir::{ClosureKind, Expr, ExprId, PatId},
@@ -199,7 +199,11 @@ pub enum Parent<'db> {
     /// in, outermost first, each by its place among the closures of the one before it and its
     /// kind. `in_anon_const` when it is in an anonymous constant of the body (an array length,
     /// a const argument, `const { .. }`): rustc's `{constant#N}`, which is not numbered here.
-    Body { owner: Def, closures: &'db [(usize, ClosureKind)], in_anon_const: bool },
+    Body {
+        owner: Def,
+        closures: &'db [(usize, ClosureKind)],
+        in_anon_const: bool,
+    },
 }
 
 /// The definition's parent; None for a crate root, and for an item in a block whose body
@@ -232,8 +236,13 @@ pub fn module_parent(db: &Db, module: ModuleId) -> Option<Parent<'_>> {
     let block = module.block(db)?;
     let (owner, _) = block_owner(db, block)?;
     let def = Def::of_body(owner)?;
-    let closures = block_expr(Body::of(db, owner), block).and_then(|at| closures_around(db, owner, at));
-    Some(Parent::Body { owner: def, closures: closures.unwrap_or(&[]), in_anon_const: closures.is_none() })
+    let closures =
+        block_expr(Body::of(db, owner), block).and_then(|at| closures_around(db, owner, at));
+    Some(Parent::Body {
+        owner: def,
+        closures: closures.unwrap_or(&[]),
+        in_anon_const: closures.is_none(),
+    })
 }
 
 /// The body a closure, `async` block or coroutine written at `expr` of `owner` is in, with
@@ -241,12 +250,19 @@ pub fn module_parent(db: &Db, module: ModuleId) -> Option<Parent<'_>> {
 pub fn closure_parent(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Parent<'_>> {
     let def = Def::of_body(owner)?;
     let closures = closures_around(db, owner, expr);
-    Some(Parent::Body { owner: def, closures: closures.unwrap_or(&[]), in_anon_const: closures.is_none() })
+    Some(Parent::Body {
+        owner: def,
+        closures: closures.unwrap_or(&[]),
+        in_anon_const: closures.is_none(),
+    })
 }
 
 /// The body a block is written in, and the module that body's owner is declared in (the
 /// module of the `impl` or trait for an associated item).
-pub fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> Option<(DefWithBodyId, ModuleIdLt<'db>)> {
+pub fn block_owner<'db>(
+    db: &'db Db,
+    block: BlockIdLt<'db>,
+) -> Option<(DefWithBodyId, ModuleIdLt<'db>)> {
     let owner = match block.owner(db) {
         Some(it) => it,
         None => hir_def::nameres::demand::block_owner(db, block.to_static()).ok()?,
@@ -256,14 +272,20 @@ pub fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> Option<(DefWithBo
 
 /// The expression that is `block` in `body`.
 fn block_expr(body: &Body, block: BlockIdLt<'_>) -> Option<ExprId> {
-    let (at, _) = body.exprs().find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block))?;
+    let (at, _) = body
+        .exprs()
+        .find(|(_, expr)| matches!(expr, Expr::Block { id: Some(id), .. } if *id == block))?;
     Some(at)
 }
 
 /// The closures and `async` blocks `target` is written in, outermost first and with `target`
 /// last when it is one: each by its place among those written in the one before it. None when
 /// `target` is in an anonymous constant of the body, or not in it.
-pub fn closures_around(db: &Db, owner: DefWithBodyId, target: ExprId) -> Option<&[(usize, ClosureKind)]> {
+pub fn closures_around(
+    db: &Db,
+    owner: DefWithBodyId,
+    target: ExprId,
+) -> Option<&[(usize, ClosureKind)]> {
     closures_around_query(db, owner, target).as_deref()
 }
 
@@ -272,7 +294,11 @@ pub fn closures_around(db: &Db, owner: DefWithBodyId, target: ExprId) -> Option<
 /// in, so a body that called no macro is ordered without it, as every closure of it is in
 /// the same file.
 #[blaze_query::tracked(returns(ref))]
-fn closures_around_query(db: &Db, owner: DefWithBodyId, target: ExprId) -> Option<Vec<(usize, ClosureKind)>> {
+fn closures_around_query(
+    db: &Db,
+    owner: DefWithBodyId,
+    target: ExprId,
+) -> Option<Vec<(usize, ClosureKind)>> {
     let body = Body::of(db, owner);
     // alloc: once per closure, in the query that keeps its result
     let mut around = Vec::new();
@@ -280,13 +306,16 @@ fn closures_around_query(db: &Db, owner: DefWithBodyId, target: ExprId) -> Optio
         return None;
     }
     let expanded = !body.macro_calls().is_empty();
-    let order = |closure: ExprId| MacroCalls::around(db, Body::unmoved_source_map(db, owner), closure);
+    let order =
+        |closure: ExprId| MacroCalls::around(db, Body::unmoved_source_map(db, owner), closure);
     let mut inside = None;
     let places = around.iter().map(|&closure| {
         // alloc: once per closure, in the query that keeps its result
         let mut beside = Vec::new();
         match inside.replace(closure) {
-            Some(it) => walk_outside_consts(body, it, |child| closures_in(body, child, &mut beside)),
+            Some(it) => {
+                walk_outside_consts(body, it, |child| closures_in(body, child, &mut beside))
+            }
             None => closures_in(body, body.root_expr(), &mut beside),
         }
         // Stable, so those of one expansion stay in the order they are written in.

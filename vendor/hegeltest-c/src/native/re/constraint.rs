@@ -77,10 +77,7 @@ impl RegexConstraint {
         if self.drawn.contains(text) {
             return true;
         }
-        let Some(chars) = text
-            .iter()
-            .map(|&cp| char::from_u32(cp))
-            .collect::<Option<Vec<char>>>()
+        let Some(chars) = text.iter().map(|&cp| char::from_u32(cp)).collect::<Option<Vec<char>>>()
         else {
             return false;
         };
@@ -99,9 +96,7 @@ impl RegexConstraint {
         &self,
         init: impl FnOnce() -> Result<Vec<u32>, E>,
     ) -> Result<&[u32], E> {
-        self.simplest
-            .get_or_try_init(|| init().map(Box::new))
-            .map(|simplest| simplest.as_slice())
+        self.simplest.get_or_try_init(|| init().map(Box::new)).map(|simplest| simplest.as_slice())
     }
 
     /// The simplest string of the pattern, once the generator has set it.
@@ -145,27 +140,14 @@ fn anywhere(parsed: &ParsedPattern) -> ParsedPattern {
         group: None,
         add_flags: SRE_FLAG_DOTALL,
         del_flags: 0,
-        p: SubPattern {
-            data: alloc::vec![OpCode::Any],
-        },
+        p: SubPattern { data: alloc::vec![OpCode::Any] },
     };
-    let skip = OpCode::MinRepeat {
-        min: 0,
-        max: MAXREPEAT,
-        item: SubPattern {
-            data: alloc::vec![any],
-        },
-    };
-    let inner = OpCode::Subpattern {
-        group: None,
-        add_flags: 0,
-        del_flags: 0,
-        p: parsed.pattern.clone(),
-    };
+    let skip =
+        OpCode::MinRepeat { min: 0, max: MAXREPEAT, item: SubPattern { data: alloc::vec![any] } };
+    let inner =
+        OpCode::Subpattern { group: None, add_flags: 0, del_flags: 0, p: parsed.pattern.clone() };
     ParsedPattern {
-        pattern: SubPattern {
-            data: alloc::vec![skip, inner],
-        },
+        pattern: SubPattern { data: alloc::vec![skip, inner] },
         flags: parsed.flags,
         group_refs: parsed.group_refs,
     }

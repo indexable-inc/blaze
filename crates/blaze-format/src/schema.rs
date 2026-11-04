@@ -123,7 +123,13 @@ const fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
-const fn compress(cv: &[u32; 8], block: &[u32; 16], counter: u64, len: u32, flags: u32) -> [u32; 16] {
+const fn compress(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    len: u32,
+    flags: u32,
+) -> [u32; 16] {
     let mut state = [
         cv[0],
         cv[1],
@@ -213,15 +219,25 @@ const fn block_words(reader: &mut Reader<'_>, len: usize) -> [u32; 16] {
     let mut words = [0; 16];
     let mut w = 0;
     while w < 16 {
-        words[w] =
-            u32::from_le_bytes([bytes[4 * w], bytes[4 * w + 1], bytes[4 * w + 2], bytes[4 * w + 3]]);
+        words[w] = u32::from_le_bytes([
+            bytes[4 * w],
+            bytes[4 * w + 1],
+            bytes[4 * w + 2],
+            bytes[4 * w + 3],
+        ]);
         w += 1;
     }
     words
 }
 
 /// Chunk `index`, `len` bytes of it, from `reader`, up to its last compression.
-const fn chunk(reader: &mut Reader<'_>, index: u64, len: usize, key: &[u32; 8], flags: u32) -> Output {
+const fn chunk(
+    reader: &mut Reader<'_>,
+    index: u64,
+    len: usize,
+    key: &[u32; 8],
+    flags: u32,
+) -> Output {
     let blocks = if len == 0 { 1 } else { len.div_ceil(BLOCK) };
     let mut cv = *key;
     let mut b = 0;
@@ -230,7 +246,13 @@ const fn chunk(reader: &mut Reader<'_>, index: u64, len: usize, key: &[u32; 8], 
         let this = if b + 1 == blocks { len - b * BLOCK } else { BLOCK };
         let words = block_words(reader, this);
         if b + 1 == blocks {
-            return Output { cv, block: words, counter: index, len: this as u32, flags: flags | start | CHUNK_END };
+            return Output {
+                cv,
+                block: words,
+                counter: index,
+                len: this as u32,
+                flags: flags | start | CHUNK_END,
+            };
         }
         cv = first_eight(&compress(&cv, &words, index, BLOCK as u32, flags | start));
         b += 1;
@@ -279,8 +301,12 @@ const fn words(bytes: &[u8; 32]) -> [u32; 8] {
     let mut words = [0; 8];
     let mut i = 0;
     while i < 8 {
-        words[i] =
-            u32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]);
+        words[i] = u32::from_le_bytes([
+            bytes[4 * i],
+            bytes[4 * i + 1],
+            bytes[4 * i + 2],
+            bytes[4 * i + 3],
+        ]);
         i += 1;
     }
     words
@@ -312,11 +338,16 @@ mod tests {
         ];
         for len in lens {
             let input = bytes(len);
-            assert_eq!(derive_key(SCHEMA_DOMAIN, Input::Bytes(&input)), runtime(&input), "{len} bytes");
+            assert_eq!(
+                derive_key(SCHEMA_DOMAIN, Input::Bytes(&input)),
+                runtime(&input),
+                "{len} bytes"
+            );
         }
         let long = "a context longer than one block of sixty-four bytes, so the key takes two";
         let input = bytes(3000);
-        let expected = blaze_ids::b3::official::Hasher::new_derive_key(long).update(&input).finalize();
+        let expected =
+            blaze_ids::b3::official::Hasher::new_derive_key(long).update(&input).finalize();
         assert_eq!(derive_key(long, Input::Bytes(&input)), expected);
     }
 

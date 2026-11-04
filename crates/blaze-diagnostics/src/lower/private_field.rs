@@ -24,7 +24,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateField) -> Vec<Found> {
     let node = cx.node_view(d.expr);
     let field_expr = match node.value.left() {
         Some(ast::Expr::FieldExpr(it)) => it,
-        Some(ast::Expr::OffsetOfExpr(it)) => return offset_of(cx, d, InFile::new(node.file_id, it)),
+        Some(ast::Expr::OffsetOfExpr(it)) => {
+            return offset_of(cx, d, InFile::new(node.file_id, it));
+        }
         // alloc: empty, allocates nothing
         _ => return vec![],
     };
@@ -46,7 +48,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateField) -> Vec<Found> {
     let mut diag = Diag::error(Some("E0616"), message, field_span.clone());
     diag.span_label(field_span, "private field");
 
-    let receiver = field_expr.expr().and_then(|base| cx.vsema.type_of_expr(base)).map(|it| it.original);
+    let receiver =
+        field_expr.expr().and_then(|base| cx.vsema.type_of_expr(base)).map(|it| it.original);
     let scope = cx.vsema.scope(field_expr.syntax());
     let mut outer = ast::Expr::FieldExpr(field_expr);
     while let Some(paren) = outer.syntax().parent().and_then(ast::ParenExpr::cast) {
@@ -76,7 +79,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateField) -> Vec<Found> {
     );
     if let Some(receiver) = &receiver {
         // alloc: the error's text, for an error hir found
-        diag.fact_opt(cx.method_fact(receiver, d.field.name(cx.db).as_str()), format!("what `{field}` is on `{}`", cx.ty(receiver)));
+        diag.fact_opt(
+            cx.method_fact(receiver, d.field.name(cx.db).as_str()),
+            format!("what `{field}` is on `{}`", cx.ty(receiver)),
+        );
     }
     code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
     // alloc: the error's parts, for an error hir found
@@ -87,10 +93,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateField) -> Vec<Found> {
 /// inference found private (its position, [`hir::PrivateField::at`]: two names of one text, a
 /// keyed field and the caller's, or `x.x`, are told apart by it). A position the call does not
 /// have still gives the error, at the whole call.
-fn offset_of(cx: &Cx<'_, '_>, d: &hir::PrivateField, node: InFile<ast::OffsetOfExpr<'_>>) -> Vec<Found> {
+fn offset_of(
+    cx: &Cx<'_, '_>,
+    d: &hir::PrivateField,
+    node: InFile<ast::OffsetOfExpr<'_>>,
+) -> Vec<Found> {
     let name = d.field.name(cx.db);
     let written = d.at.and_then(|at| node.value.fields().nth(at as usize));
-    let range = written.map_or_else(|| node.value.syntax().text_range(), |it| it.syntax().text_range());
+    let range =
+        written.map_or_else(|| node.value.syntax().text_range(), |it| it.syntax().text_range());
     let span = token_span(cx, InFile::new(node.file_id, range));
     // alloc: the error's text, for an error hir found
     let field = name.display(cx.db, cx.edition).to_string();
@@ -118,7 +129,8 @@ fn offset_of(cx: &Cx<'_, '_>, d: &hir::PrivateField, node: InFile<ast::OffsetOfE
 /// fragments with their own spans. A name a macro of its own writes is [`Cx::span`]'s.
 fn token_span(cx: &Cx<'_, '_>, range: InFile<syntax::TextRange>) -> Span {
     if let Some(call) = range.file_id.macro_file() {
-        let (at, ctxt) = hir_expand::span_for_offset(cx.db, call.expansion_span_map(cx.db), range.value.start());
+        let (at, ctxt) =
+            hir_expand::span_for_offset(cx.db, call.expansion_span_map(cx.db), range.value.start());
         if ctxt.is_root() {
             return cx.span_in_file(at.file_id.file_id(cx.db), at.range);
         }

@@ -35,8 +35,8 @@ use base_db::Db;
 use blaze_hash::HashMap;
 use hir::HirDisplay as _;
 use hir_def::{
-    AdtId, DefWithBodyId, FieldId, FunctionId, ModuleDefId, StructId, VariantId,
-    expr_store::Body, hir::ExprId, nameres::crate_def_map,
+    AdtId, DefWithBodyId, FieldId, FunctionId, ModuleDefId, StructId, VariantId, expr_store::Body,
+    hir::ExprId, nameres::crate_def_map,
 };
 use syntax::{
     TextRange,
@@ -118,7 +118,12 @@ struct Std {
 impl Std {
     fn new(db: &Db, krate: hir::Crate) -> Std {
         let item = |name: &str| krate.diagnostic_item_adt(db, &intern::Symbol::intern(name));
-        Std { vec: item("Vec"), deque: item("VecDeque"), hash_map: item("HashMap"), btree_map: item("BTreeMap") }
+        Std {
+            vec: item("Vec"),
+            deque: item("VecDeque"),
+            hash_map: item("HashMap"),
+            btree_map: item("BTreeMap"),
+        }
     }
 
     /// Which type argument of `adt` is what it holds many of, and how.
@@ -148,7 +153,13 @@ impl Std {
     }
 
     /// The structs of `krate` that `ty`, or a type inside it, holds many of.
-    fn stored_in(&self, db: &Db, krate: base_db::Crate, ty: &hir::Type<'_>, out: &mut Vec<(StructId, Collection)>) {
+    fn stored_in(
+        &self,
+        db: &Db,
+        krate: base_db::Crate,
+        ty: &hir::Type<'_>,
+        out: &mut Vec<(StructId, Collection)>,
+    ) {
         ty.walk(db, |inner| {
             let held = if let Some(element) = inner.as_array_element(db) {
                 Some((element, Collection::Array))
@@ -190,7 +201,14 @@ pub(crate) fn packable_uses(db: &Db, krate: base_db::Crate) -> Uses {
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(it)) => {
                     for &(variant, _) in it.enum_variants(db).variants.values() {
-                        record_fields(db, krate, &std, VariantId::EnumVariantId(variant), &mut found, &mut out);
+                        record_fields(
+                            db,
+                            krate,
+                            &std,
+                            VariantId::EnumVariantId(variant),
+                            &mut found,
+                            &mut out,
+                        );
                     }
                 }
                 _ => {}
@@ -198,7 +216,8 @@ pub(crate) fn packable_uses(db: &Db, krate: base_db::Crate) -> Uses {
         }
     }
     // What each distinct type holds, found once for the crate.
-    let mut seen: HashMap<hir_ty::next_solver::Ty<'_>, (u32, u32), Global> = HashMap::new_in(Global);
+    let mut seen: HashMap<hir_ty::next_solver::Ty<'_>, (u32, u32), Global> =
+        HashMap::new_in(Global);
     // alloc: the structs every distinct type holds, end to end, once per crate
     let mut held: Vec<(StructId, Collection)> = Vec::new();
     for def in frozen_collection::crate_bodies(db, krate) {
@@ -226,7 +245,8 @@ pub(crate) fn packable_uses(db: &Db, krate: base_db::Crate) -> Uses {
 fn record(out: &mut Uses, found: &[(StructId, Collection)], site: Site) {
     for &(id, how) in found {
         // alloc: one struct's storing functions, once per struct the crate stores
-        let stored = out.0.entry(id).or_insert_with(|| Stored { first: (site, how), fns: Vec::new() });
+        let stored =
+            out.0.entry(id).or_insert_with(|| Stored { first: (site, how), fns: Vec::new() });
         if let Site::Expr(DefWithBodyId::FunctionId(f), _) = site
             && stored.fns.last() != Some(&f)
         {
@@ -272,7 +292,8 @@ fn enum_bits(db: &Db, enum_: hir::Enum) -> Option<u64> {
     }
     let id = hir_def::EnumId::from(enum_);
     let variants = id.enum_variants(db);
-    let explicit = variants.variants.values().any(|&(it, _)| variants.has_explicit_discriminant(it));
+    let explicit =
+        variants.variants.values().any(|&(it, _)| variants.has_explicit_discriminant(it));
     let width = |value: u128| u64::from(128 - value.leading_zeros());
     if !explicit {
         // `0..count`.
@@ -372,7 +393,8 @@ fn place_of(cx: &Cx<'_, '_>, site: Site) -> Option<(span::FileId, TextRange)> {
             let source = cx.adt_source(adt)?;
             let node = match source {
                 ast::Adt::Struct(item) => {
-                    frozen_collection::field_node(item, &field.name(db), field.index()).unwrap_or(item.syntax())
+                    frozen_collection::field_node(item, &field.name(db), field.index())
+                        .unwrap_or(item.syntax())
                 }
                 other => other.syntax(),
             };
@@ -388,7 +410,10 @@ fn place_of(cx: &Cx<'_, '_>, site: Site) -> Option<(span::FileId, TextRange)> {
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -457,7 +482,11 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
             shown.push_str(", ");
         }
         let bits = if it.bits == 1 { "1 bit".to_owned() } else { format!("{} bits", it.bits) }; // alloc: a message's part
-        shown.push_str(&format!("`{}` (`{}`, {bits})", field.name(db).as_str(), field_ty.display(db, target)));
+        shown.push_str(&format!(
+            "`{}` (`{}`, {bits})",
+            field.name(db).as_str(),
+            field_ty.display(db, target)
+        ));
     }
     if more > 0 {
         shown.push_str(&format!(" and {more} more"));
@@ -469,7 +498,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
         diagnostic.note(note);
     }
     if let Some((file, range)) = place {
-        diagnostic.span_note(diag::of_file(file, range), format!("`{}` is {} here", name.as_str(), how.describe()));
+        diagnostic.span_note(
+            diag::of_file(file, range),
+            format!("`{}` is {} here", name.as_str(), how.describe()),
+        );
     }
     diagnostic.note(format!(
         "{shown} take whole bytes; every element pays the difference. Zig's packed structs store each field at its bit width"
@@ -486,7 +518,8 @@ fn hot_note(cx: &Cx<'_, '_>, stored: &Stored) -> Option<String> {
     let loaded = cx.conf().profile.as_ref()?;
     let db = cx.db();
     // clone: the profile's settings and a refcount, once per finding with a profile
-    let hits = query::profile_hits(db, cx.krate().base(), query::ProfileKey::new(db, loaded.clone()));
+    let hits =
+        query::profile_hits(db, cx.krate().base(), query::ProfileKey::new(db, loaded.clone()));
     let file = loaded.file_name();
     let hottest = stored
         .fns

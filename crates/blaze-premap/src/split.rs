@@ -38,7 +38,8 @@ use crate::table::SymbolId;
 
 /// The sections whose pieces the run's start orders across both sides; any other named
 /// section is one range per link.
-const ORDERED_SECTIONS: [&str; 4] = [".init_array", ".fini_array", "__DATA,__mod_init_func", ".CRT$XCU"];
+const ORDERED_SECTIONS: [&str; 4] =
+    [".init_array", ".fini_array", "__DATA,__mod_init_func", ".CRT$XCU"];
 
 /// Pieces checked on one thread at a time: fewer are checked on the caller's.
 const CHUNK: usize = 4096;
@@ -151,10 +152,12 @@ fn image_part_in<'a>(
 ) -> Result<ImagePart<'a>, PremapError> {
     let function_slots = Keys::slots(owned.functions.iter().map(|it| it.0.0.0), frame);
     let deps = Keys::<32>::new(&function_slots);
-    let static_slots = Keys::slots(owned.statics.iter().map(|(item, instance)| pair(item, instance)), frame);
+    let static_slots =
+        Keys::slots(owned.statics.iter().map(|(item, instance)| pair(item, instance)), frame);
     let dep_statics = Keys::<64>::new(&static_slots);
     let is_dep = |key: &InstanceKey| deps.get(&key.0.0).is_some();
-    let is_dep_static = |item: &ItemKey, instance: &ContentId| dep_statics.get(&pair(item, instance)).is_some();
+    let is_dep_static =
+        |item: &ItemKey, instance: &ContentId| dep_statics.get(&pair(item, instance)).is_some();
 
     lined_up(built)?;
     let mut functions = Vec::with_capacity(owned.functions.len());
@@ -175,21 +178,24 @@ fn image_part_in<'a>(
     }
     let refers = |function: &CompiledFunction| -> Option<PremapError> {
         let refers = |target: &Target| match target {
-            Target::Function(key) | Target::Direct(key) if !is_dep(key) => Some(PremapError::of(format_args!(
-                "dependency instance {:?} refers to {key:?}, which is the workspace's: an image can't \
+            Target::Function(key) | Target::Direct(key) if !is_dep(key) => {
+                Some(PremapError::of(format_args!(
+                    "dependency instance {:?} refers to {key:?}, which is the workspace's: an image can't \
                  call into the workspace but by name",
-                function.key
-            ))),
-            Target::Static { item, instance } if !is_dep_static(item, instance) => Some(PremapError::of(format_args!(
-                "dependency instance {:?} refers to the static {item:?} ({instance:?}), which is the workspace's",
-                function.key
-            ))),
+                    function.key
+                )))
+            }
+            Target::Static { item, instance } if !is_dep_static(item, instance) => {
+                Some(PremapError::of(format_args!(
+                    "dependency instance {:?} refers to the static {item:?} ({instance:?}), which is the workspace's",
+                    function.key
+                )))
+            }
             _ => None,
         };
         let personality = match &function.unwind {
-            Some(Unwind::Dwarf { personality: Some(target), .. }) | Some(Unwind::Windows { handler: Some(target), .. }) => {
-                Some(target)
-            }
+            Some(Unwind::Dwarf { personality: Some(target), .. })
+            | Some(Unwind::Windows { handler: Some(target), .. }) => Some(target),
             _ => None,
         };
         let data = function.data.iter().flat_map(|it| it.relocs.targets());
@@ -245,7 +251,11 @@ fn image_part_in<'a>(
             }
         }
         statics.push(value);
-        keyed_statics.push(KeyedStatic { item: value.item, instance: value.instance, definition: *definition });
+        keyed_statics.push(KeyedStatic {
+            item: value.item,
+            instance: value.instance,
+            definition: *definition,
+        });
         static_digests.push(*definition);
     }
     for value in built.statics {
@@ -320,7 +330,9 @@ fn lined_up(built: &Built<'_>) -> Result<(), PremapError> {
 }
 
 fn misaligned(what: &str) -> PremapError {
-    PremapError::of(format_args!("codegen's digests of the build's {what} are not one of each, in their order"))
+    PremapError::of(format_args!(
+        "codegen's digests of the build's {what} are not one of each, in their order"
+    ))
 }
 
 fn pair(item: &ItemKey, instance: &ContentId) -> [u8; 64] {
@@ -340,7 +352,10 @@ struct Keys<'s, const N: usize> {
 
 impl<'s, const N: usize> Keys<'s, N> {
     /// The slots of a set of distinct `keys`, at most half full.
-    fn slots<'f>(keys: impl ExactSizeIterator<Item = [u8; N]>, frame: &'f Frame) -> Vec<([u8; N], u32), &'f Frame> {
+    fn slots<'f>(
+        keys: impl ExactSizeIterator<Item = [u8; N]>,
+        frame: &'f Frame,
+    ) -> Vec<([u8; N], u32), &'f Frame> {
         let len = (keys.len() * 2).next_power_of_two().max(2);
         let mut slots = Vec::with_capacity_in(len, frame);
         slots.resize(len, ([0; N], u32::MAX));
@@ -480,13 +495,19 @@ fn workspace_part_in<'a>(
 
     let mut ordered = Vec::new_in(frame);
     for (value, class) in built.statics.iter().zip(statics_of.iter()) {
-        if *class == IMAGE && value.section.as_deref().is_some_and(|it| ORDERED_SECTIONS.contains(&it)) {
+        if *class == IMAGE
+            && value.section.as_deref().is_some_and(|it| ORDERED_SECTIONS.contains(&it))
+        {
             ordered.push(pair(&value.item, &value.instance));
         }
     }
     ordered.sort_unstable();
     let rust = [u32::MAX; 3];
-    if image.init().chain(image.fini()).any(|it| it.order == rust && ordered.binary_search(&it.tie).is_err()) {
+    if image
+        .init()
+        .chain(image.fini())
+        .any(|it| it.order == rust && ordered.binary_search(&it.tie).is_err())
+    {
         return Ok(Fit::Stale(Stale::Extra));
     }
 
@@ -495,7 +516,9 @@ fn workspace_part_in<'a>(
     let spilled = spilled.filter(|(_, class)| **class == SPILLED).map(|(it, _)| it.key).collect(); // alloc: edge: none but when the image lacks pieces
     let statics = pick(built.statics, &statics_of, |it| *it != IMAGE);
     let spilled_statics = statics.iter().zip(statics_of.iter().filter(|it| **it != IMAGE));
-    let spilled_statics = spilled_statics.filter(|(_, class)| **class == SPILLED).map(|(it, _)| (it.item, it.instance));
+    let spilled_statics = spilled_statics
+        .filter(|(_, class)| **class == SPILLED)
+        .map(|(it, _)| (it.item, it.instance));
     let spilled_statics = spilled_statics.collect(); // alloc: edge: none but when the image lacks pieces
     let names = pick(built.names, &names_of, |it| *it == WORKSPACE);
     let debug_names = pick(built.debug_names, &debug_of, |it| *it == WORKSPACE);
@@ -507,7 +530,15 @@ fn workspace_part_in<'a>(
     let mut kept = Vec::with_capacity(natives.iter().filter(workspace_links).count());
     kept.extend(natives.iter().filter(workspace_links).map(|it| it.native));
     let natives = kept;
-    Ok(Fit::Part(WorkspacePart { functions, statics, names, debug_names, natives, spilled, spilled_statics }))
+    Ok(Fit::Part(WorkspacePart {
+        functions,
+        statics,
+        names,
+        debug_names,
+        natives,
+        spilled,
+        spilled_statics,
+    }))
 }
 
 /// The class of each of `built.statics`, by one merge of codegen's sorted digests with the
@@ -549,7 +580,11 @@ fn static_classes<'f>(
 }
 
 /// The class of each index below `len`, on the pool's threads for a long list, in a frame buffer.
-fn classes<'f>(len: usize, class: impl Fn(usize) -> u8 + Sync, frame: &'f Frame) -> Vec<u8, &'f Frame> {
+fn classes<'f>(
+    len: usize,
+    class: impl Fn(usize) -> u8 + Sync,
+    frame: &'f Frame,
+) -> Vec<u8, &'f Frame> {
     let mut out = Vec::with_capacity_in(len, frame);
     out.resize(len, WORKSPACE);
     let run = |(chunk, slots): (usize, &mut [u8])| {
@@ -573,8 +608,11 @@ fn pick<'a, T>(items: &'a [T], classes: &[u8], of: impl Fn(&u8) -> bool) -> Vec<
 }
 
 fn sorted(owned: &Owned<'_>) -> Result<(), PremapError> {
-    if !owned.functions.is_sorted_by(|a, b| a.0 < b.0) || !owned.statics.is_sorted_by(|a, b| a < b) {
-        return Err(PremapError::of(format_args!("codegen's dependency instances are not sorted by key, each once")));
+    if !owned.functions.is_sorted_by(|a, b| a.0 < b.0) || !owned.statics.is_sorted_by(|a, b| a < b)
+    {
+        return Err(PremapError::of(format_args!(
+            "codegen's dependency instances are not sorted by key, each once"
+        )));
     }
     Ok(())
 }

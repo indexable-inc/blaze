@@ -43,12 +43,12 @@ use std::{
 
 use blaze_dbsp::Work;
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_ids::ContentId;
 use blaze_mem::{Tag, frame};
 use parking_lot::{Mutex, MutexGuard};
 use smallvec::SmallVec;
 use span::FileId;
+use std::alloc::Global;
 
 use crate::{Crate, Db, IncludedFile, SourceRoot, SourceRootId};
 
@@ -153,7 +153,11 @@ pub fn implied() -> &'static [&'static Implied] {
         let mut all: Vec<&'static Implied> = inventory::iter::<Implied>().collect();
         all.sort_by_key(|it| it.name);
         for pair in all.windows(2) {
-            assert!(pair[0].name != pair[1].name, "two implied writes are named `{}`", pair[0].name);
+            assert!(
+                pair[0].name != pair[1].name,
+                "two implied writes are named `{}`",
+                pair[0].name
+            );
         }
         all.into_boxed_slice()
     })
@@ -193,7 +197,8 @@ impl Reads {
         read: fn(&Db, &Written<'_>, &mut K),
     ) {
         // alloc: a step's keys, once per batch asked for
-        let keys: Box<[Mutex<Option<K>>]> = keys.into_iter().map(|key| Mutex::new(Some(key))).collect();
+        let keys: Box<[Mutex<Option<K>>]> =
+            keys.into_iter().map(|key| Mutex::new(Some(key))).collect();
         if !keys.is_empty() {
             // alloc: a batch, once per kind of key a step reads
             self.batches.push(Box::new(Each { tag, read, keys }));
@@ -300,11 +305,7 @@ pub fn maintainers() -> &'static [&'static Maintainer] {
         let mut all: Vec<&'static Maintainer> = inventory::iter::<Maintainer>().collect();
         all.sort_by_key(|maintainer| (maintainer.order, maintainer.name));
         for pair in all.windows(2) {
-            assert!(
-                pair[0].name != pair[1].name,
-                "two maintainers are named `{}`",
-                pair[0].name
-            );
+            assert!(pair[0].name != pair[1].name, "two maintainers are named `{}`", pair[0].name);
         }
         all.into_boxed_slice()
     })
@@ -369,13 +370,13 @@ impl Pending {
     /// them.
     const fn empty() -> Pending {
         Pending {
-            set: Vec::new(), // alloc: none, an empty list
-            added: Vec::new(), // alloc: see above
+            set: Vec::new(),     // alloc: none, an empty list
+            added: Vec::new(),   // alloc: see above
             removed: Vec::new(), // alloc: see above
-            roots: Vec::new(), // alloc: see above
+            roots: Vec::new(),   // alloc: see above
             crates: false,
             proc_macros: Vec::new(), // alloc: see above
-            included: Vec::new(), // alloc: see above
+            included: Vec::new(),    // alloc: see above
         }
     }
 
@@ -441,7 +442,12 @@ impl Pending {
 #[derive(Clone, Copy)]
 pub(crate) enum Note<'a> {
     Set(FileId),
-    View { set: &'a [FileId], added: &'a [FileId], removed: &'a [FileId], roots: &'a [SourceRootId] },
+    View {
+        set: &'a [FileId],
+        added: &'a [FileId],
+        removed: &'a [FileId],
+        roots: &'a [SourceRootId],
+    },
     Root(SourceRootId),
     Crates,
     ProcMacros(Crate),
@@ -473,7 +479,10 @@ impl Db {
     /// # Panics
     ///
     /// Outside a maintainer's reads, or when `T` is out already.
-    pub fn lend_state<T: Default + Send + Sync + 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+    pub fn lend_state<T: Default + Send + Sync + 'static, R>(
+        &self,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
         assert!(self.maintenance.reading, "`Db::lend_state` outside a maintainer's reads");
         let mut state = take_state::<T>(&mut lock(&self.maintenance.state));
         let ran = panic::catch_unwind(AssertUnwindSafe(|| f(&mut *state)));
@@ -619,7 +628,12 @@ impl Db {
     /// Notes a source root set from `old` (`None` for a new root) to `new`: the root, and the
     /// files that came into it or left it. `O(files of both)`, on a root's set, which is setup
     /// or a view change.
-    pub(crate) fn note_root(&mut self, id: SourceRootId, old: Option<&SourceRoot>, new: &SourceRoot) {
+    pub(crate) fn note_root(
+        &mut self,
+        id: SourceRootId,
+        old: Option<&SourceRoot>,
+        new: &SourceRoot,
+    ) {
         let maintenance = &mut self.maintenance;
         if maintenance.maintaining {
             return;
@@ -638,7 +652,11 @@ impl Db {
     /// Runs `f` as the write method `write` of crate inputs ([`Db::write`]): the crate graph's
     /// content ID (of every crate's data, cfg, env and dependencies) before and after tells
     /// whether it changed anything.
-    pub(crate) fn write_crates<R>(&mut self, write: &'static str, f: impl FnOnce(&mut Db) -> R) -> R {
+    pub(crate) fn write_crates<R>(
+        &mut self,
+        write: &'static str,
+        f: impl FnOnce(&mut Db) -> R,
+    ) -> R {
         self.write(write, |db| {
             let before = crate::all_crates_content(&*db);
             let result = f(db);
@@ -698,7 +716,9 @@ impl Db {
         let ran = panic::catch_unwind(AssertUnwindSafe(|| {
             let written = pending.written();
             for maintainer in all {
-                let _span = tracing::info_span!(target: "blaze", "maintainer", function = maintainer.name).entered();
+                let _span =
+                    tracing::info_span!(target: "blaze", "maintainer", function = maintainer.name)
+                        .entered();
                 self.run_maintainer(maintainer, &written);
             }
         }));
@@ -731,7 +751,9 @@ impl Db {
         let ran = panic::catch_unwind(AssertUnwindSafe(|| {
             let written = pending.written();
             for it in all {
-                let _span = tracing::info_span!(target: "blaze", "implied write", function = it.name).entered();
+                let _span =
+                    tracing::info_span!(target: "blaze", "implied write", function = it.name)
+                        .entered();
                 (it.write)(self, &written);
             }
         }));

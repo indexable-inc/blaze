@@ -185,8 +185,8 @@ export const rules = [
 		id: "sans-io-cores",
 		skill: "runtime-code",
 		line: "Every core is a synchronous state machine on an injected clock that owns no IO; drivers do the IO and stay thin.",
-		info: "Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease, a maintainer's plan) is a synchronous state machine that reads time only from an injected clock (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a transcript with no real clock.",
-		reason: "Andrew's rule for ix (2026-10-25), and `blaze_graph::sched` is built this way. A core that sleeps or reads wall time can only be tested by waiting, and those tests flake.",
+		info: "Every core (a scheduler decision, a protocol, a retry or backoff policy, a lease, a maintainer's plan) is a synchronous state machine that reads time only from an injected clock (`advance_clock(now)`), owns no socket, file, thread, timer or sleep, and hands back decisions and deadlines (`take_decisions`, `next_deadline`). Drivers do the IO and stay thin. A test replays a transcript with no real clock. Protocol code is a core too: an HTTP client or server, TLS (through rustls's own byte-in/byte-out `Connection`, never `tokio-rustls`), the daemon's wire protocol, a remote-cache or registry client. Its interface is bytes in, bytes and events out, so any IO backend can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no change to the core. A dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped.",
+		reason: "Andrew's rule for ix (2026-10-25), and `blaze_graph::sched` is built this way. A core that sleeps or reads wall time can only be tested by waiting, and those tests flake. Andrew, 2026-11-04, on the registry's HTTP client: \"is that sans io so u can have multiple io impl? like io uring on linux\" — a client built on hyper and tokio-rustls cannot move to io_uring without a rewrite.",
 	},
 	{
 		id: "every-wait-says-what",
@@ -278,6 +278,14 @@ export const rules = [
 		line: "Pick the best long-term design, not the least work, and spend the effort proving it right.",
 		info: "Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and spend the effort on proving it right: real crates' own test suites passing under blaze, and fuzzing of blaze's own invariants.",
 		reason: "Agents write most of blaze, so the amount of code a design takes is not what limits it; what stays expensive is proving it right. Andrew, 2026-10-30, deleting the harnesses that compared blaze with rustc or cargo: \"we use other ppl['s] test[s] [of] the other crates ... it over-constrains us\".",
+		link: "docs/contributing.md#rules-for-code",
+	},
+	{
+		id: "spec-then-build",
+		skill: "changing-code",
+		line: "A change that needs a design gets a spec first, then the same lane builds it right away; a spec is never the deliverable.",
+		info: "Before a change that spans crates, adds a concept, or changes a persisted format, a protocol or a hot path, write a short spec as a `plan` doc under `docs/` (what, why, the chosen design and the losing alternative in a line, the cost budget, the migration, how it is proven). Have a fresh reviewer check it against the code when it is large. Then start building it in the same lane, in the same session, without waiting to be asked: fan out the code, build, land. The spec ships in the same pull request as the first code that implements it, and is marked `current` (or rewritten to describe what was built) once the work lands. A spec with no code behind it is unfinished work, not a result; a lane that cannot build what it specified says what blocks it and who it handed the work to.",
+		reason: "Andrew, 2026-11-04: \"by default write a spec but also do it right away (don't just write and not do)\". A plan written and left alone goes stale while the code moves, and the work it describes never happens.",
 		link: "docs/contributing.md#rules-for-code",
 	},
 	{

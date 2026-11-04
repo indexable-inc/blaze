@@ -13,8 +13,9 @@ use rustc_type_ir::search_graph::{
 };
 use rustc_type_ir::solve::{
     AccessedOpaques, ExternalRegionConstraints, FastPathDepth, FetchEligibleAssocItemResponse,
-    MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
-    RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, SubRoots, TyOrConstInferVar,
+    MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased,
+    RerunCondition, RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, SubRoots,
+    TyOrConstInferVar,
 };
 use rustc_type_ir::transmute::Answer;
 use rustc_type_ir::{
@@ -1787,8 +1788,11 @@ where
         // Interned from the borrow, so a response the interner has already costs no copy, and
         // the lists go back to the scratch.
         let interned = self.cx().mk_external_constraints_ref(&external_constraints);
-        let ExternalConstraintsData { region_constraints, opaque_types, normalization_nested_goals } =
-            external_constraints;
+        let ExternalConstraintsData {
+            region_constraints,
+            opaque_types,
+            normalization_nested_goals,
+        } = external_constraints;
         let scratch = self.search_graph.scratch();
         if let ExternalRegionConstraints::Old(region_constraints) = region_constraints {
             scratch.give_region_constraints(region_constraints);

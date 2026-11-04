@@ -9,7 +9,6 @@ use std::{
 
 use base_db::{Crate, Db, FxIndexMap};
 use blaze_hash::HashSet;
-use std::alloc::Global;
 use either::Either;
 use hir_def::{
     CallableDefId, ExpressionStoreOwnerId, FindPathConfig, GenericDefId, HasModule,
@@ -48,6 +47,7 @@ use rustc_type_ir::{
 };
 use smallvec::SmallVec;
 use span::Edition;
+use std::alloc::Global;
 use stdx::never;
 
 use crate::{
@@ -57,10 +57,11 @@ use crate::{
     layout::Layout,
     mir::{IsSigned, pad16},
     next_solver::{
-        AliasConstKind, AliasTy, Allocation, Clause, ClauseKind, Const, ConstKind, DbInterner,
-        ExistentialPredicate, FnSig, FreeConstAliasId, GenericArg, GenericArgKind, GenericArgs,
-        InherentAssocConstId, ParamEnv, PolyFnSig, Region, Term, TermId, TermKind,
-        TraitAssocConstId, TraitAssocTyId, AssocTyId, TraitClause, TraitRef, Ty, TyKind, TypingMode, Unnormalized, ValTree,
+        AliasConstKind, AliasTy, Allocation, AssocTyId, Clause, ClauseKind, Const, ConstKind,
+        DbInterner, ExistentialPredicate, FnSig, FreeConstAliasId, GenericArg, GenericArgKind,
+        GenericArgs, InherentAssocConstId, ParamEnv, PolyFnSig, Region, Term, TermId, TermKind,
+        TraitAssocConstId, TraitAssocTyId, TraitClause, TraitRef, Ty, TyKind, TypingMode,
+        Unnormalized, ValTree,
         abi::Safety,
         infer::{DbInternerInferExt, traits::ObligationCause},
     },
@@ -176,7 +177,9 @@ impl<'db> HirFormatter<'_, 'db> {
                     AliasTyKind::Projection {
                         def_id: TraitAssocTyId(AssocTyId::RpititId(rpitit)),
                     } => write!(self, "{}", rpitit.display(self.db)),
-                    AliasTyKind::Projection { def_id: TraitAssocTyId(AssocTyId::TypeAliasId(def_id)) } => {
+                    AliasTyKind::Projection {
+                        def_id: TraitAssocTyId(AssocTyId::TypeAliasId(def_id)),
+                    } => {
                         let ItemContainerId::TraitId(trait_) = def_id.loc(self.db).container else {
                             panic!("expected an assoc type");
                         };
@@ -464,7 +467,10 @@ impl<'db> HirFormatter<'_, 'db> {
                 self.out.write_str(s)
             }
         }
-        fmt::Write::write_fmt(&mut Counted { out: &mut *self.out, size: &mut self.curr_size }, args)?;
+        fmt::Write::write_fmt(
+            &mut Counted { out: &mut *self.out, size: &mut self.curr_size },
+            args,
+        )?;
         Ok(())
     }
 
@@ -1224,10 +1230,12 @@ fn render_variant_after_name<'db>(
     let param_env = ParamEnvAndCrate { param_env, krate: f.krate() };
     // A `#[blaze::bits]` struct's bytes are its backing integer: each field is read out of it.
     let bits = match strukt {
-        Some(s) if crate::layout::is_bits_struct(f.db, s) => match crate::layout::bits_layout(f.db, s) {
-            Ok(bits) => Some(bits),
-            Err(_) => return f.write_str("<layout-error>"),
-        },
+        Some(s) if crate::layout::is_bits_struct(f.db, s) => {
+            match crate::layout::bits_layout(f.db, s) {
+                Ok(bits) => Some(bits),
+                Err(_) => return f.write_str("<layout-error>"),
+            }
+        }
         _ => None,
     };
     let render_field = |f: &mut HirFormatter<'_, 'db>, id: LocalFieldId| {
@@ -1498,9 +1506,7 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
                 is_rigid,
                 AliasTy {
                     kind:
-                        AliasTyKind::Projection {
-                            def_id: TraitAssocTyId(AssocTyId::RpititId(rpitit)),
-                        },
+                        AliasTyKind::Projection { def_id: TraitAssocTyId(AssocTyId::RpititId(rpitit)) },
                     args,
                     ..
                 },
@@ -1572,7 +1578,11 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
                         );
                     }
                     ClosureStyle::ClosureWithSubst => {
-                        write!(f, "{{closure#{:?}}}", (blaze_query::db::AsId::as_id(&id).as_u32() - 1))?;
+                        write!(
+                            f,
+                            "{{closure#{:?}}}",
+                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
+                        )?;
                         return hir_fmt_generics(f, substs.as_slice(), None, None);
                     }
                     _ => (),
@@ -2445,9 +2455,9 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                                         target,
                                         bound,
                                     } if matches!(
-                                            store.type_ref(*target),
-                                            TypeRef::TypeParam(t) if t == param
-                                        ) =>
+                                        store.type_ref(*target),
+                                        TypeRef::TypeParam(t) if t == param
+                                    ) =>
                                     {
                                         Some(bound)
                                     }
@@ -2744,10 +2754,12 @@ impl<'db> HirDisplayWithExpressionStore<'db> for Path<'_> {
                         // First argument will be a tuple, which already includes the parentheses.
                         // If the tuple only contains 1 item, write it manually to avoid the trailing `,`.
                         let tuple = match generic_args.args[0] {
-                            hir_def::expr_store::path::GenericArg::Type(ty) => match store.type_ref(ty) {
-                                TypeRef::Tuple(it) => Some(it),
-                                _ => None,
-                            },
+                            hir_def::expr_store::path::GenericArg::Type(ty) => {
+                                match store.type_ref(ty) {
+                                    TypeRef::Tuple(it) => Some(it),
+                                    _ => None,
+                                }
+                            }
                             _ => None,
                         };
                         if let Some(v) = tuple {

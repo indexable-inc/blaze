@@ -154,7 +154,9 @@ impl<T> RegionVec<T> {
         let index = self.push(value);
         match u32::try_from(index) {
             Ok(id) => id,
-            Err(_) => fail(&MemError::TooLarge { tag: self.tag(), what: "a u32 ID", wanted: index }),
+            Err(_) => {
+                fail(&MemError::TooLarge { tag: self.tag(), what: "a u32 ID", wanted: index })
+            }
         }
     }
 

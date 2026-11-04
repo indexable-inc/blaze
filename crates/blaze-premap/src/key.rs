@@ -115,7 +115,17 @@ impl GraphKey {
     }
 
     fn of_in(inputs: &GraphInputs<'_>, frame: &Frame) -> GraphKey {
-        let GraphInputs { units, toolchain, settings, linker, output, base, tls_bias, natives, spans } = inputs;
+        let GraphInputs {
+            units,
+            toolchain,
+            settings,
+            linker,
+            output,
+            base,
+            tls_bias,
+            natives,
+            spans,
+        } = inputs;
         let mut hasher = Hasher::new(GRAPH_DOMAIN);
 
         let mut order: Vec<&DepUnit<'_>, _> = Vec::with_capacity_in(units.len(), frame);
@@ -219,7 +229,8 @@ impl ImageKey {
             target_into(&mut hasher, target);
         }
 
-        let mut sorted: Vec<&&(InstanceKey, String), _> = Vec::with_capacity_in(debug_names.len(), frame);
+        let mut sorted: Vec<&&(InstanceKey, String), _> =
+            Vec::with_capacity_in(debug_names.len(), frame);
         sorted.extend(debug_names.iter());
         sorted.sort_unstable();
         count(&mut hasher, sorted.len());
@@ -271,7 +282,18 @@ fn set(hasher: &mut Hasher, items: &[String], frame: &Frame) {
 }
 
 fn toolchain_into(hasher: &mut Hasher, toolchain: &Toolchain, frame: &Frame) {
-    let Toolchain { id, target, arch, cpu, features, cranelift, llvm, stencils, frame_pointers, relocation } = toolchain;
+    let Toolchain {
+        id,
+        target,
+        arch,
+        cpu,
+        features,
+        cranelift,
+        llvm,
+        stencils,
+        frame_pointers,
+        relocation,
+    } = toolchain;
     hasher.id(id).part(target.as_bytes()).update(&[arch_tag(*arch)]).part(cpu.as_bytes());
     let mut sorted: Vec<&str, _> = Vec::with_capacity_in(features.len(), frame);
     sorted.extend(features.iter().map(String::as_str));
@@ -350,16 +372,17 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
     };
     hasher.update(&[*windows_subsystem as u8]);
     match dev_run {
-        Some(DevRun { arena, cells, fixed }) => {
-            hasher.update(&[1]).update(&arena.to_le_bytes()).update(&cells.to_le_bytes()).update(&fixed.to_le_bytes())
-        }
+        Some(DevRun { arena, cells, fixed }) => hasher
+            .update(&[1])
+            .update(&arena.to_le_bytes())
+            .update(&cells.to_le_bytes())
+            .update(&fixed.to_le_bytes()),
         None => hasher.update(&[0]),
     };
     hasher.part(triple.as_bytes()).update(&[*exec_log as u8]);
-    let Sanitize { sanitizers, recover, track_origins, coverage: Coverage { level, flags } } = sanitize;
-    hasher
-        .update(&[sanitizers.0, recover.0, *track_origins, *level])
-        .update(&flags.to_le_bytes());
+    let Sanitize { sanitizers, recover, track_origins, coverage: Coverage { level, flags } } =
+        sanitize;
+    hasher.update(&[sanitizers.0, recover.0, *track_origins, *level]).update(&flags.to_le_bytes());
     count(hasher, rpaths.len());
     for rpath in rpaths {
         hasher.part(rpath.as_bytes());

@@ -195,23 +195,16 @@ impl TypeCheckVisitor<'_> {
                     .map_err(|_| TypeError)?;
                 Self::apply_poly_predicate(pred, args)?
             }
-            TraitRefKind::ItemClause {
-                trait_ref,
-                type_id,
-                generics,
-                clause_id,
-                clause_args,
-            } if let Some(tdecl) = self.ctx.translated.trait_decls.get(trait_ref.trait_id())
-                && let Some(assoc_ty) = tdecl.types.get(*type_id) =>
+            TraitRefKind::ItemClause { trait_ref, type_id, generics, clause_id, clause_args }
+                if let Some(tdecl) = self.ctx.translated.trait_decls.get(trait_ref.trait_id())
+                    && let Some(assoc_ty) = tdecl.types.get(*type_id) =>
             {
                 if !generics.matches(&assoc_ty.params) {
                     return Err(TypeError);
                 }
                 // Substitute the type with the trait generics.
-                let assoc_ty = assoc_ty
-                    .clone()
-                    .try_substitute_with_tref(trait_ref)
-                    .map_err(|_| TypeError)?;
+                let assoc_ty =
+                    assoc_ty.clone().try_substitute_with_tref(trait_ref).map_err(|_| TypeError)?;
                 // Get the clause from the type and apply the GAT arguments to it.
                 let pred = assoc_ty
                     .skip_binder
@@ -330,9 +323,7 @@ impl TypeCheckVisitor<'_> {
         B: FmtWithCtx<FmtCtx<'a>>,
     {
         if a.len() == b.len() {
-            a.iter()
-                .zip(b.iter())
-                .for_each(|(x, y)| check_inner(self, x, y));
+            a.iter().zip(b.iter()).for_each(|(x, y)| check_inner(self, x, y));
             ControlFlow::Continue(())
         } else {
             let b_fmt = &self.val_fmt_ctx();
@@ -368,10 +359,7 @@ impl TypeCheckVisitor<'_> {
         }
         if let Ok(clause) = tclause.try_substitute() {
             let tref_pred = tref.pred();
-            if self
-                .match_poly_trait_decl_refs(&clause.trait_, &tref_pred)
-                .is_err()
-            {
+            if self.match_poly_trait_decl_refs(&clause.trait_, &tref_pred).is_err() {
                 let args_fmt = &self.val_fmt_ctx();
                 let clause = clause.with_ctx(args_fmt);
                 let tref_pred = tref_pred.with_ctx(args_fmt);
@@ -586,13 +574,7 @@ impl VisitAst for TypeCheckVisitor<'_> {
                     ));
                 }
             }
-            TraitRefKind::ItemClause {
-                trait_ref,
-                type_id,
-                generics,
-                clause_id,
-                clause_args,
-            } => {
+            TraitRefKind::ItemClause { trait_ref, type_id, generics, clause_id, clause_args } => {
                 self.assert_matches_trait_type(trait_ref, *type_id, generics);
                 if let Some(clause) = self
                     .ctx
@@ -610,11 +592,7 @@ impl VisitAst for TypeCheckVisitor<'_> {
                     ));
                 }
             }
-            TraitRefKind::BuiltinOrAuto {
-                parent_trait_refs,
-                types,
-                ..
-            } => {
+            TraitRefKind::BuiltinOrAuto { parent_trait_refs, types, .. } => {
                 let trait_id = x.trait_decl_ref.id;
                 let target = GenericsSource::item(trait_id);
                 let Some(tdecl) = self.ctx.translated.trait_decls.get(trait_id) else {
@@ -645,10 +623,8 @@ impl VisitAst for TypeCheckVisitor<'_> {
                     let args_fmt = &self.val_fmt_ctx();
                     let target = target.with_ctx(args_fmt);
                     let a = tdecl.types.iter().map(|t| t.name()).format(", ");
-                    let b = types
-                        .iter()
-                        .map(|assoc_ty| assoc_ty.value.with_ctx(args_fmt))
-                        .format(", ");
+                    let b =
+                        types.iter().map(|assoc_ty| assoc_ty.value.with_ctx(args_fmt)).format(", ");
                     self.error(format!(
                         "Mismatched types in builtin trait ref:\
                         \ntarget: {target}\
@@ -755,10 +731,7 @@ impl VisitAst for TypeCheckVisitor<'_> {
         }
         let methods_match = timpl.methods.elem_count() == tdecl.methods.elem_count();
         if !methods_match && self.phase != Check::PostTranslation {
-            let decl_methods = tdecl
-                .methods()
-                .map(|m| format!("- {}", m.name()))
-                .join("\n");
+            let decl_methods = tdecl.methods().map(|m| format!("- {}", m.name())).join("\n");
             let impl_methods = timpl
                 .methods
                 .iter_enumerated()
@@ -809,20 +782,13 @@ impl TransformPass for Check {
             let accept_type_errors = matches!(
                 &item,
                 ItemRefMut::Fun(FunDecl {
-                    src: FunSource::TraitImpl {
-                        reuses_default: true,
-                        ..
-                    },
+                    src: FunSource::TraitImpl { reuses_default: true, .. },
                     ..
                 })
             );
             let body_lt_unifier = if let ItemRefMut::Fun(fun_decl) = &item
-                && let Body::Unstructured(GExprBody {
-                    bound_body_regions, ..
-                })
-                | Body::Structured(GExprBody {
-                    bound_body_regions, ..
-                }) = &fun_decl.body
+                && let Body::Unstructured(GExprBody { bound_body_regions, .. })
+                | Body::Structured(GExprBody { bound_body_regions, .. }) = &fun_decl.body
             {
                 Some(UnionFind::new(*bound_body_regions))
             } else {

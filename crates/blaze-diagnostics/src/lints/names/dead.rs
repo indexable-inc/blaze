@@ -40,7 +40,8 @@ pub(super) fn observe(cx: &Cx<'_, '_>, effective: &Effective) -> crate::reach::O
 }
 
 pub(super) fn lints(cx: &Cx<'_, '_>, effective: &Effective) -> Vec<Found> {
-    const GIVES: LintSet = LintSet::of(&[LintId::DEAD_CODE, LintId::named("dead_code_pub_in_binary")]);
+    const GIVES: LintSet =
+        LintSet::of(&[LintId::DEAD_CODE, LintId::named("dead_code_pub_in_binary")]);
     if !cx.any_may_fire(&GIVES) {
         return Vec::new(); // alloc: empty, allocates nothing
     }

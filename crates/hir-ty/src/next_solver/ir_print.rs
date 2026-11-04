@@ -4,7 +4,6 @@ use base_db::Db;
 use hir_def::signatures::{ConstSignature, TraitSignature, TypeAliasSignature};
 use rustc_type_ir::{self as ty, AliasTermKind, ir_print::IrPrint};
 
-
 use super::SolverDefId;
 use super::interner::DbInterner;
 
@@ -95,7 +94,10 @@ impl<'db> IrPrint<ty::TraitClause<Self>> for DbInterner<'db> {
         Self::print_debug(t, fmt)
     }
 
-    fn print_debug(t: &ty::TraitClause<Self>, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn print_debug(
+        t: &ty::TraitClause<Self>,
+        fmt: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
         match t.polarity {
             ty::ClausePolarity::Positive => write!(fmt, "{:?}", t.trait_ref),
             ty::ClausePolarity::Negative => write!(fmt, "!{:?}", t.trait_ref),
@@ -156,11 +158,15 @@ impl<'db> IrPrint<ty::ExistentialProjection<Self>> for DbInterner<'db> {
         t: &ty::ExistentialProjection<Self>,
         fmt: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        crate::next_solver::interner::fmt_with_attached_db(fmt, "ExistentialProjection", |db, fmt| {
-            fmt.write_str("ExistentialProjection(")?;
-            print_alias(db, "", t.def_id.into(), t.args, fmt)?;
-            write!(fmt, " -> {:?})", t.term)
-        })
+        crate::next_solver::interner::fmt_with_attached_db(
+            fmt,
+            "ExistentialProjection",
+            |db, fmt| {
+                fmt.write_str("ExistentialProjection(")?;
+                print_alias(db, "", t.def_id.into(), t.args, fmt)?;
+                write!(fmt, " -> {:?})", t.term)
+            },
+        )
     }
 }
 impl<'db> IrPrint<ty::ProjectionClause<Self>> for DbInterner<'db> {

@@ -11,8 +11,8 @@ use super::{
     Level::{Allow, Deny, Warn},
     Lint,
     Reason::{
-        Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange,
-        EditionError, EditionSemanticsChange, FutureReleaseError,
+        Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange, EditionError,
+        EditionSemanticsChange, FutureReleaseError,
     },
 };
 
@@ -1081,12 +1081,8 @@ pub(super) const BLAZE: &[Lint] = &[
 /// Lints rustc declares and never registers: an attribute can't name them, but
 /// `private_macro_use` is still emitted by name resolution at its default level.
 pub(super) const UNREGISTERED: &[Lint] = &[
-    l(
-        "private_macro_use",
-        Deny,
-        "detects certain macro bindings that should not be re-exported",
-    )
-    .fcw_deps(FutureReleaseError(120192)),
+    l("private_macro_use", Deny, "detects certain macro bindings that should not be re-exported")
+        .fcw_deps(FutureReleaseError(120192)),
     l(
         "unsupported_fn_ptr_calling_conventions",
         Warn,

@@ -38,9 +38,9 @@ pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
              a field of one, its width the bits its discriminants take"
         ),
         // alloc: the error's message
-        hir_def::AdtId::UnionId(_) => format!(
-            "`#[blaze::bits]` on union `{path}`: only a struct is bit-packed"
-        ),
+        hir_def::AdtId::UnionId(_) => {
+            format!("`#[blaze::bits]` on union `{path}`: only a struct is bit-packed")
+        }
     };
     let mut diag = Diag::error(None, message, span);
     // alloc: the error's fact

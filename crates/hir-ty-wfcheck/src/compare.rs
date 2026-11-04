@@ -12,19 +12,20 @@ use hir_def::{
     hir::generics::{GenericParams, TypeOrConstParamData, TypeParamProvenance},
     signatures::FunctionSignature,
 };
-use rustc_type_ir::{
-    error::{ExpectedFound, TypeError},
-    inherent::{GenericArgs as _, IntoKind as _},
-};
 use hir_ty::{
     Span,
     db::HirDatabase as _,
     next_solver::{
-        DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region,
-        RegionExt as _, RegionKind, SolverDefId, Ty, TypingMode, references_non_lt_error,
+        DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region, RegionExt as _,
+        RegionKind, SolverDefId, Ty, TypingMode,
         infer::{BoundRegionConversionTime, DbInternerInferExt as _, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
+        references_non_lt_error,
     },
+};
+use rustc_type_ir::{
+    error::{ExpectedFound, TypeError},
+    inherent::{GenericArgs as _, IntoKind as _},
 };
 
 /// Where the signatures of an impl's method and its trait's differ: rustc's `TypeError` of
@@ -82,10 +83,7 @@ pub struct SignatureMismatch<'db> {
 
 /// The method of the trait `impl_method` implements, with the trait and the impl, when
 /// `impl_method` is a method of a trait impl that the trait has a method of its name for.
-fn trait_method_of(
-    db: &Db,
-    impl_method: FunctionId,
-) -> Option<(ImplId, TraitId, FunctionId)> {
+fn trait_method_of(db: &Db, impl_method: FunctionId) -> Option<(ImplId, TraitId, FunctionId)> {
     let ItemContainerId::ImplId(impl_) = impl_method.lookup(db).container else { return None };
     let trait_ref = db.impl_trait(impl_)?;
     let trait_ = trait_ref.skip_binder().def_id.0;
@@ -162,22 +160,22 @@ pub fn compare_impl_method_signature<'db>(
         return None;
     }
     let synthetic = |def: FunctionId| {
-        GenericParams::of(db, def.into())
-            .iter_type_or_consts()
-            .map(|(_, data)| {
-                matches!(
-                    data,
-                    TypeOrConstParamData::TypeParamData(it)
-                        if it.provenance == TypeParamProvenance::ArgumentImplTrait
-                )
-            })
+        GenericParams::of(db, def.into()).iter_type_or_consts().map(|(_, data)| {
+            matches!(
+                data,
+                TypeOrConstParamData::TypeParamData(it)
+                    if it.provenance == TypeParamProvenance::ArgumentImplTrait
+            )
+        })
     };
     if !synthetic(impl_method).eq(synthetic(trait_method)) {
         return None;
     }
-    let trait_to_impl_args =
-        GenericArgs::identity_for_item(interner, SolverDefId::FunctionId(impl_method))
-            .rebase_onto(interner, SolverDefId::ImplId(impl_), trait_ref.args);
+    let trait_to_impl_args = GenericArgs::identity_for_item(
+        interner,
+        SolverDefId::FunctionId(impl_method),
+    )
+    .rebase_onto(interner, SolverDefId::ImplId(impl_), trait_ref.args);
 
     let impl_poly_sig = db
         .callable_item_signature(CallableDefId::FunctionId(impl_method))
@@ -295,10 +293,8 @@ pub fn compare_proc_macro_signature<'db>(
         return None;
     }
 
-    let expected = interner.mk_fn_sig_safe_rust_abi(
-        std::iter::repeat_n(token_stream, inputs),
-        token_stream,
-    );
+    let expected =
+        interner.mk_fn_sig_safe_rust_abi(std::iter::repeat_n(token_stream, inputs), token_stream);
     let error = ocx.eq(&cause, param_env, expected, sig).err()?;
     let at = SignatureMismatchAt::of(&error, sig.inputs().len());
     let identity = interner.liberate_late_bound_regions(

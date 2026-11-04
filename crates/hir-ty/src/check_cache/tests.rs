@@ -7,7 +7,6 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::{Aligned, HEADER_LEN, Persist};
 use blaze_hash::HashMap;
-use std::alloc::Global;
 use blaze_query::db::AsId;
 use hir_def::{
     DefWithBodyId, FunctionId, LoweringMode, deps::ImageBuf, expr_store::Body,
@@ -15,6 +14,7 @@ use hir_def::{
 };
 use hir_expand::fixture;
 use hir_expand::name::Name;
+use std::alloc::Global;
 
 use super::{ids::Table, part, *};
 use crate::{
@@ -83,7 +83,9 @@ fn function(db: &Db, krate: Crate, name: &str) -> FunctionId {
     crate_body_owners(db, krate)
         .into_iter()
         .find_map(|def| match def {
-            DefWithBodyId::FunctionId(it) if FunctionSignature::of(db, it).name == Name::new_root(name) => {
+            DefWithBodyId::FunctionId(it)
+                if FunctionSignature::of(db, it).name == Name::new_root(name) =>
+            {
                 Some(it)
             }
             _ => None,
@@ -159,14 +161,16 @@ fn outside_a_scope_a_record_is_todays_bytes() {
     let outside = blaze_format::to_bytes(&result.to_record(interner));
     assert_eq!(outside, blaze_format::to_bytes(&result.to_record(interner)), "deterministic");
     let nodes = Nodes::of(Body::of(&db, area.into()));
-    let read = InferenceRecord::read(&Aligned::copy_from(&outside)).unwrap().to_result(interner, nodes);
+    let read =
+        InferenceRecord::read(&Aligned::copy_from(&outside)).unwrap().to_result(interner, nodes);
     assert!(read.unwrap() == *result, "a record outside a scope reads back in its own database");
     let sum_bits = u64::from(sum.as_id().as_u32()).to_le_bytes();
     let names = |bytes: &[u8]| bytes.windows(8).any(|it| it == sum_bits);
     assert!(names(&outside), "a method's id, as today's records write it");
 
     let mut table = Table::default();
-    let inside = ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
+    let inside =
+        ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
     assert!(table.len() > 0, "the record names ids");
     assert_ne!(inside, outside, "inside a scope, ids are written as their index in the table");
 }
@@ -181,7 +185,10 @@ fn an_edit_to_the_dependency_moves_the_part_key() {
     };
     let before = key_of(FIXTURE);
     assert_eq!(before, key_of(FIXTURE), "the same in every database");
-    assert_ne!(before, key_of(&FIXTURE.replace("pub const C: u32 = 3 + 4;", "pub const C: u32 = 3 + 5;")));
+    assert_ne!(
+        before,
+        key_of(&FIXTURE.replace("pub const C: u32 = 3 + 4;", "pub const C: u32 = 3 + 5;"))
+    );
     let image = blaze_ids::ContentId([1; 32]);
     assert_ne!(key(image, 0), key(image, 1), "the borrow checker's mode");
 }
@@ -191,7 +198,15 @@ fn bodies(bytes: &[u8]) -> Vec<(blaze_ids::ContentId, Result<bool, String>)> {
     let part = part::view(bytes).unwrap();
     part.keys()
         .iter()
-        .map(|key| (*key, part.find(key).ok_or_else(String::new).and_then(part::open_body).map(|it| it.passed())))
+        .map(|key| {
+            (
+                *key,
+                part.find(key)
+                    .ok_or_else(String::new)
+                    .and_then(part::open_body)
+                    .map(|it| it.passed()),
+            )
+        })
         .collect()
 }
 
@@ -260,7 +275,8 @@ fn a_damaged_record_is_refused_by_its_read() {
         damaged[start + at] ^= 0xff;
         let damaged = Aligned::copy_from(&damaged);
         let body = part::view(&damaged).unwrap().find(&key).unwrap();
-        let read = part::open_body(body).and_then(|it| it.inference(&db, dep, &items, nodes).map(drop));
+        let read =
+            part::open_body(body).and_then(|it| it.inference(&db, dep, &items, nodes).map(drop));
         assert!(read.is_err(), "the body's header byte {at} flipped");
     }
 }
@@ -272,7 +288,8 @@ fn a_body_neither_recorded_nor_left_out_is_an_error() {
     let bytes = written();
     let part = part::open(&bytes).unwrap();
     assert!(part.len() > 0);
-    let fixture = FIXTURE.replace("pub const C: u32", "pub fn unwritten() -> u32 { 9 }\npub const C: u32");
+    let fixture =
+        FIXTURE.replace("pub const C: u32", "pub fn unwritten() -> u32 { 9 }\npub const C: u32");
     let mut db = db_of(&fixture);
     let dep = crate_named(&db, "dep");
     // alloc: test setup
@@ -282,10 +299,9 @@ fn a_body_neither_recorded_nor_left_out_is_an_error() {
     let unwritten = DefWithBodyId::FunctionId(function(&db, dep, "unwritten"));
     let key = hir_def::deps::body_key(&db, unwritten).expect("a module's function has a key");
     assert!(part.find(&key).is_none() && part.left_out(&key).is_none());
-    for read in [
-        &(|| drop(served_inference(&db, unwritten))) as &dyn Fn(),
-        &|| drop(served_passed(&db, unwritten)),
-    ] {
+    for read in [&(|| drop(served_inference(&db, unwritten))) as &dyn Fn(), &|| {
+        drop(served_passed(&db, unwritten))
+    }] {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_err();
         let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
         assert!(message.contains("neither recorded nor left out"), "{message}");

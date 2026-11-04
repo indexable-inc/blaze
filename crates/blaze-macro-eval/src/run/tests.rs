@@ -57,7 +57,12 @@ fn a_run_is_one_macro_expand_span_naming_its_macro_crate_steps_peak_and_outcome(
         let spent = Spent { evaluated: true, steps: 4_200_000, peak_bytes: 48 << 20, over: None };
         ran_on(span, &spent, &Ok(ran(Ok(crate::stream::Stream::default()))));
         let stopped = expand_span("serde_derive::Deserialize", calling);
-        let spent = Spent { evaluated: true, steps: super::STEPS, peak_bytes: 1 << 20, over: Some(Over::Steps) };
+        let spent = Spent {
+            evaluated: true,
+            steps: super::STEPS,
+            peak_bytes: 1 << 20,
+            over: Some(Over::Steps),
+        };
         ran_on(stopped, &spent, &Err(crate::guest::Stop("ran out".to_owned())));
         let compiled = expand_span("serde_derive::Serialize", calling);
         ran_on(compiled, &Spent::default(), &Ok(ran(Ok(crate::stream::Stream::default()))));
@@ -78,8 +83,16 @@ fn a_run_is_one_macro_expand_span_naming_its_macro_crate_steps_peak_and_outcome(
     assert_eq!(
         runs.iter().map(|it| it.ended).collect::<Vec<_>>(),
         [
-            Some(MacroExpanded { steps: Some(4_200_000), peak_bytes: Some(48 << 20), outcome: Outcome::Ok }),
-            Some(MacroExpanded { steps: Some(super::STEPS), peak_bytes: Some(1 << 20), outcome: Outcome::StepLimit }),
+            Some(MacroExpanded {
+                steps: Some(4_200_000),
+                peak_bytes: Some(48 << 20),
+                outcome: Outcome::Ok
+            }),
+            Some(MacroExpanded {
+                steps: Some(super::STEPS),
+                peak_bytes: Some(1 << 20),
+                outcome: Outcome::StepLimit
+            }),
             Some(MacroExpanded { steps: None, peak_bytes: None, outcome: Outcome::Ok }),
         ],
         "a compiled run counts no steps"
@@ -95,11 +108,17 @@ fn a_run_stopped_by_a_budget_names_the_budget_and_a_panic_is_not_an_error() {
     use super::{Over, Spent, outcome_of, over_budget};
     let steps = MirEvalError::OverBudget { spent: Budget::Steps(super::STEPS), at: None };
     let memory = MirEvalError::OverBudget { spent: Budget::Memory(super::MEMORY), at: None };
-    assert_eq!((over_budget(&steps), over_budget(&memory)), (Some(Over::Steps), Some(Over::Memory)));
+    assert_eq!(
+        (over_budget(&steps), over_budget(&memory)),
+        (Some(Over::Steps), Some(Over::Memory))
+    );
     assert_eq!(over_budget(&MirEvalError::MachineStop), None);
     let spent = Spent { evaluated: true, ..Spent::default() };
     assert_eq!(outcome_of(&Ok(ran(Err("boom".to_owned()))), &spent), Outcome::Panic);
     let stop = || Err(crate::guest::Stop("stopped".to_owned()));
-    assert_eq!(outcome_of(&stop(), &Spent { over: Some(Over::Memory), ..spent }), Outcome::MemoryLimit);
+    assert_eq!(
+        outcome_of(&stop(), &Spent { over: Some(Over::Memory), ..spent }),
+        Outcome::MemoryLimit
+    );
     assert_eq!(outcome_of(&stop(), &spent), Outcome::Error);
 }

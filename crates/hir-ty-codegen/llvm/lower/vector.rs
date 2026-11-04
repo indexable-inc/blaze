@@ -52,7 +52,12 @@ impl<'ctx> Lowering<'ctx, '_> {
                 Opcode::ScalarToVector => {
                     let ty = self.vector_ty(self.result(inst))?;
                     let zero = self.context.i32_type().const_zero();
-                    self.builder.build_insert_element(ty.const_zero(), self.plain(arg)?, zero, "")?
+                    self.builder.build_insert_element(
+                        ty.const_zero(),
+                        self.plain(arg)?,
+                        zero,
+                        "",
+                    )?
                 }
                 _ => {
                     let Operand::Vector(x) = self.operand(arg) else { return Ok(false) };
@@ -88,7 +93,8 @@ impl<'ctx> Lowering<'ctx, '_> {
                 else {
                     return Ok(false);
                 };
-                let holds = self.builder.build_float_compare(Self::float_predicate(cond), x, y, "")?;
+                let holds =
+                    self.builder.build_float_compare(Self::float_predicate(cond), x, y, "")?;
                 let ty = self.vector_ty(self.result(inst))?;
                 self.builder.build_int_s_extend(holds, ty, "")?
             }
@@ -144,10 +150,13 @@ impl<'ctx> Lowering<'ctx, '_> {
             Opcode::SwidenLow | Opcode::SwidenHigh | Opcode::UwidenLow | Opcode::UwidenHigh => {
                 let high = matches!(opcode, Opcode::SwidenHigh | Opcode::UwidenHigh);
                 let signed = matches!(opcode, Opcode::SwidenLow | Opcode::SwidenHigh);
-                let half = self.lanes(x, (0..lanes / 2).map(|it| it + u32::from(high) * lanes / 2))?;
+                let half =
+                    self.lanes(x, (0..lanes / 2).map(|it| it + u32::from(high) * lanes / 2))?;
                 self.extend(half, self.vector_ty(self.result(inst))?, signed)?
             }
-            Opcode::FcvtFromSint => b.build_signed_int_to_float(x, self.vector_ty(self.result(inst))?, "")?,
+            Opcode::FcvtFromSint => {
+                b.build_signed_int_to_float(x, self.vector_ty(self.result(inst))?, "")?
+            }
             Opcode::FcvtFromUint => {
                 b.build_unsigned_int_to_float(x, self.vector_ty(self.result(inst))?, "")?
             }
@@ -158,9 +167,12 @@ impl<'ctx> Lowering<'ctx, '_> {
                     _ => "llvm.fptoui.sat",
                 };
                 let ty = self.vector_ty(self.result(inst))?;
-                self.intrinsic(name, &[ty.into(), x.get_type().into()], &[x.into()])?.into_vector_value()
+                self.intrinsic(name, &[ty.into(), x.get_type().into()], &[x.into()])?
+                    .into_vector_value()
             }
-            Opcode::Fpromote | Opcode::Fdemote => b.build_float_cast(x, self.vector_ty(self.result(inst))?, "")?,
+            Opcode::Fpromote | Opcode::Fdemote => {
+                b.build_float_cast(x, self.vector_ty(self.result(inst))?, "")?
+            }
             // The low two lanes, each made a `f64`.
             Opcode::FvpromoteLow => {
                 let low = self.lanes(x, 0..2)?;
@@ -199,7 +211,8 @@ impl<'ctx> Lowering<'ctx, '_> {
             // `(x + y + 1) / 2` of unsigned lanes, the sum taken without losing its carry.
             Opcode::AvgRound => {
                 let (ty, wide) = self.widened(x)?;
-                let (x, y) = (b.build_int_z_extend(x, wide, "")?, b.build_int_z_extend(y, wide, "")?);
+                let (x, y) =
+                    (b.build_int_z_extend(x, wide, "")?, b.build_int_z_extend(y, wide, "")?);
                 let one = self.splat_int(wide, 1);
                 let sum = b.build_int_add(b.build_int_add(x, y, "")?, one, "")?;
                 b.build_int_truncate(b.build_right_shift(sum, one, false, "")?, ty, "")?
@@ -209,12 +222,20 @@ impl<'ctx> Lowering<'ctx, '_> {
             Opcode::SqmulRoundSat => {
                 let (ty, wide) = self.widened(x)?;
                 let bits = u64::from(ty.get_element_type().into_int_type().get_bit_width());
-                let (x, y) = (b.build_int_s_extend(x, wide, "")?, b.build_int_s_extend(y, wide, "")?);
-                let product = b.build_int_add(b.build_int_mul(x, y, "")?, self.splat_int(wide, 1 << (bits - 2)), "")?;
-                let shifted = b.build_right_shift(product, self.splat_int(wide, bits - 1), true, "")?;
+                let (x, y) =
+                    (b.build_int_s_extend(x, wide, "")?, b.build_int_s_extend(y, wide, "")?);
+                let product = b.build_int_add(
+                    b.build_int_mul(x, y, "")?,
+                    self.splat_int(wide, 1 << (bits - 2)),
+                    "",
+                )?;
+                let shifted =
+                    b.build_right_shift(product, self.splat_int(wide, bits - 1), true, "")?;
                 let (most, least) = ((1u64 << (bits - 1)) - 1, u64::MAX << (bits - 1));
-                let clamped = self.each("llvm.smin", &[shifted.into(), self.splat_int(wide, most).into()])?;
-                let clamped = self.each("llvm.smax", &[clamped.into(), self.splat_int(wide, least).into()])?;
+                let clamped =
+                    self.each("llvm.smin", &[shifted.into(), self.splat_int(wide, most).into()])?;
+                let clamped =
+                    self.each("llvm.smax", &[clamped.into(), self.splat_int(wide, least).into()])?;
                 b.build_int_truncate(clamped, ty, "")?
             }
             Opcode::Snarrow => self.narrow(inst, x, y, Narrow::Signed)?,
@@ -229,7 +250,11 @@ impl<'ctx> Lowering<'ctx, '_> {
                 let x = b.build_int_cast_sign_flag(x, wide, signed, "")?;
                 let y = b.build_int_cast_sign_flag(y, wide, signed, "")?;
                 let product = b.build_int_mul(x, y, "")?;
-                b.build_int_truncate(b.build_right_shift(product, self.splat_int(wide, bits), false, "")?, ty, "")?
+                b.build_int_truncate(
+                    b.build_right_shift(product, self.splat_int(wide, bits), false, "")?,
+                    ty,
+                    "",
+                )?
             }
             _ => return Ok(None),
         }))
@@ -272,12 +297,18 @@ impl<'ctx> Lowering<'ctx, '_> {
     /// past the 16 bytes. That is AArch64's `tbl` of one register; elsewhere each byte is
     /// picked by its index and the bytes past the end cleared, which LLVM selects as the
     /// target's byte shuffle where it has one.
-    fn swizzle(&self, x: VectorValue<'ctx>, indices: VectorValue<'ctx>) -> Lowered<VectorValue<'ctx>> {
+    fn swizzle(
+        &self,
+        x: VectorValue<'ctx>,
+        indices: VectorValue<'ctx>,
+    ) -> Lowered<VectorValue<'ctx>> {
         let b = &self.builder;
         let ty = x.get_type();
         if self.target.arch == crate::target::Arch::Aarch64 {
             let args = [x.into(), indices.into()];
-            return Ok(self.intrinsic("llvm.aarch64.neon.tbl1", &[ty.into()], &args)?.into_vector_value());
+            return Ok(self
+                .intrinsic("llvm.aarch64.neon.tbl1", &[ty.into()], &args)?
+                .into_vector_value());
         }
         let lanes = ty.get_size();
         let lane = self.context.i32_type();
@@ -333,7 +364,10 @@ impl<'ctx> Lowering<'ctx, '_> {
 
     /// The vector of `ty`'s lanes, each half as wide: what a widening load reads.
     fn halved(ty: Type) -> Lowered<Type> {
-        ty.lane_type().half_width().and_then(|lane| lane.by(ty.lane_count())).ok_or(Unhandled::Type(ty))
+        ty.lane_type()
+            .half_width()
+            .and_then(|lane| lane.by(ty.lane_count()))
+            .ok_or(Unhandled::Type(ty))
     }
 
     /// `x`'s type, and the vector of as many lanes twice as wide.
@@ -346,7 +380,12 @@ impl<'ctx> Lowering<'ctx, '_> {
         Ok((ty, wide.vec_type(ty.get_size())))
     }
 
-    fn extend(&self, x: VectorValue<'ctx>, to: VectorType<'ctx>, signed: bool) -> Lowered<VectorValue<'ctx>> {
+    fn extend(
+        &self,
+        x: VectorValue<'ctx>,
+        to: VectorType<'ctx>,
+        signed: bool,
+    ) -> Lowered<VectorValue<'ctx>> {
         Ok(match signed {
             true => self.builder.build_int_s_extend(x, to, "")?,
             false => self.builder.build_int_z_extend(x, to, "")?,
@@ -354,7 +393,11 @@ impl<'ctx> Lowering<'ctx, '_> {
     }
 
     /// The lanes of `x` that `lanes` names, in that order.
-    fn lanes(&self, x: VectorValue<'ctx>, lanes: impl Iterator<Item = u32>) -> Lowered<VectorValue<'ctx>> {
+    fn lanes(
+        &self,
+        x: VectorValue<'ctx>,
+        lanes: impl Iterator<Item = u32>,
+    ) -> Lowered<VectorValue<'ctx>> {
         let poison = x.get_type().get_poison();
         Ok(self.builder.build_shuffle_vector(x, poison, self.mask(lanes), "")?)
     }
@@ -362,19 +405,26 @@ impl<'ctx> Lowering<'ctx, '_> {
     /// A `shufflevector` mask of `lanes`.
     fn mask(&self, lanes: impl Iterator<Item = u32>) -> VectorValue<'ctx> {
         let index = self.context.i32_type();
-        let lanes = lanes.map(|it| index.const_int(u64::from(it), false)).collect::<SmallVec<[IntValue<'ctx>; 16]>>();
+        let lanes = lanes
+            .map(|it| index.const_int(u64::from(it), false))
+            .collect::<SmallVec<[IntValue<'ctx>; 16]>>();
         VectorType::const_vector(lanes.as_slice())
     }
 
     /// `value` in every lane of `ty`, a vector of integers, as a constant.
     fn splat_int(&self, ty: VectorType<'ctx>, value: u64) -> VectorValue<'ctx> {
         let lane = ty.get_element_type().into_int_type().const_int(value, false);
-        let lanes = std::iter::repeat_n(lane, ty.get_size() as usize).collect::<SmallVec<[IntValue<'ctx>; 16]>>();
+        let lanes = std::iter::repeat_n(lane, ty.get_size() as usize)
+            .collect::<SmallVec<[IntValue<'ctx>; 16]>>();
         VectorType::const_vector(lanes.as_slice())
     }
 
     /// LLVM's intrinsic `name` of the type of the first of `args`, a vector, lane by lane.
-    fn each(&self, name: &str, args: &[BasicMetadataValueEnum<'ctx>]) -> Lowered<VectorValue<'ctx>> {
+    fn each(
+        &self,
+        name: &str,
+        args: &[BasicMetadataValueEnum<'ctx>],
+    ) -> Lowered<VectorValue<'ctx>> {
         let BasicMetadataValueEnum::VectorValue(first) = args[0] else {
             return Err(Unhandled::Shape("a vector intrinsic of no vector"));
         };

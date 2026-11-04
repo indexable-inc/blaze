@@ -41,9 +41,8 @@ fn method_entries(methods: &[MethodInfo], invariants: bool) -> Vec<TokenStream> 
             let name = &m.name;
             // Only forward attributes that are valid on expressions, which is a subset of all
             // attributes. See https://github.com/hegeldev/hegel-rust/pull/353.
-            const FORWARDED: [&str; 7] = [
-                "cfg", "cfg_attr", "allow", "expect", "warn", "deny", "forbid",
-            ];
+            const FORWARDED: [&str; 7] =
+                ["cfg", "cfg_attr", "allow", "expect", "warn", "deny", "forbid"];
             let attrs: Vec<&Attribute> = m
                 .attrs
                 .iter()
@@ -108,10 +107,7 @@ fn rule_weight(meta: &syn::meta::ParseNestedMeta) -> syn::Result<f64> {
         }
     };
     if !(weight.is_finite() && weight > 0.0) {
-        return Err(syn::Error::new_spanned(
-            &value,
-            "#[rule] weight must be finite and positive",
-        ));
+        return Err(syn::Error::new_spanned(&value, "#[rule] weight must be finite and positive"));
     }
     Ok(weight)
 }
@@ -120,10 +116,7 @@ fn rule_weight(meta: &syn::meta::ParseNestedMeta) -> syn::Result<f64> {
 /// accepted only when `concurrent`. `weight = ...` is accepted in both
 /// kinds of machine.
 fn rule_args(attr: &Attribute, concurrent: bool) -> syn::Result<RuleArgs> {
-    let mut args = RuleArgs {
-        group: RuleGroup::Anonymous,
-        weight: None,
-    };
+    let mut args = RuleArgs { group: RuleGroup::Anonymous, weight: None };
     if matches!(attr.meta, syn::Meta::Path(_)) {
         return Ok(args);
     }
@@ -171,10 +164,7 @@ fn invariant_always_run(attr: &Attribute) -> syn::Result<bool> {
     if always_run {
         Ok(true)
     } else {
-        Err(syn::Error::new_spanned(
-            attr,
-            "#[invariant(...)] requires `always_run`",
-        ))
+        Err(syn::Error::new_spanned(attr, "#[invariant(...)] requires `always_run`"))
     }
 }
 
@@ -192,11 +182,8 @@ fn concurrent_method_entries(methods: &[ConcurrentMethodInfo]) -> Vec<TokenStrea
         .map(|m| {
             let name_str = m.name.to_string();
             let name = &m.name;
-            let attrs: Vec<&Attribute> = m
-                .attrs
-                .iter()
-                .filter(|a| !a.path().is_ident("doc"))
-                .collect();
+            let attrs: Vec<&Attribute> =
+                m.attrs.iter().filter(|a| !a.path().is_ident("doc")).collect();
             match &m.group {
                 Some(group) => {
                     let group = match group {

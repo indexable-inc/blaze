@@ -8,8 +8,8 @@ use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, item_key};
 use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
-use hir_ty_mir::mir::MirSpan;
 use hir_expand::fixture;
+use hir_ty_mir::mir::MirSpan;
 
 use super::*;
 use crate::v2::{BuildTime, Databases, ItemHashes};
@@ -67,9 +67,18 @@ fn a_link_blaze_cannot_make_is_an_error_naming_it() {
         ("#[link(name = \"-Wl,-z\", kind = \"link-arg\")]\nextern \"C\" {}", "kind = \"link-arg\""),
         ("#[link(name = \"m\", modifiers = \"+as-needed\")]\nextern \"C\" {}", "+as-needed"),
         ("#[link(name = \"m\", modifiers = \"-as-needed\")]\nextern \"C\" {}", "-as-needed"),
-        ("#[link(name = \"m\", import_name_type = \"undecorated\")]\nextern \"C\" {}", "import_name_type"),
-        ("extern \"C\" {\n    #[link_ordinal(1)]\n    fn ordinal();\n}", "`#[link_ordinal(..)]` on `ordinal`"),
-        ("extern \"C\" {\n    #[link_ordinal(2)]\n    static ORDINAL: u8;\n}", "`#[link_ordinal(..)]` on `ORDINAL`"),
+        (
+            "#[link(name = \"m\", import_name_type = \"undecorated\")]\nextern \"C\" {}",
+            "import_name_type",
+        ),
+        (
+            "extern \"C\" {\n    #[link_ordinal(1)]\n    fn ordinal();\n}",
+            "`#[link_ordinal(..)]` on `ordinal`",
+        ),
+        (
+            "extern \"C\" {\n    #[link_ordinal(2)]\n    static ORDINAL: u8;\n}",
+            "`#[link_ordinal(..)]` on `ORDINAL`",
+        ),
     ] {
         let (db, frontend) = frontend(text);
         let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
@@ -106,7 +115,10 @@ fn the_tables_the_code_names_are_given_with_their_positions() {
     let start = hashes.span(db, owner, MirSpan::ExprId(root)).unwrap();
     let declared = hashes.declaration(db, func).unwrap();
     let built = Built {
-        functions: vec![compiled(1, vec![Line { at: 0, span: start }, Line { at: 1, span: declared }])],
+        functions: vec![compiled(
+            1,
+            vec![Line { at: 0, span: start }, Line { at: 1, span: declared }],
+        )],
         items: vec![item_key(db, ItemId::Function(func))],
         debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
         ..Built::default()
@@ -131,8 +143,10 @@ fn the_tables_the_code_names_are_given_with_their_positions() {
     assert_eq!(count, BodyStore::of(db, owner).exprs().count(), "a row per expression");
     assert_eq!(body.len(), after + 4 + 12 * count);
     let row = after + 4 + 12 * start.index as usize;
-    let words: Vec<u32> =
-        body[row..row + 12].chunks(4).map(|it| u32::from_le_bytes(it.try_into().unwrap())).collect();
+    let words: Vec<u32> = body[row..row + 12]
+        .chunks(4)
+        .map(|it| u32::from_le_bytes(it.try_into().unwrap()))
+        .collect();
     // The body's block, on the first line, from its 25th column.
     assert_eq!(words, [0, 1, 25]);
 
@@ -154,10 +168,16 @@ fn a_position_of_no_table_the_build_has_is_an_error() {
     };
     let error = frontend.link_inputs(&built).unwrap_err();
     assert!(error.what.contains(&format!("{:?}", stray.anchor)), "{}", error.what);
-    assert!(error.what.contains("a line row of the function"), "says what names it: {}", error.what);
+    assert!(
+        error.what.contains("a line row of the function"),
+        "says what names it: {}",
+        error.what
+    );
     assert!(error.what.contains("`lib::f`"), "names the function: {}", error.what);
     assert!(
-        error.what.contains(&format!("1 of the build's 2 items resolve to no item of the database, among them {unknown:?}")),
+        error.what.contains(&format!(
+            "1 of the build's 2 items resolve to no item of the database, among them {unknown:?}"
+        )),
         "names an item it could not look in: {}",
         error.what
     );
@@ -192,13 +212,19 @@ fn positions_are_placed_without_a_memo_per_span() {
         let executed = db.log_executed(|| found = Some(positions(&db, owner).clone().unwrap()));
         let found = found.expect("the positions");
         assert!(executed.iter().any(|it| it == "positions"), "the log sees queries: {executed:#?}");
-        for per_span in ["source_place", "row_place", "source_location_in_file", "row_location_in_file"] {
-            assert!(!executed.iter().any(|it| it == per_span), "a memo of {per_span}: {executed:#?}");
+        for per_span in
+            ["source_place", "row_place", "source_location_in_file", "row_location_in_file"]
+        {
+            assert!(
+                !executed.iter().any(|it| it == per_span),
+                "a memo of {per_span}: {executed:#?}"
+            );
         }
 
         let table = |t: usize| &found.rows[found.starts[t] as usize..found.starts[t + 1] as usize];
         let store = BodyStore::of(&db, owner);
-        let in_file = |span: MirSpan| hir_ty_mir::mir::location::source_location_in_file(&db, owner, span);
+        let in_file =
+            |span: MirSpan| hir_ty_mir::mir::location::source_location_in_file(&db, owner, span);
         let exprs: Vec<MirSpan> = store.expr_ids().map(MirSpan::ExprId).collect();
         let pats: Vec<MirSpan> = store.pat_ids().map(MirSpan::PatId).collect();
         for (spans, rows) in [(exprs, table(code::EXPRS)), (pats, table(code::PATS))] {

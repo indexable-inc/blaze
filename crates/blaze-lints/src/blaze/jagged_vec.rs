@@ -54,7 +54,10 @@ pub(super) fn jagged(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<&'static str
 }
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
-    if !cx.on_blaze(LINT) || cx.expansion().is_some() || !cx.is_written(item.syntax()) || cx.is_in_test(item.syntax())
+    if !cx.on_blaze(LINT)
+        || cx.expansion().is_some()
+        || !cx.is_written(item.syntax())
+        || cx.is_in_test(item.syntax())
     {
         return;
     }
@@ -82,7 +85,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
         if mutated.contains(FieldId::from(field)) {
             continue;
         }
-        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else { continue };
+        let Some(node) = frozen_collection::field_node(item, &field.name(db), index) else {
+            continue;
+        };
         let Some(range) = cx.range(node) else { continue };
         let flat = match row {
             "String" | "Box<str>" => "one `String` of every row's text",

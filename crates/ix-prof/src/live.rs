@@ -69,11 +69,16 @@ pub fn read(bytes: &[u8]) -> Result<Option<(Read<'_>, &[u8])>, String> {
         END => Read::End(text()?),
         BATCH => {
             let seq = u64::from_le_bytes(
-                payload.get(..8).ok_or("a BATCH frame shorter than its seq")?.try_into().map_err(|_| "seq")?,
+                payload
+                    .get(..8)
+                    .ok_or("a BATCH frame shorter than its seq")?
+                    .try_into()
+                    .map_err(|_| "seq")?,
             );
             let n = *payload.get(8).ok_or("a BATCH frame with no table name")? as usize;
             let name = payload.get(9..9 + n).ok_or("a BATCH frame's table name runs past it")?;
-            let table = std::str::from_utf8(name).map_err(|_| "a BATCH frame's table name is not UTF-8")?;
+            let table =
+                std::str::from_utf8(name).map_err(|_| "a BATCH frame's table name is not UTF-8")?;
             Read::Batch { seq, table, ipc: &payload[9 + n..] }
         }
         other => return Err(format!("unknown frame kind {other}")),
@@ -191,7 +196,13 @@ impl Encoder {
             .samples
             .iter()
             .flat_map(|s| lookups(&s.pcs))
-            .chain(delta.alloc_events.iter().chain(&delta.frees).flat_map(|a: &RawAlloc| lookups(&a.pcs)))
+            .chain(
+                delta
+                    .alloc_events
+                    .iter()
+                    .chain(&delta.frees)
+                    .flat_map(|a: &RawAlloc| lookups(&a.pcs)),
+            )
             .filter(|a| !self.chains.contains_key(a))
             .collect();
         new.sort_unstable();
@@ -296,7 +307,13 @@ impl Log {
     }
 
     /// Keeps one tick's frames and the TICK that follows them.
-    pub fn push(&mut self, tick: Tick, now_ns: i64, dropped: &BTreeMap<&'static str, (u64, String)>, open_spans: usize) {
+    pub fn push(
+        &mut self,
+        tick: Tick,
+        now_ns: i64,
+        dropped: &BTreeMap<&'static str, (u64, String)>,
+        open_spans: usize,
+    ) {
         for (seq, name, catalog, bytes) in tick.frames {
             self.last_seq = self.last_seq.max(seq);
             let bytes: Arc<[u8]> = bytes.into();
@@ -321,11 +338,18 @@ impl Log {
             ("seq", Json::Int(i128::from(self.last_seq))),
             (
                 "dropped",
-                Json::Obj(dropped.iter().map(|(k, v)| ((*k).to_owned(), Json::Int(i128::from(v.0)))).collect()),
+                Json::Obj(
+                    dropped
+                        .iter()
+                        .map(|(k, v)| ((*k).to_owned(), Json::Int(i128::from(v.0))))
+                        .collect(),
+                ),
             ),
             (
                 "dropped_reason",
-                Json::Obj(dropped.iter().map(|(k, v)| ((*k).to_owned(), json::str(&v.1))).collect()),
+                Json::Obj(
+                    dropped.iter().map(|(k, v)| ((*k).to_owned(), json::str(&v.1))).collect(),
+                ),
             ),
             ("first_retained_seq", Json::Int(i128::from(evicted_before))),
             ("open_spans", Json::Int(open_spans as i128)),
@@ -355,9 +379,15 @@ impl Log {
     /// from now on, when `fresh_from_now`.
     pub fn since(&self, from: u64, fresh_from_now: bool) -> Since {
         let data_from = if from == 0 && fresh_from_now { self.last_seq } else { from };
-        let mut frames: Vec<(u64, Arc<[u8]>)> =
-            self.catalog.iter().filter(|it| it.0 > from).map(|(s, b)| (*s, Arc::clone(b))).collect();
-        frames.extend(self.data.iter().filter(|it| it.0 > data_from).map(|(s, _, b)| (*s, Arc::clone(b))));
+        let mut frames: Vec<(u64, Arc<[u8]>)> = self
+            .catalog
+            .iter()
+            .filter(|it| it.0 > from)
+            .map(|(s, b)| (*s, Arc::clone(b)))
+            .collect();
+        frames.extend(
+            self.data.iter().filter(|it| it.0 > data_from).map(|(s, _, b)| (*s, Arc::clone(b))),
+        );
         frames.sort_by_key(|it| it.0);
         let first_retained = self.data.front().map_or(self.last_seq + 1, |it| it.0);
         let gap = (data_from + 1 < first_retained && !(from == 0 && fresh_from_now)).then(|| {
@@ -377,7 +407,13 @@ impl Log {
                 ("to_seq", Json::Int(i128::from(first_retained - 1))),
                 ("tables", Json::Obj(tables)),
                 ("batches", Json::Int(i128::from(lost))),
-                ("why", json::str(&format!("cursor older than retention ({} bytes)", self.retain_bytes))),
+                (
+                    "why",
+                    json::str(&format!(
+                        "cursor older than retention ({} bytes)",
+                        self.retain_bytes
+                    )),
+                ),
             ]);
             frame(GAP, gap.to_text().as_bytes())
         });

@@ -176,7 +176,9 @@ impl TraceBuilder {
                 trace.reads.extend(read_ids[from..to].iter().map(|&read| rank[read as usize]));
                 trace.saw.extend(self.edges[from..to].iter().map(|e| e.saw));
             }
-            trace.edges_from.push(u32::try_from(trace.reads.len()).expect("a trace has fewer than 2^32 edges"));
+            trace
+                .edges_from
+                .push(u32::try_from(trace.reads.len()).expect("a trace has fewer than 2^32 edges"));
         }
         trace
     }
@@ -198,7 +200,11 @@ impl KeyTable {
     fn with_capacity(n: usize) -> KeyTable {
         let slots = (2 * n).next_power_of_two().max(16);
         // alloc: once a trace, the table's slots, sized for its keys.
-        KeyTable { keys: Vec::with_capacity(n), slots: vec![Self::EMPTY; slots], shift: 64 - slots.trailing_zeros() }
+        KeyTable {
+            keys: Vec::with_capacity(n),
+            slots: vec![Self::EMPTY; slots],
+            shift: 64 - slots.trailing_zeros(),
+        }
     }
 
     fn slot(&self, key: &QueryKey) -> usize {
@@ -279,7 +285,8 @@ impl Trace {
 
     /// Key `i`'s edges as (key index read, fingerprint seen).
     pub fn edges(&self, i: u32) -> impl Iterator<Item = (u32, Fingerprint)> + '_ {
-        let (from, to) = (self.edges_from[i as usize] as usize, self.edges_from[i as usize + 1] as usize);
+        let (from, to) =
+            (self.edges_from[i as usize] as usize, self.edges_from[i as usize + 1] as usize);
         self.reads[from..to].iter().copied().zip(self.saw[from..to].iter().copied())
     }
 
@@ -309,7 +316,8 @@ fn same_edges(a: &Trace, i: u32, b: &Trace, j: u32) -> bool {
     loop {
         match (x.next(), y.next()) {
             (None, None) => return true,
-            (Some((ra, sa)), Some((rb, sb))) if sa == sb && a.keys[ra as usize] == b.keys[rb as usize] => {}
+            (Some((ra, sa)), Some((rb, sb)))
+                if sa == sb && a.keys[ra as usize] == b.keys[rb as usize] => {}
             _ => return false,
         }
     }
@@ -374,9 +382,16 @@ pub fn under(incremental: &Trace, scratch: &Trace, roots: &[QueryKey]) -> Vec<St
             continue;
         };
         if !incremental.ran.contains(j) {
-            if let Some((read, saw)) = incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw)) {
+            if let Some((read, saw)) =
+                incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw))
+            {
                 let now = incremental.result(read);
-                stale.push(Stale::Unverified { query, read: incremental.keys[read as usize], saw, now });
+                stale.push(Stale::Unverified {
+                    query,
+                    read: incremental.keys[read as usize],
+                    saw,
+                    now,
+                });
                 continue;
             }
         }
@@ -470,7 +485,11 @@ pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(
             (Ordering::Equal, Some((key, va)), Some((_, vb))) => {
                 if va != vb {
                     // clone: as above.
-                    out.push(Apart::Differ { key: key.clone(), first: va.clone(), second: vb.clone() });
+                    out.push(Apart::Differ {
+                        key: key.clone(),
+                        first: va.clone(),
+                        second: vb.clone(),
+                    });
                 }
                 x.next();
                 y.next();

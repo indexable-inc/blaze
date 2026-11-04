@@ -20,7 +20,7 @@ use blaze_items::Fact;
 use hir::{InFile, ModuleDef, PathResolution};
 use smallvec::SmallVec;
 use syntax::{
-    NodeOrToken, SmolStr, SyntaxKind, TextRange, T,
+    NodeOrToken, SmolStr, SyntaxKind, T, TextRange,
     view::{self as ast, AstNode, HasGenericArgs, HasGenericParams, HasTypeBounds},
 };
 
@@ -56,7 +56,8 @@ type Elision = Option<Res>;
 pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
     let anonymous_in_impl_trait = super::feature(cx, "anonymous_lifetime_in_impl_trait");
     let mut found: Vec<(Order, Found)> = Vec::new(); // alloc: empty until a lint fires; holds only what fires
-    let mut lints = Lints { cx, anonymous_in_impl_trait, orders: Orders::default(), found: &mut found };
+    let mut lints =
+        Lints { cx, anonymous_in_impl_trait, orders: Orders::default(), found: &mut found };
     for item in items {
         match item.node.value {
             ast::Item::Fn(f) => {
@@ -68,7 +69,14 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
             ast::Item::Impl(imp) => {
                 if let Some(params) = imp.generic_param_list() {
                     let span = params.syntax().text_range();
-                    lints.binder(item, item.node.file_id, Binder::Impl(imp), imp.syntax(), params, span);
+                    lints.binder(
+                        item,
+                        item.node.file_id,
+                        Binder::Impl(imp),
+                        imp.syntax(),
+                        params,
+                        span,
+                    );
                 }
             }
             _ => {}
@@ -80,16 +88,30 @@ pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
                         && let Some(ast::Type::FnPtrType(ptr)) = ty.ty()
                         && let Some(params) = ty.for_binder().and_then(|it| it.generic_param_list())
                     {
-                        let span = TextRange::new(ty.syntax().text_range().start(), ptr.syntax().text_range().start());
-                        lints.binder(item, own.file_id, Binder::FnPtr(ptr), ty.syntax(), params, span);
+                        let span = TextRange::new(
+                            ty.syntax().text_range().start(),
+                            ptr.syntax().text_range().start(),
+                        );
+                        lints.binder(
+                            item,
+                            own.file_id,
+                            Binder::FnPtr(ptr),
+                            ty.syntax(),
+                            params,
+                            span,
+                        );
                     }
                 }
                 SyntaxKind::WHERE_PRED => {
                     if let Some(pred) = ast::WherePred::cast(own.value)
-                        && let Some(params) = pred.for_binder().and_then(|it| it.generic_param_list())
+                        && let Some(params) =
+                            pred.for_binder().and_then(|it| it.generic_param_list())
                         && let Some(bounded) = pred.ty()
                     {
-                        let span = TextRange::new(pred.syntax().text_range().start(), bounded.syntax().text_range().start());
+                        let span = TextRange::new(
+                            pred.syntax().text_range().start(),
+                            bounded.syntax().text_range().start(),
+                        );
                         lints.binder(item, own.file_id, Binder::Where, pred.syntax(), params, span);
                     }
                 }
@@ -122,7 +144,9 @@ impl<'db> Lints<'_, '_, 'db, '_> {
     ) {
         let cx = self.cx;
         let linted = |param: ast::GenericParam<'_>| match param {
-            ast::GenericParam::LifetimeParam(it) => it.lifetime().is_some_and(|it| !matches!(it.text(), "'_" | "'static")),
+            ast::GenericParam::LifetimeParam(it) => {
+                it.lifetime().is_some_and(|it| !matches!(it.text(), "'_" | "'static"))
+            }
             _ => false,
         };
         if !params.generic_params().any(linted) {
@@ -151,14 +175,24 @@ impl<'db> Lints<'_, '_, 'db, '_> {
                     }
                     let param_span = span(lifetime.syntax().text_range());
                     // alloc: the firing lint's message
-                    let mut diag = Diag::lint("unused_lifetimes", format!("lifetime parameter `{name}` never used"), param_span);
+                    let mut diag = Diag::lint(
+                        "unused_lifetimes",
+                        format!("lifetime parameter `{name}` never used"),
+                        param_span,
+                    );
                     if let Some(deletion) = deletion_span(&all, index, generics_span) {
-                        diag.suggestion(span(deletion), "elide the unused lifetime", "", Applicability::MachineApplicable);
+                        diag.suggestion(
+                            span(deletion),
+                            "elide the unused lifetime",
+                            "",
+                            Applicability::MachineApplicable,
+                        );
                     }
                     diag
                 }
                 (Some(token), None) => {
-                    let bounded = param.type_bound_list().is_some_and(|it| it.bounds().next().is_some());
+                    let bounded =
+                        param.type_bound_list().is_some_and(|it| it.bounds().next().is_some());
                     if bounded {
                         continue;
                     }
@@ -183,7 +217,11 @@ impl<'db> Lints<'_, '_, 'db, '_> {
                             parts.push((span(deletion), String::new())); // alloc: the firing lint's suggestion
                         }
                         parts.push((span(use_range), replace.to_owned())); // alloc: the firing lint's suggestion
-                        diag.multipart_suggestion("elide the single-use lifetime", parts, Applicability::MachineApplicable);
+                        diag.multipart_suggestion(
+                            "elide the single-use lifetime",
+                            parts,
+                            Applicability::MachineApplicable,
+                        );
                     }
                     diag
                 }
@@ -194,7 +232,11 @@ impl<'db> Lints<'_, '_, 'db, '_> {
                 diag.fact(Fact::Signature(cx.key(id)), format!("the generics of `{item_name}`")); // alloc: the firing lint's fact
             }
             crate::lints::code_fact(cx, &mut diag, item.ptr());
-            let key = self.orders.key(cx, item.module, cx.span(InFile::new(file, param.syntax().text_range())).lo);
+            let key = self.orders.key(
+                cx,
+                item.module,
+                cx.span(InFile::new(file, param.syntax().text_range())).lo,
+            );
             self.found.push((key, Found::lint(diag, Phase::Resolve, at)));
         }
     }
@@ -202,7 +244,14 @@ impl<'db> Lints<'_, '_, 'db, '_> {
     /// Whether the one use `token` of the lifetime `name` of `binder` could be elided: the rib
     /// rustc's `resolve_lifetime` finds first, going out from the use, creates an anonymous
     /// parameter of the same binder, or elides to the same lifetime.
-    fn single(&self, binder: Binder<'db>, token: ast::Token<'db>, scope: ast::Node<'db>, name: &str, elision: &Elision) -> bool {
+    fn single(
+        &self,
+        binder: Binder<'db>,
+        token: ast::Token<'db>,
+        scope: ast::Node<'db>,
+        name: &str,
+        elision: &Elision,
+    ) -> bool {
         let Some(lifetime) = token.parent() else { return false };
         if !ast::Lifetime::can_cast(lifetime.kind()) {
             return false;
@@ -218,23 +267,35 @@ impl<'db> Lints<'_, '_, 'db, '_> {
             let nested = match node.kind() {
                 SyntaxKind::FN_PTR_TYPE | SyntaxKind::PARENTHESIZED_ARG_LIST => true,
                 SyntaxKind::IMPL_TRAIT_TYPE => !self.anonymous_in_impl_trait,
-                SyntaxKind::GENERIC_ARG_LIST => node.parent().is_some_and(|it| ast::AssocTypeArg::can_cast(it.kind())),
-                SyntaxKind::CONST_ARG | SyntaxKind::WHERE_CLAUSE | SyntaxKind::GENERIC_PARAM_LIST => true,
+                SyntaxKind::GENERIC_ARG_LIST => {
+                    node.parent().is_some_and(|it| ast::AssocTypeArg::can_cast(it.kind()))
+                }
+                SyntaxKind::CONST_ARG
+                | SyntaxKind::WHERE_CLAUSE
+                | SyntaxKind::GENERIC_PARAM_LIST => true,
                 kind => ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind),
             };
             if nested {
                 return false;
             }
         }
-        let within = |node: Option<ast::Node<'_>>| node.is_some_and(|it| it.text_range().contains_range(lifetime.text_range()));
+        let within = |node: Option<ast::Node<'_>>| {
+            node.is_some_and(|it| it.text_range().contains_range(lifetime.text_range()))
+        };
         let returns = |ret: Option<ast::RetType<'_>>| {
-            within(ret.as_ref().map(AstNode::syntax)) && matches!(elision, Some(Res::Named(it)) if it == name)
+            within(ret.as_ref().map(AstNode::syntax))
+                && matches!(elision, Some(Res::Named(it)) if it == name)
         };
         match binder {
-            Binder::Fn(f) => within(f.param_list().as_ref().map(AstNode::syntax)) || returns(f.ret_type()),
-            Binder::FnPtr(ptr) => within(ptr.param_list().as_ref().map(AstNode::syntax)) || returns(ptr.ret_type()),
+            Binder::Fn(f) => {
+                within(f.param_list().as_ref().map(AstNode::syntax)) || returns(f.ret_type())
+            }
+            Binder::FnPtr(ptr) => {
+                within(ptr.param_list().as_ref().map(AstNode::syntax)) || returns(ptr.ret_type())
+            }
             Binder::Impl(imp) => {
-                within(imp.self_ty().as_ref().map(AstNode::syntax)) || within(imp.trait_().as_ref().map(AstNode::syntax))
+                within(imp.self_ty().as_ref().map(AstNode::syntax))
+                    || within(imp.trait_().as_ref().map(AstNode::syntax))
             }
             Binder::Where => false,
         }
@@ -244,7 +305,8 @@ impl<'db> Lints<'_, '_, 'db, '_> {
     fn elision(&self, binder: Binder<'db>) -> Elision {
         let (list, impl_self) = match binder {
             Binder::Fn(f) => {
-                let impl_self = f.syntax().ancestors().find_map(ast::Impl::cast).and_then(|it| it.self_ty());
+                let impl_self =
+                    f.syntax().ancestors().find_map(ast::Impl::cast).and_then(|it| it.self_ty());
                 (f.param_list(), impl_self)
             }
             Binder::FnPtr(ptr) => (ptr.param_list(), None),
@@ -341,21 +403,31 @@ impl<'db> Lints<'_, '_, 'db, '_> {
 
     /// rustc's `find_lifetime_for_self`: the lifetimes of the references in `self`'s type whose
     /// referent names `Self` (or the impl's self type).
-    fn self_lifetimes(&self, ty: ast::Type<'db>, impl_self: Option<ast::Type<'db>>, fresh: &mut u32, found: &mut SmallVec<[Res; 4]>) {
+    fn self_lifetimes(
+        &self,
+        ty: ast::Type<'db>,
+        impl_self: Option<ast::Type<'db>>,
+        fresh: &mut u32,
+        found: &mut SmallVec<[Res; 4]>,
+    ) {
         let impl_adt = impl_self.and_then(|it| match it {
             ast::Type::PathType(p) => p.path().and_then(|p| self.cx.vsema.resolve_path(p)),
             _ => None,
         });
         let names_self = |node: ast::Node<'db>| {
-            node.descendants().filter_map(ast::PathType::cast).filter_map(|it| it.path()).any(|path| {
-                if path.qualifier().is_none() && path.segment().is_some_and(|it| it.self_type_token().is_some()) {
-                    return true;
-                }
-                match (&impl_adt, self.cx.vsema.resolve_path(path)) {
-                    (Some(PathResolution::Def(a)), Some(PathResolution::Def(b))) => *a == b,
-                    _ => false,
-                }
-            })
+            node.descendants().filter_map(ast::PathType::cast).filter_map(|it| it.path()).any(
+                |path| {
+                    if path.qualifier().is_none()
+                        && path.segment().is_some_and(|it| it.self_type_token().is_some())
+                    {
+                        return true;
+                    }
+                    match (&impl_adt, self.cx.vsema.resolve_path(path)) {
+                        (Some(PathResolution::Def(a)), Some(PathResolution::Def(b))) => *a == b,
+                        _ => false,
+                    }
+                },
+            )
         };
         for r in ty.syntax().descendants().filter_map(ast::RefType::cast) {
             let Some(inner) = r.ty() else { continue };
@@ -409,7 +481,10 @@ fn uses<'t>(scope: ast::Node<'t>, binder: Binder<'_>) -> SmallVec<[ast::Token<'t
                 let nested = node != scope
                     && ast::Item::can_cast(node.kind())
                     && node.kind() != SyntaxKind::MACRO_CALL
-                    && !(assoc && node.parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST));
+                    && !(assoc
+                        && node
+                            .parent()
+                            .is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST));
                 if nested {
                     walk.skip_subtree();
                 }
@@ -428,10 +503,14 @@ fn uses<'t>(scope: ast::Node<'t>, binder: Binder<'_>) -> SmallVec<[ast::Token<'t
                 }
             }
             SyntaxKind::LIFETIME => {
-                let declared = parent.parent().is_some_and(|it| it.kind() == SyntaxKind::LIFETIME_PARAM)
-                    && parent.prev_sibling().is_none();
+                let declared =
+                    parent.parent().is_some_and(|it| it.kind() == SyntaxKind::LIFETIME_PARAM)
+                        && parent.prev_sibling().is_none();
                 let label = parent.parent().is_some_and(|it| {
-                    matches!(it.kind(), SyntaxKind::LABEL | SyntaxKind::BREAK_EXPR | SyntaxKind::CONTINUE_EXPR)
+                    matches!(
+                        it.kind(),
+                        SyntaxKind::LABEL | SyntaxKind::BREAK_EXPR | SyntaxKind::CONTINUE_EXPR
+                    )
                 });
                 if !declared && !label {
                     found.push(token);
@@ -445,8 +524,10 @@ fn uses<'t>(scope: ast::Node<'t>, binder: Binder<'_>) -> SmallVec<[ast::Token<'t
 
 /// A lifetime token in a token tree that is a label: `'a: loop`, `break 'a`, `continue 'a`.
 fn is_label_in_tokens(token: ast::Token<'_>) -> bool {
-    let next = std::iter::successors(token.next_token(), |it| it.next_token()).find(|it| !it.kind().is_trivia());
-    let prev = std::iter::successors(token.prev_token(), |it| it.prev_token()).find(|it| !it.kind().is_trivia());
+    let next = std::iter::successors(token.next_token(), |it| it.next_token())
+        .find(|it| !it.kind().is_trivia());
+    let prev = std::iter::successors(token.prev_token(), |it| it.prev_token())
+        .find(|it| !it.kind().is_trivia());
     let labelled = next.is_some_and(|it| it.kind() == T![:])
         && std::iter::successors(next.and_then(|it| it.next_token()), |it| it.next_token())
             .find(|it| !it.kind().is_trivia())
@@ -482,7 +563,11 @@ fn extended_over_whitespace(token: ast::Token<'_>) -> TextRange {
 
 /// rustc's `deletion_span` of the parameter at `index`: the whole `<..>` when it is the only
 /// one, else it with the comma after it (the first) or before it.
-fn deletion_span(params: &[ast::GenericParam<'_>], index: usize, generics_span: TextRange) -> Option<TextRange> {
+fn deletion_span(
+    params: &[ast::GenericParam<'_>],
+    index: usize,
+    generics_span: TextRange,
+) -> Option<TextRange> {
     let range = |it: &ast::GenericParam<'_>| it.syntax().text_range();
     let inside = |it: TextRange| generics_span.contains_range(it).then_some(it);
     if params.len() == 1 {
@@ -500,8 +585,11 @@ fn deletion_span(params: &[ast::GenericParam<'_>], index: usize, generics_span: 
 mod tests {
     use super::*;
 
-    fn params(parse: &syntax::Parse<syntax::SourceFile>) -> (Vec<ast::GenericParam<'_>>, TextRange) {
-        let list = parse.root().descendants().find_map(ast::GenericParamList::cast).expect("generics");
+    fn params(
+        parse: &syntax::Parse<syntax::SourceFile>,
+    ) -> (Vec<ast::GenericParam<'_>>, TextRange) {
+        let list =
+            parse.root().descendants().find_map(ast::GenericParamList::cast).expect("generics");
         (list.generic_params().collect(), list.syntax().text_range())
     }
 

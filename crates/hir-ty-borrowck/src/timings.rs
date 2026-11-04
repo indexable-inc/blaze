@@ -125,7 +125,10 @@ pub(crate) fn start() -> Started {
     Started(CURRENT.with(|it| it.borrow().as_ref().map(|it| (Instant::now(), it.phases))))
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "finishing a phase ends its start: taking it means a start is finished once")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "finishing a phase ends its start: taking it means a start is finished once"
+)]
 pub(crate) fn finish(phase: Phase, started: Started) {
     let Started(Some((started, before))) = started else { return };
     let elapsed = started.elapsed();

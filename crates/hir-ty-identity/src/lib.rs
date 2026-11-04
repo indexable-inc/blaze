@@ -148,8 +148,7 @@ pub const INLINED_DOMAIN: &str = "blaze v2 code identity inlined 2";
 pub const NAME_DOMAIN: &str = "blaze v2 code identity name 1";
 
 /// Why code that reads its own identity has none: the query cycle's every member says it.
-pub const SELF_READ: &str =
-    "its code reads its own code identity: a constant in it asks for the identity of code that runs it";
+pub const SELF_READ: &str = "its code reads its own code identity: a constant in it asks for the identity of code that runs it";
 
 /// What an identity is of: a function, a closure, an `async` block (as its `poll`, or by move),
 /// as [`dispatch`](hir_ty_mir::mir::dispatch) names them, or a shim the code generator builds
@@ -169,7 +168,9 @@ pub enum Shim {
     CallOnce,
     Vtable(FunctionId),
     FnPointer,
-    Reify { receiver: bool },
+    Reify {
+        receiver: bool,
+    },
 }
 
 impl Shim {
@@ -194,7 +195,9 @@ impl NamesIds for Subject {
             Subject::Body(Body::Closure(it) | Body::Coroutine(it) | Body::CoroutineByMove(it)) => {
                 out.push(it)
             }
-            Subject::Shim(Shim::DropGlue | Shim::CallOnce | Shim::FnPointer | Shim::Reify { .. }) => {}
+            Subject::Shim(
+                Shim::DropGlue | Shim::CallOnce | Shim::FnPointer | Shim::Reify { .. },
+            ) => {}
         }
     }
 }
@@ -330,7 +333,11 @@ impl Unidentified {
     }
 
     fn named(instance: String, what: String) -> Unidentified {
-        Unidentified { instance: instance.into_boxed_str(), what: what.into_boxed_str(), through: Box::default() }
+        Unidentified {
+            instance: instance.into_boxed_str(),
+            what: what.into_boxed_str(),
+            through: Box::default(),
+        }
     }
 
     /// The error of an instance `instance` reaches: `instance` first on its path.

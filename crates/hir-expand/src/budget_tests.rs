@@ -74,9 +74,8 @@ fn a_path_whose_segments_exist_allocates_nothing() {
 #[test]
 fn span_lookups_allocate_nothing() {
     let file_id = EditionedFileId::new(FileId::from_raw(7), Edition::CURRENT);
-    let anchors: Vec<_> = (0..32u32)
-        .map(|i| (TextSize::new(i * 40), ErasedFileAstId::from_raw(i)))
-        .collect();
+    let anchors: Vec<_> =
+        (0..32u32).map(|i| (TextSize::new(i * 40), ErasedFileAstId::from_raw(i))).collect();
     let real = RealSpanMap::from_file(file_id, &anchors, TextSize::new(32 * 40));
     let mut expansion = ExpansionSpanMap::empty();
     let ranges: Vec<TextRange> =
@@ -108,7 +107,8 @@ fn an_argument_costs_a_constant_number_of_allocations() {
         let text = format!("m!({});", "a + 1, ".repeat(tokens / 4));
         let parse = SourceFile::parse(&text, Edition::CURRENT);
         let arg = parse.root().descendants().find_map(view::TokenTree::cast).expect("the argument");
-        let map = RealSpanMap::absolute(EditionedFileId::new(FileId::from_raw(7), Edition::CURRENT));
+        let map =
+            RealSpanMap::absolute(EditionedFileId::new(FileId::from_raw(7), Edition::CURRENT));
         let at = span(TextRange::empty(TextSize::new(0)));
         let run = || {
             syntax_bridge::call_input(

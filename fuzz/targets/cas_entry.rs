@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use blaze_cas::{Kind, Key};
+use blaze_cas::{Key, Kind};
 use blaze_fuzzer::Target;
 use blaze_ids::ContentId;
 
@@ -68,9 +68,15 @@ fn check(data: &[u8]) {
             wants.push((record.key, hashed.then_some(payload)));
         }
         let pack = shared::padded(pack);
-        let head = shared::head(None, &[shared::PackRef { committed: pack.len() as u64, ..shared::lone_ref(0) }], &[]);
-        let mut sim =
-            shared::store_of(&[(HEAD, head.as_slice()), (shared::pack_file(0).as_str(), pack.as_slice())]);
+        let head = shared::head(
+            None,
+            &[shared::PackRef { committed: pack.len() as u64, ..shared::lone_ref(0) }],
+            &[],
+        );
+        let mut sim = shared::store_of(&[
+            (HEAD, head.as_slice()),
+            (shared::pack_file(0).as_str(), pack.as_slice()),
+        ]);
         shared::read_back(&mut sim, &wants);
     } else {
         let (values, settles) = shared::values(&mut input);
@@ -109,7 +115,14 @@ fn record<'a>(input: &mut Input<'a>, key: Key) -> (Record, &'a [u8], bool) {
 }
 
 /// The input `record` reads for a record of these fields; `None` for the payload's own.
-fn encode(kind: u8, form: u8, dictionary: u32, stored: Option<u64>, raw: Option<u64>, payload: &[u8]) -> Vec<u8> {
+fn encode(
+    kind: u8,
+    form: u8,
+    dictionary: u32,
+    stored: Option<u64>,
+    raw: Option<u64>,
+    payload: &[u8],
+) -> Vec<u8> {
     let given = u8::from(stored.is_some()) * STORED_GIVEN + u8::from(raw.is_some()) * RAW_GIVEN;
     let mut out = vec![kind, form, given];
     out.extend_from_slice(&dictionary.to_le_bytes());
@@ -132,16 +145,44 @@ fn seeds() -> Vec<Vec<u8>> {
     let query = Kind::Query.code();
     let mut out = vec![
         [&[0, 0][..], &encode(query, shared::RAW, 0, None, None, b"hello")].concat(),
-        [&[0, 1][..], &encode(query, shared::RAW, 0, None, None, b"one"), &encode(query, shared::RAW, 0, None, None, b"")]
-            .concat(),
+        [
+            &[0, 1][..],
+            &encode(query, shared::RAW, 0, None, None, b"one"),
+            &encode(query, shared::RAW, 0, None, None, b""),
+        ]
+        .concat(),
         [&[0, 0][..], &encode(query, shared::RAW, 0, None, Some(6), b"hello")].concat(),
         [&[0, 0][..], &encode(query, 9, 0, None, None, b"no form")].concat(),
         [&[0, 0][..], &encode(9, shared::RAW, 0, None, None, b"no kind")].concat(),
-        [&[0, 0][..], &encode(query, shared::ZSTD, shared::NO_DICTIONARY, None, Some(1 << 40), &[0x28, 0xb5, 0x2f, 0xfd])]
-            .concat(),
-        [&[0, 0][..], &encode(query, shared::LZ4, shared::NO_DICTIONARY, None, Some(1 << 40), &[0xf0; 16])].concat(),
-        [&[0, 0][..], &encode(Kind::Output.code(), shared::CHUNKED, 0, None, Some(1 << 40), &chunk(shared::key(0), 1 << 40))]
-            .concat(),
+        [
+            &[0, 0][..],
+            &encode(
+                query,
+                shared::ZSTD,
+                shared::NO_DICTIONARY,
+                None,
+                Some(1 << 40),
+                &[0x28, 0xb5, 0x2f, 0xfd],
+            ),
+        ]
+        .concat(),
+        [
+            &[0, 0][..],
+            &encode(query, shared::LZ4, shared::NO_DICTIONARY, None, Some(1 << 40), &[0xf0; 16]),
+        ]
+        .concat(),
+        [
+            &[0, 0][..],
+            &encode(
+                Kind::Output.code(),
+                shared::CHUNKED,
+                0,
+                None,
+                Some(1 << 40),
+                &chunk(shared::key(0), 1 << 40),
+            ),
+        ]
+        .concat(),
         [
             &[0, 0][..],
             &encode(

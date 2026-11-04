@@ -40,9 +40,7 @@ struct Context {
 impl Context {
     fn new() -> Self {
         // SAFETY: hegel_context_new never returns null.
-        Context {
-            raw: unsafe { hegel_c::hegel_context_new() },
-        }
+        Context { raw: unsafe { hegel_c::hegel_context_new() } }
     }
 
     fn as_ptr(&self) -> *mut hegel_c::HegelContext {
@@ -115,11 +113,7 @@ pub(crate) fn last_error_string() -> String {
 
 fn view(bytes: &[u8]) -> hegel_c::hegel_string_t {
     hegel_c::hegel_string_t {
-        data: if bytes.is_empty() {
-            ptr::null()
-        } else {
-            bytes.as_ptr().cast()
-        },
+        data: if bytes.is_empty() { ptr::null() } else { bytes.as_ptr().cast() },
         len: bytes.len(),
     }
 }
@@ -148,9 +142,7 @@ fn take_string_result(
     // once.
     let bytes =
         unsafe { std::slice::from_raw_parts(result.data.cast::<u8>(), result.len) }.to_vec();
-    require_ok(with_context(|ctx| unsafe {
-        hegel_c::hegel_owned_string_free(ctx, &mut result)
-    }));
+    require_ok(with_context(|ctx| unsafe { hegel_c::hegel_owned_string_free(ctx, &mut result) }));
     Ok(string_from_engine_bytes(bytes))
 }
 
@@ -178,16 +170,8 @@ impl SettingsHandle {
             // SAFETY: ctx is this thread's live context; &mut raw is a valid
             // out-parameter.
             unsafe {
-                require_ok(hegel_c::hegel_settings_new_for_profile(
-                    ctx,
-                    view(b"base"),
-                    &mut raw,
-                ));
-                require_ok(hegel_c::hegel_settings_set_test_cases(
-                    ctx,
-                    raw,
-                    settings.test_cases,
-                ));
+                require_ok(hegel_c::hegel_settings_new_for_profile(ctx, view(b"base"), &mut raw));
+                require_ok(hegel_c::hegel_settings_set_test_cases(ctx, raw, settings.test_cases));
                 require_ok(hegel_c::hegel_settings_set_verbosity(
                     ctx,
                     raw,
@@ -202,11 +186,7 @@ impl SettingsHandle {
                     Some(seed) => hegel_c::hegel_settings_set_seed(ctx, raw, seed, true),
                     None => hegel_c::hegel_settings_set_seed(ctx, raw, 0, false),
                 });
-                require_ok(hegel_c::hegel_settings_set_derandomize(
-                    ctx,
-                    raw,
-                    settings.derandomize,
-                ));
+                require_ok(hegel_c::hegel_settings_set_derandomize(ctx, raw, settings.derandomize));
                 require_ok(hegel_c::hegel_settings_set_report_multiple_failures(
                     ctx,
                     raw,
@@ -237,11 +217,7 @@ impl SettingsHandle {
                         require_ok(hegel_c::hegel_settings_set_database(ctx, raw, ptr::null()));
                     }
                 }
-                require_ok(hegel_c::hegel_settings_set_print_blob(
-                    ctx,
-                    raw,
-                    settings.print_blob,
-                ));
+                require_ok(hegel_c::hegel_settings_set_print_blob(ctx, raw, settings.print_blob));
                 if let Some(key) = database_key {
                     require_ok(hegel_c::hegel_settings_set_database_key(
                         ctx,
@@ -339,32 +315,11 @@ fn read_settings(ctx: *mut hegel_c::HegelContext, raw: *const hegel_c::HegelSett
     // SAFETY: ctx and raw are live handles, and every out pointer is a valid
     // local.
     unsafe {
-        require_ok(hegel_c::hegel_settings_get_test_cases(
-            ctx,
-            raw,
-            &mut test_cases,
-        ));
-        require_ok(hegel_c::hegel_settings_get_verbosity(
-            ctx,
-            raw,
-            &mut verbosity,
-        ));
-        require_ok(hegel_c::hegel_settings_get_seed(
-            ctx,
-            raw,
-            &mut seed,
-            &mut has_seed,
-        ));
-        require_ok(hegel_c::hegel_settings_get_derandomize(
-            ctx,
-            raw,
-            &mut derandomize,
-        ));
-        require_ok(hegel_c::hegel_settings_get_database(
-            ctx,
-            raw,
-            &mut database,
-        ));
+        require_ok(hegel_c::hegel_settings_get_test_cases(ctx, raw, &mut test_cases));
+        require_ok(hegel_c::hegel_settings_get_verbosity(ctx, raw, &mut verbosity));
+        require_ok(hegel_c::hegel_settings_get_seed(ctx, raw, &mut seed, &mut has_seed));
+        require_ok(hegel_c::hegel_settings_get_derandomize(ctx, raw, &mut derandomize));
+        require_ok(hegel_c::hegel_settings_get_database(ctx, raw, &mut database));
         require_ok(hegel_c::hegel_settings_get_phases(ctx, raw, &mut phases));
         require_ok(hegel_c::hegel_settings_get_suppress_health_check(
             ctx,
@@ -381,16 +336,8 @@ fn read_settings(ctx: *mut hegel_c::HegelContext, raw: *const hegel_c::HegelSett
             raw,
             &mut stop_on_first_failure,
         ));
-        require_ok(hegel_c::hegel_settings_get_show_statistics(
-            ctx,
-            raw,
-            &mut show_statistics,
-        ));
-        require_ok(hegel_c::hegel_settings_get_print_blob(
-            ctx,
-            raw,
-            &mut print_blob,
-        ));
+        require_ok(hegel_c::hegel_settings_get_show_statistics(ctx, raw, &mut show_statistics));
+        require_ok(hegel_c::hegel_settings_get_print_blob(ctx, raw, &mut print_blob));
         require_ok(hegel_c::hegel_settings_get_backend(ctx, raw, &mut backend));
         require_ok(hegel_c::hegel_settings_get_nondeterminism_strictness(
             ctx,
@@ -600,11 +547,7 @@ impl RunHandle {
         let rc =
             with_context(|ctx| unsafe { hegel_c::hegel_next_test_case(ctx, self.raw, &mut raw) });
         require_ok(rc);
-        if raw.is_null() {
-            None
-        } else {
-            Some(CTestCase { raw })
-        }
+        if raw.is_null() { None } else { Some(CTestCase { raw }) }
     }
 
     /// [`next_test_case`](Self::next_test_case) for a run under external
@@ -618,11 +561,7 @@ impl RunHandle {
             return Step::NeedsProposal;
         }
         require_ok(rc);
-        if raw.is_null() {
-            Step::Finished
-        } else {
-            Step::Case(CTestCase { raw })
-        }
+        if raw.is_null() { Step::Finished } else { Step::Case(CTestCase { raw }) }
     }
 
     /// Answer the engine's request for a proposal (`hegel_run_propose`, or
@@ -635,10 +574,7 @@ impl RunHandle {
                     Tail::Random { seed } => (hegel_c::hegel_tail_t::HEGEL_TAIL_RANDOM, seed),
                     Tail::Simplest => (hegel_c::hegel_tail_t::HEGEL_TAIL_SIMPLEST, 0),
                 };
-                let prefix = hegel_c::hegel_bytes_t {
-                    data: prefix.as_ptr(),
-                    len: prefix.len(),
-                };
+                let prefix = hegel_c::hegel_bytes_t { data: prefix.as_ptr(), len: prefix.len() };
                 // SAFETY: self.raw is a live run handle; the prefix bytes
                 // outlive the call, which copies them.
                 with_context(|ctx| unsafe {
@@ -663,10 +599,7 @@ impl RunHandle {
     /// The report of the last proposed case to run, if it has not been
     /// taken yet.
     pub(crate) fn take_case_report(&self) -> Option<Vec<u8>> {
-        let mut report = hegel_c::hegel_bytes_t {
-            data: ptr::null(),
-            len: 0,
-        };
+        let mut report = hegel_c::hegel_bytes_t { data: ptr::null(), len: 0 };
         // SAFETY: self.raw is a live run handle; the report borrows the run
         // until the next call, and is copied out before then.
         let rc = with_context(|ctx| unsafe {
@@ -877,10 +810,7 @@ impl CTestCase {
         min_size: u64,
         max_size: u64,
     ) -> Result<Vec<u8>, hegel_result_t> {
-        let mut result = hegel_c::hegel_generate_bytes_result_t {
-            data: ptr::null_mut(),
-            len: 0,
-        };
+        let mut result = hegel_c::hegel_generate_bytes_result_t { data: ptr::null_mut(), len: 0 };
         let rc = with_context(|ctx| unsafe {
             hegel_c::hegel_generate_bytes(ctx, self.raw, min_size, max_size, &mut result)
         });
@@ -902,10 +832,7 @@ impl CTestCase {
         &self,
         generator: &StringGenerator,
     ) -> Result<String, hegel_result_t> {
-        let mut result = hegel_c::hegel_owned_string_t {
-            data: ptr::null(),
-            len: 0,
-        };
+        let mut result = hegel_c::hegel_owned_string_t { data: ptr::null(), len: 0 };
         let rc = with_context(|ctx| unsafe {
             hegel_c::hegel_generate_string(ctx, self.raw, generator.raw, &mut result)
         });
@@ -920,10 +847,7 @@ impl CTestCase {
         grammar: &Grammar,
         max_size: u64,
     ) -> Result<String, hegel_result_t> {
-        let mut result = hegel_c::hegel_owned_string_t {
-            data: ptr::null(),
-            len: 0,
-        };
+        let mut result = hegel_c::hegel_owned_string_t { data: ptr::null(), len: 0 };
         let rc = with_context(|ctx| unsafe {
             hegel_c::hegel_generate_grammar(ctx, self.raw, grammar.raw, max_size, &mut result)
         });
@@ -1004,15 +928,11 @@ impl CTestCase {
     }
 
     pub(crate) fn start_span(&self, label: u64) -> Result<(), hegel_result_t> {
-        rc_to_unit(with_context(|ctx| unsafe {
-            hegel_c::hegel_start_span(ctx, self.raw, label)
-        }))
+        rc_to_unit(with_context(|ctx| unsafe { hegel_c::hegel_start_span(ctx, self.raw, label) }))
     }
 
     pub(crate) fn stop_span(&self, discard: bool) -> Result<(), hegel_result_t> {
-        rc_to_unit(with_context(|ctx| unsafe {
-            hegel_c::hegel_stop_span(ctx, self.raw, discard)
-        }))
+        rc_to_unit(with_context(|ctx| unsafe { hegel_c::hegel_stop_span(ctx, self.raw, discard) }))
     }
 
     pub(crate) fn new_collection(
@@ -1175,14 +1095,10 @@ impl CTestCase {
         max_concurrency: i64,
         step_count: i64,
     ) -> Result<(StateMachineHandle, i64), hegel_result_t> {
-        let rule_ptrs: Vec<hegel_c::hegel_string_t> = rule_names
-            .iter()
-            .map(|name| view(name.as_bytes()))
-            .collect();
-        let invariant_ptrs: Vec<hegel_c::hegel_string_t> = invariant_names
-            .iter()
-            .map(|name| view(name.as_bytes()))
-            .collect();
+        let rule_ptrs: Vec<hegel_c::hegel_string_t> =
+            rule_names.iter().map(|name| view(name.as_bytes())).collect();
+        let invariant_ptrs: Vec<hegel_c::hegel_string_t> =
+            invariant_names.iter().map(|name| view(name.as_bytes())).collect();
         let mut raw: *mut hegel_c::HegelStateMachine = ptr::null_mut();
         let mut concurrency: i64 = 0;
         let rc = with_context(|ctx| unsafe {
@@ -1222,11 +1138,7 @@ impl CTestCase {
         let rc = with_context(|ctx| unsafe {
             hegel_c::hegel_state_machine_next_group(ctx, self.raw, state_machine.raw, &mut out)
         });
-        let group = if out == hegel_c::HEGEL_STATE_MACHINE_DONE {
-            None
-        } else {
-            Some(out)
-        };
+        let group = if out == hegel_c::HEGEL_STATE_MACHINE_DONE { None } else { Some(out) };
         rc_to_value(rc, group)
     }
 
@@ -1248,11 +1160,7 @@ impl CTestCase {
                 &mut out,
             )
         });
-        let index = if out == hegel_c::HEGEL_STATE_MACHINE_DONE {
-            None
-        } else {
-            Some(out)
-        };
+        let index = if out == hegel_c::HEGEL_STATE_MACHINE_DONE { None } else { Some(out) };
         rc_to_value(rc, index)
     }
 
@@ -1520,17 +1428,12 @@ impl StringGenerator {
                 ctx,
                 min_size,
                 max_size,
-                codec
-                    .map(|s| view(s.as_bytes()))
-                    .as_ref()
-                    .map_or(ptr::null(), |s| s),
+                codec.map(|s| view(s.as_bytes())).as_ref().map_or(ptr::null(), |s| s),
                 min_codepoint,
                 max_codepoint.unwrap_or(u32::MAX),
                 category_ptrs.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
                 category_ptrs.as_ref().map_or(0, |p| p.len()),
-                exclude_category_ptrs
-                    .as_ref()
-                    .map_or(ptr::null(), |p| p.as_ptr()),
+                exclude_category_ptrs.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
                 exclude_category_ptrs.as_ref().map_or(0, |p| p.len()),
                 include_characters
                     .map_or(hegel_c::hegel_string_t::default(), |s| view(s.as_bytes())),
@@ -1813,9 +1716,7 @@ fn with_printer_options(max_width: u64, f: impl FnOnce(*const hegel_c::HegelPrin
         hegel_c::hegel_printer_options_set_max_width(ctx, options, max_width)
     }));
     f(options);
-    require_ok(with_context(|ctx| unsafe {
-        hegel_c::hegel_printer_options_free(ctx, options)
-    }));
+    require_ok(with_context(|ctx| unsafe { hegel_c::hegel_printer_options_free(ctx, options) }));
 }
 
 impl PrinterHandle {
@@ -1869,9 +1770,7 @@ impl PrinterHandle {
 
     /// Emit an unconditional newline plus the current indentation.
     pub(crate) fn hard_break(&self) -> Result<(), PrinterCallError> {
-        Self::check(with_context(|ctx| unsafe {
-            hegel_c::hegel_printer_hard_break(ctx, self.raw)
-        }))
+        Self::check(with_context(|ctx| unsafe { hegel_c::hegel_printer_hard_break(ctx, self.raw) }))
     }
 
     /// Attach a comment (passed in full rendered form) to the line currently
@@ -1929,9 +1828,7 @@ impl PrinterHandle {
     /// Splice every deferred hole's content in at its position; all slots of
     /// the session die.
     pub(crate) fn resolve(&self) -> Result<(), PrinterCallError> {
-        Self::check(with_context(|ctx| unsafe {
-            hegel_c::hegel_printer_resolve(ctx, self.raw)
-        }))
+        Self::check(with_context(|ctx| unsafe { hegel_c::hegel_printer_resolve(ctx, self.raw) }))
     }
 
     /// Open a speculative region: subsequent output buffers until committed
@@ -1958,10 +1855,7 @@ impl PrinterHandle {
 
     /// Flush pending break points and read everything printed so far.
     pub(crate) fn value(&self) -> Result<String, PrinterCallError> {
-        let mut result = hegel_c::hegel_printer_value_result_t {
-            data: ptr::null_mut(),
-            len: 0,
-        };
+        let mut result = hegel_c::hegel_printer_value_result_t { data: ptr::null_mut(), len: 0 };
         Self::check(with_context(|ctx| unsafe {
             hegel_c::hegel_printer_value(ctx, self.raw, &mut result)
         }))?;
@@ -2071,11 +1965,7 @@ pub(crate) struct Failure {
 }
 
 fn rc_to_unit(rc: hegel_result_t) -> Result<(), hegel_result_t> {
-    if rc == hegel_result_t::HEGEL_OK {
-        Ok(())
-    } else {
-        Err(rc)
-    }
+    if rc == hegel_result_t::HEGEL_OK { Ok(()) } else { Err(rc) }
 }
 
 /// Require that a libhegel call the frontend makes with controlled inputs
@@ -2091,11 +1981,7 @@ fn require_ok(rc: hegel_result_t) {
 }
 
 fn rc_to_value<T>(rc: hegel_result_t, value: T) -> Result<T, hegel_result_t> {
-    if rc == hegel_result_t::HEGEL_OK {
-        Ok(value)
-    } else {
-        Err(rc)
-    }
+    if rc == hegel_result_t::HEGEL_OK { Ok(value) } else { Err(rc) }
 }
 
 fn string_opt(p: hegel_c::hegel_string_t) -> Option<String> {
@@ -2198,15 +2084,9 @@ fn nondeterminism_strictness_from_c(
 
 fn phases_from_bitmask(mask: u32) -> Vec<Phase> {
     [
-        (
-            hegel_c::hegel_phase_t::HEGEL_PHASE_EXPLICIT,
-            Phase::Explicit,
-        ),
+        (hegel_c::hegel_phase_t::HEGEL_PHASE_EXPLICIT, Phase::Explicit),
         (hegel_c::hegel_phase_t::HEGEL_PHASE_REUSE, Phase::Reuse),
-        (
-            hegel_c::hegel_phase_t::HEGEL_PHASE_GENERATE,
-            Phase::Generate,
-        ),
+        (hegel_c::hegel_phase_t::HEGEL_PHASE_GENERATE, Phase::Generate),
         (hegel_c::hegel_phase_t::HEGEL_PHASE_TARGET, Phase::Target),
         (hegel_c::hegel_phase_t::HEGEL_PHASE_SHRINK, Phase::Shrink),
     ]
@@ -2218,14 +2098,8 @@ fn phases_from_bitmask(mask: u32) -> Vec<Phase> {
 
 fn health_checks_from_bitmask(mask: u32) -> Vec<HealthCheck> {
     [
-        (
-            hegel_c::hegel_health_check_t::HEGEL_HC_FILTER_TOO_MUCH,
-            HealthCheck::FilterTooMuch,
-        ),
-        (
-            hegel_c::hegel_health_check_t::HEGEL_HC_TOO_SLOW,
-            HealthCheck::TooSlow,
-        ),
+        (hegel_c::hegel_health_check_t::HEGEL_HC_FILTER_TOO_MUCH, HealthCheck::FilterTooMuch),
+        (hegel_c::hegel_health_check_t::HEGEL_HC_TOO_SLOW, HealthCheck::TooSlow),
         (
             hegel_c::hegel_health_check_t::HEGEL_HC_TEST_CASES_TOO_LARGE,
             HealthCheck::TestCasesTooLarge,

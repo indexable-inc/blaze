@@ -348,7 +348,8 @@ fn a_live_heads_long_unused_profiles_yield_to_pressure_but_its_last_builds_stay(
     // `a`'s last build, two days ago, wrote into `debug`; `release` was last built nine days ago.
     let last_build = T0 - 2 * DAY;
     let a_debug = Object { checkout: checkout("a"), ..profile("a", "debug", 400, last_build) };
-    let a_release = Object { checkout: checkout("a"), ..profile("a", "release", 100, T0 - 9 * DAY) };
+    let a_release =
+        Object { checkout: checkout("a"), ..profile("a", "release", 100, T0 - 9 * DAY) };
     let b_debug = Object { checkout: checkout("b"), ..profile("b", "debug", 400, T0 - DAY) };
     let objects = vec![
         workspace("a", 0, last_build, true),
@@ -385,7 +386,8 @@ fn a_live_heads_recently_used_profile_stays_under_pressure() {
     gc.volume(0, volume(820));
     let run = asked(&mut gc, false);
     let checkout = Some(Checkout { path: "/src/a".to_owned(), exists: true });
-    let a_check = Object { checkout: checkout.clone(), ..profile("a", "check", 400, T0 - 3 * HOUR) };
+    let a_check =
+        Object { checkout: checkout.clone(), ..profile("a", "check", 400, T0 - 3 * HOUR) };
     let a_debug = Object { checkout, ..profile("a", "debug", 400, T0 - 2 * HOUR) };
     let objects = vec![workspace("a", 0, T0 - 2 * HOUR, true), a_check, a_debug];
     gc.scanned(run, Ok(inventory(objects)));
@@ -474,7 +476,10 @@ fn a_failed_scan_after_the_clock_jumped_does_not_vouch_for_it() {
     };
     restored.scanned(run, Ok(Inventory { objects: Vec::new(), problems: Vec::new(), next: None }));
     let report = finish(&mut restored);
-    assert!(matches!(report.outcome, Outcome::Stopped { why: Stop::Clock { newest_ns: T0, .. }, .. }));
+    assert!(matches!(
+        report.outcome,
+        Outcome::Stopped { why: Stop::Clock { newest_ns: T0, .. }, .. }
+    ));
 }
 
 /// A wall clock set forward while the collector runs is held to what the boot clock says has
@@ -492,7 +497,11 @@ fn a_wall_clock_set_forward_is_held_to_the_boot_clock() {
     };
     gc.scanned(run, Ok(inventory(Vec::new())));
     let report = finish(&mut gc);
-    assert!(report.problems.iter().any(|it| it.contains("ahead of the boot clock")), "{:?}", report.problems);
+    assert!(
+        report.problems.iter().any(|it| it.contains("ahead of the boot clock")),
+        "{:?}",
+        report.problems
+    );
 }
 
 /// The driver reads the collector's own clock (review N3): a wall clock stepped forward (a VM
@@ -528,12 +537,19 @@ fn a_wall_clock_step_does_not_cancel_a_runs_decisions_and_is_re_anchored_once_st
     gc.scanned(run, Ok(inventory(Vec::new())));
     let report = finish(&mut gc);
     assert_eq!(report.outcome, Outcome::Done);
-    assert!(report.problems.iter().any(|it| it.contains("ahead of the boot clock")), "{:?}", report.problems);
+    assert!(
+        report.problems.iter().any(|it| it.contains("ahead of the boot clock")),
+        "{:?}",
+        report.problems
+    );
     // As far ahead for an hour of boot time: taken as right.
     let reanchor = crate::plan::REANCHOR_NS;
     gc.advance_clocks(wall + reanchor, Some(boot + reanchor));
     assert_eq!(gc.now(), wall + reanchor, "re-anchored to the wall clock");
-    assert_eq!(gc.clock().read(wall + reanchor + S, Some(boot + reanchor + S)), wall + reanchor + S);
+    assert_eq!(
+        gc.clock().read(wall + reanchor + S, Some(boot + reanchor + S)),
+        wall + reanchor + S
+    );
     gc.ask(true);
     let run = match gc.take_decisions().as_slice() {
         [Decision::Scan { run, .. }] => *run,
