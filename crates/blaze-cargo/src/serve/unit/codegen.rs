@@ -1743,6 +1743,11 @@ fn relink(
     linked: &mut Linked,
 ) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, Laid, super::run::inproc::Told), LinkCause> {
     let built = generated.built;
+    // Where a run may start a dev executable from beside its path: the copy cargo makes of it.
+    let copy = match linked.output.dev_run {
+        Some(_) => super::artifact::uplifted(path, job.plan(unit).map_err(|it| LinkCause::Given(it.what))?),
+        None => None,
+    };
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
     let mut files = blaze_usercode::inputs::Disk::new(Vec::new());
@@ -1891,10 +1896,12 @@ fn relink(
             false => Laid::Patched,
         };
         match linked.output.dev_run {
-            // A dev executable's file is its code memory's image part, which its runs map.
+            // A dev executable's file is its code memory's image part, which its runs map,
+            // from its path or from the copy cargo makes of it (a test binary's in `deps`).
             Some(dev_run) => super::run::inproc::commit(
                 &job.shared.dev_runs,
                 path,
+                copy,
                 &mut linked.image,
                 &mut linked.loaded,
                 staged,

@@ -1463,6 +1463,7 @@ fn generate(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -
 fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases, images: &mut Vec<Image>) -> Result<(), Failed> {
     if let Some(mut kept) = phases.kept.take() {
         kept.macros = macros(job, reader, unit, kept.ok, Module::Kept(&kept));
+        held(job, unit, &mut kept)?;
         phases.linked = Some(Linked::Kept(kept));
         return Ok(());
     }
@@ -1513,6 +1514,67 @@ fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases, images
     // with the std code each reaches copied into every one, was the 8 GiB codegen heap of a
     // `blaze test` of 21 small crates (B5, coord-105).
     phases.generated = None;
+    Ok(())
+}
+
+/// A dev executable's record replayed ([`super::run::Launch::InProcess`]): each program it
+/// names held by the daemon as that file ([`super::run::inproc::DevRuns::adopt`]), at its path
+/// and at the copy cargo makes of it, so a run of the build starts the code the record is of.
+/// The daemon holds only what it linked or adopted: a record another daemon made, or one of
+/// an earlier value of the unit's inputs than the daemon's last link at the path (a variable
+/// the build script reads set back), runs its own file, never the daemon's other link. A
+/// running program replaced is told to start again, and the build says so.
+fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
+    if !kept.ok {
+        return Ok(());
+    }
+    let plan = job.plan(unit)?;
+    let made = artifact::made(plan);
+    let programs = || kept.outputs.iter().filter(|it| it.executable && made.contains(&it.path.as_str()));
+    if programs().next().is_none() {
+        return Ok(());
+    }
+    // The question its link asked ([`codegen::policy`]): a live build is a dev executable's.
+    let policy = codegen::toolchain(job, unit).and_then(|toolchain| codegen::policy(job, unit, toolchain));
+    if policy.map_err(|what| ApiError::new(what, None))?.mode != blaze_codegen::plan::Mode::Live {
+        return Ok(());
+    }
+    let guard = blaze_cas::enter();
+    let mut told = Vec::new();
+    for output in programs() {
+        let path = output.path.as_str();
+        let bytes = match kept.puts.iter().find(|it| it.key == output.key) {
+            Some(put) => &put.bytes[..],
+            None => match job.input.store.get(&guard, &output.key) {
+                Ok(Some(it)) => it.bytes,
+                Ok(None) => {
+                    // alloc: error path
+                    let what = format!("{path}: its record names the output {:x}, which the store does not hold", output.key.0);
+                    return Err(ApiError::new(what, None).into());
+                }
+                Err(corrupt) => {
+                    // alloc: error path
+                    let what = format!("{path}: reading the output {:x} from the store: {corrupt}", output.key.0);
+                    return Err(ApiError::new(what, None).into());
+                }
+            },
+        };
+        let adopted = job.shared.dev_runs.adopt(path, artifact::uplifted(path, plan), bytes);
+        match adopted.map_err(|what| ApiError::new(format!("{path}: {what}"), None))? {
+            // alloc: a path, once per running program replaced
+            super::run::inproc::Told::Restart { why } => told.push((path.to_owned(), why)),
+            super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => {}
+        }
+    }
+    if told.is_empty() {
+        return Ok(());
+    }
+    let unit_of = job.unit_of(unit)?;
+    for (path, why) in told {
+        // alloc: a warning's text, once per restart
+        let what = format!("`{path}` is running and can't take this build as a patch: {why}; start it again to run it");
+        kept.diagnostics.push(say::cargo(Level::Warning, what, Some(unit_of.clone()), job.input.color));
+    }
     Ok(())
 }
 
