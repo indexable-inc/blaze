@@ -69,8 +69,6 @@ pub struct Shell;
 pub struct Proc;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Stage;
-#[derive(Component, Clone, Copy, Debug, Default)]
-pub struct Group;
 
 /// `(Status, status)`.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -81,7 +79,7 @@ pub struct Running;
 pub struct Exited;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Lost;
-/// A run ended by a signal.
+/// A run or a session ended by a signal.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Killed;
 /// A stage that has not started yet.
@@ -179,12 +177,6 @@ pub struct History {
     pub exhausted: bool,
 }
 
-/// A group of runs with no listed session, by what they share (`repl:<id>`, `session:<n>`, `other`).
-#[derive(Component, Clone, Debug, Default, PartialEq)]
-pub struct GroupKey {
-    pub s: ScriptString,
-}
-
 /// Finished runs a parent shows while folded (running ones always show).
 pub const KEEP_RUNS: usize = 3;
 
@@ -209,8 +201,6 @@ pub enum PaneKind {
     Term,
     /// A run's or stage's output (Proc, Stage).
     Run,
-    /// A group's runs (Group).
-    Group,
     /// The Archive (ArchiveView).
     Archive,
 }
@@ -223,8 +213,6 @@ pub fn pane_kind(e: EntityView<'_>) -> PaneKind {
     let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
     if k == *w.component_id::<ArchiveView>() {
         PaneKind::Archive
-    } else if k == *w.component_id::<Group>() {
-        PaneKind::Group
     } else if k == *w.component_id::<Stage>() || (k == *w.component_id::<Proc>() && !e.has(Object::id())) {
         PaneKind::Run
     } else {
@@ -269,6 +257,8 @@ pub enum Msg {
     Runs(Vec<serde_json::Value>),
     /// A page of older runs (`runs` with `before`), and whether it was a full page (more may be older).
     RunsPage { runs: Vec<serde_json::Value>, full: bool },
+    /// Runs from all of history matching a search (`runs` with `q`, the palette's): added like a page, paging untouched.
+    RunsFound(Vec<serde_json::Value>),
     /// Output of run `r{run}` (of its stage `stage`, or the caller-visible streams), as `run_read` returned it.
     RunData { run: u64, stage: Option<u32>, err: bool, bytes: Vec<u8> },
 }
@@ -307,7 +297,6 @@ pub fn register(world: &World) {
     world.component::<History>().writable();
     world.set(ArchiveAfter { ms: 600_000 });
     world.set(History::default());
-    world.component::<GroupKey>().writable();
     world.component::<Selected>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Shows>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Term>().writable();
@@ -325,7 +314,6 @@ fn for_tags(world: &World) {
     world.component::<Shell>();
     world.component::<Proc>();
     world.component::<Stage>();
-    world.component::<Group>();
     world.component::<Running>();
     world.component::<Exited>();
     world.component::<Lost>();
@@ -469,6 +457,7 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms
             reconcile_runs(w, dev, idx, &runs, true);
             w.set(History { loading: false, exhausted: !full });
         }
+        Msg::RunsFound(runs) => reconcile_runs(w, dev, idx, &runs, true),
         Msg::RunData { run, stage, err, bytes } => {
             let ent = match stage {
                 Some(k) => idx.stages.get(&(run, k)),
@@ -686,6 +675,7 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         }
         let status = match (s["status"].as_str(), s["exit"].as_i64()) {
             (Some("lost"), _) => *w.component_id::<Lost>(),
+            (Some("killed"), _) => *w.component_id::<Killed>(),
             (_, Some(_)) => *w.component_id::<Exited>(),
             (Some("exited"), _) => *w.component_id::<Exited>(),
             _ => *w.component_id::<Running>(),
@@ -711,10 +701,8 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         if e.try_cloned::<&Cwd>().is_none_or(|n| n.s.as_str() != cwd) {
             e.set(Cwd { s: cwd.into() });
         }
-        let created = Created { ms: s["created_ms"].as_u64().unwrap_or(0) };
-        if e.try_cloned::<&Created>() != Some(created) {
-            e.set(created);
-        }
+        // When it ended (the daemon's `ended_ms`): where the Archive files it.
+        set_times(e, s["created_ms"].as_u64(), s["ended_ms"].as_u64());
     }
     for s in sessions {
         let Some(e) = s["id"].as_u64().and_then(|id| by_id.get(&id)).map(|&e| w.entity_from_id(e)) else { continue };
@@ -889,20 +877,6 @@ pub fn archive_view(world: WorldRef<'_>) -> u64 {
 
 fn ke_collapsed(w: WorldRef<'_>, e: u64) -> bool {
     w.entity_from_id(e).has(Collapsed::id())
-}
-
-/// Whether `e` is a group of runs (its row folds it rather than selecting it).
-#[must_use]
-pub fn is_group(world: WorldRef<'_>, e: u64) -> bool {
-    world.entity_from_id(e).has(GroupKey::id())
-}
-
-/// How many runs `e` holds directly.
-#[must_use]
-pub fn run_count(world: WorldRef<'_>, e: u64) -> usize {
-    let mut n = 0;
-    world.entity_from_id(e).each_child(|c| n += usize::from(c.has(Run::id())));
-    n
 }
 
 /// Collapse or expand `e`'s children.

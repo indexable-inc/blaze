@@ -209,35 +209,9 @@ prefab hn.RunRow : ui.Row {
     TextStyle: {size: $size_run, line: 15, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
+  // Room goes as on a session row: how long it took gives way first, then the command (ui.Lead, -1).
   meta : ui.Line, Faint {
-    TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-  }
-}
-
-// A group of runs with no listed session ("REPL runs", "other runs"): its icon, its name, how many runs it holds and a
-// disclosure chevron (on hover or while open, turning on a spring); pressed to fold or unfold it.
-prefab hn.GroupRow : ui.Row {
-  Pressable
-  Action: {name: ""}
-  Fill: $tone_clear
-  Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-  HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-  PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-  Flex: {axis: Row, gap: $row_gap, align: Center, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
-  Padding: {l: $row_pad, r: $row_pad, t: 0, b: 0}
-  indent : ui.Node {
-    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-  }
-  disclose : hn.Disclosure {}
-  glyph : ui.Symbol, Muted {
-    Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
-  }
-  name : ui.Lead, Ink {
-    TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
-  }
-  spacer : ui.Spacer {}
-  meta : ui.Line, Faint {
+    LayoutPriority: {value: -2}
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
 }
@@ -301,47 +275,19 @@ prefab hn.TermPane : hn.Pane {
   term : hn.Terminal {}
 }
 
-// A run or a stage (Proc, Stage): a few lines of what it is (its command; how it ended, how long it ran, where), its
-// stages as rows, then its output, stdout and stderr in the order they were written, stderr tinted. Part of the body,
-// in its margins, not a header row.
+// A run or a stage (Proc, Stage): its stages as rows (a pipeline's), then its output, stdout and stderr in the order
+// they were written, stderr tinted. The title bar names it (its id and command) and says how it stands; no heading here.
 prefab hn.RunPane : hn.Pane {
   info : ui.Column {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
-    Padding: {l: 18, r: 18, t: 16, b: 0}
-    cmd : ui.Words, Strong {
-      TextStyle: {size: $size_body, line: 18, role: 9, bold: 0}
-    }
-    meta : ui.Words, Muted {
-      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
-    }
+    Padding: {l: 18, r: 18, t: 8, b: 0}
     stages : ui.List {
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     }
   }
   term : hn.Terminal {}
-}
-
-// A group of runs (REPL runs, other runs): its name and count, then its runs, newest first.
-prefab hn.GroupPane : hn.Pane {
-  info : ui.Column {
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
-    Padding: {l: 18, r: 18, t: 16, b: 10}
-    name : ui.Words, Strong {
-      TextStyle: {size: $size_body, line: 18, role: 0, bold: 1}
-    }
-    meta : ui.Words, Muted {
-      TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
-    }
-  }
-  runs : ui.List {
-    Clip
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-    Padding: {l: 10, r: 10, t: 0, b: 10}
-  }
 }
 
 // A row of a pane's list (a run's stages, a group's runs): status dot, its id, its command in the code face, and on the
@@ -369,7 +315,7 @@ prefab hn.PaneRow : ui.Row {
   }
 }
 
-// The Archive (src/app/archive.rs): everything out of the live tree. A title and count, a search line (typed into while
+// The Archive (src/app/archive.rs): everything out of the live tree (the title bar names it and counts it). A search line (typed into while
 // the pane has the keyboard), the filter chips, then a scrolling list by day (Today, Yesterday, This week, Older):
 // sessions with their runs folded under them, runs, and at its foot the next page of older runs from the daemon.
 prefab hn.ArchivePane : hn.Pane {
@@ -377,16 +323,6 @@ prefab hn.ArchivePane : hn.Pane {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Flex: {axis: Column, gap: 10, align: Stretch, justify: Start, wrap: false}
     Padding: {l: 18, r: 18, t: 14, b: 6}
-    top : ui.Row {
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 22, min: 0, max: 0}}
-      Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-      title : ui.Line, Strong {
-        TextStyle: {size: $size_title, line: 20, role: 0, bold: 1}
-      }
-      count : ui.Line, Faint {
-        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
-      }
-    }
     search : ui.Row, Wash {
       Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
       Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
@@ -404,9 +340,15 @@ prefab hn.ArchivePane : hn.Pane {
       Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
     }
   }
+  // Lazy (SwiftUI's LazyVStack in a ScrollView): only the rows in view exist, recycled as they scroll; every row is
+  // $row_h tall (headings, items, the note and the foot alike).
   list : ui.Scroll {
-    Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: 10, r: 10, t: 0, b: 12}
+    rows : ui.LazyColumn {
+      Lazy: {count: 0, row: $row_h, overscan: 6}
+      Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
+    }
   }
 }
 
@@ -429,7 +371,7 @@ prefab hn.Chip : ui.Row {
 // A day's heading in the Archive's list.
 prefab hn.ArchSection : ui.Row {
   Flex: {axis: Row, gap: 0, align: End, justify: Start, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $section_h, min: 0, max: 0}}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
   Padding: {l: $row_pad, r: $row_pad, t: 0, b: 5}
   label : ui.Line, Faint {
     TextStyle: {size: $size_label, line: 14, role: 0, bold: 1, weight: $weight_label}
@@ -459,11 +401,13 @@ prefab hn.ArchRow : ui.Row {
   name : ui.Lead, Ink {
     TextStyle: {size: $size_row, line: 16, role: 0, bold: 0, weight: $weight_row}
   }
+  // Room goes by priority: where it ran gives way first, then the name (ui.Lead, -1); the status badge never does.
   under : ui.Lead, Faint {
+    LayoutPriority: {value: -2}
     TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
   }
   spacer : ui.Spacer {}
-  status : hn.Badge {}
+  status : hn.Badge { LayoutPriority: {value: 1} }
   took : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
     Size: {w: {kind: Fixed, value: $arch_took_w, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
@@ -497,7 +441,7 @@ prefab hn.ArchMore : ui.Row {
 // The Archive's list when nothing is in it (or nothing matches).
 prefab hn.ArchNote : ui.Row {
   Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 72, min: 0, max: 0}}
+  Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
   label : ui.Line, Faint {
     TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
   }

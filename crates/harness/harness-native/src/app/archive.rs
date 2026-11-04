@@ -33,8 +33,6 @@ pub fn register(world: &World) {
 }
 
 const CHIPS: [&str; 4] = ["All", "Sessions", "Runs", "Failed"];
-/// Rows the list makes at most (the rest is a search or a filter away).
-const MAX_ROWS: usize = 400;
 /// The search icon (cod-search) and the back chevron (cod-chevron-left).
 const SEARCH_ICON: &str = "\u{EA6D}";
 pub const BACK_ICON: &str = "\u{EAB5}";
@@ -175,9 +173,14 @@ impl App {
         self.focused_pane().filter(|&p| shows(p)).or_else(|| self.panes().into_iter().find(|&p| shows(p)))
     }
 
-    /// The Archive's list node, when a pane shows it.
+    /// The Archive's list node (the scroll), when a pane shows it.
     pub(super) fn archive_list(&self) -> Option<u64> {
         View::of(self.world.entity_from_id(self.archive_pane()?)).part("list").map(View::id)
+    }
+
+    /// The lazy column of rows inside the Archive's list.
+    fn archive_rows_node(&self) -> Option<View<'_>> {
+        View::of(self.world.entity_from_id(self.archive_list()?)).part("rows")
     }
 
     /// Whether `e` failed: killed, lost, or a nonzero exit.
@@ -229,9 +232,6 @@ impl App {
         let mut out: Vec<(String, &'static str, ARow)> = Vec::new();
         let mut last: Option<&'static str> = None;
         for &e in &items {
-            if out.len() >= MAX_ROWS {
-                break;
-            }
             if !chip_ok(e) || !q_ok(e) || (nested && parent_in(e).is_some()) {
                 continue;
             }
@@ -243,7 +243,7 @@ impl App {
             let under = kids.get(&e).map_or(&[][..], Vec::as_slice);
             out.push((format!("a{e}"), "hn.ArchRow", ARow::Item { e, depth: 0, kids: under.len() }));
             if w.entity_from_id(e).has(ArchiveOpen::id()) {
-                for &k in under.iter().take(MAX_ROWS) {
+                for &k in under {
                     out.push((format!("a{k}"), "hn.ArchRow", ARow::Item { e: k, depth: 1, kids: 0 }));
                 }
             }
@@ -259,24 +259,15 @@ impl App {
         out
     }
 
-    /// Fill an Archive pane: its title and count, search line, chips and list; and page in older runs once the list's
+    /// Fill an Archive pane (the title bar names and counts it, [`Self::archive_subtitle`]): its search line, chips and list; and page in older runs once the list's
     /// foot is in view.
     pub(super) fn fill_archive_pane(&self, pane: u64) {
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(pane));
-        let n = model::archived(w).len();
         let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
         let (strong, muted, faint) = (tone(w, "strong"), tone(w, "muted"), tone(w, "faint"));
         let q = self.archive_query();
         if let Some(head) = pv.part("head") {
-            if let Some(top) = head.part("top") {
-                if let Some(p) = top.part("title") {
-                    p.text("Archive");
-                }
-                if let Some(p) = top.part("count") {
-                    p.text(&format!("{n} item{}", if n == 1 { "" } else { "s" }));
-                }
-            }
             if let Some(s) = head.part("search") {
                 if let Some(p) = s.part("icon") {
                     p.icon(SEARCH_ICON);
@@ -302,17 +293,20 @@ impl App {
             }
         }
         let Some(list) = pv.part("list") else { return };
+        let Some(lazy) = list.part("rows") else { return };
         let looks = RowLooks::of(w, clear);
         let step = crate::look::width(w, "indent");
         let today = midnight(model::now_ms());
         let loading = w.try_get::<&model::History>(|h| h.loading).unwrap_or(false);
         let mut foot_seen = false;
         let list_rect = list.entity().try_cloned::<&Laid>();
-        view::for_each_of(list, self.archive_rows(), |row, r, new| {
-            if new {
+        // Only the rows in view are entities (recycled as the list scrolls); paging asks the daemon once the foot shows.
+        let rows = self.archive_rows();
+        view::lazy_for_each_of(lazy, rows.len() as u32, |i| rows[i as usize].0.as_str(), |i| rows[i as usize].1, |row, i, fresh| {
+            if fresh {
                 row.set(HoverAmt::default());
             }
-            match r {
+            match rows[i as usize].2 {
                 ARow::Section(s) | ARow::Note(s) => {
                     if let Some(p) = row.part("label") {
                         p.text(s);
@@ -399,6 +393,8 @@ impl App {
         if let Some(b) = row.part("status") {
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code);
             let (text, ink, wash) = match (self.status_of(e), code) {
+                // Closed (cmd+W) but its process is alive in the daemon: say so, not a bare "running".
+                ("running", _) if o.has(model::Object::id()) => ("still running".to_owned(), looks.accent, looks.clear),
                 ("running", _) => ("running".to_owned(), looks.accent, looks.clear),
                 ("killed", _) => ("killed".to_owned(), looks.failed, looks.failed_wash),
                 ("lost", _) => ("lost".to_owned(), looks.lost, looks.clear),
@@ -421,6 +417,20 @@ impl App {
         if let Some(t) = row.part("time").and_then(|c| c.part("text")) {
             t.text(&fmt_when(model::when(o), today));
         }
+    }
+
+    /// The title bar's line under "Archive": how many objects it holds, and while a chip or a search narrows it, how
+    /// many of them show.
+    pub(super) fn archive_subtitle(&self) -> String {
+        let n = model::archived(self.world.world_ref()).len();
+        let all = format!("{n} archived");
+        let chip = self.archive_chip();
+        if chip == 0 && self.archive_query().trim().is_empty() {
+            return all;
+        }
+        let shown = self.archive_rows().iter().filter(|(_, _, r)| matches!(r, ARow::Item { .. })).count();
+        let what = if chip == 0 { "matching".to_owned() } else { CHIPS[usize::from(chip)].to_lowercase() };
+        format!("{all}  \u{00B7}  {shown} {what}")
     }
 
     /// Ask the daemon for the page of runs older than the oldest the world holds.
@@ -460,11 +470,13 @@ impl App {
         if !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
             return false;
         }
-        let rows: Vec<Laid> = harness_native_ui_node_api::children(le).iter().filter_map(|c| c.try_cloned::<&Laid>()).filter(|r| r.h > 0.0).collect();
-        let content = match (rows.first(), rows.last()) {
-            (Some(a), Some(b)) => b.y + b.h - a.y + 12.0,
-            _ => 0.0,
-        };
+        // The lazy column stands for all its rows, made or not: `count` rows `row` long with `gap` between, and the foot pad.
+        let lazy = self.archive_rows_node().map(|v| v.entity());
+        let content = lazy.map_or(0.0, |e| {
+            let l = e.try_cloned::<&harness_native_ui_layout_api::Lazy>().unwrap_or_default();
+            let gap = e.try_cloned::<&harness_native_ui_layout_api::Flex>().map_or(0.0, |f| f.gap);
+            l.count as f32 * (l.row + gap) - gap + 12.0
+        });
         let max = (content - r.h).max(0.0);
         let by = if precise { dy } else { dy * 28.0 };
         let now = le.try_cloned::<&ScrollStateOf>().map_or(0.0, |s| s.y);

@@ -1,7 +1,7 @@
 //! The layout-vocabulary gallery (`HARNESS_NATIVE_GALLERY=1` with `HARNESS_NATIVE_SHOT`): the prims crate's example scenes
 //! drawn instead of the app's view, in the same App and Renderer. Every other root node is made `Offscreen`; the window's
 //! title-bar strip is the gallery root's `SafeAreaInset`; a system keeps the lazy example's rows to the ones in view and,
-//! one second in, moves the selection pill, inserts and removes chips and retargets the animated bar, so a shot shortly
+//! one second in, moves the selection pill, inserts and removes chips, removes a list row and retargets the animated bar, so a shot shortly
 //! after (`HARNESS_NATIVE_SHOT_SECS`) catches them mid-spring.
 use std::time::Instant;
 
@@ -87,7 +87,7 @@ fn label_chips(w: WorldRef<'_>) {
     }
 }
 
-/// The one-second changes: the pill to the third row, chips in and out, the bar retargeted.
+/// The one-second changes: the pill to the third row, chips in and out, a list row removed, the bar retargeted.
 fn change(w: WorldRef<'_>) {
     if let Some(pill) = at(w, "cards::matched::rows::r0::pill") {
         pill.destruct();
@@ -103,6 +103,9 @@ fn change(w: WorldRef<'_>) {
         for (name, prefab) in [("c_fade", "ex.Chip"), ("c_slide", "ex.ChipSlide"), ("c_scale", "ex.ChipScale"), ("c_move", "ex.ChipMove")] {
             chips.child(prefab).named(name);
         }
+    }
+    if let Some(b) = at(w, "cards::removal::rows::b") {
+        view::leave(View::of(b));
     }
     if let Some(bar) = at(w, "cards::animate::bar") {
         bar.set(Size { w: Sizing::fixed(240.0), h: Sizing::fixed(40.0) });

@@ -62,7 +62,20 @@ enum Do {
 struct Palette {
     query: String,
     at: usize,
+    /// The query history was last searched for, and when (the app's clock) the query last changed: the daemon is asked
+    /// once typing has paused for [`PALETTE_DEBOUNCE`].
+    searched: String,
+    changed: f32,
 }
+
+impl Palette {
+    fn new() -> Self {
+        Self { query: String::new(), at: 0, searched: String::new(), changed: 0.0 }
+    }
+}
+
+/// How long typing in the palette pauses before older history is searched (seconds).
+const PALETTE_DEBOUNCE: f32 = 0.2;
 
 /// The view's fixed nodes, by entity id.
 struct Ids {
@@ -122,8 +135,6 @@ pub struct App {
     resizing: bool,
     /// A run (and stage) to select once the runs show it.
     pending_run: Option<(u64, Option<u32>)>,
-    /// A group of runs to select once the runs make it, by its key (`repl:<id>`, `other`).
-    pending_group: Option<String>,
     link: Link,
     grid: Grid,
     zoom: usize,
@@ -310,7 +321,6 @@ impl App {
             run_terms,
             watching: HashMap::new(),
             pending_run: None,
-            pending_group: None,
             side_w,
             resizing: false,
             link,
@@ -507,18 +517,6 @@ impl App {
             self.pending_archive = false;
             model::select(w, Some(model::archive_view(w)));
         }
-        if let Some(key) = self.pending_group.clone() {
-            let mut found = None;
-            self.world.new_query::<&model::GroupKey>().each_entity(|e, g| {
-                if g.s.as_str() == key {
-                    found = Some(*e.id());
-                }
-            });
-            if found.is_some() {
-                model::select(w, found);
-                self.pending_group = None;
-            }
-        }
         if let Some((n, k)) = self.pending_run {
             let mut found = None;
             self.world.new_query::<&model::Run>().each_entity(|e, r| {
@@ -576,7 +574,6 @@ impl App {
             .into_iter()
             .map(|r| match r {
                 model::Row::Obj { e, .. } if self.run_of(e).is_some() => (format!("o{e}"), "hn.RunRow", r),
-                model::Row::Obj { e, .. } if model::is_group(w, e) => (format!("o{e}"), "hn.GroupRow", r),
                 model::Row::Obj { e, .. } => (format!("o{e}"), "hn.ObjRow", r),
                 model::Row::More { parent, .. } => (format!("more{parent}"), "hn.MoreRow", r),
             })
@@ -610,24 +607,6 @@ impl App {
                 }
             };
             let o = w.entity_from_id(e);
-            if model::is_group(w, e) {
-                // A group of runs without a listed session: pressing it shows it (its runs in a group pane); pressing it
-                // again folds it.
-                row.action(&format!("group:{e}"));
-                selection(row, sel == Some(e), clear);
-                indent(row, depth);
-                fold::disclosure(row, Some(o));
-                if let Some(p) = row.part("glyph") {
-                    p.icon(crate::look::GROUP_ICON);
-                }
-                if let Some(p) = row.part("name") {
-                    p.text(&o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
-                }
-                if let Some(p) = row.part("meta") {
-                    p.text(&model::run_count(w, e).to_string());
-                }
-                return;
-            }
             row.action(&format!("select:{e}"));
             fold::disclosure(row, Some(o));
             selection(row, sel == Some(e), clear);
@@ -690,14 +669,7 @@ impl App {
                         let cmd = name.split_whitespace().collect::<Vec<_>>().join(" ");
                         (format!("{id}  {cmd}"), join(vec![self.run_cwd(e), self.run_state(e)]))
                     }
-                    (None, model::PaneKind::Archive) => {
-                        let n = model::archived(w).len();
-                        (name, format!("{n} archived"))
-                    }
-                    (None, model::PaneKind::Group) => {
-                        let n = model::run_count(w, e);
-                        (name, format!("{n} run{}", if n == 1 { "" } else { "s" }))
-                    }
+                    (None, model::PaneKind::Archive) => (name, self.archive_subtitle()),
                     _ => {
                         // The program-set title (OSC 0/2) never names anything (agents' titles are spinner frames and
                         // "Claude Code"): only a shell's shows, in place of its directory.
@@ -969,6 +941,23 @@ impl App {
             };
             out.push((format!("arc{e}"), kind_glyph(model::kind_name(o)), name, "archived".into(), Do::Archived(e)));
         }
+        // While searching, every run the world holds that is not listed yet (in the tree, or found in older history by
+        // the daemon's search), newest first.
+        let q = self.palette.as_ref().map(|p| p.query.trim().to_lowercase()).unwrap_or_default();
+        if !q.is_empty() {
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            self.world.new_query::<&model::Run>().each_entity(|e, r| {
+                if !e.has(model::Archived::id()) {
+                    runs.push((r.n, *e.id()));
+                }
+            });
+            runs.sort_unstable_by(|a, b| b.cmp(a));
+            for (n, e) in runs {
+                let o = w.entity_from_id(e);
+                let cmd = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                out.push((format!("run{e}"), kind_glyph("proc"), format!("r{n}  {cmd}"), "run".into(), Do::Select(e)));
+            }
+        }
         out.push(("kill".into(), "\u{2715}", "Kill current object".into(), "\u{2318}W".into(), Do::Kill));
         out.push(("zoom-in".into(), "+", "Zoom in".into(), "\u{2318}=".into(), Do::Zoom(1)));
         out.push(("zoom-out".into(), "\u{2212}", "Zoom out".into(), "\u{2318}\u{2212}".into(), Do::Zoom(-1)));
@@ -978,6 +967,23 @@ impl App {
     }
 
     fn sync_palette(&mut self) {
+        // Older history than the world holds: once typing pauses, the daemon searches every run; what it finds joins the
+        // world (as a page would) and so the palette's entries.
+        let (time, mut wait) = (self.time, false);
+        if let Some(p) = self.palette.as_mut() {
+            let q = p.query.trim().to_owned();
+            if q != p.searched {
+                if q.chars().count() >= 2 && time - p.changed >= PALETTE_DEBOUNCE {
+                    self.link.runs_search(&q);
+                    p.searched = q;
+                } else {
+                    wait = true;
+                }
+            }
+        }
+        if wait {
+            self.poke();
+        }
         let w = self.world.world_ref();
         match (&self.palette, self.ids.palette) {
             (None, Some(id)) => {
@@ -1262,12 +1268,6 @@ impl App {
             } else if let Some(e) = a.strip_prefix("toggle:").or_else(|| a.strip_prefix("collapse:")).and_then(|s| s.parse().ok()) {
                 self.tree_focus = true;
                 self.toggle_fold_of(e, self.press.1.alt);
-            } else if let Some(g) = a.strip_prefix("group:").and_then(|s| s.parse().ok()) {
-                if self.selected() == Some(g) {
-                    model::toggle_collapse(self.world.world_ref(), g);
-                } else {
-                    self.select(Some(g));
-                }
             } else if let Some(p) = a.strip_prefix("fold:").and_then(|s| s.parse().ok()) {
                 model::toggle_fold(self.world.world_ref(), p);
             } else if a == "archive:open" {
@@ -1455,12 +1455,14 @@ impl App {
             51 => {
                 p.query.pop();
                 p.at = 0;
+                p.changed = self.time;
             }
             _ => {
                 let typed: String = chars.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
                 if !typed.is_empty() {
                     p.query.push_str(&typed);
                     p.at = 0;
+                    p.changed = self.time;
                 }
             }
         }
@@ -1491,7 +1493,7 @@ impl App {
             ("w", false) => self.kill(),
             ("s", false) => self.toggle_sidebar(),
             ("k", false) => {
-                self.palette = if self.palette.is_some() { None } else { Some(Palette { query: String::new(), at: 0 }) };
+                self.palette = if self.palette.is_some() { None } else { Some(Palette::new()) };
             }
             ("=", _) | ("+", _) => self.step_zoom(1),
             ("-", _) | ("_", _) => self.step_zoom(-1),
@@ -1587,11 +1589,6 @@ impl App {
         self.pending_run = Some((n, k));
     }
 
-    /// Select the group of runs keyed `key` once the runs make it (the shot's `HARNESS_NATIVE_SHOT_SELECT=g:repl:<id>`).
-    pub fn select_group(&mut self, key: &str) {
-        self.pending_group = Some(key.to_owned());
-    }
-
     /// Open the Archive once the daemon's first list is in (the shot's `HARNESS_NATIVE_SHOT_SELECT=archive`).
     pub fn select_archive_later(&mut self) {
         self.pending_archive = true;
@@ -1599,7 +1596,17 @@ impl App {
 
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
-        self.palette = Some(Palette { query: String::new(), at: 0 });
+        self.palette = Some(Palette::new());
+        self.poke();
+    }
+
+    /// Type `q` into the open palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE=<query>`).
+    pub fn palette_query(&mut self, q: &str) {
+        let time = self.time;
+        if let Some(p) = self.palette.as_mut() {
+            p.query = q.to_owned();
+            p.changed = time;
+        }
         self.poke();
     }
 }

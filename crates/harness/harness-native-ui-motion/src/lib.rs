@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use harness_native_api::{Clock, moving, settle};
 use harness_native_flecs::prelude::*;
-use harness_native_ui_layout_api::{Padding, Size, Sizing};
+use harness_native_ui_layout_api::{Collapse, Flex, FlexAxis, Padding, Size, Sizing};
 use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_motion_api::{
     Animate, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Reveal, Shown, ShownWhen, SizeTween, Target, Transition,
@@ -153,6 +153,19 @@ pub fn install(world: WorldRef<'_>) {
         if leaving {
             if e.try_cloned::<&Target>().map(|t| t.0) != Some(0.0) {
                 e.set(Target(0.0));
+            }
+            // Leaving a flow, it folds away on the same spring as it fades: layout gives its neighbours what it lets go
+            // (Collapse), and it is drawn (and clips its content) to what it still holds, from its leading edge.
+            if let Some(c) = e.try_cloned::<&Collapse>() {
+                let k = sh.spring.x.clamp(0.0, 1.0);
+                if c.k != k {
+                    e.set(Collapse { k });
+                }
+                let row = e.parent().and_then(|p| p.try_cloned::<&Flex>()).is_some_and(|f| f.axis == FlexAxis::Row);
+                let d = Drawn { x: laid.x, y: laid.y, w: if row { laid.w * k } else { laid.w }, h: if row { laid.h } else { laid.h * k } };
+                if e.try_cloned::<&Drawn>() != Some(d) {
+                    e.set(d);
+                }
             }
             if sh.spring.x <= 0.01 {
                 e.destruct();

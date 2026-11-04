@@ -1,7 +1,7 @@
 //! Panes and the terminal primitive, as flecs components.
 //!
 //! A pane is a node under `hn.Main` holding `(Shows, object)` (harness-native-model): it draws that object with the
-//! prefab its Kind picks (`hn.TermPane`, `hn.RunPane`, `hn.GroupPane`). One pane has [`PaneFocus`]; it follows the
+//! prefab its Kind picks (`hn.TermPane`, `hn.RunPane`). One pane has [`PaneFocus`]; it follows the
 //! app's `(Selected, object)`. Nothing assumes there is only one: a split is a second pane node.
 //!
 //! `hn.Terminal` is the terminal primitive inside a term or run pane. Its cells stay in the GPU grid (term.rs draws a

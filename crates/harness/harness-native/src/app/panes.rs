@@ -10,7 +10,6 @@ use model::PaneKind;
 fn pane_prefab(kind: Option<PaneKind>) -> &'static str {
     match kind {
         Some(PaneKind::Run) => "hn.RunPane",
-        Some(PaneKind::Group) => "hn.GroupPane",
         Some(PaneKind::Archive) => "hn.ArchivePane",
         _ => "hn.TermPane",
     }
@@ -129,7 +128,6 @@ impl App {
             }
             match shown.map(|e| (e, model::pane_kind(w.entity_from_id(e)))) {
                 Some((e, PaneKind::Run)) => self.fill_run_pane(pane, e),
-                Some((e, PaneKind::Group)) => self.fill_group_pane(pane, e),
                 Some((_, PaneKind::Archive)) => self.fill_archive_pane(pane),
                 _ => {}
             }
@@ -164,19 +162,11 @@ impl App {
         o.try_cloned::<&model::Cwd>().or_else(|| o.parent().and_then(|p| p.try_cloned::<&model::Cwd>())).map(|c| tilde(c.s.as_str())).unwrap_or_default()
     }
 
-    /// The run pane's summary (its command; its id, state and directory) and its run's stages, `e`'s lit.
+    /// The run pane's stages (its run's, `e`'s lit); the title bar carries its id, command, state and directory.
     fn fill_run_pane(&self, pane: u64, e: u64) {
         let w = self.world.world_ref();
         let o = w.entity_from_id(e);
         let Some(info) = View::of(w.entity_from_id(pane)).part("info") else { return };
-        let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-        if let Some(p) = info.part("cmd") {
-            p.text(&format!("$ {}", clip_text(&name.split_whitespace().collect::<Vec<_>>().join(" "), 600)));
-        }
-        if let Some(p) = info.part("meta") {
-            let parts = [self.run_id(e), self.run_state(e), self.run_cwd(e)];
-            p.text(&parts.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  \u{00B7}  "));
-        }
         let run = if o.has(model::Run::id()) { Some(o) } else { o.parent() };
         let mut stages: Vec<(u32, u64)> = Vec::new();
         if let Some(r) = run {
@@ -196,38 +186,6 @@ impl App {
                 row.action(&format!("select:{c}"));
                 set_if(row, if c == e { chosen } else { clear });
                 self.fill_pane_row(row, c);
-            });
-        }
-    }
-
-    /// The group pane's name and count, and its runs, newest first.
-    fn fill_group_pane(&self, pane: u64, g: u64) {
-        let w = self.world.world_ref();
-        let pv = View::of(w.entity_from_id(pane));
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        w.entity_from_id(g).each_child(|c| {
-            if c.has(model::Run::id()) {
-                runs.push((c.try_cloned::<&model::Created>().map_or(0, |c| c.ms), *c.id()));
-            }
-        });
-        runs.sort_unstable_by(|a, b| b.cmp(a));
-        if let Some(info) = pv.part("info") {
-            if let Some(p) = info.part("name") {
-                p.text(&w.entity_from_id(g).try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default());
-            }
-            if let Some(p) = info.part("meta") {
-                p.text(&format!("{} run{}", runs.len(), if runs.len() == 1 { "" } else { "s" }));
-            }
-        }
-        let clear = tone(w, "clear");
-        if let Some(list) = pv.part("runs") {
-            for_each(list, "hn.PaneRow", runs.into_iter().take(200).map(|(_, r)| (format!("r{r}"), r)), |row, r, new| {
-                if new {
-                    row.set(HoverAmt::default());
-                }
-                row.action(&format!("select:{r}"));
-                set_if(row, clear);
-                self.fill_pane_row(row, r);
             });
         }
     }

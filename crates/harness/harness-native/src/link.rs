@@ -377,6 +377,22 @@ impl Link {
         });
     }
 
+    /// Runs from all of history whose command or id holds `q` (the palette's search; the daemon filters, newest first,
+    /// up to [`PAGE`]): they come as `Msg::RunsFound`.
+    pub fn runs_search(&self, q: &str) {
+        let (tx, wake, q) = (self.tx.clone(), self.wake.clone(), q.to_owned());
+        std::thread::spawn(move || {
+            match request(&json!({"op": "runs", "limit": PAGE, "q": q})) {
+                Ok(v) if v.get("error").is_none() => {
+                    let _ = tx.send(Msg::RunsFound(v["runs"].as_array().cloned().unwrap_or_default()));
+                    wake();
+                }
+                Ok(v) => eprintln!("harness-native: runs matching {q:?}: {v}"),
+                Err(e) => eprintln!("harness-native: runs matching {q:?}: {e}"),
+            }
+        });
+    }
+
     /// Kill shell run `r{n}` (its process group).
     pub fn kill_run(&self, n: u64) {
         let poke = self.poke.clone();
