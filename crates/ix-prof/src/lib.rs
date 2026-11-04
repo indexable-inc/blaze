@@ -40,7 +40,9 @@ pub mod core;
 pub mod endpoint;
 #[cfg(all(feature = "http", unix))]
 pub mod http;
+pub mod images;
 pub mod ixprof;
+pub mod jit;
 pub mod json;
 #[cfg(feature = "layer")]
 pub mod layer;

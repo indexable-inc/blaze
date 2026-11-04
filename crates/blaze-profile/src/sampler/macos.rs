@@ -1,7 +1,8 @@
 //! The macOS sampler (arm64): each tick, every thread that holds a ring is stopped, its
 //! registers read and its frame pointers walked inside its own stack, and let go. A thread
-//! that is not running is sampled too, marked off the CPU: what it blocks in, and whether a
-//! wait span says so, is what the raw-block gate reads.
+//! that is not running is sampled too when it is inside a span, marked off the CPU: what it
+//! blocks in, and whether a wait span says so, is what the raw-block gate reads. A blocked
+//! thread outside every span is not, as on Linux (`linux.rs`), where sampling it would wake it.
 
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use parking_lot::{Mutex, MutexGuard};
 use super::{DEPTH, Sample, Unsampled, keep};
 
 pub(super) const HOW: &str =
-    "each thread that records spans, running or blocked, stopped (thread_suspend) and its frame pointers walked";
+    "each thread that records spans, running or blocked inside a span, stopped (thread_suspend) and its frame pointers walked";
 
 /// How often the samples taken are kept.
 const KEEP_EVERY: Duration = Duration::from_millis(100);
@@ -146,6 +147,11 @@ fn running(thread: &Thread) -> bool {
 /// while it is stopped, since it may hold the allocator's or any other.
 fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
     let on_cpu = running(thread);
+    if !on_cpu && ring.innermost() == 0 {
+        // Blocked outside every span: no span to blame its wait on, and Linux cannot sample
+        // it without waking it, so neither system does.
+        return None;
+    }
     let at = Instant::now();
     let mut sample = Sample { at, tid: thread.tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu };
     // SAFETY: the port of a live thread that is not this one (the sampler holds no ring).

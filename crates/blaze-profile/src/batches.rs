@@ -9,7 +9,7 @@ use std::{
 };
 
 use arrow_array::{
-    builder::{ListBuilder, StringDictionaryBuilder},
+    builder::{ListBuilder, StringDictionaryBuilder, UInt64Builder},
     Array, ArrayRef, DictionaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array,
     UInt32Array, UInt64Array, types::UInt32Type,
 };
@@ -237,29 +237,45 @@ pub fn open(threads: &[ThreadNow], at_ns: i64, process: Process<'_>) -> Result<R
     RecordBatch::try_new(schema_of(&schema::OPEN), columns)
 }
 
-/// The `samples` rows of `samples`, each frame named by `names` (which has every address in
-/// them), all from `process`. `at` is one reading of both clocks: an `Instant` and the schema's
-/// nanoseconds then ([`crate::clock::mono_ns`]).
+/// The `samples` rows of `samples`, each frame named by `frames` (the frames of every address
+/// in them, by the address each is looked up at: [`crate::symbols::frames`]), all from
+/// `process`. `at` is one reading of both clocks: an `Instant` and the schema's nanoseconds then
+/// ([`crate::clock::mono_ns`]).
 pub(crate) fn samples(
     samples: &[Sample],
-    names: &HashMap<u64, String, Global>,
+    frames: &HashMap<u64, Vec<String>, Global>,
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<RecordBatch, ArrowError> {
     let rows = samples.len();
     let schema = schema_of(&schema::SAMPLES);
-    let stack = schema::SAMPLES.column("stack").unwrap_or_else(|| unreachable!("samples has a stack"));
-    let DataType::List(frame) = schema.field(stack).data_type() else {
-        unreachable!("a stack is a list (arrow.rs)")
+    let list_field = |name: &str| {
+        let at = schema::SAMPLES.column(name).unwrap_or_else(|| unreachable!("samples has {name}"));
+        let DataType::List(item) = schema.field(at).data_type() else {
+            unreachable!("{name} is a list (arrow.rs)")
+        };
+        // clone: an `Arc` of the schema's field, once a batch
+        item.clone()
     };
-    // clone: an `Arc` of the schema's field, once a batch
-    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(frame.clone());
+    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(list_field("stack"));
+    let mut pcs = ListBuilder::new(UInt64Builder::new()).with_field(list_field("stack_pcs"));
     for sample in samples {
+        let stack = &sample.pcs[..usize::from(sample.depth)];
         // Outermost first; the sampler keeps the innermost first.
-        for pc in sample.pcs[..usize::from(sample.depth)].iter().rev() {
-            stacks.values().append_value(names.get(pc).map_or("?", String::as_str));
+        for (i, pc) in stack.iter().enumerate().rev() {
+            // Every address has its frames ([`crate::symbols::frames`]): `?` only for a caller
+            // that named fewer.
+            let named = frames.get(&crate::symbols::lookup(i, *pc)).map_or(&[][..], Vec::as_slice);
+            for name in named {
+                stacks.values().append_value(name);
+            }
+            if named.is_empty() {
+                stacks.values().append_value("?");
+            }
+            pcs.values().append_value(*pc);
         }
         stacks.append(true);
+        pcs.append(true);
     }
     let t_ns = |it: &Sample| at.1 - at.0.saturating_duration_since(it.at).as_nanos() as i64;
     // alloc: a batch's list of columns, once a read
@@ -271,8 +287,48 @@ pub(crate) fn samples(
         column(stacks.finish()),
         column(UInt64Array::from_iter(samples.iter().map(|it| (it.span != 0).then_some(it.span)))),
         dict(samples.iter().map(|it| if it.on_cpu { "on" } else { "off" })),
+        column(pcs.finish()),
     ];
     RecordBatch::try_new(schema, columns)
+}
+
+/// A code image a flush's `stack_pcs` addresses are in ([`crate::symbols::ImagesWritten`]).
+pub(crate) struct ImageRow {
+    pub(crate) path: String,
+    pub(crate) build_id: Option<String>,
+    /// The BLAKE3 of its file, hex, or why it was not hashed.
+    pub(crate) blake3: Result<String, String>,
+    pub(crate) base: u64,
+    pub(crate) size: u64,
+    pub(crate) slide: u64,
+    /// How its frames were named: dwarf, symbols, exports or none.
+    pub(crate) names: &'static str,
+}
+
+/// The `images` rows of `images`, all from `process` in the machine's boot `boot`, written at
+/// `seen_ns`.
+pub(crate) fn images(
+    images: &[ImageRow],
+    boot: Option<&str>,
+    seen_ns: i64,
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
+    let rows = images.len();
+    // alloc: a batch's list of columns, once a flush with new images
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt32Array::from_value(process.pid, rows)),
+        constant(boot, rows)?,
+        column(Int64Array::from_value(seen_ns, rows)),
+        column(StringArray::from_iter_values(images.iter().map(|it| it.path.as_str()))),
+        column(StringArray::from_iter(images.iter().map(|it| it.build_id.as_deref()))),
+        column(StringArray::from_iter(images.iter().map(|it| it.blake3.as_deref().ok()))),
+        column(StringArray::from_iter(images.iter().map(|it| it.blake3.as_ref().err().map(String::as_str)))),
+        column(UInt64Array::from_iter_values(images.iter().map(|it| it.base))),
+        column(UInt64Array::from_iter_values(images.iter().map(|it| it.size))),
+        column(UInt64Array::from_iter_values(images.iter().map(|it| it.slide))),
+        dict(images.iter().map(|it| it.names)),
+    ];
+    RecordBatch::try_new(schema_of(&schema::IMAGES), columns)
 }
 
 /// The `switches` rows of `switches`, all from `process`.
@@ -433,26 +489,49 @@ mod tests {
         assert!(plotted.as_primitive::<arrow_array::types::Float64Type>().values().contains(&4.0));
     }
 
+    /// A sample's row: its stack named outermost first, each address by the frames it is looked
+    /// up at (a return address at the call before it, an inlined function's frames together),
+    /// its raw addresses outermost first in `stack_pcs`, and the span and build it was taken in.
     #[test]
-    fn a_samples_stack_is_outermost_first_and_named() {
+    fn a_sample_row_carries_its_stack_addresses_span_and_build() {
         let now = Instant::now();
         let mut pcs = [0; crate::sampler::DEPTH];
-        pcs[..3].copy_from_slice(&[0x30, 0x20, 0x10]);
-        let sample = Sample { at: now, tid: 12, depth: 3, pcs, span: 0, build: 0, on_cpu: true };
-        let names: HashMap<u64, String, Global> = [(0x10, "main"), (0x20, "build"), (0x30, "typeck")]
-            .into_iter()
-            .map(|(pc, it)| (pc, it.to_owned()))
-            .collect();
+        // Innermost first: 0x10 is where the thread was, 0x21 and 0x31 return addresses.
+        pcs[..3].copy_from_slice(&[0x10, 0x21, 0x31]);
+        let sample = Sample { at: now, tid: 12, depth: 3, pcs, span: 41, build: 9, on_cpu: false };
+        let frames: HashMap<u64, Vec<String>, Global> =
+            [(0x10, &["typeck", "typeck::inlined"][..]), (0x20, &["build"][..]), (0x30, &["main"][..])]
+                .into_iter()
+                .map(|(pc, it)| (pc, it.iter().map(|it| (*it).to_owned()).collect()))
+                .collect();
         let process = Process { pid: 7, name: "blaze serve", commit: None };
-        let batch = samples(&[sample], &names, (now, 1_000), process).unwrap();
+        let batch = samples(&[sample], &frames, (now, 1_000), process).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        let stack = batch.column(schema::SAMPLES.column("stack").unwrap()).as_list::<i32>().value(0);
-        let frames = stack.as_dictionary::<UInt32Type>();
-        let values = frames.values().as_string::<i32>();
-        let named: Vec<&str> = frames.keys().values().iter().map(|it| values.value(*it as usize)).collect();
-        assert_eq!(named, ["main", "build", "typeck"]);
-        let t_ns = batch.column(schema::SAMPLES.column("t_ns").unwrap());
+        let column = |name: &str| batch.column(schema::SAMPLES.column(name).unwrap());
+        let stack = column("stack").as_list::<i32>().value(0);
+        let named = stack.as_dictionary::<UInt32Type>();
+        let values = named.values().as_string::<i32>();
+        let named: Vec<&str> = named.keys().values().iter().map(|it| values.value(*it as usize)).collect();
+        assert_eq!(named, ["main", "build", "typeck", "typeck::inlined"]);
+        let raw = column("stack_pcs").as_list::<i32>().value(0);
+        assert_eq!(raw.as_primitive::<arrow_array::types::UInt64Type>().values().as_ref(), [0x31, 0x21, 0x10]);
+        assert_eq!(column("span_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 41);
+        assert_eq!(column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 9);
+        let cpu = column("cpu").as_dictionary::<UInt32Type>();
+        assert_eq!(cpu.values().as_string::<i32>().value(cpu.keys().value(0) as usize), "off");
+        let t_ns = column("t_ns");
         assert_eq!(t_ns.as_primitive::<arrow_array::types::Int64Type>().value(0), 1_000);
+    }
+
+    /// A sample outside any span and build has those columns null, not 0.
+    #[test]
+    fn a_sample_outside_any_span_has_no_span_or_build() {
+        let now = Instant::now();
+        let sample = Sample { at: now, tid: 1, depth: 0, pcs: [0; crate::sampler::DEPTH], span: 0, build: 0, on_cpu: true };
+        let process = Process { pid: 7, name: "blaze serve", commit: None };
+        let batch = samples(&[sample], &HashMap::new_in(Global), (now, 1_000), process).unwrap();
+        assert!(batch.column(schema::SAMPLES.column("span_id").unwrap()).is_null(0));
+        assert!(batch.column(schema::SAMPLES.column("build_id").unwrap()).is_null(0));
     }
 
     #[test]

@@ -412,7 +412,7 @@ FROM uncovered
 ORDER BY uncovered_pct DESC
 
 -- name: raw_blocks
--- says: samples of a build's pool workers blocked in the kernel (a mutex, a condition, kevent, a read) with no open wait span saying on what: each is a block that bypasses blaze_graph::wait, and the gate fails on any
+-- says: samples of a build's pool workers blocked (off the CPU: a mutex, a condition, a poll, a read) with no open wait span saying on what: each is a block that bypasses blaze_graph::wait, and the gate fails on any
 WITH RECURSIVE bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -427,7 +427,7 @@ WITH RECURSIVE bounds AS (
     JOIN workers USING (process, thread)
     CROSS JOIN bounds
     WHERE samples.t_ns BETWEEN t0 AND t1
-        AND regexp_matches(array_to_string(samples.stack, ' > '), '(psynch_mutexwait|psynch_cvwait|kevent|__semwait_signal|(^| > )(read|__read_nocancel)\+)')
+        AND samples.cpu = 'off'
 ), up AS (
     SELECT blocked.process, blocked.span_id AS sampled, spans.span_id, spans.parent, spans.name
     FROM blocked JOIN spans ON spans.process = blocked.process AND spans.span_id = blocked.span_id

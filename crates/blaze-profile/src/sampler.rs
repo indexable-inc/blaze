@@ -1,17 +1,22 @@
 //! Periodic CPU sampling, for a profiler that runs in production: [`start`]ed once by the
-//! daemon, it takes [`HZ`] samples a second of CPU time of each of the process's threads, each a
-//! stack of return addresses kept in a fixed ring ([`KEPT`] samples), and names them only when
-//! a dump is written ([`crate::symbols`]).
+//! daemon, it takes [`HZ`] samples a second of each thread that records spans, while it runs
+//! and while it blocks inside a span, each a stack of addresses with the span and build it was
+//! taken in, kept in a fixed ring ([`KEPT`] samples), and names them only when a dump or flush
+//! is written ([`crate::symbols`]).
 //!
-//! - Linux: `perf_event_open`, the task clock of each thread (so an idle thread costs nothing),
-//!   user-space call chains the kernel walks by frame pointer, read from each event's mapped
-//!   buffer by the sampler's thread every 100 ms. Where the kernel refuses
-//!   (`kernel.perf_event_paranoid` above 2 for a user without `CAP_PERFMON`), [`start`] says so.
+//! Both systems sample the same threads with the same meaning of `on_cpu`: a thread that holds
+//! a ring, running or runnable (on), or blocked inside a span (off); a blocked thread outside
+//! every span is not sampled. Each walks frame pointers (blaze keeps them on both).
+//!
+//! - Linux: each tick the sampler's thread signals each such thread with a realtime signal
+//!   (`tgkill`), and the thread's handler walks its own stack on its alternate signal stack and
+//!   writes the sample into its ring's slot, which the sampler collects on its next tick
+//!   (`linux.rs` says why a signal and not `perf_event_open`). Where the signal cannot be set
+//!   up, [`start`] says why.
 //! - macOS (aarch64): no kernel sampler is open to a process for itself, but a thread of the
-//!   process may stop another: each tick the sampler stops each running thread that recorded a
-//!   span (`thread_suspend`), reads its registers, walks its frame pointers inside its own stack
-//!   (frame pointers are always kept on arm64 macOS), and lets it go. Nothing is allocated and
-//!   no lock taken while a thread is stopped.
+//!   process may stop another: each tick the sampler stops each such thread
+//!   (`thread_suspend`), reads its registers, walks its frame pointers inside its own stack,
+//!   and lets it go. Nothing is allocated and no lock taken while a thread is stopped.
 //! - Elsewhere [`start`] says there is no sampler.
 
 use std::{sync::atomic::AtomicBool, time::Instant};
@@ -31,7 +36,8 @@ use macos as platform;
 
 /// Samples a second of a thread's CPU time: prime, so it beats with no periodic work.
 pub const HZ: u32 = 49;
-/// Return addresses a sample keeps, the innermost first.
+/// Addresses a sample keeps, the innermost first: where the thread was, then each return
+/// address up its stack.
 pub(crate) const DEPTH: usize = 48;
 /// Samples kept: about 400 bytes each, 3.3 MB.
 const KEPT: usize = 8192;
@@ -46,8 +52,8 @@ pub(crate) struct Sample {
     /// build (0: none).
     pub(crate) span: u64,
     pub(crate) build: u32,
-    /// Whether it was on a CPU: a blocked thread is sampled too where the sampler can stop it
-    /// (macOS), so a block no wait span says shows in its stack.
+    /// Whether it was running or runnable (on) or blocked (off) as it was sampled: a thread
+    /// blocked inside a span is sampled too, so a block no wait span says shows in its stack.
     pub(crate) on_cpu: bool,
 }
 
@@ -193,16 +199,19 @@ fn run(_hz: u32) -> Result<&'static str, Unsampled> {
     )))
 }
 
-/// What a thread's ring holds for the sampler: on macOS its port and stack, under the lock the
-/// thread takes to leave, so no thread is stopped once it is gone.
+/// What a thread's ring holds for the sampler, under the lock the thread takes to leave, so no
+/// thread is stopped or signalled once it is gone: on macOS its port and stack, on Linux its
+/// slot and alternate signal stack.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use macos::Thread;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::Thread;
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 #[derive(Default)]
 pub(crate) struct Thread;
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
 impl Thread {
     pub(crate) fn enter(&mut self, _tid: u64) {}
     pub(crate) fn leave(&mut self) {}
@@ -232,31 +241,40 @@ pub(crate) fn os_tid() -> u64 {
     }
 }
 
+/// What the platform's sampler counted that a dump says beside its state; empty for none.
+fn said() -> String {
+    #[cfg(target_os = "linux")]
+    return linux::said();
+    #[cfg(not(target_os = "linux"))]
+    String::new()
+}
+
 /// The samples taken since `since`, named, and what the sampler is.
 pub(crate) fn taken(since: Instant, epoch: &Epoch) -> (Vec<Sampled>, String) {
     let samples = SAMPLES.lock();
     let state = match samples.state.is_empty() {
         // alloc: a dump, on demand
         true => "off: not started in this process (`blaze serve` starts it)".to_owned(),
-        // clone: a dump, on demand
-        false => samples.state.clone(),
+        // alloc: a dump, on demand
+        false => format!("{}{}", samples.state, said()),
     };
     // alloc: a dump's copy of the samples, on demand
     let kept: Vec<Sample> = samples.ring.iter().filter(|it| it.at >= since).copied().collect();
     drop(samples);
-    let pcs: Vec<u64> =
-        // alloc: a dump, on demand
-        kept.iter().flat_map(|it| it.pcs[..usize::from(it.depth)].iter().copied()).collect();
-    let names = crate::symbols::names(&pcs);
+    let frames = crate::symbols::frames(kept.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
     let mut sampled: Vec<Sampled> = kept
         .iter()
         .map(|it| Sampled {
             tid: it.tid,
             at_us: epoch.us(it.at),
+            // Innermost first, as dumps read it: each address's frames (outermost first)
+            // reversed, so an inlined function comes before the one it was inlined into.
             stack: it.pcs[..usize::from(it.depth)]
                 .iter()
-                // alloc: a dump, on demand
-                .map(|pc| names.get(pc).cloned().unwrap_or_else(|| format!("{pc:#x}")))
+                .enumerate()
+                .flat_map(|(i, pc)| {
+                    frames.get(&crate::symbols::lookup(i, *pc)).into_iter().flat_map(|it| it.iter().rev()).cloned()
+                })
                 // alloc: a dump, on demand
                 .collect(),
         })
@@ -289,7 +307,8 @@ mod tests {
     #[test]
     fn a_busy_thread_is_sampled_and_named() {
         if let Err(why) = start(HZ * 20) {
-            // The kernel refuses perf events to this user: the error says so, and so do dumps.
+            // The system refused the sampler (Linux: a seccomp filter refusing
+            // `process_vm_readv`, or the signal taken): the error says so, and so do dumps.
             assert!(!why.0.is_empty());
             return;
         }
@@ -305,7 +324,7 @@ mod tests {
         std::thread::Builder::new()
             .name("spinner".to_owned())
             .spawn(|| {
-                // The macOS sampler stops threads that recorded a span.
+                // Both samplers sample threads that recorded a span (hold a ring).
                 drop(tracing::info_span!(target: "blaze", "spinning").entered());
                 crate::flight::plot(crate::flight::Plot::Queued, 1);
                 spins_for_the_sampler(Instant::now() + std::time::Duration::from_millis(1500))

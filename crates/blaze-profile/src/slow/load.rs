@@ -4,7 +4,10 @@
 
 use arrow_array::RecordBatch;
 
-use super::{BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, QueryCount, Recorder, Report, SpanKind, ThreadName, analyse};
+use super::{
+    BuildFacts, Died, DiedSpan, DiedThread, Facts, Memory, MissGroup, QueryCount, Recorder, Report, STACKS, SpanKind, SpanStack, ThreadName,
+    analyse,
+};
 use crate::time::{
     Model, TimeError,
     load::{Source, get, ints, query, query_many, texts, uints},
@@ -85,14 +88,25 @@ pub fn facts(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, proces
     // One DuckDB for them all: the views are made once ([`crate::sql::run_all`]).
     let windowed = window.map(|(t0, t1)| (memory_sql(build, t0, t1, &of), recorder_sql(build, t0, t1, &of)));
     // alloc: the queries, once a report
-    let mut sqls = vec![build_row_sql(build), threads_sql(&spans), span_kinds_sql(&spans, &folded), misses_sql(build), query_counts_sql(build)];
+    let mut sqls = vec![
+        build_row_sql(build),
+        threads_sql(&spans),
+        span_kinds_sql(&spans, &folded),
+        misses_sql(build),
+        query_counts_sql(build),
+        span_stacks_sql(build, window, &of, &spans),
+    ];
     if let Some((memory, recorder)) = &windowed {
         // clone: a query, once a report
         sqls.extend([memory.clone(), recorder.clone()]);
     }
     // alloc: the queries' text, once a report
     let asked: Vec<&str> = sqls.iter().map(String::as_str).collect();
-    let answers = query_many(source, &asked, "reading the build's row, threads, spans by name, misses, query counts, memory and recorder")?;
+    let answers = query_many(
+        source,
+        &asked,
+        "reading the build's row, threads, spans by name, misses, query counts, sampled stacks by span, memory and recorder",
+    )?;
     let answer = |i: usize| answers.get(i).map(Vec::as_slice).unwrap_or_default();
     Ok(Facts {
         build: build_row(answer(0), build)?,
@@ -100,10 +114,66 @@ pub fn facts(source: &Source<'_>, build: u64, window: Option<(i64, i64)>, proces
         span_kinds: span_kinds(answer(2))?,
         misses: misses(answer(3))?,
         query_counts: query_counts(answer(4))?,
-        memory: if windowed.is_some() { memory(answer(5))? } else { Memory::default() },
-        recorder: if windowed.is_some() { recorder(answer(6))? } else { Recorder::default() },
+        span_stacks: span_stacks(answer(5))?,
+        memory: if windowed.is_some() { memory(answer(6))? } else { Memory::default() },
+        recorder: if windowed.is_some() { recorder(answer(7))? } else { Recorder::default() },
         spans: crate::time::SpanCut::default(),
     })
+}
+
+/// The [`STACKS`] commonest stacks, on and off the CPU, of the samples inside the build's
+/// spans of each name: a sample counts for every name among its span and that span's
+/// ancestors, once a name. Samples are the build's, or in its window from its process; their
+/// frames come back joined by newlines, which no frame's name holds.
+fn span_stacks_sql(build: u64, window: Option<(i64, i64)>, of: &str, spans: &str) -> String {
+    let which = match window {
+        // alloc: a condition, once a report
+        Some((t0, t1)) => format!("(build_id = {build} OR (build_id IS NULL AND t_ns >= {t0} AND t_ns < {t1}{of}))"),
+        // alloc: a condition, once a report
+        None => format!("build_id = {build}"),
+    };
+    // alloc: a query, once a report
+    format!(
+        "WITH RECURSIVE sampled AS (\
+           SELECT row_number() OVER () AS sample, process, span_id, \
+             CAST(CASE WHEN cpu = 'off' THEN 0 ELSE 1 END AS BIGINT) AS on_cpu, \
+             array_to_string(stack, chr(10)) AS frames \
+           FROM samples WHERE span_id IS NOT NULL AND {which}\
+         ), up AS (\
+           SELECT sampled.sample, s.process, s.span_id, s.parent, CAST(s.name AS VARCHAR) AS name \
+           FROM sampled JOIN {spans} AS s ON s.process = sampled.process AND s.span_id = sampled.span_id \
+           UNION ALL \
+           SELECT up.sample, s.process, s.span_id, s.parent, CAST(s.name AS VARCHAR) \
+           FROM up JOIN {spans} AS s ON s.process = up.process AND s.span_id = up.parent\
+         ), named AS (SELECT DISTINCT sample, name FROM up) \
+         SELECT named.name AS name, sampled.on_cpu AS on_cpu, CAST(sampled.frames AS VARCHAR) AS frames, \
+           CAST(count(*) AS UBIGINT) AS samples \
+         FROM named JOIN sampled USING (sample) \
+         GROUP BY 1, 2, 3 \
+         QUALIFY row_number() OVER (PARTITION BY named.name, sampled.on_cpu ORDER BY count(*) DESC, sampled.frames) <= {STACKS} \
+         ORDER BY 1, 2 DESC, 4 DESC, 3"
+    )
+}
+
+/// What [`span_stacks_sql`]'s answer says, sorted as [`Facts::span_stacks`] promises.
+fn span_stacks(batches: &[RecordBatch]) -> Result<Vec<SpanStack>, TimeError> {
+    // alloc: once a report
+    let mut out = Vec::new();
+    for (batch, row) in rows(batches) {
+        const T: &str = "samples";
+        let (Some(name), Some(frames)) = (text(batch, T, "name", row)?, text(batch, T, "frames", row)?) else { continue };
+        out.push(SpanStack {
+            name,
+            on_cpu: int(batch, T, "on_cpu", row)? != Some(0),
+            // alloc: a stack's frames, once a stack a report
+            frames: frames.split('\n').map(str::to_owned).collect(),
+            samples: uint(batch, T, "samples", row)?.unwrap_or(0),
+        });
+    }
+    out.sort_by(|a, b| {
+        a.name.cmp(&b.name).then(b.on_cpu.cmp(&a.on_cpu)).then(b.samples.cmp(&a.samples)).then_with(|| a.frames.cmp(&b.frames))
+    });
+    Ok(out)
 }
 
 /// What the recorder dropped in `window`: each counter's last value by its end (and the flush

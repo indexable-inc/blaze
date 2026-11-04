@@ -21,6 +21,8 @@ pub fn data_type(ty: Type) -> DataType {
         Type::Dict => dict(),
         // alloc: a schema, made once a table per process
         Type::Stack => DataType::List(Arc::new(Field::new("frame", dict(), false))),
+        // alloc: a schema, made once a table per process
+        Type::Pcs => DataType::List(Arc::new(Field::new("pc", DataType::UInt64, false))),
     }
 }
 
