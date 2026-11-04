@@ -6,7 +6,7 @@
 //!
 //! Where each is called is part of its contract:
 //!
-//! - **On an IO thread of the plane**: [`Steps::fetch`], [`Steps::library`]. They may block on
+//! - **On an IO thread of the plane**: [`Steps::fetch`], [`Steps::library`], [`Steps::native`]. They may block on
 //!   the network or the disk; they touch no state of the loop.
 //! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
 //!   [`Front::ub_tests`], [`Front::evaluate`], [`Front::codegen_inputs`], [`Front::tables`],
@@ -140,6 +140,10 @@ pub struct JobInput {
     /// environment, held in memory for the job only and never logged or kept.
     pub config: Arc<BuildConfig>,
     pub units: Arc<Units>,
+    /// Each of `units.native` laid out ([`Steps::native`]), in its order: what a build script
+    /// of its packages is given. Empty until the job's native stage settles, and for a build
+    /// whose units name none.
+    pub native: Arc<[super::native::NativeDir]>,
     /// The store, read by tasks with no lock (a read is valid while its
     /// [`blaze_cas::enter`] guard is held); written only by the loop.
     pub store: blaze_cas::Reader,
@@ -517,6 +521,19 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// fingerprint, and where that library is mounted) has it there, read before by this
     /// daemon or one before it.
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError>;
+    /// On an IO thread, before a job's lowering when its units name any: each of
+    /// `units.native` fetched by its digest and laid out read-only, in its order
+    /// ([`super::native::ensure`]). One that can't be is the job's error, naming it; there is
+    /// no other place a build script is pointed at.
+    fn native(&self, units: &Units) -> Result<Vec<super::native::NativeDir>, ApiError> {
+        match units.native.first() {
+            None => Ok(Vec::new()),
+            Some(input) => Err(ApiError::new(
+                format!("pinned native input `{}`: these steps lay out none", input.name),
+                Some(input.pin.clone()), // clone: an error's place, once
+            )),
+        }
+    }
     /// On a worker, before a job's lowering builds anything: the leases of `units`' build dirs
     /// (`target_dir`, `build_dir`) for `checkout`, `builds` the dir of every workspace's build
     /// dir, each dir made and marked on disk as docs/gc.md says (the daemon's is

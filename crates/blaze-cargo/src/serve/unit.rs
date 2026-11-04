@@ -93,6 +93,10 @@ pub struct Real {
     /// blaze's sources directory ([`blaze_manifest::home::sources`]), the one place a fetched
     /// package is written on disk ([`crate::serve::fetch::keep_on_disk`]).
     sources: PathBuf,
+    /// Where the pinned native inputs are laid out, `<BLAZE_HOME>/native`
+    /// ([`crate::serve::native`]); none when the daemon has no home (neither `BLAZE_HOME` nor
+    /// the user's home is set), which only a build that names an input is refused for.
+    native: Option<PathBuf>,
 }
 
 /// What every job's front shares: the daemon's paths, what was read of the machine's files,
@@ -134,7 +138,8 @@ impl Real {
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
         };
-        Ok(Real { fetcher, shared: Arc::new(shared), sources })
+        let native = crate::toolchain::home().map(|it| it.join(crate::serve::native::NATIVE));
+        Ok(Real { fetcher, shared: Arc::new(shared), sources, native })
     }
 }
 
@@ -171,6 +176,25 @@ impl Steps for Real {
         let source = self.fetcher.fetch(fetch)?;
         crate::serve::fetch::keep_on_disk(fetch, &source, &self.sources)?;
         Ok(source)
+    }
+
+    fn native(&self, units: &blaze_units::query::Units) -> Result<Vec<crate::serve::native::NativeDir>, ApiError> {
+        if units.native.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(native) = &self.native else {
+            let input = &units.native[0];
+            return Err(ApiError::new(
+                format!(
+                    "pinned native input `{}` is laid out under blaze's home, and the daemon has none: \
+                     set BLAZE_HOME (or HOME) where it starts",
+                    input.name
+                ),
+                Some(input.pin.clone()), // clone: an error's place, once
+            ));
+        };
+        let fetcher = self.fetcher.pinned();
+        units.native.iter().map(|input| crate::serve::native::ensure(input, native, &fetcher)).collect()
     }
 
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {

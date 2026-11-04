@@ -463,7 +463,8 @@ pub struct NativeInput {
     pub target: String,
     /// The variable the scripts read the unpacked directory from.
     pub env: String,
-    /// The packages, by name, whose build scripts are given it; sorted.
+    /// The packages whose build scripts are given it, sorted: each a name, or `name/feature`
+    /// for that package's script only when the run has the feature on.
     pub packages: Vec<String>,
     /// Where the archive is downloaded from: `https://`.
     pub url: String,
@@ -474,10 +475,20 @@ pub struct NativeInput {
 }
 
 impl NativeInput {
-    /// Whether the build script of the package named `package` is given this input.
-    pub fn gives(&self, package: &str) -> bool {
-        self.packages.binary_search_by(|it| it.as_str().cmp(package)).is_ok()
+    /// Whether the build script of the package named `package`, run with `features` on, is
+    /// given this input.
+    pub fn gives(&self, package: &str, features: &[String]) -> bool {
+        names_script(&self.packages, package, features)
     }
+}
+
+/// Whether `packages`, as [`NativeInput::packages`] lists them (`name` or `name/feature`), name
+/// the build script of `package` run with `features` on.
+pub fn names_script(packages: &[String], package: &str, features: &[String]) -> bool {
+    packages.iter().any(|it| match it.split_once('/') {
+        Some((name, feature)) => name == package && features.iter().any(|on| on == feature),
+        None => it == package,
+    })
 }
 
 impl Units {

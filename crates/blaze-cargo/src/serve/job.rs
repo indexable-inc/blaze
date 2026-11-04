@@ -135,6 +135,8 @@ pub enum Value<S: Steps> {
     /// The fetch at its place in its batch ([`Fetching::fetches`]).
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
+    /// The job's pinned native inputs laid out ([`Steps::native`]).
+    Native(Result<Vec<super::native::NativeDir>, ApiError>),
     Lowered(Result<FrontEnd<S>, ApiError>),
     /// A unit's compile, and the images it relinked, given back to the loop: by its last
     /// phase, or by the one that failed.
@@ -299,6 +301,8 @@ pub(super) enum Does<S: Steps> {
     Plan { steps: Arc<S>, db: Arc<Database>, queries: ViewId },
     /// Task `at` fetches `fetches[at]`.
     Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
+    /// The units' pinned native inputs laid out, before the lowering ([`Steps::native`]).
+    Native { steps: Arc<S>, units: Arc<Units> },
     /// The head's last front end, taken by the run that lowers into it.
     /// Its build dirs leased first ([`Steps::lease`]) into `leases`, against `checkout`,
     /// `builds` the dir of every workspace's build dir.
@@ -359,6 +363,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Library { .. } => tracing::info_span!("std library"),
             Does::Plan { .. } => tracing::info_span!("plan"),
             Does::Fetch { .. } => tracing::info_span!("fetch"),
+            Does::Native { units, .. } => tracing::info_span!(target: "blaze", "pinned native inputs", inputs = units.native.len()),
             Does::Lower { .. } => tracing::info_span!("lower workspace"),
             // Its phases have spans of their own (`unit::compile::compile`).
             Does::Compile { .. } => tracing::Span::none(),
@@ -384,6 +389,7 @@ impl<S: Steps> plane::Work for Step<S> {
                 // clone: a refcount per fetch
                 self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
             }
+            Does::Native { steps, units } => self.settle(steps.native(units).map_err(Failed::Error), Value::Native),
             Does::Lower { steps, input, kept, leases, checkout, builds } => {
                 // Its build dirs' leases, before anything is built into them: here, on the pool.
                 // The lock is held only to read and store the field, never across the lease's
@@ -1229,6 +1235,8 @@ enum Stage<S: Steps> {
     Library(NodeId),
     Plan(NodeId, Prep),
     Fetch(Fetching),
+    /// The view's pinned native inputs being laid out, the lowering to post once they are.
+    Native(NodeId, Box<NativeWait>),
     /// The view's units being lowered, and the checkout it is of.
     Lower(NodeId, JobInput, Option<u32>),
     Units(Box<Build<S>>),
@@ -1240,6 +1248,15 @@ enum Stage<S: Steps> {
     /// Waits for the VFS's commit of the heads and the store's last put before this.
     Snapshot { ticket: Option<Ticket>, heads: Vec<(String, ContentId)>, store: blaze_cas::Tickets },
     Over,
+}
+
+/// A view's lowering, held while its pinned native inputs are laid out ([`Stage::Native`]):
+/// what [`Jobs::lower_or_wait`] takes.
+struct NativeWait {
+    input: JobInput,
+    root: Option<u32>,
+    name: String,
+    checkout: String,
 }
 
 /// What the plan needs fetched: fetch `at` is node `first + at`.
@@ -1684,6 +1701,7 @@ impl<S: Steps> std::fmt::Display for WaitedOn<'_, S> {
                     fetching.fetches.len(),
                     fetching.first.0
                 )?,
+                Stage::Native(node, _) => write!(f, "waits for its pinned native inputs, node {}", node.0)?,
                 Stage::Lower(node, _, _) => write!(f, "waits for its lowering, node {}", node.0)?,
                 Stage::Units(build) => write!(f, "builds {} units, nodes from {}", build.units.len(), build.first.0)?,
                 Stage::Answer(node) => write!(f, "waits for its answer, node {}", node.0)?,
@@ -3054,6 +3072,16 @@ impl<S: Steps> Jobs<S> {
                 job.queries.retain(|it| *it != prep.queries);
                 self.open(w, id, prep.opened, prep.asked);
             }
+            Stage::Native(at, wait) if at == node => match job.take_value(node) {
+                Some(Value::Native(Ok(dirs))) => {
+                    let NativeWait { mut input, root, name, checkout } = *wait;
+                    input.native = dirs.into();
+                    self.lower_or_wait(w, id, input, root, name, checkout);
+                }
+                Some(Value::Native(Err(error))) => self.end(w, id, false, Some(error)),
+                // alloc: an error, once
+                _ => self.end(w, id, false, Some(ApiError::new(format!("laying out the pinned native inputs: {why}"), None))),
+            },
             Stage::Lower(at, input, root) if at == node => match job.take_value(node) {
                 Some(Value::Lowered(Ok(FrontEnd { front, writer, puts, mut misses }))) => {
                     job.misses.append(&mut misses);
@@ -3248,6 +3276,7 @@ impl<S: Steps> Jobs<S> {
             files: w.vfs.reader(),
             config: prep.config,
             units,
+            native: Arc::from([]),
             store: w.store.reader(),
             std: w.std.reader(),
             macros: Arc::clone(w.macros), // clone: a refcount, once per view
@@ -3267,8 +3296,26 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let name = named("lowering ", &prep.root_dir);
+        // A build script given a pinned native input runs with it laid out: each is fetched
+        // and unpacked first, on an IO thread, and the lowering posted once they are.
+        if !input.units.native.is_empty() {
+            let units = Arc::clone(&input.units); // clone: a refcount, once per view
+            let work = Step::of(&job.cancelled, Does::Native { steps: Arc::clone(w.steps), units });
+            let what = named("pinned native inputs of ", &checkout);
+            let fresh = lone(w.plane, NodeKind::Fetch, &what, Pool::Io, None, kinds::FETCH);
+            job.stage = Stage::Native(fresh.first(), Box::new(NativeWait { input, root: prep.root, name, checkout }));
+            self.add(w, id, fresh, Some(work), false);
+            return;
+        }
+        self.lower_or_wait(w, id, input, prep.root, name, checkout);
+    }
+
+    /// A job's view lowered ([`Jobs::lower`]), or once the kept front end of its root is
+    /// stored, when that is being stored now.
+    fn lower_or_wait(&mut self, w: &mut World<'_, S>, id: JobId, input: JobInput, root: Option<u32>, name: String, checkout: String) {
+        let Some(job) = self.jobs.get(key_of(id)) else { return };
         let job_idle = job.idle;
-        match prep.root {
+        match root {
             // The root's front end is being stored: the lowering waits for it rather than
             // lowering anew beside it.
             Some(root) if self.roots.storing[root as usize] > 0 => {
@@ -5313,6 +5360,7 @@ fn stage_name<S: Steps>(stage: &Stage<S>) -> &'static str {
         Stage::Library(_) => "reading the standard library",
         Stage::Plan(..) => "planning",
         Stage::Fetch(_) => "fetching",
+        Stage::Native(..) => "laying out its pinned native inputs",
         Stage::Lower(..) => "lowering its units",
         Stage::Units(_) => "building its units",
         Stage::Answer(_) => "answering",

@@ -157,6 +157,7 @@ fn of<'a>(units: &'a Units, scripts: &'a [OnceLock<script::Applied>], tools: &'a
         launcher: std::path::Path::new("/opt/blaze/bin/blaze"),
         program: PathBuf::from("/w/target/debug/build/x/build-script-build"),
         scripts,
+        native: &[],
     }
 }
 
@@ -283,6 +284,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     let place = blaze_usercode::script::Place {
         code: ContentId::of("blaze v2 test 1", b"script"),
         read: vec!["/w".into()],
+        pinned: Vec::new(),
         network: false,
         memory: None,
         mode: blaze_usercode::run::Mode::Normal,

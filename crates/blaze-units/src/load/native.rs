@@ -7,8 +7,12 @@
 //! [workspace.metadata.blaze.native.llvm]
 //! pin = "crates/hir-ty-codegen/llvm.json"
 //! env = "LLVM_SYS_231_PREFIX"
-//! packages = ["llvm-sys", "blaze-stencil"]
+//! packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 //! ```
+//!
+//! A package named `name/feature` is given the input only when its build script runs with
+//! that feature on, as cargo names a feature of a dependency: a build without it (blaze's seed,
+//! for wasm, which has no LLVM) asks for no archive.
 //!
 //! The pin file is the one home of the pin: a JSON object with `release` (the `https://` URL
 //! the archives are under) and `targets`, each target triple's `{ "name", "sha256" }`; any other
@@ -50,11 +54,12 @@ const RESERVED: &[&str] = &[
 /// Prefixes no input's variable may start with, for the same reasons as [`RESERVED`].
 const RESERVED_PREFIXES: &[&str] = &["CARGO_", "DEP_", "RUSTC", "BLAZE_", "__BLAZE", "DYLD_"];
 
-/// One build script run of the graph: its package's name and the platform it is built for
-/// (none for the host).
+/// One build script run of the graph: its package's name, the platform it is built for (none
+/// for the host) and its features.
 pub(crate) struct ScriptRun<'a> {
     pub package: &'a str,
     pub platform: Option<&'a str>,
+    pub features: &'a [String],
 }
 
 /// One input as the manifest declares it.
@@ -106,8 +111,14 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
                     let list = value.as_array().ok_or_else(|| wrong("`packages` is a list of package names"))?;
                     let mut names = list
                         .iter()
-                        // alloc: a package's name, once per name the input lists
-                        .map(|it| it.as_str().map(str::to_owned).ok_or_else(|| wrong("`packages` lists names, as strings")))
+                        .map(|it| {
+                            let name = it.as_str().ok_or_else(|| wrong("`packages` lists names, as strings"))?;
+                            let (package, feature) = name.split_once('/').unwrap_or((name, "x"));
+                            if package.is_empty() || feature.is_empty() || feature.contains('/') {
+                                return Err(wrong(&format!("`packages` lists `{name}`, which is no `name` or `name/feature`")));
+                            }
+                            Ok(name.to_owned()) // alloc: a package's name, once per name the input lists
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     names.sort_unstable();
                     names.dedup();
@@ -126,9 +137,11 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     // Two inputs in one variable of one script: which one it reads would be whichever was set last.
+    let package = |it: &String| it.split_once('/').map_or(it.as_str(), |(name, _)| name).to_owned();
     for (i, a) in out.iter().enumerate() {
         for b in &out[i + 1..] {
-            if a.env == b.env && let Some(shared) = a.packages.iter().find(|it| b.packages.contains(it)) {
+            let theirs: Vec<String> = b.packages.iter().map(package).collect(); // alloc: an error check, once a pair
+            if a.env == b.env && let Some(shared) = a.packages.iter().map(package).find(|it| theirs.contains(it)) {
                 return Err(wrong(
                     manifest,
                     &format!("inputs `{}` and `{}` both give `{shared}`'s build script `{}`", a.name, b.name, a.env),
@@ -175,7 +188,7 @@ pub(crate) fn needed<F: Files>(
         // alloc: each target some run of the input's packages is built for, once a load
         let mut targets: Vec<(&str, &str)> = runs
             .iter()
-            .filter(|run| input.packages.binary_search_by(|it| it.as_str().cmp(run.package)).is_ok())
+            .filter(|run| crate::query::names_script(&input.packages, run.package, run.features))
             .map(|run| (run.platform.unwrap_or(host), run.package))
             .collect();
         if targets.is_empty() {

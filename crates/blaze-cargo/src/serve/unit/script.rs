@@ -49,6 +49,7 @@ use super::{
     error::{UnitError, manifest_dir},
     package_of, say,
 };
+use crate::serve::native::NativeDir;
 use crate::serve::work::{RunPuts, Runs, Writer};
 
 /// The job's variable that asks an inert script compiled and run as well, and checked against
@@ -195,6 +196,7 @@ fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsStrin
         launcher: &job.shared.launcher,
         program: named_program(units, compile).map_err(|it| it.what)?,
         scripts: &job.scripts,
+        native: &job.input.native,
     };
     let unit = script_unit(&of, run)?;
     let env = inherited(&job.input.config.invocation.env, job.plan(run).map_err(|it| it.what)?);
@@ -214,6 +216,38 @@ pub(crate) struct Of<'a> {
     /// What each run told cargo, by its unit; a slot not set is a run not ended.
     #[expect(clippy::disallowed_types, reason = "the job's slots, one per unit, each set once by its run: per job, not global")]
     pub(crate) scripts: &'a [std::sync::OnceLock<Applied>],
+    /// The build's pinned native inputs, laid out ([`crate::serve::work::JobInput::native`]).
+    pub(crate) native: &'a [NativeDir],
+}
+
+/// The pinned native inputs of `native` the build script of `unit` (its package, the target
+/// it is built for, its features) is given ([`blaze_units::query::NativeInput::gives`]).
+pub(crate) fn given<'a>(native: &'a [NativeDir], unit: &'a bs::Unit) -> impl Iterator<Item = &'a NativeDir> + 'a {
+    native.iter().filter(move |it| it.input.target == unit.target && it.input.gives(&unit.package.name, &unit.features))
+}
+
+/// The variables of the pinned native inputs the build script of `package`, built for
+/// `target`, is given: each the directory its input is laid out in, set over whatever the job's
+/// environment says of it (`force`), so the script is pointed at the verified layout and never
+/// at a place the machine names. An input the load said the run is given that was not laid out
+/// is an error naming it: nothing else is put in its place.
+fn native_env(of: &Of<'_>, package: &str, target: &str, features: &[String]) -> Result<Vec<bs::ConfigEnv>, String> {
+    let mut out = Vec::new(); // alloc: a run's few variables, once a run
+    for input in of.units.native.iter().filter(|it| it.target == target && it.gives(package, features)) {
+        let laid = of.native.iter().find(|it| it.input == *input).ok_or_else(|| {
+            format!(
+                "pinned native input `{}` for target `{target}`, which `{package}`'s build script is given in `{}`, \
+                 was not laid out before the script ran",
+                input.name, input.env
+            )
+        })?;
+        let value = laid.dir.to_str().ok_or_else(|| {
+            format!("pinned native input `{}` is laid out at {}, which is not UTF-8", input.name, laid.dir.display())
+        })?;
+        // clone: the run's own variable, once an input a run
+        out.push(bs::ConfigEnv { name: input.env.clone(), value: value.to_owned(), force: true });
+    }
+    Ok(out)
 }
 
 fn var<'a>(plan: &'a UnitPlan, name: &str) -> Option<&'a str> {
@@ -241,6 +275,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         _ => format!("{} v{}", package.name, package.version),
     };
     let target = triple_of(unit, of.host).to_owned();
+    let config_env = native_env(of, &package.name, &target, &unit.features)?;
     let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
     let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
     let profile = &unit.profile;
@@ -327,7 +362,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         },
         workspace_member: package.is_member,
         dependencies,
-        config_env: Vec::new(),
+        config_env,
         dylib_search: bs::DylibSearch {
             host_deps: vec![profile_dir.join("deps")],
             host_root: Some(profile_dir),
@@ -618,6 +653,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         launcher: &job.shared.launcher,
         program: script_path,
         scripts: &job.scripts,
+        native: &job.input.native,
     };
     let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let env = inherited(&job.input.config.invocation.env, job.plan(run)?);
@@ -632,10 +668,19 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
+    // Each pinned native input it is given is read where it is laid out, and its digest is
+    // part of the run's key ([`Place::pinned`]).
+    let pinned: Vec<(String, String)> = given(&job.input.native, &unit)
+        .map(|it| {
+            read.push(it.dir.clone());
+            (it.input.env.clone(), format!("sha256:{}", it.input.sha256)) // clone: the run's own, once an input a run
+        })
+        .collect();
     read.dedup();
     let place = Place {
         code,
         read,
+        pinned,
         network: false,
         memory: None,
         mode: match rechecks(job)? {
@@ -646,6 +691,23 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let prepared = script::prepare(&unit, &env, &place)
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))?;
+    // The variable the script reads is the layout, whatever else set it (a check, not a
+    // fallback: `native_env` forces it).
+    for laid in given(&job.input.native, &unit) {
+        let set = prepared.spec.command.env.iter().find(|(name, _)| name.as_os_str() == laid.input.env.as_str());
+        if set.is_none_or(|(_, value)| Path::new(value) != laid.dir) {
+            return Err(ApiError::new(
+                format!(
+                    "the build script of `{}` is not started with `{}` set to {}, where pinned native input `{}` is laid out",
+                    unit.package.descr(),
+                    laid.input.env,
+                    laid.dir.display(),
+                    laid.input.name
+                ),
+                Some(laid.input.pin.clone()), // clone: an error's place, once
+            ));
+        }
+    }
     let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
     let how = match outside(job, run) {
         true => How::Outside(Command { sandbox: Sandbox::Off, ..prepared.spec.command }),
@@ -963,7 +1025,12 @@ impl ScriptRun {
         let link_dirs: Vec<PathBuf> = match start.how {
             How::Outside(_) => Vec::new(),
             _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env) {
-                Ok(it) => it,
+                // The layouts of the pinned native inputs it was given may be searched and
+                // be an rpath: each is the verified unpacking of its pinned archive.
+                Ok(mut it) => {
+                    it.extend(given(&job.input.native, &start.unit).map(|it| it.dir.clone()));
+                    it
+                }
                 Err(why) => {
                     return self.error(format!("the build script of `{}`: {why}", start.unit.package.descr()), out);
                 }

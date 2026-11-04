@@ -468,7 +468,11 @@ pub(crate) fn units(
                 .filter(|unit| unit.mode == Mode::RunCustomBuild && !unit.is_std)
                 .filter_map(|unit| {
                     let (id, _) = packages_by_spec.get(&unit.pkg_id)?;
-                    Some(super::native::ScriptRun { package: id.name().as_str(), platform: unit.platform.as_deref() })
+                    Some(super::native::ScriptRun {
+                        package: id.name().as_str(),
+                        platform: unit.platform.as_deref(),
+                        features: &unit.features,
+                    })
                 })
                 .collect();
             match super::native::needed(ctx.files(), ws.custom_metadata(), ws.root_manifest(), &host.triple, &runs) {

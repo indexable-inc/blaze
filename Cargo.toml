@@ -161,9 +161,15 @@ unrecorded_span = "deny"
 # which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
 # `warn`; other workspaces opt in.
 
-# llvm-sys's build script (vendor/llvm-sys/pin.rs) checks the pinned LLVM `nix develop` names.
-[workspace.metadata.blaze.sandbox]
-build-script-env = ["LLVM_SYS_231_PREFIX"]
+# The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
+# crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only
+# under its home and sets LLVM_SYS_231_PREFIX to it for these build scripts, over any value the
+# shell has. llvm-sys's (vendor/llvm-sys/pin.rs) links it; blaze-stencil's makes its stencils with
+# it when `llvm-stencils` is on (the wasm seed builds it without, and asks for no LLVM).
+[workspace.metadata.blaze.native.llvm]
+pin = "crates/hir-ty-codegen/llvm.json"
+env = "LLVM_SYS_231_PREFIX"
+packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 
 [workspace.package]
 version = "0.0.0"

@@ -31,10 +31,11 @@ impl Pin {
     pub(crate) fn refusal(&self, found: &str) -> String {
         format!(
             "blaze links only the LLVM crates/hir-ty-codegen/llvm.json pins (LLVM {}, commit {}), \
-             and {found}. Build inside `nix develop`, which sets {PIN_PREFIX} to the flake's \
-             blaze-llvm, or unpack its release with `python3 .github/scripts/llvm.py fetch \
-             --target <triple> --dir <dir>` and set {PIN_PREFIX} to <dir>; for a target llvm.json \
-             has no release for, build one with the `llvm` workflow (.github/workflows/llvm.yaml)",
+             and {found}. blaze sets {PIN_PREFIX} itself, to the release llvm.json pins for the \
+             target, fetched by its sha256 and unpacked under blaze's home \
+             (`[workspace.metadata.blaze.native.llvm]` in the root Cargo.toml, docs/cargo.md \
+             \"Pinned native inputs\"); build with blaze. For a target llvm.json has no release \
+             for, build one with the `llvm` workflow (.github/workflows/llvm.yaml)",
             self.version, self.commit
         )
     }
