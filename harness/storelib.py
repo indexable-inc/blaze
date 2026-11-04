@@ -14,9 +14,17 @@ The daemon is started here, not by the first `blaze build` (crates/blaze-cargo/s
 `blaze build` that finds no daemon listening starts one of its own, logging to
 `<home>/v2/serve.log`: `Daemon.stray` tells of that and stops it.
 
-`scratch` and `run` are what other harnesses take from here too.
+`scratch` and `run` are what other harnesses take from here too, and `Daemon.command` with
+`test_results`: any blaze command asked of the daemon, and the `blaze-test-result` lines of a
+`blaze test --reached --message-format=json` (crates/blaze-cargo/src/cli/json.rs, `test_result`)
+read into `TestLine`s.
 """
+from __future__ import annotations
+
 import concurrent.futures, hashlib, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal, TypeVar, cast
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STRESS = os.path.join(HERE, "stress")
@@ -40,7 +48,7 @@ class Failed(Exception):
     """A step the harness could not do, said whole: an error of the run, not a finding."""
 
 
-def scratch(prefix):
+def scratch(prefix: str) -> str:
     # cargo names a checkout by its real path, and the temporary directory of macOS is a link.
     # That directory is also too long for the path of a daemon's socket in it (104 bytes).
     return os.path.realpath(tempfile.mkdtemp(prefix=prefix, dir="/tmp" if sys.platform == "darwin" else None))
@@ -132,7 +140,7 @@ def named(text, path):
     return path.lstrip("/") in text
 
 
-def environment(home):
+def environment(home: str) -> dict[str, str]:
     env = {name: value for name, value in os.environ.items() if name not in SCRUBBED}
     env["BLAZE_HOME"] = home
     return env
@@ -170,10 +178,13 @@ class Daemon:
     is set for it and for every build asked of it, over what `environment` leaves, a value of
     None unsetting the variable."""
 
-    def __init__(self, blaze, home, name="serve", wait=True, env=None):
+    def __init__(self, blaze: str, home: str, name: str = "serve", wait: bool = True,
+                 env: Mapping[str, str | None] | None = None):
         self.blaze, self.home = blaze, home
         os.makedirs(home, exist_ok=True)
-        self.env = {name: value for name, value in {**environment(home), **(env or {})}.items() if value is not None}
+        self.env: dict[str, str] = {
+            name: value for name, value in {**environment(home), **(env or {})}.items() if value is not None
+        }
         self.log_path = os.path.join(home, f"{name}.log")
         self.seen = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         with open(self.log_path, "a") as out:
@@ -187,13 +198,13 @@ class Daemon:
     def store(self):
         return store_of(self.home)
 
-    def log(self):
+    def log(self) -> str:
         """What this daemon printed, without what those before it in the same file did."""
         with open(self.log_path, errors="replace") as log:
             log.seek(self.seen)
             return log.read()
 
-    def alive(self):
+    def alive(self) -> bool:
         return self.process.poll() is None
 
     def listens(self):
@@ -235,7 +246,23 @@ class Daemon:
     def build(self, ws, *args, program=PROGRAM, timeout=BUILD_SECS):
         return self.answer(self.asking(ws, *args), program, timeout)
 
-    def stop(self, timeout=STOP_SECS):
+    def command(self, ws: str, verb: str, *args: str, env: Mapping[str, str | None] | None = None,
+                timeout: float = BUILD_SECS) -> Ran:
+        """`blaze VERB ARGS` in `ws` asked of this daemon and waited for, with `env` over the
+        daemon's (None unsets a variable): what a client's environment changes, the request
+        carries. One that outlasts `timeout` is killed and fails the step, naming it."""
+        if not self.listening or not self.alive():
+            raise Failed(f"`blaze {verb}` asked of a daemon that does not listen: {self.log_path}")
+        given = {name: value for name, value in {**self.env, **(env or {})}.items() if value is not None}
+        argv = [self.blaze, verb, *args]
+        try:
+            ran = subprocess.run(argv, cwd=ws, env=given, stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise Failed(f"`{shlex.join(argv)}` in {ws} took more than {timeout} s\nlog: {self.log_path}") from error
+        return Ran(argv, ran.returncode, ran.stdout, ran.stderr)
+
+    def stop(self, timeout: float = STOP_SECS) -> None:
         """`blaze stop`, which writes the daemon's image and ends it, waited for."""
         if self.alive():
             subprocess.run([self.blaze, "stop"], env=self.env, capture_output=True, timeout=timeout)
@@ -319,9 +346,112 @@ def references(blaze, work, values, jobs=4):
         return {value: future.result() for value, future in made.items()}
 
 
-def blaze_of(path):
+def blaze_of(path: str) -> str:
     """The `blaze` command line at `path`, refused when it is not there."""
     path = os.path.abspath(path)
     if not os.path.isfile(path) or not os.access(path, os.X_OK):
         raise Failed(f"no blaze at {path}")
     return path
+
+
+@dataclass(frozen=True)
+class Ran:
+    """A blaze command that ended: its command line, exit status and what it printed."""
+    argv: list[str]
+    status: int
+    stdout: str
+    stderr: str
+
+
+Outcome = Literal["passed", "failed", "ignored", "unreached"]
+OUTCOMES: tuple[Outcome, ...] = ("passed", "failed", "ignored", "unreached")
+
+
+@dataclass(frozen=True)
+class CachedRun:
+    """The kept run that stands for a test not run (blaze_api::Cached): what it was kept by
+    (`executed`: the functions it executed; `reached`: what it reaches, its record not whole,
+    with why), how long it took and how it ended."""
+    basis: Literal["executed", "reached"]
+    why: str | None
+    millis: int
+    outcome: Outcome
+
+
+@dataclass(frozen=True)
+class TestLine:
+    """One `blaze-test-result` line (blaze_api::TestResult): `cached` is None for a test that
+    ran this time; `outside` says it ran outside the sandbox, so its pass is never kept."""
+    binary: str
+    executable: int
+    name: str
+    outcome: Outcome
+    millis: int
+    outside: bool
+    cached: CachedRun | None
+    output: str
+
+
+T = TypeVar("T")
+
+
+def _field(line: Mapping[str, object], name: str, kind: type[T]) -> T:
+    value = line.get(name)
+    # bool is an int to isinstance: a number field never takes one.
+    if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+        raise Failed(f"a blaze-test-result line's `{name}` is {value!r}, not {kind.__name__}: {dict(line)}")
+    return value
+
+
+def _outcome(line: Mapping[str, object]) -> Outcome:
+    said = _field(line, "outcome", str)
+    for known in OUTCOMES:
+        if said == known:
+            return known
+    raise Failed(f"a blaze-test-result line's outcome {said!r} is none of {OUTCOMES}: {dict(line)}")
+
+
+def _cached(line: Mapping[str, object]) -> CachedRun | None:
+    value = line.get("cached")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise Failed(f"a blaze-test-result line's `cached` is {value!r}, not an object or null: {dict(line)}")
+    cached = cast(dict[str, object], value)
+    basis = _field(cached, "basis", str)
+    if basis != "executed" and basis != "reached":
+        raise Failed(f"a kept run's basis {basis!r} is neither `executed` nor `reached`: {dict(line)}")
+    why = cached.get("why")
+    if why is not None and not isinstance(why, str):
+        raise Failed(f"a kept run's `why` is {why!r}, not text or null: {dict(line)}")
+    return CachedRun(basis, why, _field(cached, "millis", int), _outcome(cached))
+
+
+def test_results(stdout: str) -> list[TestLine]:
+    """The `blaze-test-result` lines of what `blaze test --reached --message-format=json`
+    printed, in order; a line of that reason missing a field, or with one of another type,
+    fails naming it."""
+    found: list[TestLine] = []
+    for text in stdout.splitlines():
+        if not text.startswith("{"):
+            continue
+        try:
+            parsed: object = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        line = cast(dict[str, object], parsed)
+        if line.get("reason") != "blaze-test-result":
+            continue
+        found.append(TestLine(
+            binary=_field(line, "binary", str),
+            executable=_field(line, "executable", int),
+            name=_field(line, "name", str),
+            outcome=_outcome(line),
+            millis=_field(line, "millis", int),
+            outside=_field(line, "outside", bool),
+            cached=_cached(line),
+            output=_field(line, "output", str),
+        ))
+    return found

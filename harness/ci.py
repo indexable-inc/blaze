@@ -30,7 +30,9 @@ core-1 ... core-N (packed as the fast tier is, to about CORE_SECS by the seconds
 keys-N, store-kills, store, daemon and incremental (docs/harness.md, "CI").
 
 Each harness runs with a BLAZE_HOME of its own (a harness may set its own over it), so no
-daemon, socket or store (`<home>/v2/store`) of one harness is seen by the next.
+daemon, socket or store (`<home>/v2/store`) of one harness is seen by the next. blaze's
+toolchain is not in a home: every home reads the machine's (`~/.blaze/toolchains`), which `run`
+has `blaze toolchain` download once before the first harness.
 
 Every harness in a part runs even when one before it fails; the part fails at the end and names
 them. BLAZE_BIN is the blaze the harnesses run, as for each harness on its own.
@@ -118,7 +120,7 @@ HARNESSES = [
     # fails naming it (#730); a program built with #731's unstable rustflags has its edits spliced.
     ("core", ["artifactedits.py"], {}, on("linux", "macos"), 1),
     ("core", ["testselect.py"], {}, on("linux", "macos"), 2),
-    # Each kind of reason a test is not hermetic, told from its code, and pure tests kept by it.
+    # A sandboxed test is kept by what it executed and read; one outside is said and runs every time.
     ("core", ["hermetic.py"], {}, on("linux", "macos"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
     # A lazy static's initializer inlines a dependency's helper, which is then edited.
@@ -351,6 +353,18 @@ def run_one(args, env):
     return status
 
 
+def toolchain():
+    """blaze's toolchain on this machine before any harness runs: `blaze toolchain` downloads it
+    once into `~/.blaze/toolchains`, which every BLAZE_HOME reads (crates/blaze-cargo's
+    `toolchain::own::toolchains`). A harness that starts `blaze serve` itself downloads nothing,
+    and that daemon stops at once where the toolchain is not whole, so a runner (whose harness
+    job installs no blaze) and a Mac start every part the same way."""
+    ran = subprocess.run([BLAZE_CLI, "toolchain"], capture_output=True, text=True, timeout=1800, check=False)
+    if ran.returncode:
+        sys.exit(f"ci.py: `{BLAZE_CLI} toolchain` exited {ran.returncode}, so no harness can build:\n{ran.stderr[-3000:]}")
+    print(ran.stdout.strip(), flush=True)
+
+
 def run(part):
     tier = "fast" if part.startswith("quick-") else "full"
     if part == "fast":
@@ -361,6 +375,7 @@ def run(part):
         known = list((fast_parts if tier == "fast" else full_parts)())
         sys.exit(f"ci.py: no harness of part {part!r} runs on {SYSTEM} {ARCH}; the parts here are {known}")
     os.environ["BLAZE_CI_TIER"] = tier
+    toolchain()
     failed, times = [], []
     for args, env in chosen:
         what = " ".join([*(f"{k}={v}" for k, v in env.items()), *args])

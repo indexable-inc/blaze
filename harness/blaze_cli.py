@@ -1056,8 +1056,9 @@ class Bare(Side):
 
 def own_toolchain(work, check):
     """A machine with no rustup and no Rust on the path (docs/self-contained.md): blaze builds
-    with its own copy of its release, laid out in `BLAZE_HOME` as rustup lays one out (here a
-    copy of rustup's, so nothing is downloaded), runs cargo and rustc from it, and the edit
+    with its own copy of its release, laid out in the machine's `~/.blaze/toolchains` (every
+    BLAZE_HOME reads that one) as rustup lays one out (here a copy of rustup's in a user's home
+    of the harness's, so nothing is downloaded), runs cargo and rustc from it, and the edit
     after the first build is the daemon's."""
     sysroot = subprocess.run(["rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip() if shutil.which("rustup") else ""
     if WINDOWS or not os.path.exists(os.path.join(sysroot, "lib/rustlib/multirust-channel-manifest.toml")):
@@ -1068,8 +1069,10 @@ def own_toolchain(work, check):
         subprocess.run(["rustup", "target", "add", "--toolchain", TOOLCHAIN, "wasm32-wasip1"], capture_output=True)
     home = os.path.join(work, "home-own")
     os.makedirs(home, mode=0o700)
+    # The user's home of this machine: where blaze keeps its toolchains, whatever BLAZE_HOME says.
+    user = os.path.join(work, "user-own")
     host = subprocess.run([os.path.join(sysroot, "bin", "rustc"), "-vV"], capture_output=True, text=True).stdout.split("host: ")[1].split()[0]
-    own = os.path.join(home, "toolchains", f"{TOOLCHAIN}-{host}")
+    own = os.path.join(user, ".blaze", "toolchains", f"{TOOLCHAIN}-{host}")
 
     def link(source, target):
         try:
@@ -1080,8 +1083,11 @@ def own_toolchain(work, check):
     env = base_env(home)
     for name in ("RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "CARGO"):
         env.pop(name, None)
-    # BLAZE_HOME is the daemon's directory too.
+    # BLAZE_HOME is the daemon's directory; HOME holds the toolchain. The standard library's
+    # shared directory stays the machine's (`~/.cache/blaze`), so std is not built again.
     env["BLAZE_HOME"] = home
+    env["XDG_CACHE_HOME"] = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    env["HOME"] = user
     env["RUSTUP_HOME"] = os.path.join(work, "no-rustup")
     # A directory with Rust's programs in it is replaced by one with the rest of them: the C
     # compiler can be a script of the shell beside them (Nix).

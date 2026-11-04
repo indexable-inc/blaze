@@ -12,8 +12,8 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use blaze_api::{
-    Applicability, Artifact, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef, UnitOfRef,
-    UnitTarget, UnitTargetRef,
+    Applicability, Artifact, Basis, BuildScriptRanRef, CrateType, DiagnosticRef, SpanRef,
+    TestOutcome, TestResult, UnitOfRef, UnitTarget, UnitTargetRef,
 };
 use blaze_hash::FixedState;
 use std::alloc::Global;
@@ -288,6 +288,58 @@ pub fn build_script(out: &mut String, ran: BuildScriptRanRef<'_>) {
     }
     out.push_str(r#"],"out_dir":"#);
     quote(out, ran.out_dir);
+    out.push('}');
+}
+
+/// A test's outcome as `blaze-test-result` names it.
+fn outcome(out: &mut String, outcome: TestOutcome) {
+    quote(out, match outcome {
+        TestOutcome::Passed => "passed",
+        TestOutcome::Failed => "failed",
+        TestOutcome::Ignored => "ignored",
+        TestOutcome::Unreached => "unreached",
+    });
+}
+
+/// `blaze-test-result`, blaze's own (cargo has none), without its newline: one
+/// [`TestResult`] of `blaze test --reached` whole, so a harness or an agent reads what ran,
+/// what stood in for a run (`cached`: the run kept, by what, and why when by reach) and what
+/// ran outside the sandbox (`outside`) from fields, not from libtest's text.
+pub fn test_result(out: &mut String, result: &TestResult) {
+    out.push_str(r#"{"reason":"blaze-test-result","binary":"#);
+    quote(out, &result.binary);
+    out.push_str(r#","executable":"#);
+    num(out, u64::from(result.executable));
+    out.push_str(r#","name":"#);
+    quote(out, &result.name);
+    out.push_str(r#","outcome":"#);
+    outcome(out, result.outcome);
+    out.push_str(r#","millis":"#);
+    num(out, result.millis);
+    out.push_str(r#","outside":"#);
+    boolean(out, result.outside);
+    out.push_str(r#","cached":"#);
+    match &result.cached {
+        None => out.push_str("null"),
+        Some(cached) => {
+            let (basis, why) = match &cached.basis {
+                Basis::Executed => ("executed", None),
+                Basis::Reached { why } => ("reached", Some(why.as_str())),
+            };
+            out.push_str(r#"{"basis":"#);
+            quote(out, basis);
+            out.push_str(r#","why":"#);
+            opt(out, why);
+            out.push_str(r#","millis":"#);
+            num(out, cached.millis);
+            out.push_str(r#","outcome":"#);
+            outcome(out, cached.outcome);
+            out.push('}');
+        }
+    }
+    out.push_str(r#","output":"#);
+    // alloc: only for output that is not UTF-8, which is written with U+FFFD in its place
+    quote(out, &String::from_utf8_lossy(&result.output));
     out.push('}');
 }
 

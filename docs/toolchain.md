@@ -42,7 +42,8 @@ the standard library is part of a compiler.
   from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
-- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), found
+- **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
+  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain), found
   with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/toolchain-c.md),

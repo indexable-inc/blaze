@@ -36,6 +36,7 @@ include = [
   "harness/failures.py",
   "harness/focused.py",
   "harness/fuzz/edits.py",
+  "harness/hermetic.py",
   "harness/includes.py",
   "harness/incremental.py",
   "harness/keys.py",
@@ -56,6 +57,7 @@ include = [
 # migration keeps that existing import order; new workspace packages use normal imports.
 [tool.ruff.lint.per-file-ignores]
 "harness/fuzz/edits.py" = ["E402"]
+"harness/hermetic.py" = ["E402"]
 "harness/includes.py" = ["E402"]
 "harness/keys.py" = ["E402"]
 "harness/v2/*.py" = ["E402"]
@@ -71,6 +73,7 @@ include = [
   "harness/failures.py",
   "harness/focused.py",
   "harness/fuzz/edits.py",
+  "harness/hermetic.py",
   "harness/includes.py",
   "harness/incremental.py",
   "harness/keys.py",
