@@ -1,0 +1,623 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 4f87fd3..18cea5e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -59,11 +59,7 @@ default = [
+     "bloom",
+ ]
+ lock_tracking = []
+-log = [
+-    "tracing/log",
+-    "proto/log",
+-    "udp/log",
+-]
++log = ["proto/log"]
+ platform-verifier = ["proto/platform-verifier"]
+ qlog = ["proto/qlog"]
+ ring = ["proto/ring"]
+@@ -188,14 +184,8 @@ version = "2.0.3"
+ version = "1.28.1"
+ features = ["sync"]
+ 
+-[dependencies.tracing]
+-version = "0.1.10"
+-features = ["std"]
+-default-features = false
+-
+ [dependencies.udp]
+ version = "0.5"
+-features = ["tracing"]
+ default-features = false
+ package = "quinn-udp"
+ 
+@@ -231,22 +221,6 @@ features = [
+     "macros",
+ ]
+ 
+-[dev-dependencies.tracing-futures]
+-version = "0.2.0"
+-features = ["std-future"]
+-default-features = false
+-
+-[dev-dependencies.tracing-subscriber]
+-version = "0.3.0"
+-features = [
+-    "env-filter",
+-    "fmt",
+-    "ansi",
+-    "time",
+-    "local-time",
+-]
+-default-features = false
+-
+ [dev-dependencies.url]
+ version = "2"
+ 
+diff --git a/src/connection.rs b/src/connection.rs
+index ff449dd..7a6dbe2 100644
+--- a/src/connection.rs
++++ b/src/connection.rs
+@@ -17,7 +17,6 @@ use pin_project_lite::pin_project;
+ use rustc_hash::FxHashMap;
+ use thiserror::Error;
+ use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
+-use tracing::{Instrument, Span, debug_span};
+ 
+ use crate::{
+     ConnectionEvent, Duration, Instant, VarInt,
+@@ -63,14 +62,9 @@ impl Connecting {
+         );
+ 
+         let driver = ConnectionDriver::new(conn.clone());
+-        runtime.spawn(Box::pin(
+-            async {
+-                if let Err(e) = driver.await {
+-                    tracing::error!("I/O error: {e}");
+-                }
+-            }
+-            .instrument(Span::current()),
+-        ));
++        runtime.spawn(Box::pin(async {
++            let _ = driver.await;
++        }));
+ 
+         Self {
+             conn: Some(conn),
+@@ -239,17 +233,11 @@ impl Future for ZeroRttAccepted {
+ #[derive(Debug)]
+ struct ConnectionDriver {
+     conn: ConnectionRef,
+-    span: Span,
+ }
+ 
+ impl ConnectionDriver {
+     fn new(conn: ConnectionRef) -> Self {
+-        let span = {
+-            let conn = &mut conn.state.lock("poll");
+-            debug_span!("drive", id = conn.handle.0)
+-        };
+-
+-        Self { conn, span }
++        Self { conn }
+     }
+ }
+ 
+@@ -258,7 +246,6 @@ impl Future for ConnectionDriver {
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+         let conn = &mut *self.conn.state.lock("poll");
+-        let _guard = self.span.enter();
+ 
+         if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
+             conn.terminate(e, &self.conn.shared);
+diff --git a/src/endpoint.rs b/src/endpoint.rs
+index 1bf82c0..9079641 100644
+--- a/src/endpoint.rs
++++ b/src/endpoint.rs
+@@ -32,7 +32,6 @@ use rustc_hash::FxHashMap;
+ #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring"),))]
+ use socket2::{Domain, Protocol, Socket, Type};
+ use tokio::sync::{Notify, futures::Notified, mpsc};
+-use tracing::{Instrument, Span};
+ use udp::{BATCH_SIZE, RecvMeta};
+ 
+ use crate::{
+@@ -75,9 +74,7 @@ impl Endpoint {
+     pub fn client(addr: SocketAddr) -> io::Result<Self> {
+         let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+         if addr.is_ipv6() {
+-            if let Err(e) = socket.set_only_v6(false) {
+-                tracing::debug!(%e, "unable to make socket dual-stack");
+-            }
++            let _ = socket.set_only_v6(false);
+         }
+         socket.bind(&addr.into())?;
+         let runtime =
+@@ -150,14 +147,9 @@ impl Endpoint {
+             runtime.clone(),
+         );
+         let driver = EndpointDriver(rc.clone());
+-        runtime.spawn(Box::pin(
+-            async {
+-                if let Err(e) = driver.await {
+-                    tracing::error!("I/O error: {}", e);
+-                }
+-            }
+-            .instrument(Span::current()),
+-        ));
++        runtime.spawn(Box::pin(async {
++            let _ = driver.await;
++        }));
+         Ok(Self {
+             inner: rc,
+             default_client_config: None,
+diff --git a/src/mutex.rs b/src/mutex.rs
+index bdefd72..9502821 100644
+--- a/src/mutex.rs
++++ b/src/mutex.rs
+@@ -8,7 +8,6 @@ mod tracking {
+     use super::*;
+     use crate::{Duration, Instant};
+     use std::collections::VecDeque;
+-    use tracing::warn;
+ 
+     #[derive(Debug)]
+     struct Inner<T> {
+@@ -44,18 +43,9 @@ mod tracking {
+         pub(crate) fn lock(&self, purpose: &'static str) -> MutexGuard<'_, T> {
+             // We don't bother dispatching through Runtime::now because they're pure performance
+             // diagnostics.
+-            let now = Instant::now();
+             let guard = self.inner.lock().unwrap();
+ 
+             let lock_time = Instant::now();
+-            let elapsed = lock_time.duration_since(now);
+-
+-            if elapsed > Duration::from_millis(1) {
+-                warn!(
+-                    "Locking the connection for {} took {:?}. Last owners: {:?}",
+-                    purpose, elapsed, guard.last_lock_owner
+-                );
+-            }
+ 
+             MutexGuard {
+                 guard,
+@@ -79,13 +69,6 @@ mod tracking {
+ 
+             let duration = self.start_time.elapsed();
+ 
+-            if duration > Duration::from_millis(1) {
+-                warn!(
+-                    "Utilizing the connection for {} took {:?}",
+-                    self.purpose, duration
+-                );
+-            }
+-
+             self.guard
+                 .last_lock_owner
+                 .push_front((self.purpose, duration));
+diff --git a/src/tests.rs b/src/tests.rs
+index 6ab7bff..2492834 100755
+--- a/src/tests.rs
++++ b/src/tests.rs
+@@ -8,10 +8,8 @@ use rustls::crypto::ring::default_provider;
+ use std::{
+     convert::TryInto,
+     future::Future,
+-    io,
+     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+     pin::pin,
+-    str,
+     sync::{
+         Arc,
+         atomic::{AtomicUsize, Ordering},
+@@ -33,15 +31,11 @@ use tokio::{
+     join,
+     runtime::{Builder, Runtime},
+ };
+-use tracing::{error_span, info};
+-use tracing_futures::Instrument as _;
+-use tracing_subscriber::EnvFilter;
+ 
+ use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
+ 
+ #[test]
+ fn handshake_timeout() {
+-    let _guard = subscribe();
+     let runtime = rt_threaded();
+     let client = {
+         let _guard = runtime.enter();
+@@ -83,8 +77,6 @@ fn handshake_timeout() {
+ 
+ #[tokio::test]
+ async fn close_endpoint() {
+-    let _guard = subscribe();
+-
+     // Avoid NoRootAnchors error
+     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+     let mut roots = RootCertStore::empty();
+@@ -140,7 +132,6 @@ fn local_addr() {
+ 
+ #[test]
+ fn read_after_close() {
+-    let _guard = subscribe();
+     let runtime = rt_basic();
+     let endpoint = {
+         let _guard = runtime.enter();
+@@ -177,7 +168,6 @@ fn read_after_close() {
+ 
+ #[test]
+ fn export_keying_material() {
+-    let _guard = subscribe();
+     let runtime = rt_basic();
+     let endpoint = {
+         let _guard = runtime.enter();
+@@ -222,7 +212,6 @@ fn export_keying_material() {
+ 
+ #[tokio::test]
+ async fn ip_blocking() {
+-    let _guard = subscribe();
+     let endpoint_factory = EndpointFactory::new();
+     let client_1 = endpoint_factory.endpoint();
+     let client_1_addr = client_1.local_addr().unwrap();
+@@ -317,7 +306,6 @@ impl EndpointFactory {
+ 
+ #[tokio::test]
+ async fn zero_rtt() {
+-    let _guard = subscribe();
+     let endpoint = endpoint();
+ 
+     const MSG0: &[u8] = b"zero";
+@@ -334,12 +322,10 @@ async fn zero_rtt() {
+                     assert_eq!(msg, MSG0);
+                 }
+             });
+-            info!("sending 0.5-RTT");
+             let mut s = connection.open_uni().await.expect("open_uni");
+             s.write_all(MSG0).await.expect("write");
+             s.finish().unwrap();
+             established.await;
+-            info!("sending 1-RTT");
+             let mut s = connection.open_uni().await.expect("open_uni");
+             s.write_all(MSG1).await.expect("write");
+             // The peer might close the connection before ACKing
+@@ -368,8 +354,6 @@ async fn zero_rtt() {
+         drop(connection);
+     }
+ 
+-    info!("initial connection complete");
+-
+     let (connection, zero_rtt) = endpoint
+         .connect(endpoint.local_addr().unwrap(), "localhost")
+         .unwrap()
+@@ -379,7 +363,6 @@ async fn zero_rtt() {
+     let c = connection.clone();
+     tokio::spawn(async move {
+         let mut s = c.open_uni().await.expect("0-RTT open uni");
+-        info!("sending 0-RTT");
+         s.write_all(MSG0).await.expect("0-RTT write");
+         s.finish().unwrap();
+     });
+@@ -481,7 +464,6 @@ fn stress_both_windows() {
+ }
+ 
+ fn run_echo(args: EchoArgs) {
+-    let _guard = subscribe();
+     let runtime = rt_basic();
+     let handle = {
+         // Use small receive windows
+@@ -509,7 +491,6 @@ fn run_echo(args: EchoArgs) {
+         let server_addr = server_sock.local_addr().unwrap();
+         let server = {
+             let _guard = runtime.enter();
+-            let _guard = error_span!("server").entered();
+             Endpoint::new(
+                 Default::default(),
+                 Some(server_config),
+@@ -531,7 +512,6 @@ fn run_echo(args: EchoArgs) {
+ 
+         let mut client = {
+             let _guard = runtime.enter();
+-            let _guard = error_span!("client").entered();
+             Endpoint::client(args.client_addr).unwrap()
+         };
+         let mut client_config =
+@@ -569,7 +549,6 @@ fn run_echo(args: EchoArgs) {
+             server.wait_idle().await;
+         });
+ 
+-        info!("connecting from {} to {}", args.client_addr, server_addr);
+         runtime.block_on(
+             async move {
+                 let new_conn = client
+@@ -598,8 +577,7 @@ fn run_echo(args: EchoArgs) {
+                 }
+                 new_conn.close(0u32.into(), b"done");
+                 client.wait_idle().await;
+-            }
+-            .instrument(error_span!("client")),
++            },
+         );
+         handle
+     };
+@@ -650,29 +628,6 @@ fn gen_data(size: usize, seed: u64) -> Vec<u8> {
+     buf
+ }
+ 
+-fn subscribe() -> tracing::subscriber::DefaultGuard {
+-    let sub = tracing_subscriber::FmtSubscriber::builder()
+-        .with_env_filter(EnvFilter::from_default_env())
+-        .with_writer(|| TestWriter)
+-        .finish();
+-    tracing::subscriber::set_default(sub)
+-}
+-
+-struct TestWriter;
+-
+-impl std::io::Write for TestWriter {
+-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+-        print!(
+-            "{}",
+-            str::from_utf8(buf).expect("tried to log invalid UTF-8")
+-        );
+-        Ok(buf.len())
+-    }
+-    fn flush(&mut self) -> io::Result<()> {
+-        io::stdout().flush()
+-    }
+-}
+-
+ fn rt_basic() -> Runtime {
+     Builder::new_current_thread().enable_all().build().unwrap()
+ }
+@@ -683,8 +638,6 @@ fn rt_threaded() -> Runtime {
+ 
+ #[tokio::test]
+ async fn rebind_recv() {
+-    let _guard = subscribe();
+-
+     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+     let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+     let cert = CertificateDer::from(cert.cert);
+@@ -704,7 +657,6 @@ async fn rebind_recv() {
+     let server_config =
+         crate::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+     let server = {
+-        let _guard = tracing::error_span!("server").entered();
+         Endpoint::server(
+             server_config,
+             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+@@ -721,7 +673,6 @@ async fn rebind_recv() {
+     let connected_recv = connected_send.clone();
+     let server = tokio::spawn(async move {
+         let connection = server.accept().await.unwrap().await.unwrap();
+-        info!("got conn");
+         connected_send.notify_one();
+         write_recv.notified().await;
+         let mut stream = connection.open_uni().await.unwrap();
+@@ -732,19 +683,16 @@ async fn rebind_recv() {
+     });
+ 
+     let connection = {
+-        let _guard = tracing::error_span!("client").entered();
+         client
+             .connect(server_addr, "localhost")
+             .unwrap()
+             .await
+             .unwrap()
+     };
+-    info!("connected");
+     connected_recv.notified().await;
+     client
+         .rebind(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap())
+         .unwrap();
+-    info!("rebound");
+     write_send.notify_one();
+     let mut stream = connection.accept_uni().await.unwrap();
+     assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+@@ -753,7 +701,6 @@ async fn rebind_recv() {
+ 
+ #[tokio::test]
+ async fn stream_id_flow_control() {
+-    let _guard = subscribe();
+     let mut cfg = TransportConfig::default();
+     cfg.max_concurrent_uni_streams(1u32.into());
+     let endpoint = endpoint_with_config(cfg);
+@@ -787,7 +734,6 @@ async fn stream_id_flow_control() {
+ 
+ #[tokio::test]
+ async fn two_datagram_readers() {
+-    let _guard = subscribe();
+     let endpoint = endpoint();
+ 
+     let (client, server) = tokio::join!(
+@@ -823,23 +769,19 @@ async fn two_datagram_readers() {
+ 
+ #[tokio::test]
+ async fn multiple_conns_with_zero_length_cids() {
+-    let _guard = subscribe();
+     let mut factory = EndpointFactory::new();
+     factory
+         .endpoint_config
+         .cid_generator(|| Box::new(RandomConnectionIdGenerator::new(0)));
+     let server = {
+-        let _guard = error_span!("server").entered();
+         factory.endpoint()
+     };
+     let server_addr = server.local_addr().unwrap();
+ 
+     let client1 = {
+-        let _guard = error_span!("client1").entered();
+         factory.endpoint()
+     };
+     let client2 = {
+-        let _guard = error_span!("client2").entered();
+         factory.endpoint()
+     };
+ 
+@@ -850,8 +792,7 @@ async fn multiple_conns_with_zero_length_cids() {
+             .await
+             .unwrap();
+         conn.closed().await;
+-    }
+-    .instrument(error_span!("client1"));
++    };
+     let client2 = async move {
+         let conn = client2
+             .connect(server_addr, "localhost")
+@@ -859,31 +800,26 @@ async fn multiple_conns_with_zero_length_cids() {
+             .await
+             .unwrap();
+         conn.closed().await;
+-    }
+-    .instrument(error_span!("client2"));
++    };
+     let server = async move {
+         let client1 = server.accept().await.unwrap().await.unwrap();
+         let client2 = server.accept().await.unwrap().await.unwrap();
+         // Both connections are now concurrently live.
+         client1.close(42u32.into(), &[]);
+         client2.close(42u32.into(), &[]);
+-    }
+-    .instrument(error_span!("server"));
++    };
+     tokio::join!(client1, client2, server);
+ }
+ 
+ #[tokio::test]
+ async fn stream_stopped() {
+-    let _guard = subscribe();
+     let factory = EndpointFactory::new();
+     let server = {
+-        let _guard = error_span!("server").entered();
+         factory.endpoint()
+     };
+     let server_addr = server.local_addr().unwrap();
+ 
+     let client = {
+-        let _guard = error_span!("client1").entered();
+         factory.endpoint()
+     };
+ 
+@@ -911,7 +847,7 @@ async fn stream_stopped() {
+         let stopped3 = stopped3.await;
+         assert_eq!(stopped3, Ok(Some(42u32.into())));
+     };
+-    let client = timeout(Duration::from_millis(100), client).instrument(error_span!("client"));
++    let client = timeout(Duration::from_millis(100), client);
+     let server = async move {
+         let conn = server.accept().await.unwrap().await.unwrap();
+         let mut stream = conn.accept_uni().await.unwrap();
+@@ -919,8 +855,7 @@ async fn stream_stopped() {
+         stream.read_exact(&mut buf).await.unwrap();
+         stream.stop(42u32.into()).unwrap();
+         conn
+-    }
+-    .instrument(error_span!("server"));
++    };
+     let (client, conn) = tokio::join!(client, server);
+     client.expect("timeout");
+     drop(conn);
+@@ -928,7 +863,6 @@ async fn stream_stopped() {
+ 
+ #[tokio::test]
+ async fn stream_stopped_2() {
+-    let _guard = subscribe();
+     let endpoint = endpoint();
+ 
+     let (conn, _server_conn) = tokio::try_join!(
+@@ -939,8 +873,7 @@ async fn stream_stopped_2() {
+     )
+     .unwrap();
+     let send_stream = conn.open_uni().await.unwrap();
+-    let stopped = timeout(Duration::from_millis(100), send_stream.stopped())
+-        .instrument(error_span!("stopped"));
++    let stopped = timeout(Duration::from_millis(100), send_stream.stopped());
+     tokio::pin!(stopped);
+     // poll the future once so that the waker is registered.
+     tokio::select! {
+@@ -957,8 +890,6 @@ async fn stream_stopped_2() {
+ 
+ #[tokio::test]
+ async fn stream_drop_removes_blocked_reader() {
+-    let _guard = subscribe();
+-
+     for drop_stream in [false, true] {
+         let endpoint_factory = EndpointFactory::new();
+         let server = endpoint_factory.endpoint();
+@@ -1016,16 +947,13 @@ async fn stream_drop_removes_blocked_reader() {
+ /// explicitly `stop`ing it doesn't panic.
+ #[tokio::test]
+ async fn recv_stream_cancel_stop_drop() {
+-    let _guard = subscribe();
+     let factory = EndpointFactory::new();
+     let server = {
+-        let _guard = error_span!("server").entered();
+         factory.endpoint()
+     };
+     let server_addr = server.local_addr().unwrap();
+ 
+     let client = {
+-        let _guard = error_span!("client").entered();
+         factory.endpoint()
+     };
+     let recv_dropped = tokio::sync::SetOnce::new();
+diff --git a/tests/many_connections.rs b/tests/many_connections.rs
+index a22371e..b8a686b 100644
+--- a/tests/many_connections.rs
++++ b/tests/many_connections.rs
+@@ -19,11 +19,6 @@ struct Shared {
+ #[test]
+ #[ignore]
+ fn connect_n_nodes_to_1_and_send_1mb_data() {
+-    let _ = tracing_subscriber::FmtSubscriber::builder()
+-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+-        .with_test_writer()
+-        .try_init();
+-
+     let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+     let _guard = runtime.enter();
+     let shared = Arc::new(Mutex::new(Shared { errors: vec![] }));
+diff --git a/tests/post_quantum.rs b/tests/post_quantum.rs
+index 8983794..7464111 100644
+--- a/tests/post_quantum.rs
++++ b/tests/post_quantum.rs
+@@ -10,7 +10,6 @@ use rustls::{
+     NamedGroup,
+     pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+ };
+-use tracing::info;
+ 
+ use quinn::{
+     Endpoint,
+@@ -28,11 +27,6 @@ async fn post_quantum_key_exchange_large_mtu() {
+ }
+ 
+ async fn check_post_quantum_key_exchange(min_mtu: u16) {
+-    let _ = tracing_subscriber::FmtSubscriber::builder()
+-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+-        .with_test_writer()
+-        .try_init();
+-
+     let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+ 
+     let (endpoint, server_cert) = make_server_endpoint(server_addr, min_mtu).unwrap();
+@@ -41,10 +35,6 @@ async fn check_post_quantum_key_exchange(min_mtu: u16) {
+     let jh = tokio::spawn(async move {
+         let incoming_conn = endpoint.accept().await.unwrap();
+         let conn = incoming_conn.await.unwrap();
+-        info!(
+-            "[server] connection accepted: addr={}",
+-            conn.remote_address()
+-        );
+         assert_eq!(
+             conn.handshake_data()
+                 .unwrap()
+@@ -63,7 +53,6 @@ async fn check_post_quantum_key_exchange(min_mtu: u16) {
+         .unwrap()
+         .await
+         .unwrap();
+-    info!("[client] connected: addr={}", connection.remote_address());
+ 
+     // Waiting for a stream will complete with an error when the server closes the connection
+     let _ = connection.accept_uni().await;
