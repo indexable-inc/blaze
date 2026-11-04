@@ -1,0 +1,9 @@
+[package]
+name = "harness-ghostty-config"
+description = "Reads the user's Ghostty config live (includes, dark/light themes, palette, font, padding, cursor blink) so harness-native and harnessd look like the user's Ghostty"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]

@@ -35,6 +35,7 @@ mod archive;
 mod keys;
 mod stats;
 pub use stats::TICK as STATS_TICK;
+mod ghostty;
 pub use keys::{MenuLine, Outcome};
 pub use sidebar::Wheel;
 
@@ -43,10 +44,8 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 const TOKENS: &str = include_str!("../scene/00-tokens.flecs");
 const HARNESS: &str = include_str!("../scene/10-harness.flecs");
 
-/// The terminal's font size at zoom 1 (points), and its padding inside the main card.
+/// The terminal's font size at zoom 1 (points) when the Ghostty config sets none (src/app/ghostty.rs).
 const TERM_SIZE: f32 = 13.0;
-/// The terminal's padding inside its pane (Ghostty's window-padding), in points; the cell remainder is added on top.
-const TERM_PAD: (f32, f32) = (18.0, 16.0);
 const ZOOMS: [f32; 9] = [0.67, 0.75, 0.85, 0.92, 1.0, 1.1, 1.25, 1.4, 1.6];
 
 
@@ -198,6 +197,8 @@ pub struct App {
     corner_x: harness_native_api::spring::Spring,
     /// F3's debug overlay (src/app/stats.rs) and the last poke's reason.
     stats: stats::Stats,
+    /// The user's Ghostty config, live: the terminal's themes, font size and padding (src/app/ghostty.rs).
+    look: ghostty::Look,
 }
 
 /// The fill of the theme's role `name` (`running`: `hn.Theme.running`).
@@ -298,6 +299,7 @@ impl App {
         let host = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "This Mac".into());
         let (terms, run_terms) = model::install(w, &host, &crate::link::sock().display().to_string(), rx);
         let key_file = keys::KeyFile::watch(wake.clone());
+        let look = ghostty::Look::new(wake.clone());
         let link = Link::start(tx, wake);
         // The view's fixed frame: the window row, the sidebar (device row over the tree), the main card.
         let root = View::root(w, "hn.Window");
@@ -372,7 +374,9 @@ impl App {
             key_file,
             keys_gen: 0,
             stats: stats::Stats::default(),
+            look,
         };
+        app.apply_ghostty();
         app.load_keys()?;
         // F3's overlay as it was left (native.json `stats`), or HARNESS_NATIVE_STATS=1|0 over that.
         let stats = match std::env::var("HARNESS_NATIVE_STATS").as_deref() {
@@ -1091,12 +1095,13 @@ impl App {
         self.pending = self.pending.saturating_sub(1);
         self.stats_begin();
         self.reload_keys_if_changed();
+        self.reload_ghostty_if_changed();
         let z = self.zoom();
         let view = (points.0 / z, points.1 / z);
         let scale = backing * z;
         if self.grid.scale != scale {
             // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
-            self.grid = Grid::new(&mut self.fonts, TERM_SIZE, scale);
+            self.grid = Grid::new(&mut self.fonts, self.look.size, scale);
         }
         self.step_sidebar(dt);
         self.lay_chrome(z);
@@ -1205,7 +1210,7 @@ impl App {
         }
         let bpad = bar.try_cloned::<&Padding>().unwrap_or_default();
         let past_lights = self.chrome.title_x / z * self.corner_x.x.clamp(0.0, 1.0);
-        bar.set(Padding { l: (width + TERM_PAD.0).max(past_lights), ..bpad });
+        bar.set(Padding { l: (width + self.look.pad[0]).max(past_lights), ..bpad });
     }
 
     /// Step the sidebar's fold spring toward open or folded (cmd+S).
