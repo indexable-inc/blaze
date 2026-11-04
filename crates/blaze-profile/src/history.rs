@@ -1228,6 +1228,7 @@ impl History {
     /// `crash.<pid>.refused` ([`crash::recover`]).
     pub fn refused_crashes(&self) -> &[crash::CrashError] {
         &self.crashes.refused
+    }
 
     /// Keeps this process's flight recorder past a crash, in a file of this history's
     /// directory ([`flight::persist`]): the next history to open here writes the rows this one
