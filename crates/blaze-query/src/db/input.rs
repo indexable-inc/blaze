@@ -188,9 +188,8 @@ pub fn input_read<I: Input>(storage: &Storage, id: Id, field: u32) {
     let node = row::<I>(storage, id).first.load(Ordering::Relaxed) + field;
     let seen = storage.color_of(node);
     let durability = ((seen >> 32) as u32 & !FIELD) as u8;
-    if local::with(|local| local.read(storage, node, durability, seen as u32)) {
-        super::runaway_reads(storage);
-    }
+    let note = local::with(|local| local.read(storage, node, durability, seen as u32));
+    super::noted(storage, note);
 }
 
 #[cfg(test)]
@@ -244,9 +243,8 @@ pub fn input_singleton<I: Input>(storage: &Storage) -> Option<Id> {
     let node = row.first.load(Ordering::Relaxed);
     let seen = storage.color_of(node);
     let durability = ((seen >> 32) as u32 & !FIELD) as u8;
-    if local::with(|local| local.read(storage, node, durability, seen as u32)) {
-        super::runaway_reads(storage);
-    }
+    let note = local::with(|local| local.read(storage, node, durability, seen as u32));
+    super::noted(storage, note);
     None
 }
 

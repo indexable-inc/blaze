@@ -37,9 +37,9 @@ pub(crate) const NONE: u32 = u32::MAX;
 /// Buckets of the filter that says whether a node may be on the stack.
 const BLOOM: usize = 1024;
 
-/// The reads one run may hold on its thread's edge stack (its own and those replayed into it,
-/// before they are deduplicated as it is stored) before it fails with [`super::Runaway`]
-/// (rule 15). A stored row holds at most [`super::row::span::MAX_LEN`] (2^24) distinct reads,
+/// The reads one run may record (its own and those replayed into it, counted before they are
+/// deduplicated: what it holds on its thread's edge stack and what [`Local::full`] and a
+/// capture's close dropped as repeats) before it fails with [`super::Runaway`] (rule 15). A stored row holds at most [`super::row::span::MAX_LEN`] (2^24) distinct reads,
 /// and [`Local::read`] drops a read equal to the last, so a run past 2^28 reads 16 times more
 /// than any run can keep: a loop that keeps reading. No profile yet counts a run's reads (the
 /// "query stack reads" memory row now does); in run m2 of lane checkheap the edge, pending and
@@ -56,16 +56,67 @@ pub(crate) const RUN_READS: u64 = 1 << 28;
 /// 96 GiB. This floor keeps a small storage from tripping on a few repeats.
 pub(crate) const PENDING_FLOOR: u64 = 1 << 16;
 
-/// The most reads one run held and the most rows one task's pending list held, process-wide,
-/// as the stacks grew past them (so within a factor of 2): the measure [`RUN_READS`] and
-/// [`PENDING_FLOOR`] are set against, in the memory report ([`high_water`]).
+/// The reads a run holds before [`Local::full`] first drops its repeats, and the least it may
+/// hold before any drop ([`next_dedup`]): 16 KiB of `u32`s, a spare's size ([`SPARE_BYTES`]),
+/// so a small run is never deduplicated before it is stored and a dedup never runs every few
+/// reads.
+const DEDUP_FROM: u32 = (SPARE_BYTES / size_of::<u32>()) as u32;
+
+/// The most entries one run held on its thread's edge stack at once ([`Frame::held_most`],
+/// exact: taken at each point its count stops rising) and the most rows one task's pending
+/// list held (sampled as the list doubles, so within a factor of 2), process-wide: the measure
+/// [`RUN_READS`] and [`PENDING_FLOOR`] are set against, in the memory report ([`high_water`]). `MOST_RUN` names the run that set `MOST_RUN_READS`
+/// ([`name_most_reads`]), written only as a new mark is set: the cold path.
 static MOST_RUN_READS: AtomicU64 = AtomicU64::new(0);
+static MOST_RUN: ShortLock<(u64, String)> = ShortLock::new((0, String::new()));
 static MOST_PENDING: AtomicU64 = AtomicU64::new(0);
 
-/// The most reads one run held and the most rows one task held pending, process-wide, sampled
-/// as the stacks grew: what the query stack bounds are measured against.
-pub(crate) fn high_water() -> (u64, u64) {
-    (MOST_RUN_READS.load(Ordering::Relaxed), MOST_PENDING.load(Ordering::Relaxed))
+/// What the query stacks held most, process-wide, sampled as they filled ([`high_water`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HighWater {
+    /// The most reads one run held on its thread's edge stack (repeats dropped as it filled).
+    pub run_reads: u64,
+    /// The run that held them, as `` `query` of key ``; empty until one is named.
+    pub run: String,
+    /// The most rows one task's pending list held.
+    pub pending: u64,
+}
+
+/// The most reads one run held (and which run) and the most rows one task held pending,
+/// process-wide, sampled as the stacks filled: what the query stack bounds are measured against.
+pub fn high_water() -> HighWater {
+    let run = MOST_RUN.lock().1.clone(); // clone: a name, once a memory report
+    HighWater {
+        run_reads: MOST_RUN_READS.load(Ordering::Relaxed),
+        run,
+        pending: MOST_PENDING.load(Ordering::Relaxed),
+    }
+}
+
+/// Names the run `run()` writes as the holder of the most reads one run held, `held`, unless a
+/// run holding as many was named first ([`super::name_most_reads`] writes it).
+pub(crate) fn name_most_reads(held: u64, run: impl FnOnce() -> String) {
+    if MOST_RUN.lock().0 >= held {
+        return;
+    }
+    // Written outside the lock (a key's `Debug` runs in `run`), then kept only if still the most.
+    let run = run();
+    let mut most = MOST_RUN.lock();
+    if most.0 < held {
+        *most = (held, run);
+    }
+}
+
+/// What a read or a replay leaves its caller to do once it has let go of the stack
+/// ([`super::noted`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use = "a run past its bound fails and a new high-water mark is named (`super::noted`)"]
+pub(crate) enum Note {
+    Fine,
+    /// The run on top set the most reads one run held, this many: name it.
+    Most(u64),
+    /// The run on top recorded more reads than [`RUN_READS`]: fail it.
+    Runaway,
 }
 
 /// What one task may hold on its query stack ([`RUN_READS`], [`PENDING_FLOOR`]); a test lowers
@@ -96,8 +147,22 @@ pub(crate) struct Frame {
     pub(crate) id: u32,
     /// Where its reads start on the edge stack.
     pub(crate) edges_start: u32,
-    /// A read equal to the last edge above this is not pushed again.
+    /// A read equal to the last edge above this is not pushed again; the innermost capture
+    /// open in this run starts here (else its reads do), so [`Local::full`] dedups from it.
     pub(crate) dedup_floor: u32,
+    /// Its reads dropped from the edge stack as repeats while it ran ([`Local::full`], a
+    /// capture's close): with what it holds, the reads it recorded.
+    pub(crate) dropped: u64,
+    /// The edge stack's length at which [`Local::full`] next drops this run's repeats: its own
+    /// count, not the stack's capacity, which a thread keeps at its high-water mark, so a run on
+    /// a warm thread would otherwise hold every repeat up to whatever an earlier run grew it to.
+    pub(crate) dedup_at: u32,
+    /// The most entries it held on the edge stack at once, nested runs' excluded (they are
+    /// gone when it reads again). Its count only rises between the points that lower it or end
+    /// it, so this is taken there: just before a dedup at its limit ([`Local::full`]) or at a
+    /// capture's close, before a fixpoint round's reads are cut, and as it stores its edges.
+    /// Kept across a head's rounds: the most of any of them.
+    pub(crate) held_most: u64,
     /// The lowest durability read.
     pub(crate) durability: u8,
     /// The highest `changed` read.
@@ -133,6 +198,9 @@ impl Frame {
             id: id.as_u32(),
             edges_start: 0,
             dedup_floor: 0,
+            dropped: 0,
+            dedup_at: 0,
+            held_most: 0,
             durability: u8::MAX,
             changed: 0,
             summary: [0; 2],
@@ -712,6 +780,25 @@ fn grow<T>(buffer: &mut Vec<T>) {
     blaze_mem::frame::task(Tag::Query, |_| buffer.reserve(1));
 }
 
+/// The stack length at which a run whose reads start at `start`, holding `kept` after its last
+/// dedup, next drops its repeats ([`Frame::dedup_at`]): once it holds `max(DEDUP_FROM, 2 x
+/// kept)`. So a run never holds more than that at once, whatever it read before, and each
+/// dedup's pass over its reads is paid for by at least half as many pushes since the last.
+pub(crate) fn next_dedup(start: usize, kept: usize) -> u32 {
+    u32::try_from(start + (2 * kept).max(DEDUP_FROM as usize)).unwrap_or(u32::MAX)
+}
+
+/// Raises the process-wide most one run held at once to `held`; [`Note::Most`] when that set a
+/// new mark, for the caller to name the run ([`super::noted`]). A load first, so a run that
+/// sets no mark writes no shared line.
+fn most_reads(held: u64) -> Note {
+    if MOST_RUN_READS.load(Ordering::Relaxed) < held && MOST_RUN_READS.fetch_max(held, Ordering::Relaxed) < held {
+        Note::Most(held)
+    } else {
+        Note::Fine
+    }
+}
+
 #[inline(always)]
 fn bucket(node: u32) -> usize {
     (node as usize).wrapping_mul(0x9e37_79b9) >> 7 & (BLOOM - 1)
@@ -724,44 +811,75 @@ impl Local {
         self.frames.last_mut().filter(|frame| frame.kind == Kind::Run && frame.storage == storage)
     }
 
-    /// Records a read of `node` into the running query of `storage`, if any: `true`, and the
-    /// read not recorded, when that run holds more reads than [`RUN_READS`] and must fail
-    /// ([`super::runaway_reads`], called by the caller once it has let go of the stack).
+    /// Records a read of `node` into the running query of `storage`, if any. What the caller
+    /// does next, once it has let go of the stack ([`super::noted`]): [`Note::Runaway`], and
+    /// the read not recorded, when that run recorded more reads than [`RUN_READS`].
     #[inline(always)]
-    #[must_use = "a run past its bound fails (`runaway_reads`)"]
-    pub(crate) fn read(
-        &mut self,
-        storage: *const Storage,
-        node: u32,
-        durability: u8,
-        changed: u32,
-    ) -> bool {
+    pub(crate) fn read(&mut self, storage: *const Storage, node: u32, durability: u8, changed: u32) -> Note {
         let edges_len = self.edges.len() as u32;
         let last = self.edges.last().copied();
-        let Some(frame) = self.recording(storage) else { return false };
+        let Some(frame) = self.recording(storage) else { return Note::Fine };
         frame.durability = frame.durability.min(durability);
         frame.changed = frame.changed.max(changed);
         if edges_len > frame.dedup_floor && last == Some(node) {
-            return false;
+            return Note::Fine;
         }
-        let start = frame.edges_start;
-        if self.edges.len() == self.edges.capacity() && self.past_run_reads(start) {
-            return true;
+        let mut note = Note::Fine;
+        if edges_len >= frame.dedup_at {
+            note = self.full();
+            if note == Note::Runaway {
+                return note;
+            }
         }
         // alloc: none once warm: the edge stack grows to its high-water mark once per thread
         push_kept(&mut self.edges, node);
-        false
+        note
     }
 
-    /// Whether the run whose reads start at `start` holds more than its bound; records the
-    /// high-water mark. Checked only as the edge stack grows (and after a replay), so it costs
-    /// nothing per read.
+    /// The recording run on top reached its [`Frame::dedup_at`]. Drops its repeated reads from
+    /// its [`Frame::dedup_floor`] up (a node read again is proved by its first read, so the run
+    /// holds each node it read about once, not once a read: a pass over many rows re-reading
+    /// the same inputs, or replays of captures that share their reads, held 2^27 reads in one
+    /// run of coord-120's check), and sets the next limit once it has added as many reads again
+    /// ([`next_dedup`]). The limit is the run's own, never the stack's capacity: a thread keeps
+    /// its stack at its high-water mark, and a run on it must drop its repeats all the same.
+    /// Below the floor are reads an open capture does not hold, kept as they are, so its start
+    /// stays put. Fails the run ([`Note::Runaway`]) once it recorded [`RUN_READS`], counting
+    /// the reads dropped, and says when it set the high-water mark. Run only at the limit, so
+    /// a read costs one compare.
     #[cold]
     #[inline(never)]
-    fn past_run_reads(&self, start: u32) -> bool {
-        let held = (self.edges.len() - start as usize) as u64;
-        MOST_RUN_READS.fetch_max(held, Ordering::Relaxed);
-        held >= self.bounds.run_reads
+    fn full(&mut self) -> Note {
+        let at = self.frames.len() - 1;
+        let peak = self.held_peak(at);
+        let frame = &self.frames[at];
+        let (start, floor) = (frame.edges_start as usize, frame.dedup_floor as usize);
+        let before = self.edges.len();
+        self.dedup_from(floor);
+        let len = self.edges.len();
+        let frame = &mut self.frames[at];
+        frame.dropped += (before - len) as u64;
+        frame.dedup_at = next_dedup(start, len - start);
+        let recorded = (len - start) as u64 + frame.dropped;
+        if recorded >= self.bounds.run_reads {
+            return Note::Runaway;
+        }
+        most_reads(peak)
+    }
+
+    /// Takes what the run at `at` holds now into its [`Frame::held_most`], at a point its count
+    /// stops rising; returns that most.
+    pub(crate) fn held_peak(&mut self, at: usize) -> u64 {
+        let len = self.edges.len();
+        let frame = &mut self.frames[at];
+        frame.held_most = frame.held_most.max((len - frame.edges_start as usize) as u64);
+        frame.held_most
+    }
+
+    /// [`Local::held_peak`] of the run at `at`, and whether that set the process-wide mark.
+    pub(crate) fn note_peak(&mut self, at: usize) -> (u64, Note) {
+        let peak = self.held_peak(at);
+        (peak, most_reads(peak))
     }
 
     /// Drops every edge from `start` on that repeats one before it there, the first of each
@@ -820,10 +938,10 @@ impl Local {
     }
 
     /// Pushes every node capture `capture` read onto the edge stack, marked as its, for the
-    /// recording run on top: a replay. `true` when that run now holds more reads than
-    /// [`RUN_READS`] and must fail ([`super::runaway_reads`]).
-    #[must_use = "a run past its bound fails (`runaway_reads`)"]
-    pub(crate) fn replay(&mut self, storage: &Storage, capture: u32) -> bool {
+    /// recording run on top: a replay. What the caller does next, as for a read
+    /// ([`Local::read`]): a replay that took the run past its limit drops its repeats
+    /// ([`Local::full`]).
+    pub(crate) fn replay(&mut self, storage: &Storage, capture: u32) -> Note {
         let start = self.edges.len();
         let Local { edges, spans, walked, .. } = self;
         let _: Option<()> = walk_capture(storage, capture, spans, walked, |node| {
@@ -832,14 +950,20 @@ impl Local {
             ControlFlow::Continue(())
         });
         self.mark_capture(start, capture);
-        let run = self.frames.last().map_or(start, |it| it.edges_start as usize);
-        (self.edges.len() - run) as u64 >= self.bounds.run_reads && self.past_run_reads(run as u32)
+        let limit = self.frames.last().map_or(u32::MAX, |it| it.dedup_at);
+        if (self.edges.len() as u32) < limit {
+            return Note::Fine;
+        }
+        self.full()
     }
 
     pub(crate) fn push(&mut self, mut frame: Frame) -> u32 {
         let at = self.frames.len() as u32;
         frame.edges_start = self.edges.len() as u32;
         frame.dedup_floor = frame.edges_start;
+        frame.dropped = 0;
+        frame.held_most = 0;
+        frame.dedup_at = next_dedup(frame.edges_start as usize, 0);
         frame.members_start = self.members.len() as u32;
         frame.pending_start = self.pending.len() as u32;
         self.serial += 1;
@@ -889,6 +1013,9 @@ impl Local {
         frame.kind = Kind::Run;
         frame.edges_start = edges;
         frame.dedup_floor = edges;
+        frame.dropped = 0;
+        frame.held_most = 0;
+        frame.dedup_at = next_dedup(edges as usize, 0);
         frame.durability = u8::MAX;
         frame.changed = 0;
         frame.summary = [0; 2];
@@ -1032,6 +1159,9 @@ impl Frame {
             id: 0,
             edges_start: 0,
             dedup_floor: 0,
+            dropped: 0,
+            dedup_at: 0,
+            held_most: 0,
             durability: u8::MAX,
             changed: 0,
             summary: [0; 2],

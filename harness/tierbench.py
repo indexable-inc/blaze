@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""How fast tiered code runs (macOS on AArch64, blaze built with `--features llvm`):
+"""How fast tiered code runs (macOS on AArch64, a native blaze, which has LLVM):
 demo/lifebench, the Game of Life on a 512 x 512 grid run flat out, built each way the
 table of docs/tiers.md has, each run for the same time, the steady rate the mean of the
 half-second rates from `--from` seconds on.

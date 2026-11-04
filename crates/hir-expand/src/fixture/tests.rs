@@ -9,7 +9,7 @@ use intern::Symbol;
 use span::{Edition, TextRange, TextSize};
 use test_utils::RangeOrOffset;
 
-use super::{Fixture, db, db_with_proc_macros, test_crate};
+use super::{Fixture, db, db_with_proc_macros, stable_ids, test_crate};
 use crate::proc_macro::{ProcMacro, ProcMacros};
 
 fn named(db: &Db, name: &str) -> Crate {
@@ -424,4 +424,12 @@ fn an_edit_after_setup_is_set_file_text() {
 #[should_panic(expected = "twice")]
 fn a_path_twice_is_refused() {
     db("//- /main.rs crate:a\n//- /main.rs crate:b\n");
+}
+
+#[test]
+fn stable_ids_renumber_by_first_use() {
+    assert_eq!(
+        stable_ids("Crate(Id(10240)) FileId(EditionedFileId(Id(13312))) Crate(Id(10240)) FunctionId(8c03) Idx::<FieldData>(0) FunctionId(\"f\")"),
+        "Crate(Id(#0)) FileId(EditionedFileId(Id(#1))) Crate(Id(#0)) FunctionId(#0) Idx::<FieldData>(0) FunctionId(\"f\")",
+    );
 }

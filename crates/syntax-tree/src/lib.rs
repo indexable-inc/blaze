@@ -22,8 +22,6 @@ mod utility_types;
 
 pub mod ast;
 pub mod view;
-#[cfg(feature = "serde1")]
-mod serde_impls;
 
 pub use blaze_bytes::Text;
 pub use text_size::{TextLen, TextRange, TextSize};

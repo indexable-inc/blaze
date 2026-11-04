@@ -92,6 +92,24 @@ pub fn default_crates(triple: &str) -> Result<Vec<String>, String> {
     Ok(vec![if facts.has_std { "std" } else { "core" }.to_owned()])
 }
 
+/// blaze's dev runtime, a crate of the standard library's workspace (library/blaze_inproc_rt):
+/// the run process's side of a dev run on the daemon's code memory, whose start hook
+/// (`blaze_inproc_start`) the link puts first among a dev executable's initializers
+/// (docs/v2/plan/lanes/fastcompile/inproc.md, "The runtime"). The load asks it of the standard
+/// library of a build whose dev executables run on this machine's code memory and gives it to
+/// each of them as it gives std ([`crate::load`]'s `attach_std`), so every dev binary and test
+/// has its hook whatever it depends on. Its package name is its `--extern` name.
+pub const DEV_RUNTIME: &str = "blaze_inproc_rt";
+
+/// Whether a program built for `triple` can run on the daemon's code memory, so its standard
+/// library has [`DEV_RUNTIME`]: the platforms the runtime maps code memory on, Linux on x86_64
+/// and AArch64 and macOS on AArch64. Its Windows side builds only in blaze's workspace
+/// (crates/blaze-inproc-rt): the library's windows-sys is a stub.
+pub fn has_dev_runtime(triple: &str) -> bool {
+    let arch = triple.split('-').next().unwrap_or_default();
+    (matches!(arch, "x86_64" | "aarch64") && triple.split('-').any(|it| it == "linux")) || triple == "aarch64-apple-darwin"
+}
+
 /// The crates built, from those asked: `std` brings `core`, `alloc`, `proc_macro`,
 /// `panic_unwind` and `compiler_builtins`; `core` brings `compiler_builtins`; `test` only when
 /// asked (cargo's `std_crates`). Sorted.

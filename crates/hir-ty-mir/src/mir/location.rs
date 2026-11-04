@@ -158,11 +158,16 @@ pub fn located_concats<'db>(
         .collect()
 }
 
-// dyn: the build's rule, told once a build and called once per file (`file_source_path`)
-type SourcePaths = dyn Fn(&Db, base_db::FileId) -> Option<String> + Send + Sync;
+// dyn: the build's rule, told once a build and called once per crate and file
+// (`file_source_path`)
+type SourcePaths = dyn Fn(&Db, base_db::Crate, base_db::FileId) -> Option<String> + Send + Sync;
 
-/// How a build names files, told by [`name_sources`]. Two rules with the same `key` name every
-/// file the same: the key is all the rule depends on besides what it reads of the database.
+/// How a build names files, told by [`name_sources`]: by the crate whose code is written there
+/// and the file, as rustc names a file from the path its crate's root was passed by, so one
+/// file two crates read is named by each its own way (a root cargo spells
+/// `crates/x/../../library/x/src/lib.rs` names its modules from there). Two rules with the same
+/// `key` name every file the same: the key is all the rule depends on besides what it reads of
+/// the database.
 #[derive(Clone)] // clone: a field of the `SourceNames` input, which the database copies once per image it writes
 pub struct NamingRule {
     key: Box<str>,
@@ -189,7 +194,7 @@ pub struct SourceNames {
 pub fn name_sources(
     db: &mut Db,
     key: &str,
-    paths: impl Fn(&Db, base_db::FileId) -> Option<String> + Send + Sync + 'static,
+    paths: impl Fn(&Db, base_db::Crate, base_db::FileId) -> Option<String> + Send + Sync + 'static,
 ) {
     // alloc: once per naming rule a build tells
     let rule = NamingRule { key: key.into(), paths: std::sync::Arc::new(paths) };
@@ -208,19 +213,19 @@ pub fn name_sources(
     }
 }
 
-/// What the build calls `file`, as `file!()` and `Location::file` say: none when the
-/// evaluator was not told ([`name_sources`]).
-pub fn source_path<'db>(db: &'db Db, file: base_db::FileId) -> Option<&'db str> {
-    file_source_path(db, db.file_text(file))
+/// What the build calls `file` in the code of `krate`, as `file!()` and `Location::file` say:
+/// none when the evaluator was not told ([`name_sources`]).
+pub fn source_path<'db>(db: &'db Db, krate: base_db::Crate, file: base_db::FileId) -> Option<&'db str> {
+    file_source_path(db, krate, db.file_text(file))
 }
 
 #[blaze_query::tracked(returns(as_deref))]
-fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String> {
+fn file_source_path<'db>(db: &'db Db, krate: base_db::Crate, file: base_db::FileText) -> Option<String> {
     let Some(names) = SourceNames::try_get(db) else {
         blaze_query::db::report_untracked_read(db);
         return None;
     };
-    (names.rule(db).paths)(db, *file.file_id(db))
+    (names.rule(db).paths)(db, krate, *file.file_id(db))
 }
 
 /// The text of the literal `expr` of `owner` when it is what `file!()`, or a `concat!` with
@@ -228,22 +233,23 @@ fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String>
 /// and a constant is evaluated from what the build names the file. `None` for any other
 /// expression; an error, never the placeholder, for one of those it can not place.
 pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Result<String, &'static str>> {
+    // `file!()` is named as the crate of the code it is written in names its files.
     if let Some(&file_id) = located_concats(db, owner).get(&expr) {
-        return Some(placed_concat(db, file_id));
+        return Some(placed_concat(db, hir_def::HasModule::krate(&owner, db), file_id));
     }
     let &file_id = location_macros(db, owner).get(&expr)?;
-    Some(placed_file(db, file_id))
+    Some(placed_file(db, hir_def::HasModule::krate(&owner, db), file_id))
 }
 
-/// What the build calls `file`, or why there is no name.
-fn named(db: &Db, file: base_db::FileId) -> Result<&str, &'static str> {
-    source_path(db, file).ok_or(
+/// What the build calls `file` in the code of `krate`, or why there is no name.
+fn named(db: &Db, krate: base_db::Crate, file: base_db::FileId) -> Result<&str, &'static str> {
+    source_path(db, krate, file).ok_or(
         "`file!()` evaluated with no source names: the build did not tell the evaluator \
          what it calls the files (`name_sources`)",
     )
 }
 
-fn placed_concat(db: &Db, file_id: HirFileId) -> Result<String, &'static str> {
+fn placed_concat(db: &Db, krate: base_db::Crate, file_id: HirFileId) -> Result<String, &'static str> {
     use std::fmt::Write;
     let call = file_id.macro_file().ok_or("a `concat!` of `file!()` not in a macro file")?;
     let call = call.loc(db).to_node_view(db);
@@ -259,7 +265,7 @@ fn placed_concat(db: &Db, file_id: HirFileId) -> Result<String, &'static str> {
                 match expander {
                     BuiltinFnLikeExpander::Line => _ = write!(text, "{line}"),
                     BuiltinFnLikeExpander::Column => _ = write!(text, "{col}"),
-                    _ => text.push_str(named(db, file)?),
+                    _ => text.push_str(named(db, krate, file)?),
                 }
             }
         }
@@ -267,14 +273,14 @@ fn placed_concat(db: &Db, file_id: HirFileId) -> Result<String, &'static str> {
     Ok(text)
 }
 
-fn placed_file(db: &Db, file_id: HirFileId) -> Result<String, &'static str> {
+fn placed_file(db: &Db, krate: base_db::Crate, file_id: HirFileId) -> Result<String, &'static str> {
     let site = written_call(db, file_id).ok_or("a `file!()` whose call is not written in the source")?;
     let range = InFile::new(site.file_id, written_range(site.value));
     let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
     let (file, _, _) = macro_location_of(db, file_id.into(), range)
         .ok_or("a `file!()` with no place in a source file")?;
     // alloc: the value of `file!()`, made only where one is evaluated
-    Ok(named(db, file)?.to_owned())
+    Ok(named(db, krate, file)?.to_owned())
 }
 
 /// The macro of `name` that expands to a place in the source.

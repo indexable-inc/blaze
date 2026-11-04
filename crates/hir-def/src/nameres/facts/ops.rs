@@ -131,8 +131,16 @@ pub(crate) struct DeferredDerive {
 pub(crate) type DeriveHelper = (Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>);
 
 /// The `macro_rules!` a module starts with: its parent's textual scope where it is declared,
-/// every definition of each name in definition order.
+/// every distinct definition of each name in definition order, no id twice. The whole chain,
+/// not only the latest: `legacy_macro_before` (a trait's or impl's items) picks the latest
+/// one before the call, and a module an expansion declares in a later round inherits its
+/// parent's scope as of that round, which can hold a shadowing definition written after the
+/// call.
 pub(crate) type Inherited = Box<[(Name, Box<[MacroId]>)]>;
+
+/// What a `#[macro_use] mod` hands its parent: the latest definition of each name the module
+/// defines or brings in, not one it only inherited (the parent's latest already).
+pub(crate) type LegacyExports = Box<[(Name, MacroId)]>;
 
 /// One mutation. Ops naming a `module` change that module's state; the rest are crate-level
 /// (the root's extern prelude, `macro_use` prelude, proc-macro tables) or side tables.

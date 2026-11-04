@@ -269,8 +269,8 @@ blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`,
     then commit crates/blaze-units/src/stdlib/rustc.json;
   - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
-  - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM (`nix develop -c ...`,
-    a blaze built with `--features llvm`: the release profile is LLVM's);
+  - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM (`nix develop -c ...`;
+    the release profile is LLVM's, which every native blaze has);
   - the full tier (the train and the crates' own test suites) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
 

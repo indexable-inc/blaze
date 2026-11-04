@@ -134,6 +134,22 @@ pub fn launch(artifact: &Artifact, exec: &mut Exec) -> Result<(), String> {
     if !artifact.runner.is_empty() {
         return Ok(());
     }
+    match launched(executable)? {
+        Some(env) if cfg!(unix) => exec.env.extend(env),
+        Some(_) => {
+            return Err(format!(
+                "{executable} runs on the daemon's code memory, and on this platform `blaze run` starts it as a child \
+                 whose process ID the daemon's launch can't know beforehand"
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// The daemon's answer to starting `executable` as this process (`Request::Launch`): the start
+/// hook's variables when it runs on the daemon's code memory, `None` when it runs its file.
+fn launched(executable: &str) -> Result<Option<Vec<(String, String)>>, String> {
     let request = blaze_api::Request::Launch { program: executable.to_owned(), pid: std::process::id() };
     let mut launched = None;
     super::observe::ask(request, super::daemon::Start::Never, |response| {
@@ -144,17 +160,62 @@ pub fn launch(artifact: &Artifact, exec: &mut Exec) -> Result<(), String> {
     })
     .map_err(|why| format!("starting {executable} on the daemon's code memory: {why}"))?;
     match launched {
-        Some((true, env)) if cfg!(unix) => exec.env.extend(env),
-        Some((true, _)) => {
-            return Err(format!(
-                "{executable} runs on the daemon's code memory, and on this platform `blaze run` starts it as a child \
-                 whose process ID the daemon's launch can't know beforehand"
-            ));
-        }
-        Some((false, _)) => {}
-        None => return Err(format!("the daemon answered the launch of {executable} with no `Launched`")),
+        Some((true, env)) => Ok(Some(env)),
+        Some((false, _)) => Ok(None),
+        None => Err(format!("the daemon answered the launch of {executable} with no `Launched`")),
     }
-    Ok(())
+}
+
+/// The hidden command a test executable starts through (`blaze __launch PROGRAM ARGS...`), on
+/// Unix: `test` runs each of its programs as a child, whose process ID it can't know before it
+/// spawns it, and the daemon's launch waits for the one process that becomes the program. So
+/// the child is this command, which launches the program as itself ([`launch`]) and becomes it
+/// ([`exec`]): a dev test binary runs on the daemon's code memory, never from its file
+/// (docs/v2/plan/lanes/no-fallback/link/cargo-units.md), as `blaze run`'s program does.
+pub const TRAMPOLINE: &str = "__launch";
+
+/// `exec` made to start through [`TRAMPOLINE`]: this blaze, which asks the daemon to launch
+/// `artifact`'s program as the process it then becomes. One under a runner, which takes the
+/// file, or with no executable, stays as it is. Unix's: elsewhere the trampoline could not
+/// become the program, only wait for it.
+pub fn through_trampoline(artifact: &Artifact, exec: Exec) -> Result<Exec, String> {
+    let Some(executable) = artifact.executable.as_deref() else { return Ok(exec) };
+    if !artifact.runner.is_empty() {
+        return Ok(exec);
+    }
+    let blaze = std::env::current_exe().map_err(|why| format!("starting {executable}: this blaze's own path: {why}"))?;
+    // alloc: once per test executable run, its command line
+    let mut args = Vec::with_capacity(exec.args.len() + 2);
+    args.push(OsString::from(TRAMPOLINE));
+    args.push(OsString::from(executable));
+    args.extend(exec.args);
+    Ok(Exec { program: blaze, args, env: exec.env, cwd: exec.cwd })
+}
+
+/// [`TRAMPOLINE`]'s command, `words` what follows it: the program's path, then its arguments.
+/// Its variables and directory are this process's, which `test` set. Ends only when the program
+/// could not start: the daemon refused it, or it could not be executed.
+pub fn trampoline(words: impl Iterator<Item = OsString>, color: bool) -> i32 {
+    let mut words = words;
+    let Some(program) = words.next() else {
+        let _ = std::io::stderr().write_all(say::error(&format!("blaze {TRAMPOLINE}: no program to start"), color).as_bytes());
+        return Exit::Usage.code();
+    };
+    let Some(executable) = program.to_str() else {
+        let what = format!("blaze {TRAMPOLINE}: the program's path {} is not UTF-8", program.to_string_lossy());
+        let _ = std::io::stderr().write_all(say::error(&what, color).as_bytes());
+        return Exit::Failed.code();
+    };
+    let env = match launched(executable) {
+        Ok(env) => env.unwrap_or_default(),
+        Err(what) => {
+            let _ = std::io::stderr().write_all(say::error(&what, color).as_bytes());
+            return Exit::Failed.code();
+        }
+    };
+    // alloc: once, the program's command
+    let program = Exec { program: PathBuf::from(&program), args: words.collect(), env, cwd: PathBuf::from(".") };
+    exec(&program, &mut std::io::stderr(), Told { color, quiet: false, verbose: 0 })
 }
 
 /// How `run` speaks of its program: colored, `-q`, how many `-v`s.

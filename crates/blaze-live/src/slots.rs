@@ -32,10 +32,10 @@ use std::{
 use blaze_inproc::runtime::{self, Attached};
 
 use crate::ask::{self, Kinds};
-use crate::patch::{self, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message};
+use crate::patch::{self, Answer, Message};
 pub use exec::publish;
 use os::backtrace;
-use switch::{Layout, Switch};
+use switch::Switch;
 
 mod column;
 pub mod exec;
@@ -125,16 +125,6 @@ mod os {
         fn publish(&mut self, _: u64, _: u64) -> Result<(), String> {
             match *self {}
         }
-    }
-
-    pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
-        // alloc: error path, on a platform it doesn't run on
-        Err(PLATFORMS.to_owned())
-    }
-
-    pub(super) fn in_image_of(_: &Range<u64>, _: u64) -> Result<(), String> {
-        // alloc: error path, on a platform it doesn't run on
-        Err(PLATFORMS.to_owned())
     }
 
     pub(super) fn backtrace(_: &mut Vec<u64>) {}
@@ -271,16 +261,7 @@ impl Live {
             .map_err(|it| {
                 format!("patches come only to a program blaze started on its code memory: {it}")
             })?;
-        let (at, bytes) = os::descriptor()?;
-        let descriptor = Descriptor::decode(bytes).ok_or_else(|| {
-            // alloc: error path
-            format!(
-                "{DESCRIPTOR} at {at:#x} does not start with {}",
-                // alloc: error path
-                String::from_utf8_lossy(&DESCRIPTOR_MAGIC)
-            )
-        })?;
-        let layout = Layout::new(&descriptor, at)?;
+        let (_, layout) = blaze_inproc_rt::live::this_layout()?;
         let memory = os::Os::new(&layout)?;
         let switch = Switch::new(memory, layout)?;
         hook::install();

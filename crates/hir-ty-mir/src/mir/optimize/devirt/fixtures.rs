@@ -319,7 +319,7 @@ fn a_track_caller_method_behind_a_plain_declaration_stays_virtual() {
 #[test]
 fn a_dyn_call_of_a_track_caller_method_reports_its_definition() {
     let mut db = fixture::db(TRACKED).into_db();
-    name_sources(&mut db, "fixture", |_, _| Some("main.rs".to_owned()));
+    name_sources(&mut db, "fixture", |_, _, _| Some("main.rs".to_owned()));
     blaze_query::db::attach(&db, || {
         let held = world(&db, TRACKED, &[("Lines", &["Mine"], Made::Closed)]);
         let run = function(&db, "run");

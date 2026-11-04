@@ -33,7 +33,7 @@ use crate::query::{
 };
 use crate::schema::{self, BuiltFor, Mode, Unit, UnitDep};
 use crate::stdlib::target::{self as platform, CfgArgs};
-use crate::stdlib::{STD_OUT, default_crates, default_features};
+use crate::stdlib::{DEV_RUNTIME, STD_OUT, default_crates, default_features, has_dev_runtime};
 use crate::{Filter, Intent, LibRule, Package, Platformed, Request, Rule};
 
 /// A build's units as the load made them: [`crate::query::Units`] less what only the view's
@@ -320,6 +320,7 @@ pub(crate) fn units(
             // those units, as every workspace asking for one std shares its outputs. Two sets of
             // units of one key would build and place the same files twice.
             let mut merged: Vec<(blaze_ids::ContentId, Vec<(String, usize)>)> = Vec::new(); // alloc: a few platforms, once per load
+            let links_runtime = links_dev_runtime(&graph, &packages_by_spec);
             for built_for in platforms_used {
                 let triple = built_for.platform.unwrap_or(host.triple.as_str());
                 // The wasm macros' std is planned as their units are: no rustflags, std's
@@ -338,7 +339,7 @@ pub(crate) fn units(
                     if let Err(error) = runs_as_keyed(&graph, roots, &key, id, built_for) {
                         return Ok(Staged::Failed(error));
                     }
-                    attach_std(&mut graph, roots, built_for);
+                    attach_std(&mut graph, roots, built_for, &links_runtime);
                     continue;
                 }
                 let std = match ctx.files().with_cx(|cx| cx.get::<StdUnits>(&key).map(|it| it.get()))? {
@@ -354,7 +355,7 @@ pub(crate) fn units(
                     )));
                 }
                 let out = format!("{}/{:x}", spec.std, id);
-                let roots = merge_std(&mut graph, &mut std_plans, &mut std_packages, std, built_for, &out);
+                let roots = merge_std(&mut graph, &mut std_plans, &mut std_packages, std, built_for, &out, &links_runtime);
                 if let Err(error) = runs_as_keyed(&graph, &roots, &key, id, built_for) {
                     return Ok(Staged::Failed(error));
                 }
@@ -799,13 +800,30 @@ fn std_key(
         Some(crates) if !for_macros => crates.clone(),
         _ => default_crates(triple).map_err(|what| LoadError { what, at: None })?,
     };
-    // cargo's `std_crates`: `test` when a unit is a test in libtest's harness, or a library's
-    // doctests, whose runner is a libtest harness blaze writes (docs/v2/plan/doctests.md).
+    // cargo's `std_crates`: `test` when a unit is compiled with `--test` in libtest's harness
+    // (`CompileMode::is_rustc_test`: a test, or a check of one, `check --tests` and the
+    // `--all-targets` of `check --fix`, whose crate's root has the harness and its `extern crate
+    // test` appended all the same), or a library's doctests, whose runner is a libtest harness
+    // blaze writes (docs/v2/plan/doctests.md).
     let harnessed = !for_macros && graph.units.iter().any(|unit| {
-        (unit.mode == Mode::Test && harness_of(unit, packages)) || unit.mode == Mode::Doctest
+        let rustc_test = unit.mode == Mode::Test || (unit.mode == Mode::Check && unit.checked_as_test);
+        (rustc_test && harness_of(unit, packages)) || unit.mode == Mode::Doctest
     });
     if crates.iter().any(|it| it == "std") && harnessed && !crates.iter().any(|it| it == "test") {
         crates.push("test".to_owned());
+    }
+    // blaze's dev runtime ([`DEV_RUNTIME`]) when an executable of this platform may run on the
+    // daemon's code memory: a build of this machine's own target, on a platform that has the
+    // runtime, under a profile a live process is allowed under (`blaze_lazy::allow`: not
+    // `release` or `bench`, at opt-level 0 or 1), with a binary or a test among its units.
+    let dev_run = !for_macros
+        && triple == spec.host
+        && has_dev_runtime(triple)
+        && !matches!(base.name.as_str(), "release" | "bench")
+        && matches!(base.opt_level.as_str(), "0" | "1")
+        && graph.units.iter().any(|unit| unit.built_for() == built_for && dev_executable(unit));
+    if crates.iter().any(|it| it == "std") && dev_run && !crates.iter().any(|it| it == DEV_RUNTIME) {
+        crates.push(DEV_RUNTIME.to_owned());
     }
     crates.sort();
     crates.dedup();
@@ -923,6 +941,7 @@ fn merge_std(
     std: StdGraph,
     built_for: BuiltFor<'_>,
     out: &str,
+    links_runtime: &[bool],
 ) -> Vec<(String, usize)> {
     let offset = graph.units.len();
     // alloc: the triple, once per platform's std.
@@ -948,20 +967,27 @@ fn merge_std(
     }
     // alloc: std's few roots, once per platform's std.
     let roots: Vec<(String, usize)> = std.roots.into_iter().map(|(name, index)| (name, index + offset)).collect();
-    attach_std(graph, &roots, built_for);
+    attach_std(graph, &roots, built_for, links_runtime);
     packages.extend(std.packages);
     roots
 }
 
 /// Every unit of the build's own built for `built_for` but a build script's run made to depend
-/// on each of std's `roots` (by name, at their indexes in `graph`), as [`merge_std`] says.
-fn attach_std(graph: &mut schema::UnitGraph, roots: &[(String, usize)], built_for: BuiltFor<'_>) {
-    for unit in &mut graph.units {
+/// on each of std's `roots` (by name, at their indexes in `graph`), as [`merge_std`] says. The
+/// dev runtime ([`DEV_RUNTIME`]), when a root, only for a dev executable ([`dev_executable`])
+/// that does not link it itself (`links_runtime`, by unit, [`links_dev_runtime`]): two would
+/// be two start hooks, and two runtimes whose program asks one that the hook never attached.
+fn attach_std(graph: &mut schema::UnitGraph, roots: &[(String, usize)], built_for: BuiltFor<'_>, links_runtime: &[bool]) {
+    for (at, unit) in graph.units.iter_mut().enumerate() {
         if unit.is_std || unit.built_for() != built_for || unit.mode == Mode::RunCustomBuild {
             continue;
         }
+        let runtime = dev_executable(unit) && !links_runtime.get(at).copied().unwrap_or(false);
         unit.dependencies.reserve(roots.len());
         for (name, index) in roots {
+            if name == DEV_RUNTIME && !runtime {
+                continue;
+            }
             unit.dependencies.push(UnitDep {
                 index: *index,
                 extern_crate_name: name.clone(),
@@ -972,6 +998,74 @@ fn attach_std(graph: &mut schema::UnitGraph, roots: &[(String, usize)], built_fo
             });
         }
     }
+}
+
+/// Whether `unit` builds a program that blaze runs on the daemon's code memory in a dev build,
+/// and so gets the dev runtime ([`DEV_RUNTIME`]): a test, in libtest's harness or not, or a
+/// binary or example program. Never a build script, which blaze runs from its file.
+fn dev_executable(unit: &Unit) -> bool {
+    !unit.is_std
+        && match unit.mode {
+            Mode::Test => true,
+            Mode::Build => !unit.target.is_custom_build() && unit.target.crate_types.iter().any(|it| it == "bin"),
+            _ => false,
+        }
+}
+
+/// By unit of `graph` (the build's own, before std is merged): whether the program it builds
+/// links blaze's dev runtime itself, a package of the build's named as [`DEV_RUNTIME`] is
+/// (`blaze-inproc-rt`, which `blaze-inproc` and `blaze-live` depend on) among the units it
+/// links. Build scripts and proc macros are not linked into it, so their dependencies are not
+/// followed. A unit graph has no cycle; one would be followed once.
+fn links_dev_runtime(graph: &schema::UnitGraph, packages: &BySpec<'_>) -> Vec<bool> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Seen {
+        Not,
+        On,
+        Done(bool),
+    }
+    let is_runtime = |name: &str| {
+        name.len() == DEV_RUNTIME.len()
+            && name.bytes().zip(DEV_RUNTIME.bytes()).all(|(it, want)| it == want || (it == b'-' && want == b'_'))
+    };
+    let linked = |unit: &Unit| {
+        unit.mode != Mode::RunCustomBuild && !unit.target.is_custom_build() && !unit.target.is_proc_macro()
+    };
+    let units = &graph.units;
+    // alloc: one mark a unit, once per load
+    let mut seen = vec![Seen::Not; units.len()];
+    // alloc: the walk's path, once per load
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for start in 0..units.len() {
+        if seen[start] != Seen::Not {
+            continue;
+        }
+        seen[start] = Seen::On;
+        stack.push((start, 0));
+        while let Some(&(at, next)) = stack.last() {
+            let unit = &units[at];
+            if let Some(dep) = unit.dependencies.get(next) {
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
+                if seen[dep.index] == Seen::Not && linked(&units[dep.index]) {
+                    seen[dep.index] = Seen::On;
+                    stack.push((dep.index, 0));
+                }
+                continue;
+            }
+            let own = !unit.is_std
+                && packages.get(unit.pkg_id.as_str()).is_some_and(|(id, _)| is_runtime(id.name().as_str()));
+            let reached = own
+                || unit
+                    .dependencies
+                    .iter()
+                    .any(|dep| linked(&units[dep.index]) && seen[dep.index] == Seen::Done(true));
+            seen[at] = Seen::Done(reached);
+            stack.pop();
+        }
+    }
+    seen.into_iter().map(|it| it == Seen::Done(true)).collect()
 }
 
 /// The units of a foreign workspace as its ask says: every one `is_std` when asked, the

@@ -17,8 +17,8 @@ blaze-hash.workspace = true
 tracing.workspace = true
 
 # locals deps
-tt = { workspace = true, optional = true }
-syntax = { workspace = true, optional = true }
+tt.workspace = true
+syntax.workspace = true
 intern.workspace = true
 
 [dev-dependencies]
@@ -27,15 +27,6 @@ hegeltest.workspace = true
 
 # local deps
 syntax-bridge.workspace = true
-
-# tt and syntax are needed for testing
-cfg = { workspace = true, features = ["tt", "syntax"] }
-
-[features]
-default = []
-syntax = ["dep:syntax"]
-tt = ["dep:tt"]
-in-rust-tree = []
 
 [lints]
 workspace = true

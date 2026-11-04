@@ -650,8 +650,6 @@ def ship_code_identities(staged: Path) -> None:
         "--locked",
         "--package",
         "blaze-codegen-code",
-        "--features",
-        "ship",
         "--bin",
         "ship-code-identity",
         "--",

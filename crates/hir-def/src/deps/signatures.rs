@@ -121,6 +121,17 @@ const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
 /// of its modules. An item that cannot be written portably fails the whole part, with why.
 /// Appends to `calls` each macro call a record names.
 pub(crate) fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> R<Vec<u8>> {
+    encode_with(db, krate, calls, |item, calls| record_of(db, krate, item, calls))
+}
+
+/// [`encode`], each item's record written by `record_of`: the one layout of the part, which a
+/// test hands a record that differs from the item's own.
+fn encode_with(
+    db: &Db,
+    krate: Crate,
+    calls: &mut Vec<MacroCallId>,
+    mut record_of: impl FnMut(Item, &mut Vec<MacroCallId>) -> R<Vec<u8>>,
+) -> R<Vec<u8>> {
     let items = items(db, krate);
     let mut keyed = Vec::with_capacity(items.len());
     for item in items {
@@ -139,7 +150,7 @@ pub(crate) fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> R<V
     // alloc: the error that fails the part.
     let place = |it: usize| u32::try_from(it).map_err(|_| "a part of 4 GiB or more".to_owned());
     for &(_, item) in &keyed {
-        let record = record_of(db, krate, item, calls)
+        let record = record_of(item, calls)
             // alloc: the error that fails the part.
             .map_err(|why| format!("the signature of {item:?}: {why}"))?;
         let at = out.bytes.len().next_multiple_of(ALIGN);
@@ -442,7 +453,8 @@ fn read<S: Sig>(
 fn corrupt(db: &Db, krate: Crate, item: Item, why: &str) -> ! {
     panic!(
         "the image of crate {} is corrupt: the signature of {item:?}: {why}; its bytes were \
-         checked against their key, so an encoding wrote what it does not read",
+         checked against their key, so an encoding wrote what it does not read or the key left \
+         out an input the bytes depend on",
         krate.named(db)
     )
 }

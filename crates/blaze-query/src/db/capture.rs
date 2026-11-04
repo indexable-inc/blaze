@@ -198,17 +198,29 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
         }
         let start = capture.edges_start as usize;
         let number = storage.push_capture(local.capture_entries(start), owner);
+        // Its run's count stops rising here: the dedup below lowers it.
+        let (_, note) = local.note_peak(capture.frame as usize);
+        let before = local.edges.len();
         local.dedup_from(start);
+        local.frames[capture.frame as usize].dropped += (before - local.edges.len()) as u64;
         local.mark_capture(start, number);
         let edges = &local.edges[start..];
         let durability = u32::from(durability.min(2));
-        Some(Reads {
-            capture: number,
-            len: edges.len() as u32,
-            view: storage.view_bits(),
-            changed: changed | (durability << DURABILITY_SHIFT),
-            summary: or(replayed, storage.summary_of_edges(edges)),
-        })
+        Some((
+            Reads {
+                capture: number,
+                len: edges.len() as u32,
+                view: storage.view_bits(),
+                changed: changed | (durability << DURABILITY_SHIFT),
+                summary: or(replayed, storage.summary_of_edges(edges)),
+            },
+            note,
+        ))
+    });
+    let reads = reads.map(|(reads, note)| {
+        // The run is on top again: a new mark names it.
+        super::noted(storage, note);
+        reads
     });
     (value, reads)
 }
@@ -222,16 +234,14 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
 pub fn replay_reads<D: Database>(db: &D, reads: Reads) {
     let storage = db.storage();
     reads.check_view(storage);
-    let over = local::with(|local| {
-        let Some(frame) = local.recording(storage) else { return false };
+    let note = local::with(|local| {
+        let Some(frame) = local.recording(storage) else { return local::Note::Fine };
         frame.durability = frame.durability.min(reads.durability());
         frame.changed = frame.changed.max(reads.changed());
         frame.summary = or(frame.summary, reads.summary);
         local.replay(storage, reads.capture)
     });
-    if over {
-        super::runaway_reads(storage);
-    }
+    super::noted(storage, note);
 }
 
 /// Appends to `out` the tracing text `write` writes: a span's name (`hir_def::span_names`).

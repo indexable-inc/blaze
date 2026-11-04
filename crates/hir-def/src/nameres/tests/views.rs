@@ -177,5 +177,5 @@ fn in_file() {
     assert_eq!(seen.in_macro, 1);
     // The bodies of `in_inline`, `in_file` and `with_block`, its inner block, and `deeper`.
     assert_eq!(seen.block, 5);
-    expect_file!["views_definition_source.txt"].assert_eq(&out);
+    expect_file!["views_definition_source.txt"].assert_eq(&fixture::stable_ids(&out));
 }

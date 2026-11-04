@@ -92,8 +92,8 @@ jobs:
       # library from the release's assets (the step `Standard library` below; shipped.rs).
       - if: github.ref_type == 'tag'
         run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-      # No build cache: release binaries come from a clean build. With the `llvm` feature, so
-      # every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
+      # No build cache: release binaries come from a clean build. With LLVM, as every native
+      # blaze has (blaze-engine's default `native`), so every user gets the LLVM tiers: build_release.py fetches the LLVM llvm.json pins and
       # links it in statically, and refuses a binary that loads libLLVM or a C++ runtime. The recipe the flake's build runs too, with the profile tools/pgo/profiles.json pins; a
       # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
       # since the pgo workflow last ran).

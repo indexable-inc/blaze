@@ -47,6 +47,7 @@ pub(super) fn every_kind() -> Vec<Fact> {
         Fact::Target(id(6)),
         Fact::Crate(id(7)),
         Fact::HiddenTypes(b),
+        Fact::RpititTys(a),
     ]
 }
 
@@ -87,7 +88,8 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         | Fact::Specializes(it)
         | Fact::DropCheck(it)
         | Fact::Derive(it)
-        | Fact::HiddenTypes(it) => (it.0, None, None),
+        | Fact::HiddenTypes(it)
+        | Fact::RpititTys(it) => (it.0, None, None),
         Fact::Target(it) | Fact::Crate(it) => (it, None, None),
     };
     (fact.kind().0, parts)

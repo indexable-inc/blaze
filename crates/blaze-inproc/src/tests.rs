@@ -10,7 +10,7 @@ use crate::frame::{self, FrameError, Header, Kind, Reader, Writer, kinds};
 use crate::handshake::{
     Grant, Hello, Lookup, MOST_BINDS, MOST_NAME, OVERLAY_BYTES, Overlay, Place, VERSION, hex, host_var, unhex,
 };
-use crate::image::tests::{R, RX, elf};
+use crate::image::testing::{R, RX, elf};
 use crate::sys::Rights;
 use crate::{Access, CodeMemory, CodeRange, Format, ImageWrite, Layout, Segment};
 

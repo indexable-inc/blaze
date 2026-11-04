@@ -55,8 +55,13 @@ pub(crate) fn is_path(package: &PackagePlan) -> bool {
     package.is_member || package.source.as_deref().is_some_and(|it| !it.contains("://"))
 }
 
-/// The unit's root file, absolute and `/`-separated, as the mounts name paths.
-pub(crate) fn src_path(unit: &Unit, what: &str) -> Result<String, LowerError> {
+/// The unit's root file as cargo passes it to rustc: absolute and `/`-separated, its `.`s and
+/// `..`s kept. cargo's `src_path` is the package's directory joined with `[lib] path` as
+/// written, and rustc names the crate's files from it (`file!()`, panic and `#[track_caller]`
+/// locations, debug info): a root of `path = "../../library/x/src/lib.rs"` names its module
+/// `more` `crates/x/../../library/x/src/more.rs`. Only naming reads it; [`src_path`] finds the
+/// file.
+pub(crate) fn spelled_src_path(unit: &Unit, what: &str) -> Result<String, LowerError> {
     let Some(path) = unit.target.src_path.to_str() else {
         return Err(LowerError::at(
             format!("the root file of {what} is not a UTF-8 path"),
@@ -67,6 +72,14 @@ pub(crate) fn src_path(unit: &Unit, what: &str) -> Result<String, LowerError> {
         true => path.replace('\\', "/"),
         false => path.to_owned(),
     })
+}
+
+/// [`spelled_src_path`] normal (`.` and `..` taken out), as the mounts and the source roots name
+/// paths: as cargo spells it, a root outside the package keeps its `..`s, which by its bytes is
+/// under the package's own directory and by its name in no source root. `..` is taken out by
+/// the text, as the front end resolves `mod` and `#[path]` and as `files::follow` does.
+pub(crate) fn src_path(unit: &Unit, what: &str) -> Result<String, LowerError> {
+    Ok(files::normalize(&spelled_src_path(unit, what)?))
 }
 
 /// blaze's rustc's version (`1.101.0-nightly`), which the front end gates nightly behavior on.

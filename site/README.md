@@ -59,6 +59,13 @@ uv run --script renderer/fetch.py --scp HOST:DIR [--port 9999]    # DIR = render
 uv run --script renderer/build.py                                 # with the Rust toolchain, clang and wasm-opt
 ```
 
+## Code graph (`/graph`)
+
+`graph/`: a standalone page, not a Flecs page: blaze's symbols and their relations (from `blaze index`; a hand-made
+sample until then) as a live force-directed graph on WebGPU. `gen/build.ts` builds it into `dist/graph.html` and
+`dist/graph/`; the worker sends it a CSP that lets it compile its layout simulation's wasm. `graph/README.md` has the
+rest, `graph/schema.ts` the file format.
+
 ## Commands
 
 ```

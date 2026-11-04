@@ -237,7 +237,8 @@ fn split(fact: &Fact) -> (u8, ContentId, Object) {
         | Fact::Specializes(it)
         | Fact::DropCheck(it)
         | Fact::Derive(it)
-        | Fact::HiddenTypes(it) => (tag, it.0, Object::None),
+        | Fact::HiddenTypes(it)
+        | Fact::RpititTys(it) => (tag, it.0, Object::None),
         Fact::Field { ty, field } => (tag, ty.0, Object::Field(field)),
         Fact::Method { self_ty, name } => (tag, self_ty.0, Object::Id(name.0)),
         Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {
@@ -280,6 +281,7 @@ fn joined(tag: u8, subject: ContentId, object: Object) -> Option<Fact> {
         kinds::TARGET => return alone(Fact::Target(subject)),
         kinds::CRATE => return alone(Fact::Crate(subject)),
         kinds::HIDDEN_TYPES => return alone(Fact::HiddenTypes(item)),
+        kinds::RPITIT_TYS => return alone(Fact::RpititTys(item)),
         _ => return None,
     })
 }

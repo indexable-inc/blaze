@@ -51,9 +51,9 @@ program's peak and size.
 than in the first by more than the threshold, was built by cargo where the daemon built it,
 was linked again where it was added, or is missing. Differences under 50 ms are not counted.
 
-The blaze of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm, a blaze built with
-`--features llvm`). A backend is a profile, as v2 picks it: `cranelift` builds the dev profile,
-`llvm` the release profile (`--release`), on both sides.
+Both backends run one blaze, `BLAZE_BIN`, which has LLVM as every native blaze does. A backend
+is a profile, as v2 picks it: `cranelift` builds the dev profile, `llvm` the release profile
+(`--release`), on both sides.
 """
 import csv, glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
@@ -429,8 +429,8 @@ FLOOR_SECS = 0.05
 
 
 def blaze_of(backend):
-    if backend == "llvm":
-        return os.environ.get("BLAZE_LLVM_BIN") or os.path.join(ROOT, "target-llvm/release/blaze-engine")
+    """The blaze `backend` is measured with: the one blaze for both, a backend being a profile."""
+    del backend
     return blaze_cli.BLAZE
 
 

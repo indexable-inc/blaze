@@ -37,7 +37,7 @@ pub mod live;
 pub mod observe;
 pub mod place;
 pub mod perf;
-#[cfg(feature = "pprof")]
+#[cfg(feature = "native")]
 pub mod pprof;
 pub mod print;
 pub mod reach;
@@ -124,13 +124,17 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     _ = blaze_profile::flight::count_cpu(blaze_profile::thread_cpu);
     let words = words(args);
     if words.first().is_some_and(|it| it == "serve") {
-        #[cfg(feature = "daemon")]
+        #[cfg(feature = "native")]
         return crate::serve::main(words.into_iter().skip(1));
-        #[cfg(not(feature = "daemon"))]
+        #[cfg(not(feature = "native"))]
         {
             eprint!("{}", say::error(&format!("blaze serve: {}", daemon::NO_DAEMON), auto_color()));
             return ended(Exit::Failed.code());
         }
+    }
+    // A test executable started through this blaze, to run as the process the daemon launched.
+    if words.first().is_some_and(|it| it == run::TRAMPOLINE) {
+        return ended(run::trampoline(words.into_iter().skip(1), auto_color()));
     }
     ended(command(words))
 }
@@ -215,11 +219,11 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Why(words) => observe::why(words, auto_color()),
         Asked::Reach(words) => reach::main(words, auto_color()),
         Asked::Slow(words) => observe::slow(words, auto_color()),
-        #[cfg(feature = "pprof")]
+        #[cfg(feature = "native")]
         Asked::Pprof(words) => pprof::main(words, auto_color()),
-        #[cfg(not(feature = "pprof"))]
+        #[cfg(not(feature = "native"))]
         Asked::Pprof(_) => said(Err(anyhow::anyhow!(
-            "blaze pprof: this blaze is built without blaze-cargo's `pprof` feature (the seed profile, docs/future/bootstrap.md)"
+            "blaze pprof: this blaze is built without blaze-cargo's `native` feature (the seed profile, docs/future/bootstrap.md)"
         ))),
         Asked::Perf(words) => perf::main(words, auto_color()),
         Asked::Clean(words) => clean::main(words, auto_color()),
@@ -340,7 +344,8 @@ fn cargo(asked: &Invocation) -> i32 {
         Err(error) => return refused(&format!("{error:#}"), color),
     };
     let stats = std::env::var_os("BLAZE_STATS").is_some();
-    let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color, stats };
+    let fixing = pinned.is_some();
+    let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color, stats, fixing };
     // On a terminal, `test` draws its live view, whose screen thread writes stderr: the locks
     // below are taken only off that path.
     if live::wanted(asked, shown) {

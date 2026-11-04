@@ -22,7 +22,7 @@
 
 use blaze_codegen::Arch;
 use blaze_graph::par;
-use blaze_live::patch::exec;
+use blaze_live::patch::{ARCH_AARCH64, ARCH_X86_64, exec, slot_stub_bytes};
 
 use crate::model::Apply;
 
@@ -34,13 +34,15 @@ pub(crate) struct StubFixup {
     pub addend: i64,
 }
 
-/// The size of one slot's stub.
+/// The size of one slot's stub: the dev runtime's (`blaze_inproc_rt::live::slot_stub_bytes`),
+/// which a profiler in the run reads stubs by.
 pub(crate) fn stub_size(arch: Arch) -> u64 {
-    match arch {
-        Arch::X86_64 => 16,
-        Arch::Aarch64 => 24,
-        Arch::Wasm32 | Arch::Wasm64 => 0,
-    }
+    let live = match arch {
+        Arch::X86_64 => ARCH_X86_64,
+        Arch::Aarch64 => ARCH_AARCH64,
+        Arch::Wasm32 | Arch::Wasm64 => return 0,
+    };
+    slot_stub_bytes(live).unwrap_or_else(|| unreachable!("the dev runtime sizes the stubs of {arch:?}"))
 }
 
 /// `mov r11, [rip + cell]; jmp [r11 + disp32]; int3; int3`, the displacement at 10.
@@ -551,6 +553,23 @@ mod tests {
                 tp: None,
             };
             apply(fixup.apply, &ctx, &mut code[fixup.at as usize..]).unwrap();
+        }
+    }
+
+    /// Every form of stub `write_stub` makes reads back as its slot by the dev runtime's
+    /// decoder (`blaze_inproc_rt::live::stub_slot`), which a profiler in the run names a
+    /// function pointer by: the two stay one encoding.
+    #[test]
+    fn each_stub_reads_back_as_its_slot() {
+        use blaze_live::patch::stub_slot;
+        // Each AArch64 form's ends: one load, an `add` and a load, `movz`/`movk`.
+        let slots = [0, 1, 4095, 4096, (1 << 21) - 1, 1 << 21, (1 << 26) - 1];
+        for (arch, live) in [(Arch::X86_64, ARCH_X86_64), (Arch::Aarch64, ARCH_AARCH64)] {
+            for slot in slots {
+                let (code, _) = stub(arch, slot);
+                assert_eq!(stub_slot(live, &code), Some(slot), "{arch:?} slot {slot}");
+            }
+            assert_eq!(stub_slot(live, &vec![0; stub_size(arch) as usize]), None, "{arch:?}: zeros are no stub");
         }
     }
 

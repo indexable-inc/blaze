@@ -81,51 +81,6 @@ fn roots<'db>(
     roots
 }
 
-/// `out` with each raw interned id renumbered, per id type, in the order the answers first name
-/// it: `Crate(Id(10240))` is `Crate(Id(#0))`, `FunctionId(8c03)` is `FunctionId(#0)`. A raw id is
-/// its place in interning order, which anything interned before it moves; which answers name
-/// the same id is what the stored files hold.
-fn stable_ids(out: &str) -> String {
-    use std::fmt::Write as _;
-    let mut labels = blaze_hash::HashMap::<(&str, &str), usize, std::alloc::Global>::default();
-    let mut counts = blaze_hash::HashMap::<&str, usize, std::alloc::Global>::default();
-    let mut result = String::with_capacity(out.len());
-    let (mut at, mut copied) = (0, 0);
-    while let Some(found) = out[at..].find("Id(") {
-        let open = at + found + 2;
-        let name_start = out[..open]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map_or(0, |it| it + 1);
-        let name = &out[name_start..open];
-        let end = out[open + 1..].find(|c: char| !c.is_ascii_hexdigit()).map(|it| open + 1 + it);
-        match end {
-            Some(end) if end > open + 1 && out[end..].starts_with(')') => {
-                let raw = &out[open + 1..end];
-                let label = *labels.entry((name, raw)).or_insert_with(|| {
-                    let count = counts.entry(name).or_default();
-                    *count += 1;
-                    *count - 1
-                });
-                result.push_str(&out[copied..=open]);
-                write!(result, "#{label}").unwrap();
-                copied = end;
-                at = end;
-            }
-            _ => at = open + 1,
-        }
-    }
-    result.push_str(&out[copied..]);
-    result
-}
-
-#[test]
-fn stable_ids_renumber_by_first_use() {
-    assert_eq!(
-        stable_ids("Crate(Id(10240)) FileId(EditionedFileId(Id(13312))) Crate(Id(10240)) FunctionId(8c03) Idx::<FieldData>(0) FunctionId(\"f\")"),
-        "Crate(Id(#0)) FileId(EditionedFileId(Id(#1))) Crate(Id(#0)) FunctionId(#0) Idx::<FieldData>(0) FunctionId(\"f\")",
-    );
-}
-
 /// One line of a stored answer: what was asked, of the node at `range` in `file`.
 fn line(out: &mut String, file: HirFileId, range: syntax::TextRange, what: &str, answer: impl std::fmt::Debug) {
     use std::fmt::Write as _;
@@ -160,7 +115,7 @@ fn to_def_of_every_node() {
             }
         }
         assert!(checked > 60, "the fixture has defs of every kind, {checked} checked");
-        expect_file!["expect/to_def.txt"].assert_eq(&stable_ids(&out));
+        expect_file!["expect/to_def.txt"].assert_eq(&fixture::stable_ids(&out));
     });
 }
 
@@ -190,7 +145,7 @@ fn ancestors_ranges_and_scopes_of_every_node() {
                 );
             }
         }
-        expect_file!["expect/ancestors_ranges_scopes.txt"].assert_eq(&stable_ids(&out));
+        expect_file!["expect/ancestors_ranges_scopes.txt"].assert_eq(&fixture::stable_ids(&out));
     });
 }
 
@@ -269,7 +224,7 @@ fn types_and_resolutions_of_every_node() {
             }
         }
         assert!(exprs > 50 && paths > 30, "{exprs} expressions, {paths} paths");
-        expect_file!["expect/types_resolutions.txt"].assert_eq(&stable_ids(&out));
+        expect_file!["expect/types_resolutions.txt"].assert_eq(&fixture::stable_ids(&out));
     });
 }
 
@@ -296,7 +251,7 @@ fn descending_every_token() {
             line(&mut out, file_id.into(), token.text_range(), &what, views);
         }
         assert!(into_macros >= 3, "the tokens of `id!` and `make_fn!` descend, {into_macros} did");
-        expect_file!["expect/descend.txt"].assert_eq(&stable_ids(&out));
+        expect_file!["expect/descend.txt"].assert_eq(&fixture::stable_ids(&out));
     });
 }
 
@@ -373,7 +328,7 @@ fn source_view_of_every_def() {
             }
         }
         assert!(checked > 20, "{checked} defs checked");
-        expect_file!["expect/source_view.txt"].assert_eq(&stable_ids(&out));
+        expect_file!["expect/source_view.txt"].assert_eq(&fixture::stable_ids(&out));
     });
 }
 

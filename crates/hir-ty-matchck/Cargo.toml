@@ -34,8 +34,5 @@ blaze-alloc-count.workspace = true
 hir-ty-mir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
-[features]
-in-rust-tree = ["hir-ty/in-rust-tree"]
-
 [lints]
 workspace = true

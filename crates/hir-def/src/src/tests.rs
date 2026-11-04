@@ -193,7 +193,7 @@ fn child_source_view() {
         "the fixture's children: 10 fields, 10 type or const parameters (with `Tr`'s `Self`) and \
          7 lifetimes"
     );
-    expect_file!["child_source_view.txt"].assert_eq(&out);
+    expect_file!["child_source_view.txt"].assert_eq(&fixture::stable_ids(&out));
 }
 
 /// Each use tree of each import (numbered in the order [`defs`] walks them): the arena of
@@ -221,5 +221,5 @@ fn use_tree_views() {
         }
     }
     assert_eq!(seen, 7, "the fixture's use trees");
-    expect_file!["use_tree_views.txt"].assert_eq(&out);
+    expect_file!["use_tree_views.txt"].assert_eq(&fixture::stable_ids(&out));
 }

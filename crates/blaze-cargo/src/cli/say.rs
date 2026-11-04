@@ -240,14 +240,16 @@ pub struct Warned {
     pub total: u32,
     pub duplicates: u32,
     /// The warnings with a machine-applicable suggestion; `None` once the unit has an error,
-    /// which takes `cargo fix`'s hint away.
+    /// which takes the `blaze check --fix` hint away.
     pub fixable: Option<u32>,
 }
 
-/// `` `foo` (lib) generated 2 warnings (1 duplicate) (run `cargo fix --lib -p foo` to apply 1
-/// suggestion) ``: what follows `warning:` for a unit with warnings, `None` for one without
-/// (`JobQueue::report_warning_count`). The hint is for a local unit that is no build script,
-/// and always names the package (cargo since "fix(check): ... always using -p").
+/// `` `foo` (lib) generated 2 warnings (1 duplicate) (run `blaze check --fix --lib -p foo` to
+/// apply 1 suggestion) ``: what follows `warning:` for a unit with warnings, `None` for one
+/// without (`JobQueue::report_warning_count`). The hint is for a local unit that is no build
+/// script, and always names the package (cargo since "fix(check): ... always using -p"). It
+/// names blaze's own command, which makes the suggestions blaze gave, never `cargo fix`, which
+/// would run rustc for its own (useful-not-parity).
 pub fn generated<'a>(package: &str, target: impl Into<Named<'a>>, test: bool, local: bool, warned: Warned) -> Option<String> {
     let target = target.into();
     let mut out = String::with_capacity(package.len() * 2 + target.name.len() + 96);
@@ -282,7 +284,7 @@ pub fn generated_into<'a>(
         && local
         && target.kind != TargetKind::CustomBuild
     {
-        out.push_str(" (run `cargo fix --");
+        out.push_str(" (run `blaze check --fix --");
         target_named_into(out, target);
         out.push_str(" -p ");
         out.push_str(package);

@@ -20,7 +20,8 @@ doctest = false
 syntax.workspace = true
 
 [features]
-# `SOURCE`, the crate's own files, for a host to put in a const macro's crate graph.
+# `SOURCE`, the crate's own files, for a host to put in a const macro's crate graph (hir-ty-mir
+# turns it on). Off in that graph itself, where this source is what the const evaluator runs.
 source = []
 
 [lints]

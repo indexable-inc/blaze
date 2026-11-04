@@ -37,7 +37,7 @@
 //! again), so no patch message lists it, and blaze-live's switch (`slots/switch.rs`) stores
 //! only the slots whose cell differs between the two generations' tables. A switch to a patch
 //! and back keeps every placed slot's published target, in the loader's table and in each pool
-//! table, where blaze-live's `slots::exec::publish` stored it ([`Slots`]). The counter pairs
+//! table, where the dev runtime's `blaze_inproc_rt::live::log::publish` stored it ([`Slots`]). The counter pairs
 //! the placer gives are carried into a commit staged before them ([`Image::commit`]).
 
 #![forbid(unsafe_code)]
@@ -151,8 +151,8 @@ fn name_addr(image: &Image, name: &str) -> Option<u64> {
 }
 
 /// Where a placement publishes a slot's code: every run process of the code memory stores
-/// `target` in `slot` by blaze-live's `slots::exec::publish(slot, target)` in the run process,
-/// which owns its tables: the loader's and each table of the switch's pool, each by one
+/// `target` in `slot` by the dev runtime's `blaze_inproc_rt::live::log::publish(slot, target)`
+/// in the run process, which owns its tables: the loader's and each table of the switch's pool, each by one
 /// release store, never the execution log's table, so an armed log's stub stays in place and
 /// the function's first call is still logged (fastcompile-ident-select 9). A process that
 /// starts later stores it before it runs. Returns once every running process has stored it:

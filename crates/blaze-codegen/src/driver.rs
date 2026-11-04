@@ -210,7 +210,7 @@ pub struct Built {
     /// and, in a build that links none, makes every crate but the library's the workspace's.
     pub editable: Vec<InstanceKey>,
     /// Of each of [`Built::inputs`], in its order, what test selection keys it by: what it is
-    /// across versions and its code as it runs ([`crate::exec::fn_id`], `exec::bound`). A bound its item has none of is the error a test binary's
+    /// across versions ([`subject`] with its settings) and its code as it runs ([`crate::exec::fn_id`], `exec::bound`). A bound its item has none of is the error a test binary's
     /// [`crate::exec::ExecTable`] names, and no build's but its.
     pub versions: Vec<(ContentId, Result<ContentId, String>)>,
     /// A digest of each function, static and debug name, made with it ([`Digests`]).
@@ -221,7 +221,7 @@ pub struct Built {
     /// ([`Memo::retain`]).
     pub memo_used: Vec<ContentId>,
     /// Every instance the walk reached by key, with what it is across edits of its body and
-    /// its settings ([`Described::identity`]), and each folded group's body with one made of
+    /// its settings, told apart from instances side by side ([`subject`]), and each folded group's body with one made of
     /// its members' identities: what a profile of an earlier build names it by
     /// (docs/v2/plan/lanes/layout/layout.md).
     pub identities: Vec<(InstanceKey, ContentId)>,
@@ -305,6 +305,13 @@ struct FnNode<I, S> {
     instance: I,
     /// Whose code the walk first asked for it as: what describing it again takes.
     requester: Origin,
+    /// The least origin of every describe the walk keyed to it: what tells it apart
+    /// ([`subject`]: its live slot, its test binary's table) from an instance of the same
+    /// identity compiled for another origin. Each origin's describe of one instance gives one key, so
+    /// two keys of one identity have no origin in common and so two least ones; the least,
+    /// never `described.origin` (the describe kept, which a merge may swap), so it is the
+    /// same whichever describe came first.
+    least_origin: Origin,
     described: Described<I, S>,
     /// [`digests::debug_name_digest`] of `described.name`, made where it is described.
     name_digest: ContentId,
@@ -427,7 +434,29 @@ pub(crate) fn place_kind(target: &Target) -> u8 {
     }
 }
 
-const FOLDED_IDENTITY_DOMAIN: &str = "blaze v2 folded identity 1";
+const FOLDED_IDENTITY_DOMAIN: &str = "blaze v2 folded identity 2";
+pub const SUBJECT_DOMAIN: &str = "blaze v2 subject 1";
+
+/// What a function is across edits of its body, telling apart instances side by side: its
+/// identity ([`Described::identity`]: item, which instance, type arguments) and whose code it
+/// is compiled as. The one ID of that concept: the live image's slots
+/// ([`Built::identities`]), a layout profile's and perf map's names, a folded group's
+/// members, what `blaze why` compares a dev template by, and, with its settings, test
+/// selection's ([`crate::exec::fn_id`]).
+///
+/// The identity alone does not tell instances apart: a generic asked for by a member and by
+/// a dependency is one identity, but its key's arguments and code are each asker's (what its
+/// origin's units build bodies with and tell a debugger, what its origin builds in), so it can
+/// be two keys, each with its own slot (`blaze_radix::Parts<..>::write` in `hir-def`'s tests,
+/// arrayvec's `CapacityError<&[u8; 1024]>::new` in `blaze-profile`'s). Not its settings, so a
+/// settings change is named as one ("its codegen settings") rather than read as a first
+/// compute, and a live slot keeps its function across one.
+pub fn subject(identity: ContentId, origin: Origin) -> ContentId {
+    let mut hasher = Hasher::new(SUBJECT_DOMAIN);
+    hasher.id(&identity);
+    origin.hash_into(&mut hasher);
+    hasher.finish()
+}
 pub const GROUP_FLIGHT_DOMAIN: &str = "blaze v2 group flight 2";
 
 /// What a folded group's merge flies under ([`crate::flight`]): its key, and each member with
@@ -455,22 +484,10 @@ impl<I, S> FnNode<I, S> {
         dev_template_key(&self.unit.instance, &self.built_in, &self.refs, &self.spec.toolchain.id)
     }
 
-    /// What it is across edits of its body within one build, telling apart instances side by
-    /// side: its identity ([`Described::identity`]: item, which instance, type arguments) and
-    /// whose code it is. Not its settings, so a settings change is named as one ("its codegen
-    /// settings") rather than read as a first compute; one build with one function at two
-    /// settings in one unit is refused as computed twice. What `blaze why` compares it by.
+    /// What it is across edits of its body, telling apart instances side by side
+    /// ([`subject`]), of its least origin ([`FnNode::least_origin`]).
     fn subject(&self) -> ContentId {
-        let mut hasher = blaze_ids::Hasher::new("blaze v2 why dev template subject 2");
-        hasher.id(&self.described.identity);
-        let (tag, package) = match self.described.origin {
-            Origin::Member(it) => (0u8, it.as_str()),
-            Origin::Dependency(it) => (1, it.as_str()),
-            Origin::BuildTime(it) => (2, it.as_str()),
-            Origin::Std => (3, ""),
-        };
-        hasher.update(&[tag]).update(&(package.len() as u64).to_le_bytes()).update(package.as_bytes());
-        hasher.finish()
+        subject(self.described.identity, self.least_origin)
     }
 
     /// Why its dev template under `at` ([`Self::template_key`]) was not in the store, as its
@@ -1439,6 +1456,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             // clone: per build, the walk's handle of the instance
             instance: instance.clone(),
             requester,
+            least_origin: described.origin,
             name_digest: digests::debug_name_digest(&described.name),
             described,
             // alloc: none, empty until the walk resolves them
@@ -1611,8 +1629,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                                     new.refs.len(),
                                 ),
                             ));
-                        } else if new.owner < kept.owner {
-                            it.insert(node);
+                        } else {
+                            let least = it.get().least_origin.min(node.least_origin);
+                            if new.owner < kept.owner {
+                                it.insert(node);
+                            }
+                            it.get_mut().least_origin = least;
                         }
                     }
                 }
@@ -2148,7 +2170,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             .collect();
         // alloc: per build, what it gives the linker's address map
         let mut identities: Vec<(InstanceKey, ContentId)> =
-            nodes.iter().map(|(key, node)| (*key, node.described.identity)).collect();
+            nodes.iter().map(|(key, node)| (*key, node.subject())).collect();
         identities.append(&mut out.folded);
         // alloc: per build, what it gives the linker
         let cold = nodes.iter().filter(|it| it.1.described.cold).map(|it| *it.0).collect();
@@ -2165,7 +2187,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // Each instance's two hashes are its own: on every core, in key order.
         // alloc: per build, what it gives the test binary's table
         let versions = par::map(&nodes.values, |node| {
-            let id = crate::exec::fn_id(node.described.identity, node.unit.instance.settings);
+            let id = crate::exec::fn_id(node.subject(), node.unit.instance.settings);
             let item_of = |key: &InstanceKey| nodes.get(key).map(|it| it.unit.item);
             (id, crate::exec::bound(&node.described.bound, &node.refs, item_of))
         });
@@ -2595,7 +2617,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut merging = Vec::new();
         for group in groups {
             let key = group.key();
-            out.folded.push((key, folded_identity(group.members.iter().map(|it| nodes[it].described.identity))));
+            out.folded.push((key, folded_identity(group.members.iter().map(|it| nodes[it].subject()))));
             let first = &nodes[&group.members[0]];
             // alloc: an error
             let decode = |it: &[u8]| blob::decode(it).map_err(|e| e.to_string());

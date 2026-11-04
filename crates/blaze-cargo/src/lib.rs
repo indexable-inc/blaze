@@ -30,8 +30,8 @@ pub mod sandbox;
 /// the store in one loop (docs/v2/plan/lanes/cargo/notes.md section 6).
 #[allow(unsafe_code, reason = "the daemon's own signal and process calls")]
 pub mod serve;
-/// The daemon's sockets: not in the seed, which runs no daemon (the `daemon` feature).
-#[cfg(feature = "daemon")]
+/// The daemon's sockets: not in the seed, which runs no daemon (without the `native` feature).
+#[cfg(feature = "native")]
 pub mod socket;
 pub mod toolchain;
 pub mod unstable;

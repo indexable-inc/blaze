@@ -3,15 +3,16 @@
 work (PGO). The release workflow, the flake's `daemon` and `cargo install` from a checkout all
 build it with this.
 
-  build_release.py --target T [--profdata FILE] [--features F] [--out DIR]
+  build_release.py --target T [--profdata FILE] [--out DIR]
                                                   # the build, into target/T/dist; DIR gets every binary of blaze
   build_release.py --target T --train DIR         # a new profile for T, into DIR (the pgo workflow)
   build_release.py --pin DIR                      # tools/pgo/profiles.json names the profiles in DIR
   build_release.py --target T --show              # the command the build runs, for any other driver
 
-The build is `cargo build -p blaze-engine --profile dist --locked --target T --features llvm` with
-`RUSTFLAGS=-Cprofile-use=<profile>`. The `llvm` feature is part of every build of it, the
-training's included, so that every user gets the LLVM tiers (docs/tiers.md): LLVM is linked in
+The build is `cargo build -p blaze-engine --profile dist --locked --target T` with
+`RUSTFLAGS=-Cprofile-use=<profile>`, blaze-engine's default features: their `native` has LLVM,
+so every build of it has it, the training's included (std and every opt-level 2/3 unit are
+LLVM's): LLVM is linked in
 statically from the build crates/hir-ty-codegen/llvm.json pins, which `LLVM_SYS_231_PREFIX`
 names (the flake's) or, unset, .github/scripts/llvm.py fetches into target/llvm/T. The binaries
 are refused when one loads libLLVM, or on Linux a C++ runtime: a machine that downloads them has
@@ -90,7 +91,7 @@ CRATE = re.compile(rb"Cs([0-9A-Za-z]+)_6blaze")
 # how a binary names the versions it asks for (in its dynamic string table).
 GLIBC = (2, 34)
 GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
-# The LLVM the `llvm` feature links (crates/hir-ty-codegen/build.rs), and the libraries no
+# The LLVM hir-ty-codegen's `llvm` feature links (vendor/llvm-sys/pin.rs), and the libraries no
 # shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
 LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
 NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM")}
@@ -109,9 +110,9 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def recipe(target, rustflags, cflags, features=None, llvm="<LLVM_SYS_231_PREFIX>"):
+def recipe(target, rustflags, cflags, llvm="<LLVM_SYS_231_PREFIX>"):
     """The environment and command of the build for `target`: `cargo build -p blaze-engine --profile
-    dist --features llvm` with `rustflags`, `cflags` for the C code that crates build with `cc`,
+    dist` with `rustflags`, `cflags` for the C code that crates build with `cc`,
     and the LLVM prefix `llvm`. No wrapper
     of rustc: one around the workspace's crates (`blaze enable`'s, nixpkgs' cargo-auditable)
     changes their symbols, and the profile no longer finds them. Cargo hashes the empty
@@ -124,8 +125,7 @@ def recipe(target, rustflags, cflags, features=None, llvm="<LLVM_SYS_231_PREFIX>
            "CARGO_INCREMENTAL": "0", LLVM_PREFIX: str(llvm)}
     for name in ("CFLAGS", "CXXFLAGS"):
         env[f"{name}_{triple}"] = " ".join(filter(None, [os.environ.get(f"{name}_{triple}"), cflags]))
-    return env, ["cargo", "build", "-p", "blaze-engine", "--profile", "dist", "--locked", "--target", target,
-                 "--features", ",".join(["llvm", *filter(None, [features])])]
+    return env, ["cargo", "build", "-p", "blaze-engine", "--profile", "dist", "--locked", "--target", target]
 
 
 def llvm_prefix(target):
@@ -139,10 +139,10 @@ def llvm_prefix(target):
     return prefix
 
 
-def build(target, target_dir, rustflags, cflags, features=None):
+def build(target, target_dir, rustflags, cflags):
     """The build into `target_dir`; the result is the binaries it built (every one of blaze's:
     what ships is all of them) and how many functions LLVM found changed since the profile."""
-    own, argv = recipe(target, rustflags, cflags, features, llvm_prefix(target))
+    own, argv = recipe(target, rustflags, cflags, llvm_prefix(target))
     own["CARGO_TARGET_DIR"] = str(target_dir)
     env = dict(os.environ, **own)
     print("+", " ".join(f"{k}={shlex.quote(v)}" for k, v in own.items()), " ".join(argv), flush=True)
@@ -371,7 +371,6 @@ def main():
     parser.add_argument("--train", type=Path, metavar="DIR", help="train a new profile into DIR")
     parser.add_argument("--pin", nargs="+", metavar="DIR", help="pin the profiles trained into DIR")
     parser.add_argument("--out", type=Path, metavar="DIR", help="copy the binaries into DIR")
-    parser.add_argument("--features", help="cargo features of blaze besides `llvm`, which every build has")
     parser.add_argument("--strict", action="store_true", help="fail when the profile is of other crates (a release)")
     parser.add_argument("--no-pgo", action="store_true", help="build without a profile (releases, while PGO is off)")
     parser.add_argument("--show", action="store_true", help="print the build's environment and command")
@@ -387,12 +386,12 @@ def main():
         return train(args.target, args.train)
     if args.show:
         chosen = pinned(args.target)
-        env, argv = recipe(args.target, f"-Cprofile-use=<{chosen['url']}, sha256 {chosen['sha256']}>", "-fno-profile-use", args.features)
+        env, argv = recipe(args.target, f"-Cprofile-use=<{chosen['url']}, sha256 {chosen['sha256']}>", "-fno-profile-use")
         print(" ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()), " ".join(argv))
         return
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
     if args.no_pgo:
-        binaries, _ = build(args.target, target_dir, "", "", args.features)
+        binaries, _ = build(args.target, target_dir, "", "")
         ship(args, binaries)
         print(f"build_release: {', '.join(b.name for b in binaries)} in {args.out or binaries[0].parent}, "
               "without PGO (--no-pgo)", flush=True)
@@ -402,13 +401,13 @@ def main():
         # harness/toolchain changes on main): a build that is not a release goes without PGO.
         print(f"warning: build_release: {PINS} has profiles of Rust {pins()['toolchain']}, blaze builds with "
               f"{TOOLCHAIN}: built without PGO until the pgo workflow trains on {TOOLCHAIN}", file=sys.stderr, flush=True)
-        binaries, _ = build(args.target, target_dir, "", "", args.features)
+        binaries, _ = build(args.target, target_dir, "", "")
         ship(args, binaries)
         print(f"build_release: {', '.join(b.name for b in binaries)} in {args.out or binaries[0].parent}, "
               "without PGO", flush=True)
         return
     path, chosen = profile(args.target, args.profdata)
-    binaries, stale = build(args.target, target_dir, f"-Cprofile-use={path}", "-fno-profile-use", args.features)
+    binaries, stale = build(args.target, target_dir, f"-Cprofile-use={path}", "-fno-profile-use")
     crate = crate_hash(binaries)
     if crate != chosen.get("crate"):
         said = (f"build_release: this build's crates are not the ones the profile was trained on (blaze is crate "

@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use crate::channel::Channel;
 use crate::fence::Words;
@@ -77,8 +77,8 @@ const S_ASK: usize = 1;
 /// The answer's, likewise.
 const S_ANSWER: usize = 2;
 const S_BODY: usize = 4;
-pub(crate) const WORDS: usize = W_SLOTS + SLOTS * SLOT_WORDS;
-pub(crate) const BYTES: u64 = (WORDS * 8) as u64;
+pub const WORDS: usize = W_SLOTS + SLOTS * SLOT_WORDS;
+pub const BYTES: u64 = (WORDS * 8) as u64;
 
 const FREE: u64 = 0;
 const ASKED: u64 = 1;
@@ -125,20 +125,20 @@ fn get(words: &impl Words, at: usize, out: &mut [u8]) {
 }
 
 /// A new asks object, zero, set up for its run process.
-pub(crate) fn prepare(words: &impl Words) {
+pub fn prepare(words: &impl Words) {
     words.word(W_MAGIC).store(MAGIC, Ordering::Release);
 }
 
 /// Writes what the run process names its bells by ([`sys::Bells::new`]): the doorbell's, then
 /// each slot's. Before the start hook can ask anything.
-pub(crate) fn name_bells(words: &impl Words, names: &[u64]) {
+pub fn name_bells(words: &impl Words, names: &[u64]) {
     for (index, name) in names.iter().take(SLOTS + 1).enumerate() {
         words.word(W_BELLS + index).store(*name, Ordering::Release);
     }
 }
 
 /// Whether `words` is an asks object the daemon set up.
-pub(crate) fn ready(words: &impl Words) -> bool {
+pub fn ready(words: &impl Words) -> bool {
     words.words() >= WORDS && words.word(W_MAGIC).load(Ordering::Acquire) == MAGIC
 }
 
@@ -190,7 +190,7 @@ fn answered(words: &impl Words, index: usize, generation: u64) -> Result<(), u64
 /// [`answered`], spinning for up to `spin` while it is not.
 fn answered_within(words: &impl Words, index: usize, generation: u64, spin: Duration) -> Result<(), u64> {
     let start = Instant::now();
-    let mut relax = blaze_spin::SpinWait::new();
+    let mut relax = Relax::new();
     loop {
         let seen = answered(words, index, generation);
         if seen.is_ok() || start.elapsed() >= spin {
@@ -239,7 +239,7 @@ fn release(words: &impl Words, index: usize, generation: u64) {
 }
 
 /// The run process's ask on `words`, the doorbell `stream`: [`crate::runtime::Attached::request_into`].
-pub(crate) fn request(
+pub fn request(
     words: &impl Words,
     stream: &sys::Stream,
     kind: Kind,
@@ -326,7 +326,7 @@ fn answer_into(words: &impl Words, seq: u32, kind: Kind, body: &[u8]) -> Result<
 
 /// The daemon's side of one run process's asks: its view of the asks object, its bells, and
 /// what ends the process.
-pub(crate) struct Run {
+pub struct Run {
     words: sys::View,
     bells: sys::Bells,
     remote: sys::Remote,
@@ -335,19 +335,19 @@ pub(crate) struct Run {
 }
 
 impl Run {
-    pub(crate) fn new(words: sys::View, bells: sys::Bells, remote: sys::Remote, pid: u32) -> Run {
+    pub fn new(words: sys::View, bells: sys::Bells, remote: sys::Remote, pid: u32) -> Run {
         Run { words, bells, remote, pid, killed: Mutex::new(None) }
     }
 
     /// Ends the process, `why` its run's error (the first one, when ended twice). Only while it
     /// has not been reaped: on macOS the process ID is all the daemon holds of it.
-    pub(crate) fn kill(&self, why: &str) -> Result<(), Error> {
-        self.killed.lock().get_or_insert_with(|| why.to_owned());
+    pub fn kill(&self, why: &str) -> Result<(), Error> {
+        self.killed.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(|| why.to_owned());
         self.remote.kill().map_err(|it| Error::new(format!("ending process {}: {it}", self.pid)))
     }
 
-    pub(crate) fn killed(&self) -> Option<String> {
-        self.killed.lock().clone()
+    pub fn killed(&self) -> Option<String> {
+        self.killed.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 }
 
@@ -362,7 +362,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub(crate) fn new(channel: Channel, run: Arc<Run>) -> Reader {
+    pub fn new(channel: Channel, run: Arc<Run>) -> Reader {
         Reader { channel, run, next: 0, body: Vec::new(), last: None }
     }
 
@@ -370,7 +370,7 @@ impl Reader {
     /// it lives until the next call. Blocks until one comes. An error when the process hung up
     /// (it ended) or wrote an ask no slot holds (end it).
     pub fn recv(&mut self) -> Result<Frame<'_>, Error> {
-        let mut relax = blaze_spin::SpinWait::new();
+        let mut relax = Relax::new();
         loop {
             if let Some((index, generation, kind)) = take(&self.run.words, self.next, &mut self.body)? {
                 self.next = (index + 1) % SLOTS;
@@ -396,7 +396,7 @@ pub struct Sender {
 }
 
 impl Sender {
-    pub(crate) fn new(run: Arc<Run>) -> Sender {
+    pub fn new(run: Arc<Run>) -> Sender {
         Sender { run }
     }
 
@@ -415,5 +415,27 @@ impl Sender {
     /// Ends the run process, `why` its run's error, as `host::Session::kill` does.
     pub fn kill(&self, why: &str) -> Result<(), Error> {
         self.run.kill(why)
+    }
+}
+
+/// A spin whose rounds double up to the longest, never yielding: `blaze_spin::SpinWait::relax`,
+/// which this crate can't depend on (a crate of the standard library's workspace too).
+struct Relax {
+    round: u32,
+}
+
+impl Relax {
+    /// The longest round is `1 << (SPINS - 1)` pauses, as `blaze_spin`'s.
+    const SPINS: u32 = 6;
+
+    fn new() -> Relax {
+        Relax { round: 0 }
+    }
+
+    fn relax(&mut self) {
+        for _ in 0..1u32 << self.round.min(Relax::SPINS - 1) {
+            std::hint::spin_loop();
+        }
+        self.round = self.round.saturating_add(1);
     }
 }

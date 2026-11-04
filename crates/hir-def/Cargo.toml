@@ -72,8 +72,5 @@ hegeltest.workspace = true
 test-utils.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
-[features]
-in-rust-tree = ["hir-expand/in-rust-tree"]
-
 [lints]
 workspace = true

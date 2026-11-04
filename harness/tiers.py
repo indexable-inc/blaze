@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiering end to end (macOS on AArch64, blaze built with `--features llvm`): a program that
+"""Tiering end to end (macOS on AArch64, a native blaze, which has LLVM): a program that
 takes edits runs under the daemon, which samples it and compiles its hot functions again with
 LLVM, swapping them in as patches while it runs (docs/tiers.md).
 

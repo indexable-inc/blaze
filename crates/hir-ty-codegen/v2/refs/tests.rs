@@ -669,7 +669,7 @@ fn extern_and_variadic_calls_list_their_symbols() {
         {
             let Err(e) = code else { panic!("a blaze with no assembler assembled `asm!`") };
             assert!(
-                e.contains("inline assembly for x86_64-") && e.contains("built with no assembler") && e.contains("--features llvm"),
+                e.contains("inline assembly for x86_64-") && e.contains("built with no assembler") && e.contains("blaze-engine's `native`"),
                 "{e}"
             );
         }

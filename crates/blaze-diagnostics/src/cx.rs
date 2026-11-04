@@ -61,6 +61,24 @@ impl<'a> Files<'a> {
         }
     }
 
+    /// The name a span of `file` gives it, `name` the name of its path ([`Files::name`],
+    /// [`Files::relative`]): `name` itself when the front end's text of `file` is the file at
+    /// that path, else `name` with the content ID of the text ([`crate::emit::name_with_id`]),
+    /// as for a crate root blaze appended a module to (a test harness, a wasm proc macro's
+    /// glue), an alias of the file on disk shown by its path. The one place a span's file is
+    /// named for every check and lint, so the text a span is placed in is the text it was made
+    /// against, never the file on disk read by its name (keys-cover-every-input).
+    pub fn of_text(db: &Db, file: FileId, name: String) -> String {
+        if !db.has_file_text(file) {
+            return name;
+        }
+        let text = db.file_text(file);
+        match text.appended_root_module(db) {
+            None => name,
+            Some(_) => crate::emit::name_with_id(&name, text.content(db)),
+        }
+    }
+
     /// The name rustc gives `path`: from `root` when it is below it, as cargo runs rustc there,
     /// else the whole path, as `root` itself keeps it. A root of `""` is none, and keeps every
     /// path whole; under a root of `/` cargo gives rustc paths from `/`, without their `/`.
@@ -256,7 +274,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     pub fn file_name(&self, file: FileId) -> String {
         let outside = || self.db.files().included_source_path(file);
         let name = match self.files.paths.contains_key(&file) {
-            true => self.files.name(file),
+            true => Files::of_text(self.db, file, self.files.name(file)),
             // alloc: a span's file name, made only as a diagnostic is built
             false => match outside() {
                 Some(path) => Files::relative(path.as_str(), self.files.root).to_owned(),

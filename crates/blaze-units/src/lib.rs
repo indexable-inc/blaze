@@ -25,14 +25,11 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 mod graph;
 pub mod index;
 mod order;
-#[cfg(feature = "query")]
 pub mod load;
-#[cfg(feature = "query")]
 pub mod query;
 pub mod read;
 pub mod schema;
 pub mod sources;
-#[cfg(feature = "query")]
 pub mod stdlib;
 
 use blaze_hash::HashMap;

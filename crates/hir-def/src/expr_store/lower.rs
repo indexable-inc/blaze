@@ -70,7 +70,7 @@ use crate::{
     lang_item::{LangItemTarget, LangItems},
     nameres::{DefMap, Hygienic, LocalDefMap, MacroSubNs, block_def_map},
     per_ns::Namespace,
-    signatures::{StructSignature, TypeAliasSignature},
+    signatures::{ImplSignature, StructSignature, TypeAliasSignature},
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
         RefType, TraitBoundModifier, TraitRef, TypeBound, TypeRef, TypeRefId,
@@ -577,7 +577,19 @@ pub(crate) fn lower_function(
             this.lower_type_ref_opt(ret_type.ty(), &mut ImplTraitLowering::Opaque)
         })
     });
-    collector.update_to_late_bound_lifetimes(&expr_collector.named_lifetime_store);
+    // rustc's `has_fully_capturing_opaque`: an `async` or `gen` function returns an opaque
+    // that captures every lifetime in scope (`OpaqueTyOrigin::AsyncFn`), as does an
+    // `impl Trait` without `use<..>` of edition 2024, or of a trait or trait impl.
+    let return_captures_all = fn_.value.async_token().is_some()
+        || fn_.value.gen_token().is_some()
+        || expr_collector.named_lifetime_store.return_opaque_captures_all(|| {
+            match function_id.lookup(db).container {
+                ItemContainerId::TraitId(_) => true,
+                ItemContainerId::ImplId(it) => ImplSignature::of(db, it).target_trait.is_some(),
+                ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => false,
+            }
+        });
+    collector.update_to_late_bound_lifetimes(&expr_collector.named_lifetime_store, return_captures_all);
     let generics = collector.finish();
 
     let return_type = if fn_.value.async_token().is_some() || fn_.value.gen_token().is_some() {
@@ -894,6 +906,11 @@ pub struct NamedLifetimeStore {
     lifetimes_in_where_clause: FxIndexSet<Name>,
     lifetimes_constrained_by_input: FxIndexSet<Name>,
     lifetimes_in_output: FxIndexSet<Name>,
+    /// An `impl Trait` of the return type has no `use<..>` bound: rustc's
+    /// `opaque_captures_all_in_scope_lifetimes` holds of it in a trait or a trait impl.
+    return_opaque_without_use: bool,
+    /// One such is written in edition 2024 or later, where it holds anywhere.
+    return_opaque_2024_without_use: bool,
 }
 
 #[derive(Debug)]
@@ -927,6 +944,14 @@ impl NamedLifetimeStore {
             }
             None => (),
         };
+    }
+
+    /// Whether an `impl Trait` of the return type captures every lifetime in scope, so every
+    /// lifetime counts as in the output (rustc's `has_fully_capturing_opaque` in
+    /// `is_late_bound_map`): one without `use<..>` written in edition 2024 or later, or in a
+    /// function of a trait or a trait impl (`in_trait_or_impl`, asked only when it decides).
+    fn return_opaque_captures_all(&self, in_trait_or_impl: impl FnOnce() -> bool) -> bool {
+        self.return_opaque_2024_without_use || (self.return_opaque_without_use && in_trait_or_impl())
     }
 }
 
@@ -1220,6 +1245,7 @@ impl<'db> ExprCollector<'db> {
                 ty
             }
             ast::Type::ImplTraitType(inner) => {
+                self.note_return_opaque(inner);
                 if self.outer_impl_trait {
                     // Disallow nested impl traits
                     self.alloc_type_ref(TypeRef::Error, ptr)
@@ -1374,6 +1400,29 @@ impl<'db> ExprCollector<'db> {
         impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> Option<PathIdx> {
         super::lower::path::lower_path(self, path, impl_trait_lower_fn)
+    }
+
+    /// Notes an `impl Trait` of a function's return type (or nested in one) that has no
+    /// `use<..>` bound, and whether it is written in edition 2024 or later: rustc's
+    /// `opaque_captures_all_in_scope_lifetimes` goes by the opaque's own span, so one a macro
+    /// of an older edition writes keeps that edition's rule.
+    fn note_return_opaque(&mut self, opaque: ast::ImplTraitType<'_>) {
+        if !matches!(
+            self.named_lifetime_store.lifetime_bound_scope,
+            Some(LifetimeBoundScope::Return | LifetimeBoundScope::ImplTrait { is_argument_scope: false })
+        ) {
+            return;
+        }
+        let has_use = opaque.type_bound_list().is_some_and(|list| {
+            list.bounds().any(|bound| bound.use_bound_generic_args().is_some())
+        });
+        if has_use {
+            return;
+        }
+        let edition = self.expander.ctx_for_range(opaque.syntax().text_range()).edition(self.db);
+        let store = &mut self.named_lifetime_store;
+        store.return_opaque_without_use = true;
+        store.return_opaque_2024_without_use |= edition.at_least_2024();
     }
 
     fn with_outer_impl_trait_scope<R>(

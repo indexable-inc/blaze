@@ -387,7 +387,7 @@ fn section_of(class: &Class) -> (Segment, &str, u32) {
     let (name, flags) = match class {
         Class::Text => ("__text", code),
         Class::Patch => ("__blaze_patch", code),
-        Class::Stubs => ("__blaze_stubs", code),
+        Class::Stubs => (blaze_live::patch::STUBS_SECTION_MACHO, code),
         Class::Plt => ("__stubs", code),
         Class::Rodata => ("__const", macho::S_REGULAR.to_flags().0),
         Class::Synthetic(name) => (*name, macho::S_REGULAR.to_flags().0),

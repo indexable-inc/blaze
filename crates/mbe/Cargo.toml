@@ -38,8 +38,5 @@ expect-test.workspace = true
 syntax.workspace = true
 syntax-bridge = { workspace = true, features = ["reference"] }
 
-[features]
-in-rust-tree = ["parser/in-rust-tree", "tt/in-rust-tree"]
-
 [lints]
 workspace = true

@@ -233,11 +233,16 @@ fn misses(source: &Source<'_>, build: u64) -> Result<Vec<MissGroup>, TimeError> 
 }
 
 fn query_counts(source: &Source<'_>, build: u64) -> Result<Vec<QueryCount>, TimeError> {
-    const COLUMNS: [&str; 6] = ["executed", "verified", "reran", "evicted_asked", "evicted", "dropped"];
+    const COLUMNS: [&str; 8] =
+        ["executed", "verified", "reran", "evicted_asked", "evicted", "dropped", "reads_recorded", "reads_kept"];
     // alloc: a query, once a report
     let sums = COLUMNS.map(|it| format!("CAST(sum({it}) AS UBIGINT) AS {it}")).join(", ");
+    // `reads_most` is a mark, not a sum: the build's most.
     // alloc: a query, once a report
-    let sql = format!("SELECT CAST(query AS VARCHAR) AS query, {sums} FROM query_counts WHERE build_id = {build} GROUP BY 1 ORDER BY 1");
+    let sql = format!(
+        "SELECT CAST(query AS VARCHAR) AS query, {sums}, CAST(max(reads_most) AS UBIGINT) AS reads_most \
+         FROM query_counts WHERE build_id = {build} GROUP BY 1 ORDER BY 1"
+    );
     let batches = query(source, &sql, "reading the build's query counts")?;
     // alloc: once a report
     let mut out = Vec::new();
@@ -252,6 +257,9 @@ fn query_counts(source: &Source<'_>, build: u64) -> Result<Vec<QueryCount>, Time
             evicted_asked: n("evicted_asked")?,
             evicted: n("evicted")?,
             dropped: n("dropped")?,
+            reads_recorded: n("reads_recorded")?,
+            reads_kept: n("reads_kept")?,
+            reads_most: n("reads_most")?,
         });
     }
     Ok(out)

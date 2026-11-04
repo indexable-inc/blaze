@@ -79,12 +79,12 @@ fn generated_warnings() {
     let fixable = Warned { total: 2, duplicates: 1, fixable: Some(1) };
     assert_eq!(
         generated("foo", &bin, false, true, fixable).unwrap(),
-        "`foo` (bin \"foo\") generated 2 warnings (1 duplicate) (run `cargo fix --bin \"foo\" -p foo` to apply 1 suggestion)"
+        "`foo` (bin \"foo\") generated 2 warnings (1 duplicate) (run `blaze check --fix --bin \"foo\" -p foo` to apply 1 suggestion)"
     );
     let lib_fixable = Warned { total: 3, duplicates: 2, fixable: Some(2) };
     assert_eq!(
         generated("foo", &lib, false, true, lib_fixable).unwrap(),
-        "`foo` (lib) generated 3 warnings (2 duplicates) (run `cargo fix --lib -p foo` to apply 2 suggestions)"
+        "`foo` (lib) generated 3 warnings (2 duplicates) (run `blaze check --fix --lib -p foo` to apply 2 suggestions)"
     );
     assert_eq!(
         generated("foo", &lib, true, true, one).unwrap(),

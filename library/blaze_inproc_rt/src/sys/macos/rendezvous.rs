@@ -24,9 +24,8 @@ use std::ffi::{CStr, CString, c_char, c_int};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use blaze_bytes::le::{get_u32 as get, get_u64 as get64};
-use crossbeam_channel::RecvTimeoutError;
-use parking_lot::Mutex;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, PoisonError};
 
 use super::{
     KERN_SUCCESS, Kern, MACH_PORT_NULL, Object, Port, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, kern,
@@ -298,14 +297,14 @@ struct Pending {
     token: Token,
     ports: Ports,
     lens: Vec<u64>,
-    done: crossbeam_channel::Sender<Result<(), Error>>,
+    done: mpsc::Sender<Result<(), Error>>,
 }
 
 /// What is filed for each run process being started. Locked only to file or take an entry.
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 
 fn take(token: &Token) -> Option<Pending> {
-    let mut pending = PENDING.lock();
+    let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
     let index = pending.iter().position(|it| it.token == *token)?;
     Some(pending.swap_remove(index))
 }
@@ -409,12 +408,12 @@ fn spoke(fd: i64) -> bool {
 /// process was reaped and its ID reused would reach another process, and its launcher must
 /// not reap it while it may still be killed.
 #[derive(Debug)]
-pub(crate) struct Remote {
+pub struct Remote {
     pid: u32,
 }
 
 impl Remote {
-    pub(crate) fn kill(&self) -> Result<(), Error> {
+    pub fn kill(&self) -> Result<(), Error> {
         let Ok(pid) = libc::pid_t::try_from(self.pid) else {
             return Err(Error::new(format!("process ID {} past pid_t", self.pid)));
         };
@@ -425,11 +424,11 @@ impl Remote {
         Ok(())
     }
 
-    pub(crate) fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
+    pub fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
         Err(Error::new(format!("a start hook asked the daemon to map object {object}: on macOS the hook maps it")))
     }
 
-    pub(crate) fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
+    pub fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
         Err(Error::new("a start hook asked the daemon to lay its overlays: on macOS the hook lays them"))
     }
 }
@@ -437,7 +436,7 @@ impl Remote {
 /// Files the objects for the run process on `channel`, sends the GRANT frame, and waits until
 /// the service gave them to its start hook. A hook that writes to the channel before it asked
 /// (its FAILED frame) is left for the host to read.
-pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
+pub fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
     if objects.len() > MOST_OBJECTS {
         return Err(Error::new(format!("{} objects to grant, past the {MOST_OBJECTS} one reply carries", objects.len())));
     }
@@ -455,9 +454,9 @@ pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], object
         ports.0.push(object.entry(protection(rights))?);
         lens.push(object.len());
     }
-    let (done, finished) = crossbeam_channel::unbounded();
+    let (done, finished) = mpsc::channel();
     {
-        let mut pending = PENDING.lock();
+        let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
         pending.retain(|it| it.token != token);
         pending.push(Pending { token, ports, lens, done });
     }
@@ -504,7 +503,7 @@ impl Drop for Receive {
     }
 }
 
-pub(crate) fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<super::Granted>, Error> {
+pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<super::Granted>, Error> {
     if count > MOST_OBJECTS {
         return Err(Error::new(format!("a grant of {count} objects, past the {MOST_OBJECTS} one reply carries")));
     }
@@ -566,4 +565,14 @@ pub(crate) fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<su
             Err(Error::new(format!("the rendezvous reply: {why}")))
         }
     }
+}
+
+/// The little-endian `u32` at `at`, or `None` past the end.
+fn get(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
+}
+
+/// The little-endian `u64` at `at`, or `None` past the end.
+fn get64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(at..at.checked_add(8)?)?.try_into().ok()?))
 }

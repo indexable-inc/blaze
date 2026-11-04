@@ -290,6 +290,15 @@ pub enum Fact {
     /// (by the function's or alias's key): what `rpit_hidden_types` and `tait_hidden_types`
     /// give, which the defining bodies' inference decides.
     HiddenTypes(ItemKey),
+    /// An impl method's type for each `impl Trait` of the trait method it implements (by the
+    /// impl method's key): what `hir_ty::rpitit::impl_rpitit_tys` gives, rustc's
+    /// `collect_return_position_impl_trait_in_trait_tys`, which a caller normalizing the
+    /// trait's item for the impl reads. Not part of the method's [`Fact::Signature`]: finding
+    /// it proves the trait's bounds of the impl method's own `impl Trait`s, which reads their
+    /// bounds, part of that signature, so a signature holding it would be read while it is
+    /// made (rustc keeps the two apart too: `explicit_item_bounds` and `fn_sig` are not
+    /// `collect_return_position_impl_trait_in_trait_tys`).
+    RpititTys(ItemKey),
 }
 
 /// The facts' query kinds, in [`blaze_query::kinds::FACTS`].
@@ -317,6 +326,7 @@ pub mod kinds {
     pub const TARGET: QueryKind = QueryKind(0x1011);
     pub const CRATE: QueryKind = QueryKind(0x1012);
     pub const HIDDEN_TYPES: QueryKind = QueryKind(0x1013);
+    pub const RPITIT_TYS: QueryKind = QueryKind(0x1014);
     // 0x1800..0x1810 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
     // not hash, listed in `blaze_item_hash::values::kinds`. None is defined here.
 }
@@ -345,6 +355,7 @@ impl Fact {
             Fact::Target(_) => kinds::TARGET,
             Fact::Crate(_) => kinds::CRATE,
             Fact::HiddenTypes(_) => kinds::HIDDEN_TYPES,
+            Fact::RpititTys(_) => kinds::RPITIT_TYS,
         }
     }
 
@@ -364,7 +375,8 @@ impl Fact {
             | Fact::Specializes(it)
             | Fact::DropCheck(it)
             | Fact::Derive(it)
-            | Fact::HiddenTypes(it) => hasher.id(&it.0),
+            | Fact::HiddenTypes(it)
+            | Fact::RpititTys(it) => hasher.id(&it.0),
             Fact::Field { ty, field } => hasher.id(&ty.0).update(&field.to_le_bytes()),
             Fact::Method { self_ty, name } => hasher.id(&self_ty.0).id(&name.0),
             Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {

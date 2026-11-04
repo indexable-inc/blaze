@@ -39,6 +39,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze_inproc_rt"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "std",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

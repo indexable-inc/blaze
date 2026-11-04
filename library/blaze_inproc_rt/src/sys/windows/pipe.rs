@@ -9,7 +9,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use std::sync::{Mutex, PoisonError};
 use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -76,7 +76,7 @@ fn hung_up(error: &std::io::Error) -> bool {
 }
 
 /// One end of a connected pipe.
-pub(crate) struct Stream {
+pub struct Stream {
     pipe: OwnedHandle,
     event: OwnedHandle,
     /// Milliseconds a transfer may take; `INFINITE` for ever.
@@ -88,7 +88,7 @@ impl Stream {
         Ok(Stream { pipe, event: event()?, timeout: INFINITE })
     }
 
-    pub(crate) fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         let at = buf.as_mut_ptr();
         // SAFETY: `buf` is valid for `len` bytes and stays borrowed until `transfer` returns,
@@ -99,7 +99,7 @@ impl Stream {
         Ok(done.unwrap_or(0) as usize)
     }
 
-    pub(crate) fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
+    pub fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
         while !bytes.is_empty() {
             let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             let at = bytes.as_ptr();
@@ -164,7 +164,7 @@ impl Stream {
         ok == 0 && hung_up(&std::io::Error::last_os_error())
     }
 
-    pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
         self.timeout = match timeout {
             None => INFINITE,
             Some(timeout) => u32::try_from(timeout.as_millis()).unwrap_or(INFINITE).min(INFINITE - 1),
@@ -174,7 +174,7 @@ impl Stream {
 }
 
 /// The daemon's end: instances of one pipe name, one always waiting for the next start hook.
-pub(crate) struct Listener {
+pub struct Listener {
     name: Vec<u16>,
     security: Security,
     next: Mutex<Option<OwnedHandle>>,
@@ -185,7 +185,7 @@ pub(crate) struct Listener {
 impl Listener {
     /// A pipe of a name no one can guess. `dir` holds nothing on Windows: pipes live in the
     /// pipe namespace, and the DACL is what keeps others out.
-    pub(crate) fn bind(dir: &Path) -> Result<(Listener, String), Error> {
+    pub fn bind(dir: &Path) -> Result<(Listener, String), Error> {
         let _ = dir;
         let mut token = [0u8; 16];
         super::random(&mut token)?;
@@ -198,8 +198,8 @@ impl Listener {
         Ok((listener, address))
     }
 
-    pub(crate) fn accept(&self) -> Result<(Stream, u32), Error> {
-        let waiting = self.next.lock().take();
+    pub fn accept(&self) -> Result<(Stream, u32), Error> {
+        let waiting = self.next.lock().unwrap_or_else(PoisonError::into_inner).take();
         let pipe = match waiting {
             Some(pipe) => pipe,
             None => instance(&self.name, &self.security, false)?,
@@ -208,7 +208,7 @@ impl Listener {
         // The next instance waits before this one is handed out, so a start hook never finds none.
         // Where it can't be made, the next `accept` makes it and says why.
         if let Ok(next) = instance(&self.name, &self.security, false) {
-            *self.next.lock() = Some(next);
+            *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(next);
         }
         let mut pid = 0;
         // SAFETY: a query of the pipe this listener owns; writes only `pid`.
@@ -272,7 +272,7 @@ fn wait_for_client(pipe: &OwnedHandle, event: &OwnedHandle) -> Result<(), Error>
 }
 
 /// The start hook's end, of the pipe `address` ([`Listener::bind`]).
-pub(crate) fn connect(address: &str) -> Result<Stream, Error> {
+pub fn connect(address: &str) -> Result<Stream, Error> {
     if !address.strip_prefix(PIPES).is_some_and(|it| it.starts_with(PREFIX)) {
         return Err(Error::new(format!("{address} is not a pipe of blaze-inproc's")));
     }

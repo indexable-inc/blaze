@@ -1,12 +1,8 @@
 //! Conversions between syntax trees, read through their views (`syntax::view`), and
 //! [`tt::TokenTree`]s.
 
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![forbid(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
-
-#[cfg(feature = "in-rust-tree")]
-extern crate rustc_driver as _;
 
 use std::{
     alloc::{Allocator, Global},

@@ -594,9 +594,18 @@ impl UnitReader {
         self.front.paths()
     }
 
+    /// How cargo passes the job's crates' roots, which the program's names of its files are
+    /// made from ([`blaze_lower::Spellings::name`]).
+    pub(crate) fn spellings(&self) -> &Arc<blaze_lower::Spellings> {
+        self.front.spellings()
+    }
+
     /// The file of each of `names` (the files diagnostics name, from `root` as
-    /// [`blaze_diagnostics::Files::relative`] names them) that the database has the text of, by
-    /// name: a file of [`UnitReader::paths`], the first by ID of two of one name, else the one
+    /// [`blaze_diagnostics::Files::relative`] names them, with the identity of a text that is
+    /// not the file at its path as [`blaze_diagnostics::Files::of_text`] adds it) that the
+    /// database has the text of, by name: a file of [`UnitReader::paths`] whose name is that
+    /// whole name, so a crate root with an appended module and the file on disk it is an alias
+    /// of are never taken for one another, the first by ID of two of one name, else the one
     /// `include!` parsed of a file outside every source root at that path
     /// ([`base_db::Files::included_source_file`]), which no path of the job names.
     pub(crate) fn files_named(&self, root: &str, names: &[&str]) -> Vec<(String, FileId)> {
@@ -604,14 +613,17 @@ impl UnitReader {
         let mut found: Vec<(String, FileId)> = (self.paths().iter())
             .filter(|&(&file, _)| db.has_file_text(file))
             .map(|(&file, path)| (blaze_diagnostics::Files::relative(path, root), file))
-            .filter(|(name, _)| names.contains(name))
-            .map(|(name, file)| (name.to_owned(), file)) // alloc: the few names of a unit's diagnostics
+            .filter(|(name, _)| names.iter().any(|it| blaze_diagnostics::emit::shown(it) == *name))
+            // alloc: the few names of a unit's diagnostics
+            .map(|(name, file)| (blaze_diagnostics::Files::of_text(db, file, name.to_owned()), file))
+            .filter(|(name, _)| names.contains(&name.as_str()))
             .collect(); // alloc: as above
         // The first file of a name by ID, whatever order the map is in.
         found.sort_by(|a, b| (&a.0, a.1.index()).cmp(&(&b.0, b.1.index())));
         found.dedup_by(|a, b| a.0 == b.0);
         for &name in names {
-            if found.iter().any(|(it, _)| it == name) {
+            // A text that is not the file at its path is no file `include!` read either.
+            if found.iter().any(|(it, _)| it == name) || blaze_diagnostics::emit::names_text(name) {
                 continue;
             }
             let whole = match name.starts_with('/') {

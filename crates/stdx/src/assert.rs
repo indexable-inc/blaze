@@ -59,7 +59,7 @@ macro_rules! always {
 
     ($cond:expr, $fmt:literal $($arg:tt)*) => {{
         let cond = $cond;
-        if cfg!(debug_assertions) || $crate::assert::__FORCE {
+        if cfg!(debug_assertions) {
             assert!(cond, $fmt $($arg)*);
         }
         if !cond {
@@ -92,7 +92,7 @@ macro_rules! never {
     (false $($tt:tt)*) => { $crate::never!((false) $($tt)*) };
     () => { $crate::never!("assertion failed: entered unreachable code") };
     ($fmt:literal $(, $($arg:tt)*)?) => {{
-        if cfg!(debug_assertions) || $crate::assert::__FORCE {
+        if cfg!(debug_assertions) {
             unreachable!($fmt $(, $($arg)*)?);
         }
         $crate::assert::reported::report("assertion", $fmt);
@@ -112,9 +112,6 @@ macro_rules! never {
 
 #[doc(hidden)]
 pub use tracing::error as __tracing_error;
-
-#[doc(hidden)]
-pub const __FORCE: bool = cfg!(feature = "force-always-assert");
 
 // --- Reported bugs ------------------------------------------------------------------------
 

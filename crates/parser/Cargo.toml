@@ -37,9 +37,8 @@ name = "lex"
 harness = false
 
 [features]
-default = []
-in-rust-tree = []
-# `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone, for the fuzz target.
+# `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone, for the fuzz target; only
+# fuzz/ turns it on.
 fuzz = []
 
 [lints]

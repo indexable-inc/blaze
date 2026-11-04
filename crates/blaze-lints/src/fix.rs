@@ -278,8 +278,9 @@ fn at_of(db: &Db, files: &BTreeMap<String, (FileId, String)>, span: Option<&Span
         let lo = (span.lo as usize).min(text.len());
         1 + text.as_bytes()[..lo].iter().filter(|&&it| it == b'\n').count()
     });
+    let file = blaze_diagnostics::emit::shown(&span.file);
     match line {
-        Some(line) => format!("{}:{line}", span.file),
-        None => span.file.clone(),
+        Some(line) => format!("{file}:{line}"),
+        None => file.to_owned(),
     }
 }

@@ -11,7 +11,7 @@ use crate::handshake::Grant;
 use crate::{Error, Format};
 
 /// Refuses `slide` unless it is 0 or no overlay of `grant` is a dependency image.
-pub(crate) fn check_slide(grant: &Grant, slide: u64) -> Result<(), Error> {
+pub fn check_slide(grant: &Grant, slide: u64) -> Result<(), Error> {
     if slide == 0 {
         return Ok(());
     }
@@ -29,7 +29,7 @@ pub(crate) fn check_slide(grant: &Grant, slide: u64) -> Result<(), Error> {
 
 /// The C name of a symbol named `name` in an image of `format`: what `dlsym` and
 /// `GetProcAddress` take.
-pub(crate) fn c_name(format: Format, name: &str) -> Result<&str, Error> {
+pub fn c_name(format: Format, name: &str) -> Result<&str, Error> {
     match format {
         Format::Elf | Format::Pe => Ok(name),
         Format::MachO => name.strip_prefix('_').filter(|it| !it.is_empty()).ok_or_else(|| {
@@ -53,7 +53,7 @@ const MOST_LISTED: usize = 8;
 /// `grant` came from [`Grant::decode`], so every place is 8 bytes inside an overlay of a
 /// dependency image mapped as a private copy ([`Grant::check_binds`]): `store` writes only
 /// there.
-pub(crate) fn bind(
+pub fn bind(
     grant: &Grant,
     slide: u64,
     mut find: impl FnMut(&str) -> Result<Option<u64>, Error>,

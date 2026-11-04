@@ -189,16 +189,11 @@ unsafe fn store_atomic(bytes: &[u8], to: *mut u8) {
     }
 }
 
-/// `len` bytes of the image at `at`.
-///
-/// # Safety
-///
-/// `at..at + len` is mapped readable for the life of the program (the platform checked it
-/// is in the image), and nothing writes it while the slice is used.
-pub(super) unsafe fn view(at: u64, len: usize) -> &'static [u8] {
-    // SAFETY: the caller's; any bytes are valid `u8`s.
-    unsafe { std::slice::from_raw_parts(at as *const u8, len) }
-}
+// A view of the image's bytes and of its words: the dev runtime's (`blaze_inproc_rt::live::mem`),
+// which reads the descriptor and the execution log's header through them.
+pub(super) use blaze_inproc_rt::live::mem::{cell, view};
+#[cfg(test)]
+pub(super) use blaze_inproc_rt::live::mem::byte;
 
 /// `len` 8-byte words of the image at `at`, which [`crate::slots::publish`] may store to while
 /// they are read.
@@ -212,28 +207,6 @@ pub(super) unsafe fn words(at: u64, len: usize) -> &'static [AtomicU64] {
     // SAFETY: the caller's; an `AtomicU64` has a `u64`'s size and alignment, and any bits are
     // a valid one.
     unsafe { std::slice::from_raw_parts(at as *const AtomicU64, len) }
-}
-
-/// The byte at `at`, which log stubs and other processes sharing its pages may store to.
-///
-/// # Safety
-///
-/// `at` is mapped readable and writable for the life of the program, and accessed only
-/// atomically or by the log stubs' single-byte stores.
-pub(super) unsafe fn byte(at: u64) -> &'static AtomicU8 {
-    // SAFETY: the caller's; an `AtomicU8` has a `u8`'s size and alignment.
-    unsafe { AtomicU8::from_ptr(at as *mut u8) }
-}
-
-/// The 8-byte table cell at `at`.
-///
-/// # Safety
-///
-/// `at` is 8-aligned, in the image's data, mapped for the life of the program, and accessed
-/// only atomically: the switch's stores and the stubs' loads.
-pub(super) unsafe fn cell(at: u64) -> &'static AtomicU64 {
-    // SAFETY: the caller's; an `AtomicU64` has a `u64`'s size and alignment.
-    unsafe { AtomicU64::from_ptr(at as *mut u64) }
 }
 
 #[cfg(test)]

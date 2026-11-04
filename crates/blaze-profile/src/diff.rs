@@ -501,7 +501,7 @@ errors gone:
         crate::install();
         let dir = std::env::temp_dir().join(format!("blaze-diff-duckdb-{}", std::process::id()));
         _ = fs::remove_dir_all(&dir);
-        let mut history = History::open(&dir, CAP_BYTES).unwrap();
+        let mut history = History::open(&dir, CAP_BYTES, crate::sampler::unsampled()).unwrap();
         for (build, ms) in [(81u32, 1), (82, 30)] {
             std::thread::spawn(move || {
                 let _build = crate::flight::building(build);

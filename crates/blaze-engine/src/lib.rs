@@ -10,9 +10,9 @@
 #![deny(unsafe_code)]
 
 mod as_rustc;
-#[cfg(feature = "mimalloc")]
+#[cfg(feature = "native")]
 mod heaps;
-#[cfg(feature = "mimalloc")]
+#[cfg(feature = "native")]
 mod huge;
 mod pin;
 mod program;
@@ -25,12 +25,12 @@ pub use program::main;
 /// small-object allocator, mimalloc, with a heap per blaze-mem tag (`heaps.rs`). Counted, so
 /// that the plane's `arena::measure` and admission's `arena::held` see its bytes, and each
 /// tag's share of them (`blaze_mem::tag::Counters::heap`) is named in the memory line.
-#[cfg(all(not(test), feature = "mimalloc"))]
+#[cfg(all(not(test), feature = "native"))]
 #[global_allocator]
 static ALLOC: blaze_graph::arena::Counting<heaps::Heaps> = blaze_graph::arena::Counting(heaps::Heaps);
 
-/// Without `mimalloc` (the seed profile, which has no C): std's allocator, counted the same way.
-#[cfg(all(not(test), not(feature = "mimalloc")))]
+/// Without `native` (the seed profile, which has no C): std's allocator, counted the same way.
+#[cfg(all(not(test), not(feature = "native")))]
 #[global_allocator]
 static ALLOC: blaze_graph::arena::Counting<std::alloc::System> =
     blaze_graph::arena::Counting(std::alloc::System);

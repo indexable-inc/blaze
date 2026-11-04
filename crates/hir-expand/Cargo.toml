@@ -49,7 +49,6 @@ syntax-bridge = { workspace = true, features = ["reference"] }
 test-utils.workspace = true
 
 [features]
-in-rust-tree = ["syntax/in-rust-tree"]
 # `hir_expand::fixture`, for other crates' tests (as a dev-dependency).
 fixture = ["dep:blaze-vfs", "dep:test-utils"]
 

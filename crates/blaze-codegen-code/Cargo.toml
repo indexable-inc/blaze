@@ -22,19 +22,12 @@ doctest = false
 blake3.workspace = true
 glob.workspace = true
 toml.workspace = true
-# The request of `ship-code-identity` (`ship`).
-serde_json = { workspace = true, optional = true }
+# The request of `ship-code-identity`.
+serde_json.workspace = true
 
 # What a checkout ships with a package cut from it (.github/scripts/publish_crates.py).
 [[bin]]
 name = "ship-code-identity"
-required-features = ["ship"]
-
-[features]
-# The `ship-code-identity` tool.
-ship = ["dep:serde_json"]
-# blake3's SIMD128 code on wasm32 (Rust, no C); does nothing on other targets.
-wasm32-simd = ["blake3/wasm32_simd"]
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 name: llvm
 
-# Builds the LLVM the `llvm` feature links (crates/hir-ty-codegen/llvm.json: our fork
+# Builds the LLVM every native blaze links (crates/hir-ty-codegen/llvm.json: our fork
 # indexable-inc/llvm, ix/23.x, LLVM 23.1.4 with our fixes, the commit ix-aot pins) on each runner
 # a release of blaze is built on, and Windows, with .github/scripts/llvm.py, and puts the
 # archives on the release llvm.json names, each under a name that carries its sha256. The

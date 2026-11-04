@@ -12,4 +12,4 @@
 - No changes to `src/`. Go back to the crates.io release once one past 0.1.3 has these.
 
 blaze uses it as the seed's assembler: `crates/hir-ty-codegen/asm/rsasm.rs`,
-todo/bootstrap/plan.md, "std and assembly in the seed".
+docs/future/bootstrap.md, "std and assembly in the seed".

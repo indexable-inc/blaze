@@ -82,6 +82,9 @@ pub struct QueryCountRow {
     pub evicted_asked: u64,
     pub evicted: u64,
     pub dropped: u64,
+    pub reads_recorded: u64,
+    pub reads_kept: u64,
+    pub reads_most: u64,
 }
 
 /// A row of the schema's `misses` table: one thing a build computed again, and why.
@@ -139,6 +142,9 @@ pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.evicted_asked),
         count(|it| it.evicted),
         count(|it| it.dropped),
+        count(|it| it.reads_recorded),
+        count(|it| it.reads_kept),
+        count(|it| it.reads_most),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::QUERY_COUNTS), columns)
 }

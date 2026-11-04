@@ -41,6 +41,8 @@ impl Checked {
         let mut sources = Sources::default();
         for (file, name) in &self.names {
             let text = self.db.file_text(*file).text(&self.db).as_str().to_owned();
+            // By the name its spans give it: a root with an appended module names its text.
+            let name = &Files::of_text(&self.db, *file, name.clone());
             match Some(*file) == self.core {
                 true => sources.add_unshown(name, text),
                 false => sources.add(name, Some(text)),
