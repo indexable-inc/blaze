@@ -162,19 +162,11 @@ impl App {
         o.try_cloned::<&model::Cwd>().or_else(|| o.parent().and_then(|p| p.try_cloned::<&model::Cwd>())).map(|c| tilde(c.s.as_str())).unwrap_or_default()
     }
 
-    /// The run pane's summary (its command; its id, state and directory) and its run's stages, `e`'s lit.
+    /// The run pane's stages (its run's, `e`'s lit); the title bar carries its id, command, state and directory.
     fn fill_run_pane(&self, pane: u64, e: u64) {
         let w = self.world.world_ref();
         let o = w.entity_from_id(e);
         let Some(info) = View::of(w.entity_from_id(pane)).part("info") else { return };
-        let name = o.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).unwrap_or_default();
-        if let Some(p) = info.part("cmd") {
-            p.text(&format!("$ {}", clip_text(&name.split_whitespace().collect::<Vec<_>>().join(" "), 600)));
-        }
-        if let Some(p) = info.part("meta") {
-            let parts = [self.run_id(e), self.run_state(e), self.run_cwd(e)];
-            p.text(&parts.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("  \u{00B7}  "));
-        }
         let run = if o.has(model::Run::id()) { Some(o) } else { o.parent() };
         let mut stages: Vec<(u32, u64)> = Vec::new();
         if let Some(r) = run {

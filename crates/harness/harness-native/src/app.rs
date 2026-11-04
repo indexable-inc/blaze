@@ -656,10 +656,7 @@ impl App {
                         let cmd = name.split_whitespace().collect::<Vec<_>>().join(" ");
                         (format!("{id}  {cmd}"), join(vec![self.run_cwd(e), self.run_state(e)]))
                     }
-                    (None, model::PaneKind::Archive) => {
-                        let n = model::archived(w).len();
-                        (name, format!("{n} archived"))
-                    }
+                    (None, model::PaneKind::Archive) => (name, self.archive_subtitle()),
                     _ => {
                         // The program-set title (OSC 0/2) never names anything (agents' titles are spinner frames and
                         // "Claude Code"): only a shell's shows, in place of its directory.

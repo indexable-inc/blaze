@@ -259,24 +259,15 @@ impl App {
         out
     }
 
-    /// Fill an Archive pane: its title and count, search line, chips and list; and page in older runs once the list's
+    /// Fill an Archive pane (the title bar names and counts it, [`Self::archive_subtitle`]): its search line, chips and list; and page in older runs once the list's
     /// foot is in view.
     pub(super) fn fill_archive_pane(&self, pane: u64) {
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(pane));
-        let n = model::archived(w).len();
         let (clear, chosen) = (tone(w, "clear"), tone(w, "selected"));
         let (strong, muted, faint) = (tone(w, "strong"), tone(w, "muted"), tone(w, "faint"));
         let q = self.archive_query();
         if let Some(head) = pv.part("head") {
-            if let Some(top) = head.part("top") {
-                if let Some(p) = top.part("title") {
-                    p.text("Archive");
-                }
-                if let Some(p) = top.part("count") {
-                    p.text(&format!("{n} item{}", if n == 1 { "" } else { "s" }));
-                }
-            }
             if let Some(s) = head.part("search") {
                 if let Some(p) = s.part("icon") {
                     p.icon(SEARCH_ICON);
@@ -421,6 +412,20 @@ impl App {
         if let Some(t) = row.part("time").and_then(|c| c.part("text")) {
             t.text(&fmt_when(model::when(o), today));
         }
+    }
+
+    /// The title bar's line under "Archive": how many objects it holds, and while a chip or a search narrows it, how
+    /// many of them show.
+    pub(super) fn archive_subtitle(&self) -> String {
+        let n = model::archived(self.world.world_ref()).len();
+        let all = format!("{n} archived");
+        let chip = self.archive_chip();
+        if chip == 0 && self.archive_query().trim().is_empty() {
+            return all;
+        }
+        let shown = self.archive_rows().iter().filter(|(_, _, r)| matches!(r, ARow::Item { .. })).count();
+        let what = if chip == 0 { "matching".to_owned() } else { CHIPS[usize::from(chip)].to_lowercase() };
+        format!("{all}  \u{00B7}  {shown} {what}")
     }
 
     /// Ask the daemon for the page of runs older than the oldest the world holds.
