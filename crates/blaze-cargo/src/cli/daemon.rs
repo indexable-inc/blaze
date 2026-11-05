@@ -113,13 +113,14 @@ pub enum DaemonError {
     /// no daemon is started over it.
     Connect { socket: PathBuf, error: ClientError },
     /// The daemon was started and did not say it listens at its socket within [`STARTING`] of
-    /// the last phase of its start it said.
-    NotListening { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase },
+    /// the last phase of its start it said; `inside`, what it last said its start's thread was
+    /// inside ([`crate::serve::INSIDE`]), if it said any.
+    NotListening { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase, inside: Option<String> },
     /// The daemon was started and ended in `phase`, before it listened, as `ended` says.
     Exited { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase, ended: Reaped },
     /// The daemon was started and closed its ready pipe in `phase`, before it listened, and
-    /// had not ended a moment ([`ENDING`]) after.
-    Closed { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase },
+    /// had not ended a moment ([`ENDING`]) after; `inside` as [`DaemonError::NotListening`]'s.
+    Closed { socket: PathBuf, log: PathBuf, pid: u32, phase: Phase, inside: Option<String> },
     /// The daemon reached keeps for its life settings this command sets to other values
     /// ([`crate::serve::settings::drift`]): refused before any request, each named with both
     /// values. `activated`: a socket unit starts it, with the settings `blaze daemon install`
@@ -138,8 +139,8 @@ impl std::fmt::Display for DaemonError {
             DaemonError::Connect { socket, error } => {
                 write!(f, "connecting to blaze's daemon at {}: {error}", socket.display())
             }
-            DaemonError::NotListening { socket, log, pid, phase } => {
-                f.write_str(&not_listening(socket, log, *pid, *phase))
+            DaemonError::NotListening { socket, log, pid, phase, inside } => {
+                f.write_str(&not_listening(socket, log, *pid, *phase, inside.as_deref()))
             }
             DaemonError::Exited { socket, log, pid, phase, ended } => {
                 let how = match ended {
@@ -157,11 +158,12 @@ impl std::fmt::Display for DaemonError {
                     log.display()
                 )
             }
-            DaemonError::Closed { socket, log, pid, phase } => write!(
+            DaemonError::Closed { socket, log, pid, phase, inside } => write!(
                 f,
-                "the daemon (`blaze serve`, pid {pid}) was started and closed its ready pipe while {}, before it \
-                 listened at {}, and runs on; its log is {}",
+                "the daemon (`blaze serve`, pid {pid}) was started and closed its ready pipe while {}, {}, before \
+                 it listened at {}, and runs on; its log is {}",
                 phase.doing(),
+                Inside(inside.as_deref()),
                 socket.display(),
                 log.display()
             ),
@@ -252,18 +254,18 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
             }
             Err(error) => Err(DaemonError::Connect { socket, error }.into()),
         },
-        Heard::Ended { phase } => {
+        Heard::Ended { phase, inside } => {
             crate::raw::process::ended_within(pid, ENDING)
                 .context("waiting for the daemon that closed its pipe to end")?;
             let status = child.try_wait().context("asking how the daemon it started ended")?;
             Err(match status.and_then(reaped) {
                 Some(ended) => DaemonError::Exited { socket, log, pid, phase, ended },
-                None => DaemonError::Closed { socket, log, pid, phase },
+                None => DaemonError::Closed { socket, log, pid, phase, inside },
             }
             .into())
         }
-        Heard::Nothing { phase } => {
-            Err(DaemonError::NotListening { socket, log, pid, phase }.into())
+        Heard::Nothing { phase, inside } => {
+            Err(DaemonError::NotListening { socket, log, pid, phase, inside }.into())
         }
     }
 }
@@ -471,14 +473,15 @@ fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
 
 /// What the daemon this command started said on its pipe ([`started`]).
 #[cfg(all(unix, feature = "native"))]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Heard {
     /// It listens: it said [`Phase::Listening`].
     Listening,
-    /// The pipe closed first, `phase` the last it said.
-    Ended { phase: Phase },
-    /// Neither, within the wait of `phase`, the last it said.
-    Nothing { phase: Phase },
+    /// The pipe closed first, `phase` the last it said, `inside` the last it said its start's
+    /// thread was inside ([`crate::serve::INSIDE`]).
+    Ended { phase: Phase, inside: Option<String> },
+    /// Neither, within the wait of `phase`, the last it said; `inside` as `Ended`'s.
+    Nothing { phase: Phase, inside: Option<String> },
 }
 
 /// How long a start may stay in `phase`, `long` for each but [`Phase::Waiting`]: the daemon
@@ -490,35 +493,115 @@ fn within(phase: Phase, long: Duration) -> Duration {
     }
 }
 
+/// What the daemon said on its ready pipe so far, read as bytes come ([`Hearing::feed`]): its
+/// phases' bytes ([`Phase::byte`]) and its records of what its start's thread is inside
+/// ([`crate::serve::INSIDE`]), which may arrive cut across reads.
+#[cfg(all(unix, feature = "native"))]
+#[derive(Debug)]
+struct Hearing {
+    phase: Phase,
+    /// The text of the last record of what the start is inside.
+    inside: Option<String>,
+    /// Bytes of a record not yet whole.
+    held: Vec<u8>,
+}
+
+#[cfg(all(unix, feature = "native"))]
+impl Hearing {
+    fn new() -> Hearing {
+        // alloc: one start's pipe, a record of at most 515 bytes held
+        Hearing { phase: Phase::Launched, inside: None, held: Vec::new() }
+    }
+
+    /// Takes `bytes`, the next the pipe gave; true once [`Phase::Listening`] is said, and what
+    /// follows it is not read. A phase said again or out of order, a byte that is neither a
+    /// phase nor [`crate::serve::INSIDE`], or a record longer than
+    /// [`crate::serve::INSIDE_MAX`] or not UTF-8 is refused, named.
+    fn feed(&mut self, bytes: &[u8]) -> io::Result<bool> {
+        use crate::serve::{INSIDE, INSIDE_MAX};
+        self.held.extend_from_slice(bytes);
+        let mut at = 0;
+        // Bounded: each turn takes at least one byte of `held`, or ends.
+        let listening = loop {
+            let Some(&tag) = self.held.get(at) else { break false };
+            if tag == INSIDE {
+                let Some(&[low, high]) = self.held.get(at + 1..at + 3) else { break false };
+                let len = usize::from(u16::from_le_bytes([low, high]));
+                if len > INSIDE_MAX {
+                    // alloc: an error's text
+                    return Err(refused(format!(
+                        "the daemon said on its ready pipe, while {}, what its start is inside in {len} bytes: \
+                         at most {INSIDE_MAX} are said",
+                        self.phase.doing()
+                    )));
+                }
+                let Some(text) = self.held.get(at + 3..at + 3 + len) else { break false };
+                let text = std::str::from_utf8(text).map_err(|error| {
+                    // alloc: an error's text
+                    refused(format!(
+                        "the daemon said on its ready pipe, while {}, what its start is inside in text that is \
+                         not UTF-8: {error}",
+                        self.phase.doing()
+                    ))
+                })?;
+                // alloc: the last record of a start, kept for its error
+                self.inside = Some(text.to_owned());
+                at += 3 + len;
+                continue;
+            }
+            match Phase::of(tag) {
+                Some(Phase::Listening) => break true,
+                Some(next) if next > self.phase => {
+                    self.phase = next;
+                    at += 1;
+                }
+                said => {
+                    // alloc: an error's text
+                    return Err(refused(format!(
+                        "the daemon said {:?} on its ready pipe while {}: no later phase of a start",
+                        char::from(tag),
+                        said.unwrap_or(self.phase).doing()
+                    )));
+                }
+            }
+        };
+        self.held.drain(..at);
+        Ok(listening)
+    }
+}
+
+/// A ready pipe's word refused ([`Hearing::feed`]).
+#[cfg(all(unix, feature = "native"))]
+fn refused(said: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, said)
+}
+
 /// Waits for the daemon to say on `ready` that it listens, or to end: at most [`within`] its
-/// phase for each.
+/// phase for each, from when it said the phase. The deadline is taken once, as the phase
+/// begins: the records of what the start is inside, which come every 500 ms, never move it.
 #[cfg(all(unix, feature = "native"))]
 fn heard(ready: &std::io::PipeReader, long: Duration) -> io::Result<Heard> {
-    use std::{io::Read as _, os::fd::AsFd as _};
-    let mut phase = Phase::Launched;
-    // Bounded: each byte read moves to a later phase, of which there are five, or is refused.
+    use std::{io::Read as _, os::fd::AsFd as _, time::Instant};
+    let mut hearing = Hearing::new();
+    let mut deadline = Instant::now() + within(hearing.phase, long);
+    let mut bytes = [0u8; 1024];
+    // Bounded: each turn reads at least one byte or ends; the phases only move forward, five
+    // of them, and within one every turn is before its deadline.
     loop {
-        if !crate::raw::process::readable_within(ready.as_fd(), within(phase, long))? {
-            return Ok(Heard::Nothing { phase });
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || !crate::raw::process::readable_within(ready.as_fd(), left)? {
+            return Ok(Heard::Nothing { phase: hearing.phase, inside: hearing.inside });
         }
-        let mut byte = [0u8; 1];
-        if (&mut &*ready).read(&mut byte)? == 0 {
-            return Ok(Heard::Ended { phase });
+        let read = (&mut &*ready).read(&mut bytes)?;
+        if read == 0 {
+            return Ok(Heard::Ended { phase: hearing.phase, inside: hearing.inside });
         }
-        match Phase::of(byte[0]) {
-            Some(Phase::Listening) => return Ok(Heard::Listening),
-            Some(next) if next > phase => phase = next,
-            said => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    // alloc: an error's text
-                    format!(
-                        "the daemon said {:?} on its ready pipe while {}: no later phase of a start",
-                        char::from(byte[0]),
-                        said.unwrap_or(phase).doing()
-                    ),
-                ));
-            }
+        let was = hearing.phase;
+        if hearing.feed(&bytes[..read])? {
+            return Ok(Heard::Listening);
+        }
+        if hearing.phase != was {
+            deadline = Instant::now() + within(hearing.phase, long);
         }
     }
 }
@@ -552,16 +635,39 @@ pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
     crate::serve::once::connect().map(Some)
 }
 
-/// What a start that never listened says.
-pub fn not_listening(socket: &Path, log: &Path, pid: u32, phase: Phase) -> String {
+/// What a start that never listened says: its phase, and `inside`, what it last said its
+/// start's thread was inside ([`crate::serve::INSIDE`]), if it said any.
+pub fn not_listening(
+    socket: &Path,
+    log: &Path,
+    pid: u32,
+    phase: Phase,
+    inside: Option<&str>,
+) -> String {
+    // alloc: an error's text
     format!(
         "the daemon (`blaze serve`, pid {pid}) was started and did not listen at {}: it was {} for \
-         {}s; its log is {}",
+         {}s, {}; its log is {}",
         socket.display(),
         phase.doing(),
         within(phase, STARTING).as_secs(),
+        Inside(inside),
         log.display()
     )
+}
+
+/// What a start last said its thread was inside, as an error says it: "inside `open store`
+/// (1.2s open)", "inside no span", or that it said nothing of it.
+struct Inside<'a>(Option<&'a str>);
+
+impl std::fmt::Display for Inside<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            None => f.write_str("and said nothing about what it was inside"),
+            Some("") => f.write_str("inside no span its flight recorder names"),
+            Some(span) => write!(f, "inside {span}"),
+        }
+    }
 }
 
 /// Whether the daemon ended a connection that was waiting on it: its end of the socket closed
@@ -1188,6 +1294,7 @@ mod refusals {
             log: log.clone(),
             pid: 9,
             phase: Phase::State,
+            inside: None,
         }
         .to_string();
         assert!(
@@ -1196,8 +1303,8 @@ mod refusals {
             ),
             "{said}"
         );
-        let reading =
-            "it was reading its state (the VFS journal, the daemon image and the store) for 60s";
+        let reading = "it was reading its state (the VFS journal, the daemon image and the store) for 60s, \
+             and said nothing about what it was inside";
         assert!(said.contains(reading), "{said}");
         assert!(said.ends_with("its log is /c/blaze/v2/serve.log"), "{said}");
         let ended = Reaped::Code(101);
@@ -1230,8 +1337,16 @@ mod refusals {
             said.contains("ended by signal 11 while finding its build and its state"),
             "{said}"
         );
-        let said = DaemonError::Closed { socket, log, pid: 9, phase: Phase::State }.to_string();
+        let said = DaemonError::Closed {
+            socket,
+            log,
+            pid: 9,
+            phase: Phase::State,
+            inside: Some("`open store` (0.4s open)".to_owned()),
+        }
+        .to_string();
         assert!(said.contains("closed its ready pipe while reading its state"), "{said}");
+        assert!(said.contains("inside `open store` (0.4s open), before it listened"), "{said}");
     }
 
     #[cfg(unix)]
@@ -1244,12 +1359,15 @@ mod refusals {
         assert_eq!(heard(&ready, STARTING).unwrap(), Heard::Listening);
         let (ready, said) = std::io::pipe().unwrap();
         drop(said);
-        assert_eq!(heard(&ready, STARTING).unwrap(), Heard::Ended { phase: Phase::Launched });
+        assert_eq!(
+            heard(&ready, STARTING).unwrap(),
+            Heard::Ended { phase: Phase::Launched, inside: None }
+        );
         assert!(started.elapsed() < PATIENCE / 10, "heard after {:?}", started.elapsed());
         let (ready, _said) = std::io::pipe().unwrap();
         assert_eq!(
             heard(&ready, Duration::from_millis(20)).unwrap(),
-            Heard::Nothing { phase: Phase::Launched }
+            Heard::Nothing { phase: Phase::Launched, inside: None }
         );
     }
 
@@ -1279,11 +1397,14 @@ mod refusals {
         said.write_all(&[Phase::State.byte()]).unwrap();
         assert_eq!(
             heard(&ready, Duration::from_millis(20)).unwrap(),
-            Heard::Nothing { phase: Phase::State }
+            Heard::Nothing { phase: Phase::State, inside: None }
         );
         said.write_all(&[Phase::Setup.byte()]).unwrap();
         drop(said);
-        assert_eq!(heard(&ready, STARTING).unwrap(), Heard::Ended { phase: Phase::Setup });
+        assert_eq!(
+            heard(&ready, STARTING).unwrap(),
+            Heard::Ended { phase: Phase::Setup, inside: None }
+        );
         // Bounded: a phase said again, or one that is no phase, is refused.
         let (ready, mut said) = std::io::pipe().unwrap();
         said.write_all(&[Phase::Setup.byte(), Phase::State.byte()]).unwrap();
@@ -1292,6 +1413,94 @@ mod refusals {
         let (ready, mut said) = std::io::pipe().unwrap();
         said.write_all(b"x").unwrap();
         assert!(heard(&ready, STARTING).is_err());
+    }
+
+    /// The 2026-11-05 hang said only its phase. A start that says a phase, then what it is
+    /// inside twice, then nothing, is named by the last span it said, whole records read across
+    /// any cut of the bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_start_that_never_listens_names_the_last_span_it_said_it_was_inside() {
+        use std::io::Write as _;
+        use crate::serve::inside_record;
+        let mut bytes = vec![Phase::State.byte()];
+        inside_record("`read journal` (0.5s open)", &mut bytes);
+        inside_record("`open store` (crate=std, 1.0s open)", &mut bytes);
+        let (ready, mut said) = std::io::pipe().unwrap();
+        said.write_all(&bytes).unwrap();
+        let inside = Some("`open store` (crate=std, 1.0s open)".to_owned());
+        assert_eq!(
+            heard(&ready, Duration::from_millis(20)).unwrap(),
+            Heard::Nothing { phase: Phase::State, inside: inside.clone() }
+        );
+        // Cut anywhere, the same records are read.
+        for cut in 0..bytes.len() {
+            let mut hearing = Hearing::new();
+            assert!(!hearing.feed(&bytes[..cut]).unwrap());
+            assert!(!hearing.feed(&bytes[cut..]).unwrap());
+            assert_eq!((hearing.phase, &hearing.inside), (Phase::State, &inside), "cut at {cut}");
+        }
+        let said = not_listening(
+            Path::new("/run/blaze/v2.sock"),
+            Path::new("/c/blaze/v2/serve.log"),
+            9,
+            Phase::State,
+            inside.as_deref(),
+        );
+        assert!(
+            said.contains(
+                "for 60s, inside `open store` (crate=std, 1.0s open); its log is /c/blaze/v2/serve.log"
+            ),
+            "{said}"
+        );
+        // The record carries at most its cap, cut at a character's boundary.
+        let mut long = Vec::new();
+        inside_record(&"é".repeat(crate::serve::INSIDE_MAX), &mut long);
+        let mut hearing = Hearing::new();
+        assert!(!hearing.feed(&long).unwrap());
+        let kept = hearing.inside.unwrap();
+        assert!(kept.len() <= crate::serve::INSIDE_MAX && kept.chars().all(|it| it == 'é'));
+        assert_eq!(kept.len(), crate::serve::INSIDE_MAX);
+        // A record past the cap is refused.
+        let mut hearing = Hearing::new();
+        let over = u16::try_from(crate::serve::INSIDE_MAX + 1).unwrap().to_le_bytes();
+        let why = hearing.feed(&[crate::serve::INSIDE, over[0], over[1]]).unwrap_err().to_string();
+        assert!(why.contains("at most 512 are said"), "{why}");
+    }
+
+    /// The records of what a start is inside come every 500 ms, faster than a phase's wait:
+    /// they never restart it. A writer says them as fast as the pipe takes them, and the wait
+    /// of the phase still ends at its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn records_of_what_a_start_is_inside_do_not_extend_its_phase_wait() {
+        use std::io::Write as _;
+        let (ready, mut said) = std::io::pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            let mut record = Vec::new();
+            crate::serve::inside_record("`spin` (0.1s open)", &mut record);
+            // Bounded: until the reader is gone (the write fails) or 30 s.
+            while began.elapsed() < Duration::from_secs(30) {
+                if said.write_all(&record).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let long = Duration::from_millis(100);
+        let heard = heard(&ready, long).unwrap();
+        let waited = started.elapsed();
+        drop(ready);
+        writer.join().unwrap();
+        assert_eq!(
+            heard,
+            Heard::Nothing {
+                phase: Phase::Launched,
+                inside: Some("`spin` (0.1s open)".to_owned())
+            }
+        );
+        assert!(waited < Duration::from_secs(5), "the phase's 100 ms wait took {waited:?}");
     }
 
     #[test]
