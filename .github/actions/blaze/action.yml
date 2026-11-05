@@ -28,6 +28,22 @@ runs:
         if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
           sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
         fi
+    # The daemon pins its direct-IO buffers with io_uring (crates/blaze-core/src/uring.rs,
+    # `Registered`), which needs more locked memory than Ubuntu's 8 MiB RLIMIT_MEMLOCK; without
+    # it `blaze serve` exits at start ("io_uring registered buffers: Cannot allocate memory").
+    # Each later step's shell is a child of Runner.Worker, so its limit is the one raised.
+    - name: locked memory
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        worker=$(pgrep -o -f Runner.Worker) || { echo "::error::locked memory: no Runner.Worker process to raise RLIMIT_MEMLOCK of"; exit 1; }
+        sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
+        prlimit --pid "$worker" --memlock
+    - name: locked memory is raised
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        [ "$(ulimit -l)" = unlimited ] || { echo "::error::locked memory: RLIMIT_MEMLOCK is $(ulimit -l) KiB in a step after it was raised"; exit 1; }
     # The release .github/blaze-version names, not the newest canary: canaries come every 40
     # minutes, sooner than a cold run (about an hour) ends and pushes, so with the newest every
     # run whose canary changed blaze's sources would be cold. A pull request that moves the gate
