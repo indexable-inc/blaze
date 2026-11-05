@@ -275,282 +275,392 @@ pub(crate) fn foreign_site(name: &str, target: &str, level: &str) -> Option<u16>
 
 // --- Names ------------------------------------------------------------------------------
 
-/// A string a row names (a field's value, a thread's name), as a number: 0 is none.
+pub mod names;
+
+use names::{CLASS, KEPT_SYM, KEPT_TOKEN, Token};
+
+/// A string a decoded row names (a field's value, a thread's name), as a number of this
+/// process: 0 is none. Its top two bits say its table: [`KEPT_SYM`] the kept names (threads'),
+/// [`READER_SYM`] the readers' ([`READER`]), [`RECOVERED_SYM`] a postmortem's. A ring's rows
+/// hold ids of their own ring instead ([`names`]), which [`decode`] turns into these.
 pub type Sym = u32;
 
-const SHARDS: usize = 16;
-/// Names a shard's generation holds. A full generation becomes the previous one and the one
-/// before it is let go, so a daemon that names every key of every build keeps two generations,
-/// never a cap past which names are dropped.
-const GENERATION: usize = 1 << 14;
-/// The epochs a `Sym` can say, in its bits 4..12; epoch 0 is the [`kept`] table's.
-const EPOCHS: u32 = 1 << 8;
-/// Tries one [`intern`] makes before it gives up on a name (counted, [`NAMES_LOST`]): each one
-/// that does not end found or given saw its shard's generation full and moved it on, and a
-/// generation holds [`GENERATION`] names, so only a shard filled this many times over while
-/// one call ran (its thread stopped meanwhile) runs out.
-const INTERN_TRIES: usize = 8;
+/// The class of a name a reader gave ([`ReadTable`]): bits 24..30 its generation's epoch,
+/// the index from 1 below.
+const READER_SYM: u32 = 0b01 << 30;
+/// The class of a name a postmortem gave ([`RECOVERED`]).
+const RECOVERED_SYM: u32 = 0b11 << 30;
+/// Names one generation of the readers' table holds: its index bits.
+const READER_GENERATION: usize = (1 << 24) - 1;
+/// The epochs a reader's sym can say: bits 24..30.
+const READER_EPOCHS: u32 = 1 << 6;
 
-/// A `Sym`: bits 0..4 its shard, 4..12 its generation's epoch, 12.. its index from 1. A `Sym` of
-/// a generation let go reads as none; its epoch comes round again only after 255 more, by when
-/// every ring has written over each row that held it (a generation outlasts a ring's rows).
-const fn sym(shard: usize, epoch: u32, index: usize) -> Sym {
-    (index as u32 + 1) << 12 | epoch << 4 | shard as u32
-}
-
-/// The epoch after `epoch`: 1..=255 round, 0 being the kept table's and a shard's before its
-/// first name.
-const fn next_epoch(epoch: u32) -> u32 {
-    epoch % (EPOCHS - 1) + 1
-}
-
-/// The epoch before `epoch` (of 1..=255).
-const fn previous_epoch(epoch: u32) -> u32 {
-    if epoch <= 1 { EPOCHS - 1 } else { epoch - 1 }
-}
-
-/// The names of the kept and recovered tables: few, given under their lock.
+/// Names numbered from 1 under `class`: the kept names, a postmortem's, or one generation of
+/// the readers'. Each is under its lock, which only its givers and readers take, never a
+/// thread that records.
 #[derive(Default)]
-struct Generation {
-    epoch: u32,
+struct Table {
     ids: HashMap<std::sync::Arc<str>, Sym, Global>,
     names: Vec<std::sync::Arc<str>>,
 }
 
-impl Generation {
-    fn get(&self, sym: Sym) -> Option<&std::sync::Arc<str>> {
-        (sym >> 4 & (EPOCHS - 1) == self.epoch)
-            .then(|| self.names.get((sym >> 12).checked_sub(1)? as usize))?
+impl Table {
+    /// The name of index `index` (from 1).
+    fn get(&self, index: u32) -> Option<&std::sync::Arc<str>> {
+        self.names.get(usize::try_from(index.checked_sub(1)?).ok()?)
     }
 
-    fn add(&mut self, shard: usize, name: &str) -> Sym {
-        // alloc: once per distinct name a generation, let go with it
+    fn add(&mut self, base: u32, name: &str) -> Sym {
+        // alloc: once per distinct name a table holds, let go with it
         let kept: std::sync::Arc<str> = name.into();
-        let id = sym(shard, self.epoch, self.names.len());
         // clone: a refcount, the name's one string shared by both
-        self.names.push(kept.clone());
-        self.ids.insert(kept, id);
+        self.add_arc(base, kept.clone())
+    }
+
+    fn add_arc(&mut self, base: u32, name: std::sync::Arc<str>) -> Sym {
+        self.names.push(name.clone());
+        let id = base | self.names.len() as u32;
+        self.ids.insert(name, id);
         id
     }
 }
 
-/// One generation of a shard's names, shared with no lock: a hit is one papaya read, a new
-/// name an atomic add for its index and two papaya inserts. Nothing a thread holds while it
-/// gives a name stops another, so a thread stopped there (sampled, preempted, faulting) stops
-/// only itself; with the lock this replaced, 60 threads queued behind one the sampler had
-/// interrupted, the daemon's turn loop among them.
-#[derive(Default)]
-struct Shared {
-    /// The next index to give; past [`GENERATION`] the generation is full.
-    next: std::sync::atomic::AtomicUsize,
-    ids: blaze_hash::SharedMap<std::sync::Arc<str>, Sym>,
-    names: blaze_hash::SharedMap<Sym, std::sync::Arc<str>>,
-}
+/// Names that live as long as the process: threads', and `&'static str`s
+/// ([`span::Name::kept`]). Logged for a postmortem as they are given.
+static KEPT: Mutex<Option<Table>> = Mutex::new(None);
+/// Names past [`KEPT`]'s room: the index bits of a kept sym.
+const KEPT_MAX: usize = (1 << 30) - 1;
 
-/// A shard's names: its current generation's epoch, and its generations by epoch, the current
-/// one and the one before (and, between a move and the old one's removal, the one before
-/// that). A generation removed is freed once no thread reads it (papaya's reclamation).
-#[derive(Default)]
-struct Shard {
-    /// 0 until the shard's first name.
-    current: AtomicU32,
-    generations: blaze_hash::SharedMap<u32, Shared>,
-}
-
-/// The names of a process's rows, by shard.
-struct Names([Shard; SHARDS]);
-
-static NAMES: std::sync::LazyLock<Names> = std::sync::LazyLock::new(Names::new);
-/// Names that live as long as what holds them, not a build: threads'.
-static KEPT: Mutex<Option<Generation>> = Mutex::new(None);
-static NAMES_FORGOTTEN: AtomicU64 = AtomicU64::new(0);
-/// Names given ([`intern`] found none): [`Plot::ProfileNamesGiven`].
-static NAMES_GIVEN: AtomicU64 = AtomicU64::new(0);
-/// Names two threads gave at once, the loser's number left unused: [`Plot::ProfileNamesRaced`].
-static NAMES_RACED: AtomicU64 = AtomicU64::new(0);
-/// Names [`INTERN_TRIES`] did not settle, read as none: [`Plot::ProfileNamesLost`].
-static NAMES_LOST: AtomicU64 = AtomicU64::new(0);
-
-/// The number of `name`, given it the first time in its generation: a hash, then a lock-free
-/// read of its shard's current generation; a new name is an atomic add and two lock-free
-/// inserts. A name the previous generation has is given a number of the current one, so a
-/// name still in use outlives the generation it was first named in.
-pub fn intern(name: &str) -> Sym {
-    NAMES.intern(name)
-}
-
-impl Names {
-    fn new() -> Names {
-        Names(std::array::from_fn(|_| Shard::default()))
+/// The number of `name` for as long as the process lives: a thread's name, which its ring's
+/// rows hold for the thread's life, or a kept name. Only for names of which there are few: it
+/// takes [`KEPT`]'s lock the first time a thread asks for each.
+pub(crate) fn intern_kept(name: &str) -> Sym {
+    let mut kept = lock(&KEPT);
+    let kept = kept.get_or_insert_with(Table::default);
+    if let Some(&id) = kept.ids.get(name) {
+        return id;
     }
-
-    fn intern(&self, name: &str) -> Sym {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = FixedHasher::default();
-        name.hash(&mut hasher);
-        let at = (hasher.finish() >> 60) as usize % SHARDS;
-        let shard = &self.0[at];
-        let generations = shard.generations.pin();
-        for _ in 0..INTERN_TRIES {
-            let epoch = shard.current.load(Ordering::Acquire);
-            let Some(generation) = generations.get(&epoch) else {
-                // The shard's first name, or a move whose new generation is not in yet.
-                Self::move_on(shard, epoch);
-                continue;
-            };
-            let ids = generation.ids.pin();
-            if let Some(&id) = ids.get(name) {
-                return id;
-            }
-            let index = generation.next.fetch_add(1, Ordering::Relaxed);
-            if index >= GENERATION {
-                Self::move_on(shard, epoch);
-                continue;
-            }
-            let id = sym(at, epoch, index);
-            // alloc: once per distinct name a generation, let go with it
-            let kept: std::sync::Arc<str> = name.into();
-            // Its text first, so no reader holds the number before the number reads as it.
-            // clone: a refcount, the name's one string shared by both maps
-            generation.names.pin().insert(id, kept.clone());
-            // clone: a refcount, as above
-            match ids.try_insert(kept.clone(), id) {
-                Ok(_) => {
-                    NAMES_GIVEN.fetch_add(1, Ordering::Relaxed);
-                    // Its insert before the mapping is read, as `persist` sets the mapping
-                    // before it reads the names: one of the two logs the name.
-                    fence(Ordering::SeqCst);
-                    postmortem::named(at, id, &kept);
-                    return id;
-                }
-                Err(taken) => {
-                    let won = *taken.current;
-                    generation.names.pin().remove(&id);
-                    NAMES_RACED.fetch_add(1, Ordering::Relaxed);
-                    return won;
-                }
-            }
-        }
+    if kept.names.len() >= KEPT_MAX {
         NAMES_LOST.fetch_add(1, Ordering::Relaxed);
-        0
+        return 0;
+    }
+    let id = kept.add(KEPT_SYM, name);
+    postmortem::named(id, name);
+    id
+}
+
+/// One generation and the one before of the names readers give: a name read again after its
+/// generation moved on is given a number of the current one, so a name in use outlives the
+/// generation it was first given in; one in neither reads as none.
+#[derive(Default)]
+struct ReadTable {
+    epoch: u32,
+    current: Table,
+    previous: Table,
+}
+
+impl ReadTable {
+    fn base(epoch: u32) -> u32 {
+        READER_SYM | epoch << 24
     }
 
-    /// Moves `shard` on from `seen`, its current epoch as a caller read it (full, or 0 before
-    /// any): the generation after it goes in, becomes current, and the one before `seen` goes.
-    /// Of threads that move it at once, one inserts and one swaps; the rest find it moved.
-    fn move_on(shard: &Shard, seen: u32) {
-        if shard.current.load(Ordering::Acquire) != seen {
-            return;
+    fn sym_of(&mut self, text: std::sync::Arc<str>) -> Sym {
+        if let Some(&id) = self.current.ids.get(&text) {
+            return id;
         }
-        let generations = shard.generations.pin();
-        let next = next_epoch(seen);
-        // A generation of `next` already in is this move's (another thread's insert), or one a
-        // move as late as this one put in: never one with names, as only the current one is
-        // given into.
-        _ = generations.try_insert(next, Shared::default());
-        if shard
-            .current
-            .compare_exchange(seen, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            && seen != 0
-        {
-            generations.remove(&previous_epoch(seen));
+        if self.current.names.len() >= READER_GENERATION {
+            self.previous = std::mem::take(&mut self.current);
+            self.epoch = (self.epoch + 1) % READER_EPOCHS;
         }
+        self.current.add_arc(Self::base(self.epoch), text)
     }
 
-    /// Every name a shard holds now, to `each`: what the mapping logs as it is made
-    /// ([`postmortem`]). A name given meanwhile may be passed here and log itself too.
-    fn each(&self, shard: usize, mut each: impl FnMut(Sym, &str)) {
-        let generations = self.0[shard].generations.pin();
-        for (_, generation) in generations.iter() {
-            for (&sym, name) in generation.names.pin().iter() {
-                each(sym, name);
-            }
+    fn get(&self, sym: Sym) -> Option<&std::sync::Arc<str>> {
+        let (epoch, index) = (sym >> 24 & (READER_EPOCHS - 1), sym & ((1 << 24) - 1));
+        if epoch == self.epoch {
+            self.current.get(index)
+        } else if epoch == (self.epoch + READER_EPOCHS - 1) % READER_EPOCHS {
+            self.previous.get(index)
+        } else {
+            None
         }
-    }
-
-    /// The string of `sym`, an interned (not kept) name: none once its generation was let go.
-    fn get(&self, sym: Sym) -> Option<std::sync::Arc<str>> {
-        let shard = &self.0[(sym & 0xf) as usize];
-        let generations = shard.generations.pin();
-        let generation = generations.get(&(sym >> 4 & (EPOCHS - 1)))?;
-        // clone: a refcount
-        generation.names.pin().get(&sym).cloned()
     }
 }
 
-/// Names given, raced and lost since the process began, and names whose postmortem log entry
-/// another thread wrote ([`postmortem::handed_off`]): how contended interning was.
+/// What readers hold of the rings' names: each ring's definitions ([`names::Streams`]) and the
+/// numbers of this process they were given ([`ReadTable`]). Taken by readers alone (a read of
+/// the rings, a name's text, a stall's dump), never by a thread as it records.
+struct Reader {
+    streams: names::Streams,
+    table: ReadTable,
+}
+
+static READER: Mutex<Option<Reader>> = Mutex::new(None);
+
+fn reader() -> parking_lot::MappedMutexGuard<'static, Reader> {
+    MutexGuard::map(lock(&READER), |it| {
+        it.get_or_insert_with(|| Reader { streams: names::Streams::default(), table: ReadTable::default() })
+    })
+}
+
+/// The live rings, as the readers' [`names::Source`].
+struct Rings;
+
+impl names::Source for Rings {
+    fn names_rows(
+        &mut self,
+        ring: u16,
+        from: u64,
+        into: &mut Vec<(u64, [u64; WORDS])>,
+    ) -> (u64, u64) {
+        match by_number(usize::from(ring)) {
+            Some(ring) => ring.store().read_names(from, into),
+            None => (from, from),
+        }
+    }
+}
+
+/// Names a thread gave ([`names::Count::Given`]) and the like, summed over rings in
+/// [`name_counts`]: each ring's written by its thread alone.
+#[derive(Default)]
+struct RingNames {
+    given: AtomicU64,
+    linked: AtomicU64,
+    /// The generation its last thread began last: where the next thread's names begin.
+    generation: AtomicU32,
+}
+
+/// Names lost: a thread's table taken already (a `Debug` that names), no ring, a text cut,
+/// or a row of more links than a generation's indexes.
+static NAMES_LOST: AtomicU64 = AtomicU64::new(0);
+/// Names a ring held that no reader's definitions resolved: [`Read::names_forgotten`].
+static NAMES_FORGOTTEN: AtomicU64 = AtomicU64::new(0);
+
+/// A thread's ring as the writer side of [`names`] sees it.
+struct Writing<'a>(&'a Ring);
+
+impl names::Out for Writing<'_> {
+    #[inline]
+    fn head(&self) -> u64 {
+        self.0.store_mine().head.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn put(&mut self, row: [u64; WORDS]) -> u64 {
+        self.0.put(row)
+    }
+
+    fn began(&mut self, generation: u32) {
+        self.0.names.generation.store(generation, Ordering::Relaxed);
+    }
+
+    fn counted(&mut self, count: names::Count) {
+        let names = &self.0.names;
+        let one = |it: &AtomicU64| it.store(it.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        match count {
+            names::Count::Given => one(&names.given),
+            names::Count::Linked => one(&names.linked),
+            names::Count::Cut | names::Count::Lost => {
+                NAMES_LOST.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// This thread's names ([`names::Local`]), for the ring it holds: made as it first names.
+    static NAMES_HERE: RefCell<Option<names::Local>> = const { RefCell::new(None) };
+}
+
+/// Runs `with` on this thread's names and ring: `None` when the thread has no ring or its names
+/// are taken (a `Debug` that names inside a name being given). Never inlined and never across a
+/// wait: a fiber that parks resumes on another thread, whose names are its own
+/// (`no-wait-across-thread-locals`).
+#[inline(never)]
+fn with_local<T>(with: impl FnOnce(&mut names::Local, &mut Writing<'_>) -> T) -> Option<T> {
+    let ring = ring()?;
+    let done = NAMES_HERE.try_with(|here| {
+        let mut here = here.try_borrow_mut().ok()?;
+        let local = match &mut *here {
+            Some(local) if local.ring() == ring.number => local,
+            here => here.insert(names::Local::new(
+                ring.number,
+                ring.names.generation.load(Ordering::Relaxed),
+            )),
+        };
+        Some(with(local, &mut Writing(ring)))
+    });
+    let done = done.ok().flatten();
+    if done.is_none() {
+        NAMES_LOST.fetch_add(1, Ordering::Relaxed);
+    }
+    done
+}
+
+/// The token of `text` on this thread: its first use in this thread's generation writes its
+/// definition into the thread's ring; nothing shared is touched. 0 when the thread can't name.
+#[inline]
+pub(crate) fn intern(text: &str) -> Token {
+    with_local(|local, out| local.intern(text, out)).unwrap_or(0)
+}
+
+/// `words`, tokens a row this thread writes next will hold, as the row's own ids ([`names`]).
+/// A word under 2^32 is a sym of this process's tables (a name read back from a table or a
+/// row), named again here.
+#[inline]
+fn row_syms(words: &mut [u64]) {
+    if words.iter().all(|it| *it == 0 || *it & KEPT_TOKEN != 0) {
+        for word in words {
+            if *word != 0 {
+                *word = u64::from(KEPT_SYM) | *word & ((1 << 30) - 1);
+            }
+        }
+        return;
+    }
+    for word in words.iter_mut() {
+        if *word != 0 && *word >> 32 == 0 {
+            *word = match name(*word as Sym) {
+                _ if *word as u32 & CLASS == KEPT_SYM => KEPT_TOKEN | *word & ((1 << 30) - 1),
+                Some(text) => intern(&text),
+                None => 0,
+            };
+        }
+    }
+    if with_local(|local, out| local.row_syms(words, out)).is_none() {
+        words.fill(0);
+    }
+}
+
+/// The text of `token`, a [`span::Name`]'s or a slot's: a kept name, a sym of this process,
+/// or a ring's name, whose ring a reader catches up to find it.
+pub(crate) fn token_text(token: Token) -> Option<std::sync::Arc<str>> {
+    if token == 0 {
+        return None;
+    }
+    if token & KEPT_TOKEN != 0 {
+        return name(KEPT_SYM | (token & ((1 << 30) - 1)) as u32);
+    }
+    if token >> 32 == 0 {
+        return name(token as Sym);
+    }
+    let found = reader().streams.text(token, &mut Rings);
+    if found.is_none() {
+        NAMES_FORGOTTEN.fetch_add(1, Ordering::Relaxed);
+    }
+    found
+}
+
+/// A sym of this process for `text`, from the readers' table: what a name read back from a
+/// table is given ([`span::Value::of_text`]).
+pub fn read_sym(text: &str) -> Sym {
+    reader().table.sym_of(text.into())
+}
+
+/// The key the hot sketches keep `token` under ([`names::hot_key`]).
+pub(crate) fn hot_key(token: Token) -> u32 {
+    if token != 0 && token >> 32 == 0 {
+        // A sym of this process: named on this thread first.
+        return names::hot_key(name(token as Sym).map_or(0, |it| intern(&it)));
+    }
+    names::hot_key(token)
+}
+
+/// The text of a hot sketch's key ([`hot_key`]): a kept name's, or a ring's name's.
+pub(crate) fn hot_name(key: u32) -> Option<std::sync::Arc<str>> {
+    if key == 0 {
+        return None;
+    }
+    if key < 1 << 20 {
+        return name(KEPT_SYM | key);
+    }
+    let mut reader = reader();
+    reader.streams.catch_up((key >> 20) as u16, &mut Rings);
+    reader.streams.hot_text(key)
+}
+
+/// Names given, linked and lost since the process began: what naming cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NameCounts {
+    /// Definitions written: a text a thread named first in its generation.
     pub given: u64,
-    pub raced: u64,
+    /// Links written: a name a thread used that another thread or an older generation gave.
+    pub linked: u64,
     pub lost: u64,
-    pub handed_off: u64,
 }
 
 /// See [`NameCounts`].
 pub fn name_counts() -> NameCounts {
+    let rings = lock(&RINGS);
+    let sum = |of: fn(&RingNames) -> &AtomicU64| {
+        rings.iter().map(|it| of(&it.names).load(Ordering::Relaxed)).sum()
+    };
     NameCounts {
-        given: NAMES_GIVEN.load(Ordering::Relaxed),
-        raced: NAMES_RACED.load(Ordering::Relaxed),
+        given: sum(|it| &it.given),
+        linked: sum(|it| &it.linked),
         lost: NAMES_LOST.load(Ordering::Relaxed),
-        handed_off: postmortem::handed_off(),
     }
 }
 
-/// The number of `name` for as long as the process lives: a thread's name, which its ring's
-/// rows hold for the thread's life. Only for names of which there are few.
-pub(crate) fn intern_kept(name: &str) -> Sym {
-    let mut kept = lock(&KEPT);
-    let kept = kept.get_or_insert_with(Generation::default);
-    if let Some(&id) = kept.ids.get(name) {
-        return id;
-    }
-    let id = kept.add(0, name);
-    postmortem::named(SHARDS, id, name);
-    id
-}
-
-/// Names of rows a postmortem read back from a process that died ([`postmortem`]): epoch 0 as
-/// [`KEPT`], shard 1 (kept names are all shard 0), for as long as one postmortem writes them.
-/// `None` between postmortems.
-static RECOVERED: Mutex<Option<Generation>> = Mutex::new(None);
-/// The shard bits of a [`RECOVERED`] name.
-const RECOVERED_SHARD: usize = 1;
-/// Names one postmortem may give: the index bits of a [`Sym`].
-const RECOVERED_MAX: usize = (1 << 20) - 1;
+/// Names of rows a postmortem read back from a process that died ([`postmortem`]), for as
+/// long as one postmortem writes them. `None` between postmortems.
+static RECOVERED: Mutex<Option<Table>> = Mutex::new(None);
+/// Names one postmortem may give: the index bits of a recovered sym.
+const RECOVERED_MAX: usize = (1 << 30) - 1;
 
 /// A number of this process for `name`, a name of a dead process's rows, while its postmortem
 /// runs; `None` past [`RECOVERED_MAX`].
 fn recovered(name: &str) -> Option<Sym> {
     let mut recovered = lock(&RECOVERED);
-    let recovered = recovered.get_or_insert_with(Generation::default);
+    let recovered = recovered.get_or_insert_with(Table::default);
     if let Some(&id) = recovered.ids.get(name) {
         return Some(id);
     }
-    (recovered.names.len() < RECOVERED_MAX).then(|| recovered.add(RECOVERED_SHARD, name))
+    (recovered.names.len() < RECOVERED_MAX).then(|| recovered.add(RECOVERED_SYM, name))
 }
 
-/// The string of `sym`: none for 0, and for a name of a generation let go (counted).
+/// The string of `sym`, a sym of this process: none for 0, and for a name of a generation let
+/// go (counted).
 pub fn name(sym: Sym) -> Option<std::sync::Arc<str>> {
     if sym == 0 {
         return None;
     }
-    let epoch = sym >> 4 & (EPOCHS - 1);
-    let found = if epoch == 0 && (sym & 0xf) as usize == RECOVERED_SHARD {
-        // clone: a refcount
-        lock(&RECOVERED).as_ref().and_then(|it| it.get(sym).cloned())
-    } else if epoch == 0 {
-        // clone: a refcount
-        lock(&KEPT).as_ref().and_then(|it| it.get(sym).cloned())
-    } else {
-        NAMES.get(sym)
+    let index = sym & !CLASS;
+    // clone: a refcount
+    let found = match sym & CLASS {
+        KEPT_SYM => lock(&KEPT).as_ref().and_then(|it| it.get(index).cloned()),
+        RECOVERED_SYM => lock(&RECOVERED).as_ref().and_then(|it| it.get(index).cloned()),
+        READER_SYM => lock(&READER).as_ref().and_then(|it| it.table.get(sym).cloned()),
+        // A ring's own id: only a row holds one, and decoding turns it into one of the above.
+        _ => None,
     };
     if found.is_none() {
         NAMES_FORGOTTEN.fetch_add(1, Ordering::Relaxed);
     }
     found
+}
+
+/// How [`decode`] turns the ids a ring's rows hold into syms of this process.
+trait Namer {
+    /// The sym of `word`, an id the row at index `at` of ring `ring` holds: 0, a kept name's, or
+    /// one of the ring's own.
+    fn sym(&mut self, ring: u16, at: u64, word: u64) -> Sym;
+}
+
+/// This process's rings, through the readers' state.
+struct LiveNamer<'a>(&'a mut Reader);
+
+impl Namer for LiveNamer<'_> {
+    fn sym(&mut self, ring: u16, at: u64, word: u64) -> Sym {
+        let word = word as u32;
+        if word == 0 || word & CLASS == KEPT_SYM {
+            return word;
+        }
+        let Reader { streams, table } = &mut *self.0;
+        match streams.resolve(ring, at, word, &mut Rings) {
+            Some(text) => table.sym_of(text),
+            None => 0,
+        }
+    }
 }
 
 // --- Plots ------------------------------------------------------------------------------
@@ -629,20 +739,19 @@ pub enum Plot {
     /// Reads of a thread's CPU clock the recorder made so far, one a boundary
     /// ([`crate::time::cpu`]).
     ProfileCpuReads,
-    /// Names the recorder gave so far ([`intern`] found none): span fields' and events' text.
-    /// Written with [`Plot::ProfileCostNs`], as are the three after it ([`name_counts`]).
+    /// Names the recorder's threads defined so far, each in its own ring ([`names`]): span
+    /// fields' and events' text a thread named first in its generation. Written with
+    /// [`Plot::ProfileCostNs`], as are the two after it ([`name_counts`]).
     ProfileNamesGiven,
-    /// Names two threads gave at once, one number left unused: how often interning collided.
-    ProfileNamesRaced,
-    /// Names [`intern`] gave up on, read as none: a shard moved on many times during one call.
+    /// Links written: a name a thread used that another thread, or an older generation of its
+    /// own, gave (a span closed on another thread than it began on, a `Name` passed along).
+    ProfileNamesLinked,
+    /// Names lost: a text cut, a thread with no ring, a `Debug` that names while it is named.
     ProfileNamesLost,
-    /// Names whose postmortem log entry a thread already writing that log wrote, as the giver's
-    /// try of the log's lock failed: how contended the name logs are. None waits for them.
-    ProfileNamesHandedOff,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 30] = [
+    pub const ALL: [Plot; 29] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -670,9 +779,8 @@ impl Plot {
         Plot::ProfileSpansMade,
         Plot::ProfileCpuReads,
         Plot::ProfileNamesGiven,
-        Plot::ProfileNamesRaced,
+        Plot::ProfileNamesLinked,
         Plot::ProfileNamesLost,
-        Plot::ProfileNamesHandedOff,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -704,9 +812,8 @@ impl Plot {
             Plot::ProfileSpansMade => "profile spans made",
             Plot::ProfileCpuReads => "profile cpu reads",
             Plot::ProfileNamesGiven => "profile names given",
-            Plot::ProfileNamesRaced => "profile names raced",
+            Plot::ProfileNamesLinked => "profile names linked",
             Plot::ProfileNamesLost => "profile names lost",
-            Plot::ProfileNamesHandedOff => "profile names handed off",
         }
     }
 
@@ -1284,7 +1391,8 @@ const fn event_id(ring: u16, index: u64) -> u64 {
 /// (a field's `Debug` that itself logs), since the process began: not kept.
 static FIELDS_LOST: AtomicU64 = AtomicU64::new(0);
 
-/// A field's value as an event recorded it: a number as itself, text interned ([`intern`]).
+/// A field's value as an event recorded it: a number as itself, text as a [`Sym`] (in a ring's
+/// row, an id of the ring's own, [`names`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FieldValue {
     I64(i64),
@@ -1341,18 +1449,26 @@ impl FieldValue {
 
 /// What an event said: its message and its other fields, each by its index in its callsite,
 /// as [`evented`] writes them. A fixed buffer, so a number is kept with no allocation; text is
-/// interned.
+/// named on the thread ([`intern`]), a field's [`FieldValue::Str`] holding its place in
+/// `tokens` until [`evented`] gives the row its ids.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Logged {
-    /// Its `message` field, interned; 0 for none.
-    pub(crate) message: Sym,
+    /// Its `message` field's token; 0 for none.
+    message: Token,
     fields: [(u8, FieldValue); EVENT_FIELDS],
     len: usize,
+    tokens: [Token; EVENT_FIELDS],
+    texts: usize,
 }
 
 impl Logged {
-    const EMPTY: Logged =
-        Logged { message: 0, fields: [(0, FieldValue::Bool(false)); EVENT_FIELDS], len: 0 };
+    const EMPTY: Logged = Logged {
+        message: 0,
+        fields: [(0, FieldValue::Bool(false)); EVENT_FIELDS],
+        len: 0,
+        tokens: [0; EVENT_FIELDS],
+        texts: 0,
+    };
 
     /// Its fields other than its message, in the order it recorded them: each one's index in
     /// its callsite's fields and its value.
@@ -1370,12 +1486,35 @@ impl Logged {
         self.len += 1;
     }
 
-    fn text(&mut self, field: &tracing::field::Field, sym: Sym) {
+    fn text(&mut self, field: &tracing::field::Field, token: Token) {
         if field.name() == "message" {
-            self.message = sym;
+            self.message = token;
+        } else if self.texts < EVENT_FIELDS {
+            let at = self.texts;
+            let len = self.len;
+            self.put(field, FieldValue::Str(at as Sym));
+            if self.len > len {
+                self.tokens[at] = token;
+                self.texts += 1;
+            }
         } else {
-            self.put(field, FieldValue::Str(sym));
+            FIELDS_LOST.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Its tokens as the ids of the row its thread writes next ([`row_syms`]): the message's,
+    /// and each text field's in place.
+    fn named(&mut self) -> Sym {
+        let mut words = [0; EVENT_FIELDS + 1];
+        words[0] = self.message;
+        words[1..=self.texts].copy_from_slice(&self.tokens[..self.texts]);
+        row_syms(&mut words[..=self.texts]);
+        for (_, value) in &mut self.fields[..self.len] {
+            if let FieldValue::Str(at) = value {
+                *at = words[1 + *at as usize] as Sym;
+            }
+        }
+        words[0] as Sym
     }
 }
 
@@ -1455,10 +1594,12 @@ pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
     };
     let span = if span == UNRECORDED { 0 } else { span };
     keep(span);
-    // Every field is read before a row is written: a field's `Debug` that logs writes its own
-    // event's rows first, never between this one's.
+    // Every field is read and named before a row is written: a field's `Debug` that logs writes
+    // its own event's rows first, and a definition goes in before the rows that name it, never
+    // between this one's.
     let mut logged = Logged::EMPTY;
     event.record(&mut logged);
+    let message = logged.named();
     let running = RUNNING.with(Cell::get);
     let build = match BUILD.with(Cell::get) {
         0 => running.build,
@@ -1467,7 +1608,7 @@ pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
     let now = clock::ticks();
     let what = KIND_PLOT << 62 | u64::from(site) << 8 | EVENT_ROW;
     let index =
-        ring.put([now, running.job, span, 0, what, u64::from(logged.message), u64::from(build), 0]);
+        ring.put([now, running.job, span, 0, what, u64::from(message), u64::from(build), 0]);
     let id = event_id(ring.number, index);
     for chunk in logged.fields().chunks(COL_WORDS.len()) {
         let mut row = [now, 0, 0, id, 0, 0, 0, 0];
@@ -1855,6 +1996,10 @@ const _: () = {
         SPAN_COLS_ROW,
         FOLD_ROW,
         CPU_ROW,
+        names::GEN_ROW,
+        names::NAME_ROW,
+        names::NAME_MORE_ROW,
+        names::LINK_ROW,
     ];
     let mut i = 0;
     while i < bytes.len() {
@@ -1887,8 +2032,9 @@ struct Slot {
     parent: AtomicU64,
     /// Its site, depth and build.
     what: AtomicU64,
-    /// Its crate and function.
-    of: AtomicU64,
+    /// Its crate, function and unit, as tokens ([`names::Token`]).
+    krate: AtomicU64,
+    function: AtomicU64,
     unit: AtomicU64,
     alloc_bytes: AtomicU64,
     allocs: AtomicU64,
@@ -1927,7 +2073,8 @@ impl Slot {
         start: AtomicU64::new(0),
         parent: AtomicU64::new(0),
         what: AtomicU64::new(0),
-        of: AtomicU64::new(0),
+        krate: AtomicU64::new(0),
+        function: AtomicU64::new(0),
         unit: AtomicU64::new(0),
         alloc_bytes: AtomicU64::new(0),
         allocs: AtomicU64::new(0),
@@ -1952,8 +2099,9 @@ struct Opened {
     site: u16,
     depth: u16,
     build: u32,
-    of: u64,
-    unit: u64,
+    krate: Token,
+    function: Token,
+    unit: Token,
     alloc: Allocated,
     copied: FrameCopied,
     lease: u64,
@@ -1972,12 +2120,7 @@ struct Opened {
 impl Opened {
     /// Its columns, as a span kind reads them.
     fn said(&self) -> Said {
-        Said {
-            krate: (self.of >> 32) as Sym,
-            function: self.of as Sym,
-            unit: self.unit as Sym,
-            typed: self.typed,
-        }
+        Said { krate: self.krate, function: self.function, unit: self.unit, typed: self.typed }
     }
 }
 
@@ -2060,6 +2203,41 @@ impl Store {
         }
         into.truncate(kept);
         head
+    }
+
+    /// The names rows ([`names`]) from index `from` that are whole now, each with its index,
+    /// into `into`; the first index read and the one after the last, every row between them
+    /// read whole ([`names::Source`]).
+    fn read_names(&self, from: u64, into: &mut Vec<(u64, [u64; WORDS])>) -> (u64, u64) {
+        let head = self.head.load(Ordering::Acquire);
+        let first = from.max(head.saturating_sub(CAP as u64));
+        let start = into.len();
+        for i in first..head {
+            let at = (i as usize & (CAP - 1)) * WORDS;
+            let tag = self.words[at + 4].load(Ordering::Relaxed);
+            if tag >> 62 != KIND_PLOT || !(names::LINK_ROW..=names::GEN_ROW).contains(&(tag & 0xff))
+            {
+                continue;
+            }
+            let mut row = [0; WORDS];
+            for (value, word) in row.iter_mut().zip(&self.words[at..at + WORDS]) {
+                *value = word.load(Ordering::Relaxed);
+            }
+            into.push((i, row));
+        }
+        fence(Ordering::Acquire);
+        // Rows the writer was writing over as they were read are dropped, and so is the claim
+        // that they were read: the first row read is the first one whole.
+        let whole_from = (self.head.load(Ordering::Relaxed) + 1).saturating_sub(CAP as u64);
+        let mut kept = start;
+        for i in start..into.len() {
+            if into[i].0 >= whole_from {
+                into.swap(kept, i);
+                kept += 1;
+            }
+        }
+        into.truncate(kept);
+        (first.max(whole_from.min(head)), head)
     }
 
     /// Copies `self` into `to`, which no one reads yet: rows, owners and the history's marks,
@@ -2282,6 +2460,8 @@ pub(crate) struct Ring {
     cost: AtomicU64,
     cpu_reads: AtomicU64,
     sample: AtomicU64,
+    /// What its threads' names wrote ([`names`]), each count by its thread alone.
+    names: RingNames,
 }
 
 impl Ring {
@@ -2325,6 +2505,7 @@ impl Ring {
             cpu_reads: AtomicU64::new(0),
             // Any odd seed: xorshift never leaves a nonzero state.
             sample: AtomicU64::new(0x9E37_79B9_7F4A_7C15 ^ u64::from(number) << 1 | 1),
+            names: RingNames::default(),
         }
     }
 
@@ -2462,7 +2643,8 @@ impl Ring {
             site: (what & ((1 << SITE_BITS) - 1)) as u16,
             depth: (what >> 16 & 0xffff) as u16,
             build: (what >> 32) as u32,
-            of: slot.of.load(Ordering::Relaxed),
+            krate: slot.krate.load(Ordering::Relaxed),
+            function: slot.function.load(Ordering::Relaxed),
             unit: slot.unit.load(Ordering::Relaxed),
             alloc: Allocated {
                 bytes: slot.alloc_bytes.load(Ordering::Relaxed),
@@ -2705,7 +2887,7 @@ struct Fields {
 impl Fields {
     /// `field` is one bit of [`Site::fields`].
     fn set(&mut self, field: u8, value: &str) {
-        self.said.set(field.trailing_zeros() as usize, u64::from(intern(value)));
+        self.said.set(field.trailing_zeros() as usize, intern(value));
     }
 }
 
@@ -2857,8 +3039,9 @@ pub(crate) fn keep(id: u64) {
 
 #[inline]
 fn store_said(slot: &Slot, said: &Said) {
-    slot.of.store(u64::from(said.krate) << 32 | u64::from(said.function), Ordering::Relaxed);
-    slot.unit.store(u64::from(said.unit), Ordering::Relaxed);
+    slot.krate.store(said.krate, Ordering::Relaxed);
+    slot.function.store(said.function, Ordering::Relaxed);
+    slot.unit.store(said.unit, Ordering::Relaxed);
     for (word, value) in slot.typed.iter().zip(said.typed) {
         word.store(value, Ordering::Relaxed);
     }
@@ -3058,7 +3241,6 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
         | u64::from(opened.depth.min((1 << DEPTH_BITS) - 1)) << (62 - SITE_BITS - DEPTH_BITS)
         | (ring_of(id) as u64) << ALLOCS_BITS
         | allocs;
-    let build_unit = u64::from(opened.build) << 32 | opened.unit;
     let ring = ring()?;
     let cost = cost_from(ring);
     // Closed by another thread than made it: its own ring, but leased again since, is another
@@ -3105,18 +3287,37 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
             parent_site = (parent.what.load(Ordering::Relaxed) & ((1 << SITE_BITS) - 1)) as u16;
         }
     }
-    let key = crate::hot::record::key(opened.site, opened.of as u32);
+    let key = crate::hot::record::key(opened.site, hot_key(opened.function));
     let waits_on = opened.typed[<span::col::WaitsOn as span::Column>::AT - span::GENERIC];
     crate::hot::record::closed(&ring.hot, key, ticks, waits_on);
     if fold {
         folded(ring, &opened, parent_site, now, known, pending, allocs, bytes);
     } else {
+        // Every name its rows hold, as ids of this ring's, given before its first row: a
+        // definition or a link (a span another thread made, a `Name` passed along) goes in
+        // before the rows that name it, never between them.
+        let mut words = [0; 3 + TYPED];
+        words[..3].copy_from_slice(&[opened.krate, opened.function, opened.unit]);
+        let mut typed = opened.typed;
+        for (at, word) in typed.iter().enumerate() {
+            if span::SYM_COLUMNS[span::GENERIC + at] {
+                words[3 + at] = *word;
+            }
+        }
+        row_syms(&mut words);
+        for (at, word) in typed.iter_mut().enumerate() {
+            if span::SYM_COLUMNS[span::GENERIC + at] {
+                *word = words[3 + at];
+            }
+        }
+        let of = words[0] << 32 | words[1];
+        let build_unit = u64::from(opened.build) << 32 | words[2];
         let bytes_share = bytes.min(BYTES_MAX) | share << SHARE_SHIFT;
-        ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes_share]);
+        ring.put([now, opened.start, id, opened.parent, what, of, build_unit, bytes_share]);
         let folded = (opened.folded != 0).then_some((opened.folded, opened.folded_ticks));
         // The CPU of the stretches it outlived, a row more only for a span that did.
         let cpu = known.filter(|it| *it > 0).map_or(0, |it| it + 1);
-        put_cols(ring, now, id, cpu, moved.then_some(opened.thread), folded, &opened.typed);
+        put_cols(ring, now, id, cpu, moved.then_some(opened.thread), folded, &typed);
         if let Some(copied) = copied {
             let row = if moved {
                 Some([0, 0, UNCOUNTED])
@@ -3591,7 +3792,12 @@ pub struct SpanRow {
 impl SpanRow {
     /// Its columns, as a span kind reads them.
     pub fn said(&self) -> Said {
-        Said { krate: self.krate, function: self.function, unit: self.unit, typed: self.typed }
+        Said {
+            krate: u64::from(self.krate),
+            function: u64::from(self.function),
+            unit: u64::from(self.unit),
+            typed: self.typed,
+        }
     }
 
     /// Its column `C`: `None` when not said.
@@ -3909,6 +4115,8 @@ fn take(into: &mut Read, mut taking: Taking<'_>) {
     let mut scratch = std::mem::take(&mut into.scratch);
     let mut lost = RINGLESS.load(Ordering::Relaxed);
     let counting_copies = FRAME_COPIED.get().is_some();
+    // The readers' names, for the whole read: no thread that records takes it.
+    let mut reader = reader();
     for ring in rings {
         lost += ring.lost.load(Ordering::Relaxed);
         scratch.clear();
@@ -3941,8 +4149,11 @@ fn take(into: &mut Read, mut taking: Taking<'_>) {
                 ring.read(0, &mut scratch);
             }
         }
+        // Its definitions up to (at least) the rows just read, so every id they hold resolves.
+        reader.streams.catch_up(ring.number, &mut Rings);
         let owners = lock(&ring.owners);
         into.ring_begins();
+        let namer = &mut LiveNamer(&mut reader);
         for &(i, row) in &scratch[..end.unwrap_or(scratch.len())] {
             let Some(by) = Ring::owner(&owners, i) else { continue };
             decode(
@@ -3952,12 +4163,13 @@ fn take(into: &mut Read, mut taking: Taking<'_>) {
                 &row,
                 &scale,
                 counting_copies,
+                namer,
             );
         }
         into.ring_ends();
     }
     into.lost = lost;
-    into.names_forgotten = NAMES_FORGOTTEN.load(Ordering::Relaxed);
+    into.names_forgotten = NAMES_FORGOTTEN.load(Ordering::Relaxed) + reader.streams.forgotten;
     into.scratch = scratch;
 }
 
@@ -4004,8 +4216,16 @@ fn decode(
     row: &[u64; WORDS],
     scale: &clock::Scale,
     counting_copies: bool,
+    namer: &mut impl Namer,
 ) {
-    let (tid, thread_name) = by;
+    let (ring, at) = event_place(id);
+    let mut sym = |word: u64| namer.sym(ring, at, word & 0xffff_ffff);
+    let tid = by.0;
+    if names::is_names_row(row) {
+        // A definition, a link or a generation's start: the readers' ([`names::Streams`]).
+        return;
+    }
+    let thread_name = sym(u64::from(by.1));
     match row[4] >> 62 {
         KIND_SPAN => {
             let allocs = row[4] & ALLOCS_MAX;
@@ -4034,9 +4254,9 @@ fn decode(
                 alloc: (allocs != 0)
                     .then(|| Allocated { bytes: row[7] & BYTES_MAX, count: allocs - 1 }),
                 copied: counting_copies.then_some(FrameCopied::default()),
-                krate: (row[5] >> 32) as u32,
-                function: row[5] as u32,
-                unit: row[6] as u32,
+                krate: sym(row[5] >> 32),
+                function: sym(row[5]),
+                unit: sym(row[6]),
                 self_cpu_ns,
                 typed: [0; TYPED],
                 folded_spans: 0,
@@ -4100,7 +4320,7 @@ fn decode(
             job: row[1],
             span: row[2],
             site: (row[4] >> 8 & ((1 << SITE_BITS) - 1)) as u16,
-            message: row[5] as Sym,
+            message: sym(row[5]),
             event_id: id,
         }),
         KIND_PLOT if row[4] & 0xff == EVENT_FIELDS_ROW => {
@@ -4114,6 +4334,10 @@ fn decode(
                 let slot = row[4] >> (FIELD_SLOT_SHIFT + FIELD_SLOT_BITS * place as u32)
                     & ((1 << FIELD_SLOT_BITS) - 1);
                 let Some(value) = FieldValue::of(slot & 0b111, row[word]) else { continue };
+                let value = match value {
+                    FieldValue::Str(word) => FieldValue::Str(sym(u64::from(word))),
+                    value => value,
+                };
                 into.fields.push(FieldRow {
                     build,
                     t_ns,
@@ -4154,13 +4378,15 @@ fn decode(
                         FOLDED_TICKS_COL => span.folded_ns = scale.ns(row[word]) as i64,
                         THREAD_COL => {
                             span.thread = (row[word] >> 32) as u32;
-                            span.thread_name = row[word] as Sym;
+                            span.thread_name = sym(row[word]);
                         }
                         col => {
-                            if let Some(typed) =
-                                usize::try_from(col).ok().and_then(|it| span.typed.get_mut(it))
-                            {
-                                *typed = row[word];
+                            if let Some(at) = usize::try_from(col).ok().filter(|it| *it < TYPED) {
+                                span.typed[at] = if span::SYM_COLUMNS[span::GENERIC + at] {
+                                    u64::from(sym(row[word]))
+                                } else {
+                                    row[word]
+                                };
                             }
                         }
                     }
@@ -4233,10 +4459,8 @@ pub(crate) fn write_working_on(out: &mut String) -> bool {
         let id = entered.load(Ordering::Relaxed);
         let Some(opened) = by_number(ring_of(id)).and_then(|it| it.opened(id)) else { continue };
         let Some(meta) = meta(opened.site) else { continue };
-        let of = [opened.of as Sym, opened.unit as Sym, (opened.of >> 32) as Sym]
-            .into_iter()
-            .find(|it| *it != 0);
-        match of.and_then(name) {
+        let of = [opened.function, opened.unit, opened.krate].into_iter().find(|it| *it != 0);
+        match of.and_then(token_text) {
             Some(of) => {
                 // Writing to a `String` does not fail.
                 _ = write!(out, "{} {of}", meta.name());
@@ -4311,9 +4535,9 @@ pub fn threads_now() -> Vec<ThreadNow> {
                     name: meta.name(),
                     target: meta.target(),
                     for_ns: scale.ns(now.saturating_sub(opened.start)),
-                    krate: self::name((opened.of >> 32) as Sym),
-                    function: self::name(opened.of as Sym),
-                    unit: self::name(opened.unit as Sym),
+                    krate: token_text(opened.krate),
+                    function: token_text(opened.function),
+                    unit: token_text(opened.unit),
                     awaits: opened.said().value::<span::col::Awaits>().and_then(span::Name::text),
                     owner: opened.said().value::<span::col::Owner>(),
                     build: opened.build,
@@ -4545,85 +4769,52 @@ mod tests {
     }
 
     #[test]
-    fn a_name_is_one_number_and_reads_back() {
+    fn a_name_is_one_token_on_its_thread_and_reads_back() {
         let a = intern("blaze_profile::flight::tests");
         assert_ne!(a, 0);
         assert_eq!(intern("blaze_profile::flight::tests"), a);
-        assert_eq!(name(a).as_deref(), Some("blaze_profile::flight::tests"));
+        assert_eq!(token_text(a).as_deref(), Some("blaze_profile::flight::tests"));
         assert_ne!(intern("another name"), a);
+        assert_eq!(token_text(0), None);
         assert_eq!(name(0), None);
+        let sym = read_sym("blaze_profile::flight::tests");
+        assert_eq!(name(sym).as_deref(), Some("blaze_profile::flight::tests"));
+        assert_eq!(read_sym("blaze_profile::flight::tests"), sym, "a reader's sym is one a text");
     }
 
+    /// Threads naming the same texts and their own at once, each in its own table: every token
+    /// reads back as its own text, from any thread, with no lock or atomic any of them shares.
     #[test]
-    fn names_past_a_generation_are_still_named_and_older_ones_read_as_none_never_as_another() {
-        let names = Names::new();
-        let count = 3 * GENERATION * SHARDS;
-        // alloc: a test's names
-        let syms: Vec<Sym> = (0..count).map(|i| names.intern(&format!("key {i}"))).collect();
-        assert!(syms.iter().all(|&it| it != 0), "no name is left out");
-        for (i, &sym) in syms.iter().enumerate() {
-            if let Some(read) = names.get(sym) {
-                assert_eq!(&*read, format!("key {i}"), "a number reads as its own name or none");
-            }
-        }
-        for i in count - GENERATION..count {
-            assert_eq!(
-                names.get(syms[i]).as_deref(),
-                Some(format!("key {i}").as_str()),
-                "a recent name reads back"
-            );
-        }
-        assert_eq!(names.get(syms[0]), None, "the first name's generation was let go");
-        let again = names.intern("key 0");
-        assert_eq!(
-            names.get(again).as_deref(),
-            Some("key 0"),
-            "a name asked for again is named anew"
-        );
-    }
-
-    /// Threads giving the same names and their own at once: each shared name is one number on
-    /// every thread, and every number reads back as its own name. With the shard locks this
-    /// replaced, these threads queued behind whichever held a shard.
-    #[test]
-    fn threads_naming_at_once_agree_on_each_number() {
+    fn threads_naming_at_once_read_back_their_own_names() {
         const THREADS: usize = 16;
         const SHARED: usize = 512;
         const OWN: usize = 2048;
-        let names = Names::new();
-        // alloc: a test's numbers
-        let seen: Vec<Vec<Sym>> = std::thread::scope(|scope| {
-            let names = &names;
+        // alloc: a test's tokens
+        let seen: Vec<Vec<(String, Token)>> = std::thread::scope(|scope| {
             // alloc: a test's threads
             let threads: Vec<_> = (0..THREADS)
                 .map(|t| {
                     scope.spawn(move || {
-                        // alloc: a test's numbers
-                        let mut shared = vec![0; SHARED];
+                        // alloc: a test's tokens
+                        let mut named = Vec::new();
                         for i in 0..OWN {
-                            let own = names.intern(&format!("thread {t} name {i}"));
-                            assert_eq!(
-                                names.get(own).as_deref(),
-                                Some(format!("thread {t} name {i}").as_str()),
-                                "a thread's own name reads back"
-                            );
-                            // Each thread walks the shared names from its own place.
-                            let at = (i + t * 31) % SHARED;
-                            let sym = names.intern(&format!("shared {at}"));
-                            assert!(shared[at] == 0 || shared[at] == sym, "one number a name");
-                            shared[at] = sym;
+                            let own = format!("thread {t} name {i}");
+                            let token = intern(&own);
+                            assert_eq!(token_text(token).as_deref(), Some(own.as_str()));
+                            named.push((own, token));
+                            let shared = format!("shared {}", (i + t * 31) % SHARED);
+                            let token = intern(&shared);
+                            named.push((shared, token));
                         }
-                        shared
+                        named
                     })
                 })
                 .collect();
             threads.into_iter().map(|it| it.join().unwrap()).collect()
         });
-        for at in 0..SHARED {
-            let sym = seen[0][at];
-            assert_ne!(sym, 0, "shared {at} was named");
-            assert!(seen.iter().all(|it| it[at] == sym), "every thread got one number for shared {at}");
-            assert_eq!(names.get(sym).as_deref(), Some(format!("shared {at}").as_str()));
+        for (text, token) in seen.iter().flatten() {
+            assert_ne!(*token, 0, "{text} was named");
+            assert_eq!(token_text(*token).as_deref(), Some(text.as_str()), "{text} reads back");
         }
     }
 

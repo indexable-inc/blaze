@@ -715,7 +715,7 @@ mod tests {
             alloc: None,
             copied: None,
             krate: 0,
-            function: flight::intern("serde_derive::Serialize"),
+            function: flight::read_sym("serde_derive::Serialize"),
             unit: 0,
             self_cpu_ns: Some(700),
             typed: typed.typed,
