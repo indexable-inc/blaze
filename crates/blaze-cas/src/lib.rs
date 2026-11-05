@@ -552,6 +552,37 @@ struct Source {
     retried: bool,
 }
 
+/// A place's clone, made under a name of its own beside `to` and then renamed onto it, so that
+/// a concurrent place of the same value at the same path is idempotent: two daemons with
+/// different homes share output directories (the machine's std cache), and a place that removed
+/// `to` and then cloned onto it lost to the other's clone landing in between (`File exists`).
+/// A rename replaces `to` atomically on every driver (`renameat` on io_uring, `rename` on Unix
+/// and WASI, `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows), so whichever place
+/// renames last leaves `to` holding the same bytes. A rename that is refused all the same (on
+/// Windows, a `to` that is read-only or open without sharing its delete) is a success only once
+/// `to` is mapped and its bytes hash to `content` ([`Op::Verify`]), never otherwise.
+///
+/// A crash between the clone and the rename leaves the clone behind under its hidden name in
+/// the output's directory. It is not swept: the store lists only its own directories
+/// ([`Op::Swept`] is for `placed/`), never a build's outputs, and nothing reads a `.placing`
+/// name. It shares its blocks with the store's file; a later place of the same store with the
+/// same tag removes it before it clones ([`Op::Clear`]), and a clean of the output directory
+/// removes it with the rest.
+#[derive(Clone)]
+struct Staged {
+    /// [`Store::staging_name`].
+    temp: FileName,
+    /// The value's content: what `to` must hash to for a refused rename to be a success.
+    content: ContentId,
+}
+
+/// The domain of the hash of a store's directory that its staged names carry
+/// ([`Store::staging_name`]).
+const STAGING_DOMAIN: &str = "blaze v2 store staging 1";
+/// The most bytes of `to`'s own name a staged name keeps, so a long name stays under the file
+/// system's limit with the store's hash and the tag added.
+const STAGING_LEAF_MOST: usize = 160;
+
 /// What [`Store::open`] found of the whole files outputs are cloned from.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct PlacedOnOpen {
@@ -672,10 +703,17 @@ pub struct Store {
     columns: Arc<Encodings>,
     /// The other writers of its directory's shared one ([`Store::open_shared`]).
     peers: Option<peers::Peers>,
+    /// What tells this store's staged names from every other store's ([`Store::staging_name`]).
+    staging: u64,
     /// A test's hook, run with a move's key when the move of `prev`'s spot found the delta
     /// lacking the key and is about to put its pack spot there (`Store::finish_batches`).
     #[cfg(test)]
     move_probed: Option<Box<dyn FnMut(Key) + Send>>,
+    /// A planted bug for the place race's DST (`tests::place_race`): a clone made by removing
+    /// `to` and cloning onto it, as before [`Staged`], which a concurrent place of the same
+    /// value at the same path can lose to.
+    #[cfg(test)]
+    plant_clear_then_clone: bool,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -878,20 +916,44 @@ enum Op {
     RemovePack {
         pack: usize,
     },
-    /// `to` removed so `from` can be cloned there; `of`, the content of the whole file of
-    /// [`PlacedFile`] it clones.
+    /// `staged`'s name removed (a clone an earlier run of this store left there under the same
+    /// tag) so `from` can be cloned there, to be renamed onto `to`; `of`, the content of the
+    /// whole file of [`PlacedFile`] it clones.
     Clear {
         asked: Tag,
         from: FileName,
         to: FileName,
+        staged: Staged,
         of: Option<Source>,
         bytes: PlacedBytes,
     },
+    /// The clone into `staged`'s name, or (`staged` none) the write of `to` itself, which
+    /// [`Effect::Write`] makes beside it and renames over it already.
     Place {
         asked: Tag,
         to: FileName,
+        staged: Option<Staged>,
         of: Option<Source>,
         bytes: PlacedBytes,
+    },
+    /// `staged`'s clone renamed onto `to`.
+    Commit {
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+    },
+    /// `to` mapped to be hashed, after the rename of `staged` onto it failed with `why`.
+    Verify {
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+        why: String,
+    },
+    /// A staged clone not renamed onto its path, removed.
+    Discard {
+        file: FileName,
     },
     /// Whether the whole file of `content` is there ([`PlacedFile::Probing`]).
     Probe {
@@ -1281,6 +1343,10 @@ impl Store {
         shared.add_segment(own.segment().clone());
         // clone: setup, once per store
         let drains = vec![Drain::new(own.segment().clone())];
+        // One daemon a directory (#686), so the hash of the store's own directory, as the driver
+        // names it, tells its staged names from those of any other daemon's store.
+        let staging = ContentId::of(STAGING_DOMAIN, config.dir.as_str().as_bytes());
+        let staging = u64::from_le_bytes(staging.0[..8].try_into().expect("8 bytes"));
         Store {
             tags: Tags { range: blaze_core::Tags::new(config.tags), ops: HashMap::new_in(Global) }, // alloc: the store's own table, for its life
             config,
@@ -1321,8 +1387,11 @@ impl Store {
             periods: 0,
             columns,
             peers,
+            staging,
             #[cfg(test)]
             move_probed: None,
+            #[cfg(test)]
+            plant_clear_then_clone: false,
         }
     }
 
@@ -2034,7 +2103,7 @@ impl Store {
         );
         self.tidy();
         enum Plan {
-            Clone(FileName, u64),
+            Clone(FileName, u64, ContentId),
             File(ContentId, u64),
             Write(Vec<u8>),
             Refused(String),
@@ -2056,7 +2125,7 @@ impl Store {
                             && external.committed =>
                     {
                         // clone: the clone effect owns the name it clones from; once per place
-                        Plan::Clone(external.file.clone(), entry.bytes.len() as u64)
+                        Plan::Clone(external.file.clone(), entry.bytes.len() as u64, entry.content)
                     }
                     _ => {
                         let mut bytes = Vec::with_capacity(entry.bytes.len());
@@ -2068,11 +2137,9 @@ impl Store {
         };
         let tag = self.tags.fresh();
         match plan {
-            Plan::Clone(from, raw) => {
-                // clone: the effect and the op each own the name; once per place
-                effects.push(Effect::Remove { file: to.clone(), tag });
+            Plan::Clone(from, raw, content) => {
                 let bytes = PlacedBytes { cloned: raw, ..PlacedBytes::default() };
-                self.tags.ops.insert(tag, Op::Clear { asked: tag, from, to, of: None, bytes });
+                effects.push(self.clear_staged(tag, from, to, content, None, bytes));
             }
             Plan::File(content, raw) => {
                 let waiter = Waiter { asked: tag, to, key: *key, raw, retried: false };
@@ -2088,9 +2155,13 @@ impl Store {
             }
             Plan::Write(bytes) => {
                 let placed = PlacedBytes { copied: bytes.len() as u64, ..PlacedBytes::default() };
+                // No staged name: every driver makes a write under a temporary name of its own
+                // process beside `to` and renames it over `to` (`write_atomically`, io_uring's
+                // `push_temporary`), so two writes of the same bytes there both end with them.
                 // clone: the effect and the op each own the name; once per place
                 effects.push(Effect::Write { file: to.clone(), bytes, tag });
-                self.tags.ops.insert(tag, Op::Place { asked: tag, to, of: None, bytes: placed });
+                let op = Op::Place { asked: tag, to, staged: None, of: None, bytes: placed };
+                self.tags.ops.insert(tag, op);
             }
             Plan::Refused(why) => self.placed.push(Placed {
                 tag,
@@ -2312,9 +2383,60 @@ impl Store {
         let Waiter { asked, to, key, raw, retried } = waiter;
         let bytes = PlacedBytes { cloned: raw, written, copied: 0 };
         let of = Some(Source { content, key, retried });
+        effects.push(self.clear_staged(asked, from, to, content, of, bytes));
+    }
+
+    /// The place `asked` of `from`'s clone at `to` begun ([`Staged`]): its staged name cleared
+    /// by the effect it returns, then `from` cloned there ([`Op::Clear`]) and renamed onto `to`
+    /// ([`Op::Commit`]).
+    fn clear_staged(
+        &mut self,
+        asked: Tag,
+        from: FileName,
+        to: FileName,
+        content: ContentId,
+        of: Option<Source>,
+        bytes: PlacedBytes,
+    ) -> Effect {
+        let temp = self.staging_name(&to, asked);
+        // The planted bug: `to` itself removed and cloned onto, as before staged names.
+        #[cfg(test)]
+        let temp = match self.plant_clear_then_clone {
+            // clone: a test's planted bug; the effect and the op each own the name
+            true => to.clone(),
+            false => temp,
+        };
         // clone: the effect and the op each own the name; once per place
-        effects.push(Effect::Remove { file: to.clone(), tag: asked });
-        self.tags.ops.insert(asked, Op::Clear { asked, from, to, of, bytes });
+        let clear = Effect::Remove { file: temp.clone(), tag: asked };
+        let staged = Staged { temp, content };
+        self.tags.ops.insert(asked, Op::Clear { asked, from, to, staged, of, bytes });
+        clear
+    }
+
+    /// The hidden name beside `to` that the place `asked` clones into before it renames it onto
+    /// `to` ([`Staged`]): in `to`'s directory, so the rename never crosses a volume and is one
+    /// atomic step. Unique to this store and this place: two daemons with different homes share
+    /// an output directory, and their stores' directories differ (one daemon a directory, #686),
+    /// so the store's hash (`staging`) tells their names apart and the tag this store's places.
+    /// Only this store makes names with its hash, so it may remove one it finds there: a tag is
+    /// given again after a reopen, and a crash may have left that name's clone ([`Op::Clear`]).
+    fn staging_name(&self, to: &FileName, asked: Tag) -> FileName {
+        let (dir, leaf) = match to.as_str().rsplit_once('/') {
+            Some((dir, leaf)) => (Some(dir), leaf),
+            None => (None, to.as_str()),
+        };
+        let mut cut = leaf.len().min(STAGING_LEAF_MOST);
+        while !leaf.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (leaf, id, n) = (&leaf[..cut], self.staging, asked.0);
+        let name = match dir {
+            // alloc: a file name for an effect, which owns it; once per place
+            Some(dir) => format!("{dir}/.{leaf}.{id:016x}-{n:x}.placing"),
+            // alloc: a file name for an effect, which owns it; once per place
+            None => format!(".{leaf}.{id:016x}-{n:x}.placing"),
+        };
+        FileName::new(&name).expect("a hidden name beside a file's name is a name")
     }
 
     /// A clone of the whole file of `content` ended: it goes once it is let go of (or found gone)
@@ -2725,11 +2847,13 @@ impl Store {
                     }
                 }
             },
-            Op::Clear { asked, from, to, of, bytes } => match done {
+            Op::Clear { asked, from, to, staged, of, bytes } => match done {
                 Done::Removed => {
                     // clone: the effect and the op each own the name; once per place
-                    let tag = self.tags.ask(Op::Place { asked, to: to.clone(), of, bytes });
-                    effects.push(Effect::Clone { from, to, tag });
+                    let into = staged.temp.clone();
+                    let op = Op::Place { asked, to, staged: Some(staged), of, bytes };
+                    let tag = self.tags.ask(op);
+                    effects.push(Effect::Clone { from, to: into, tag });
                 }
                 done => {
                     if let Some(source) = of {
@@ -2743,15 +2867,24 @@ impl Store {
                     });
                 }
             },
-            Op::Place { asked, to, of, bytes } => {
+            Op::Place { asked, to, staged, of, bytes } => {
                 if let Some(source) = of {
                     self.cloned(source.content, effects);
                 }
-                match (done, of) {
-                    (Done::Cloned | Done::Written, _) => {
+                match (done, of, staged) {
+                    // The clone is whole under its own name: renamed onto `to`, it replaces
+                    // whatever is there in one step, a concurrent place's clone of the same
+                    // bytes too. (Under the planted bug the clone was made at `to` itself.)
+                    (Done::Cloned, _, Some(staged)) if !(cfg!(test) && staged.temp == to) => {
+                        // clone: the effect and the op each own the names; once per place
+                        let (from, into) = (staged.temp.clone(), to.clone());
+                        let tag = self.tags.ask(Op::Commit { asked, to, staged, bytes });
+                        effects.push(Effect::Rename { from, to: into, tag });
+                    }
+                    (Done::Cloned | Done::Written, _, _) => {
                         self.placed.push(Placed { tag: asked, to, result: Ok(()), bytes })
                     }
-                    (done, Some(Source { content, key, retried: false })) => {
+                    (done, Some(Source { content, key, retried: false }), _) => {
                         // Whether the file it cloned from is gone or no file, which is made
                         // again once.
                         let waiter = Waiter { asked, to, key, raw: bytes.cloned, retried: true };
@@ -2766,7 +2899,7 @@ impl Store {
                             effects.push(Effect::Stat { file, tag });
                         }
                     }
-                    (done, _) => {
+                    (done, _, _) => {
                         let result = Err(describe(&done));
                         self.placed.push(Placed {
                             tag: asked,
@@ -2779,6 +2912,58 @@ impl Store {
             }
             Op::Recheck { content, waiter, why } => {
                 self.rechecked(content, waiter, &why, &done, effects)
+            }
+            Op::Commit { asked, to, staged, bytes } => match done {
+                Done::Renamed => {
+                    self.placed.push(Placed { tag: asked, to, result: Ok(()), bytes })
+                }
+                done => {
+                    // Refused (on Windows, a `to` that is read-only or open without sharing
+                    // its delete): a success only if `to` already holds the value's bytes.
+                    let why = describe(&done);
+                    // clone: the effect and the op each own the name; once per refused rename
+                    let file = to.clone();
+                    let tag = self.tags.ask(Op::Verify { asked, to, staged, bytes, why });
+                    effects.push(Effect::Map { file, tag });
+                }
+            },
+            Op::Verify { asked, to, staged, bytes, why } => {
+                let Staged { temp, content } = staged;
+                let result = match done {
+                    Done::Mapped(mapping) => {
+                        let found = tracing::info_span!(target: "blaze", "placed verify", %to)
+                            .in_scope(|| content_of(mapping.bytes()));
+                        drop(mapping);
+                        match found == content {
+                            true => Ok(()),
+                            // alloc: the error of a place that fails
+                            false => Err(format!(
+                                "renaming {temp} over {to}: {why}; {to} holds bytes of \
+                                 {found:x}, not of {content:x}"
+                            )),
+                        }
+                    }
+                    // alloc: the error of a place that fails
+                    done => Err(format!(
+                        "renaming {temp} over {to}: {why}; {to} could not be read to check \
+                         its bytes: {}",
+                        describe(&done)
+                    )),
+                };
+                let bytes = if result.is_ok() { bytes } else { PlacedBytes::default() };
+                self.placed.push(Placed { tag: asked, to, result, bytes });
+                // clone: the effect and the op each own the name; once per refused rename
+                let tag = self.tags.ask(Op::Discard { file: temp.clone() });
+                effects.push(Effect::Remove { file: temp, tag });
+            }
+            Op::Discard { file } => {
+                if !matches!(done, Done::Removed) {
+                    // alloc: a problem reported
+                    self.placed_problem(format!(
+                        "{file}, a place's clone not renamed onto its path, was left behind: {}",
+                        describe(&done)
+                    ));
+                }
             }
             Op::LookPlaced => match done {
                 // None yet: nothing placed.
