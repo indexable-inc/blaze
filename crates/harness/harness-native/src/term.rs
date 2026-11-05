@@ -493,6 +493,9 @@ pub fn draw(
     let inverts = show_cursor && p.focused && shape == harness_vt::CursorShape::Block;
     let mut sprites: Vec<SpriteInst> = Vec::new();
     let mut jobs: Vec<Job> = Vec::new();
+    // A copy's pulse is playing: text runs break at the selection's edges, so the selected glyphs can grow with their plate.
+    let flashing = p.sel.is_some() && p.flash.is_some_and(|f| f.live());
+    let selected = |r: u16, c: u16| p.sel.is_some_and(|s| s.holds(i64::from(r) - p.scroll as i64, c));
     let ink_at = |cell: &Cell, r: u16, c: u16| {
         let mut ink = match theme.select_fg {
             Some(f) if p.sel.is_some_and(|s| s.holds(i64::from(r) - p.scroll as i64, c)) => f,
@@ -587,6 +590,7 @@ pub fn draw(
                                 || (show_cursor && (r, nu) == cursor)
                                 || n.procedural().is_some()
                                 || in_marked(r, nu)
+                                || (flashing && selected(r, nu) != selected(r, start as u16))
                             {
                                 break;
                             }
@@ -655,7 +659,8 @@ pub fn draw(
         }
     }
     // The selection: one joined plate over the grounds and under the text, each row from its first selected cell to its
-    // last (a row it runs through whole, the grid's width), pulsing after a copy.
+    // last (a row it runs through whole, the grid's width), pulsing after a copy (its glyphs growing with it, below).
+    let mut grow = None;
     if let Some(sel) = p.sel {
         let ((r0, c0), (r1, c1)) = sel.ordered();
         let cols = snap.rows.first().map_or(0, Vec::len) as i32;
@@ -671,6 +676,7 @@ pub fn draw(
                 (b > a).then(|| harness_native_render::select::Plate::of(pt(ox + a * cw), pt(y), pt((b - a) * cw), pt(ch)))
             })
             .collect();
+        grow = harness_native_render::select::Grow::of(&plates, p.select, p.flash);
         harness_native_render::select::emit(d, &plates, p.select, p.select_ink, p.flash, 1.0, sc);
     }
     if let (Some(m), Some((r, a, b))) = (marked, marked_span) {
@@ -784,6 +790,7 @@ pub fn draw(
             put(d, e, ix + e.left as f32, base_px - e.top as f32, ink);
         }
     };
+    let first_glyph = d.glyphs.len();
     for job in jobs {
         match job {
             Job::Run { x, base, font, glyphs, ink } => {
@@ -820,6 +827,16 @@ pub fn draw(
                     continue;
                 };
                 put(d, e, (x + e.left) as f32, (bottom - e.top) as f32, ink);
+            }
+        }
+    }
+    // Under a copy's pulse, the glyphs whose cell (the one under their middle) is selected grow with the plate.
+    if let Some(g) = grow {
+        let cell = |v: f32, o: i32, step: i32| ((v * sc - o as f32) / step as f32).floor();
+        for gi in &mut d.glyphs[first_glyph..] {
+            let (col, row) = (cell(gi.rect[0] + gi.rect[2] * 0.5, ox, cw), cell(gi.rect[1] + gi.rect[3] * 0.5, oy, ch));
+            if row >= 0.0 && col >= 0.0 && selected(row as u16, col as u16) {
+                gi.rect = g.rect(gi.rect);
             }
         }
     }
@@ -1130,6 +1147,18 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
         format!("\x1b[200~{}\x1b[201~", body.replace("\x1b[201~", "")).into_bytes()
     } else {
         body.into_bytes()
+    }
+}
+
+/// `path` as one shell word: as it is when it holds only characters no shell treats specially, else in single quotes (a
+/// quote inside closed, escaped and reopened), as Ghostty and Terminal paste a dropped file.
+#[must_use]
+pub fn shell_quote(path: &str) -> String {
+    let plain = |c: char| c.is_alphanumeric() || "/._-+,:@%=".contains(c);
+    if !path.is_empty() && path.chars().all(plain) {
+        path.to_owned()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
     }
 }
 

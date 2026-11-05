@@ -6,7 +6,7 @@
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
 //! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts.
 use super::*;
-use harness_native_ui_motion_api::{CopyFlash, Motion};
+use harness_native_ui_motion_api::CopyFlash;
 use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, Vec2};
 use harness_native_ui_layout_api::{ScrollState, ScrollerGrip, scroll_quietly};
 use harness_native_ui_text_api::{Highlight, TextEdit};
@@ -197,6 +197,9 @@ pub struct ChatState {
     /// The transcript's selection (where it was started, where it reaches), and the press-and-drag making one.
     sel: Option<(Spot, Spot)>,
     drag: Option<Drag>,
+    /// The last press was in the transcript (not the input) and nothing was typed since: Command-A selects the
+    /// transcript, not the draft.
+    reading: bool,
     /// The table rows opened below their rows as records, by the transcript row the table is (its key).
     rows_open: HashMap<String, usize>,
 }
@@ -244,6 +247,7 @@ impl Default for ChatState {
             ours: false,
             sel: None,
             drag: None,
+            reading: false,
             rows_open: HashMap::new(),
         }
     }
@@ -858,15 +862,6 @@ fn is_open(t: &Transcript, fold: &HashMap<String, bool>, key: &str) -> bool {
     }) == Some(true)
 }
 
-/// Put the macOS pasteboard's string.
-fn pasteboard_set(text: &str) {
-    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-    let pb = NSPasteboard::generalPasteboard();
-    pb.clearContents();
-    // SAFETY: NSPasteboardTypeString is a valid static pasteboard type.
-    pb.setString_forType(&objc2_foundation::NSString::from_str(text), unsafe { NSPasteboardTypeString });
-}
-
 /// UTF-16 units in `s`.
 fn units(s: &str) -> usize {
     s.encode_utf16().count()
@@ -949,6 +944,18 @@ fn covered(lo: Spot, hi: Spot, row: usize, part: usize, len: usize) -> Option<(u
     Some((a, b))
 }
 
+/// A row selected only whole (a table, search results, a drawn card): no words of its own to place a selection in,
+/// copied as [`Row::markdown`]. A selection takes it when it reaches past its middle: its one place is `at` 0 (above
+/// the middle) or 1 (below), in part 0.
+fn atomic(r: &Row) -> bool {
+    texts(r).is_empty() && r.markdown().is_some_and(|m| !m.trim().is_empty())
+}
+
+/// Whether the selection `lo..hi` takes atomic row `row` whole.
+fn takes_whole(lo: Spot, hi: Spot, row: usize) -> bool {
+    lo <= Spot { row, part: 0, at: 0 } && Spot { row, part: 0, at: 1 } <= hi
+}
+
 impl Row {
     /// The row as markdown, for a copy that takes it whole (None: its words as shown).
     fn markdown(&self) -> Option<String> {
@@ -968,15 +975,23 @@ impl Row {
             Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
             Row::Output { text, .. } => format!("```\n{text}\n```"),
             Row::Table(t) => t.markdown(),
-            Row::Results { .. }
-            | Row::Tool { .. }
+            Row::Grid { v, .. } => grid_table(v).markdown(),
+            Row::Results { v, cap } => {
+                let items = result_items(v, *cap);
+                let line = |r: &view::table::Result| match (r.title.is_empty(), r.url.is_empty()) {
+                    (_, true) => r.title.clone(),
+                    (true, false) => r.url.clone(),
+                    (false, false) => format!("[{}]({})", r.title, r.url),
+                };
+                items.iter().map(|r| format!("- {}", line(r))).collect::<Vec<_>>().join("\n")
+            }
+            Row::Ui { v } => genui::plain(v),
+            Row::Tool { .. }
             | Row::Thinking { .. }
             | Row::Card { .. }
             | Row::Run { .. }
             | Row::Step { .. }
-            | Row::Grid { .. }
-            | Row::CodeToggle { .. }
-            | Row::Ui { .. } => {
+            | Row::CodeToggle { .. } => {
                 return None;
             }
         })
@@ -1003,9 +1018,9 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
                 bits.push(s[byte_of(&s, a)..byte_of(&s, b)].to_owned());
             }
         }
-        // A row with no words to select (a table) is taken whole when the selection runs past it on both sides.
+        // A row with no words to select (a table) is taken whole when the selection reaches past its middle.
         let piece = if bits.is_empty() {
-            match r.markdown().filter(|_| texts(r).is_empty() && lo.row < i && i < hi.row) {
+            match r.markdown().filter(|_| atomic(r) && takes_whole(lo, hi, i)) {
                 Some(md) => md,
                 None => continue,
             }
@@ -1148,6 +1163,10 @@ impl App {
                     if row.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
                         row.set(pad);
                     }
+                }
+                if atomic(&rows[i].1) {
+                    let whole = sel.is_some_and(|(lo, hi)| takes_whole(lo, hi, i));
+                    select_all_words(row.entity(), whole);
                 }
                 for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
                     let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
@@ -1427,16 +1446,6 @@ impl App {
         }
         match op {
             "newline" => _ = self.with_draft(|d| d.insert("\n")),
-            "cut" => {
-                let mut cut = String::new();
-                self.with_draft(|d| {
-                    cut = d.selected().to_owned();
-                    d.insert("");
-                });
-                if !cut.is_empty() {
-                    pasteboard_set(&cut);
-                }
-            }
             "send" => {
                 let mut text = String::new();
                 self.with_draft(|d| {
@@ -1474,13 +1483,33 @@ impl App {
     /// Text typed (a key no binding took), committed by an input method or pasted, into the focused chat's input.
     /// Whether a chat took it.
     pub(super) fn chat_type(&mut self, text: &str) -> bool {
+        // A pasteboard's line ends (CRLF from Windows text, a lone CR from old Mac text) as the input's newlines.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let typed: String = text.chars().filter(|c| *c == '\n' || *c == '\t' || (!c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))).collect();
+        if let Some((_, _, sid)) = self.focused_chat()
+            && let Some(st) = self.chat.borrow_mut().get_mut(&sid)
+        {
+            st.reading = false;
+        }
         self.with_draft(|d| {
             d.marked = None;
             if !typed.is_empty() {
                 d.insert(&typed);
             }
         })
+    }
+
+    /// Command-X in the focused chat: its input's selection taken out, for the pasteboard (None: nothing selected there;
+    /// the transcript is read-only, so a selection in it is not cut).
+    pub(super) fn chat_cut(&mut self) -> Option<String> {
+        let mut cut = String::new();
+        self.with_draft(|d| {
+            cut = d.selected().to_owned();
+            if !cut.is_empty() {
+                d.insert("");
+            }
+        });
+        (!cut.is_empty()).then_some(cut)
     }
 
     /// An input method's marked text on the focused chat's input. Whether a chat took it.
@@ -1527,7 +1556,7 @@ impl App {
     }
 
     /// Pulse what a copy in the focused chat took (`what`, from [`Self::chat_copy`]): the transcript's selected words, the
-    /// input's, or a table's row. Each gets a fresh `CopyFlash` on the `ui.spring.copy` spring.
+    /// input's, or a table's row. Each gets a fresh `CopyFlash` of the selection's CopyLook.
     pub(super) fn chat_flash(&self, what: &Copied) {
         let Some((pane, _, _)) = self.focused_chat() else { return };
         let w = self.world.world_ref();
@@ -1555,10 +1584,10 @@ impl App {
         if hit.is_empty() {
             return;
         }
-        let omega = w.try_lookup("ui::spring::copy").and_then(|t| t.try_cloned::<&Motion>()).map_or(0.0, |m| m.omega);
+        let look = harness_native_render::select::Look::of(w).copy;
         let whole = matches!(what, Copied::TableRow(..));
         for id in hit {
-            w.entity_from_id(id).set(CopyFlash { whole, ..CopyFlash::kicked(omega) });
+            w.entity_from_id(id).set(CopyFlash { whole, ..CopyFlash::kicked(look.secs, look.rise) });
         }
     }
 
@@ -1604,8 +1633,21 @@ impl App {
         false
     }
 
-    /// Command-A in the focused chat's input. Whether a chat took it.
+    /// Command-A in the focused chat: the whole transcript after a press in it, else the input's draft. Whether a chat
+    /// took it.
     pub(super) fn chat_select_all(&mut self) -> bool {
+        let Some((_, _, sid)) = self.focused_chat() else { return false };
+        let n = self.chat_rows(sid).len();
+        let reading = self.chat.borrow().get(&sid).is_some_and(|st| st.reading);
+        if reading {
+            let mut states = self.chat.borrow_mut();
+            let st = states.entry(sid).or_default();
+            st.sel = (n > 0).then_some((Spot { row: 0, part: 0, at: 0 }, Spot { row: n, part: 0, at: 0 }));
+            st.draft.anchor = st.draft.caret;
+            drop(states);
+            self.poke();
+            return true;
+        }
         self.with_draft(|d| {
             d.anchor = 0;
             d.caret = d.text.len();
@@ -1709,6 +1751,14 @@ impl App {
         found.sort_by_key(|(i, _)| *i);
         let mut last = None;
         for (i, row) in found {
+            if atomic(&rows[i].1) {
+                let Some(l) = row.entity().try_cloned::<&Laid>() else { continue };
+                if y < l.y + l.h {
+                    return Some(Spot { row: i, part: 0, at: usize::from(y >= l.y + l.h * 0.5) });
+                }
+                last = Some(Spot { row: i, part: 0, at: 1 });
+                continue;
+            }
             for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
                 let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
                 let Some(l) = node.entity().try_cloned::<&Laid>() else { continue };
@@ -1727,6 +1777,10 @@ impl App {
 
     /// What a press at `s` selects by `unit`: nothing (a place), its word, or its words whole.
     fn spot_span(rows: &[(String, Row)], s: Spot, unit: Unit) -> (Spot, Spot) {
+        if rows.get(s.row).is_some_and(|(_, r)| atomic(r)) {
+            let whole = (Spot { at: 0, ..s }, Spot { at: 1, ..s });
+            return if unit == Unit::Cell { (s, s) } else { whole };
+        }
         let text = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)).map(|(_, src, md)| shown(&src, md));
         let Some(t) = text else { return (s, s) };
         match unit {
@@ -1757,7 +1811,7 @@ impl App {
             let at = self.input_index(x, y);
             let mut states = self.chat.borrow_mut();
             let st = states.entry(sid).or_default();
-            st.sel = None;
+            (st.sel, st.reading) = (None, false);
             if let Some(i) = at.filter(|_| st.draft.marked.is_none()) {
                 let span = st.draft.span(i, unit);
                 (st.draft.anchor, st.draft.caret, st.draft.goal) = (span.0, span.1, None);
@@ -1769,7 +1823,7 @@ impl App {
             let mut states = self.chat.borrow_mut();
             let st = states.entry(sid).or_default();
             st.draft.anchor = st.draft.caret;
-            st.sel = None;
+            (st.sel, st.reading) = (None, true);
             if let Some(s) = spot {
                 let span = Self::spot_span(&rows, s, unit);
                 st.sel = Some(span);
@@ -2108,12 +2162,24 @@ fn fill_grid(row: View<'_>, v: &Value, cap: usize, ctx: &RowCtx<'_>, measure: &m
 /// Search results (a table the kernel tags `kind: "search"`: title, url, site, snippet) as a `ui.ResultList`: each a
 /// link titled as its page, its host (an unresolved Google link: the site Google shows), two lines of its snippet.
 fn fill_results(row: View<'_>, v: &Value, cap: usize) {
+    let items = result_items(v, cap);
+    if let Some(list) = row.part("list") {
+        view::table::results(list, &items, "hn.ChatResult");
+    }
+    let total = v["total"].as_u64().map_or(v["rows"].as_array().map_or(0, Vec::len), |t| t as usize);
+    if let Some(f) = row.part("foot") {
+        foot(f, &if items.len() < total { format!("{} of {total} results", items.len()) } else { String::new() });
+    }
+}
+
+/// Search results' first `cap` as [`view::table::Result`]s (see [`fill_results`]).
+fn result_items(v: &Value, cap: usize) -> Vec<view::table::Result> {
     let cols: Vec<&str> = v["cols"].as_array().into_iter().flatten().map(|c| c["name"].as_str().unwrap_or("")).collect();
     let at = |name: &str| cols.iter().position(|c| *c == name);
     let (title, url, site, snippet) = (at("title"), at("url"), at("site"), at("snippet"));
     let rows: &[Value] = v["rows"].as_array().map_or(&[], Vec::as_slice);
     let get = |r: &Value, c: Option<usize>| c.map(|c| cell_text(&r[c])).filter(|s| s != "null").unwrap_or_default();
-    let items: Vec<view::table::Result> = rows
+    rows
         .iter()
         .take(cap)
         .map(|r| {
@@ -2125,13 +2191,28 @@ fn fill_results(row: View<'_>, v: &Value, cap: usize) {
             };
             view::table::Result { title: get(r, title), url, host, snippet: get(r, snippet) }
         })
-        .collect();
-    if let Some(list) = row.part("list") {
-        view::table::results(list, &items, "hn.ChatResult");
-    }
-    let total = v["total"].as_u64().map_or(rows.len(), |t| t as usize);
-    if let Some(f) = row.part("foot") {
-        foot(f, &if items.len() < total { format!("{} of {total} results", items.len()) } else { String::new() });
+        .collect()
+}
+
+/// Mark every word under `e` selected whole (`on`) or not, so the selection plate covers an atomic row the transcript's
+/// selection takes and a copy's pulse plays on it.
+fn select_all_words(e: EntityView<'_>, on: bool) {
+    let mut todo = vec![e]; // alloc: the walk of one row's nodes
+    while let Some(n) = todo.pop() {
+        if let Some(t) = n.try_cloned::<&Text>() {
+            let len = units(&shown(t.s.as_str(), n.has(MarkdownText::id())));
+            match on && len > 0 {
+                true => {
+                    let te = TextEdit { anchor: 0, caret: len as u32, ..TextEdit::default() };
+                    if n.try_cloned::<&TextEdit>() != Some(te) {
+                        n.set(te);
+                    }
+                }
+                false if n.has(TextEdit::id()) => _ = n.remove(TextEdit::id()),
+                false => {}
+            }
+        }
+        n.each_child(|c| todo.push(c));
     }
 }
 

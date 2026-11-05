@@ -458,3 +458,38 @@ mod tests {
         }
     }
 }
+
+/// A drawn tree's words as plain text, for a copy that takes the card whole: each element's own words (its text, title,
+/// label, value, note; a table's rows a line each, cells a tab apart) in reading order, one element a line.
+pub(super) fn plain(ui: &Value) -> String {
+    fn walk(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Array(a) => a.iter().for_each(|n| walk(n, out)),
+            Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+            Value::Object(_) => {
+                for name in ["title", "label", "text", "value", "note"] {
+                    match prop(node, name) {
+                        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+                        Value::Number(n) => out.push(n.to_string()),
+                        _ => {}
+                    }
+                }
+                if node["type"].as_str() == Some("Table") {
+                    for r in prop(node, "rows").as_array().into_iter().flatten() {
+                        let cells: Vec<String> = match r {
+                            Value::Object(o) => o.values().map(super::cell_text).collect(),
+                            Value::Array(a) => a.iter().map(super::cell_text).collect(),
+                            x => vec![super::cell_text(x)],
+                        };
+                        out.push(cells.join("\t"));
+                    }
+                }
+                walk(&node["children"], out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(ui, &mut out);
+    out.join("\n")
+}

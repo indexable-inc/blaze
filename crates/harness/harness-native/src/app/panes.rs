@@ -2,7 +2,7 @@
 //! the focused one following the app's `(Selected, object)`; and every terminal's sync, drawing and input, which read
 //! and write the `hn.Terminal` node's components rather than any one terminal's fields on the App.
 use super::*;
-use harness_native_ui_motion_api::{CopyFlash, Motion};
+use harness_native_ui_motion_api::CopyFlash;
 use crate::pane::{
     MarkedText, PaneFocus, PaneNode, TermCursor, TermFocus, TermGrid, TermInput, TermMouse,
     TermNode, TermScroll, TermSelection, Unit,
@@ -921,14 +921,25 @@ impl App {
     /// A key: the binding it matches in the active contexts runs (scene/20-keys.flecs: the palette's, the Archive's, the
     /// tree's, natural text editing in the terminal's); a key none takes goes to the palette's or the Archive's search, or
     /// (handing the keyboard back from the tree) to the focused terminal's program in its own encoding.
-    pub fn key(&mut self, k: &term::KeyIn<'_>) {
+    /// A key from the window's keyDown: its binding's action when one takes it (a selector, `copy:`, is the window's to
+    /// send up the responder chain), else typing for whatever has the keyboard.
+    pub fn key(&mut self, k: &term::KeyIn<'_>) -> super::Outcome {
         self.poke_why("key");
-        if k.action != KeyAction::Release {
-            if let Some(c) = crate::keys::Chord::of(k.code, k.unshifted, k.mods)
-                && self.dispatch(&c) != super::Outcome::None
-            {
-                return;
+        if k.action != KeyAction::Release
+            && let Some(c) = crate::keys::Chord::of(k.code, k.unshifted, k.mods)
+        {
+            let out = self.dispatch(&c);
+            if out != super::Outcome::None {
+                return out;
             }
+        }
+        self.key_unbound(k);
+        super::Outcome::None
+    }
+
+    /// A key no binding took: the palette's query, the Archive's search, the chat's input, else the focused terminal.
+    fn key_unbound(&mut self, k: &term::KeyIn<'_>) {
+        if k.action != KeyAction::Release {
             if self.palette.is_some() {
                 self.palette_type(k.text);
                 return;
@@ -1053,12 +1064,29 @@ impl App {
         let sel = self.get::<TermSelection>(t).get()?;
         let text = self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())?;
         let w = self.world.world_ref();
-        let omega = w.try_lookup("ui::spring::copy").and_then(|e| e.try_cloned::<&Motion>()).map_or(0.0, |m| m.omega);
-        self.put(t, CopyFlash::kicked(omega));
+        let look = harness_native_render::select::Look::of(w).copy;
+        self.put(t, CopyFlash::kicked(look.secs, look.rise));
         self.poke();
         Some(text)
     }
 
+    /// What Command-X takes out for the pasteboard: the focused chat input's selection (None: nothing editable is
+    /// selected; a terminal's or a transcript's selection is read-only, so it stays).
+    pub fn cut(&mut self) -> Option<String> {
+        self.poke();
+        self.chat_cut()
+    }
+
+    /// Files pasted (a Finder copy: their paths): into a terminal as words its shell reads back as those paths (quoted
+    /// where they need it), anywhere else as the paths, a space apart.
+    pub fn paste_paths(&mut self, paths: &[String]) {
+        let terminal = self.palette.is_none() && !self.archive_focused() && !self.chat_focused();
+        let words: Vec<String> = paths.iter().map(|p| if terminal { term::shell_quote(p) } else { p.clone() }).collect();
+        self.paste(&words.join(" "));
+    }
+
+    /// Text pasted (Command-V) into whatever has the keyboard: the palette's query (its first line), the Archive's search,
+    /// the focused chat's input, else the focused terminal (bracketed when its program asked).
     pub fn paste(&mut self, text: &str) {
         if self.palette.is_some() {
             if let Some(p) = self.palette.as_mut().filter(|p| p.mode == super::Mode::Commands) {
