@@ -857,7 +857,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
-        crate::history::manifest::list_written(&dir);
+        crate::history::list_written(&dir);
 
         let mut args = Map::new();
         args.insert("build".into(), Value::from(1));
@@ -932,7 +932,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(written.status.success(), "{}", String::from_utf8_lossy(&written.stderr));
-        crate::history::manifest::list_written(&dir);
+        crate::history::list_written(&dir);
 
         let mut args = Map::new();
         args.insert("build".into(), Value::from(1));

@@ -40,8 +40,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
     ban and `blaze check --fix` (or `blaze check --replace A=B`), by name resolution, never by text.
     Skill: `changing-code`.
-14. **sans-io-cores**: Every core is a synchronous state machine on an injected clock that owns no IO;
-    drivers do the IO and stay thin. Skill: `runtime-code`.
+14. **sans-io-cores**: Every core is a synchronous state machine on an injected clock that owns no IO,
+    marked `#![blaze::sans_io]` so the lint enforces it; drivers do the IO and stay thin. Skill:
+    `runtime-code`.
 15. **every-wait-says-what**: Every blocking wait opens a span naming what it waits for. Skill:
     `runtime-code`.
 16. **slow-is-p0-traced**: Anything slow is a P0 until a span names it; the trace comes before the speed

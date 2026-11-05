@@ -98,8 +98,12 @@ smallest run that still fails, and replays it exactly.
   random prefix of the later changes, the last of which may be torn. A whole-file write or rename
   that completed is kept whole.
 - Targeted faults: `fail_syncs`, `hold_syncs`/`release_held` (a commit that hangs), `slow_writes`,
-  `hold_lists`/`fail_lists`, `hold_sends`, `lose_changes`, and `record` to see the order
-  completions were told in.
+  `hold_lists`/`fail_lists`, `hold_sends`, `lose_changes`, `fill` (a full disk: appends and
+  writes under a directory past its room fail with ENOSPC, an append keeping the part that fit),
+  and `record` to see the order completions were told in.
+- A lock table for `Effect::Lock`/`Effect::Unlock` (flock's semantics, never waiting: a lock that
+  another excludes is `Done::Contended`), with `hold_lock`/`release_lock` for another process's
+  lock of a file; a crash lets every lock go, another process's too.
 - `program` for spawned processes (a memory limit kills, as a cgroup does), `dial`/`peer_*` for a
   peer outside the simulation.
 
@@ -186,7 +190,17 @@ each maps to a DST capability that does:
 | A lost `flushed` update when a ring moves between two atomics: a writer's store lands between the mover's load and its store | Scheduled atomics, a switch point at every atomic op, plus mmap semantics for what a crash keeps of the ring (`hegel::sim` only) |
 | Recovery holds `manifest.lock` while it walks the directory, so a daemon that starts during it blocks | Multi-process restart on the virtual clock with a bounded-progress oracle: the second daemon's first answer arrives within its bound (`hold_lists`/`slow_writes` today, a second process in `hegel::sim`) |
 
-The DST for it draws records, flushes, merges, retires, pins, reads and restarts, crashes at any
+Since 2026-11-04 the writer is a sans-IO core (`crates/blaze-profile/src/history/files.rs`,
+marked `#![blaze::sans_io]`; `manifest.rs`, `retire.rs`, `compact.rs` and `merge.rs` too) driven
+by `history/drive.rs`, and its DST is `history/files/tests.rs`: it draws flushes, build ends
+(merges), crashes at a completion count and reopens (recovery), with swarm faults
+(`fail_one_in`, `fill` for ENOSPC, `fail_syncs`, a held `manifest.lock`), and its oracle is that
+after any crash and reopen the rows in listed files plus the rows recovered equal the rows
+recorded, each once, no listed file is missing or torn, and the history always opens. Its
+planted bugs (`files::Plant`) are the first two rows of the table: no sync before a rename, and
+a flush's consumption marked after its commit.
+
+The full DST for it draws records, flushes, merges, retires, pins, reads and restarts, crashes at any
 point, and checks: every row recorded and flushed appears exactly once; no file a live pin's
 generation lists is deleted; a reader opened after any crash sees only listed files; a restart
 reaches its first answer within its bound. Each row of the table is a planted bug it must catch.

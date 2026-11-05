@@ -55,7 +55,19 @@ byte-in/byte-out `Connection`, never `tokio-rustls`), the daemon's wire protocol
 registry client. Its interface is bytes in, bytes and events out, so any IO backend can drive it
 (tokio today, io_uring on Linux later) by writing one thin driver, with no change to the core. A
 dependency that ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest,
-tokio-rustls) is replaced by a core and a driver, not wrapped.
+tokio-rustls) is replaced by a core and a driver, not wrapped. Persisted state is a core too: a
+writer of files that must survive a crash (a manifest, a journal, a history, a store) asks for each
+write, sync, rename, delete and lock as a blaze-core `Effect` and takes `Completion`s, so `Sim` sees
+every one and can tear what was not synced; its durability is the order of the effects it emits,
+never a direct `fsync`, `F_FULLFSYNC` or `flock`. Each core module carries `#![blaze::sans_io]` and
+`#![deny(blaze::sans_io_core)]`: the lint walks every call the module makes, through workspace
+functions, and refuses the clock, `std::fs`, `std::thread`, `std::net`, `std::process`, `std::env`,
+OS randomness and `libc`/`rustix`/`nix`. What a core needs of its process beyond IO (its pid,
+whether another process lives, symbols to name a stack) comes through a trait the driver implements,
+taken as a type parameter: calls through it are the driver's, not the core's. Drivers are separate,
+unmarked modules, so the exemption is by module, never by an allow on a line. A core's errors carry
+the path the driver will report, and a step that waits on no effect is a typed error
+(`bounded-progress`).
 
 ## every-wait-says-what (rule 15)
 

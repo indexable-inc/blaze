@@ -25,6 +25,9 @@
 //! leaves a lock file no one holds, which the writer deletes. Until 2026-11-04 a merge deleted
 //! its inputs at once, and a `blaze slow` racing it failed on DuckDB's "Cannot open file".
 
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+
 use serde_derive::{Deserialize, Serialize};
 
 #[cfg(test)]

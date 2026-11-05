@@ -47,10 +47,13 @@
 //! the rows of (a crash between a merge's rename and its deletes, before manifests) are left
 //! out, and deleted by a writer.
 
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt, fs, io,
-    path::{Path, PathBuf},
+    fmt, io,
+    path::Path,
     time::Duration,
 };
 
@@ -63,11 +66,11 @@ use parquet::file::{
     metadata::{ParquetMetaData, ParquetMetaDataReader},
     statistics::Statistics,
 };
+use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
-use stdx::file_lock::Locked;
 
-use super::{HistoryError, compact::Name, io_error, put, retire::Retired};
-use crate::{clock, perf, schema};
+use super::{HistoryError, compact::Name, merge, retire::Retired};
+use crate::{perf, schema};
 
 /// The manifest's file in the history's directory.
 pub const FILE: &str = "manifest.json";
@@ -163,7 +166,7 @@ pub struct Entry {
     /// The earliest and latest instant of its rows (each of [`INSTANTS`] it has), on the clock
     /// of `boot`; `None`: no instant. A range a footer can't bound is `[i64::MIN, i64::MAX]`.
     pub t_ns: Option<[i64; 2]>,
-    /// The boot its instants count from ([`clock::boot`]); `None`: unknown, any boot.
+    /// The boot its instants count from ([`crate::clock::boot`]); `None`: unknown, any boot.
     pub boot: Option<String>,
     /// The process that wrote it; `None`: several (a merge of several), or unknown.
     pub pid: Option<u32>,
@@ -173,16 +176,22 @@ pub struct Entry {
 pub const INSTANTS: [&str; 6] = ["t_ns", "start_ns", "started_ns", "from_ns", "to_ns", "read_ns"];
 
 impl Entry {
-    /// The entry of a file of `table` this process writes with the rows of `parts`.
-    pub fn of_batches(table: &schema::Table, parts: &[RecordBatch]) -> Entry {
+    /// The entry of a file of `table` that the process `pid`, whose clock counts from `boot`,
+    /// writes with the rows of `parts` (the driver's [`Entry::of_batches`] says this process's).
+    pub(crate) fn of_rows(
+        table: &schema::Table,
+        parts: &[RecordBatch],
+        pid: u32,
+        boot: Option<&str>,
+    ) -> Entry {
         let mut entry = Entry {
             version: schema::VERSION,
             rows: 0,
             builds: None,
             t_ns: None,
             // alloc: a file's entry, once a file
-            boot: clock::boot().map(str::to_owned),
-            pid: Some(std::process::id()),
+            boot: boot.map(str::to_owned),
+            pid: Some(pid),
         };
         for part in parts {
             entry.rows += part.num_rows() as u64;
@@ -204,14 +213,17 @@ impl Entry {
         entry
     }
 
-    /// The entry of the file at `path`, from its footer: its version from its
-    /// `blaze.schema` key, its ranges from its row groups' statistics. A history adopted reads
-    /// it once a file; so does a test that writes files with DuckDB, whose files have no
-    /// `blaze.schema` (`version` says theirs). A footer with no `blaze.schema` and no
+    /// The entry of the file at `path`, whose bytes are `bytes`, from its footer: its version
+    /// from its `blaze.schema` key, its ranges from its row groups' statistics. A history
+    /// adopted reads it once a file; so does a test that writes files with DuckDB, whose files
+    /// have no `blaze.schema` (`version` says theirs). A footer with no `blaze.schema` and no
     /// `version` given is [`ManifestError::Unversioned`].
-    pub(crate) fn of_footer(path: &Path, version: Option<u32>) -> Result<Entry, HistoryError> {
-        let file = fs::File::open(path).map_err(io_error(path, "opening to read its footer"))?;
-        let metadata = ParquetMetaDataReader::new().parse_and_finish(&file).map_err(|error| {
+    pub(crate) fn of_footer(
+        path: &Path,
+        bytes: &Bytes,
+        version: Option<u32>,
+    ) -> Result<Entry, HistoryError> {
+        let metadata = ParquetMetaDataReader::new().parse_and_finish(bytes).map_err(|error| {
             HistoryError::Io {
                 // alloc: an error
                 path: path.to_owned(),
@@ -321,10 +333,27 @@ fn footer_version(metadata: &ParquetMetaData) -> Option<u32> {
     if let Some(value) = own.and_then(|it| it.value.as_deref()) {
         return value.parse().ok();
     }
-    let arrow =
-        parquet::arrow::parquet_to_arrow_schema(file.schema_descr(), file.key_value_metadata())
-            .ok()?;
-    arrow.metadata().get("blaze.schema")?.parse().ok()
+    let pairs = file.key_value_metadata()?;
+    let encoded = pairs.iter().find(|it| it.key == "ARROW:schema")?.value.as_deref()?;
+    arrow_schema_version(encoded)
+}
+
+/// The `blaze.schema` key of the Arrow schema a Parquet footer encodes (`ARROW:schema`: base64
+/// of an IPC schema message, after a continuation marker and length when it has one, as
+/// parquet's `get_arrow_schema_from_metadata` reads it), read from the flatbuffer in place: no
+/// `Schema` is built, whose metadata map would draw a hasher's random state, which a sans-IO
+/// core does not read.
+fn arrow_schema_version(encoded: &str) -> Option<u32> {
+    use base64::Engine as _;
+    // alloc: the footer's encoded schema, decoded once a file read
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let message = match bytes.get(..4) {
+        Some([0xff, 0xff, 0xff, 0xff]) if bytes.len() > 8 => &bytes[8..],
+        _ => &bytes[..],
+    };
+    let schema = arrow_ipc::root_as_message(message).ok()?.header_as_schema()?;
+    let pair = schema.custom_metadata()?.iter().find(|it| it.key() == Some("blaze.schema"))?;
+    pair.value()?.parse().ok()
 }
 
 /// Which files a reader reads.
@@ -692,65 +721,34 @@ pub(crate) fn kind(name: &str) -> Kind {
     Kind::Unclassified
 }
 
-/// The manifest of the history `dir`, as a reader takes it, with no lock: the manifest is
-/// replaced whole, so this is one version of it. A directory with no manifest (a history no
-/// blaze with manifests has written to) gives the manifest its files make ([`adopted`]),
-/// written by no reader: the history's next writer writes it.
-pub fn read(dir: &Path) -> Result<Manifest, HistoryError> {
-    let path = dir.join(FILE);
-    match fs::read(&path) {
-        Ok(bytes) => Manifest::decode(&bytes).map_err(|why| HistoryError::Manifest { path, why }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => adopted(dir),
-        Err(error) => Err(io_error(&path, "reading the manifest")(error)),
-    }
-}
-
-/// The manifest the files of `dir` make, for a history written before manifests. Every Parquet
-/// file not hidden and not a schema file is listed, or is [`HistoryError::Unclassified`],
-/// except the ones that left the history: those [`LEGACY_RETIRED`] names (a blaze of pins with
-/// no manifest retired them; their generations kept), and those a merged file holds the rows
-/// of, retired now. None is deleted here: a reader of a blaze before manifests may have it
-/// pinned, so it waits for a reap like any retired file.
+/// The manifest the files of a directory with none make, for a history written before
+/// manifests: `names` its Parquet files of a form blaze lists, sorted, `footers` a mapping of
+/// each, `legacy` the bytes of its [`LEGACY_RETIRED`] when there is one, and `said` the highest
+/// generation any pin in [`super::PINS`] said. Every file is listed, except the ones that left
+/// the history: those [`LEGACY_RETIRED`] names (a blaze of pins with no manifest retired them;
+/// their generations kept), and those a merged file holds the rows of, retired now. None is
+/// deleted here: a reader of a blaze before manifests may have it pinned, so it waits for a
+/// reap like any retired file. `dir` names the directory in errors.
 ///
-/// The generation starts at the highest that file or any pin in [`super::PINS`] says, never 0:
-/// a reader still running that said generation 7 holds only files retired after 7, so a file
-/// retired here at 1 would be deleted under it.
-fn adopted(dir: &Path) -> Result<Manifest, HistoryError> {
-    // alloc: the directory's files, once a history is adopted
-    let mut names: Vec<String> = Vec::new();
-    for entry in fs::read_dir(dir).map_err(io_error(dir, "listing"))? {
-        let entry = entry.map_err(io_error(dir, "listing"))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            if name.to_string_lossy().ends_with(".parquet") {
-                return Err(HistoryError::Unclassified {
-                    // alloc: an error
-                    dir: dir.to_owned(),
-                    file: name.to_string_lossy().into_owned(),
-                });
-            }
-            continue;
-        };
-        match kind(name) {
-            // alloc: a file's name, once a history is adopted
-            Kind::Listable => names.push(name.to_owned()),
-            Kind::Unclassified => {
-                // alloc: an error
-                return Err(HistoryError::Unclassified {
-                    dir: dir.to_owned(),
-                    file: name.to_owned(),
-                });
-            }
-            Kind::Schema | Kind::Hidden | Kind::Other => {}
-        }
-    }
-    names.sort_unstable();
-    let legacy = legacy_retired(dir)?;
+/// The generation starts at the highest that file or any pin says, never 0: a reader still
+/// running that said generation 7 holds only files retired after 7, so a file retired here at 1
+/// would be deleted under it.
+pub(crate) fn adopt(
+    dir: &Path,
+    mut names: Vec<String>,
+    footers: Vec<blaze_core::Mapping>,
+    legacy: Option<&[u8]>,
+    said: u64,
+) -> Result<Manifest, HistoryError> {
     // alloc: once a history is adopted
-    let mut retired = Retired {
-        generation: legacy.generation.max(super::pin::said_most(dir)?),
-        files: Vec::new(),
+    let mut footers: BTreeMap<String, blaze_core::Mapping> =
+        names.iter().cloned().zip(footers).collect(); // clone: each name, once a history is adopted
+    let legacy = match legacy {
+        Some(bytes) => legacy_retired(&dir.join(LEGACY_RETIRED), bytes)?,
+        None => Retired::default(),
     };
+    // alloc: once a history is adopted
+    let mut retired = Retired { generation: legacy.generation.max(said), files: Vec::new() };
     for (name, generation) in legacy.files {
         // One gone already was reaped before the writer that retired it stopped.
         if let Ok(at) = names.binary_search(&name) {
@@ -778,7 +776,10 @@ fn adopted(dir: &Path) -> Result<Manifest, HistoryError> {
         if let Some(named) = Name::parse(&name) {
             manifest.flush_committed(named.last);
         }
-        let entry = Entry::of_footer(&dir.join(&name), None)?;
+        let Some(mapping) = footers.remove(&name) else {
+            unreachable!("a mapping of each file adopted")
+        };
+        let entry = Entry::of_footer(&dir.join(&name), &merge::bytes_of(mapping), None)?;
         manifest
             .insert(&name, entry)
             .map_err(|why| HistoryError::Manifest { path: dir.join(FILE), why })?;
@@ -795,21 +796,12 @@ fn adopted(dir: &Path) -> Result<Manifest, HistoryError> {
 /// generation and retired files. Read once, when its history is adopted, then deleted.
 pub const LEGACY_RETIRED: &str = "retired";
 
-/// What [`LEGACY_RETIRED`] says, or nothing retired at generation 0 when it is not there.
-fn legacy_retired(dir: &Path) -> Result<Retired, HistoryError> {
+/// What [`LEGACY_RETIRED`], at `path` with `bytes`, says.
+fn legacy_retired(path: &Path, bytes: &[u8]) -> Result<Retired, HistoryError> {
     const HEADER: &str = "blaze profile history retired v1";
-    let path = dir.join(LEGACY_RETIRED);
-    let text = match fs::read_to_string(&path) {
-        Ok(it) => it,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Retired::default()),
-        Err(error) => {
-            return Err(
-                io_error(&path, "reading the retired files of a history before manifests")(error),
-            );
-        }
-    };
-    let refused =
-        |why| HistoryError::Manifest { path: path.clone(), why: ManifestError::Retired(why) };
+    // alloc: an error
+    let refused = |why| HistoryError::Manifest { path: path.to_owned(), why: ManifestError::Retired(why) };
+    let text = std::str::from_utf8(bytes).map_err(|_| refused("it is not UTF-8"))?;
     let mut lines = text.lines();
     if lines.next() != Some(HEADER) {
         return Err(refused("its first line is not `blaze profile history retired v1`"));
@@ -836,71 +828,62 @@ fn legacy_retired(dir: &Path) -> Result<Retired, HistoryError> {
     Ok(retired)
 }
 
-/// The manifest of a history, held under its lock by a writer: changed in memory, then
-/// [`Held::commit`]ted. The lock is let go of as this drops.
+/// The manifest of a history as a writer read it under its lock ([`LOCK`], taken and let go of
+/// by the history's core, [`super::files`]): changed in memory, then committed by the core,
+/// which writes it only when it changed ([`Held::changed`]).
 pub(crate) struct Held {
-    path: PathBuf,
     manifest: Manifest,
     /// The manifest as its file holds it: a commit writes only a change.
     written: Manifest,
-    _lock: Locked,
-}
-
-/// The manifest of the history `dir`, its lock held, the directory made if it is not there. A
-/// directory with no manifest has one made of its files ([`adopted`]) and written now, and the
-/// files a merged file holds the rows of deleted.
-pub(crate) fn hold(dir: &Path) -> Result<Held, HistoryError> {
-    fs::create_dir_all(dir).map_err(io_error(dir, "making the directory"))?;
-    let lock = lock(dir)?;
-    let path = dir.join(FILE);
-    let (manifest, adopting) = match fs::read(&path) {
-        Ok(bytes) => {
-            // clone: an error
-            let manifest = Manifest::decode(&bytes)
-                .map_err(|why| HistoryError::Manifest { path: path.clone(), why })?;
-            (manifest, false)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (adopted(dir)?, true),
-        Err(error) => return Err(io_error(&path, "reading the manifest")(error)),
-    };
-    let written = match adopting {
-        // The manifest the directory's files make is written once, so the next open of the
-        // history sweeps against it.
-        true => Manifest { format: 0, ..Manifest::new() },
-        // clone: the manifest, once a commit
-        false => manifest.clone(),
-    };
-    // alloc: once a commit
-    let mut held = Held { path, manifest, written, _lock: lock };
-    held.commit()?;
-    if adopting {
-        // The manifest now says what it said; a reader reads the manifest, never it.
-        let legacy = dir.join(LEGACY_RETIRED);
-        match fs::remove_file(&legacy) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io_error(
-                    &legacy,
-                    "deleting the retired files of a history before manifests, adopted",
-                )(error));
-            }
-        }
-    }
-    Ok(held)
+    /// Made from the files of a directory with none: the commit that writes it deletes
+    /// [`LEGACY_RETIRED`] after.
+    adopting: bool,
 }
 
 impl Held {
+    /// The manifest read from its file.
+    pub(crate) fn read(manifest: Manifest) -> Held {
+        // clone: the manifest, once a hold
+        Held { written: manifest.clone(), manifest, adopting: false }
+    }
+
+    /// The manifest a directory with none makes ([`adopt`]): written at the next commit, so the
+    /// next open of the history sweeps against it.
+    pub(crate) fn adopted(manifest: Manifest) -> Held {
+        let mut written = Manifest::new();
+        written.format = 0;
+        Held { manifest, written, adopting: true }
+    }
+
     pub(crate) fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
+    /// Whether the manifest differs from what its file holds.
+    pub(crate) fn changed(&self) -> bool {
+        self.manifest != self.written
+    }
+
+    /// The manifest's bytes, as its file holds them once committed.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, ManifestError> {
+        self.manifest.encode()
+    }
+
+    /// Whether the manifest was made from a directory's files and is not yet written.
+    pub(crate) fn adopting(&self) -> bool {
+        self.adopting
+    }
+
+    /// The core renamed the manifest's bytes into place: its file holds it.
+    pub(crate) fn committed(&mut self) {
+        // clone: the manifest, once a commit
+        self.written = self.manifest.clone();
+        self.adopting = false;
+    }
+
     /// Lists the file `name` of the history's directory, with its entry.
-    pub(crate) fn add(&mut self, name: &str, entry: Entry) -> Result<(), HistoryError> {
-        // clone: an error
-        self.manifest
-            .insert(name, entry)
-            .map_err(|why| HistoryError::Manifest { path: self.path.clone(), why })
+    pub(crate) fn add(&mut self, name: &str, entry: Entry) -> Result<(), ManifestError> {
+        self.manifest.insert(name, entry)
     }
 
     /// Unlists each of `names` and retires it ([`Manifest::retire`]): deleted once no pin holds
@@ -924,7 +907,7 @@ impl Held {
         let recorders = &mut self.manifest.consumed.recorders;
         match recorders.get_mut(&pid) {
             Some(it) if it.nonce == nonce => it.flushed = it.flushed.max(seq),
-            _ => _ = recorders.insert(pid, Recorder { nonce, flushed: seq, recovered: false }),
+            Some(_) | None => _ = recorders.insert(pid, Recorder { nonce, flushed: seq, recovered: false }),
         }
     }
 
@@ -941,70 +924,13 @@ impl Held {
         self.manifest.consumed.crashes.extend(ids);
     }
 
-    /// Forgets what was consumed of a mapping or crash record no longer in `dir`: nothing can
-    /// read it again. One whose presence can't be told is kept, which costs nothing.
-    pub(crate) fn prune_consumed(&mut self, dir: &Path) {
-        let gone = |name: String| matches!(dir.join(name).try_exists(), Ok(false));
+    /// Forgets what was consumed of a mapping or crash record whose file `gone` says is no
+    /// longer in the history's directory: nothing can read it again.
+    pub(crate) fn prune_consumed(&mut self, gone: impl Fn(&str) -> bool) {
         let consumed = &mut self.manifest.consumed;
-        consumed.recorders.retain(|&pid, _| !gone(crate::flight::postmortem::file_name(pid)));
-        consumed.crashes.retain(|&(pid, _)| !gone(crate::crash::file_name(pid)));
+        consumed.recorders.retain(|&pid, _| !gone(&crate::flight::postmortem::file_name(pid)));
+        consumed.crashes.retain(|&(pid, _)| !gone(&crate::crash::file_name(pid)));
     }
-
-    /// Writes the manifest when it changed: to a hidden name, then renamed over the last.
-    pub(crate) fn commit(&mut self) -> Result<(), HistoryError> {
-        if self.manifest == self.written {
-            return Ok(());
-        }
-        // clone: an error
-        let bytes = self
-            .manifest
-            .encode()
-            .map_err(|why| HistoryError::Manifest { path: self.path.clone(), why })?;
-        put(&self.path, &bytes)?;
-        // clone: the manifest, once a commit
-        self.written = self.manifest.clone();
-        Ok(())
-    }
-}
-
-/// The exclusive lock of `dir`'s manifest, waiting at most [`LOCK_WAIT`] for another process
-/// to let go of it ([`super::lock_within`]).
-fn lock(dir: &Path) -> Result<Locked, HistoryError> {
-    let path = dir.join(LOCK);
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(io_error(&path, "opening the manifest's lock"))?;
-    let file = match Locked::try_lock(file) {
-        Ok(Ok(locked)) => return Ok(locked),
-        Ok(Err(back)) => back,
-        Err(error) => return Err(io_error(&path, "locking the manifest's lock")(error)),
-    };
-    let _span = tracing::info_span!(target: "blaze", "waits on the profile history's manifest lock", dir = %dir.display())
-        .entered();
-    match super::lock_within(file, LOCK_WAIT) {
-        Ok(Ok(locked)) => Ok(locked),
-        Ok(Err(_held)) => Err(HistoryError::Manifest { path, why: ManifestError::Locked }),
-        Err(error) => Err(io_error(&path, "locking the manifest's lock")(error)),
-    }
-}
-
-/// Lists each Parquet file `dir` holds that its manifest does not and that is of a form blaze
-/// writes: what a test that writes a history's files with DuckDB does, so its files are read.
-#[cfg(test)]
-pub(crate) fn list_written(dir: &Path) {
-    let mut held = hold(dir).unwrap();
-    for entry in fs::read_dir(dir).unwrap() {
-        let name = entry.unwrap().file_name().into_string().unwrap();
-        if matches!(kind(&name), Kind::Listable) && !held.manifest().contains(&name) {
-            let entry = Entry::of_footer(&dir.join(&name), Some(schema::VERSION)).unwrap();
-            held.add(&name, entry).unwrap();
-        }
-    }
-    held.commit().unwrap();
 }
 
 #[cfg(test)]

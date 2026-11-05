@@ -181,7 +181,7 @@ pub fn runs(dir: &Path) -> Result<Vec<RunRow>, String> {
         Ok(true) => {}
         Err(error) => return Err(format!("{}: {error}", dir.display())),
     }
-    let manifest = history::manifest::read(dir).map_err(|error| error.to_string())?;
+    let manifest = history::read_manifest(dir).map_err(|error| error.to_string())?;
     // alloc: once a listing, the runs files
     let mut files: Vec<std::path::PathBuf> = manifest
         .files(schema::PERF_RUNS.name)

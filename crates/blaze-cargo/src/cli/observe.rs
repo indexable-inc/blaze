@@ -730,7 +730,7 @@ pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
                 "the daemon (pid {pid}) answered the ask to flush the profile history with no flush"
             )
         })?;
-        let manifest = history::manifest::read(&dir).map_err(|error| error.to_string())?;
+        let manifest = history::read_manifest(&dir).map_err(|error| error.to_string())?;
         if manifest.flushed() < seq {
             return Err(format!(
                 "the daemon (pid {pid}) said its flush {seq} of the profile history {} committed, and the manifest says flush {}",

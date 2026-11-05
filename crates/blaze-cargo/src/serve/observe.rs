@@ -1526,7 +1526,7 @@ mod tests {
         };
         assert_eq!(asker, to(4, 9));
         assert!(
-            history::manifest::read(dir.path()).unwrap().flushed() >= seq,
+            history::read_manifest(dir.path()).unwrap().flushed() >= seq,
             "the manifest says the flush told"
         );
     }

@@ -439,6 +439,8 @@ pub struct Threads {
     /// Each connection's [`crate::Conn`] is its handle's bits.
     #[cfg(unix)]
     conns: Slab<Connection>,
+    /// The file locks of [`Effect::Lock`], each taken as it is asked for.
+    locks: crate::locks::Locks,
     in_flight: usize,
 }
 
@@ -500,6 +502,7 @@ impl Threads {
             untold: Vec::with_capacity(4),
             confine: None,
             spawn_dirs,
+            locks: crate::locks::Locks::new(),
             #[cfg(unix)]
             spawns: Tagged::new(RESERVE),
             #[cfg(unix)]
@@ -1060,6 +1063,9 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Removed)
         }),
         Effect::Map { file, .. } => Ok(Done::Mapped(at(root, &file, |path| fs::map(path))?)),
+        Effect::Lock { .. } | Effect::Unlock { .. } => {
+            unreachable!("file locks are kept by the driver, which takes each as it is asked for")
+        }
         Effect::Timer { .. }
         | Effect::Watch { .. }
         | Effect::Journal { .. }
@@ -1796,6 +1802,15 @@ impl Driver for Threads {
                     if !self.flush(watch, tag) {
                         self.tell(tag, Done::Failed(IoError(no_watch(watch))));
                     }
+                }
+                // A lock never waits, so it is taken here rather than on an IO thread.
+                Effect::Lock { file, mode, tag } => {
+                    let done = self.locks.lock(&self.shared.root, &file, mode, tag);
+                    self.tell(tag, done.unwrap_or_else(|error| crate::locks::failed(&error)));
+                }
+                Effect::Unlock { lock, tag } => {
+                    let done = self.locks.unlock(lock);
+                    self.tell(tag, done.unwrap_or_else(|error| crate::locks::failed(&error)));
                 }
                 #[cfg(unix)]
                 Effect::Spawn { command, tag } => {

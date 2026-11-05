@@ -15,6 +15,9 @@
 //! before manifests may hold both (a crash between a merge's rename and its deletes): the
 //! manifest made of its files leaves out the inputs ([`superseded`]).
 
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+
 use crate::schema;
 
 #[cfg(test)]
