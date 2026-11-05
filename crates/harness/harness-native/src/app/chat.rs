@@ -9,8 +9,13 @@ use super::*;
 use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, Vec2};
 use harness_native_ui_layout_api::ScrollState;
 use harness_native_ui_text_api::{Highlight, TextEdit};
+use crate::pane::Unit;
+use harness_native_render::text::Layout;
+use harness_native_ui_look_api::TextStyle;
+use harness_native_ui_text_api::{MarkdownText, Text};
 use model::chat::{Item, Transcript};
 use std::collections::HashSet;
+use std::rc::Rc;
 
 /// cod-chevron-right, cod-chevron-down.
 const CLOSED: &str = "\u{EAB6}";
@@ -24,6 +29,8 @@ pub struct Draft {
     pub caret: usize,
     pub anchor: usize,
     pub marked: Option<String>,
+    /// The x (points) up and down keep to, from the first of a run of them.
+    pub goal: Option<f32>,
 }
 
 /// One edit of a [`Draft`] (an `act.Edit`'s `EditOp`).
@@ -57,6 +64,7 @@ impl Draft {
         self.text.replace_range(a..b, s);
         self.caret = a + s.len();
         self.anchor = self.caret;
+        self.goal = None;
     }
 
     fn prev(&self, i: usize) -> usize {
@@ -98,61 +106,53 @@ impl Draft {
         i
     }
 
-    /// The same column (in characters) on the line above (`up`) or below, or the text's end.
-    fn vertical(&self, i: usize, up: bool) -> usize {
-        let start = self.line_start(i);
-        let col = self.text[start..i].chars().count();
-        let (from, to) = if up {
-            if start == 0 {
-                return 0;
-            }
-            (self.line_start(start - 1), start - 1)
-        } else {
-            let end = self.line_end(i);
-            if end == self.text.len() {
-                return end;
-            }
-            (end + 1, self.line_end(end + 1))
-        };
-        self.text[from..to].char_indices().nth(col).map_or(to, |(k, _)| from + k)
-    }
-
-    fn target(&self, m: Move) -> usize {
+    /// Where `m` takes the caret, for the moves along the source; None for the moves along the laid-out lines (up, down,
+    /// a line's start and end), which [`App::chat_target`] finds on the input's layout.
+    fn target(&self, m: Move) -> Option<usize> {
         let i = self.caret;
-        match m {
+        Some(match m {
             Move::Left => self.prev(i),
             Move::Right => self.next(i),
-            Move::Up => self.vertical(i, true),
-            Move::Down => self.vertical(i, false),
             Move::WordLeft => self.word_left(i),
             Move::WordRight => self.word_right(i),
-            Move::LineStart => self.line_start(i),
-            Move::LineEnd => self.line_end(i),
             Move::DocStart => 0,
             Move::DocEnd => self.text.len(),
-        }
+            Move::Up | Move::Down | Move::LineStart | Move::LineEnd => return None,
+        })
     }
 
-    /// Move the caret; with `select` the selection's other end stays. A plain left or right over a selection collapses it
-    /// to that side, as AppKit does.
-    fn go(&mut self, m: Move, select: bool) {
+    /// Move the caret by `m` to `to`; with `select` the selection's other end stays. A plain left or right over a
+    /// selection collapses it to that side, as AppKit does. Up and down keep the column they started from (`goal`).
+    fn go(&mut self, m: Move, to: usize, select: bool) {
         let (a, b) = self.sel();
         if !select && a != b && matches!(m, Move::Left | Move::Right) {
             self.caret = if m == Move::Left { a } else { b };
         } else {
-            self.caret = self.target(m);
+            self.caret = to;
         }
         if !select {
             self.anchor = self.caret;
         }
+        if !matches!(m, Move::Up | Move::Down) {
+            self.goal = None;
+        }
     }
 
-    /// Erase the selection, or from the caret to where `m` goes.
-    fn erase(&mut self, m: Move) {
+    /// Erase the selection, or from the caret to `to`.
+    fn erase(&mut self, to: usize) {
         if self.anchor == self.caret {
-            self.anchor = self.target(m);
+            self.anchor = to;
         }
         self.insert("");
+    }
+
+    /// What a press at byte `i` selects by `unit`: nothing (the caret there), its word, or its line.
+    fn span(&self, i: usize, unit: Unit) -> (usize, usize) {
+        match unit {
+            Unit::Cell => (i, i),
+            Unit::Word => word_around(&self.text, i),
+            Unit::Line => (self.line_start(i), self.line_end(i)),
+        }
     }
 
     /// The words shown (the marked text in at the caret) and the TextEdit's units: caret, anchor, marked range (UTF-16).
@@ -187,6 +187,26 @@ pub struct ChatState {
     /// When the last attach was tried, and whether the link's stream is this pane's (events, not a terminal's text).
     tried: Option<f32>,
     ours: bool,
+    /// The transcript's selection (where it was started, where it reaches), and the press-and-drag making one.
+    sel: Option<(Spot, Spot)>,
+    drag: Option<Drag>,
+}
+
+/// A place in a chat's transcript: row `row`, its `part`th words ([`texts`]), UTF-16 unit `at` of what they show (the
+/// markers out of markdown). Places order as they read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Spot {
+    row: usize,
+    part: usize,
+    at: usize,
+}
+
+/// A press-and-drag selecting in a chat pane: in its input (byte offsets of the draft) or its transcript, by `unit`,
+/// the press's own span kept whole as it extends.
+#[derive(Clone, Copy, Debug)]
+enum Drag {
+    Input { unit: Unit, span: (usize, usize) },
+    List { unit: Unit, span: (Spot, Spot) },
 }
 
 impl Default for ChatState {
@@ -204,6 +224,8 @@ impl Default for ChatState {
             shift: 0.0,
             tried: None,
             ours: false,
+            sel: None,
+            drag: None,
         }
     }
 }
@@ -434,7 +456,158 @@ fn pasteboard_set(text: &str) {
     pb.setString_forType(&objc2_foundation::NSString::from_str(text), unsafe { NSPasteboardTypeString });
 }
 
+/// UTF-16 units in `s`.
+fn units(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// The byte offset of UTF-16 unit `u` of `s` (a unit inside a character: that character's start; past the end: the end).
+fn byte_of(s: &str, u: usize) -> usize {
+    let mut n = 0;
+    for (b, c) in s.char_indices() {
+        n += c.len_utf16();
+        if n > u {
+            return b;
+        }
+    }
+    s.len()
+}
+
+/// The word (letters, digits, `_`) at byte `i` of `s` (at its end, the word before), or the one character there.
+fn word_around(s: &str, i: usize) -> (usize, usize) {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    match s[i..].chars().next() {
+        Some(c) if word(c) => {
+            let a = s[..i].char_indices().rev().take_while(|&(_, c)| word(c)).last().map_or(i, |(k, _)| k);
+            let b = s[i..].char_indices().find(|&(_, c)| !word(c)).map_or(s.len(), |(k, _)| i + k);
+            (a, b)
+        }
+        Some(c) => (i, i + c.len_utf8()),
+        None => match s[..i].chars().next_back() {
+            Some(c) if word(c) => word_around(s, i - c.len_utf8()),
+            _ => (i, i),
+        },
+    }
+}
+
+/// The words of a row a selection can cover, in reading order: each one's path below the row, what it is given (as
+/// [`fill_row`] gives it) and whether it is inline markdown.
+fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
+    match r {
+        Row::User(s) => vec![(&["bubble", "text"], s.clone(), false)],
+        Row::Prose(s) | Row::Heading(_, s) | Row::Quote(s) => vec![(&["text"], s.clone(), true)],
+        Row::ListItem { mark, text, .. } => vec![(&["mark"], mark.clone(), false), (&["text"], text.clone(), true)],
+        Row::Code { text, .. } => vec![(&["card", "text"], text.clone(), false)],
+        Row::Tool { open: true, input, result, .. } => vec![
+            (&["body", "input"], input.clone(), false),
+            (&["body", "result"], tool_result(result).to_owned(), false),
+        ],
+        Row::Thinking { open: true, text, .. } => vec![(&["text"], text.trim().to_owned(), false)],
+        Row::Note(s) | Row::Error(s) | Row::Foot(s) => vec![(&["text"], s.clone(), false)],
+        Row::Tool { .. } | Row::Thinking { .. } => Vec::new(),
+    }
+}
+
+/// A tool's result as its open row shows it (an ellipsis while it has none).
+fn tool_result(result: &str) -> &str {
+    if result.is_empty() { "\u{2026}" } else { result.trim_end() }
+}
+
+/// What words given `src` show (inline markdown: the markers out), which a [`Spot`]'s units count in.
+fn shown(src: &str, md: bool) -> String {
+    if md { harness_native_render::markdown::inline(src).text } else { src.to_owned() }
+}
+
+/// The units of row `row`'s `part`th words (`len` long) the selection `lo..hi` covers, if any.
+fn covered(lo: Spot, hi: Spot, row: usize, part: usize, len: usize) -> Option<(usize, usize)> {
+    let here = (row, part);
+    if here < (lo.row, lo.part) || here > (hi.row, hi.part) {
+        return None;
+    }
+    let a = if here == (lo.row, lo.part) { lo.at.min(len) } else { 0 };
+    let b = if here == (hi.row, hi.part) { hi.at.min(len) } else { len };
+    Some((a, b))
+}
+
+impl Row {
+    /// The row as markdown, for a copy that takes it whole (None: its words as shown).
+    fn markdown(&self) -> Option<String> {
+        Some(match self {
+            Row::User(s) | Row::Prose(s) | Row::Note(s) | Row::Error(s) | Row::Foot(s) => s.clone(),
+            Row::Heading(n, s) => format!("{} {s}", "#".repeat(usize::from(*n))),
+            Row::ListItem { depth, mark, text } => {
+                let mark = match mark.as_str() {
+                    "\u{2022}" => "-",
+                    "\u{2610}" => "- [ ]",
+                    "\u{2611}" => "- [x]",
+                    m => m,
+                };
+                format!("{}{mark} {text}", "  ".repeat(*depth))
+            }
+            Row::Quote(s) => format!("> {s}"),
+            Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
+            Row::Tool { .. } | Row::Thinking { .. } => return None,
+        })
+    }
+}
+
+/// The transcript's text from `lo` to `hi`, for the pasteboard: a row taken whole as markdown, a row cut by the
+/// selection as it shows; rows a blank line apart (list items a line).
+fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
+    let mut out = String::new();
+    let mut last: Option<&Row> = None;
+    for (i, (_, r)) in rows.iter().enumerate().take(hi.row + 1).skip(lo.row) {
+        let mut whole = true;
+        let mut bits = Vec::new();
+        for (k, (_, src, md)) in texts(r).iter().enumerate() {
+            let s = shown(src, *md);
+            let n = units(&s);
+            let Some((a, b)) = covered(lo, hi, i, k, n) else {
+                whole = false;
+                continue;
+            };
+            whole &= a == 0 && b == n;
+            if a < b {
+                bits.push(s[byte_of(&s, a)..byte_of(&s, b)].to_owned());
+            }
+        }
+        if bits.is_empty() {
+            continue;
+        }
+        let piece = if whole { r.markdown().unwrap_or_else(|| bits.join("\n")) } else { bits.join(" ") };
+        if let Some(prev) = last {
+            let list = matches!(prev, Row::ListItem { .. }) && matches!(r, Row::ListItem { .. });
+            out.push_str(if list { "\n" } else { "\n\n" });
+        }
+        out.push_str(&piece);
+        last = Some(r);
+    }
+    out
+}
+
+/// Words node `e` laid out as the painter draws it (at the width layout gave it), and where it is (window points).
+fn words_layout(paint: &mut Painter, e: EntityView<'_>) -> Option<(Rc<Layout>, Laid)> {
+    let text = e.try_cloned::<&Text>()?;
+    let laid = e.try_cloned::<&Laid>()?;
+    let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
+    let md = e.has(MarkdownText::id());
+    Some((paint.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md), laid))
+}
+
+/// Chat pane `p`'s input words.
+fn input_text(w: WorldRef<'_>, p: u64) -> Option<View<'_>> {
+    View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?.part("text")
+}
+
 impl App {
+    /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
+    fn term_ground_dark(&self) -> bool {
+        let w = self.world.world_ref();
+        let Some(f) = view::prefab(w, "hn.Main").and_then(|e| e.try_cloned::<&Fill>()) else { return self.dark };
+        let c = if self.dark { f.dark } else { f.light };
+        0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.5
+    }
+
     /// Whether the focused pane shows a chat session (keys go to its input).
     pub(super) fn chat_focused(&self) -> bool {
         self.focused_chat().is_some()
@@ -477,6 +650,16 @@ impl App {
                 self.link.attach(sid, 80, 24, true);
             }
         }
+        // Drawn in the appearance of the ground it sits on (the terminal's, dark in both appearances unless the Ghostty
+        // theme says otherwise), so its inks, plates and washes read on it whatever the window's appearance.
+        let scheme = harness_native_ui_look_api::Scheme { dark: self.term_ground_dark() };
+        for part in ["list", "foot"] {
+            if let Some(v) = pv.part(part)
+                && v.entity().try_cloned::<&harness_native_ui_look_api::Scheme>() != Some(scheme)
+            {
+                v.entity().set(scheme);
+            }
+        }
         let chats = self.chats.borrow();
         let empty = Transcript::default();
         let t = chats.get(&sid).unwrap_or(&empty);
@@ -486,6 +669,9 @@ impl App {
         {
             let room = list.entity().try_cloned::<&Laid>().map_or(600.0, |l| l.h);
             let pad = stack.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().unwrap_or_default();
+            // The transcript's selection, a wash over the words it covers in the input's selection colours.
+            let sel = st.sel.map(|(a, b)| (a.min(b), a.max(b))).filter(|(a, b)| a != b);
+            let wash = input_text(w, pane).and_then(|t| t.entity().try_cloned::<&TextEdit>()).unwrap_or_default();
             let fresh_rows = |row: View<'_>, i: usize, new: bool| {
                 if new {
                     row.set(HoverAmt::default());
@@ -494,6 +680,27 @@ impl App {
                     }
                 }
                 fill_row(row, &rows[i].1);
+                for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
+                    let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
+                    let e = node.entity();
+                    let range = sel.and_then(|(lo, hi)| covered(lo, hi, i, k, units(&shown(src, *md))));
+                    match range.filter(|(a, b)| a < b) {
+                        Some((a, b)) => {
+                            let te = TextEdit {
+                                caret: b as u32,
+                                anchor: a as u32,
+                                select_dark: wash.select_dark,
+                                select_light: wash.select_light,
+                                ..TextEdit::default()
+                            };
+                            if e.try_cloned::<&TextEdit>() != Some(te) {
+                                e.set(te);
+                            }
+                        }
+                        None if e.has(TextEdit::id()) => _ = e.remove(TextEdit::id()),
+                        None => {}
+                    }
+                }
             };
             let s = view::lazy_stack(
                 stack,
@@ -518,7 +725,11 @@ impl App {
             if let Some(txt) = area.part("text") {
                 txt.text(&shown);
                 let mut te = txt.entity().try_cloned::<&TextEdit>().unwrap_or_default();
-                let next = TextEdit { caret, anchor, mark_lo: lo, mark_hi: hi, focused, ..te };
+                // The caret blinks as the terminal's cursor does (Ghostty's cursor-style-blink), solid again as it moves.
+                let blink = self.look.themes[usize::from(self.dark)].blink;
+                let moved = (te.caret, te.anchor, te.mark_lo, te.mark_hi) != (caret, anchor, lo, hi) || (focused && !te.focused);
+                let since = if moved { self.time } else { te.since };
+                let next = TextEdit { caret, anchor, mark_lo: lo, mark_hi: hi, focused, blink, since, ..te };
                 if next != te {
                     te = next;
                     txt.entity().set(te);
@@ -611,6 +822,10 @@ impl App {
         if moving {
             self.poke();
         }
+        // A focused input's caret fades on the clock: keep drawing.
+        if self.focused && self.look.themes[usize::from(self.dark)].blink && self.chat_focused() && !self.tree_focus && self.palette.is_none() {
+            self.poke_why("caret blink");
+        }
     }
 
     /// A scroll over a chat pane's transcript: its physics take it (scrolling up lets go of the bottom). Whether it was
@@ -698,15 +913,26 @@ impl App {
             _ => None,
         };
         if let Some(m) = mv {
-            self.with_draft(|d| d.go(m, select));
+            if let Some(to) = self.chat_target(m) {
+                self.with_draft(|d| d.go(m, to, select));
+            }
+            return;
+        }
+        let erase = match op {
+            "backspace" => Some(Move::Left),
+            "delete" => Some(Move::Right),
+            "word_erase" => Some(Move::WordLeft),
+            "word_delete" => Some(Move::WordRight),
+            "line_erase" => Some(Move::LineStart),
+            _ => None,
+        };
+        if let Some(m) = erase {
+            if let Some(to) = self.chat_target(m) {
+                self.with_draft(|d| d.erase(to));
+            }
             return;
         }
         match op {
-            "backspace" => _ = self.with_draft(|d| d.erase(Move::Left)),
-            "delete" => _ = self.with_draft(|d| d.erase(Move::Right)),
-            "word_erase" => _ = self.with_draft(|d| d.erase(Move::WordLeft)),
-            "word_delete" => _ = self.with_draft(|d| d.erase(Move::WordRight)),
-            "line_erase" => _ = self.with_draft(|d| d.erase(Move::LineStart)),
             "newline" => _ = self.with_draft(|d| d.insert("\n")),
             "cut" => {
                 let mut cut = String::new();
@@ -742,6 +968,9 @@ impl App {
                     self.link.chat_interrupt(sid);
                 } else {
                     self.with_draft(|d| d.anchor = d.caret);
+                    if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+                        st.sel = None;
+                    }
                 }
             }
             _ => eprintln!("harness-native: keys: act.Edit has no edit {op:?}"),
@@ -771,10 +1000,19 @@ impl App {
         Some(self.chat.borrow().get(&sid).and_then(|s| s.draft.marked.clone()))
     }
 
-    /// The selection of the focused chat's input, for Command-C.
+    /// What the focused chat has selected, for Command-C: its transcript's selection (a row taken whole as markdown),
+    /// else its input's.
     pub(super) fn chat_copy(&self) -> Option<Option<String>> {
         let (_, _, sid) = self.focused_chat()?;
-        Some(self.chat.borrow().get(&sid).map(|s| s.draft.selected().to_owned()).filter(|s| !s.is_empty()))
+        let states = self.chat.borrow();
+        let Some(st) = states.get(&sid) else { return Some(None) };
+        if let Some((a, b)) = st.sel.filter(|(a, b)| a != b) {
+            let chats = self.chats.borrow();
+            let empty = Transcript::default();
+            let rows = rows(chats.get(&sid).unwrap_or(&empty), &st.open);
+            return Some(Some(transcript_text(&rows, a.min(b), a.max(b))).filter(|s| !s.is_empty()));
+        }
+        Some(Some(st.draft.selected().to_owned()).filter(|s| !s.is_empty()))
     }
 
     /// Command-A in the focused chat's input. Whether a chat took it.
@@ -785,15 +1023,234 @@ impl App {
         })
     }
 
-    /// Where the focused chat's input is (window points), for the input method's candidate window: its last line.
-    pub(super) fn chat_caret_rect(&self) -> Option<Option<[f32; 4]>> {
-        let (p, ..) = self.focused_chat()?;
+    /// The focused chat's input laid out as drawn, where it is, and its session.
+    fn input_layout(&mut self) -> Option<(Rc<Layout>, Laid, u64, u64)> {
+        let (p, _, sid) = self.focused_chat()?;
         let w = self.world.world_ref();
-        let txt = View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?.part("text")?;
-        let l = txt.entity().try_cloned::<&Laid>()?;
+        let txt = input_text(w, p)?;
+        let (lay, laid) = words_layout(&mut self.paint, txt.entity())?;
+        Some((lay, laid, p, sid))
+    }
+
+    /// Where `m` takes the focused chat's caret (a byte offset of its draft): along the source, or along the input's
+    /// lines as they wrap (up and down keep their column's x, a line's start and end are the wrapped line's). None
+    /// while there is no input laid out, or an input method holds marked text.
+    fn chat_target(&mut self, m: Move) -> Option<usize> {
+        let (_, _, sid) = self.focused_chat()?;
+        let along = self.chat.borrow().get(&sid).map_or(Some(0), |st| st.draft.target(m));
+        if along.is_some() {
+            return along;
+        }
+        let (lay, _, _, sid) = self.input_layout()?;
+        let mut states = self.chat.borrow_mut();
+        let d = &mut states.entry(sid).or_default().draft;
+        if d.marked.is_some() {
+            return None;
+        }
+        let n = units(&d.text);
+        if lay.lines.is_empty() {
+            return Some(if matches!(m, Move::Down | Move::LineEnd) { d.text.len() } else { 0 });
+        }
+        let (x, li) = lay.caret(units(&d.text[..d.caret]));
+        let line = &lay.lines[li];
+        let u = match m {
+            Move::Up | Move::Down => {
+                let goal = *d.goal.get_or_insert(x);
+                let next = if m == Move::Up { li.checked_sub(1) } else { Some(li + 1).filter(|&i| i < lay.lines.len()) };
+                match next {
+                    Some(i) => {
+                        let l = &lay.lines[i];
+                        lay.index_at(goal, l.top + l.height * 0.5)
+                    }
+                    None if m == Move::Up => 0,
+                    None => n,
+                }
+            }
+            Move::LineStart => line.start,
+            // Before the newline that ends it, or before the space a soft wrap broke at (after it is the next line's start).
+            Move::LineEnd if line.hard_break => line.end.saturating_sub(1).max(line.start),
+            Move::LineEnd if line.end < n => {
+                let b = byte_of(&d.text, line.end);
+                let space = d.text[..b].chars().next_back().is_some_and(char::is_whitespace);
+                if space { line.end - 1 } else { line.end }
+            }
+            _ => line.end,
+        };
+        Some(byte_of(&d.text, u))
+    }
+
+    /// Where the focused chat's caret is (window points), for the input method's candidate window: the start of the
+    /// marked text, else the caret, on the input's layout.
+    pub(super) fn chat_caret_rect(&mut self) -> Option<Option<[f32; 4]>> {
+        let (p, ..) = self.focused_chat()?;
+        let Some((lay, l, ..)) = self.input_layout() else { return Some(None) };
+        let w = self.world.world_ref();
+        let Some(te) = input_text(w, p).and_then(|t| t.entity().try_cloned::<&TextEdit>()) else { return Some(None) };
+        let at = if te.mark_hi > te.mark_lo { te.mark_lo } else { te.caret } as usize;
+        let (x, top, h) = match lay.lines.is_empty() {
+            true => (0.0, 0.0, l.h),
+            false => {
+                let (x, li) = lay.caret(at);
+                (x, lay.lines[li].top, lay.lines[li].height)
+            }
+        };
         let z = self.zoom();
-        let line = 20.0;
-        Some(Some([(l.x + l.w.min(4.0)) * z, (l.y + l.h - line) * z, 2.0 * z, line * z]))
+        Some(Some([(l.x + x) * z, (l.y + top) * z, 2.0 * z, h * z]))
+    }
+
+    /// The byte of the focused chat's draft nearest window point `(x, y)` on its input.
+    fn input_index(&mut self, x: f32, y: f32) -> Option<usize> {
+        let (lay, l, _, sid) = self.input_layout()?;
+        let u = lay.index_at(x - l.x, y - l.y);
+        self.chat.borrow().get(&sid).map(|st| byte_of(&st.draft.text, u))
+    }
+
+    /// The transcript place of chat pane `p` nearest window point `(x, y)`: in the words under it, else the start of the
+    /// next words below, else the end of the last. None when no words are in view.
+    fn transcript_spot(&mut self, p: u64, rows: &[(String, Row)], x: f32, y: f32) -> Option<Spot> {
+        let w = self.world.world_ref();
+        let stack = View::of(w.entity_from_id(p)).part("list")?.part("rows")?;
+        let keys: HashMap<&str, usize> = rows.iter().enumerate().map(|(i, (k, _))| (k.as_str(), i)).collect();
+        let mut found: Vec<(usize, View<'_>)> = Vec::new();
+        stack.entity().each_child(|c| {
+            if let Some(&i) = keys.get(c.name().as_str()) {
+                found.push((i, View::of(c)));
+            }
+        });
+        found.sort_by_key(|(i, _)| *i);
+        let mut last = None;
+        for (i, row) in found {
+            for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
+                let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
+                let Some(l) = node.entity().try_cloned::<&Laid>() else { continue };
+                if y < l.y {
+                    return Some(Spot { row: i, part: k, at: 0 });
+                }
+                if y < l.y + l.h {
+                    let (lay, l) = words_layout(&mut self.paint, node.entity())?;
+                    return Some(Spot { row: i, part: k, at: lay.index_at(x - l.x, y - l.y) });
+                }
+                last = Some(Spot { row: i, part: k, at: units(&shown(src, *md)) });
+            }
+        }
+        last
+    }
+
+    /// What a press at `s` selects by `unit`: nothing (a place), its word, or its words whole.
+    fn spot_span(rows: &[(String, Row)], s: Spot, unit: Unit) -> (Spot, Spot) {
+        let text = rows.get(s.row).and_then(|(_, r)| texts(r).into_iter().nth(s.part)).map(|(_, src, md)| shown(&src, md));
+        let Some(t) = text else { return (s, s) };
+        match unit {
+            Unit::Cell => (s, s),
+            Unit::Word => {
+                let (a, b) = word_around(&t, byte_of(&t, s.at));
+                (Spot { at: units(&t[..a]), ..s }, Spot { at: units(&t[..b]), ..s })
+            }
+            Unit::Line => (Spot { at: 0, ..s }, Spot { at: units(&t), ..s }),
+        }
+    }
+
+    /// A left press: in the focused chat's input it places the caret (a double press a word, a triple its line), in
+    /// its transcript it starts a selection there; a drag extends either. Whether a chat took it.
+    pub(super) fn chat_pointer_down(&mut self, clicks: isize) -> bool {
+        let Some((p, _, sid)) = self.focused_chat() else { return false };
+        let (x, y) = (self.pointer.x, self.pointer.y);
+        let unit = match clicks {
+            ..=1 => Unit::Cell,
+            2 => Unit::Word,
+            _ => Unit::Line,
+        };
+        let w = self.world.world_ref();
+        let pv = View::of(w.entity_from_id(p));
+        let over = |v: Option<View<'_>>| v.and_then(|v| v.entity().try_cloned::<&Laid>()).is_some_and(|l| l.contains(x, y));
+        let (in_input, in_list) = (over(pv.part("foot").and_then(|f| f.part("input"))), over(pv.part("list")));
+        if in_input {
+            let at = self.input_index(x, y);
+            let mut states = self.chat.borrow_mut();
+            let st = states.entry(sid).or_default();
+            st.sel = None;
+            if let Some(i) = at.filter(|_| st.draft.marked.is_none()) {
+                let span = st.draft.span(i, unit);
+                (st.draft.anchor, st.draft.caret, st.draft.goal) = (span.0, span.1, None);
+                st.drag = Some(Drag::Input { unit, span });
+            }
+        } else if in_list {
+            let rows = self.chat_rows(sid);
+            let spot = self.transcript_spot(p, &rows, x, y);
+            let mut states = self.chat.borrow_mut();
+            let st = states.entry(sid).or_default();
+            st.draft.anchor = st.draft.caret;
+            st.sel = None;
+            if let Some(s) = spot {
+                let span = Self::spot_span(&rows, s, unit);
+                st.sel = Some(span);
+                st.drag = Some(Drag::List { unit, span });
+            }
+        } else {
+            return false;
+        }
+        self.poke();
+        true
+    }
+
+    /// The pointer moved with a chat's press held: its selection follows (the press's own span kept whole). Whether a
+    /// chat is being dragged in.
+    pub(super) fn chat_pointer_drag(&mut self) -> bool {
+        let held = self.chat.borrow().iter().find_map(|(sid, st)| st.drag.map(|d| (*sid, d)));
+        let Some((sid, drag)) = held else { return false };
+        let Some((p, ..)) = self.focused_chat().filter(|c| c.2 == sid) else {
+            if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
+                st.drag = None;
+            }
+            return false;
+        };
+        let (x, y) = (self.pointer.x, self.pointer.y);
+        match drag {
+            Drag::Input { unit, span: (a0, a1) } => {
+                if let Some(i) = self.input_index(x, y) {
+                    let mut states = self.chat.borrow_mut();
+                    let d = &mut states.entry(sid).or_default().draft;
+                    let s = d.span(i, unit);
+                    (d.anchor, d.caret) = if s.0 < a0 { (a1, s.0) } else { (a0, s.1) };
+                }
+            }
+            Drag::List { unit, span: (a0, a1) } => {
+                let rows = self.chat_rows(sid);
+                if let Some(at) = self.transcript_spot(p, &rows, x, y) {
+                    let s = Self::spot_span(&rows, at, unit);
+                    let sel = if s.0 < a0 { (a1, s.0) } else { (a0, s.1) };
+                    self.chat.borrow_mut().entry(sid).or_default().sel = Some(sel);
+                }
+            }
+        }
+        self.poke();
+        true
+    }
+
+    /// The press let go: a drag ends, and a transcript selection that covers nothing goes. Whether a chat was dragged in.
+    pub(super) fn chat_pointer_up(&mut self) -> bool {
+        let mut any = false;
+        for st in self.chat.borrow_mut().values_mut() {
+            if st.drag.take().is_some() {
+                any = true;
+                if st.sel.is_some_and(|(a, b)| a == b) {
+                    st.sel = None;
+                }
+            }
+        }
+        if any {
+            self.poke();
+        }
+        any
+    }
+
+    /// Session `sid`'s transcript as rows.
+    fn chat_rows(&self, sid: u64) -> Vec<(String, Row)> {
+        let chats = self.chats.borrow();
+        let empty = Transcript::default();
+        let states = self.chat.borrow();
+        let open = states.get(&sid).map(|s| s.open.clone()).unwrap_or_default();
+        rows(chats.get(&sid).unwrap_or(&empty), &open)
     }
 }
 
@@ -849,7 +1306,7 @@ fn fill_row(row: View<'_>, r: &Row) {
                     i.text(input);
                 }
                 if let Some(o) = b.part("result") {
-                    o.text(if result.is_empty() { "\u{2026}" } else { result.trim_end() });
+                    o.text(tool_result(result));
                 }
             }
         }
@@ -892,18 +1349,41 @@ mod tests {
 
     #[test]
     fn draft_edits_like_a_mac_text_field() {
+        let step = |d: &mut Draft, m: Move, select: bool| {
+            let to = d.target(m).unwrap();
+            d.go(m, to, select);
+        };
         let mut d = Draft::default();
         d.insert("hello world");
-        d.go(Move::WordLeft, false);
+        step(&mut d, Move::WordLeft, false);
         assert_eq!(d.caret, 6);
-        d.go(Move::WordRight, true);
+        step(&mut d, Move::WordRight, true);
         assert_eq!(d.selected(), "world");
         d.insert("there");
         assert_eq!(d.text, "hello there");
-        d.erase(Move::WordLeft);
+        d.erase(d.target(Move::WordLeft).unwrap());
         assert_eq!(d.text, "hello ");
-        d.insert("\nab");
-        d.go(Move::Up, false);
-        assert_eq!(d.caret, 2);
+        assert_eq!(d.span(2, Unit::Word), (0, 5));
+        assert_eq!(word_around("a \u{e9}t\u{e9} b", 4), (2, 7));
+    }
+
+    /// A copy across the transcript takes the rows it covers whole as markdown, and the cut ones as they show (the
+    /// markdown markers out, counted in UTF-16).
+    #[test]
+    fn a_transcript_copy_is_markdown_whole_and_shown_cut() {
+        let rows: Vec<(String, Row)> = [
+            Row::Prose("say **h\u{e9}llo** there".into()),
+            Row::ListItem { depth: 0, mark: "\u{2022}".into(), text: "one".into() },
+            Row::ListItem { depth: 0, mark: "\u{2022}".into(), text: "two".into() },
+            Row::Code { lang: "rs".into(), text: "fn main() {}".into() },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| (format!("i{i}"), r))
+        .collect();
+        let at = |row, part, at| Spot { row, part, at };
+        assert_eq!(transcript_text(&rows, at(0, 0, 4), at(2, 1, 3)), "h\u{e9}llo there\n\n- one\n- two");
+        assert_eq!(transcript_text(&rows, at(1, 0, 0), at(3, 0, 2)), "- one\n- two\n\nfn");
+        assert_eq!(transcript_text(&rows, at(3, 0, 0), at(3, 0, 12)), "```rs\nfn main() {}\n```");
     }
 }

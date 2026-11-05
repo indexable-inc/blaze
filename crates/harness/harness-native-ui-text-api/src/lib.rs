@@ -93,8 +93,10 @@ pub struct Caret {
 }
 
 /// Words being edited (a `ui.TextArea`'s): the caret at UTF-16 unit `caret`, the selection from `anchor` to it, an input
-/// method's marked text at `mark_lo..mark_hi` (underlined), drawn while `focused`. The caret is a bar in `caret_*`, the
-/// selection a wash in `select_*` (dark, light).
+/// method's marked text at `mark_lo..mark_hi` (underlined). The caret is a bar in `caret_*`, drawn while `focused`; with
+/// `blink` it fades on the `Clock` as the terminal's cursor does, solid for a moment after `since` (the clock's time
+/// when it last moved). The selection is a wash in `select_*` (dark, light), drawn focused or not (a transcript's
+/// selection is never focused).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct TextEdit {
     pub caret: u32,
@@ -102,6 +104,8 @@ pub struct TextEdit {
     pub mark_lo: u32,
     pub mark_hi: u32,
     pub focused: bool,
+    pub blink: bool,
+    pub since: f32,
     pub caret_dark: harness_native_ui_look_api::Rgba,
     pub caret_light: harness_native_ui_look_api::Rgba,
     pub select_dark: harness_native_ui_look_api::Rgba,

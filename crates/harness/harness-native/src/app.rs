@@ -293,51 +293,60 @@ fn tilde(p: &str) -> String {
     }
 }
 
+/// The app's world before anything runs in it: every component registered, the tokens, the primitives and the harness
+/// scene (with its included widget files) loaded. Err names the first script that failed and flecs's error. No window,
+/// Metal or daemon: the `scenes_load` test builds it headless.
+fn scene_world() -> Result<World, String> {
+    harness_native_ecs::init_os_api();
+    harness_native_flecs::set_message_source(harness_native_ecs::last_error);
+    // SAFETY: the OS API is set, and this binary links flecs (harness-native-ecs).
+    let world = unsafe { World::init_host() };
+    harness_native_ui_prims::register(&world);
+    harness_native_api::register(&world);
+    model::register(&world);
+    crate::pane::register(&world);
+    crate::look::register(&world);
+    archive::register(&world);
+    stats::register(&world);
+    crate::keys::register(&world);
+    view::register(&world);
+    world.component::<HoverLift>().writable();
+    world.component::<Bump>().writable();
+    script::install(&world);
+    let _ = world.entity_named(APP);
+    world.set(Clock::default());
+    world.set(PointerState::default());
+    world.set(Paint::default());
+    let mut scripts: Vec<(&str, &str)> = vec![("00-tokens", TOKENS)];
+    scripts.extend(harness_native_ui_prims::SCENES.iter().copied());
+    for (name, src) in scripts {
+        let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
+        if let Some(err) = script_error(*e) {
+            return Err(format!("scene script {name}: {err}"));
+        }
+    }
+    harness_native_ecs::embed_files(SCENE);
+    let e = world.script_named("scene::10-harness").build_from_file(SCENE[0].0);
+    if let Some(err) = script_error(*e) {
+        return Err(format!("scene script {}: {err}", SCENE[0].0));
+    }
+    // Each `include` is a managed script of its own, so its error is on its own entity, not the includer's.
+    let mut bad = None;
+    world.new_query::<&flecs::Script>().each_entity(|e, _| {
+        if bad.is_none() {
+            bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
+        }
+    });
+    match bad {
+        Some(err) => Err(err),
+        None => Ok(world),
+    }
+}
+
 impl App {
     pub fn new(wake: Wake) -> Result<Self, String> {
-        harness_native_ecs::init_os_api();
-        harness_native_flecs::set_message_source(harness_native_ecs::last_error);
-        // SAFETY: the OS API is set, and this binary links flecs (harness-native-ecs).
-        let world = unsafe { World::init_host() };
-        harness_native_ui_prims::register(&world);
-        harness_native_api::register(&world);
-        model::register(&world);
-        crate::pane::register(&world);
-        crate::look::register(&world);
-        archive::register(&world);
-        stats::register(&world);
-        crate::keys::register(&world);
-        view::register(&world);
-        world.component::<HoverLift>().writable();
-        world.component::<Bump>().writable();
-        script::install(&world);
+        let world = scene_world()?;
         let app = world.entity_named(APP);
-        world.set(Clock::default());
-        world.set(PointerState::default());
-        world.set(Paint::default());
-        let mut scripts: Vec<(&str, &str)> = vec![("00-tokens", TOKENS)];
-        scripts.extend(harness_native_ui_prims::SCENES.iter().copied());
-        for (name, src) in scripts {
-            let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
-            if let Some(err) = script_error(*e) {
-                return Err(format!("scene script {name}: {err}"));
-            }
-        }
-        harness_native_ecs::embed_files(SCENE);
-        let e = world.script_named("scene::10-harness").build_from_file(SCENE[0].0);
-        if let Some(err) = script_error(*e) {
-            return Err(format!("scene script {}: {err}", SCENE[0].0));
-        }
-        // Each `include` is a managed script of its own, so its error is on its own entity, not the includer's.
-        let mut bad = None;
-        world.new_query::<&flecs::Script>().each_entity(|e, _| {
-            if bad.is_none() {
-                bad = script_error(e).map(|err| format!("scene script {}: {err}", e.name()));
-            }
-        });
-        if let Some(err) = bad {
-            return Err(err);
-        }
         let w = world.world_ref();
         // The rule's delay for a finished run with no session, from the scene's token (seconds).
         world.set(model::ArchiveAfter {
@@ -1720,7 +1729,7 @@ impl App {
                     (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1),
                 )
             });
-            let at = match self.paint.node(d, e, &p, laid, dark, held == Some(id), sc, upload) {
+            let at = match self.paint.node(d, e, &p, laid, p.dark(dark), held == Some(id), sc, upload) {
                 Ok(at) => at,
                 Err(err) => {
                     eprintln!("harness-native: paint: {err}");
@@ -1998,5 +2007,37 @@ impl RowLooks {
 fn set_if(v: View<'_>, fill: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(fill) {
         v.set(fill);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every scene script loads, headless (no window, Metal or daemon): the tokens, the primitives, the harness scene and
+    /// its widget files, the keys, the primitives gallery and the SwiftUI-vocabulary examples. A prefab named like a
+    /// component it sets, or an entity named by a script keyword, fails here with flecs's error instead of at launch.
+    /// `cargo test -p harness-native scenes_load`.
+    #[test]
+    fn scenes_load() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        for root in crate::keys::ROOTS {
+            world.entity_named(root).add(flecs::OrderedChildren::ID);
+        }
+        let mut extra = vec![("20-keys", keys::KEYS), harness_native_ui_prims::GALLERY];
+        extra.extend(harness_native_ui_prims::EXAMPLES.iter().copied());
+        for (name, src) in extra {
+            let e = world.script_named(&format!("scene::{name}")).build_from_code(src);
+            if let Some(err) = script_error(*e) {
+                panic!("scene script {name}: {err}");
+            }
+        }
+        let mut bad = Vec::new();
+        world.new_query::<&flecs::Script>().each_entity(|e, _| {
+            if let Some(err) = script_error(e) {
+                bad.push(format!("scene script {}: {err}", e.name()));
+            }
+        });
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 }

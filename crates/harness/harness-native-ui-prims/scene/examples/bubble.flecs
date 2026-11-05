@@ -1,0 +1,35 @@
+// ui.Bubble and the width proposal: a Fit box around words is as wide as its words up to the room it is offered and its
+// own max, and its words wrap at what it has inside. A short message hugs its words; a long one stops at the max and
+// wraps; a message of two paragraphs keeps its break; in a narrow column (160 points) the room is the cap. Each row is
+// trailing-justified, a chat's user side.
+
+@tree ChildOf
+ex {
+  prefab BubbleRow : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    bubble : ui.Bubble {
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 220}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      text : ui.Words { Text: {s: "Short."} }
+    }
+  }
+
+  prefab BubbleDemo : ex.Card {
+    label : ui.Label { Text: {s: "BUBBLE, WIDTH PROPOSAL"} }
+    short : ex.BubbleRow {}
+    long : ex.BubbleRow {
+      bubble { text { Text: {s: "A long message stops at the bubble's max width and wraps inside it, the plate around every line."} } }
+    }
+    paras : ex.BubbleRow {
+      bubble { text { Text: {s: "Two paragraphs:\nthe break between them stays."} } }
+    }
+    narrow : ui.Column {
+      Flex: {axis: Column, gap: 6, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Fixed, value: 160, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      edge : ex.Outline { Overlay }
+      row : ex.BubbleRow {
+        bubble { text { Text: {s: "In a narrow column the room is the cap, not the max."} } }
+      }
+    }
+  }
+}

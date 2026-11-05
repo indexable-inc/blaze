@@ -119,6 +119,15 @@ pub struct Ribbon {
     pub min: f32,
 }
 
+/// The appearance a subtree is drawn in, whatever the window's (SwiftUI's `.environment(\.colorScheme, ...)`): every
+/// Fill, Edge and look in it takes its `dark` half when `dark`, else its `light` half; the nearest ancestor's wins. A view
+/// on a ground of its own says which half reads on it (the chat pane sits on the terminal's ground, which is dark in both
+/// appearances unless the Ghostty theme says otherwise).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scheme {
+    pub dark: bool,
+}
+
 /// `(RibbonFrom, node)` and `(RibbonTo, node)` on a [`Ribbon`]: the nodes its ends span. Exclusive; deleting either node
 /// deletes the ribbon (it joins nothing then).
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -140,6 +149,7 @@ hyperion_api_layouts::api_layouts! {
     "OnLook" => alias OnLook,
     "TextStyle" => alias TextStyle,
     "HoverLook" => alias HoverLook,
+    "Scheme" => alias Scheme,
 }
 
 /// Register the appearance vocabulary before scenes or systems resolve it.
@@ -157,6 +167,7 @@ pub fn register(world: &World) {
     world.component::<TextStyle>().writable();
     world.component::<HoverLook>().writable();
     world.component::<Ribbon>().writable();
+    world.component::<Scheme>().writable();
     world.component::<RibbonFrom>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Delete);
     world.component::<RibbonTo>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Delete);
 }

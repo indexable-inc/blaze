@@ -73,20 +73,21 @@ pub fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
 }
 
-/// The `code_ink` tokens: each entity under `code_ink` with a `Fill`, by its dotted path below it, in the dark ink.
-fn code_ink(w: WorldRef<'_>) -> Vec<(String, [f32; 4])> {
-    fn walk(e: EntityView<'_>, prefix: &str, out: &mut Vec<(String, [f32; 4])>) {
+/// The `code_ink` tokens: each entity under `code_ink` with a `Fill`, by its dotted path below it, in its `dark` or
+/// light ink.
+fn code_ink(w: WorldRef<'_>, dark: bool) -> Vec<(String, [f32; 4])> {
+    fn walk(e: EntityView<'_>, prefix: &str, dark: bool, out: &mut Vec<(String, [f32; 4])>) {
         e.each_child(|c| {
             let name = if prefix.is_empty() { c.name() } else { format!("{prefix}.{}", c.name()) };
             if let Some(f) = c.try_cloned::<&Fill>() {
-                out.push((name.clone(), rgba(f.dark)));
+                out.push((name.clone(), rgba(if dark { f.dark } else { f.light })));
             }
-            walk(c, &name, out);
+            walk(c, &name, dark, out);
         });
     }
     let mut out = Vec::new();
     if let Some(root) = w.try_lookup("code_ink") {
-        walk(root, "", &mut out);
+        walk(root, "", dark, &mut out);
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -380,7 +381,7 @@ impl Painter {
                 let time = e.world().try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
                 let inks = match e.try_cloned::<&Highlight>() {
                     Some(h) => {
-                        let tokens = code_ink(e.world());
+                        let tokens = code_ink(e.world(), dark);
                         let names: Vec<String> = tokens.iter().map(|(n, _)| n.clone()).collect();
                         let spans = self
                             .highlight
@@ -431,7 +432,7 @@ impl Painter {
                     }
                 }
                 if let Some(t) = edit {
-                    emit_edit(d, &lay, &t, laid, &style, dark, sc, p.alpha);
+                    emit_edit(d, &lay, &t, laid, &style, dark, sc, p.alpha, time);
                 }
                 if let Some(c) =
                     e.try_cloned::<&Caret>().filter(|c| (c.at..c.until).contains(&time))
@@ -708,11 +709,11 @@ fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
 
 /// A `TextEdit`'s selection wash, marked text's underline and caret bar over its words' layout.
 #[allow(clippy::too_many_arguments)]
-fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32) {
+fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32, time: f32) {
     let square = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
     let snap = |v: f32| (v * sc).round() / sc;
     let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
-    if t.focused && lo < hi {
+    if lo < hi {
         let wash = rgba(if dark { t.select_dark } else { t.select_light });
         for r in spans_of(lay, lo, hi) {
             d.panel(panel_from(wash, [0.0; 4], square, [laid.x + r[0], laid.y + r[1], r[2], r[3]], alpha));
@@ -736,6 +737,26 @@ fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextS
         };
         let w = (2.0 * sc).round().max(1.0) / sc;
         let rect = [snap(laid.x + x), snap(laid.y + top + 1.0), w, snap(h - 2.0)];
-        d.panel(panel_from(ink, [0.0; 4], square, rect, alpha));
+        let on = if t.blink { caret_blink(time - t.since) } else { 1.0 };
+        if on > 0.004 {
+            d.panel(panel_from(ink, [0.0; 4], square, rect, alpha * on));
+        }
     }
+}
+
+/// Seconds a caret stays solid after it moved, and a whole blink's period (the terminal's cursor and a text area's caret).
+pub const BLINK_PAUSE: f32 = 0.5;
+pub const BLINK_PERIOD: f32 = 1.2;
+
+/// A blinking caret's opacity `since` seconds after it last moved: solid for [`BLINK_PAUSE`], then a smooth fade in and out
+/// every [`BLINK_PERIOD`].
+#[must_use]
+pub fn caret_blink(since: f32) -> f32 {
+    let t = since - BLINK_PAUSE;
+    if t <= 0.0 {
+        return 1.0;
+    }
+    let v = (t * std::f32::consts::TAU / BLINK_PERIOD).cos();
+    let k = (v + 0.5).clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
 }

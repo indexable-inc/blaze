@@ -25,6 +25,7 @@ swiftui_gallery : ui.Column {
     baseline : ex.BaselineDemo {}
     alignself : ex.AlignSelfDemo {}
     truncate : ex.TruncateDemo {}
+    bubble : ex.BubbleDemo {}
     compose : ex.ComposeDemo {}
     safearea : ex.SafeAreaDemo {}
     fits : ex.FitsDemo {}

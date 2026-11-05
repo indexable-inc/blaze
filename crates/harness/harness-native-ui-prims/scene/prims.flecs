@@ -158,6 +158,18 @@ ui {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
   }
 
+  // Words on a soft plate that hugs them (a chat message, a callout): as wide as its words up to the width it is offered,
+  // and never more than Size.w.max (`$bubble_max_w`); past that its words wrap inside it. It is padding, fill and shape
+  // around content and nothing else: the trailing or leading edge is its parent's `justify`. Children: `text : ui.Words`.
+  prefab Bubble : ui.Box {
+    Fill: $tone_wash
+    Edge: {dark: $tone_clear.dark, light: $tone_clear.light}
+    Shape: {radius: $radius_bubble, n: 4, border: 0, feather: 0}
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: $bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 14, r: 14, t: 8, b: 8}
+  }
+
   // A section label: small, muted, bold words.
   prefab Label : ui.Words, Muted {
     TextStyle: {size: $size_caption, line: 16, role: 0, bold: 1}

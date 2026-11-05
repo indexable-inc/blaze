@@ -277,28 +277,40 @@ pub fn mark_lost_sessions() {
     log("mark_lost", r);
 }
 
-/// PTY sessions in the shape of daemon::Session::info (for `list` with all: true).
+/// The columns a session row (`sessions`, `session`) reads.
+const SESSION_COLS: &str =
+    "select id, kind, name, parent, cwd, args, status, created_ms, ended_ms, exit_code, meta from objects where kind not in ('proc', 'stage', 'repl')";
+
+/// One row of `SESSION_COLS` in the shape of daemon::Session::info: its mode (`chat` or `tui`) and model from its meta.
+fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let num = |s: Option<String>| s.and_then(|s| s.get(1..)?.parse::<u64>().ok());
+    let args: Option<String> = r.get(5)?;
+    let meta: Value = r.get::<_, Option<String>>(10)?.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or(Value::Null);
+    Ok(json!({
+        "id": num(r.get(0)?), "object": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?,
+        "parent": num(r.get(3)?), "cwd": r.get::<_, Option<String>>(4)?,
+        "argv": args.and_then(|a| serde_json::from_str::<Value>(&a).ok()), "status": r.get::<_, Option<String>>(6)?,
+        "created_ms": r.get::<_, Option<i64>>(7)?, "ended_ms": r.get::<_, Option<i64>>(8)?,
+        "exit": r.get::<_, Option<i64>>(9)?, "title": "", "attached": 0,
+        "mode": meta["mode"].as_str().unwrap_or("tui"), "model": meta["model"],
+    }))
+}
+
+/// Sessions in the shape of daemon::Session::info (for `list` with all: true).
 pub fn sessions() -> Vec<Value> {
     let c = conn();
     let r = (|| {
-        let mut st = c.prepare(
-            "select id, kind, name, parent, cwd, args, status, created_ms, ended_ms, exit_code from objects
-             where kind not in ('proc', 'stage', 'repl') order by created_ms",
-        )?;
-        let rows = st.query_map([], |r| {
-            let num = |s: Option<String>| s.and_then(|s| s.get(1..)?.parse::<u64>().ok());
-            let args: Option<String> = r.get(5)?;
-            Ok(json!({
-                "id": num(r.get(0)?), "kind": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?,
-                "parent": num(r.get(3)?), "cwd": r.get::<_, Option<String>>(4)?,
-                "argv": args.and_then(|a| serde_json::from_str::<Value>(&a).ok()), "status": r.get::<_, Option<String>>(6)?,
-                "created_ms": r.get::<_, Option<i64>>(7)?, "ended_ms": r.get::<_, Option<i64>>(8)?,
-                "exit": r.get::<_, Option<i64>>(9)?, "title": "", "attached": 0,
-            }))
-        })?;
+        let mut st = c.prepare(&format!("{SESSION_COLS} order by created_ms"))?;
+        let rows = st.query_map([], session_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     })();
     log("sessions", r).unwrap_or_default()
+}
+
+/// Session `sN` as the index knows it (one that ended before this daemon started), in the shape of [`sessions`]' rows.
+pub fn session(id: u64) -> Option<Value> {
+    let r = conn().query_row(&format!("{SESSION_COLS} and id = ?1"), [format!("s{id}")], session_row).optional();
+    log("session", r).flatten()
 }
 
 /// Agent sessions with a transcript to mirror into their `messages` stream: (object id, kind, meta).

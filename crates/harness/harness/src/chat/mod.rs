@@ -70,6 +70,34 @@ fn partial(ev: &str) -> bool {
     matches!(ev, "block_start" | "delta" | "tool_start" | "tool_delta")
 }
 
+/// Whether event `ev` is a block that came whole (it replaces its partials).
+fn whole(ev: &str) -> bool {
+    matches!(ev, "block" | "tool_call")
+}
+
+/// A chat's history from its record (`objects/sN/chat`) as a reattach to it live gives it: every event but the partials
+/// of each block that came whole since. For a chat that ended before this daemon started.
+pub fn history_of(path: &Path) -> std::io::Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut partials: HashMap<String, Vec<usize>> = HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let ev: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        let kind = ev["ev"].as_str().unwrap_or("");
+        if let Some(b) = ev["block"].as_str() {
+            if partial(kind) {
+                partials.entry(b.to_owned()).or_default().push(out.len());
+            } else if whole(kind) {
+                for i in partials.remove(b).unwrap_or_default() {
+                    out[i] = None;
+                }
+            }
+        }
+        out.push(Some(line.to_owned()));
+    }
+    Ok(out.into_iter().flatten().collect())
+}
+
 /// The history a reattach replays.
 struct Store {
     raw: File,
@@ -185,7 +213,7 @@ impl Chat {
         if let Some(b) = &block {
             if partial(&kind) {
                 st.partials.entry(b.clone()).or_default().push(at);
-            } else if matches!(kind.as_str(), "block" | "tool_call") {
+            } else if whole(&kind) {
                 for i in st.partials.remove(b).unwrap_or_default() {
                     st.replay[i] = None;
                 }
@@ -340,5 +368,64 @@ impl portable_pty::ChildKiller for PidKiller {
 
     fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
         Box::new(*self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Quiet;
+    impl Adapter for Quiet {
+        fn events(&mut self, _: &str) -> Vec<Value> {
+            Vec::new()
+        }
+        fn user(&mut self, _: &str) -> String {
+            String::new()
+        }
+        fn interrupt(&mut self) -> String {
+            String::new()
+        }
+    }
+
+    /// An ended chat's history read back from its record is the history a live reattach gave, line for line: the
+    /// partials of every block that came whole left out, a block still streaming kept.
+    #[test]
+    fn a_record_replays_as_the_live_history() {
+        let dir = std::env::temp_dir().join(format!("harness-chat-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let open = |n: &str| std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(dir.join(n)).unwrap();
+        let chat = Chat {
+            oid: "s1".into(),
+            store: Mutex::new(Store {
+                raw: open("raw"),
+                events: open("chat"),
+                messages: open("messages"),
+                replay: Vec::new(),
+                partials: HashMap::new(),
+                tools: HashMap::new(),
+                adapter: Box::new(Quiet),
+            }),
+            title: Mutex::new(String::new()),
+            model: Mutex::new(String::new()),
+            busy: AtomicBool::new(false),
+        };
+        let (tx, _rx) = broadcast::channel(64);
+        for ev in [
+            json!({"ev": "user", "text": "hi"}),
+            json!({"ev": "block_start", "block": "b1", "kind": "text"}),
+            json!({"ev": "delta", "block": "b1", "text": "hel"}),
+            json!({"ev": "tool_start", "block": "t1", "name": "Bash"}),
+            json!({"ev": "block", "block": "b1", "kind": "text", "text": "hello"}),
+            json!({"ev": "tool_delta", "block": "t1", "json": "{"}),
+        ] {
+            chat.record(ev, &tx);
+        }
+        let (live, _) = chat.history_and_subscribe(&tx);
+        let live: Vec<String> = live.iter().map(|l| l.to_string()).collect();
+        let read = history_of(&dir.join("chat")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(read, live);
+        assert_eq!(read.len(), 4, "{read:?}");
     }
 }

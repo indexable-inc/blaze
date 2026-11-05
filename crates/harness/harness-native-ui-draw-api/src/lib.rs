@@ -54,9 +54,21 @@ pub struct Painted {
     pub h: f32,
     /// Its own and its ancestors' transition scale (1 for none).
     pub scale: f32,
+    /// The appearance its nearest `Scheme` says it is drawn in: 0 the window's, 1 dark, 2 light.
+    pub scheme: u8,
 }
 
 impl Painted {
+    /// Whether it is drawn in the dark half of its looks, in a window whose appearance is `window_dark`.
+    #[must_use]
+    pub fn dark(&self, window_dark: bool) -> bool {
+        match self.scheme {
+            1 => true,
+            2 => false,
+            _ => window_dark,
+        }
+    }
+
     /// The rectangle it is laid out in before `scale` (see [`Painted::x`]).
     #[must_use]
     pub fn rect(&self) -> [f32; 4] {
