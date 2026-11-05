@@ -128,7 +128,6 @@ jobs:
         with:
           job: tests
           llvm: true
-          also: build
       # What this run's build job compiled, which main's remote has only once main pushes it:
       # a pull request's build pushes nowhere.
       - if: env.BLAZE == 'true' && (inputs.tier == 'gate' || inputs.tier == 'warm')
@@ -162,18 +161,6 @@ jobs:
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: |
           $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
-      # What was compiled, and each test that passed, for the runs after this one; a run whose
-      # tests failed pushes too, since what it compiled is no less right. The daemons end
-      # first: a push sends sealed packs, and a daemon's last pack seals when it ends.
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
-        run: blaze stop
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
-        uses: ./.github/actions/blaze-remote
-        with:
-          mode: push
-          project: ${{ steps.blaze.outputs.project }}
-          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
-          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
 
   build:
     name: build
@@ -264,13 +251,6 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
-      - if: always() && env.BLAZE == 'true' && github.ref == 'refs/heads/main' && inputs.tier == 'warm' && steps.blaze.outcome == 'success'
-        uses: ./.github/actions/blaze-remote
-        with:
-          mode: push
-          project: ${{ steps.blaze.outputs.project }}
-          token: ${{ secrets.BLAZE_CACHE_TOKEN }}
-          sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
       # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
         working-directory: target/release

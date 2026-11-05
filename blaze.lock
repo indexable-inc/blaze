@@ -2,6 +2,10 @@
 # blaze writes it (`blaze lock`); commit it. docs/cargo.md, "Lock files".
 version = 1
 
+[blaze]
+release = "0.20261105.0"
+toolchain = "nightly-2026-10-27"
+
 [native.llvm]
 pin = "crates/hir-ty-codegen/llvm.json"
 
