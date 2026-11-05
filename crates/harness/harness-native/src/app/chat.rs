@@ -222,8 +222,9 @@ pub struct ChatState {
     /// not) and when (the clock), while he still shows it.
     kip_busy: bool,
     kip_end: Option<(bool, f32)>,
-    /// The model and effort picker's menu open under the composer (chat/pick.rs), and which.
+    /// The model and effort picker's menu open under the composer (chat/pick.rs), and which; its highlight.
     pick: Option<pick::Pick>,
+    pick_nav: pick::PickNav,
 }
 
 /// What a Cmd+C in a chat took, so its pulse plays there: the transcript's selection, the input's, or row `.1` of the
@@ -276,6 +277,7 @@ impl Default for ChatState {
             kip_busy: false,
             kip_end: None,
             pick: None,
+            pick_nav: pick::PickNav::default(),
         }
     }
 }
@@ -1344,7 +1346,7 @@ impl App {
                 let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
                 (t.model.clone(), effort.to_owned())
             };
-            self.fill_chat_pick(status, sid, t, model::kind_name(o), st.pick, &model, &effort);
+            self.fill_chat_pick(status, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
             let state = if self.status_of(e) != "running" {
                 "ended \u{00B7} a message resumes it"
             } else if t.busy {
@@ -1524,6 +1526,12 @@ impl App {
         }
         if op == "pick_model" || op == "effort_next" {
             return self.chat_pick_key(op);
+        }
+        // An open picker menu takes the arrows and Return (chat/pick.rs).
+        if let Some((_, _, sid)) = self.focused_chat()
+            && self.chat_pick_nav(sid, op)
+        {
+            return;
         }
         // Escape closes the picker's menu, and what a cell floats over the transcript (a popover, a menu, a dialog),
         // before it interrupts.

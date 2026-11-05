@@ -182,6 +182,44 @@ export const overlay_pad = 6
 export const overlay_lift_blur = 24
 export const overlay_lift_alpha = 0.5
 export const overlay_lift_dy = 8
+
+// Menus (prims.flecs ui.Menu and its parts), macOS NSMenu's: a plate menu_radius round that hugs its widest item (at
+// least menu_min_w, at most menu_max_w), menu_pad in from its edge, hung menu_gap off what opened it, its shadow
+// menu_lift_*; it opens growing from menu_in_scale out of that edge and fading in, on the menu spring. An item is
+// menu_item_h tall at size_menu, its highlight a pill menu_item_radius round in tone_menu_hot (on the hover spring);
+// a ticked item's check sits in the leading gutter (menu_gutter_l in, menu_check across, menu_gutter_gap before the
+// label), so every label starts at menu_label_x whether ticked or not. Its trailing words (a model's line, a key) are
+// muted, at least menu_trail_gap after the label. A section's head is size_menu_head, muted; a separator is a hairline
+// menu_sep_pad above and below.
+export const menu_radius = 10
+export const menu_pad = 5
+export const menu_gap = 6
+export const menu_min_w = 120
+export const menu_max_w = 380
+export const menu_lift_blur = 18
+export const menu_lift_alpha = 0.28
+export const menu_lift_dy = 6
+export const menu_in_scale = 0.94
+export const menu_omega = 34
+export const menu_zeta = 1
+export const menu_item_h = 22
+export const menu_item_radius = 5
+export const menu_item_pad_r = 10
+export const menu_gutter_l = 6
+export const menu_check = 11
+export const menu_gutter_gap = 5
+export const menu_label_x = $menu_gutter_l + $menu_check + $menu_gutter_gap
+export const menu_trail_gap = 20
+export const menu_head_h = 20
+export const menu_sep_pad = 5
+export const size_menu = 13
+export const line_menu = 16
+export const size_menu_head = 11
+export const tone_menu: Fill = {dark: {0.157, 0.157, 0.169, 1}, light: {0.988, 0.988, 0.992, 1}}
+export const tone_menu_edge: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.11}}
+export const tone_menu_hot: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.07}}
+export const tone_menu_press: Fill = {dark: {1, 1, 1, 0.16}, light: {0, 0, 0, 0.11}}
+export const tone_menu_rule: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.09}}
 // The palette: a wide card near the window's top, its query line, its entries.
 export const palette_w = 560
 export const palette_top = 96
@@ -386,8 +424,7 @@ export const chat_input_radius = 12
 // The status line under the composer (hn.ChatPane's foot.status): its words, and den's model and effort picker in it
 // (hn.ChatPick, src/app/chat/pick.rs): each word its own control chat_pick_h tall, chat_pick_gap apart, the chevron
 // chat_pick_chevron across; the context meter after them (hn.ChatContext) a ring chat_ring across, its stroke
-// chat_ring_stroke, chat_context_gap from its percentage. The picker's menu is den's: chat_pick_menu_min to
-// chat_pick_menu_max wide, corners chat_pick_menu_radius, rows chat_pick_row_h tall under heads chat_pick_head_h tall.
+// chat_ring_stroke, chat_context_gap from its percentage. The picker's menu is a ui.Menu (the menu_* tokens).
 export const size_chat_status = 12.5
 export const line_chat_status = 16
 export const chat_pick_h = 20
@@ -397,11 +434,6 @@ export const chat_ring = 12
 export const chat_ring_stroke = 2
 export const chat_context_gap = 5
 export const chat_context_lead = 4
-export const chat_pick_menu_min = 248
-export const chat_pick_menu_max = 360
-export const chat_pick_menu_radius = 12
-export const chat_pick_row_h = 30
-export const chat_pick_head_h = 24
 export const chat_row_estimate = 44
 // A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, no icon. Its height, its
 // lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its

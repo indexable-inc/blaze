@@ -149,6 +149,12 @@ pub fn install(w: WorldRef<'_>) {
             e.set(HoverAmt::default());
         }
     });
+    // A node with a HoverLook (a menu's item, a row's wash) fades it in and out on its hover spring.
+    w.observer_named::<&HoverLook>("HoverLookAmt").on_set().each_entity(|e, _| {
+        if !e.has(HoverAmt::id()) {
+            e.set(HoverAmt::default());
+        }
+    });
     w.observer_named::<&PressGive>("PressGiveAmt").on_set().each_entity(|e, _| {
         if !e.has(PressAmt::id()) {
             e.set(PressAmt::default());

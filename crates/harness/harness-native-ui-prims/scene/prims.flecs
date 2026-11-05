@@ -76,6 +76,11 @@ ui {
     Size: {w: {kind: Fixed, value: 16, min: 0, max: 0}, h: {kind: Fixed, value: 16, min: 0, max: 0}}
   }
 
+  // A check mark (a menu item's tick; before ui.Icon, whose name `Icon` means from here on in this scope).
+  prefab Check : ui.Symbol {
+    Icon: {glyph: ""}
+  }
+
   // A vector mark by name (a brand's: `Mark: {name: "claude"}`), 16 points, drawn from its outline so it is crisp at every
   // zoom, sized by its ink rather than its bounds, in its Fill (the ink unless set).
   prefab Icon : ui.Node, Ink {
@@ -426,6 +431,100 @@ ui {
   }
   prefab LineHead : ui.Line {
     Truncate: {mode: Head}
+  }
+
+  // A menu, macOS NSMenu's (tokens menu_*): a plate hugging its widest item, its items, heads, separators and notes
+  // down it. ui.MenuPlate is the look alone (laid in the flow: a gallery's); ui.Menu floats it, out of the flow in the
+  // Overlay layer, hung menu_gap off the node it is `AnchoredTo` on its Side's edge (Top: above it; an instance sets
+  // another), growing out of that edge and fading in as it opens, back as it closes (a Grow Transition: its `from` is
+  // the edge it hangs from, so an instance that hangs it Bottom sets `from: Top`).
+  prefab MenuPlate : ui.Column {
+    Hoverable
+    Fill: $tone_menu
+    Edge: {dark: $tone_menu_edge.dark, light: $tone_menu_edge.light}
+    Shape: {radius: $menu_radius, n: 4, border: 1, feather: 0}
+    Lift: {blur: $menu_lift_blur, alpha: $menu_lift_alpha, dy: $menu_lift_dy}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: $menu_min_w, max: $menu_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $menu_pad, r: $menu_pad, t: $menu_pad, b: $menu_pad}
+  }
+  prefab Menu : ui.MenuPlate {
+    Placed
+    Layer: {level: Overlay}
+    Side: {edge: Top, dx: 0, dy: $menu_gap}
+    Transition: {kind: Grow, from: Bottom, scale: $menu_in_scale, fade: true}
+    Motion: {omega: $menu_omega, zeta: $menu_zeta}
+  }
+  // An item: the check gutter (`mark`, clear unless ui.MenuItemOn), the `label`, then trailing muted words pushed to
+  // the end (`about`, a line about it that truncates first; `keys`, its shortcut). Its highlight is a pill fading in on
+  // the hover spring; the pointer and the arrow keys move it together, so its owner keeps `Lit` on the highlighted item
+  // (HoverSteered; harness_native_ui_view::menu::Nav). `Action` names what a press does.
+  prefab MenuItem : ui.Row {
+    Pressable
+    HoverSteered
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    Fill: $tone_clear
+    Shape: {radius: $menu_item_radius, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_menu_hot.dark, light: $tone_menu_hot.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_menu_press.dark, light: $tone_menu_press.light}
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_item_h, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_item_pad_r, t: 0, b: 0}
+    mark : ui.Check {
+      Fill: $tone_clear
+      Size: {w: {kind: Fixed, value: $menu_check, min: 0, max: 0}, h: {kind: Fixed, value: $menu_check, min: 0, max: 0}}
+      Padding: {l: 0, r: 0, t: 0, b: 0}
+    }
+    gutter : ui.Node {
+      Size: {w: {kind: Fixed, value: $menu_gutter_gap, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    label : ui.Line, Strong {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+    gap : ui.Spacer {
+      Size: {w: {kind: Grow, value: 1, min: $menu_trail_gap, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    about : ui.Lead, Muted {
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+    keys : ui.Line, Muted {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
+  }
+  // The item that is chosen now: its check shown.
+  prefab MenuItemOn : ui.MenuItem {
+    mark : ui.Check { Fill: $tone_ink_1 }
+  }
+  // A section's head: small, muted, in line with the items' labels.
+  prefab MenuHead : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_head_h, min: 0, max: 0}}
+    Padding: {l: $menu_label_x, r: $menu_item_pad_r, t: 0, b: 0}
+    label : ui.Line, Muted {
+      TextStyle: {size: $size_menu_head, line: $line_menu, role: 0, bold: 1}
+    }
+  }
+  // A hairline between sections.
+  prefab MenuSep : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $menu_gutter_l, r: $menu_gutter_l, t: $menu_sep_pad, b: $menu_sep_pad}
+    line : ui.Node {
+      Fill: $tone_menu_rule
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+  }
+  // Why nothing can be chosen here: one short muted line in place of items, in line with their labels.
+  prefab MenuNote : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $menu_item_h, min: 0, max: 0}}
+    Padding: {l: $menu_label_x, r: $menu_item_pad_r, t: 0, b: 0}
+    label : ui.Line, Muted {
+      TextStyle: {size: $size_menu, line: $line_menu, role: 0, bold: 0}
+    }
   }
 }
 

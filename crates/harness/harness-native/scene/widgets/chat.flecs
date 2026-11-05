@@ -55,8 +55,7 @@ hn {
         state : ui.Line, Faint {
           TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
         }
-        // The picker's menu while it is open (hn.ChatPickMenu): out of the row's flow, its plate placed above what opened
-        // it.
+        // The picker's menu while it is open (a ui.Menu): out of the row's flow, its plate placed above what opened it.
         menu : ui.Node {
           Overlay
         }
@@ -104,79 +103,9 @@ hn {
     name { Fill: $tone_term_ink }
     word { Fill: $tone_term_muted }
   }
-  // Its menu, den's: above what opened it, a head over each part when it shows both (the chevron's), the current row
-  // ticked, a model's line about it muted after its name. An agent that listed no models, or a model with no efforts,
-  // shows one row saying so (hn.ChatPickFixed), never a choice it cannot make.
-  // (genui's menu plate's look, hn.GenMenuPlate, which loads after this file.)
-  prefab ChatPickMenu : ui.Column {
-    Placed
-    Hoverable
-    Layer: {level: Overlay}
-    Side: {edge: Top, dx: 0, dy: $gen_float_gap}
-    Fill: $tone_gen_float
-    Edge: {dark: $tone_gen_float_edge.dark, light: $tone_gen_float_edge.light}
-    Shape: {radius: $chat_pick_menu_radius, n: 4, border: 1, feather: 0}
-    Lift: {blur: 22, alpha: 0.32, dy: 6}
-    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: $chat_pick_menu_min, max: $chat_pick_menu_max}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 4, r: 4, t: 4, b: 4}
-  }
-  prefab ChatPickSep : ui.Column {
-    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 6, r: 6, t: 4, b: 4}
-    line : ui.Node {
-      Fill: $tone_gen_rule
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-    }
-  }
-  prefab ChatPickHead : ui.Row {
-    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_head_h, min: 0, max: 0}}
-    Padding: {l: 10, r: 10, t: 0, b: 0}
-    label : ui.Line {
-      Fill: $tone_term_muted
-      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 1}
-    }
-  }
-  prefab ChatPickRow : ui.Row {
-    Pressable
-    Action: {name: ""}
-    Fill: $tone_clear
-    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
-    Cursor: {shape: Arrow}
-    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_row_h, min: 0, max: 0}}
-    Padding: {l: 8, r: 10, t: 0, b: 0}
-    mark : ui.Symbol {
-      Icon: {glyph: ""}
-      Fill: $tone_clear
-      Size: {w: {kind: Fixed, value: 12, min: 0, max: 0}, h: {kind: Fixed, value: 12, min: 0, max: 0}}
-    }
-    label : ui.Line {
-      Fill: $tone_term_ink
-      TextStyle: {size: $size_gen_control, line: 18, role: 0, bold: 0}
-    }
-    about : ui.Lead {
-      Fill: $tone_term_muted
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
-    }
-  }
-  prefab ChatPickRowOn : hn.ChatPickRow {
-    mark : ui.Symbol { Fill: $tone_term_ink }
-  }
-  prefab ChatPickFixed : ui.Row {
-    Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 10, r: 10, t: 7, b: 7}
-    label : ui.Words {
-      Fill: $tone_term_muted
-      TextStyle: {size: $size_gen_small, line: 16, role: 0, bold: 0}
-    }
-  }
+  // Its menu is a ui.Menu (prims.flecs) above what opened it: a head over each part when it shows both (the chevron's),
+  // the current row ticked, a model's line about it muted at the end; where nothing can be chosen, a ui.MenuNote says
+  // why.
   // The context meter (den's): a ring filling as the conversation fills its model's window, and the percentage; muted,
   // then hn.ChatContextTone's warn from 80% and full from 95% (pick.rs). Its tooltip says the tokens.
   prefab ChatContext : ui.Row {

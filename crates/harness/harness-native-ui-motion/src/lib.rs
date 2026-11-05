@@ -45,6 +45,17 @@ fn reveal_of(t: Transition, l: Laid, leaving: bool) -> Reveal {
             FromEdge::Leading => (-l.w, 0.0, 1.0),
             FromEdge::Trailing => (l.w, 0.0, 1.0),
         },
+        // Scaled about its middle, then moved so the `from` edge stays where it rests at every step.
+        TransitionKind::Grow => {
+            let s = t.scale.clamp(0.01, 1.0);
+            let (hw, hh) = (l.w * (1.0 - s) / 2.0, l.h * (1.0 - s) / 2.0);
+            match t.from {
+                FromEdge::Top => (0.0, -hh, s),
+                FromEdge::Bottom => (0.0, hh, s),
+                FromEdge::Leading => (-hw, 0.0, s),
+                FromEdge::Trailing => (hw, 0.0, s),
+            }
+        }
     };
     Reveal { alpha0, dx, dy, scale0 }
 }
