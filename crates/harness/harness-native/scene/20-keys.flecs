@@ -8,8 +8,9 @@
 //   key: a character as typed without modifiers ("n", "[", "=") or a named key (left right up down return enter tab
 //   space backspace delete escape home end pageup pagedown f1..f12). Modifiers are 0 or 1 and must match exactly.
 //   No When: the binding holds everywhere (below every context). With When it holds only while that context is active;
-//   the innermost active context wins (ctx.Palette, ctx.Archive, then ctx.Tree over ctx.Terminal), then later bindings
-//   over earlier ones. A key no binding takes goes to the terminal (or the palette's or the Archive's search).
+//   the innermost active context wins (ctx.Palette or ctx.Picker, ctx.Archive, then ctx.Tree over ctx.Terminal), then
+//   later bindings over earlier ones. A key no binding takes goes to the terminal (or the palette's or the Archive's
+//   search; the picker drops it).
 // An action: act.<Name>, run by the handler registered under its name, else its base's (`act.SpawnClaude : act.Spawn`).
 //   MenuItem puts it in the menu bar (bar order is first appearance; sep: 1 draws a separator above it); Selector sends an
 //   AppKit action up the responder chain instead of a handler.
@@ -23,6 +24,8 @@ ctx {
   Terminal {}
   Tree {}
   Palette {}
+  // The new-object picker (cmd+N) while it is open.
+  Picker {}
   Archive {}
 }
 
@@ -35,14 +38,19 @@ act {
   Quit { Selector: {sel: "terminate:"}
     MenuItem: {bar: "harness", title: "Quit harness", sep: 1} }
 
+  // The picker (cmd+N): a row for each act.Spawn below, in this order (the one picked last is highlighted when it opens,
+  // native.json `new_kind`). A Spawn added in keys.flecs joins it.
+  Picker { MenuItem: {bar: "File", title: "New…"} }
+  // A new object of `kind` in the selected object's directory (else home); `title` names it in the picker.
   prefab Spawn
-  SpawnShell : act.Spawn { SpawnKind: {kind: "shell"}
-    MenuItem: {bar: "File", title: "New Shell"} }
-  SpawnClaude : act.Spawn { SpawnKind: {kind: "claude"}
+  SpawnClaude : act.Spawn { SpawnKind: {kind: "claude", title: "Claude"}
     MenuItem: {bar: "File", title: "New Claude"} }
-  SpawnCodex : act.Spawn { SpawnKind: {kind: "codex"}
+  SpawnCodex : act.Spawn { SpawnKind: {kind: "codex", title: "Codex"}
     MenuItem: {bar: "File", title: "New Codex"} }
-  SpawnCursor : act.Spawn { SpawnKind: {kind: "cursor"} }
+  SpawnCursor : act.Spawn { SpawnKind: {kind: "cursor", title: "Cursor"}
+    MenuItem: {bar: "File", title: "New Cursor"} }
+  SpawnShell : act.Spawn { SpawnKind: {kind: "shell", title: "Shell"}
+    MenuItem: {bar: "File", title: "New Shell"} }
   Archive { MenuItem: {bar: "File", title: "Archive", sep: 1} }
 
   Copy { Selector: {sel: "copy:"}
@@ -90,6 +98,7 @@ act {
   // Hand the keyboard back to the terminal.
   TreeLeave {}
 
+  // The palette's, and the picker's too (its rows are the palette's entries while it is open; its arrows go round).
   PaletteClose {}
   PaletteUp {}
   PaletteDown {}
@@ -122,7 +131,9 @@ key {
   quit { Keybind: {key: "q", cmd: 1}
     (Does, act.Quit) }
 
-  new_shell { Keybind: {key: "n", cmd: 1}
+  new { Keybind: {key: "n", cmd: 1}
+    (Does, act.Picker) }
+  new_shell { Keybind: {key: "n", cmd: 1, shift: 1}
     (Does, act.SpawnShell) }
   new_claude { Keybind: {key: "t", cmd: 1}
     (Does, act.SpawnClaude) }
@@ -226,6 +237,54 @@ key {
   palette_backspace { Keybind: {key: "backspace"}
     (Does, act.PaletteErase)
     (When, ctx.Palette) }
+
+  // The picker: arrows or Tab move the highlight, Return starts it, a digit (first, so the keycaps show it) or a letter
+  // starts one at once, Escape closes it.
+  picker_escape { Keybind: {key: "escape"}
+    (Does, act.PaletteClose)
+    (When, ctx.Picker) }
+  picker_up { Keybind: {key: "up"}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_down { Keybind: {key: "down"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  picker_tab { Keybind: {key: "tab"}
+    (Does, act.PaletteDown)
+    (When, ctx.Picker) }
+  picker_backtab { Keybind: {key: "tab", shift: 1}
+    (Does, act.PaletteUp)
+    (When, ctx.Picker) }
+  picker_return { Keybind: {key: "return"}
+    (Does, act.PaletteRun)
+    (When, ctx.Picker) }
+  picker_enter { Keybind: {key: "enter"}
+    (Does, act.PaletteRun)
+    (When, ctx.Picker) }
+  picker_1 { Keybind: {key: "1"}
+    (Does, act.SpawnClaude)
+    (When, ctx.Picker) }
+  picker_2 { Keybind: {key: "2"}
+    (Does, act.SpawnCodex)
+    (When, ctx.Picker) }
+  picker_3 { Keybind: {key: "3"}
+    (Does, act.SpawnCursor)
+    (When, ctx.Picker) }
+  picker_4 { Keybind: {key: "4"}
+    (Does, act.SpawnShell)
+    (When, ctx.Picker) }
+  picker_claude { Keybind: {key: "c"}
+    (Does, act.SpawnClaude)
+    (When, ctx.Picker) }
+  picker_codex { Keybind: {key: "x"}
+    (Does, act.SpawnCodex)
+    (When, ctx.Picker) }
+  picker_cursor { Keybind: {key: "u"}
+    (Does, act.SpawnCursor)
+    (When, ctx.Picker) }
+  picker_shell { Keybind: {key: "s"}
+    (Does, act.SpawnShell)
+    (When, ctx.Picker) }
 
   archive_escape { Keybind: {key: "escape"}
     (Does, act.SearchClear)

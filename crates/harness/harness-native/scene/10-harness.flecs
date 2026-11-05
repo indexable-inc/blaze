@@ -11,5 +11,6 @@ include widgets/rows
 include widgets/panes
 include widgets/archive
 include widgets/palette
+include widgets/picker
 include widgets/theme
 include widgets/stats

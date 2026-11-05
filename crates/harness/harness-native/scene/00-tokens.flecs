@@ -101,6 +101,36 @@ export const arch_time_w = 84
 // A finished run with no session leaves the live tree this long after it ended (seconds).
 export const archive_after_s = 600
 
+// Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
+// (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs). They come in on a spring (the scrim fades in, the card
+// grows from overlay_scale) and go out the same way, never in a step.
+export const overlay_omega = 30
+export const overlay_zeta = 0.92
+export const overlay_scale = 0.96
+export const overlay_radius = 12
+export const overlay_pad = 6
+export const overlay_lift_blur = 24
+export const overlay_lift_alpha = 0.5
+export const overlay_lift_dy = 8
+// The palette: a wide card near the window's top, its query line, its entries.
+export const palette_w = 560
+export const palette_top = 96
+export const palette_query_h = 38
+export const palette_row_h = 32
+// The picker: a narrow card a little above the window's middle (picker_rise lifts it), a quiet label over one row a
+// kind (its mark in a picker_mark box, its name, its shortcut, the key that picks it in a keycap).
+export const picker_w = 300
+export const picker_rise = 80
+export const picker_head_h = 24
+export const picker_row_h = 34
+export const picker_mark = 18
+export const keycap_min = 18
+export const keycap_h = 18
+export const keycap_pad = 5
+export const keycap_radius = 4
+export const size_keycap = 11
+export const line_keycap = 13
+
 export const radius_control = 6
 export const radius_card = 12
 

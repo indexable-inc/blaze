@@ -885,8 +885,10 @@ impl App {
     pub fn commit_text(&mut self, text: &str) {
         self.set_marked(None);
         if let Some(p) = self.palette.as_mut() {
-            p.query.push_str(text);
-            p.at = 0;
+            if p.mode == super::Mode::Commands {
+                p.query.push_str(text);
+                p.at = 0;
+            }
             return;
         }
         if self.archive_text(text) {
@@ -946,7 +948,7 @@ impl App {
 
     pub fn paste(&mut self, text: &str) {
         if self.palette.is_some() {
-            if let Some(p) = self.palette.as_mut() {
+            if let Some(p) = self.palette.as_mut().filter(|p| p.mode == super::Mode::Commands) {
                 p.query.push_str(text.lines().next().unwrap_or(""));
             }
             self.poke();

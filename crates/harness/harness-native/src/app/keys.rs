@@ -34,13 +34,27 @@ const HANDLERS: &[(&str, Handler)] = &[
             .try_cloned::<&keys::SpawnKind>()
             .map(|k| k.kind.as_str().to_owned())
             .unwrap_or_else(|| "shell".into());
+        a.spawning(&kind);
         a.spawn(&kind);
+    }),
+    // cmd+N: the new-object picker, or closed again.
+    ("Picker", |a, _, _| {
+        if a.picking() {
+            a.palette = None;
+        } else {
+            a.open_picker();
+        }
     }),
     ("Archive", |a, _, _| a.kill()),
     ("SelectAll", |a, _, _| a.select_all()),
     ("ToggleSidebar", |a, _, _| a.toggle_sidebar()),
+    // cmd+K: the palette, or closed again (over the picker, the palette takes its place).
     ("Palette", |a, _, _| {
-        a.palette = if a.palette.is_some() { None } else { Some(Palette::new()) }
+        a.palette = if a.palette.as_ref().is_some_and(|p| p.mode == Mode::Commands) {
+            None
+        } else {
+            Some(Palette::new())
+        }
     }),
     ("Zoom", |a, act, _| {
         let step =
@@ -67,22 +81,12 @@ const HANDLERS: &[(&str, Handler)] = &[
     ("TreeUnfold", |a, _, c| a.tree_unfold(c.is_some_and(|c| c.opt))),
     ("TreeLeave", |a, _, _| a.tree_focus = false),
     ("PaletteClose", |a, _, _| a.palette = None),
-    ("PaletteUp", |a, _, _| {
-        if let Some(p) = a.palette.as_mut() {
-            p.at = p.at.saturating_sub(1);
-        }
-    }),
-    ("PaletteDown", |a, _, _| {
-        let n = a.entries().len();
-        if let Some(p) = a.palette.as_mut() {
-            p.at = (p.at + 1).min(n.saturating_sub(1));
-        }
-    }),
+    ("PaletteUp", |a, _, _| a.palette_step(-1)),
+    ("PaletteDown", |a, _, _| a.palette_step(1)),
     ("PaletteRun", |a, _, _| {
         let at = a.palette.as_ref().map_or(0, |p| p.at);
         if let Some((.., d)) = a.entries().into_iter().nth(at) {
-            a.palette = None;
-            a.run(d);
+            a.choose(d);
         }
     }),
     ("PaletteErase", |a, _, _| {
@@ -207,12 +211,14 @@ impl App {
         }
     }
 
-    /// The contexts a key is matched in, innermost first: the palette while it is open, else the Archive while it has the
-    /// keyboard, else the tree (while it has it) over the terminal.
+    /// The contexts a key is matched in, innermost first: the palette or the picker while it is open, else the Archive
+    /// while it has the keyboard, else the tree (while it has it) over the terminal.
     fn active_contexts(&self) -> Vec<u64> {
         let w = self.world.world_ref();
         let id = |p: &str| w.try_lookup(p).map(|e| *e.id());
-        let names: &[&str] = if self.palette.is_some() {
+        let names: &[&str] = if self.picking() {
+            &[keys::PICKER]
+        } else if self.palette.is_some() {
             &[keys::PALETTE]
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
