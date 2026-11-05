@@ -246,10 +246,13 @@ fn lay_out(
     drop(out);
     seal(&mark_path).map_err(|e| format!("making {} read-only: {e}", mark_path.display()))?;
     unpack::sync_dir(part).map_err(|e| format!("syncing {}: {e}", part.display()))?;
-    // Sealed before it moves: a rename within one directory asks nothing of the one renamed.
-    unpack::seal_dir(part).map_err(|e| format!("making {} read-only: {e}", part.display()))?;
+    // Sealed after it moves: macOS refuses to rename a read-only directory even within one
+    // parent (EACCES on macOS 15.8 APFS, the CI runners'), which Linux allows. Its mark is
+    // sealed and synced already, so what a crash between the two leaves is a whole layout
+    // that is still writable.
     fs::rename(part, dir)
         .map_err(|e| format!("moving {} to {}: {e}", part.display(), dir.display()))?;
+    unpack::seal_dir(dir).map_err(|e| format!("making {} read-only: {e}", dir.display()))?;
     unpack::sync_dir(native).map_err(|e| format!("syncing {}: {e}", native.display()))
 }
 
