@@ -1053,7 +1053,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
     }
 
     /// Whether a task with memory was held back for it as the plane last dispatched.
-    pub fn held_back(&self) -> bool {
+    pub fn held_any_back(&self) -> bool {
         self.graph.held_back()
     }
 
