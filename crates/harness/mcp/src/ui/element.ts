@@ -530,6 +530,14 @@ export class ViewNode {
     this.tree?.touch();
   }
 
+  /** `handler` as the tree runs it: refused, naming the element, while the node is `disabled` (the app sends nothing then; this holds if it does). */
+  private gated(name: string, handler: Handler): Handler {
+    return (value) => {
+      if (this.props.disabled === true) throw new Error(`<${this.type}> is disabled: its ${name} does not run`);
+      return handler(value);
+    };
+  }
+
   /** `type` (`click`) now has `handler`: the prop `onClick` is its handler id, the same one for as long as the node listens. */
   listen(type: string, handler: Handler): void {
     const name = wireName(type);
@@ -537,7 +545,7 @@ export class ViewNode {
     if (!id) this.ids.set(name, id = `h${++handlerSeq}`);
     this.fns.set(name, handler);
     this.props[name] = id;
-    this.tree?.bind(id, handler, name);
+    this.tree?.bind(id, this.gated(name, handler), name);
     this.tree?.touch();
   }
 
@@ -556,7 +564,7 @@ export class ViewNode {
   /** Hangs this node and everything under it in `tree`: its ids answer there from now on. */
   attach(tree: Attachment): void {
     this.tree = tree;
-    for (const [name, id] of this.ids) tree.bind(id, this.fns.get(name)!, name);
+    for (const [name, id] of this.ids) tree.bind(id, this.gated(name, this.fns.get(name)!), name);
     for (const child of this.children) child.attach(tree);
   }
 
