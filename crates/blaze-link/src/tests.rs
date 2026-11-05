@@ -188,10 +188,17 @@ impl Sparse {
         let mut done = 0;
         while done < bytes.len() {
             let addr = at + done as u64;
-            let page = self.pages.entry(addr / PAGE).or_insert_with(|| vec![0; PAGE as usize]);
             let from = (addr % PAGE) as usize;
             let n = (PAGE as usize - from).min(bytes.len() - done);
-            page[from..from + n].copy_from_slice(&bytes[done..done + n]);
+            let chunk = &bytes[done..done + n];
+            // A page it has not got reads as zeros: zeros written there change nothing, and a
+            // gigabyte of zeroed code costs no memory.
+            if !self.pages.contains_key(&(addr / PAGE)) && chunk.iter().all(|it| *it == 0) {
+                done += n;
+                continue;
+            }
+            let page = self.pages.entry(addr / PAGE).or_insert_with(|| vec![0; PAGE as usize]);
+            page[from..from + n].copy_from_slice(chunk);
             done += n;
         }
         self.len = self.len.max(at + bytes.len() as u64);
@@ -2167,6 +2174,8 @@ mod icf;
 mod layout;
 
 mod thunks;
+
+mod eh_frame_reach;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

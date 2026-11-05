@@ -242,8 +242,8 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     let prots: Vec<Prot> = placed.segments.iter().map(|it| it.prot).collect();
     assert_eq!(
         prots,
-        [Prot::ReadOnly, Prot::Code, Prot::ReadOnly, Prot::Data],
-        "read, code, relro, write"
+        [Prot::ReadOnly, Prot::Data, Prot::Code, Prot::Data],
+        "read, relro, code, write"
     );
     assert_eq!(placed.segments[0].addr, BASE, "never slid");
     let mut end = BASE;
@@ -251,7 +251,7 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
         assert!(it.addr % 4096 == 0 && it.addr >= end && it.len <= it.size, "{it:?}");
         end = it.addr + it.size;
     }
-    let (code, code_bytes) = &written[1];
+    let (code, code_bytes) = &written[2];
 
     let (one, two) = (linked.functions[0], linked.functions[1]);
     assert_eq!((one.0, one.2, two.0, two.2), (key(1), 6, key(2), 6));
