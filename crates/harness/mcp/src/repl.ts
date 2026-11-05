@@ -14,7 +14,7 @@ import { req, daemonPresent } from "./daemon.ts";
 import { install as installEffects, fsFor, rawsOf } from "./effects.ts";
 import { shown } from "./shown.ts";
 import { stripCell } from "./ui/compile.ts";
-import { count, installUi, isElement, show } from "./ui/index.ts";
+import { count, installUi, isElement, show, uiError } from "./ui/index.ts";
 
 // This REPL process as the parent of its cells' objects in the harness index (`<repl>.t3`, kind repl).
 export const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
@@ -155,6 +155,9 @@ export class Repl {
       if (t.ui !== undefined) return { ok: true, value, result: `UI shown (${count(t.ui)} elements)${value === undefined ? "" : `\n${typeof value === "string" ? value : nuon(value, { maxRows: 100 })}`}` };
       return { ok: true, value, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }) };
     } catch (e) {
+      // An error that came through the cell's UI is said at the cell's line, without Svelte's frames or the kernel's (ui/index.ts).
+      const ui = uiError(e);
+      if (ui !== undefined) return { ok: false, value: e, result: ui };
       // Drop the harness frames below the cell.
       const stack = e instanceof Error ? (e.stack ?? e.message).split("\n") : [String(e)];
       const cut = stack.findIndex((l) => l.includes("at #run "));

@@ -1,6 +1,8 @@
-import { TEXT_PROP, ViewNode } from './element.ts';
+import { DRAWING, TEXT_PROP, ViewNode, wholeChartError, wireValue } from './element.ts';
 import type { Attachment, Handler } from './element.ts';
-import { AWAITS, rooted, runtime } from './svelte.ts';
+import { drawWire } from './draw.ts';
+import type { Paint } from './draw.ts';
+import { placed, rooted, runtime } from './svelte.ts';
 
 /*
  * A mounted UI: `UiTree` mounts a cell's Svelte component with the custom renderer (svelte.ts) and turns the `ViewNode`s it builds into
@@ -91,7 +93,6 @@ export class UiTree implements Attachment {
     this.mounting = true;
     latest = this;
     let thrown: { error: unknown } | undefined;
-    const awaits = (component as unknown as Record<symbol, unknown>)[AWAITS] === true;
     const onerror = (error: unknown) => {
       if (this.mounting) thrown ??= { error };
       else this.options.fail('render', error);
@@ -100,7 +101,9 @@ export class UiTree implements Attachment {
       this.within(() => {
         const anchor = renderer.createComment('');
         renderer.insert(this.container, anchor, null);
-        const mounted = awaits ? rooted(component, props, onerror, () => undefined) : { component, props };
+        // Always inside a boundary: what a later update throws is reported (`fail`) and shown in place, never thrown into Svelte's
+        // scheduler, where nothing would catch it.
+        const mounted = rooted(component, props, onerror, () => undefined);
         this.instance = api.mount(mounted.component, { renderer, target: this.container, anchor, props: mounted.props });
       });
       if (thrown) throw thrown.error;
@@ -199,9 +202,10 @@ export class UiTree implements Attachment {
 
   /**
    * The children of `parent` as drawn nodes: runs of text are one string, and a string among elements is a `Text` (trimmed: the
-   * spaces Svelte's templates leave around it are layout noise). The anchors Svelte keeps (comments) are not drawn.
+   * spaces Svelte's templates leave around it are layout noise). The anchors Svelte keeps (comments) are not drawn. `paint` is what a
+   * drawing passes down to what it holds, and says the children are in one.
    */
-  private children(parent: ViewNode): UiNode[] {
+  private children(parent: ViewNode, paint?: Paint): UiNode[] {
     const parts: Array<string | UiNode> = [];
     let run: string | undefined;
     for (const child of parent.children) {
@@ -209,18 +213,18 @@ export class UiTree implements Attachment {
       if (!child.isElement) continue;
       if (run !== undefined) parts.push(run);
       run = undefined;
-      parts.push(this.node(child));
+      parts.push(this.node(child, paint));
     }
     if (run !== undefined) parts.push(run);
     const among = parts.some(part => typeof part !== 'string');
     return parts.flatMap((part): UiNode[] => {
       if (typeof part !== 'string') return [part];
       const text = among ? part.trim() : part;
-      return text ? [{ type: 'Text', props: { text }, children: [] }] : [];
+      return text ? [{ type: 'Text', props: paint ? drawWire('Text', undefined, { text }, paint).props : { text }, children: [] }] : [];
     });
   }
 
-  private node(node: ViewNode): UiNode {
+  private node(node: ViewNode, paint?: Paint): UiNode {
     const props: Record<string, unknown> = {};
     for (const [name, value] of Object.entries(node.props)) {
       if (node.ids.has(name)) props[name] = value;
@@ -239,11 +243,21 @@ export class UiTree implements Attachment {
     const into = TEXT_PROP[node.type];
     // (Svelte leaves empty text nodes it fills in later; an element with only those has no children.)
     const kids = node.children.filter(child => child.kind === 'element' || (child.kind === 'text' && child.text !== ''));
-    if (into && props[into] === undefined && kids.length > 0 && kids.every(child => child.isText)) {
-      props[into] = kids.map(child => child.text).join('');
-      return { type: node.type, props, children: [] };
+    const leaf = into !== undefined && props[into] === undefined && kids.length > 0 && kids.every(child => child.isText);
+    if (leaf) props[into] = kids.map(child => child.text).join('');
+    if (node.type === 'Chart') {
+      const error = wholeChartError(props, node.at);
+      if (error) throw placed(error, node.at);
     }
-    return { type: node.type, props, children: this.children(node) };
+    // A drawing and what it holds go as the app reads them (draw.ts), the paint a group says passed on to its shapes.
+    if (node.type === 'Canvas' || DRAWING.has(node.type) || (node.type === 'Text' && paint)) {
+      let drawn: ReturnType<typeof drawWire>;
+      try { drawn = drawWire(node.type, node.from, props, paint ?? {}, node.at); }
+      catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+      return { type: node.type, props: drawn.props, children: leaf ? [] : this.children(node, drawn.paint) };
+    }
+    for (const [name, value] of Object.entries(props)) props[name] = wireValue(node.type, name, value);
+    return { type: node.type, props, children: leaf ? [] : this.children(node) };
   }
 }
 

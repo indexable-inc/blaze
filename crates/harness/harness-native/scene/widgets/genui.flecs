@@ -31,6 +31,15 @@ hn {
     accent { Fill: $tone_accent }
     success { Fill: $tone_running }
     warning { Fill: $tone_lost }
+    faint { Fill: $tone_term_faint }
+    series1 { Fill: $tone_series1 }
+    series2 { Fill: $tone_series2 }
+    series3 { Fill: $tone_series3 }
+    series4 { Fill: $tone_series4 }
+    series5 { Fill: $tone_series5 }
+    series6 { Fill: $tone_series6 }
+    series7 { Fill: $tone_series7 }
+    series8 { Fill: $tone_series8 }
   }
 
   // Children down a column or along a row, $gen_gap apart (`gap`, `pad` in points override). Across a column a child
@@ -111,6 +120,130 @@ hn {
   // A hairline across, and room that grows (or `size` points of it).
   prefab GenDivider : ui.Divider {}
   prefab GenSpacer : ui.Spacer {}
+
+  // A drawing (Canvas, or SVG markup): its box, and each shape (genui/canvas.rs) laid over all of it, its path data in
+  // the canvas's user units through its view box. A shape behind the rest (a chart's gridlines) is a GenShapeBack.
+  prefab GenCanvas : ui.Node {
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 160, min: 0, max: 0}}
+  }
+  prefab GenShape : ui.Node {
+    Overlay
+    Vector: {d: ""}
+  }
+  prefab GenShapeBack : ui.Node {
+    Background
+    Vector: {d: ""}
+  }
+
+  // A chart (genui/chart.rs): its plot, then a legend when it has more than one series. The plot is its axis's ticks
+  // beside its area (bars, or shapes over it) over a row of labels; the area is inset half a tick's line top and foot so
+  // each gridline runs through its tick.
+  prefab GenChart : ui.Column {
+    Flex: {axis: Column, gap: 8, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenChartPlot : ui.Row {
+    Flex: {axis: Row, gap: 6, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 178, min: 0, max: 0}}
+    axis : ui.Column {
+      Flex: {axis: Column, gap: 0, align: End, justify: SpaceBetween, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+    body : ui.Column {
+      Flex: {axis: Column, gap: 4, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      area : ui.Row {
+        Flex: {axis: Row, gap: 2, align: End, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+        Padding: {l: 0, r: 0, t: 7, b: 7}
+      }
+      labels : ui.Row {
+        Flex: {axis: Row, gap: 2, align: Center, justify: Start, wrap: false}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
+      }
+    }
+  }
+  prefab GenChartTick : ui.Line {
+    Fill: $tone_term_muted
+    TextStyle: {size: $size_caption, line: 14, role: 10, bold: 0}
+  }
+  // A bar: a share of its cell's height, round at its corners, its value on hover.
+  prefab GenChartBar : ui.Node {
+    Hoverable
+    Fill: $tone_accent
+    Shape: {radius: 2, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0, min: 0, max: 0}}
+  }
+  // Each series' bar side by side at one x, or stacked (the first on the baseline, 1 point apart).
+  prefab GenChartGroup : ui.Row {
+    Hoverable
+    Flex: {axis: Row, gap: 1, align: End, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 1, min: 0, max: 0}}
+  }
+  prefab GenChartStack : ui.Column {
+    Hoverable
+    Flex: {axis: Column, gap: 1, align: Stretch, justify: End, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0, min: 0, max: 0}}
+  }
+  // Over a line: the whole height at one x, its values on hover.
+  prefab GenChartHit : ui.Node {
+    Hoverable
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+  }
+  prefab GenChartLabel : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    text : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  // A legend: a swatch in the series' ink, its name in the ink, its value quiet.
+  prefab GenChartLegend : ui.Row {
+    Flex: {axis: Row, gap: 14, align: Center, justify: Start, wrap: true}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenChartKey : ui.Row {
+    Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    swatch : ui.Node {
+      Fill: $tone_accent
+      Shape: {radius: 2, n: 4, border: 0, feather: 0}
+      Size: {w: {kind: Fixed, value: 9, min: 0, max: 0}, h: {kind: Fixed, value: 9, min: 0, max: 0}}
+    }
+    label : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_caption, line: 16, role: 0, bold: 0}
+    }
+    value : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_caption, line: 16, role: 10, bold: 0}
+    }
+  }
+  // A pie or a donut: the disc (its slices as shapes, a donut's total in its middle), its legend beside, a key a row.
+  prefab GenChartPie : ui.Row {
+    Flex: {axis: Row, gap: 20, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    disc : ui.Node {
+      Size: {w: {kind: Fixed, value: 140, min: 0, max: 0}, h: {kind: Fixed, value: 140, min: 0, max: 0}}
+    }
+    legend : ui.Column {
+      Flex: {axis: Column, gap: 5, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    }
+  }
+  prefab GenChartCenter : ui.Column {
+    Overlay
+    Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+    value : ui.Line {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_gen_stat, line: $line_gen_stat, role: 10, bold: 1}
+    }
+    caption : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
 
   // What the app does not draw: its name in the failed tone, never a guess at what was meant.
   prefab GenUnknown : ui.Words {

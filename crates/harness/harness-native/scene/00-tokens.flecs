@@ -336,6 +336,21 @@ export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0
 // a Stat's value, set large.
 export const gen_gap = 8
 export const size_gen_stat = 22
+// A chart's series inks (genui chart.rs, `hn.GenTone.series1` on), the dataviz skill's validated categorical palette in its
+// fixed order (blue orange aqua yellow magenta green violet red; never cycled, a ninth folds into "other"). They sit on
+// the terminal's ground, dark in both appearances (tone_term_ground), so both take the dark steps; checked with
+// validate_palette.js against #121214: worst adjacent CVD dE 8.4, normal-vision dE 19.3, all >= 3:1. The light steps,
+// for a ground a theme makes light: #2a78d6 #eb6834 #1baf7a #eda100 #e87ba4 #008300 #6250d6 #e34948.
+export const tone_series1: Fill = {dark: {0.224, 0.529, 0.898, 1}, light: {0.224, 0.529, 0.898, 1}}
+export const tone_series2: Fill = {dark: {0.851, 0.349, 0.149, 1}, light: {0.851, 0.349, 0.149, 1}}
+export const tone_series3: Fill = {dark: {0.098, 0.620, 0.439, 1}, light: {0.098, 0.620, 0.439, 1}}
+export const tone_series4: Fill = {dark: {0.788, 0.522, 0.000, 1}, light: {0.788, 0.522, 0.000, 1}}
+export const tone_series5: Fill = {dark: {0.835, 0.318, 0.506, 1}, light: {0.835, 0.318, 0.506, 1}}
+export const tone_series6: Fill = {dark: {0.000, 0.514, 0.000, 1}, light: {0.000, 0.514, 0.000, 1}}
+export const tone_series7: Fill = {dark: {0.565, 0.522, 0.914, 1}, light: {0.565, 0.522, 0.914, 1}}
+export const tone_series8: Fill = {dark: {0.902, 0.404, 0.404, 1}, light: {0.902, 0.404, 0.404, 1}}
+// The quietest ink on the terminal's ground: a chart's gridlines, a canvas's `faint`.
+export const tone_term_faint: Fill = {dark: {1, 1, 1, 0.13}, light: {1, 1, 1, 0.13}}
 export const line_gen_stat = 28
 
 // Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):

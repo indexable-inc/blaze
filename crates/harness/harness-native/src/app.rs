@@ -2205,6 +2205,10 @@ mod tests {
             "hn.ChatUi", "hn.GenTone.ink",
             "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",
             "hn.GenBadge", "hn.GenStat", "hn.GenCard", "hn.GenDivider", "hn.GenSpacer", "hn.GenUnknown",
+            "hn.GenCanvas", "hn.GenShape", "hn.GenShapeBack", "hn.GenChart", "hn.GenChartPlot", "hn.GenChartTick",
+            "hn.GenChartBar", "hn.GenChartGroup", "hn.GenChartStack", "hn.GenChartHit", "hn.GenChartLabel",
+            "hn.GenChartLegend", "hn.GenChartKey", "hn.GenChartPie", "hn.GenChartCenter", "hn.GenTone.faint",
+            "hn.GenTone.series1", "hn.GenTone.series8",
         ]
         .into_iter()
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())

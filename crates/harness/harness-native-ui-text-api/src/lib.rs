@@ -151,8 +151,9 @@ pub enum VectorFit {
 /// A shape drawn from SVG path data (`d`: M L H V C S Q T A Z, absolute and relative) in its own user units, filled in
 /// the node's `Fill` and stroked in its `Stroke` (look api) `stroke_w` wide. The user units go through the transform
 /// `ma .. mf` (SVG's `matrix(a b c d e f)`; all four of `ma .. md` at 0 is no transform), then the view box `view_*` is fitted into
-/// the node's box less `inset_*` (points) as `fit` says. `stroke_fixed` keeps the stroke `stroke_w` points wide whatever
-/// the scale (a chart's lines); else it scales with the drawing, as SVG's does. Drawn by the host's path pass: fills
+/// the node's box less `inset_*` (points) as `fit` says. `stroke_fixed` keeps the stroke `stroke_w` points wide and a
+/// `VectorText` `size` points tall whatever the scale (a chart's lines and labels); else both scale with the drawing, as
+/// SVG's do. Drawn by the host's path pass: fills
 /// with their winding (`even_odd` for the even-odd rule) and an edge one device pixel soft, strokes round at their ends
 /// and joins, both cut to the clip the node sits in.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
