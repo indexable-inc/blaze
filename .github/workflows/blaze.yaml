@@ -1,17 +1,17 @@
 # blaze: the merge gate. What a pull request and each entry of the merge queue has to pass,
 # kept to a few minutes so that the queue moves: one build of blaze and the unit tests on Linux
-# x86-64, and the checks of the harness scripts. Everything else, every harness on every
+# AArch64, a build for Linux x86-64 cross-compiled there, and the checks of the harness scripts. Everything else, every harness on every
 # platform, runs after the merge, in the release train (train.yaml), which releases main when
 # it is green and opens an issue when it is not. What runs where, and how long it takes, is in
 # docs/harness.md ("CI").
 #
-#   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux x86-64,
-#       `blaze check --workspace` with the release on Linux x86-64 and macOS,
+#   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux AArch64,
+#       `blaze check --workspace` with the release on Linux AArch64,
 #       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
 #       Linux AArch64,
 #       `harness/imports.py` and `harness/rustcsites.py`, actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
 #       formats main after each push instead.
-#   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
+#   push to main: the build and the unit tests on Linux AArch64 and macOS, which
 #       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a
 #       newer one replaces it, so each run ends and writes the caches as of its commit.
 #
@@ -28,18 +28,18 @@
 # is the check branch rules and the merge queue require. The queue tests each pull request
 # merged onto main and whatever is ahead of it, and main moves only to what it tested.
 #
-# ix runners (https://ix.dev/docs/runners): with the repository variable BLAZE_IX_RUNNERS set to
-# `true`, the gate's build and unit tests run on Linux AArch64 on a 64-vCPU ix runner, whose
-# memory grows on demand up to 256 GiB, in place of Linux x86-64 on a hosted runner, whose 16 GB
-# a build of blaze outgrows into swap for an hour or more and was shut down in (#1654); main's
-# `linux arm64` build and tests and the lint baselines run there too, and their green runs on
-# main are the snapshots the gate's runs fork, store and checkout included. Linux x86-64's
-# build and tests (main's push, and the gate's when BLAZE_IX_RUNNERS is off) move to a 64-vCPU
-# x86-64 ix runner with the repository variable BLAZE_IX_X64_RUNNERS, a variable of its own
-# because ix serves AArch64 alone today and refuses an `x64` job: until it serves x86-64 they stay
-# on a hosted runner, whose build of blaze OOMs (#1376). Unset, every job runs on GitHub's hosted
-# runners as before: a job whose labels no runner serves waits for one for a day, so each
-# variable goes on only once the ix-runners app serves this repository on that architecture.
+# Runners (docs/harness.md "ix runners"): every Linux job runs on indexable's ix runners
+# (https://ix.dev/docs/runners), on Linux AArch64: the build and unit tests on 64 vCPUs whose
+# memory grows on demand up to 256 GiB, where a hosted runner's 16 GB a build of blaze outgrows
+# into swap for an hour or more and was shut down in (#1654), each forking the snapshot its own
+# job's last green run on main left, store and checkout included; the small jobs on ix's default
+# size. TODO(x86-64): ix has no x86-64 capacity today, so nothing is built or tested on Linux
+# x86-64; `linux-x64-cross` cross-compiles blaze for it and does not run it. One job runs on a Mac,
+# `macos` on main's push: blaze's unit tests on macOS, which run only on macOS, and blaze cannot
+# yet cross-compile for macOS from Linux (no macOS SDK or darwin clang there, and llvm-sys runs
+# the target LLVM's Mach-O llvm-config). A pull request from a fork runs only once a maintainer
+# approves it (fork pull request policy `all_external_contributors`), and a run off main never
+# becomes a snapshot.
 name: blaze
 on:
   push:
@@ -72,7 +72,7 @@ jobs:
   # .github/scripts/gate_changes.py). Anything that cannot be told counts as code.
   changes:
     name: changes
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     outputs:
       tier: ${{ steps.files.outputs.tier }}
@@ -94,7 +94,7 @@ jobs:
 
   scripts:
     name: harness imports, rustc sites
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -103,7 +103,7 @@ jobs:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: '0.13.5'
-          checksum: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
           enable-cache: false
       - run: uv run --frozen ruff check
       - run: uv run --frozen pyright
@@ -131,7 +131,7 @@ jobs:
   # passes are off. What it is told to ignore is in .github/actionlint.yaml.
   workflows:
     name: actionlint
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -151,37 +151,68 @@ jobs:
           tar -xzf "$tgz" -C "$RUNNER_TEMP" actionlint
       - run: '"$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes='
 
-  linux-x64:
-    name: linux x64
+  # TODO(x86-64): no Linux x86-64 test runs anywhere until ix has x86-64 capacity (docs/harness.md
+  # "ix runners"). Until then blaze is cross-compiled for x86_64-unknown-linux-gnu on an AArch64
+  # ix runner, and not run: the target's LLVM `llvm-config` (which llvm-sys's build script runs)
+  # under qemu-user, and Ubuntu's x86-64 cross gcc and glibc for the C and C++ and the start
+  # files blaze's linker asks the C driver for. Not in `ci`'s needs until it has passed once.
+  linux-x64-cross:
+    name: linux x64 (cross-compiled, not run)
     needs: changes
-    # The gate's on Linux AArch64 on ix in its place when BLAZE_IX_RUNNERS is on.
-    if: needs.changes.outputs.tier == 'warm' || (needs.changes.outputs.tier == 'gate' && vars.BLAZE_IX_RUNNERS != 'true')
-    uses: ./.github/workflows/blaze-platform.yaml
-    # For main's push of blaze's store (the cache-writer environment's secrets).
-    secrets: inherit
-    with:
-      platform: linux-x64
-      os: ubuntu-24.04
-      ix-cpu: ${{ vars.BLAZE_IX_X64_RUNNERS == 'true' && '64' || '' }}
-      ix-arch: x64
-      tier: ${{ needs.changes.outputs.tier }}
-      smoke: true
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: [ix, arm64, ix-cpu-64, blaze-linux-x64-cross]
+    timeout-minutes: 150
+    env:
+      # Read by blaze's daemon when it starts (blaze-link's C driver, cc-rs in build scripts), so
+      # set for the whole job. llvm-sys finds libstdc++ by asking plain CXX.
+      CC_x86_64_unknown_linux_gnu: x86_64-linux-gnu-gcc
+      CXX_x86_64_unknown_linux_gnu: x86_64-linux-gnu-g++
+      CXX: x86_64-linux-gnu-g++
+      LLVM_SYS_231_PREFIX: /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
+      # The x86-64 llvm-config's own libraries, for qemu-user.
+      QEMU_LD_PREFIX: /usr/x86_64-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - name: x86-64 cross gcc and glibc, qemu-user
+        uses: ./.github/actions/apt
+        with:
+          packages: gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross qemu-user-static binfmt-support
+      - name: qemu-user runs x86-64 programs
+        run: |
+          sudo systemctl restart systemd-binfmt || sudo update-binfmts --enable qemu-x86_64
+          test -e /proc/sys/fs/binfmt_misc/qemu-x86_64 || { echo "::error::binfmt_misc has no qemu-x86_64 entry: the x86-64 llvm-config cannot run"; exit 1; }
+      - id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: cross-x86_64
+      - name: LLVM for x86_64-unknown-linux-gnu (the pin)
+        run: |
+          sudo mkdir -p /usr/local/lib/blaze-llvm
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir "$LLVM_SYS_231_PREFIX"
+          "$LLVM_SYS_231_PREFIX/bin/llvm-config" --version
+      - run: blaze build --release --locked -p blaze-engine --target x86_64-unknown-linux-gnu
+      - name: an x86-64 ELF, not run
+        run: |
+          for bin in blaze-engine blaze; do
+            f="target/x86_64-unknown-linux-gnu/release/$bin"
+            file "$f" | tee /dev/stderr | grep -q 'ELF 64-bit LSB .*x86-64' || { echo "::error::$f is not an x86-64 ELF"; exit 1; }
+          done
 
-  # On a push to main: their caches, for the train's runs and the next push's (and, on ix, the
-  # snapshots the gate's runs fork). The gate's build and unit tests too when BLAZE_IX_RUNNERS
-  # is on.
+  # The gate's build and unit tests, on ix (blaze-platform.yaml). On a push to main, the caches
+  # for the train's runs and the next push's, and the snapshots the gate's runs fork.
   linux-arm64:
     name: linux arm64
     needs: changes
-    if: needs.changes.outputs.tier == 'warm' || (needs.changes.outputs.tier == 'gate' && vars.BLAZE_IX_RUNNERS == 'true')
+    if: needs.changes.outputs.tier != 'none'
     uses: ./.github/workflows/blaze-platform.yaml
     # For main's push of blaze's store (the cache-writer environment's secrets).
     secrets: inherit
     with:
       platform: linux-arm64
       os: ubuntu-24.04-arm
-      ix-cpu: ${{ vars.BLAZE_IX_RUNNERS == 'true' && '64' || '' }}
       tier: ${{ needs.changes.outputs.tier }}
+      smoke: true
 
   macos:
     name: macos arm64
@@ -195,23 +226,21 @@ jobs:
       os: macos-15
       tier: warm
 
+  # TODO(macos): macOS's check left the gate with the move to ix (one Mac job, `macos`); it comes
+  # back as `--target aarch64-apple-darwin` here once a check no longer runs the target LLVM's
+  # Mach-O llvm-config (docs/harness.md "ix runners").
   # The release .github/blaze-version names loads and checks blaze's whole workspace, as a
   # contributor's `blaze check --workspace` does: 0.20261028.7 could not load it, and no job ran
   # it. Installed and given the pinned LLVM (LLVM_SYS_231_PREFIX, which llvm-sys's build script
   # reads) by .github/actions/blaze, with no Nix, as the build is. Its store's project is its
-  # own and nothing pushes it, so every run checks from cold; the pull needs no secret.
+  # own and nothing pushes it, so the pull needs no secret; a run starts from the store main's
+  # last green run left in its ix snapshot.
   workspace-check:
-    name: blaze check --workspace, ${{ matrix.platform }}
+    name: blaze check --workspace, linux arm64
     needs: changes
     if: needs.changes.outputs.tier != 'none'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 120 || 90 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { platform: linux x64, os: ubuntu-24.04 }
-          - { platform: macos arm64, os: macos-15 }
+    runs-on: [ix, arm64, ix-cpu-64, blaze-workspace-check]
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/blaze
@@ -242,11 +271,9 @@ jobs:
     name: lint baselines
     needs: changes
     if: needs.changes.outputs.tier != 'none'
-    # On a 64-vCPU ix runner when BLAZE_IX_RUNNERS is on (blaze-platform.yaml's `ix-cpu`).
-    runs-on: ${{ vars.BLAZE_IX_RUNNERS == 'true' && fromJSON('["self-hosted", "ix", "arm64", "ix-cpu-64", "blaze-lint-baselines"]') || 'ubuntu-24.04-arm' }}
+    # On a 64-vCPU ix runner, as blaze-platform.yaml's build.
+    runs-on: [ix, arm64, ix-cpu-64, blaze-lint-baselines]
     timeout-minutes: 150
-    env:
-      BLAZE_CI_IX: ${{ vars.BLAZE_IX_RUNNERS == 'true' }}
     steps:
       - uses: actions/checkout@v7
       - id: blaze
@@ -267,9 +294,9 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, linux-x64, linux-arm64, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, linux-arm64, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     steps:
       - env:

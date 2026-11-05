@@ -35,7 +35,7 @@ env:
 jobs:
   fmt:
     name: blaze fmt
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

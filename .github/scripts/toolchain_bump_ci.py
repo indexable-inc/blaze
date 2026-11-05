@@ -42,7 +42,7 @@ TITLE = "Toolchain bump to {date} is blocked"
 TITLED = re.compile(r"^Toolchain bump to (\d{4}-\d{2}-\d{2}) is blocked$")
 # train.yaml's jobs that gather the others, and those that do not block it (train_issue.py).
 GATHERERS = {"train", "train issue", "release"}
-NOT_BLOCKING = ("nix / ", "linux x64 / bench")
+NOT_BLOCKING = ("nix / ", "linux arm64 / bench")
 FAILED = {"failure", "cancelled", "timed_out"}
 # Attempts of the bump's train before red that main does not have blocks it.
 ATTEMPTS = 2

@@ -72,7 +72,7 @@ env:
 jobs:
   release:
     name: which release
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.which.outputs.tag }}
@@ -102,12 +102,15 @@ jobs:
   smoke:
     name: smoke (${{ matrix.os }})
     needs: release
-    runs-on: ${{ matrix.os }}
+    # Linux AArch64 on a cold ix runner (booted from the image, never snapshotted): a clean
+    # machine, as a user's. TODO(x86-64): ubuntu-24.04 (x86-64) again once ix has x86-64
+    # capacity; macOS on a Mac, the release's own binaries (docs/harness.md "ix runners").
+    runs-on: ${{ matrix.os == 'ubuntu-24.04-arm' && fromJSON('["ix", "arm64", "ix-mode-cold"]') || matrix.os }}
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04-arm, macos-15]
     env:
       BLAZE_REPO: ${{ github.repository }}
       TAG: ${{ needs.release.outputs.tag }}
@@ -186,13 +189,16 @@ jobs:
     name: ${{ matrix.app }} ${{ matrix.check }} (${{ matrix.os }})
     needs: release
     if: github.event_name == 'workflow_dispatch' && needs.release.outputs.apps != '[]'
-    runs-on: ${{ matrix.os }}
+    # Linux AArch64 on a cold ix runner (booted from the image, never snapshotted): a clean
+    # machine, as a user's. TODO(x86-64): ubuntu-24.04 (x86-64) again once ix has x86-64
+    # capacity; macOS on a Mac, the release's own binaries (docs/harness.md "ix runners").
+    runs-on: ${{ matrix.os == 'ubuntu-24.04-arm' && fromJSON('["ix", "arm64", "ix-mode-cold"]') || matrix.os }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         app: ${{ fromJSON(needs.release.outputs.apps) }}
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04-arm, macos-15]
         check: [works, speed]
     env:
       BLAZE_REPO: ${{ github.repository }}
@@ -292,7 +298,7 @@ jobs:
     name: main's tests
     needs: release
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 310
     permissions:
       contents: read
@@ -315,7 +321,7 @@ jobs:
     name: train on the tag
     needs: release
     if: github.event_name == 'workflow_dispatch' && inputs.train
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 360
     permissions:
       actions: write
@@ -352,7 +358,7 @@ jobs:
     name: promote or file
     needs: [release, smoke, apps, train, main-tests]
     if: always() && github.event_name == 'workflow_dispatch' && needs.release.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 10
     permissions:
       contents: write
@@ -397,7 +403,7 @@ jobs:
     name: pointers and latest.json
     needs: verdict
     if: always() && needs.verdict.outputs.promoted == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 10
     # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
     # latest.json from the releases as they are when it runs, so the last one to run is right. A

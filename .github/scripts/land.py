@@ -7,8 +7,8 @@
 Run it in the lane's worktree, on its branch, with everything committed and the local gate
 passed. It pushes the branch, opens its pull request (titled "Merge <branch>: <what it does>",
 which with " (#N)" is the merge commit's subject) or takes the one already open, and turns on
-auto-merge: the pull request's run is the merge gate, the build and the unit tests on Linux x86-64
-(about 5 minutes), and once it passes GitHub merges the branch with a merge commit, as `git merge
+auto-merge: the pull request's run is the merge gate, the build and the unit tests on Linux AArch64
+(on ix runners), and once it passes GitHub merges the branch with a merge commit, as `git merge
 --no-ff` would. The branch need not be up to date with main; every harness runs after the merge, in
 the release train (train.yaml). land.py waits until then and exits 0 with the commit main is at, or
 exits 1 and says why the pull request did not merge (a check that failed, a conflict with main).

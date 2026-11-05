@@ -51,7 +51,7 @@ jobs:
   bump:
     name: bump
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.train == '')
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 60
     permissions:
       contents: write
@@ -90,10 +90,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - { platform: linux-x64, os: ubuntu-24.04 }
-          - { platform: linux-arm64, os: ubuntu-24.04-arm }
-          - { platform: macos-arm64, os: macos-15 }
-    runs-on: ${{ matrix.os }}
+          # TODO(x86-64): Linux x86-64's answers need rustc running on x86-64; until ix has x86-64
+          # capacity answers.py --write keeps the ones it last wrote (docs/harness.md "ix runners").
+          - { platform: linux-arm64, runner: [ix, arm64] }
+          - { platform: macos-arm64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -110,7 +111,7 @@ jobs:
   pr:
     name: pull request
     needs: [bump, answers]
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 15
     permissions:
       contents: write
@@ -148,7 +149,7 @@ jobs:
   verdict:
     name: verdict
     if: ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'toolchain/bump' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository) || (github.event_name == 'workflow_dispatch' && inputs.train != ''))
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     # It waits for the train of the main commit the bump is on (toolchain/base), started beside
     # the bump's: about as long as the bump's took.
     timeout-minutes: 150

@@ -25,7 +25,7 @@ TITLE = "Release train is red"
 # The job of train.yaml whose success is the train's: the one that gathers the blocking jobs.
 VERDICT = "train"
 GATHERERS = {VERDICT, "train issue", "release"}
-NOT_BLOCKING = ("nix / ", "linux x64 / bench")
+NOT_BLOCKING = ("nix / ", "linux arm64 / bench")
 FAILED = {"failure", "cancelled", "timed_out"}
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 

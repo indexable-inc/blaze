@@ -229,8 +229,8 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   deterministic simulation test whose oracle checks the invariant, with a planted bug it
   catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
-  you did not run. CI's merge gate is the build and the unit tests on Linux x86-64, and
-  `blaze check --workspace` with the released blaze on Linux x86-64 and macOS, with astlog's
+  you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners), and
+  `blaze check --workspace` with the released blaze on Linux AArch64 and macOS, with astlog's
   rules after it (`tools/astlog/README.md`), and the lint baselines held by the blaze the
   change builds ([cargo.md](cargo.md#lints)); every
   harness on every platform, Windows too, and the slow ones (`norustc.py`, the store,

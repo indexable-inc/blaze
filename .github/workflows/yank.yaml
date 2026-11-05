@@ -22,7 +22,7 @@ permissions:
 jobs:
   yank:
     name: yank ${{ inputs.tag }}
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
@@ -41,7 +41,7 @@ jobs:
     name: pointers and latest.json
     needs: yank
     if: success()
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 10
     # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
     # latest.json from the releases as they are when it runs, so the last one to run is right. A

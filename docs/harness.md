@@ -527,8 +527,8 @@ for each platform, each on a machine of its own kind.
 
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
-| `blaze.yaml` (`gate`) | pull request | on Linux x86-64: blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux x86-64 and macOS, `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from cold: nothing pushes its store); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
-| `blaze.yaml` (`warm`) | push to main | the same on Linux x86-64, AArch64 and macOS, every test, then a push of the store for the runs after it. Its `linux x64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux x86-64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
+| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix), `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from main's last green run's snapshot); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `harness/rustcsites.py`, actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
+| `blaze.yaml` (`warm`) | push to main | the same on Linux AArch64 (ix) and macOS, every test, then a push of the store for the runs after it, and `linux x64 (cross-compiled, not run)`, blaze cross-compiled for x86-64 and not run ([ix runners](#ix-runners); TODO(x86-64): no x86-64 tests). Its `linux arm64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux AArch64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file | 2 min |
@@ -600,29 +600,85 @@ moves in when it is next changed. `harness/imports.py` runs in the workspace's P
 
 ### ix runners
 
-The repository variable `BLAZE_IX_RUNNERS` moves the slow Linux jobs to ix's GitHub Actions
-runners ([ix.dev/docs/runners](https://ix.dev/docs/runners)). Set to `true`, the gate's build and
-unit tests run on Linux AArch64 (`linux arm64 / build`, `linux arm64 / tests`) in place of Linux
-x86-64, and main's `linux arm64` jobs and `lint-baselines` move with them, each on
-`[self-hosted, ix, arm64, ix-cpu-64, blaze-<job>]`: 64 vCPUs, and memory that grows on demand up
-to 256 GiB, where a hosted runner has 4 vCPUs and 16 GB. A cold build of blaze needs about 28 GB
-and on a hosted runner swapped for over an hour; the run of #1654 was shut down in it.
+blaze's CI runs on indexable's own GitHub Actions runners, ix's
+([ix.dev/docs/runners](https://ix.dev/docs/runners)), with no switch to turn it off, and on
+Linux AArch64 alone: ix has no x86-64 capacity today (its runner plane refuses a job for an
+architecture it has no node for, and an `x64` job then waits a day), so every Linux job runs on
+`arm64`, builds there and tests there.
 
-Every ix runner is a fork of the snapshot of the last green job on main with the same labels, its
-disk included: the checkout, `target/`, the toolchain, the pinned LLVM and blaze's store, which
-`.github/actions/blaze` keeps under `$HOME/.cache/blaze-ci/store` there (ix's scrub deletes
-`_work/_temp` before a snapshot) and bounds at 200G. The pull from the remote then fetches only
-what main pushed since. A pull request's fork never becomes a snapshot. No swap is made on ix:
-its scrub refuses to snapshot a machine with swap on.
+**TODO(x86-64): blaze's x86-64 tests are missing.** No job runs blaze's tests on Linux x86-64
+until ix has x86-64 capacity; then `linux x64` comes back to `blaze.yaml`, the train,
+`focused.yaml`, promote.yaml's smoke and apps, install.yaml's installs and toolchain-bump's
+answers. Until then `linux x64 (cross-compiled, not run)` (`blaze.yaml`, every tier, not part of `ci`)
+cross-compiles `blaze` and `blaze-engine` for `x86_64-unknown-linux-gnu` on an ix AArch64
+runner, with Ubuntu's x86-64 cross gcc and glibc for C and the link, and qemu-user to run the
+x86-64 `llvm-config` the pinned LLVM's build script asks; it checks the binaries are x86-64 ELF
+and runs nothing.
 
-ix serves AArch64 alone today (its runner plane refuses an `x64` job), so with the variable on,
-Linux x86-64's build and unit tests run only on main's push (and the train), on hosted runners,
-and `workspace-check` stays on hosted runners on both platforms. A second variable,
-`BLAZE_IX_X64_RUNNERS`, moves `linux x64 / build` and `linux x64 / tests` to
-`[self-hosted, ix, x64, ix-cpu-64, blaze-<job>]` (64 vCPUs, ix's x86-64 cap, and the same 256 GiB
-memory), for once ix serves x86-64. Unset, every job runs on hosted runners: a job whose labels
-no runner serves waits a day for one, so each variable goes on only once the ix-runners GitHub
-App serves this repository on that architecture and its ix account can pay.
+- The gate's build and unit tests (`linux arm64 / build`, `linux arm64 / tests`),
+  `workspace-check` and `lint-baselines` run on `[ix, arm64, ix-cpu-64, blaze-<job>]`: 64
+  vCPUs, and memory that grows on demand up to 256 GiB, where a hosted runner has 4 vCPUs and
+  16 GB. A cold build of blaze needs about 28 GB and on a hosted runner swapped for over an
+  hour; across main's last 150 runs before the move, hosted `linux x64 / build` passed 0 of 54
+  times (median 86.5 min to its failure).
+- Every job of `blaze-platform.yaml` for `linux-arm64` (the train's and `focused.yaml`'s
+  harnesses, smoke, the larger projects, the profile gate, the bench) runs on ix: 64 vCPUs for
+  the build, the unit tests and the projects, 16 for the rest, each with a label of its own.
+- The small jobs (`changes`, `scripts`, `actionlint`, `ci`, the train's verdict and release,
+  canary and release cuts, the profile trend, the bench workflows' matrix jobs, ...) run on
+  `[ix, arm64]`, ix's default size.
+- Clean-machine jobs and jobs holding a long-lived secret run on **cold** runners,
+  `[ix, arm64, ix-mode-cold]`: booted from the base image every time, never snapshotted and
+  never a seed, so nothing an earlier job left is there and nothing they leave reaches a later
+  one. The clean machines: install.yaml's installs and promote.yaml's smoke and apps. The
+  secrets (the bot token, Cloudflare's, crates.io's): fmt, site, the bench and live-latency
+  history commits, promote.yaml's and yank's metadata, release.yaml's notes-free jobs (crates,
+  publish, metadata), pgo's pin and toolchain-bump's branch and pull request.
+
+Every warm ix runner is a fork of the snapshot of the last green job on main with the same
+labels, its disk included: the checkout, `target/`, the toolchain, the pinned LLVM, `/nix/store`
+and blaze's store, which `.github/actions/blaze` keeps under `$HOME/.cache/blaze-ci/store` on a
+self-hosted runner (ix's scrub deletes `_work/_temp` before a snapshot) and bounds at 200G. The
+pull from the remote then fetches only what main pushed since. No swap is made on ix: its scrub
+refuses to snapshot a machine with swap on. The image is Ubuntu 24.04 with build-essential, git,
+gh, jq, python3 and Nix, and lacks some of what a hosted image has: `.github/actions/rustup`
+installs rustup when there is none, `.github/actions/nix` uses the image's Nix in place of
+Determinate's installer, and an `apt-get install` first fetches the package lists the image does
+not ship.
+
+A run off main never becomes a snapshot, and before every snapshot ix's scrub removes what a job
+could leave for the next (processes, the job's credentials, git credentials and logins, `/tmp`),
+since a fork's pull request restores the same snapshots. A pull request from a fork runs only
+once a maintainer approves it: the repository's fork pull request policy is
+`all_external_contributors`, and no workflow uses `pull_request_target`.
+
+What stays on GitHub's hosted runners, and why:
+
+- **One macOS job in the gate path, `macos arm64` in `blaze.yaml`'s `warm` tier**: blaze's
+  Mach-O output, its ad hoc signature, dyld and the macOS std are only exercised by running on
+  macOS, and blaze cannot cross-compile for `aarch64-apple-darwin` from Linux today (below). The
+  gate's `workspace-check` is Linux alone (TODO(macos): a cross `blaze check --target
+  aarch64-apple-darwin` once the SDK is in CI). The other macOS jobs run what users run on a
+  Mac: release.yaml's, llvm.yaml's and pgo.yaml's darwin builds, install.yaml's and
+  promote.yaml's macOS installs and smoke, toolchain-bump's and profile-nightly's macOS entries.
+- **Builds of what users run on Linux**: release.yaml, llvm.yaml's and pgo.yaml's builds and
+  install.yaml's archive (and the no-Rust containers that install it) run on hosted Ubuntu 22.04
+  so that the binaries ask for an old glibc (`build_release.py` refuses one newer than RHEL 9's
+  2.34); the ix image's glibc is 2.39. **TODO(sysroot)**: blaze has no `--sysroot`; it finds crt
+  objects and libc through `$CC_<triple> -print-search-dirs`, and the sysroot archives of
+  [toolchain-c.md](v2/plan/toolchain-c.md) are not built. Once blaze links against an old glibc
+  sysroot, these move to ix.
+- Windows, which ix does not serve.
+- The bench workflows' measurements run on the machines `BENCH_RUNNERS` registers.
+
+How far blaze cross-compiles today: `--target` takes one foreign triple; std is built from
+`library/` for it, Cranelift and LLVM emit for it, and blaze-link writes ELF and Mach-O itself,
+signing Mach-O ad hoc (no `codesign`). What a cross build still borrows from the host: a C cross
+compiler as `CC_<triple>` (crt objects, libc, build scripts' `cc`), read when the daemon starts;
+the pinned LLVM's build script runs the target archive's own `llvm-config` (qemu-user for
+x86-64, impossible for a Mach-O one on Linux); and `build_release.py` builds only for the host.
+For `aarch64-apple-darwin` on Linux it also needs a macOS SDK at `SDKROOT`, a darwin clang as
+`CC_aarch64_apple_darwin` and `otool`, none of which CI has, so no darwin cross job runs.
 
 ### Named harnesses, and the projects downstream
 
@@ -659,7 +715,7 @@ commits (`.github/scripts/downstream.py`, from astral-experiments/blaze#38, #41,
 
 Each runs under `--message-format=json-render-diagnostics` and has to print blaze's `blaze-work`
 message, so a run that built nothing does not pass. It tests a release (`-f blaze=canary`, the
-default, `stable` or a version), or with `-f build-run=<id>` the `blaze-linux-x64` build of a
+default, `stable` or a version), or with `-f build-run=<id>` the `blaze-linux-arm64` build of a
 `focused.yaml` or train run: the way to try a branch on them before it lands. Build scripts and proc macros run in blaze's sandbox, as for any user.
 
 ### The release train

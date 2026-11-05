@@ -98,17 +98,17 @@ async def successful_build(it: Build) -> None:
         response = await api(it.repository, f"actions/runs/{it.build_run}/jobs?per_page=100&page={page}")
         jobs = items(response, "jobs")
         for job in jobs:
-            if field(job, "name") == "linux x64 / build":
-                require(field(job, "head_sha") == it.sha, "Linux x64 build job has another commit")
+            if field(job, "name") == "linux arm64 / build":
+                require(field(job, "head_sha") == it.sha, "Linux arm64 build job has another commit")
                 require(
                     field(job, "status") == "completed" and field(job, "conclusion") == "success",
-                    "Linux x64 build job has not completed successfully",
+                    "Linux arm64 build job has not completed successfully",
                 )
                 found += 1
         if len(jobs) < 100:
             break
         page += 1
-    require(found == 1, f"expected one successful Linux x64 build job, found {found}")
+    require(found == 1, f"expected one successful Linux arm64 build job, found {found}")
 
 
 async def validate(it: Build) -> None:
@@ -149,7 +149,7 @@ async def validate(it: Build) -> None:
     async with asyncio.TaskGroup() as group:
         workflow_task = group.create_task(api(it.repository, f"actions/workflows/{workflow_id}"))
         artifact_task = group.create_task(
-            api(it.repository, f"actions/runs/{it.build_run}/artifacts?name=blaze-linux-x64&per_page=100")
+            api(it.repository, f"actions/runs/{it.build_run}/artifacts?name=blaze-linux-arm64&per_page=100")
         )
         group.create_task(successful_build(it))
     require(
@@ -160,10 +160,10 @@ async def validate(it: Build) -> None:
     matches = items(artifacts, "artifacts")
     require(
         field(artifacts, "total_count") == 1 and len(matches) == 1,
-        "expected exactly one blaze-linux-x64 artifact",
+        "expected exactly one blaze-linux-arm64 artifact",
     )
     artifact = matches[0]
-    require(field(artifact, "name") == "blaze-linux-x64", "selected artifact has another name")
+    require(field(artifact, "name") == "blaze-linux-arm64", "selected artifact has another name")
     require(field(artifact, "expired") is False, "selected build artifact has expired")
     digest = field(artifact, "digest")
     require(

@@ -1,0 +1,16 @@
+# rustup on PATH, with no toolchain. A hosted image has it; the ix runner image has none, and an
+# ix runner's snapshot keeps ~/.cargo and ~/.rustup once a job on main has put them there.
+# rustup-init comes from rustup's own server.
+name: rustup
+description: rustup on PATH (installed when the runner has none)
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        if ! command -v rustup > /dev/null; then
+          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi

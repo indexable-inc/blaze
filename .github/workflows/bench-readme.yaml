@@ -52,7 +52,7 @@ env:
 jobs:
   platforms:
     name: platforms with a registered runner
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64]
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       any: ${{ steps.matrix.outputs.any }}
@@ -140,7 +140,7 @@ jobs:
     name: README, history and regressions
     needs: [platforms, bench]
     if: always() && needs.platforms.outputs.any == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64, ix-mode-cold]
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
