@@ -21,8 +21,14 @@ pub fn run(path: &str) -> Result<(), String> {
     app.set_gpu_clock(renderer.gpu_clock());
     // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset);
     // `prims`: the primitives gallery.
+    // `genui`: one generative-UI cell's tree (HARNESS_NATIVE_GENUI=<tree.json>), drawn as a chat card draws it.
+    let mut genui = None;
     if let Ok(g) = std::env::var("HARNESS_NATIVE_GALLERY") {
-        crate::gallery::load(&app, 32.0, g == "prims")?;
+        if g == "genui" {
+            genui = Some((crate::gallery::load_genui(&app, 32.0)?, crate::gallery::genui_tree()?));
+        } else {
+            crate::gallery::load(&app, 32.0, g == "prims")?;
+        }
     }
     // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
     app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
@@ -100,6 +106,7 @@ pub fn run(path: &str) -> Result<(), String> {
     // HARNESS_NATIVE_SHOT_KEY `k,t`: Command-k at t seconds, into this offscreen app only (`w,2.4`: archive the selected
     // object, which kills its session). With a `+`, the keys as a binding names them: `cmd+shift+t,1.5`, `none+down,2`
     // (`none+` a key with no modifiers: a tree arrow, the palette's Return), dispatched as the window would.
+    // A Command key bound to an Edit selector (cmd+c, cmd+x, cmd+v) runs what the window's responder would (see `press`).
     // HARNESS_NATIVE_SHOT_TYPE `text,t`: `text` typed at t seconds, into this offscreen app only (the palette's query
     // when it is open, the Archive's search when it has the keyboard).
     let mut typed = std::env::var("HARNESS_NATIVE_SHOT_TYPE").ok().and_then(|s| {
@@ -133,6 +140,9 @@ pub fn run(path: &str) -> Result<(), String> {
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
+        if let Some((root, tree)) = &genui {
+            app.fill_genui_gallery(*root, tree);
+        }
         let t = if seq.is_some() { frames as f32 / 60.0 } else { start.elapsed().as_secs_f32() };
         frames += 1;
         // The last hover's shape, resolved by the frame after it moved.
@@ -283,8 +293,22 @@ fn press(app: &mut App, spec: &str) {
             mods: c.mods(),
             action: crate::term::KeyAction::Press,
             composing: false,
-        });
-        crate::app::Outcome::Done
+        })
     };
     eprintln!("harness-native: shot key {spec}: {out:?}");
+    // A selector goes up the responder chain to the view (src/window.rs): this app plays the view's part, with
+    // HARNESS_NATIVE_SHOT_CLIP as the pasteboard (`\n` in it a newline); what a copy or cut would put on it is logged.
+    if let crate::app::Outcome::Selector(sel) = out {
+        let clip = std::env::var("HARNESS_NATIVE_SHOT_CLIP").unwrap_or_default().replace("\\n", "\n");
+        let took = match sel.as_str() {
+            "copy:" => app.copy(),
+            "cut:" => app.cut(),
+            "paste:" => {
+                app.paste(&clip);
+                None
+            }
+            _ => None,
+        };
+        eprintln!("harness-native: shot {sel} pasteboard {took:?}");
+    }
 }

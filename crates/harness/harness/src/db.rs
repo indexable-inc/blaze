@@ -15,7 +15,8 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use parking_lot::{Mutex, MutexGuard};
+use std::sync::OnceLock;
 
 pub fn path() -> PathBuf { paths::home().join("harness.db") }
 pub fn object_dir(id: &str) -> PathBuf { paths::home().join("objects").join(id) }
@@ -58,7 +59,6 @@ fn conn() -> MutexGuard<'static, Connection> {
         Mutex::new(c)
     })
     .lock()
-    .unwrap_or_else(|e| e.into_inner())
 }
 
 fn log<T>(what: &str, r: rusqlite::Result<T>) -> Option<T> { r.map_err(|e| eprintln!("harness.db {what}: {e}")).ok() }
@@ -308,6 +308,7 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
         title: meta["title"].as_str().unwrap_or("").to_owned(),
         mode: meta["mode"].as_str().unwrap_or("tui").to_owned(),
         model: meta["model"].as_str().map(str::to_owned),
+        effort: meta["effort"].as_str().map(str::to_owned),
         ..SessionInfo::default()
     })
 }

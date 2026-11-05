@@ -1,10 +1,9 @@
 //! The sidebar's tree scroll: `hn.Tree` is a `ui.Scroll` driven by AppKit's scroll physics (harness-native-scroll-physics,
-//! den's copy of a default `NSScrollView`'s animator and momentum), a soft fade at an edge with more beyond it, and the
+//! den's copy of a default `NSScrollView`'s animator and momentum; its edge fade is the scroll's `ClipFade`), and the
 //! selected row kept in view (on a spring) whichever way it was selected. Its knob is the ui.Scroll's overlay scroller
 //! (prims.flecs `ui.Scroller`): the UI layer draws and drives it, and a drag or page on it is adopted here as the origin.
 use super::*;
 use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, SurfaceConfig, Vec2};
-use harness_native_ui_draw_api::Painted;
 use harness_native_ui_layout_api::{ScrollExtent, ScrollState, ScrollerPart};
 
 /// A scroll event as AppKit gives it: deltas (points when `precise`, else lines), and its gesture and momentum phases
@@ -18,7 +17,7 @@ pub struct Wheel {
     pub momentum: usize,
 }
 
-/// The tree's scroll: its engine, the origin it last reported, a glide to the selected row, and what it last measured.
+/// The tree's scroll: its engine, the origin it last reported, and a glide to the selected row.
 pub struct TreeScroll {
     engine: Engine,
     clock: std::time::Instant,
@@ -30,8 +29,6 @@ pub struct TreeScroll {
     glide: Option<(Spring, f32)>,
     /// The selected object last kept in view.
     shown_sel: Option<u64>,
-    viewport: f32,
-    content: f32,
 }
 
 impl Default for TreeScroll {
@@ -43,8 +40,6 @@ impl Default for TreeScroll {
             rev: 0,
             glide: None,
             shown_sel: None,
-            viewport: 0.0,
-            content: 0.0,
         }
     }
 }
@@ -88,7 +83,8 @@ impl App {
             self.poke();
             return;
         }
-        if self.table_wheel(&ev, z) || self.chat_wheel(&ev, z) {
+        let (gdx, gdy) = if ev.precise { (ev.dx / z, ev.dy / z) } else { (ev.dx * 12.0, ev.dy * 12.0) };
+        if self.table_wheel(&ev, z) || self.genui_wheel(gdx, gdy) || self.chat_wheel(&ev, z) {
             return;
         }
         if self.archive_wheel(if ev.precise { ev.dy / z } else { ev.dy }, ev.precise) {
@@ -166,8 +162,6 @@ impl App {
             origin = max;
             self.tree.rev += 1;
         }
-        self.tree.viewport = l.h;
-        self.tree.content = content;
         let t = self.tree.clock.elapsed().as_secs_f64();
         self.tree.engine.configure(config(
             l.w,
@@ -187,18 +181,5 @@ impl App {
         if moving {
             self.poke();
         }
-    }
-
-    /// The fades (top, foot; points) for what `p` paints when it is cut to the tree's band: soft at an edge with more of
-    /// the tree beyond it.
-    pub(super) fn tree_fade(&self, p: &Painted) -> Option<[f32; 2]> {
-        let l = self.world.entity_from_id(self.ids.tree).try_cloned::<&Laid>()?;
-        if !p.clipped || (p.clip_y - l.y).abs() > 0.5 || (p.clip_h - l.h).abs() > 0.5 {
-            return None;
-        }
-        let fade = crate::look::width(self.world.world_ref(), "tree_fade");
-        let max = (self.tree.content - self.tree.viewport).max(0.0);
-        let k = |v: f32| (v / fade).clamp(0.0, 1.0) * fade;
-        Some([k(self.tree.y), k(max - self.tree.y)])
     }
 }

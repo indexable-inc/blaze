@@ -652,25 +652,27 @@ impl SyntaxNode {
             return TokenAtOffset::None;
         }
 
-        let mut children = self.children_with_tokens().filter(|child| {
-            let child_range = child.text_range();
-            !child_range.is_empty()
-                && (child_range.start() <= offset && offset <= child_range.end())
-        });
-
-        let left = children.next().unwrap();
-        let right = children.next();
-        assert!(children.next().is_none());
-
-        if let Some(right) = right {
-            match (left.token_at_offset(offset), right.token_at_offset(offset)) {
-                (TokenAtOffset::Single(left), TokenAtOffset::Single(right)) => {
-                    TokenAtOffset::Between(left, right)
+        // The children holding `offset` are the one holding the byte before it and the one
+        // holding the byte after it, found by binary search, not by walking every child: a
+        // file's root has as many children as it has items.
+        let one = TextSize::from(1);
+        let left = (offset > range.start())
+            .then(|| self.child_or_token_at_range(TextRange::new(offset - one, offset)))
+            .flatten();
+        let right = (offset < range.end())
+            .then(|| self.child_or_token_at_range(TextRange::new(offset, offset + one)))
+            .flatten();
+        match (left, right) {
+            (Some(left), Some(right)) if left != right => {
+                match (left.token_at_offset(offset), right.token_at_offset(offset)) {
+                    (TokenAtOffset::Single(left), TokenAtOffset::Single(right)) => {
+                        TokenAtOffset::Between(left, right)
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
-        } else {
-            left.token_at_offset(offset)
+            (Some(it), _) | (None, Some(it)) => it.token_at_offset(offset),
+            (None, None) => unreachable!("a node that is not empty has a child at {offset:?}"),
         }
     }
 

@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -97,6 +98,22 @@ impl ChildKiller for NoAgent {
 /// When this daemon started (ms since the epoch): a session that ended before it is past (`list`'s `past`).
 static STARTED_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+/// Each kernel's UI feed (ui_feed.rs): where the app's `ui_event`s go.
+static FEEDS: std::sync::LazyLock<Mutex<crate::ui_feed::Feeds<FeedSink>>> = std::sync::LazyLock::new(|| Mutex::new(crate::ui_feed::Feeds::default()));
+
+/// A `ui_listen` connection's queue, [`crate::ui_feed::FEED_CAP`] deep.
+struct FeedSink(tokio::sync::mpsc::Sender<crate::ui_feed::UiEv>);
+
+impl crate::ui_feed::Sink for FeedSink {
+    fn offer(&self, ev: crate::ui_feed::UiEv) -> Result<(), crate::ui_feed::Refused> {
+        use tokio::sync::mpsc::error::TrySendError;
+        self.0.try_send(ev).map_err(|e| match e {
+            TrySendError::Full(_) => crate::ui_feed::Refused::Full,
+            TrySendError::Closed(_) => crate::ui_feed::Refused::Closed,
+        })
+    }
+}
+
 impl Session {
     /// A chat session around `chat`, its agent not running yet (a new chat starts it next; a restored one when resumed).
     #[allow(clippy::too_many_arguments)]
@@ -116,11 +133,11 @@ impl Session {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        *self.pid.lock().unwrap()
+        *self.pid.lock()
     }
 
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock();
         w.write_all(bytes)?;
         w.flush()?;
         Ok(())
@@ -130,17 +147,17 @@ impl Session {
         if cols == 0 || rows == 0 {
             return Ok(());
         }
-        let master = self.master.lock().unwrap();
+        let master = self.master.lock();
         let Some(master) = master.as_ref() else { return Ok(()) };
         master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("{e}"))?;
-        self.term.lock().unwrap().resize(cols, rows);
+        self.term.lock().resize(cols, rows);
         Ok(())
     }
 
     /// Escape codes that redraw the current screen on a fresh terminal, plus a receiver for
     /// everything after it. Taken under the emulator lock so nothing is lost or doubled.
     pub fn snapshot_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Ev>) {
-        let mut term = self.term.lock().unwrap();
+        let mut term = self.term.lock();
         let rx = self.tx.subscribe();
         (term.vt_snapshot(), rx)
     }
@@ -149,20 +166,20 @@ impl Session {
         if let Some(c) = &self.chat {
             return c.screen();
         }
-        self.term.lock().unwrap().text()
+        self.term.lock().text()
     }
 
     pub fn size(&self) -> (u16, u16) {
-        self.term.lock().unwrap().size()
+        self.term.lock().size()
     }
 
     pub fn info(&self) -> SessionInfo {
         let (cols, rows) = self.size();
         let title = match &self.chat {
             Some(c) => c.title(),
-            None => self.term.lock().unwrap().title(),
+            None => self.term.lock().title(),
         };
-        let ended = *self.ended.lock().unwrap();
+        let ended = *self.ended.lock();
         SessionInfo {
             id: self.id,
             object: format!("s{}", self.id),
@@ -174,7 +191,7 @@ impl Session {
             argv: self.argv.clone(),
             created_ms: Some(self.created_ms),
             ended_ms: ended.map(|(_, ms)| ms),
-            exit: self.exit.lock().unwrap().map(i64::from),
+            exit: self.exit.lock().map(i64::from),
             status: Some(ended.map_or("running", |(s, _)| s).to_owned()),
             attached: self.attached.load(Ordering::Relaxed) as u64,
             cols: Some(cols),
@@ -182,6 +199,7 @@ impl Session {
             busy: self.busy.load(Ordering::Relaxed),
             mode: if self.chat.is_some() { "chat" } else { "tui" }.to_owned(),
             model: self.chat.as_ref().map(|c| c.model()),
+            effort: self.chat.as_ref().map(|c| c.effort()).filter(|e| !e.is_empty()),
             past: false,
         }
     }
@@ -231,7 +249,7 @@ impl Session {
 
     pub fn kill(&self) {
         self.killed.store(true, Ordering::Relaxed);
-        let _ = self.killer.lock().unwrap().kill();
+        let _ = self.killer.lock().kill();
     }
 }
 
@@ -249,7 +267,7 @@ impl Daemon {
     /// Session `id`: a live one, else a chat from before this daemon started, restored from its log (chat/mod.rs) and kept
     /// from then on as a session whose agent is not running.
     pub fn get(&self, id: u64) -> Result<Arc<Session>> {
-        if let Some(s) = self.sessions.lock().unwrap().get(&id).cloned() {
+        if let Some(s) = self.sessions.lock().get(&id).cloned() {
             return Ok(s);
         }
         let row = db::session(id).ok_or_else(|| anyhow!("no session {id}"))?;
@@ -257,7 +275,7 @@ impl Daemon {
             anyhow::bail!("no session {id}: it ended before this daemon started, and only a chat can be opened again");
         }
         let s = Arc::new(Self::restore_chat(id, &row)?);
-        Ok(self.sessions.lock().unwrap().entry(id).or_insert(s).clone())
+        Ok(self.sessions.lock().entry(id).or_insert(s).clone())
     }
 
     /// A past chat (`row` its index row) as a session: its conversation folded back from its log.
@@ -279,7 +297,7 @@ impl Daemon {
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {
-        self.sessions.lock().unwrap().values().map(|s| s.info()).collect()
+        self.sessions.lock().values().map(|s| s.info()).collect()
     }
 
     pub fn spawn(
@@ -369,7 +387,7 @@ impl Daemon {
             tx, exit: Mutex::new(None), ended: Mutex::new(None), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
             last_out: AtomicU64::new(0), busy: AtomicBool::new(false), chat: None, resuming: Mutex::new(()),
         });
-        self.sessions.lock().unwrap().insert(id, session.clone());
+        self.sessions.lock().insert(id, session.clone());
         changed();
 
         let s = session.clone();
@@ -387,7 +405,7 @@ impl Daemon {
                 // An OSC in the chunk may set the title `list` reports: compare it around the feed (only then).
                 let osc = buf[..n].windows(2).any(|w| w == b"\x1b]");
                 let (f, retitled) = {
-                    let mut term = s.term.lock().unwrap();
+                    let mut term = s.term.lock();
                     let before = osc.then(|| term.title());
                     let f = queries::filter(&buf[..n], &mut term);
                     if !f.out.is_empty() {
@@ -412,8 +430,8 @@ impl Daemon {
             let signalled = st.as_ref().is_ok_and(|st| st.signal().is_some());
             let status = if signalled || s.killed.load(Ordering::Relaxed) { "killed" } else { "exited" };
             let ended = now_ms();
-            *s.ended.lock().unwrap() = Some((status, ended));
-            *s.exit.lock().unwrap() = Some(code);
+            *s.ended.lock() = Some((status, ended));
+            *s.exit.lock() = Some(code);
             changed();
             let _ = s.tx.send(Ev::Exit(code));
             db::session_end(s.id, code, status, ended);
@@ -431,7 +449,7 @@ impl Daemon {
         prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
     ) -> Result<u64> {
         let adapter: Box<dyn chat::Adapter> = match kind {
-            "claude" => Box::new(chat::claude::Claude::default()),
+            "claude" => Box::new(chat::claude::Claude::new(launch.effort.clone())),
             "codex" => Box::new(chat::codex::Codex::new(&cwd)),
             other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
         };
@@ -443,7 +461,7 @@ impl Daemon {
         });
         let c = Arc::new(chat::Chat::open(&oid, &db::object_dir(&oid), Box::new(chat::NoAdapter))?);
         let session = Arc::new(Session::chat(id, kind, name, parent, cwd, argv, created_ms, c, None, None));
-        self.sessions.lock().unwrap().insert(id, session.clone());
+        self.sessions.lock().insert(id, session.clone());
         self.start_agent(&session, &launch, adapter, env)?;
         changed();
         if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
@@ -482,12 +500,12 @@ impl Daemon {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("{oid}: no stdout pipe"))?;
         let pid = child.id();
         c.set_adapter(&dir, adapter)?;
-        *s.writer.lock().unwrap() = Box::new(stdin);
-        *s.killer.lock().unwrap() = Box::new(chat::PidKiller(pid));
-        *s.pid.lock().unwrap() = Some(pid);
+        *s.writer.lock() = Box::new(stdin);
+        *s.killer.lock() = Box::new(chat::PidKiller(pid));
+        *s.pid.lock() = Some(pid);
         s.killed.store(false, Ordering::Relaxed);
-        *s.exit.lock().unwrap() = None;
-        *s.ended.lock().unwrap() = None;
+        *s.exit.lock() = None;
+        *s.ended.lock() = None;
         let reader = {
             let (s, c) = (s.clone(), c.clone());
             std::thread::Builder::new().name(format!("chat-read-{id}")).spawn(move || {
@@ -523,12 +541,12 @@ impl Daemon {
             if let Some(c) = &s.chat {
                 c.ended(&s.tx);
             }
-            *s.writer.lock().unwrap() = Box::new(NoAgent);
-            *s.killer.lock().unwrap() = Box::new(NoAgent);
-            *s.pid.lock().unwrap() = None;
+            *s.writer.lock() = Box::new(NoAgent);
+            *s.killer.lock() = Box::new(NoAgent);
+            *s.pid.lock() = None;
             s.busy.store(false, Ordering::Relaxed);
-            *s.ended.lock().unwrap() = Some((status, ended));
-            *s.exit.lock().unwrap() = Some(code);
+            *s.ended.lock() = Some((status, ended));
+            *s.exit.lock() = Some(code);
             changed();
             let _ = s.tx.send(Ev::Exit(code));
             db::session_end(s.id, code, status, ended);
@@ -540,8 +558,8 @@ impl Daemon {
     /// A message to chat `s`: sent to its agent, which is resumed first when it is not running.
     fn chat_send(self: &Arc<Self>, s: &Arc<Session>, text: &str) -> Result<()> {
         {
-            let _one = s.resuming.lock().unwrap();
-            if s.ended.lock().unwrap().is_some() {
+            let _one = s.resuming.lock();
+            if s.ended.lock().is_some() {
                 if let Err(e) = self.resume(s) {
                     if let Some(c) = &s.chat {
                         let why = format!("Can't resume this chat: {e:#}. The message was not sent.");
@@ -578,20 +596,23 @@ impl Daemon {
                 a => args.push(a.to_owned()),
             }
         }
-        let adapter: Box<dyn chat::Adapter> = match s.kind.as_str() {
-            "claude" => {
-                args.extend(["--resume".to_owned(), session.clone()]);
-                Box::new(chat::claude::Claude::default())
-            }
-            "codex" => Box::new(chat::codex::Codex::resume(&s.cwd, &session)),
+        match s.kind.as_str() {
+            "claude" => args.extend(["--resume".to_owned(), session.clone()]),
+            "codex" => {}
             other => anyhow::bail!("{other} has no chat adapter to resume with"),
-        };
+        }
         if let Some(n) = &s.name {
             db::check_name(n)?;
         }
         let launch = profiles::launch(
             &s.kind, &profiles::Ctx { session: s.id, cwd: &s.cwd, sock: &paths::sock(), user_args: &args, prompt: None, chat: true },
         )?;
+        // Claude's adapter says the effort its launch passed, so it is made after the launch.
+        let adapter: Box<dyn chat::Adapter> = if s.kind == "claude" {
+            Box::new(chat::claude::Claude::new(launch.effort.clone()))
+        } else {
+            Box::new(chat::codex::Codex::resume(&s.cwd, &session))
+        };
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.iter().cloned());
         db::session_start(&db::SessionRow {
@@ -605,6 +626,12 @@ impl Daemon {
     }
 
     fn handle(self: &Arc<Self>, req: Req) -> Result<Reply> {
+        #[cfg(test)]
+        if tests::PANIC_NEXT.swap(false, Ordering::SeqCst) {
+            // The planted panic of `tests::a_panicking_request_fails_only_itself`, holding the lock every request takes.
+            let _held = self.sessions.lock();
+            panic!("planted panic");
+        }
         Ok(match req {
             Req::List { all, chats } => {
                 let mut v = self.list();
@@ -633,8 +660,8 @@ impl Daemon {
             }
             Req::Info => Reply::Daemon { pid: std::process::id(), sock: paths::sock().display().to_string() },
             Req::Last => {
-                let last = *self.last.lock().unwrap();
-                let alive = last.and_then(|id| self.get(id).ok()).filter(|s| s.exit.lock().unwrap().is_none()).map(|s| s.id);
+                let last = *self.last.lock();
+                let alive = last.and_then(|id| self.get(id).ok()).filter(|s| s.exit.lock().is_none()).map(|s| s.id);
                 Reply::Last { id: alive }
             }
             Req::SpawnObject { opts } => Reply::Record(crate::object::spawn(self, &opts)?),
@@ -672,27 +699,36 @@ impl Daemon {
             }
             Req::Forget { id } => {
                 let s = self.get(id)?;
-                if s.exit.lock().unwrap().is_none() {
+                if s.exit.lock().is_none() {
                     s.kill();
                 }
-                self.sessions.lock().unwrap().remove(&id);
+                self.sessions.lock().remove(&id);
                 changed();
                 Reply::Ok
             }
             Req::Shutdown => {
-                for s in self.sessions.lock().unwrap().values() {
+                for s in self.sessions.lock().values() {
                     s.kill();
                 }
                 let _ = std::fs::remove_file(paths::sock());
                 std::process::exit(0);
             }
             Req::Runs(r) => Reply::Record(runs::handle(r)?),
-            Req::Attach { .. } | Req::Watch => anyhow::bail!("attach and watch hold the connection: send them as a connection's request, not through rpc"),
+            Req::UiEvent { cell, handler, value } => {
+                FEEDS.lock().deliver(crate::ui_feed::UiEv { cell, handler, value }).map_err(anyhow::Error::msg)?;
+                Reply::Ok
+            }
+            Req::Attach { .. } | Req::Watch | Req::UiListen { .. } => {
+                anyhow::bail!("attach, watch and ui_listen hold the connection: send them as a connection's request, not through rpc")
+            }
         })
     }
 }
 
 pub async fn run() -> Result<()> {
+    // Every agent's MCP server is the kernel: without it no spawn can work, so say where it was looked for now.
+    let kernel = paths::root().context("harnessd refuses to start")?;
+    eprintln!("harnessd kernel {}", kernel.display());
     std::fs::create_dir_all(paths::home())?;
     let sock = paths::sock();
     if UnixStream::connect(&sock).await.is_ok() {
@@ -726,7 +762,7 @@ pub async fn run() -> Result<()> {
                 tick.tick().await;
                 n += 1;
                 let now = now_ms();
-                let sessions: Vec<Arc<Session>> = d.sessions.lock().unwrap().values().cloned().collect();
+                let sessions: Vec<Arc<Session>> = d.sessions.lock().values().cloned().collect();
                 for s in sessions {
                     s.settle(now);
                 }
@@ -741,12 +777,65 @@ pub async fn run() -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let d = d.clone();
-        tokio::spawn(async move {
-            if let Err(e) = conn(d, stream).await {
-                eprintln!("connection error: {e:#}");
-            }
-        });
+        tokio::spawn(guarded(d, stream));
     }
+}
+
+/// One connection in its own task: a panic in it (outside a request, which [`blocking`] already turns into that
+/// request's error) ends only this connection, and its client gets an error frame naming the panic.
+async fn guarded(d: Arc<Daemon>, stream: UnixStream) {
+    use std::os::fd::AsFd;
+    // A second handle on the socket, to report a panic on once the task (and its handle) is gone.
+    let report = stream.as_fd().try_clone_to_owned();
+    match tokio::spawn(conn(d, stream)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("connection error: {e:#}"),
+        Err(e) if e.is_panic() => {
+            let error = format!("harnessd panicked serving this connection: {}; it keeps serving others", panic_text(&*e.into_panic()));
+            eprintln!("{error}");
+            if let Ok(fd) = report {
+                let _ = tokio::task::spawn_blocking(move || report_panic(fd, &error)).await;
+            }
+        }
+        Err(e) => eprintln!("connection task cancelled: {e}"),
+    }
+}
+
+/// An error frame to a client whose connection task panicked, on a blocking copy of its socket (bounded by a write
+/// timeout, so a client that reads nothing cannot hold the thread).
+fn report_panic(fd: std::os::fd::OwnedFd, error: &str) {
+    let mut s = std::os::unix::net::UnixStream::from(fd);
+    let sent = s
+        .set_nonblocking(false)
+        .and_then(|()| s.set_write_timeout(Some(std::time::Duration::from_secs(1))))
+        .and_then(|()| harness_proto::frame::write(&mut s, T_CBOR, &harness_proto::cbor::encode(&Down::Error { error: error.to_owned() })));
+    if let Err(e) = sent {
+        eprintln!("reporting a connection's panic to its client: {e}");
+    }
+}
+
+/// What a panic said.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| (*s).to_owned()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic with no message".to_owned())
+}
+
+/// `f` on the blocking pool; a panic in it is the error of `what` (the request it served), never the connection's or
+/// the daemon's (rule panics-fail-one-job: parking_lot's locks do not poison, so the next request finds them usable).
+async fn blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(r) => r,
+        Err(e) if e.is_panic() => {
+            let error = anyhow!("harnessd panicked handling {what}: {}; it keeps serving", panic_text(&*e.into_panic()));
+            eprintln!("{error}");
+            Err(error)
+        }
+        Err(e) => Err(anyhow!("harnessd cancelled {what}: {e}")),
+    }
+}
+
+/// A request, named for an error: its first 120 characters.
+fn request_name(req: &Req) -> String {
+    format!("{req:?}").chars().take(120).collect()
 }
 
 /// One message to a client.
@@ -804,7 +893,7 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         if let Req::Attach { id, cols, rows, events } = req {
             let got = {
                 let d = d.clone();
-                tokio::task::spawn_blocking(move || d.get(id)).await?
+                blocking(&format!("attach to s{id}"), move || d.get(id)).await
             };
             let s = match got {
                 Ok(s) => s,
@@ -816,7 +905,7 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             if let (Some(c), Some(rw)) = (cols, rows) {
                 s.resize(c, rw)?;
             }
-            *d.last.lock().unwrap() = Some(id);
+            *d.last.lock() = Some(id);
             send(&mut w, &Down::Reply(Reply::Attached { info: s.info() })).await?;
             if let Some(c) = s.chat.clone() {
                 return attach_chat(s, c, events, r, w).await;
@@ -827,8 +916,13 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             send(&mut w, &Down::Reply(Reply::Watching)).await?;
             return watch(r, w).await;
         }
+        if let Req::UiListen { repl } = req {
+            send(&mut w, &Down::Reply(Reply::Listening)).await?;
+            return ui_listen(repl, r, w).await;
+        }
         let d2 = d.clone();
-        let resp = tokio::task::spawn_blocking(move || d2.handle(req)).await?;
+        let what = request_name(&req);
+        let resp = blocking(&what, move || d2.handle(req)).await;
         let m = match resp {
             Ok(reply) => Down::Reply(reply),
             Err(e) => Down::Error { error: format!("{e:#}") },
@@ -857,10 +951,31 @@ async fn watch(mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::
     }
 }
 
+/// A `ui_listen` connection: kernel `repl`'s UI feed, a [`Down::Ui`] per event the app sends for one of its cells, until
+/// the kernel sends anything or goes, or a newer listener for `repl` replaces it (its queue's sender is dropped).
+async fn ui_listen(repl: String, mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::ui_feed::FEED_CAP);
+    let id = FEEDS.lock().listen(&repl, FeedSink(tx));
+    let out = async {
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(crate::ui_feed::UiEv { cell, handler, value }) => send(&mut w, &Down::Ui { cell, handler, value }).await?,
+                    None => return Ok::<(), anyhow::Error>(()),
+                },
+                _ = aio::read(&mut r) => return Ok(()),
+            }
+        }
+    }
+    .await;
+    FEEDS.lock().gone(&repl, id);
+    out
+}
+
 async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {
     s.attached.fetch_add(1, Ordering::Relaxed);
     let (snap, mut rx) = s.snapshot_and_subscribe();
-    let exited = *s.exit.lock().unwrap();
+    let exited = *s.exit.lock();
     let mut out = {
         let s = s.clone();
         tokio::spawn(async move {
@@ -892,7 +1007,7 @@ async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: 
             match t {
                 T_DATA => {
                     let s = s.clone();
-                    tokio::task::spawn_blocking(move || s.write(&payload)).await??;
+                    blocking("keys to an attached session", move || s.write(&payload)).await?;
                 }
                 T_CBOR => match harness_proto::cbor::decode::<Up>(&payload) {
                     Ok(Up::Resize { cols, rows }) => s.resize(cols, rows)?,
@@ -925,7 +1040,7 @@ async fn attach_chat(
 ) -> Result<()> {
     s.attached.fetch_add(1, Ordering::Relaxed);
     let (history, mut rx) = c.history_and_subscribe(&s.tx);
-    let exited = *s.exit.lock().unwrap();
+    let exited = *s.exit.lock();
     let sid = s.id;
     let mut out = tokio::spawn(async move {
         send_history(&mut w, &history, events).await?;
@@ -1008,4 +1123,42 @@ fn uuid_v4() -> String {
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{recv, send};
+
+    /// Set: the next request panics while holding the sessions lock.
+    pub(super) static PANIC_NEXT: AtomicBool = AtomicBool::new(false);
+
+    /// A request that panics fails alone: its client gets an error frame naming the panic, and the next request on the
+    /// same connection (and on a new one) is answered. Remove the cause (no planted panic) and the first answer is a
+    /// reply; with std's poisoning locks the second request panicked too and the connection closed.
+    #[tokio::test]
+    async fn a_panicking_request_fails_only_itself() {
+        let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(1), last: Mutex::new(None) });
+        let list = || Up::Req(Req::List { all: false, chats: false });
+        let open = |d: Arc<Daemon>| async move {
+            let (client, server) = UnixStream::pair().expect("socket pair");
+            tokio::spawn(guarded(d, server));
+            let mut client = client;
+            send(&mut client, &Up::Hello { schema: harness_proto::SCHEMA }).await.expect("hello");
+            assert!(matches!(recv(&mut client).await.expect("hello back"), Down::Hello { .. }));
+            client
+        };
+        let mut c = open(d.clone()).await;
+        PANIC_NEXT.store(true, Ordering::SeqCst);
+        send(&mut c, &list()).await.expect("send");
+        match recv(&mut c).await.expect("an answer to the panicking request") {
+            Down::Error { error } => assert!(error.contains("panicked") && error.contains("planted panic"), "{error}"),
+            m => panic!("the planted panic was not reported: {m:?}"),
+        }
+        send(&mut c, &list()).await.expect("send");
+        assert!(matches!(recv(&mut c).await.expect("the next request answered"), Down::Reply(Reply::Sessions { .. })));
+        let mut c2 = open(d).await;
+        send(&mut c2, &list()).await.expect("send");
+        assert!(matches!(recv(&mut c2).await.expect("a new connection answered"), Down::Reply(Reply::Sessions { .. })));
+    }
 }

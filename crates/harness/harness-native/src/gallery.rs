@@ -26,6 +26,28 @@ fn at<'a>(w: WorldRef<'a>, path: &str) -> Option<EntityView<'a>> {
     w.try_lookup(&format!("{ROOT}::{path}"))
 }
 
+/// The generative-UI gallery (`HARNESS_NATIVE_GALLERY=genui`, `HARNESS_NATIVE_GENUI=<tree.json>`): one cell's tree (as the
+/// kernel sends it: mcp's `t.ui`) on the terminal's ground, filled each frame by the chat's own `genui::fill`. The root's id.
+pub fn load_genui(app: &App, strip: f32) -> Result<u64, String> {
+    let w = app.world.world_ref();
+    let root = View::root(w, "hn.GenGallery").named("genui_gallery");
+    root.entity().set(SafeAreaInset { l: 0.0, r: 0.0, t: strip, b: 0.0 });
+    let root_id = root.id();
+    w.system_named::<&Node>("GalleryOnly").without(Offscreen::id()).each_entity(move |e, _| {
+        if *e.id() != root_id && !e.parent().is_some_and(|p| p.has(Node::id())) {
+            e.add(Offscreen::id());
+        }
+    });
+    Ok(root_id)
+}
+
+/// The tree `HARNESS_NATIVE_GENUI` names, read.
+pub fn genui_tree() -> Result<serde_json::Value, String> {
+    let path = std::env::var("HARNESS_NATIVE_GENUI").map_err(|_| "HARNESS_NATIVE_GALLERY=genui needs HARNESS_NATIVE_GENUI=<tree.json>".to_owned())?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("HARNESS_NATIVE_GENUI {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("HARNESS_NATIVE_GENUI {path}: {e}"))
+}
+
 /// Load the examples (or, `prims`, the primitives gallery) and make them the only thing drawn; `strip` is the title-bar strip
 /// (points) to inset.
 pub fn load(app: &App, strip: f32, prims: bool) -> Result<(), String> {

@@ -42,9 +42,12 @@ pub struct Progress {
     /// look, a run of user code's IO): its tasks and units' steps.
     pub steps: u64,
     /// The daemon's looks that found work running though nothing ended: a worker inside a
-    /// job's code (`blaze_graph::pool::Pool::working`), as one long compile is, or a run of
-    /// user code (a build script, a test) alive. A pool whose workers only search, sleep and
-    /// check for stalls never moves it.
+    /// job's code (`blaze_graph::pool::Pool::working`), as one long compile is, a run of
+    /// user code (a build script, a test) alive, or a download that got a byte since the last
+    /// look (`blaze_fetch::downloads`: a cold build's LLVM, minutes at a slow link, is work
+    /// under way). A pool whose workers only search, sleep and check for stalls never moves
+    /// it, nor does a download that gets nothing (it stops itself, naming its address, after
+    /// `blaze_fetch::progress::STALL`).
     pub working: u64,
 }
 
@@ -109,7 +112,7 @@ impl Watchdog {
 }
 
 /// What stayed still, as a stall says it: every count of [`Progress`].
-pub const STILL: &str = "no job ended, no query completed, no task or step ended and no job's code or run of user code was running";
+pub const STILL: &str = "no job ended, no query completed, no task or step ended, no job's code or run of user code was running and no download got a byte";
 
 /// A build that stopped: how long nothing moved and the bound it reached, the counts where
 /// they stayed, how many tasks were under way, each thread's open spans, and the flight
@@ -353,7 +356,7 @@ mod tests {
         );
         let text = error.to_string();
         for name in [
-            "blaze stalled: no job ended, no query completed, no task or step ended and no job's code or run of user code was running for",
+            "blaze stalled: no job ended, no query completed, no task or step ended, no job's code or run of user code was running and no download got a byte for",
             "the stall bound is 120 s, `blaze serve --stall-bound SECS` sets it",
             "7 queries completed, 3 tasks or steps ended and 0 looks found work running",
             "job a",

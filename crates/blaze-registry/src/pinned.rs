@@ -16,8 +16,10 @@ use crate::{
     http::{Http, HttpNotSuccessful, Retry, Transport},
 };
 
-/// [`blaze_fetch::Net`] over an [`Http`]: a 200 streams to the sink; a server error, too many
-/// requests or no answer is worth another try; any other answer is not.
+/// [`blaze_fetch::Net`] over an [`Http`]: a 200 or 206 streams to the sink (HyperHttp's in
+/// ranges, many at once, each piece with its offset); a server error, too many requests or no
+/// answer is worth another try; a download that stalled ([`Stalled`](crate::http::Stalled)) or any other answer is
+/// not.
 pub struct Net {
     // dyn: the I/O driver, as on `Context::http`.
     http: Arc<dyn Http>,
@@ -35,10 +37,11 @@ impl blaze_fetch::Net for Net {
         &self,
         url: &str,
         headers: &[(&str, &str)],
-        sink: &mut (dyn FnMut(&[u8]) -> std::io::Result<()> + Send),
+        from: u64,
+        sink: &mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send),
     ) -> Result<(), Failure> {
-        match self.http.stream(url, headers, sink) {
-            Ok(answer) if answer.status == 200 => Ok(()),
+        match self.http.stream(url, headers, from, sink) {
+            Ok(answer) if matches!(answer.status, 200 | 206) => Ok(()),
             // Every message is scrubbed of URLs' credentials and queries: the client's own say
             // its address redacted, and a fake's or a future client's may not.
             Ok(answer) => {

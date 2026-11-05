@@ -130,6 +130,15 @@ jobs:
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'
+      # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
+      # (.github/scripts/explore_page.py; release.yaml checks every release too).
+      - name: ix.dev/explore reads a new profile schema
+        run: |
+          git fetch -q --depth=1 origin main
+          version() { grep -E '^pub const VERSION: u32' "$@"; }
+          if [ "$(git show FETCH_HEAD:crates/blaze-profile/src/schema.rs | version)" != "$(version crates/blaze-profile/src/schema.rs)" ]; then
+            uv run --frozen python .github/scripts/explore_page.py '{}'
+          fi
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
   # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after
@@ -224,6 +233,42 @@ jobs:
       tier: ${{ needs.changes.outputs.tier }}
       smoke: true
 
+  # The daemon this change builds starts on Linux 6.8: GitHub's hosted ubuntu-22.04 runners
+  # boot Ubuntu's linux-azure 6.8 (6.8.0-1070-azure in November 2026), the release's Linux
+  # builds run there, and ix's kernel is newer. linux-azure 6.8.0-1063 and later invert
+  # io_uring's check of a provided buffer ring's reserved words (blaze-core's
+  # `ReservedCheck`), which stopped every daemon start of v0.20261105.3's release. The
+  # binary is the linux-arm64 build's, linked against the ix image's glibc (Ubuntu 24.04's),
+  # so it runs in an ubuntu:24.04 container, which shares the host's kernel; Docker's default
+  # seccomp profile refuses io_uring, so the container's is off.
+  linux-6-8:
+    name: daemon starts on Linux 6.8 (hosted ubuntu-22.04-arm)
+    needs: [changes, linux-arm64]
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 10
+    container:
+      image: ubuntu:24.04
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+    env:
+      # As in `docker run`: the runner's /github/home belongs to its own user.
+      HOME: /root
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: blaze-linux-arm64
+      - name: blaze serve listens, blaze status sees it, blaze stop ends it
+        run: |
+          tar -xf blaze.tar && uname -r
+          ./blaze serve > serve.log 2>&1 & serve=$!
+          for _ in $(seq 120); do
+            ./blaze status | grep -qvx "no daemon is running" && break
+            kill -0 "$serve" 2>/dev/null || { cat serve.log; echo "::error::blaze serve ended before it listened on Linux $(uname -r)"; exit 1; }
+            sleep 0.5
+          done
+          ./blaze status | grep -qvx "no daemon is running" || { cat serve.log; echo "::error::blaze serve did not listen within 60 s on Linux $(uname -r)"; exit 1; }
+          ./blaze stop && wait "$serve"
+
   macos:
     name: macos arm64
     needs: changes
@@ -310,7 +355,7 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, linux-arm64, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5

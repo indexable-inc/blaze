@@ -23,7 +23,7 @@ use crate::{
 };
 
 const REQUESTS: usize = 36;
-const RESPONSES: usize = 44;
+const RESPONSES: usize = 45;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -614,6 +614,22 @@ impl Gen {
                 uptime_ms: self.wide(),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
+                builds: self.many(depth, |g| crate::Building {
+                    id: g.u32(),
+                    what: g.text(),
+                    phase: g.text(),
+                    spans: g.texts(depth + 1),
+                    for_ms: g.wide(),
+                }),
+                downloads: self.many(depth, |g| crate::Downloading {
+                    url: g.text(),
+                    done: g.wide(),
+                    rate: g.maybe(Gen::wide),
+                    what: g.text(),
+                    total: g.maybe(Gen::wide),
+                    idle_ms: g.wide(),
+                    elapsed_ms: g.wide(),
+                }),
                 build: crate::Build {
                     id: self.id(),
                     exe: crate::Executable {
@@ -768,6 +784,15 @@ impl Gen {
                 stopped: self.yes(),
             }),
             42 => Response::Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
+            43 => Response::Doing(crate::Doing {
+                on: self.maybe_text(),
+                busy: self.u32(),
+                idle: self.u32(),
+                units: self
+                    .many(depth, |g| crate::UnitDoing { id: g.u32(), doing: g.text() }),
+                for_ms: self.wide(),
+                running: self.maybe_text(),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
             }
@@ -1002,7 +1027,8 @@ fn response_index(response: &Response) -> usize {
         Response::Unchecked(_) => 40,
         Response::Stored { .. } => 41,
         Response::Report { .. } => 42,
-        Response::Of { .. } => 43,
+        Response::Doing(_) => 43,
+        Response::Of { .. } => 44,
     }
 }
 

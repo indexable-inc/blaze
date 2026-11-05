@@ -148,6 +148,7 @@ const REGISTER_FILES2: libc::c_uint = 13;
 const REGISTER_FILES_UPDATE2: libc::c_uint = 14;
 const REGISTER_BUFFERS2: libc::c_uint = 15;
 const REGISTER_PBUF_RING: libc::c_uint = 22;
+const UNREGISTER_PBUF_RING: libc::c_uint = 23;
 const REGISTER_FILE_ALLOC_RANGE: libc::c_uint = 25;
 const RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 
@@ -441,7 +442,8 @@ fn register<T>(
             io::ErrorKind::Unsupported,
             // alloc: the error of a setup that failed.
             format!(
-                "io_uring {what}: {error}: Linux {since} or later has it, and this is Linux {}",
+                "io_uring {what}: {error}: Linux {since} or later has it, and this kernel \
+                 (Linux {}) refuses it, by lacking it or by refusing what it was given",
                 crate::cgroup::kernel()
             ),
         ),
@@ -686,14 +688,23 @@ impl Provided {
     fn new(fd: RawFd) -> io::Result<Provided> {
         let ring = anonymous(RECV_BUFFERS as usize * size_of::<ProvidedBuf>())?;
         let buffers = anonymous(RECV_BUFFERS as usize * RECV_BUFFER)?;
+        let check = ReservedCheck::of(fd)?;
         let reg = BufReg {
             ring_addr: ring.at as u64,
             ring_entries: RECV_BUFFERS.into(),
             bgid: RECV_GROUP,
             flags: 0,
-            resv: [0; 3],
+            resv: check.reserved(),
         };
-        register(fd, REGISTER_PBUF_RING, &raw const reg, 1, "a ring of provided buffers", "5.19")?;
+        // SAFETY: `reg` is the `io_uring_buf_reg` the call reads, alive for it; the ring it
+        // names is `ring`, mapped for `RECV_BUFFERS` entries, which `Provided` keeps mapped
+        // while the ring's file lives.
+        let got = unsafe {
+            libc::syscall(libc::SYS_io_uring_register, fd, REGISTER_PBUF_RING, &raw const reg, 1)
+        };
+        if got < 0 {
+            return Err(pbuf_refused(&reg, check, &io::Error::last_os_error()));
+        }
         let mut provided = Provided { ring, buffers, tail: 0, published: 0 };
         for bid in 0..RECV_BUFFERS {
             provided.give(bid);
@@ -771,6 +782,116 @@ impl Provided {
 }
 
 const _: () = assert!(RECV_BUFFERS.is_power_of_two());
+/// How this kernel checks the reserved words of a provided buffer ring's registration
+/// (`io_uring_buf_reg.resv`).
+///
+/// Upstream Linux, from 5.19 on, refuses a registration whose reserved words are not zero.
+/// Ubuntu's linux-azure 6.8 from 6.8.0-1063.71 (through 6.8.0-1070.78 at least, the kernel of
+/// GitHub's hosted ubuntu-22.04 runners, x86-64 and AArch64, in November 2026) backported
+/// upstream's `if (!mem_is_zero(reg.resv, sizeof(reg.resv))) return -EINVAL;` as
+/// `if (!memchr_inv(reg.resv, 0, sizeof(reg.resv))) return -EINVAL;`. `memchr_inv` answers
+/// NULL when every byte is zero, so that kernel refuses exactly the registrations upstream
+/// takes, in io_register_pbuf_ring and io_unregister_pbuf_ring alike (io_uring/kbuf.c), and
+/// takes only one whose reserved words are not zero, which it reads nowhere else.
+///
+/// The check is asked of the kernel before the registration, with no side effect: an
+/// unregister of a group the ring does not have gets past a right check to the group's lookup
+/// (ENOENT) and stops at an inverted one (EINVAL). It must run before the ring has any group,
+/// as [`Provided::new`] runs it: upstream 6.8 answers EINVAL for an unregister of a group of
+/// its array of the first 64 once that array is made. Each kernel then gets the one
+/// registration it takes; there is no second attempt and no other kind of receive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReservedCheck {
+    Upstream,
+    Inverted,
+}
+
+impl ReservedCheck {
+    fn of(fd: RawFd) -> io::Result<ReservedCheck> {
+        let reg =
+            BufReg { ring_addr: 0, ring_entries: 0, bgid: RECV_GROUP, flags: 0, resv: [0; 3] };
+        // SAFETY: `reg` is the `io_uring_buf_reg` the call reads, alive for it; the ring has no
+        // group, so nothing is unregistered.
+        let got = unsafe {
+            libc::syscall(libc::SYS_io_uring_register, fd, UNREGISTER_PBUF_RING, &raw const reg, 1)
+        };
+        let errno = match got {
+            0.. => None,
+            _ => io::Error::last_os_error().raw_os_error(),
+        };
+        ReservedCheck::answered(errno).ok_or_else(|| {
+            let answer = match errno {
+                Some(errno) => io::Error::from_raw_os_error(errno).to_string(), // alloc: an error.
+                None => "success, unregistering a group that is not there".to_owned(), // alloc: an error.
+            };
+            io::Error::other(
+                // alloc: the error of a setup that failed.
+                format!(
+                    "io_uring a ring of provided buffers: asking this kernel (Linux {}) how it \
+                     checks the reserved words of IORING_REGISTER_PBUF_RING, by unregistering \
+                     group {RECV_GROUP}, which the ring does not have, answered {answer}, where a \
+                     kernel answers ENOENT (upstream's check) or EINVAL (the inverted check of \
+                     Ubuntu's linux-azure 6.8.0-1063 and later)",
+                    crate::cgroup::kernel(),
+                ),
+            )
+        })
+    }
+
+    /// The check the unregister probe's answer (its errno, `None` for a success) shows, if it
+    /// shows one.
+    fn answered(errno: Option<i32>) -> Option<ReservedCheck> {
+        match errno {
+            Some(libc::ENOENT) => Some(ReservedCheck::Upstream),
+            Some(libc::EINVAL) => Some(ReservedCheck::Inverted),
+            _ => None,
+        }
+    }
+
+    /// The reserved words this kernel takes.
+    fn reserved(self) -> [u64; 3] {
+        match self {
+            ReservedCheck::Upstream => [0; 3],
+            ReservedCheck::Inverted => [1, 0, 0],
+        }
+    }
+}
+
+/// Why `IORING_REGISTER_PBUF_RING` of `reg` failed with `error`: what was asked, and which of
+/// io_register_pbuf_ring's requirements the answer stands for.
+fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Error {
+    let kernel = crate::cgroup::kernel();
+    let inverted = match check {
+        ReservedCheck::Upstream => "",
+        ReservedCheck::Inverted => ", as this kernel's inverted check takes them",
+    };
+    let why = match error.raw_os_error() {
+        // alloc: the error of a setup that failed.
+        Some(libc::EINVAL) => format!(
+            "every requirement io_register_pbuf_ring states is met (a power of two of entries \
+             under 65536, a page-aligned ring, no flags, reserved words as this kernel checks \
+             them), and this kernel (Linux {kernel}) refuses it all the same: its io_uring/kbuf.c \
+             says for what"
+        ),
+        // alloc: the error of a setup that failed.
+        Some(libc::EEXIST) => format!("group {} already has buffers on this ring", reg.bgid),
+        // alloc: the error of a setup that failed.
+        Some(libc::ENOMEM) => "the kernel had no memory for the group or to pin the ring's page".to_owned(),
+        // alloc: the error of a setup that failed.
+        Some(libc::EFAULT) => "the kernel could not read the registration or pin the ring's page".to_owned(),
+        // alloc: the error of a setup that failed.
+        _ => format!("an answer io_register_pbuf_ring is not known to give on Linux {kernel}"),
+    };
+    io::Error::new(
+        error.kind(),
+        // alloc: the error of a setup that failed.
+        format!(
+            "io_uring a ring of provided buffers (IORING_REGISTER_PBUF_RING of {} entries at \
+             {:#x}, group {}, flags {:#x}, reserved words {}, {}, {}{inverted}): {error}: {why}",
+            reg.ring_entries, reg.ring_addr, reg.bgid, reg.flags, reg.resv[0], reg.resv[1], reg.resv[2],
+        ),
+    )
+}
 
 /// What `statx` says of a descriptor's file: its device, and the alignment of offset and
 /// length a write bypassing the page cache needs (0 where its file system has none).
@@ -4176,10 +4297,8 @@ mod tests {
                 action.sa_sigaction = trapped as usize;
                 action.sa_flags = libc::SA_SIGINFO;
                 // SAFETY: a handler that touches an atomic and its context alone.
-                assert_eq!(
-                    unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) },
-                    0
-                );
+                let set = unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) };
+                assert_eq!(set, 0);
             });
             const LD_W_ABS: u16 = 0x20;
             const JEQ_K: u16 = 0x15;
@@ -4555,6 +4674,41 @@ mod tests {
         storm.join().unwrap();
         assert!(out.is_empty(), "nothing was sent, and the poll ended with {out:?}");
         assert!(took < Duration::from_secs(2), "a 50 ms poll under signals every 5 ms took {took:?}");
+    }
+
+    /// The reserved-word check `ReservedCheck::of` reads is the one this kernel applies: a
+    /// ring registers with the words it chose and is refused (EINVAL) with the other choice,
+    /// upstream's zeroes on an inverted kernel (Ubuntu's linux-azure 6.8.0-1063 and later)
+    /// and a set word on any other.
+    #[test]
+    fn the_reserved_check_is_the_kernels() {
+        let ring = Ring::new(ENTRIES, COMPLETIONS).unwrap();
+        let fd = ring.fd.as_raw_fd();
+        let check = ReservedCheck::of(fd).unwrap();
+        let other = match check {
+            ReservedCheck::Upstream => ReservedCheck::Inverted,
+            ReservedCheck::Inverted => ReservedCheck::Upstream,
+        };
+        let map = anonymous(RECV_BUFFERS as usize * size_of::<ProvidedBuf>()).unwrap();
+        let reg = |bgid: u16, check: ReservedCheck| BufReg {
+            ring_addr: map.at as u64,
+            ring_entries: RECV_BUFFERS.into(),
+            bgid,
+            flags: 0,
+            resv: check.reserved(),
+        };
+        let call = |reg: BufReg| {
+            // SAFETY: `reg` is the `io_uring_buf_reg` the call reads, alive for it; the ring
+            // it names is `map`, mapped for `RECV_BUFFERS` entries and kept past the ring.
+            let got = unsafe {
+                libc::syscall(libc::SYS_io_uring_register, fd, REGISTER_PBUF_RING, &raw const reg, 1)
+            };
+            if got < 0 { io::Error::last_os_error().raw_os_error() } else { None }
+        };
+        let kernel = crate::cgroup::kernel();
+        assert_eq!(call(reg(1, other)), Some(libc::EINVAL), "{other:?} on Linux {kernel}");
+        assert_eq!(call(reg(1, check)), None, "{check:?} on Linux {kernel}");
+        drop(ring);
     }
 
     /// The provided buffers a pass of completions gives back are shown to the kernel together,

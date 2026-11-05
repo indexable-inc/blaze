@@ -29,7 +29,8 @@
 //! ## `tool_detail`: a REPL cell's steps and value
 //!
 //! The harness REPL (`mcp/src/repl.ts`) posts each cell to the daemon as it runs (`repl_task`), with the agent's id for
-//! the tool call that ran it when the agent gave one (Claude puts it in the MCP request's `_meta`). For a chat session
+//! the tool call that ran it when the agent gave one (in the MCP request's `_meta`: Claude as `claudecode/toolUseId`, Codex
+//! as `callId`, the id of its `mcpToolCall` item). For a chat session
 //! the daemon records each post as a `tool_detail` for that call's `block`: the cell's whole state, so the latest one
 //! stands for all before it (a reattach replays only the latest). It may come before the call's `tool_call` or after its
 //! `tool_result` (a backgrounded cell ends later). Its fields, as the kernel writes them:
@@ -97,7 +98,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// How many lines of the conversation `screen` returns (its tail).
@@ -322,28 +324,33 @@ impl Chat {
     /// The agent's process (re)starts: its protocol from here on, its raw lines appended to `objects/sN/raw`.
     pub fn set_adapter(&self, dir: &Path, adapter: Box<dyn Adapter>) -> anyhow::Result<()> {
         let raw = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("raw"))?;
-        let mut st = self.store.lock().unwrap();
+        let mut st = self.store.lock();
         st.adapter = adapter;
         st.raw = Some(raw);
         Ok(())
     }
 
     pub fn title(&self) -> String {
-        self.store.lock().unwrap().transcript.title.clone()
+        self.store.lock().transcript.title.clone()
     }
 
     pub fn model(&self) -> String {
-        self.store.lock().unwrap().transcript.model.clone()
+        self.store.lock().transcript.model.clone()
+    }
+
+    /// The reasoning effort its agent runs with; empty when its `session` event did not say.
+    pub fn effort(&self) -> String {
+        self.store.lock().transcript.effort.clone()
     }
 
     /// The agent's own id for this conversation (what resumes it), when its log said one.
     pub fn session_id(&self) -> Option<String> {
-        Some(self.store.lock().unwrap().transcript.session_id.clone()).filter(|s| !s.is_empty())
+        Some(self.store.lock().transcript.session_id.clone()).filter(|s| !s.is_empty())
     }
 
     /// The lines to write to the child as it starts.
     pub fn start_lines(&self) -> Vec<String> {
-        self.store.lock().unwrap().adapter.start()
+        self.store.lock().adapter.start()
     }
 
     /// A line the agent wrote: kept in `raw`, and its events recorded. Whether the busy state changed, and the lines to
@@ -354,7 +361,7 @@ impl Chat {
             return (false, Vec::new());
         }
         let (evs, replies) = {
-            let mut st = self.store.lock().unwrap();
+            let mut st = self.store.lock();
             if let Some(raw) = st.raw.as_mut()
                 && let Err(e) = raw.write_all(format!("{line}\n").as_bytes())
             {
@@ -374,12 +381,12 @@ impl Chat {
     pub fn user_lines(&self, text: &str, tx: &broadcast::Sender<Ev>) -> Vec<String> {
         self.record(Body::User { text: text.to_owned() }, tx);
         self.record(Body::Busy { busy: true }, tx);
-        self.store.lock().unwrap().adapter.user(text)
+        self.store.lock().adapter.user(text)
     }
 
     /// The lines that stop the turn in flight.
     pub fn interrupt_lines(&self) -> Vec<String> {
-        self.store.lock().unwrap().adapter.interrupt()
+        self.store.lock().adapter.interrupt()
     }
 
     /// The agent ended: a turn still in flight ends with it.
@@ -393,7 +400,7 @@ impl Chat {
     /// to the attached clients. Whether the busy state or the title changed (what `list` says of it).
     pub fn record(&self, body: Body, tx: &broadcast::Sender<Ev>) -> bool {
         let ev = Event { ts: now_ms(), body };
-        let mut st = self.store.lock().unwrap();
+        let mut st = self.store.lock();
         let title = st.transcript.title.is_empty();
         let frame = st.append(&self.oid, &ev);
         let retitled = title && !st.transcript.title.is_empty();
@@ -407,13 +414,13 @@ impl Chat {
 
     /// The history a reattach starts with (frames), and a receiver for every event after it.
     pub fn history_and_subscribe(&self, tx: &broadcast::Sender<Ev>) -> (Vec<Arc<[u8]>>, broadcast::Receiver<Ev>) {
-        let st = self.store.lock().unwrap();
+        let st = self.store.lock();
         (st.replay.iter().flatten().cloned().collect(), tx.subscribe())
     }
 
     /// The conversation as plain text, its last [`SCREEN_LINES`] lines.
     pub fn screen(&self) -> String {
-        let history: Vec<Arc<[u8]>> = self.store.lock().unwrap().replay.iter().flatten().cloned().collect();
+        let history: Vec<Arc<[u8]>> = self.store.lock().replay.iter().flatten().cloned().collect();
         let out = text_of_frames(history.iter().map(|f| &f[..]));
         let lines: Vec<&str> = out.lines().collect();
         lines[lines.len().saturating_sub(SCREEN_LINES)..].join("\n") + "\n"
@@ -587,8 +594,8 @@ mod tests {
             let mut restored = Transcript::default();
             restored.feed(&history.concat());
             assert_eq!(&restored, live, "restored from the log vs fed live");
-            assert_eq!(back.store.lock().unwrap().transcript, *live, "the daemon's fold of the file");
-            assert_eq!(chat.store.lock().unwrap().transcript, *live, "the daemon's fold of the live events");
+            assert_eq!(back.store.lock().transcript, *live, "the daemon's fold of the file");
+            assert_eq!(chat.store.lock().transcript, *live, "the daemon's fold of the live events");
             let (again, _) = chat.history_and_subscribe(&tx);
             assert_eq!(history, again, "a reattach to the live chat sends the restore's history, byte for byte");
             back

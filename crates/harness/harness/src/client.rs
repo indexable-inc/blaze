@@ -75,15 +75,81 @@ fn decode_down(payload: &[u8]) -> Result<Down> {
     harness_proto::cbor::decode(payload).map_err(|e| anyhow!("harnessd sent a message that is not harness schema {}'s: {e}", harness_proto::SCHEMA))
 }
 
-/// Open a connection: this client's hello, and the daemon's (an error naming both schemas when they differ).
+/// How long a daemon has to answer the hello.
+pub const HELLO_WAIT: Duration = Duration::from_secs(3);
+
+/// A daemon that took the connection but did not answer the hello in [`HELLO_WAIT`]: most likely an older one that
+/// predates the CBOR hello. Named by its pid (the socket's peer credentials) and socket.
+#[derive(Debug)]
+pub struct NoHello {
+    pub pid: Option<i32>,
+    pub sock: std::path::PathBuf,
+}
+
+impl std::fmt::Display for NoHello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pid = self.pid.map_or("unknown".to_owned(), |p| p.to_string());
+        write!(
+            f,
+            "harnessd (pid {pid}, socket {}) did not answer the hello within {}s: it is likely an older daemon that does not speak harness schema {}; run `harness stop` and try again",
+            self.sock.display(),
+            HELLO_WAIT.as_secs(),
+            harness_proto::SCHEMA
+        )
+    }
+}
+
+impl std::error::Error for NoHello {}
+
+/// Open a connection: this client's hello, and the daemon's (an error naming both schemas when they differ), within
+/// [`HELLO_WAIT`] ([`NoHello`] past it).
 pub async fn hello(s: &mut UnixStream) -> Result<()> {
     send(s, &Up::Hello { schema: harness_proto::SCHEMA }).await?;
-    match recv(s).await? {
+    let answer = match tokio::time::timeout(HELLO_WAIT, recv(s)).await {
+        Ok(answer) => answer?,
+        Err(_) => return Err(NoHello { pid: s.peer_cred().ok().and_then(|c| c.pid()), sock: paths::sock() }.into()),
+    };
+    match answer {
         Down::Hello { schema, .. } if schema == harness_proto::SCHEMA => Ok(()),
         Down::Hello { schema, .. } => bail!("harnessd speaks harness schema {schema}, this client {}", harness_proto::SCHEMA),
         Down::Error { error } => bail!("harnessd refused the connection: {error}"),
         m => bail!("harnessd answered the hello with {m:?}"),
     }
+}
+
+/// Stop the daemon: `shutdown` (it kills every session first). A daemon this client cannot speak to (no hello in
+/// [`HELLO_WAIT`], or another schema's) is sent SIGTERM, by the pid its socket's peer credentials name, and waited for
+/// a few seconds.
+pub async fn stop() -> Result<()> {
+    let sock = paths::sock();
+    let Ok(mut s) = UnixStream::connect(&sock).await else {
+        println!("harnessd is not running (nothing listens at {})", sock.display());
+        return Ok(());
+    };
+    let refused = match hello(&mut s).await {
+        Ok(()) => {
+            let _ = Ctl { stream: s }.req(Request::Shutdown).await;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    let Some(pid) = s.peer_cred().ok().and_then(|c| c.pid()) else {
+        return Err(refused.context(format!("stopping harnessd at {}: its pid is unknown, so it cannot be signalled", sock.display())));
+    };
+    // SAFETY: kill(2) with a pid and a signal number; no memory is shared.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(refused.context(format!("stopping harnessd pid {pid} ({}): SIGTERM failed: {e}", sock.display())));
+    }
+    for _ in 0..60 {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            println!("stopped harnessd pid {pid} with SIGTERM ({refused:#})");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("harnessd pid {pid} ({}) is still running 3s after SIGTERM; kill it with `kill -9 {pid}`", sock.display())
 }
 
 /// Connect to harnessd, starting it detached (own session, log file) if nothing is listening.

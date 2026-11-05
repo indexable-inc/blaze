@@ -10,11 +10,11 @@
 import * as acorn from "acorn";
 import { nuon } from "./nuon.ts";
 import { installCapture, inTask, newTask, watchTasks, type Task } from "./tasks.ts";
-import { req, daemonPresent } from "./daemon.ts";
+import { req, daemonPresent, listen } from "./daemon.ts";
 import { install as installEffects, fsFor, rawsOf } from "./effects.ts";
 import { shown } from "./shown.ts";
 import { stripCell } from "./ui/compile.ts";
-import { count, installUi, isElement, show } from "./ui/index.ts";
+import { count, dispatch, installUi, isElement, show, uiError } from "./ui/index.ts";
 
 // This REPL process as the parent of its cells' objects in the harness index (`<repl>.t3`, kind repl).
 export const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
@@ -37,9 +37,21 @@ export function body(t: Task) {
   };
 }
 
+/** This kernel's UI feed (daemon.ts `listen`), opened when a cell first draws UI: what the person does to it comes back here. */
+let feed: { stop(): void } | undefined;
+function listenOnce() {
+  if (feed || !daemonPresent()) return;
+  feed = listen(REPL_ID, (ev) => {
+    const id = ev.cell.slice(ev.cell.lastIndexOf(".") + 1);
+    if (ev.cell !== `${REPL_ID}.${id}`) return console.error(`[harness] ui event for cell ${ev.cell}: not this kernel's (${REPL_ID})`);
+    dispatch(id, ev.handler, ev.value).then((why) => { if (why) console.error(`[harness] ${why}`); });
+  });
+}
+
 /** Index a cell in harnessd (best effort; the REPL works without the daemon): now when it starts or ends (`now`), else within POST_MS. */
 function post(t: Task, now = false) {
   if (!daemonPresent()) return;
+  if (t.ui !== undefined) listenOnce();
   const first = !posting.has(t);
   const p = posting.get(t) ?? posting.set(t, { chain: Promise.resolve() }).get(t)!;
   const send = () => {
@@ -155,6 +167,9 @@ export class Repl {
       if (t.ui !== undefined) return { ok: true, value, result: `UI shown (${count(t.ui)} elements)${value === undefined ? "" : `\n${typeof value === "string" ? value : nuon(value, { maxRows: 100 })}`}` };
       return { ok: true, value, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }) };
     } catch (e) {
+      // An error that came through the cell's UI is said at the cell's line, without Svelte's frames or the kernel's (ui/index.ts).
+      const ui = uiError(e);
+      if (ui !== undefined) return { ok: false, value: e, result: ui };
       // Drop the harness frames below the cell.
       const stack = e instanceof Error ? (e.stack ?? e.message).split("\n") : [String(e)];
       const cut = stack.findIndex((l) => l.includes("at #run "));

@@ -5,7 +5,9 @@
 //! per request: [`Down::Reply`] or [`Down::Error`]. An `attach` or `watch` request turns the connection into a stream:
 //! after its reply come terminal bytes ([`crate::frame::T_DATA`]) or chat events ([`crate::frame::T_EVENT`]),
 //! [`Down::Exit`] when the session's process ends, [`Down::Changed`] on a watch; the client sends keys
-//! ([`crate::frame::T_DATA`]), [`Up::Resize`], and [`Up::Detach`] to end it.
+//! ([`crate::frame::T_DATA`]), [`Up::Resize`], and [`Up::Detach`] to end it. A `ui_listen` request (the kernel's) turns
+//! it into the feed of what the person does to the UI its cells drew: a [`Down::Ui`] per [`Request::UiEvent`] the app
+//! sends for one of its cells.
 //!
 //! Each map is tagged by `t` (and a request by `op`, a reply by `reply`), so the kernel reads a reply as one flat map.
 //! The parts whose shape another program owns stay open records ([`Value`]): a REPL cell as the kernel posts it, a tool
@@ -45,6 +47,14 @@ pub enum Down {
     Changed {
         #[serde(rename = "gen")]
         generation: u64,
+    },
+    /// On a `ui_listen` stream: the person did something to cell `cell`'s UI; run its handler `handler` with `value`
+    /// (the [`Request::UiEvent`] as the app sent it).
+    Ui {
+        cell: String,
+        handler: String,
+        #[serde(default)]
+        value: Value,
     },
 }
 
@@ -119,6 +129,20 @@ pub enum Request {
         #[serde(flatten)]
         task: Value,
     },
+    /// The person did something to a cell's UI (the app sends it): cell `cell` (`<repl>.<task>`, a tool detail's `cell`)
+    /// runs handler `handler` (the id the UI's node carries, `h3`) with `value` (a toggle's new state, a slider's number,
+    /// a field's text; null for a press). The daemon hands it to the kernel listening for `<repl>`, or refuses naming the
+    /// cell when none is.
+    UiEvent {
+        cell: String,
+        handler: String,
+        #[serde(default)]
+        value: Value,
+    },
+    /// Hold the connection as kernel `repl`'s UI feed (the kernel sends it): a [`Reply::Listening`], then a [`Down::Ui`]
+    /// per [`Request::UiEvent`] for one of its cells, until the client goes. A newer listener for the same `repl`
+    /// replaces this one.
+    UiListen { repl: String },
     /// The object API (crates/harness/harness/src/object.rs): get-or-create any kind, one object's record, and RPC to it.
     SpawnObject {
         #[serde(flatten)]
@@ -228,6 +252,8 @@ pub enum Reply {
     Attached { info: SessionInfo },
     /// `watch`: the change feed follows.
     Watching,
+    /// `ui_listen`: the UI feed follows.
+    Listening,
     /// A run's or an object's answer, an open record whose shape runs.rs and object.rs define.
     Record(Value),
 }
@@ -260,6 +286,9 @@ pub struct SessionInfo {
     pub mode: String,
     /// A chat's model, as its agent said.
     pub model: Option<String>,
+    /// A chat's reasoning effort, as its launch chose or its agent said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// It ended before this daemon started (set by `list`).
     #[serde(default)]
     pub past: bool,

@@ -29,6 +29,10 @@ hn {
     archive_after {
       Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
+    // The same for a top-level session from before the daemon started.
+    archive_past_after {
+      Size: {w: {kind: Fixed, value: $archive_past_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
     // A tree level's indent, and a failure badge's padding while it shows.
     indent {
       Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
@@ -60,14 +64,11 @@ hn {
     window_back { Motion: {omega: $window_back_omega, zeta: $window_back_zeta} }
     // A tree row folding in or away (its height and opacity).
     tree_fold { Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta} }
-    // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it), and how
-    // far an edge with more beyond it fades. Its knob is the ui.Scroll's overlay scroller (prims.flecs ui.Scroller).
+    // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it). Its knob
+    // is the ui.Scroll's overlay scroller (prims.flecs ui.Scroller); its edge fade is hn.Tree's ClipFade.
     tree_scroll {
       Motion: {omega: $tree_glide_omega, zeta: $tree_glide_zeta}
       Size: {w: {kind: Fixed, value: $tree_reveal_margin, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
-    }
-    tree_fade {
-      Size: {w: {kind: Fixed, value: $tree_fade_len, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
     }
   }
 }

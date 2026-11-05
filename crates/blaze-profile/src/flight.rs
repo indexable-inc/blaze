@@ -3941,6 +3941,11 @@ pub struct OpenSpan {
     /// A wait's `awaits` and `owner`, as in `spans`.
     pub awaits: Option<std::sync::Arc<str>>,
     pub owner: Option<u64>,
+    /// The build its thread worked for as it opened ([`building`]: the daemon plane's request
+    /// number); 0 for none.
+    pub build: u32,
+    /// A daemon `task` span's plane node ([`crate::span::col::Node`]); `None` for any other.
+    pub node: Option<u64>,
 }
 
 /// A live thread and the spans it is inside now, outermost first.
@@ -3988,6 +3993,8 @@ pub fn threads_now() -> Vec<ThreadNow> {
                     unit: self::name(opened.unit as Sym),
                     awaits: opened.said().value::<span::col::Awaits>().and_then(span::Name::text),
                     owner: opened.said().value::<span::col::Owner>(),
+                    build: opened.build,
+                    node: opened.said().value::<span::col::Node>(),
                 })
             })
             // alloc: a dump, on demand

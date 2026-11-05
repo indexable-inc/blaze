@@ -55,7 +55,8 @@ impl Net for Fake {
         &self,
         _url: &str,
         _headers: &[(&str, &str)],
-        sink: &mut (dyn FnMut(&[u8]) -> std::io::Result<()> + Send),
+        from: u64,
+        sink: &mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send),
     ) -> Result<(), Failure> {
         let ask = self.asks.fetch_add(1, Ordering::SeqCst);
         if let Some((started, gate)) = &self.gate {
@@ -63,16 +64,21 @@ impl Net for Fake {
             gate.recv().unwrap();
         }
         if ask < self.fail {
-            // Half a body, then a cut: a retry must start from nothing.
-            sink(&self.body[..self.body.len() / 2])
+            // The body up to its middle, then a cut: a retry resumes from there.
+            let half = self.body.len() / 2;
+            let from = usize::try_from(from).unwrap().min(half);
+            sink(from as u64, &self.body[from..half])
                 .map_err(|e| Failure::Permanent(e.to_string()))?;
             return Err(Failure::Transient("connection reset".to_owned()));
         }
         // Small pieces for a small body, so a piece boundary falls everywhere; large ones for
-        // a body of several chunks, which would otherwise take millions of calls.
+        // a body of several chunks, which would otherwise take millions of calls. Like a
+        // server that ignores ranges, it sends the whole body from its start.
         let step = if self.body.len() > 1 << 16 { 1 << 16 } else { 7 };
+        let mut at = 0u64;
         for piece in self.body.chunks(step) {
-            sink(piece).map_err(|e| Failure::Permanent(e.to_string()))?;
+            sink(at, piece).map_err(|e| Failure::Permanent(e.to_string()))?;
+            at += piece.len() as u64;
         }
         Ok(())
     }
@@ -760,4 +766,111 @@ fn a_request_is_checked_one_way_wherever_it_comes_from() {
     assert!(from_fields(None, Some("https://e.com/r"), Some("main"), None).is_err());
     assert!(from_fields(Some("u"), Some("r"), Some(REV), None).is_err());
     assert!(from_fields(None, None, None, None).is_err());
+}
+
+/// One answer of [`Cutting`]: whether it keeps to the range asked, where it cuts the transfer
+/// (past the body's end: it ends whole), and whether it lies, saying the range asked while
+/// sending the body from its start (the planted fault the pin must catch).
+#[derive(Clone, Copy, Debug)]
+struct Answer {
+    ranged: bool,
+    cut: usize,
+    lies: bool,
+}
+
+/// A server that answers by a script, then whole and true; it counts the bytes it sends.
+struct Cutting {
+    body: Vec<u8>,
+    script: Vec<Answer>,
+    asked: std::sync::atomic::AtomicUsize,
+    sent: std::sync::atomic::AtomicUsize,
+}
+
+impl Net for Cutting {
+    fn get(
+        &self,
+        _url: &str,
+        _headers: &[(&str, &str)],
+        from: u64,
+        sink: &mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send),
+    ) -> Result<(), Failure> {
+        let ask = self.asked.fetch_add(1, Ordering::SeqCst);
+        let len = self.body.len();
+        let answer = self.script.get(ask).copied().unwrap_or(Answer { ranged: true, cut: len, lies: false });
+        let from = usize::try_from(from).unwrap().min(len);
+        let start = if answer.ranged { from } else { 0 };
+        let end = answer.cut.clamp(start, len);
+        let (offset, bytes) = if answer.lies {
+            (start, &self.body[..end - start])
+        } else {
+            (start, &self.body[start..end])
+        };
+        let mut at = offset as u64;
+        for piece in bytes.chunks(5) {
+            sink(at, piece).map_err(|e| Failure::Permanent(e.to_string()))?;
+            at += piece.len() as u64;
+            self.sent.fetch_add(piece.len(), Ordering::SeqCst);
+        }
+        if end < len {
+            return Err(Failure::Transient("connection reset".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+/// Resuming a cut download, through any order of cuts, servers that ignore ranges and servers
+/// that lie about them: the store only ever gets the pinned bytes (a lie is a mismatch, and its
+/// partial goes), an honest server's body is got in the end with no partial left, and when
+/// every answer keeps to its range and none lies no byte is sent twice: each try resumes where
+/// the last stopped, even across `get`s (as across attempts of a build). With resume taken out
+/// (a try from nothing) that last check fails on the first cut.
+#[hegel::test]
+fn a_cut_download_resumes_and_keeps_only_the_pinned_bytes(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let len: usize = tc.draw(gs::integers().min_value(1).max_value(200));
+    let body: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+    let script: Vec<Answer> = tc
+        .draw(
+            gs::vecs(gs::tuples!(gs::booleans(), gs::integers().max_value(len + 10), gs::integers().max_value(9)))
+                .max_size(12),
+        )
+        .into_iter()
+        .map(|(ranged, cut, lie): (bool, usize, u8)| Answer { ranged, cut, lies: lie == 0 })
+        .collect();
+    let honest = script.iter().all(|it| it.ranged && !it.lies);
+    let dir = tempfile::tempdir().unwrap();
+    let (_driven, store) = store(dir.path());
+    let net = Arc::new(Cutting {
+        body: body.clone(),
+        script: script.clone(),
+        asked: std::sync::atomic::AtomicUsize::new(0),
+        sent: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let flights = Box::leak(Box::new(Flights::new()));
+    let fetcher = Fetcher::new(StoreOf::Given(store), Arc::clone(&net) as Arc<dyn Net>, dir.path().join("scratch"))
+        .with_policy(quick())
+        .with_flights(flights);
+    let pin = Digest::of(Algo::Sha256, &body);
+    let mut got = None;
+    // Each `get` is a build's attempt; the script runs out within 13 asks, and then the server
+    // is whole and true.
+    for _ in 0..16 {
+        match fetcher.get(&url(pin)) {
+            Ok(object) => {
+                got = Some(object);
+                break;
+            }
+            Err(FetchError::GaveUp { .. }) => {}
+            Err(FetchError::Mismatch { .. }) => {
+                assert!(script.iter().any(|it| it.lies), "a mismatch with no lie: {script:?}");
+            }
+            Err(other) => panic!("{other} ({script:?})"),
+        }
+    }
+    let object = got.unwrap_or_else(|| panic!("never got the body: {script:?}"));
+    assert_eq!(&*fetcher.bytes(&object).unwrap(), &body[..], "{script:?}");
+    assert_eq!(std::fs::read_dir(dir.path().join("scratch")).unwrap().count(), 0, "a partial is left");
+    if honest {
+        assert_eq!(net.sent.load(Ordering::SeqCst), len, "a byte was sent twice: {script:?}");
+    }
 }

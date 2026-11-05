@@ -12,18 +12,18 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{PaintKind, Painted};
 use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
-use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
+use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, Stroke, TextStyle};
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
     BlazeMark, Caret, Frames, Highlight, Mark, MarkdownText, OneLine, Picture, Pixelated, Text,
-    TextEdit, Truncate, TruncateMode,
+    TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
 use harness_native_ui_timeline_api::GlyphsIn;
 
 use crate::draw::{ATLAS_SIZE, Draw};
 use crate::select;
-use crate::pack::{GlyphInst, ImageInst, PanelInst};
+use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst};
 use crate::text::{Face, Fonts, Glyph, GlyphCache, Layout, SUBPX, Style, TypeLook};
 
 /// The atlas uploader a frame is drawn with: `(x, y, w, h, bytes)` into the glyph atlas.
@@ -49,7 +49,12 @@ pub struct Painter {
     highlight: crate::highlight::Highlighter,
     /// Where a `Picture`'s handle is a path under (the scene's directory); None: this host draws no pictures.
     pub media: Option<PathBuf>,
+    /// Each `Vector`'s path data read once (vector.rs), by its `d`.
+    paths: HashMap<String, Rc<[crate::vector::Seg]>>,
 }
+
+/// The most points one `Vector` node flattens to; past it the path is cut and the node's paint fails, named.
+pub const MAX_VECTOR_POINTS: usize = 20_000;
 
 /// What [`Painter::node`] did with a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +63,8 @@ pub struct Emitted {
     pub panels: usize,
     pub glyphs: usize,
     pub images: usize,
+    pub lines: usize,
+    pub paths: usize,
 }
 
 /// The `Style` a `TextStyle` sets (14 points on 1.3 lines unless it says).
@@ -155,15 +162,16 @@ pub fn emit_layout(
     limit: usize,
     upload: &mut Upload<'_>,
 ) {
-    emit_glyphs(d, fonts, cache, lay, at, sc, upload, &mut |n, _| {
+    emit_glyphs(d, fonts, cache, lay, at, sc, upload, None, &mut |n, _| {
         (n < limit).then_some((ink, alpha, 0.0))
     });
 }
 
 /// A layout's glyphs at `(ox, oy)`, each as `look(n, glyph)` says (its ink, opacity and how far below its place it sits,
 /// points), stopping at the first it gives None. Glyphs in place snap to the device pixel grid with den's subpixel steps;
-/// one still moving is drawn where it is. Where the pen stands after the last one drawn (x, its line's top and height),
-/// in points, if any was.
+/// one still moving is drawn where it is. `grow` grows the glyphs of a UTF-16 range (a copied selection, under its pulse)
+/// as their plate grows. Where the pen stands after the last one drawn (x, its line's top and height), in points, if any
+/// was.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_glyphs(
     d: &mut Draw,
@@ -173,6 +181,7 @@ pub fn emit_glyphs(
     (ox, oy): (f32, f32),
     sc: f32,
     upload: &mut Upload<'_>,
+    grow: Option<(usize, usize, select::Grow)>,
     look: &mut dyn FnMut(usize, &Glyph) -> Option<([f32; 4], f32, f32)>,
 ) -> Option<(f32, f32, f32)> {
     let asz = cache.size as f32;
@@ -198,13 +207,13 @@ pub fn emit_glyphs(
             }
             let mut col = ink;
             col[3] *= alpha;
+            let rect = [(ix + e.left as f32) / sc, (base_px - e.top as f32) / sc, e.w as f32 / sc, e.h as f32 / sc];
+            let rect = match grow {
+                Some((lo, hi, gr)) if (lo..hi).contains(&g.idx) => gr.rect(rect),
+                _ => rect,
+            };
             d.glyph(GlyphInst {
-                rect: [
-                    (ix + e.left as f32) / sc,
-                    (base_px - e.top as f32) / sc,
-                    e.w as f32 / sc,
-                    e.h as f32 / sc,
-                ],
+                rect,
                 uv: [
                     e.x as f32 / asz,
                     e.y as f32 / asz,
@@ -232,6 +241,7 @@ impl Painter {
             widths: HashMap::new(),
             sheets: HashMap::new(),
             marks: HashMap::new(),
+            paths: HashMap::new(),
             highlight: crate::highlight::Highlighter::default(),
             media: None,
         }
@@ -377,7 +387,13 @@ impl Painter {
         sc: f32,
         upload: &mut Upload<'_>,
     ) -> Result<Emitted, String> {
-        let at = Emitted { panels: d.panels.len(), glyphs: d.glyphs.len(), images: d.images.len() };
+        let at = Emitted {
+            panels: d.panels.len(),
+            glyphs: d.glyphs.len(),
+            images: d.images.len(),
+            lines: d.lines.len(),
+            paths: d.paths.len(),
+        };
         let rect = [laid.x, laid.y, laid.w, laid.h];
         let ink = e
             .try_cloned::<&Fill>()
@@ -439,10 +455,10 @@ impl Painter {
                     d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
                 }
                 // A copied plate (a table's row): the selection's plate over it for as long as the copy's pulse lasts.
-                if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.amount() > 0.0) {
+                if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.live()) {
                     let look = select::Look::of(e.world());
                     let plate = [select::Plate::of(rect[0], rect[1], rect[2], rect[3])];
-                    select::emit(d, &plate, &look, look.colour(dark), Some(f), p.alpha * f.amount(), sc);
+                    select::emit(d, &plate, &look, look.colour(dark), Some(f), p.alpha * f.amount().max(f.light()), sc);
                 }
             }
             PaintKind::Glyphs => {
@@ -523,7 +539,9 @@ impl Painter {
                     let col = std::array::from_fn(|k| col[k] + (hot[k] - col[k]) * heat);
                     Some((col, p.alpha * a, dy))
                 };
-                // The selection, under the words: one joined shape over the rows it covers, pulsing after a copy.
+                // The selection, under the words: one joined shape over the rows it covers, pulsing after a copy, the
+                // words it holds growing with it.
+                let mut grow = None;
                 if let Some(t) = edit.filter(|t| t.anchor != t.caret) {
                     let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
                     let plates: Vec<select::Plate> = spans_of(&lay, lo, hi)
@@ -531,7 +549,9 @@ impl Painter {
                         .map(|r| select::Plate::of(laid.x + r[0], laid.y + r[1], r[2], r[3]))
                         .collect();
                     let look = select::Look::of(e.world());
-                    select::emit(d, &plates, &look, look.colour(dark), e.try_cloned::<&CopyFlash>(), p.alpha, sc);
+                    let flash = e.try_cloned::<&CopyFlash>();
+                    grow = select::Grow::of(&plates, &look, flash).map(|g| (lo, hi, g));
+                    select::emit(d, &plates, &look, look.colour(dark), flash, p.alpha, sc);
                 }
                 let pen = emit_glyphs(
                     d,
@@ -541,15 +561,28 @@ impl Painter {
                     (laid.x, laid.y),
                     sc,
                     upload,
+                    grow,
                     &mut look,
                 );
                 if let Some(m) = md {
                     // Code spans on a chip, a plate per line they cover.
                     let chip = rgba(if dark { m.chip_dark } else { m.chip_light });
-                    let shape = Shape { radius: 3.0, n: 4.0, border: 0.0, feather: 0.0 };
-                    for &(lo, hi) in shown_md.as_ref().map_or(&[][..], |m| m.code.as_slice()) {
-                        for r in spans_of(&lay, lo, hi) {
-                            let rect = [laid.x + r[0] - 3.0, laid.y + r[1] + 1.0, r[2] + 6.0, r[3] - 2.0];
+                    let shape = Shape { radius: crate::markdown::CHIP_RADIUS, n: 4.0, border: 0.0, feather: 0.0 };
+                    let size = set_of(&style).size;
+                    let inset = size * crate::markdown::CHIP_INSET_EM;
+                    let (units, code): (Vec<u16>, &[(usize, usize)]) = shown_md
+                        .as_ref()
+                        .map_or((Vec::new(), &[][..]), |m| (m.text.encode_utf16().collect(), m.code.as_slice()));
+                    for &(lo, hi) in code {
+                        // The span's carets are half the room the typesetter left (chip_room) outside its glyphs; the
+                        // plate reaches `inset` past the glyphs either side, into that room.
+                        let (before, after) = crate::markdown::chip_room(&units, lo, hi, size);
+                        let rects = spans_of(&lay, lo, hi);
+                        let last = rects.len().saturating_sub(1);
+                        for (k, r) in rects.into_iter().enumerate() {
+                            let x0 = r[0] + if k == 0 { before * 0.5 } else { 0.0 } - inset;
+                            let x1 = r[0] + r[2] - if k == last { after * 0.5 } else { 0.0 } + inset;
+                            let rect = [laid.x + x0, laid.y + r[1] + 1.0, x1 - x0, r[3] - 2.0];
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
                         }
                     }
@@ -642,6 +675,7 @@ impl Painter {
                     e.path()
                 ));
             }
+            PaintKind::Vector => self.vector(d, e, p, laid, dark, sc, upload)?,
         }
         // A transition's scale: what this node drew, scaled about its corner.
         if (p.scale - 1.0).abs() > 1e-4 && p.scale > 0.0 {
@@ -689,8 +723,109 @@ impl Painter {
                 m.clip[..2].copy_from_slice(&band);
                 m.clipx[..2].copy_from_slice(&across);
             }
+            for l in &mut d.lines[at.lines..] {
+                l.clip[..2].copy_from_slice(&band);
+                l.clipx[..2].copy_from_slice(&across);
+            }
+            for f in &mut d.paths[at.paths..] {
+                f.clip[..2].copy_from_slice(&band);
+                f.clipx[..2].copy_from_slice(&across);
+            }
         }
         Ok(at)
+    }
+
+    /// A `Vector` node: its path data through its transform and view box into its box (less its insets), filled in its
+    /// `Fill` (none when that is clear) and stroked in its `Stroke`, then its `VectorText` at its point. Strokes and fills
+    /// are cut to device-pixel accuracy; a transition's scale is folded into the mapping (the caller scales only panels,
+    /// glyphs and images).
+    #[allow(clippy::too_many_arguments)]
+    fn vector(
+        &mut self,
+        d: &mut Draw,
+        e: EntityView<'_>,
+        p: &Painted,
+        laid: Laid,
+        dark: bool,
+        sc: f32,
+        upload: &mut Upload<'_>,
+    ) -> Result<(), String> {
+        let Some(v) = e.try_cloned::<&Vector>() else { return Ok(()) };
+        let pick = |c: (Rgba, Rgba)| rgba(if dark { c.0 } else { c.1 });
+        let fill = e.try_cloned::<&Fill>().map(|f| pick((f.dark, f.light)));
+        let stroke = e.try_cloned::<&Stroke>().map(|s| pick((s.dark, s.light)));
+        let map = VectorMap::new(&v, laid, p.scale);
+        let segs = if v.d.as_str().trim().is_empty() {
+            None
+        } else if let Some(s) = self.paths.get(v.d.as_str()) {
+            Some(s.clone())
+        } else {
+            let segs: Rc<[crate::vector::Seg]> = crate::vector::segments(v.d.as_str())
+                .map_err(|err| format!("{}: Vector path data: {err}", e.path()))?
+                .into();
+            if self.paths.len() > 4096 {
+                self.paths.clear();
+            }
+            self.paths.insert(v.d.as_str().to_owned(), segs.clone()); // alloc: the parse cache, cleared past 4096 paths
+            Some(segs)
+        };
+        if let Some(segs) = segs {
+            // A quarter of a device pixel off the true curve at most.
+            let tol = 0.25 / sc.max(0.1);
+            let (rings, cut) = crate::vector::flatten(&segs, |q| map.at(q), tol, MAX_VECTOR_POINTS);
+            if cut {
+                return Err(format!(
+                    "{}: Vector path flattens to more than {MAX_VECTOR_POINTS} points; draw it with fewer",
+                    e.path()
+                ));
+            }
+            if let Some(ink) = fill.filter(|c| c[3] > 0.0) {
+                // alloc: this node's rings as plain polygons, for one frame
+                let polys: Vec<Vec<[f32; 2]>> = rings.iter().map(|r| r.pts.clone()).collect();
+                if let Some(inst) = PathInst::fill(&polys, v.even_odd, (ink, ink), p.alpha, &mut d.edges) {
+                    d.path(inst);
+                }
+            }
+            if let Some(ink) = stroke.filter(|c| c[3] > 0.0) {
+                let w = if v.stroke_w > 0.0 { v.stroke_w } else { 1.0 };
+                let w = if v.stroke_fixed { w * p.scale.max(0.0) } else { w * map.unit };
+                for r in &rings {
+                    let mut pts = r.pts.clone(); // alloc: one ring's stroke points, for one frame
+                    if r.closed && pts.first() != pts.last() {
+                        pts.push(pts[0]);
+                    }
+                    for l in LineInst::stroke(&pts, w, (ink, ink), p.alpha) {
+                        d.line(l);
+                    }
+                }
+            }
+        }
+        if let Some(t) = e.try_cloned::<&VectorText>() {
+            let ink = fill.unwrap_or([0.9, 0.9, 0.92, 1.0]);
+            let size = if t.size > 0.0 { t.size } else { 12.0 };
+            // The text is drawn at the node's own scale (the caller scales its glyphs by a transition's).
+            let size = if v.stroke_fixed { size } else { size * map.unit / p.scale.max(1e-3) };
+            let style = TextStyle {
+                size,
+                line: (size * 1.25).ceil(),
+                bold: i32::from(t.bold),
+                ..TextStyle::default()
+            };
+            let lay = self.layout(t.s.as_str(), &style, 1.0e5);
+            let w = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max);
+            let base = lay.lines.first().map_or(size, |l| l.baseline);
+            let k = p.scale.max(1e-3);
+            let [x, y] = map.at([f64::from(t.x), f64::from(t.y)]);
+            // Undo the transition's scale here; the caller applies it to the glyphs about the node's corner.
+            let (x, y) = (laid.x + (x - laid.x) / k, laid.y + (y - laid.y) / k);
+            let x = x - w * match t.anchor {
+                1 => 0.5,
+                2 => 1.0,
+                _ => 0.0,
+            };
+            emit_layout(d, &self.fonts, &mut self.cache, &lay, (x, y - base), ink, p.alpha, sc, usize::MAX, upload);
+        }
+        Ok(())
     }
 
     /// A picture, drawn as pixel art: one texture whose texels are fetched, never filtered, so each is a crisp block with no
@@ -714,10 +849,34 @@ impl Painter {
         }
         let Some(pic) = e.try_cloned::<&Picture>() else { return Ok(()) };
         if !e.has(Pixelated::id()) {
-            return Err(format!(
-                "{path}: Picture {:?} without Pixelated: only pixel art is drawn so far",
-                pic.handle.as_str()
-            ));
+            // A photo (an absolute path to a PNG or JPEG): filtered, covering its box, cut to the box's shape about its
+            // middle (layout gives a contained photo a box of its own shape).
+            let handle = pic.handle.as_str();
+            if !handle.starts_with('/') {
+                return Err(format!(
+                    "{path}: Picture {handle:?} without Pixelated: a photo is an absolute path, pixel art is Pixelated"
+                ));
+            }
+            let rest = e.try_cloned::<&Laid>().map_or([rect[2], rect[3]], |l| [l.w, l.h]);
+            if rest[0] <= 0.0 || rest[1] <= 0.0 {
+                return Ok(());
+            }
+            // The shape to a thousandth, so a box that wobbles by a fraction of a point decodes once.
+            let milli = (rest[0] / rest[1] * 1000.0).round().max(1.0) as u32;
+            let key = format!("photo:{milli}:{handle}");
+            let sheet = match self.sheets.get(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0))
+                        .map_err(|err| format!("{path}: {err}"))?;
+                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba] });
+                    self.sheets.insert(key, s.clone());
+                    s
+                }
+            };
+            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4] };
+            d.image(img, sheet.frames[0].clone());
+            return Ok(());
         }
         let frames = e.try_cloned::<&Frames>().unwrap_or(Frames { count: 1, fps: 0.0 });
         let sheet = self
@@ -883,6 +1042,58 @@ pub fn caret_blink(since: f32) -> f32 {
     let v = (t * std::f32::consts::TAU / BLINK_PERIOD).cos();
     let k = (v + 0.5).clamp(0.0, 1.0);
     k * k * (3.0 - 2.0 * k)
+}
+
+/// A `Vector`'s user units into points: its transform, then its view box fitted into its node's box less its insets,
+/// then a transition's scale about the node's corner.
+struct VectorMap {
+    m: [f64; 6],
+    sx: f64,
+    sy: f64,
+    tx: f64,
+    ty: f64,
+    /// Points per user unit (the geometric mean of both axes and the transform): what a scaling stroke is multiplied by.
+    unit: f32,
+}
+
+impl VectorMap {
+    fn new(v: &Vector, laid: Laid, scale: f32) -> Self {
+        let m = if v.ma == 0.0 && v.mb == 0.0 && v.mc == 0.0 && v.md == 0.0 {
+            [1.0, 0.0, 0.0, 1.0, f64::from(v.me), f64::from(v.mf)]
+        } else {
+            [v.ma, v.mb, v.mc, v.md, v.me, v.mf].map(f64::from)
+        };
+        let k = f64::from(if scale > 0.0 { scale } else { 1.0 });
+        let (bx, by) = (f64::from(laid.x + v.inset_l), f64::from(laid.y + v.inset_t));
+        let bw = f64::from((laid.w - v.inset_l - v.inset_r).max(0.0));
+        let bh = f64::from((laid.h - v.inset_t - v.inset_b).max(0.0));
+        let (vx, vy, vw, vh) = if v.view_w > 0.0 && v.view_h > 0.0 {
+            (f64::from(v.view_x), f64::from(v.view_y), f64::from(v.view_w), f64::from(v.view_h))
+        } else {
+            (0.0, 0.0, bw.max(1e-6), bh.max(1e-6))
+        };
+        let (mut sx, mut sy) = (bw / vw, bh / vh);
+        let (mut ox, mut oy) = (bx, by);
+        if v.fit == VectorFit::Meet {
+            let s = sx.min(sy);
+            ox += (bw - vw * s) * 0.5;
+            oy += (bh - vh * s) * 0.5;
+            (sx, sy) = (s, s);
+        }
+        let (lx, ly) = (f64::from(laid.x), f64::from(laid.y));
+        // Into the box, then about the node's corner by the transition's scale.
+        let tx = lx + (ox - vx * sx - lx) * k;
+        let ty = ly + (oy - vy * sy - ly) * k;
+        let det = (m[0] * m[3] - m[1] * m[2]).abs();
+        let unit = ((sx * sy).abs().sqrt() * det.sqrt() * k) as f32;
+        Self { m, sx: sx * k, sy: sy * k, tx, ty, unit }
+    }
+
+    fn at(&self, p: [f64; 2]) -> [f32; 2] {
+        let m = &self.m;
+        let (ux, uy) = (m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5]);
+        [(self.tx + ux * self.sx) as f32, (self.ty + uy * self.sy) as f32]
+    }
 }
 
 #[cfg(test)]

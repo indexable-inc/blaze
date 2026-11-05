@@ -55,8 +55,10 @@ hn {
   }
 
   // The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
-  // device row and the Archive pinned under it, and clips what does not fit.
+  // device row and the Archive pinned under it, and clips what does not fit: soft at an edge with more of it beyond
+  // (ClipFade, from the ScrollState its physics writes, src/app/sidebar.rs), hard at an edge it ends at.
   prefab Tree : ui.Scroll {
+    ClipFade: {len: $tree_fade_len}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $side_inset, r: 0, t: 0, b: 0}
@@ -67,6 +69,16 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $side_inset, r: 0, t: 0, b: 0}
+  }
+
+  // Over the Archive row: why the link is refused (src/link.rs `Refused`: a daemon that never answered the hello, or
+  // speaks another schema), naming its pid and socket and `harness stop`. No room and no words while it is not
+  // (src/app.rs sync_view sets its height and text).
+  prefab LinkNote : ui.Words {
+    Fill: $tone_failed
+    TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+    Padding: {l: $row_pad, r: $row_pad, t: 0, b: 8}
   }
 
   // The selected tree row's pill: a Background under the row (src/app.rs), matched by id so a new selection's pill

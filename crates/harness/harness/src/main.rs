@@ -10,6 +10,7 @@ mod paths;
 mod profiles;
 mod queries;
 mod runs;
+mod ui_feed;
 
 use anyhow::{Result, bail};
 use harness_proto::msg::{Reply, Request, RunReq};
@@ -92,11 +93,7 @@ async fn main() -> Result<()> {
         Some("app") => {
             open_app(None)
         }
-        Some("stop") => {
-            let mut ctl = client::Ctl::connect().await?;
-            let _ = ctl.req(Request::Shutdown).await;
-            Ok(())
-        }
+        Some("stop") => client::stop().await,
         Some("tee") => runs::tee(&arg(1)),
         Some("run") => {
             if args.len() < 2 {

@@ -9,6 +9,8 @@
 //!
 //! [`Transcript::feed`] takes the bytes of a chat attach stream (its event frames, harness-proto's `T_EVENT`) in any
 //! pieces; [`Transcript::apply`] one typed event.
+pub mod group;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -47,6 +49,8 @@ pub struct ToolResult {
 /// so a row that draws one holds it without a copy.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Detail {
+    /// The cell, `<repl>.<task>`: what an event from the UI it draws names (`Request::UiEvent`).
+    pub cell: String,
     /// `running`, `done` or `error`.
     pub status: String,
     pub ms: Option<u64>,
@@ -80,6 +84,7 @@ pub struct Effect {
 impl Detail {
     fn of(d: &ev::Detail) -> Self {
         Self {
+            cell: d.cell.clone(),
             status: d.status.clone(),
             ms: d.ms,
             code: d.code.clone(),
@@ -113,6 +118,8 @@ pub struct Transcript {
     pub busy: bool,
     pub agent: String,
     pub model: String,
+    /// The reasoning effort it runs with; empty when its `session` event did not say.
+    pub effort: String,
     /// The agent's own id for the conversation (Claude's session id, Codex's thread id): what resumes it. Empty when the
     /// log never said (a chat recorded before `session` events carried it).
     pub session_id: String,
@@ -132,8 +139,8 @@ pub struct Transcript {
 /// are bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
-        (&self.items, self.busy, &self.agent, &self.model, &self.session_id, &self.title, &self.details, &self.at)
-            == (&o.items, o.busy, &o.agent, &o.model, &o.session_id, &o.title, &o.details, &o.at)
+        (&self.items, self.busy, &self.agent, &self.model, &self.effort, &self.session_id, &self.title, &self.details, &self.at)
+            == (&o.items, o.busy, &o.agent, &o.model, &o.effort, &o.session_id, &o.title, &o.details, &o.at)
     }
 }
 
@@ -204,9 +211,10 @@ impl Transcript {
     pub fn apply(&mut self, e: &Event) {
         self.rev = self.rev.wrapping_add(1);
         match &e.body {
-            Body::Session { agent, model, session_id } => {
+            Body::Session { agent, model, session_id, effort } => {
                 self.agent.clone_from(agent);
                 self.model.clone_from(model);
+                self.effort = effort.clone().unwrap_or_default();
                 if let Some(id) = session_id.as_ref().filter(|id| !id.is_empty()) {
                     self.session_id.clone_from(id);
                 }

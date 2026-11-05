@@ -1,8 +1,10 @@
 import { createRequire } from 'node:module';
-import { ELEMENT_NAMES, COMPONENT, TONED, ViewNode, isKnownElement, propError, tableError, toneError } from './element.ts';
+import { AT, BINDABLE, BOUND_BY, ELEMENT_NAMES, COMPONENT, NOT_DRAWN, ViewNode, cellError, isKnownElement, notDrawnError } from './element.ts';
 import type { CellComponent, Handler } from './element.ts';
+import { SVG_TAGS, attributeError, isSvgTag, unknownTagError } from './draw.ts';
 import { FAILED_SNIPPET, PENDING_SNIPPET, compileComponent } from './compile.ts';
 import { sveltePath } from './files.ts';
+import { ASK_SOURCE } from './ask.ts';
 
 /*
  * Svelte 5 for a cell's UI: runes (`$state`, `$derived`, `$effect`, `$props`) with fine-grained updates, rendering into `ViewNode`s
@@ -10,7 +12,7 @@ import { sveltePath } from './files.ts';
  * the object `renderer` below (createElement, insert, setAttribute, addEventListener, ...) wherever the browser's would call the DOM.
  * This file loads that Svelte, gives the renderer nodes to work on, and makes every element name a preloaded component. Copied
  * from den's repl/src/ui/svelte.ts (den's docs/ui-runtime.md says why Svelte and which Svelte: the custom renderer is a pull
- * request that has not landed), without den's transitions, bindings and own elements.
+ * request that has not landed), without den's transitions and own elements.
  *
  * Which svelte: the package's own `exports` map hands a server build to anything that does not set the `custom-renderer` (or
  * `browser`) condition, and a server build has no reactivity, so the UI would draw once and never move. The client build is
@@ -87,7 +89,14 @@ const sibling = (node: ViewNode): ViewNode | null => {
 const renderer = {
   createFragment: () => ViewNode.fragment(),
   createElement(name: string): ViewNode {
-    if (!isKnownElement(name)) throw new TypeError(`unknown element ${JSON.stringify(name)}; the elements are ${ELEMENT_NAMES.join(', ')}`);
+    // An SVG tag is the Canvas element it is sent as, keeping its tag so its attributes are read as SVG's (draw.ts).
+    if (isSvgTag(name)) {
+      const node = ViewNode.element(SVG_TAGS[name]!);
+      node.from = name;
+      return node;
+    }
+    if (NOT_DRAWN.has(name)) throw cellError(notDrawnError(name));
+    if (!isKnownElement(name)) throw cellError(unknownTagError(name));
     return ViewNode.element(name);
   },
   createTextNode: (data: string) => ViewNode.text(String(data)),
@@ -96,11 +105,11 @@ const renderer = {
   getNodeValue: (node: ViewNode) => node.kind === 'text' || node.kind === 'comment' ? node.text : null,
   getAttribute: (node: ViewNode, name: string) => node.props[name] ?? null,
   setAttribute(node: ViewNode, name: string, value: unknown) {
-    // A tone the compiler could not wrap (one in a spread) is still refused, only without its line.
-    const error = name === 'tone' && TONED.has(node.type) ? toneError(node.type, value)
-      : node.type === 'Table' && (name === 'columns' || name === 'rows') ? tableError(name === 'columns' ? value : node.props.columns, name === 'rows' ? value : node.props.rows)
-      : propError(node.type, name, value);
-    if (error) throw error;
+    // Where the cell writes the element (compile.ts gives each its place first), kept off the wire for the errors below.
+    if (name === AT) { node.at = typeof value === 'string' ? value : undefined; return; }
+    // What compile.ts could not check at its line (a spread, a value made of text and expressions) is checked here, at the element's.
+    const error = attributeError(node.from ?? node.type, name, value, node.at, node.props);
+    if (error) throw placed(error, node.at);
     node.setProp(name, value);
   },
   removeAttribute(node: ViewNode, name: string) { node.setProp(name, undefined); },
@@ -116,15 +125,43 @@ const renderer = {
   insert: insertNode,
   remove: removeNode,
   getParent: (node: ViewNode) => node.parent ?? null,
-  addEventListener(node: ViewNode, type: string, handler: unknown) { node.listen(type, handler as Handler); },
+  addEventListener(node: ViewNode, type: string, handler: unknown) {
+    // An event the element has not (`onclick` on a Text, any on a shape) would never be called: refused, as a prop it has not is.
+    const error = attributeError(node.from ?? node.type, `on${type}`, handler, node.at);
+    if (error) throw placed(error, node.at);
+    node.listen(type, handler as Handler);
+  },
   removeEventListener(node: ViewNode, type: string, handler: unknown) { node.unlisten(type, handler as Handler); },
 };
 
+/** `error` as the cell's, at the line and column `at` (`line 5:3: ...`) names. */
+export function placed<E extends Error>(error: E, at: string | undefined): E {
+  const found = at ? /^line (\d+)(?::(\d+))?/.exec(at) : null;
+  return cellError(error, found ? Number(found[1]) : undefined, found?.[2] ? Number(found[2]) : 1);
+}
+
 const components = new Map<string, CellComponent>();
 
-/** Svelte source for one element as a component: its props are the element's, reactive ones updating just that attribute. */
+/**
+ * Svelte source for one element as a component: its props are the element's, reactive ones updating just that attribute. A bindable
+ * element (element.ts `BINDABLE`) declares its bound prop `$bindable()` and always listens for the events that write it back (`change`,
+ * or element.ts `BOUND_BY`: `toggle` for a fold or a float, `close` for a Dialog): the event's value (or the fixed one, `false` for a
+ * close) is written back to the prop first (so `bind:open` follows the person, and a plain `open={x}` still moves under their hand),
+ * then the cell's own handler runs. So a bound element always carries those handler ids. Copied from den's repl/src/ui/svelte.ts.
+ */
 export function hostSource(name: string): string {
-  return `<script>let { children, ...rest } = $props();</script><svelte:element this={${JSON.stringify(name)}} {...rest}>{@render children?.()}</svelte:element>`;
+  const bound = BINDABLE[name];
+  if (!bound) {
+    return `<script>let { children, ...rest } = $props();</script><svelte:element this={${JSON.stringify(name)}} {...rest}>{@render children?.()}</svelte:element>`;
+  }
+  const by = BOUND_BY[name] ?? [{ event: 'change' }];
+  const handlers = by.map(({ event }) => `on${event}`);
+  const writes = by.map(({ event, value }, i) => `  const write${i} = (v) => { ${bound} = ${value === undefined ? 'v' : JSON.stringify(value)}; return on${event}?.(v); };`).join('\n');
+  return `<script>
+  let { ${bound} = $bindable(), ${handlers.join(', ')}, children, ...rest } = $props();
+${writes}
+</script>
+<svelte:element this={${JSON.stringify(name)}} ${bound}={${bound}} ${handlers.map((h, i) => `${h}={write${i}}`).join(' ')} {...rest}>{@render children?.()}</svelte:element>`;
 }
 
 /** The component of a source Svelte compiled, as the preloaded runtime would evaluate it. */
@@ -178,7 +215,8 @@ function listed(props: Anything): string {
 }
 
 /** The error for a template name that is nothing: the name, where the template says it, and both places it could have come from. */
-function notDefined(name: string, entry: CellName, props: Anything): ReferenceError {
+function notDefined(name: string, entry: CellName, props: Anything): Error {
+  if (NOT_DRAWN.has(name)) return cellError(notDrawnError(name, entry.at), entry.line);
   const element = /^[A-Z]/.test(name) ? `; the elements are ${ELEMENT_NAMES.join(', ')}` : '';
   const error = new ReferenceError(`${name} is not defined (${entry.at}): it is neither a prop passed to render() nor a variable of the cell (${listed(props)})${element}`);
   error.stack = `ReferenceError: ${error.message}\n    at repl-cell.js:${entry.line}:1`;
@@ -213,12 +251,15 @@ function free(given: Anything | undefined, table: Record<string, CellName>): Any
   });
 }
 
-/** A `tone={...}` of `element` at cell line `line` (compile.ts `checkTones`): the value when it is a tone or none, else the error at that line. */
-function tone(value: unknown, element: string, line: number, at: string): unknown {
-  const error = toneError(element, value, at);
+/**
+ * A prop's `{...}` value on an element of the app's (or an SVG tag) at cell line `line` (compile.ts `checkElements`): the value when it
+ * is one the element reads, else the error at that line and column. `known` holds the element's other props whose values the markup
+ * writes as text (a Chart's `kind`), for the checks that read two together.
+ */
+function prop(value: unknown, element: string, name: string, at: string, known?: Record<string, unknown>): unknown {
+  const error = attributeError(element, name, value, at, known);
   if (!error) return value;
-  error.stack = `TypeError: ${error.message}\n    at repl-cell.js:${line}:1`;
-  throw error;
+  throw placed(error, at);
 }
 
 /** Marks a component that awaits (compile.ts): mounted on its own, it is drawn inside `root()`, which shows a pending line while it loads. */
@@ -232,6 +273,9 @@ export const OWN_SOURCES = {
 <svelte:boundary {onerror}><Body {...given} /><Settle done={onloaded} />${PENDING_SNIPPET}${FAILED_SNIPPET}</svelte:boundary>`,
 };
 
+/** The question `ask` shows (ask.ts): its elements are handed to it as props when it is mounted (index.ts). */
+export const askComponent: CellComponent = lazy('Ask', ASK_SOURCE);
+
 const settle = lazy('Settle', OWN_SOURCES.Settle);
 const root = lazy('Root', OWN_SOURCES.Root);
 
@@ -243,11 +287,11 @@ export function rooted(body: unknown, given: Record<string, unknown>, onerror: (
 /** The words a failed boundary shows for `error`: its message's first line. */
 const said = (error: unknown): string => String((error as Error | undefined)?.message ?? error).split('\n', 1)[0]!;
 
-/** What compiled components are given as `__repl_svelte` (compile.ts): Svelte's client runtime, the renderer, the brand of a component, the names it reads, its tone check and a failed boundary's words. */
-export function cellRuntime(): { client: Anything; renderer: Anything; component: (fn: unknown, awaits?: boolean) => CellComponent; free: typeof free; tone: typeof tone; said: typeof said } {
+/** What compiled components are given as `__repl_svelte` (compile.ts): Svelte's client runtime, the renderer, the brand of a component, the names it reads, its prop check and a failed boundary's words. */
+export function cellRuntime(): { client: Anything; renderer: Anything; component: (fn: unknown, awaits?: boolean) => CellComponent; free: typeof free; prop: typeof prop; said: typeof said } {
   const { client } = runtime();
   return {
-    client, renderer, free, tone, said,
+    client, renderer, free, prop, said,
     component: (fn: unknown, awaits = false) => Object.defineProperties(fn as CellComponent, {
       [COMPONENT]: { value: true }, [AWAITS]: { value: awaits },
     }),

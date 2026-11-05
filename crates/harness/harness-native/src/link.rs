@@ -59,26 +59,94 @@ fn recv(r: &mut impl Read) -> std::io::Result<Down> {
     match frame::read(r)? {
         Some((T_CBOR, body)) => decode_down(&body),
         Some((t, _)) => Err(std::io::Error::other(format!("harnessd sent a frame of type {t} where a message belongs"))),
-        None => Err(std::io::Error::other("harnessd closed the connection")),
+        None => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "harnessd closed the connection")),
     }
+}
+
+/// How long a daemon has to answer the hello (the CLI's `HELLO_WAIT`).
+const HELLO_WAIT: Duration = Duration::from_secs(3);
+
+/// How long a request waits for its answer once the hello is in.
+const REPLY_WAIT: Duration = Duration::from_secs(10);
+
+/// A daemon that took the connection but that this app cannot speak to (no hello in [`HELLO_WAIT`], another schema, a
+/// refusal), as an io error's inner error: the list thread tells it from no daemon at all and shows it, rather than
+/// trying to connect again and again.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn refused(why: String) -> std::io::Error {
+    std::io::Error::other(Refused(why))
+}
+
+/// The reason, when `e` is a [`Refused`].
+fn refusal(e: &std::io::Error) -> Option<&str> {
+    e.get_ref()?.downcast_ref::<Refused>().map(|r| r.0.as_str())
+}
+
+/// The pid at the other end of `s`: macOS's `LOCAL_PEERPID` socket option (sys/un.h).
+fn peer_pid(s: &UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `pid`, which is that size.
+    let r = unsafe {
+        libc::getsockopt(s.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len)
+    };
+    (r == 0 && pid > 0).then_some(pid)
 }
 
 /// A fresh connection: the hello and `first` written together, and the daemon's hello read (an error naming both
 /// schemas when they differ). The answer to `first` is the next message.
+///
+/// # Errors
+/// The socket's (no daemon, a connection closed or reset), or a [`Refused`] naming the daemon's pid and socket: no hello
+/// within [`HELLO_WAIT`] (an older daemon), another schema's, or a hello this app cannot read.
 fn open(first: &Up) -> std::io::Result<UnixStream> {
-    let mut s = UnixStream::connect(sock())?;
-    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let path = sock();
+    let mut s = UnixStream::connect(&path)?;
+    s.set_read_timeout(Some(HELLO_WAIT))?;
     let mut out = up(&Up::Hello { schema: harness_proto::SCHEMA });
     out.extend_from_slice(&up(first));
     std::io::Write::write_all(&mut s, &out)?;
-    match recv(&mut s)? {
-        Down::Hello { schema, .. } if schema == harness_proto::SCHEMA => Ok(s),
-        Down::Hello { schema, .. } => Err(std::io::Error::other(format!(
-            "harnessd speaks harness schema {schema}, this app {}: restart the daemon (harness stop)",
+    let pid = peer_pid(&s).map_or("unknown".to_owned(), |p| p.to_string());
+    let who = || format!("harnessd (pid {pid}, socket {})", path.display());
+    let hello = match recv(&mut s) {
+        Ok(m) => m,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            return Err(refused(format!(
+                "{} did not answer the hello within {}s: it is likely an older daemon that does not speak harness schema {}; run `harness stop`",
+                who(),
+                HELLO_WAIT.as_secs(),
+                harness_proto::SCHEMA
+            )));
+        }
+        Err(e) if matches!(
+            e.kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        ) => return Err(e),
+        Err(e) => return Err(refused(format!("{} answered the hello with something this app cannot read ({e}); run `harness stop`", who()))),
+    };
+    match hello {
+        Down::Hello { schema, .. } if schema == harness_proto::SCHEMA => {
+            s.set_read_timeout(Some(REPLY_WAIT))?;
+            Ok(s)
+        }
+        Down::Hello { schema, .. } => Err(refused(format!(
+            "{} speaks harness schema {schema}, this app {}: run `harness stop` to restart it",
+            who(),
             harness_proto::SCHEMA
         ))),
-        Down::Error { error } => Err(std::io::Error::other(format!("harnessd refused the connection: {error}"))),
-        m => Err(std::io::Error::other(format!("harnessd answered the hello with {m:?}"))),
+        Down::Error { error } => Err(refused(format!("{} refused the connection: {error}", who()))),
+        m => Err(refused(format!("{} answered the hello with {m:?}", who()))),
     }
 }
 
@@ -91,6 +159,27 @@ pub fn request(r: Request) -> std::io::Result<Result<Reply, String>> {
         Down::Error { error } => Ok(Err(error)),
         m => Err(std::io::Error::other(format!("harnessd answered a request with {m:?}"))),
     }
+}
+
+/// The thread that sends the UI's events to the daemon, one at a time so they arrive in the order they happened (a
+/// slider's values while it is dragged), and the sender that feeds it.
+fn ui_sender() -> Sender<UiEvent> {
+    let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+    std::thread::Builder::new()
+        .name("harness-ui-events".into())
+        .spawn(move || {
+            for UiEvent { cell, handler, value } in rx {
+                let shown: String = value.to_string().chars().take(80).collect();
+                let said = format!("harness-native: ui event {cell} {handler} {shown}");
+                match request(Request::UiEvent { cell, handler, value }) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("{said}: the daemon refused it: {e}"),
+                    Err(e) => eprintln!("{said}: {e}"),
+                }
+            }
+        })
+        .expect("ui events thread");
+    tx
 }
 
 /// A request whose reply is an open record (runs, objects).
@@ -245,6 +334,16 @@ pub struct Link {
     pid: Arc<AtomicU32>,
     bytes: Arc<Mutex<HashMap<u64, Arc<AtomicU64>>>>,
     run_bytes: Arc<Mutex<HashMap<(u64, Option<u32>), Arc<AtomicU64>>>>,
+    /// The person's events on cells' UI (`Request::UiEvent`), in the order they happened, to the one thread that sends
+    /// them ([`Link::ui_event`]).
+    ui: Sender<UiEvent>,
+}
+
+/// One event on a cell's UI: cell `<repl>.<task>` runs handler `handler` with `value`.
+struct UiEvent {
+    cell: String,
+    handler: String,
+    value: Value,
 }
 
 impl Link {
@@ -260,6 +359,7 @@ impl Link {
             pid: Arc::default(),
             bytes: Arc::default(),
             run_bytes: Arc::default(),
+            ui: ui_sender(),
         };
         let (rtt_us, pid) = (link.rtt_us.clone(), link.pid.clone());
         std::thread::Builder::new()
@@ -269,15 +369,17 @@ impl Link {
                 // The daemon's change feed (`watch`), while it is open; None against a daemon without one (it is polled).
                 let mut feed: Option<UnixStream> = None;
                 let mut polled = false;
+                // The last refusal shown (Msg::Refused), so an unchanged one is not sent again.
+                let mut refused_why: Option<String> = None;
                 loop {
                     let asked = std::time::Instant::now();
                     // Every chat too, from before the daemon's restarts (the Archive files them; opening one asks the
                     // daemon for its log's events, resuming one sends it a message).
                     let listed = match request(Request::List { all: false, chats: true }) {
                         Ok(Ok(Reply::Sessions { sessions })) => Ok(sessions),
-                        Ok(Ok(r)) => Err(format!("list answered {r:?}")),
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => Err(e.to_string()),
+                        Ok(Ok(r)) => Err((format!("list answered {r:?}"), None)),
+                        Ok(Err(e)) => Err((e, None)),
+                        Err(e) => Err((e.to_string(), refusal(&e).map(str::to_owned))),
                     };
                     let state = match listed {
                         Ok(sessions) => {
@@ -302,7 +404,17 @@ impl Link {
                             }
                             LinkState::Up
                         }
-                        Err(e) => {
+                        // A daemon is there but cannot be spoken to: say so in the window (asked again each POLL, so
+                        // a `harness stop` and a fresh daemon bring the link up), never "connecting" forever.
+                        Err((_, Some(why))) => {
+                            if refused_why.as_deref() != Some(why.as_str()) {
+                                eprintln!("harness-native: {why}");
+                                tx.send(Msg::Refused(why.clone()));
+                                refused_why = Some(why);
+                            }
+                            LinkState::Refused
+                        }
+                        Err((e, None)) => {
                             if up == Some(LinkState::Up) {
                                 eprintln!("harness-native: list: {e}");
                             }
@@ -319,6 +431,9 @@ impl Link {
                             }
                         }
                     };
+                    if state != LinkState::Refused {
+                        refused_why = None;
+                    }
                     if up != Some(state) {
                         tx.send(Msg::Link(state));
                         up = Some(state);
@@ -491,6 +606,16 @@ impl Link {
             }
             let _ = poke.send(());
         });
+    }
+
+    /// The person did something to a cell's UI: cell `cell` (`<repl>.<task>`) runs handler `handler` (`h3`) with `value`
+    /// (null for a press). Sent in order, one after another, by the link's UI thread; a daemon's refusal (no kernel
+    /// listens for the cell's REPL) is logged naming the cell and handler.
+    pub fn ui_event(&self, cell: &str, handler: &str, value: Value) {
+        let ev = UiEvent { cell: cell.to_owned(), handler: handler.to_owned(), value };
+        if self.ui.send(ev).is_err() {
+            eprintln!("harness-native: ui event {cell} {handler}: the link's UI thread is gone");
+        }
     }
 
     /// Interrupt chat session `id`'s turn in flight.

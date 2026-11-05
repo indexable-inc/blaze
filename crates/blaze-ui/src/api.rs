@@ -304,6 +304,17 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         Response::Stored { path: None, blake3 } => {
             put!(out, "{} blake3:{blake3} in the store\n", status("Stored"))
         }
+        Response::Doing(doing) => {
+            if let Some(on) = &doing.on {
+                put!(out, "{} {on}\n", status("Waiting"));
+            }
+            if let Some(running) = &doing.running {
+                put!(out, "{} {running} ({} workers busy, {} idle)\n", status("Running"), doing.busy, doing.idle);
+            }
+            for unit in &doing.units {
+                put!(out, "  {} unit {}: {}\n", paint(DIM, "doing"), unit.id, unit.doing);
+            }
+        }
     }
 }
 

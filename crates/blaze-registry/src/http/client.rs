@@ -21,7 +21,7 @@ use http::Method;
 
 use blaze_fetch::{redact, scrub};
 
-use super::{Bounds, Http, Pending, Refused, Response, Sink, Transport};
+use super::{Bounds, Http, Pending, Refused, Response, Sink, Stalled, Transport, Watch};
 
 /// How many requests [`HyperHttp::get_async`] has in flight at once, each on a connection of
 /// its own (HTTP/1), and so the most idle connections the client keeps.
@@ -91,7 +91,7 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(method, url, headers, body, Bounds::NONE, None))
+        self.runtime.block_on(self.client.fetch(method, url, headers, body, Bounds::NONE))
     }
 
     /// [`Http::get`] of `url` held to `bounds`: a body past `bounds.most` stops being read, and
@@ -102,15 +102,82 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         bounds: Bounds,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(
-            Method::GET,
-            url,
-            headers,
-            Vec::new(),
-            bounds,
-            None,
-        ))
+        self.runtime.block_on(self.client.fetch(Method::GET, url, headers, Vec::new(), bounds))
     }
+
+    /// `url`'s body from byte `from` into `sink`, in order, each piece with its offset in the
+    /// whole body (0 when the server sends it whole): in ranges, [`PARALLEL`] at once, held to
+    /// `bounds`, said in blaze-fetch's downloads as `what`, with `watch` told its line every
+    /// [`TICK`] and at its end. No byte for the stall bound is [`Stalled`]. A 200 or 206 is
+    /// success; any other answer is given with the first 64 KiB of its body, for its error.
+    #[expect(clippy::too_many_arguments, reason = "one download's every input, said once")]
+    pub fn stream_watched(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        from: u64,
+        bounds: Bounds,
+        sink: Sink<'_>,
+        what: &str,
+        watch: Watch<'_>,
+    ) -> anyhow::Result<Response> {
+        self.runtime.block_on(self.client.ranged(url, headers, from, bounds, sink, what, watch))
+    }
+}
+
+impl HyperHttp {
+    /// `url`'s body from byte `from`, collected, as a task on this client's runtime for a caller
+    /// in a runtime of its own: [`HyperHttp::stream_watched`]'s ranges, progress (said in
+    /// blaze-fetch's downloads as `what`) and stall bound. The answer's body is the bytes from
+    /// `from` on, whether the server kept to the range (206) or sent the whole (200).
+    pub fn get_from_async(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        from: u64,
+        what: &str,
+    ) -> Pending<anyhow::Result<Response>> {
+        let (client, in_flight) = (self.client.clone(), self.in_flight.clone());
+        let (url, what) = (url.to_owned(), what.to_owned()); // alloc: moved into the task
+        let headers: Vec<(String, String)> =
+            headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect(); // alloc: as above
+        let task = self.runtime.spawn(async move {
+            let _turn = in_flight.acquire_owned().await?;
+            let headers: Vec<(&str, &str)> =
+                headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect(); // alloc: borrowed views of the above
+            // The body kept, and the offset of its first byte: `from`, or 0 once the server
+            // sends the whole.
+            let (mut body, mut base) = (Vec::new(), from); // alloc: the body, for the caller
+            let mut sink = |offset: u64, bytes: &[u8]| -> std::io::Result<()> {
+                if offset != base + body.len() as u64 {
+                    if offset != 0 {
+                        return Err(std::io::Error::other(format!(
+                            "a piece at byte {offset} came after byte {}",
+                            base + body.len() as u64
+                        )));
+                    }
+                    (body, base) = (Vec::new(), 0); // alloc: as above, begun again
+                }
+                body.extend_from_slice(bytes);
+                Ok(())
+            };
+            let mut answer = client
+                .ranged(&url, &headers, from, Bounds::NONE, &mut sink, &what, &mut |_| {})
+                .await?;
+            if matches!(answer.status, 200 | 206) {
+                let skip = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX);
+                answer.body = body.split_off(skip.min(body.len()));
+            }
+            Ok(answer)
+        });
+        Box::pin(async move { task.await.context("a request's task ended")? })
+    }
+}
+
+/// What a download is called where it is shown: the last part of its address's path.
+fn named(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.trim_end_matches('/').rsplit('/').next().filter(|it| !it.is_empty()).unwrap_or(path)
 }
 
 impl Requests {
@@ -121,11 +188,7 @@ impl Requests {
         headers: &[(&str, &str)],
         body: Vec<u8>,
         bounds: Bounds,
-        // A 200's body, a piece at a time as it comes, not decoded and not collected: the
-        // answer's `body` is then empty. Any other answer's body is collected, for its error.
-        mut sink: Option<Sink<'_>>,
     ) -> anyhow::Result<Response> {
-        let streamed = sink.is_some();
         let request = Request {
             method,
             // alloc: one per request, handed to the client.
@@ -136,10 +199,9 @@ impl Requests {
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
             body,
-            // A streamed body is written out as it comes and hashed from there, so it is asked
-            // for as it is kept: not encoded. Any other is asked for as gzip, decoded by the
-            // client and held to `most` once decoded.
-            gzip: !streamed,
+            // Asked for as gzip, decoded by the client and held to `most` once decoded. A
+            // streamed body is [`Requests::ranged`]'s, asked for as it is kept.
+            gzip: true,
             most: bounds.most,
             https_only: bounds.https_only,
         };
@@ -154,62 +216,336 @@ impl Requests {
                 anyhow::bail!("{}: blaze-http's client told of a body before its head", redact(url))
             }
         };
-        if let Some(sink) = sink.as_mut().filter(|_| status == 200) {
-            let encoded = headers.iter().find(|(name, _)| name == "content-encoding");
-            // A server's answer, not a lost connection: asking again gets the same, so it is
-            // no `Transport` error and never tried again.
-            if let Some((_, encoding)) =
-                encoded.filter(|(_, it)| !it.eq_ignore_ascii_case("identity"))
-            {
-                anyhow::bail!(
-                    "{said} sent its body as `{encoding}`, which was not asked for, so none of it was kept"
-                );
-            }
-            // Held to `bounds.most` by the client, as sent (nothing is decoded).
-            while let Some(piece) = next_piece(&mut answer, &said).await? {
-                sink(&piece).with_context(|| format!("keeping the body of {said}"))?;
-            }
-            return Ok(Response { status, headers, body: Vec::new() });
-        }
-        // A streamed request's other answers are read for their error alone: their first
-        // `ERROR_BODY_MOST` bytes, the rest left unread (the answer dropped, its connection
-        // closed), so no server can fill the daemon's memory with a 404 page. Any other request
-        // is held to its bounds by the client.
-        let most = if streamed { ERROR_BODY_MOST.min(bounds.most) } else { bounds.most };
-        let room = usize::try_from(most).unwrap_or(usize::MAX);
+        let room = usize::try_from(bounds.most).unwrap_or(usize::MAX);
         // alloc: one per answer, its body for the caller.
         let mut bytes = Vec::new();
         while let Some(piece) = next_piece(&mut answer, &said).await? {
-            let left = room.saturating_sub(bytes.len());
-            if piece.len() > left {
-                if !streamed {
-                    // The client holds the body to `most` itself; past it is its bug, said here.
-                    let refused =
-                        Refused::TooBig { url: said.clone(), most, said: None, decoded: true };
-                    return Err(refused.into());
-                }
-                bytes.extend_from_slice(&piece[..left]);
-                break;
+            if piece.len() > room.saturating_sub(bytes.len()) {
+                // The client holds the body to `most` itself; past it is its bug, said here.
+                let refused =
+                    Refused::TooBig { url: said.clone(), most: bounds.most, said: None, decoded: true };
+                return Err(refused.into());
             }
             bytes.extend_from_slice(&piece);
         }
-        drop(answer);
-        let mut response = Response { status, headers, body: bytes };
-        // gzip a streamed request did not ask for, on an error's body: decoded for its message,
-        // as far as `most`. Any other request's gzip the client decoded.
-        if streamed
-            && response.header("content-encoding").is_some_and(|it| it.eq_ignore_ascii_case("gzip"))
-        {
-            // alloc: one per gzip error body, at most `most` bytes and one.
-            let mut decoded = Vec::new();
-            flate2::read::GzDecoder::new(&response.body[..])
-                .take(most.saturating_add(1))
-                .read_to_end(&mut decoded)
-                .map_err(|e| Transport(format!("{said} sent gzip that is not: {e}")))?;
-            decoded.truncate(room);
-            response.body = decoded;
+        Ok(Response { status, headers, body: bytes })
+    }
+}
+
+/// The length of one ranged request of a body ([`HyperHttp::stream_watched`]), and how many
+/// are in flight at once. GitHub's release CDN holds one connection to well under a megabyte a
+/// second from some places, and gives each connection its own share, so a large asset comes
+/// as many ranges at once; the first range's answer says the whole length, and a body shorter
+/// than one range costs one request, as before.
+const PIECE: u64 = 8 << 20;
+const PARALLEL: usize = 8;
+
+/// How many times one range is asked for before the download gives up, each from where the
+/// last stopped.
+const PIECE_TRIES: u32 = 4;
+
+/// How often a streamed download's driver wakes while it waits for bytes: to tell its watcher
+/// the line and to check the stall bound.
+const TICK: Duration = blaze_fetch::progress::TERMINAL_EVERY;
+
+/// The head of an answer to a ranged GET, the body still to read from `answer`.
+struct Opened {
+    said: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+    answer: Answer,
+}
+
+impl Opened {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(it, _)| it == name).map(|(_, it)| it.as_str())
+    }
+}
+
+/// `bytes <start>-<end>/<total>` of a 206, or `bytes */<total>` of a 416.
+fn content_range(value: &str) -> Option<(Option<(u64, u64)>, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let total = total.trim().parse().ok()?;
+    if range.trim() == "*" {
+        return Some((None, total));
+    }
+    let (start, end) = range.split_once('-')?;
+    Some((Some((start.trim().parse().ok()?, end.trim().parse().ok()?)), total))
+}
+
+impl Requests {
+    /// A GET of `url` asking for bytes `from..=to` (`to` open when `None`), not encoded, held to
+    /// `bounds`; with `if_range` (the first answer's `ETag`), a body that changed meanwhile comes
+    /// whole as a 200, which the caller refuses.
+    async fn open(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        (from, to): (u64, Option<u64>),
+        if_range: Option<&str>,
+        bounds: Bounds,
+    ) -> anyhow::Result<Opened> {
+        // alloc: one per request, its headers handed to the client.
+        let mut asked: Vec<(String, String)> = headers.to_vec();
+        let range = match to {
+            Some(to) => format!("bytes={from}-{to}"),
+            None => format!("bytes={from}-"),
+        };
+        asked.push(("range".to_owned(), range));
+        if let Some(tag) = if_range {
+            asked.push(("if-range".to_owned(), tag.to_owned()));
         }
-        Ok(response)
+        let request = Request {
+            method: Method::GET,
+            url: url.to_owned(), // alloc: one per request
+            headers: asked,
+            body: Vec::new(),
+            gzip: false,
+            most: bounds.most,
+            https_only: bounds.https_only,
+        };
+        let mut answer = self.driver.ask(request);
+        match next(&mut answer, url).await? {
+            Event::Head { url, status, headers, .. } => {
+                Ok(Opened { said: redact(&url), status, headers, answer })
+            }
+            Event::Failed { error, .. } => Err(failed(error)),
+            Event::Body { .. } | Event::Done { .. } => {
+                anyhow::bail!("{}: blaze-http's client told of a body before its head", redact(url))
+            }
+        }
+    }
+
+    /// One range `from..=to` of `url`, collected, asked again from where it stopped when the
+    /// transfer is lost, at most [`PIECE_TRIES`] times. A 200 (the body changed since the first
+    /// answer, as `if_range` says) or a range other than asked is refused.
+    async fn piece(
+        self,
+        url: String,
+        headers: Vec<(String, String)>,
+        (from, to): (u64, u64),
+        if_range: Option<String>,
+        bounds: Bounds,
+        counter: blaze_fetch::downloads::Counter<'static>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let len = usize::try_from(to - from + 1).unwrap_or(usize::MAX);
+        // alloc: one range of a download, at most `PIECE` bytes
+        let mut got = Vec::with_capacity(len);
+        let mut tries = 0;
+        loop {
+            let at = from + got.len() as u64;
+            let tried: anyhow::Result<()> = async {
+                let mut opened =
+                    self.open(&url, &headers, (at, Some(to)), if_range.as_deref(), bounds).await?;
+                let said = opened.header("content-range").and_then(content_range);
+                if opened.status != 206 || said.and_then(|it| it.0) != Some((at, to)) {
+                    let error = anyhow::anyhow!(
+                        "{} answered a request for bytes {at}-{to} with {} {}: its body changed \
+                         since the download began, or it does not keep to the ranges it offers",
+                        opened.said,
+                        opened.status,
+                        opened.header("content-range").unwrap_or("and no Content-Range"),
+                    );
+                    return Err(error);
+                }
+                while let Some(bytes) = next_piece(&mut opened.answer, &opened.said).await? {
+                    let room = len - got.len();
+                    let bytes = &bytes[..bytes.len().min(room)];
+                    got.extend_from_slice(bytes);
+                    counter.got(bytes.len() as u64);
+                }
+                Ok(())
+            }
+            .await;
+            match tried {
+                Ok(()) if got.len() == len => return Ok(got),
+                Ok(()) => {}
+                Err(error) if error.downcast_ref::<Transport>().is_none() => return Err(error),
+                Err(error) if tries + 1 >= PIECE_TRIES => {
+                    return Err(error.context(format!(
+                        "bytes {from}-{to} of {}: given up after {PIECE_TRIES} tries",
+                        redact(&url)
+                    )));
+                }
+                Err(_) => {}
+            }
+            tries += 1;
+            if tries >= PIECE_TRIES {
+                anyhow::bail!(
+                    "bytes {from}-{to} of {} ended short {PIECE_TRIES} times, at {} of {len} bytes",
+                    redact(&url),
+                    got.len()
+                );
+            }
+        }
+    }
+
+    /// `url`'s body from byte `from`, into `sink` in order, each piece with its offset in the
+    /// whole body: one ranged request for the first [`PIECE`] (whose answer says the length),
+    /// then the rest as [`PARALLEL`] ranges at once. A server that ignores ranges answers a 200
+    /// of the whole body, which goes to `sink` from offset 0. Registered in blaze-fetch's
+    /// downloads as `what` for the status line and the stall bound, `watch`ed every [`TICK`],
+    /// and stopped as [`Stalled`] when no byte comes for the stall bound.
+    #[expect(clippy::too_many_arguments, reason = "one download's every input, said once")]
+    async fn ranged(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        from: u64,
+        bounds: Bounds,
+        sink: Sink<'_>,
+        what: &str,
+        watch: Watch<'_>,
+    ) -> anyhow::Result<Response> {
+        let download = blaze_fetch::downloads::Downloads::process().begin(what, url, None);
+        // alloc: one per download, its headers for every range.
+        let owned: Vec<(String, String)> =
+            headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
+        let first_to = from.saturating_add(PIECE - 1);
+        let ticked = |download: &blaze_fetch::downloads::Download<'_>,
+                      watch: &mut (dyn FnMut(&blaze_fetch::progress::Line) + Send),
+                      said: &str|
+         -> anyhow::Result<()> {
+            let line = download.line();
+            watch(&line);
+            if line.idle >= blaze_fetch::progress::STALL {
+                return Err(Stalled { url: redact(said), idle: line.idle, line }.into());
+            }
+            Ok(())
+        };
+        let mut opened = tick_until(
+            self.open(url, &owned, (from, Some(first_to)), None, bounds),
+            || ticked(&download, watch, url),
+        )
+        .await?;
+        let length = opened.header("content-length").and_then(|it| it.trim().parse::<u64>().ok());
+        let (at, total) = match opened.status {
+            200 => (0, length),
+            206 => match opened.header("content-range").and_then(content_range) {
+                Some((Some((start, _)), total)) if start == from => (from, Some(total)),
+                _ => anyhow::bail!(
+                    "{} answered a request for bytes {from}- with 206 and Content-Range {:?}, \
+                     which is not from byte {from}",
+                    opened.said,
+                    opened.header("content-range")
+                ),
+            },
+            // All of it is here already: a resumed download that had every byte.
+            416 if from > 0
+                && opened.header("content-range").and_then(content_range)
+                    == Some((None, from)) =>
+            {
+                download.resumed(from);
+                download.set_total(Some(from));
+                watch(&download.line());
+                return Ok(Response { status: 206, headers: opened.headers, body: Vec::new() });
+            }
+            status => {
+                // An error's body, for its message: its first `ERROR_BODY_MOST` bytes.
+                let room = usize::try_from(ERROR_BODY_MOST).unwrap_or(usize::MAX);
+                // alloc: one per error answer
+                let mut body = Vec::new();
+                while let Some(piece) = next_piece(&mut opened.answer, &opened.said).await? {
+                    body.extend_from_slice(&piece[..piece.len().min(room - body.len())]);
+                    if body.len() >= room {
+                        break;
+                    }
+                }
+                return Ok(Response { status, headers: opened.headers, body });
+            }
+        };
+        if let Some(total) = total.filter(|it| *it > bounds.most) {
+            let refused = Refused::TooBig { url: opened.said, most: bounds.most, said: Some(total), decoded: false };
+            return Err(refused.into());
+        }
+        download.resumed(at);
+        download.set_total(total);
+        let status = opened.status;
+        let said = opened.said.clone();
+        let tag = opened.header("etag").map(str::to_owned);
+        let head = opened.headers.clone(); // clone: the answer's head, for the caller
+        // The first answer's body: the whole of a 200, or the first range.
+        let mut offset = at;
+        loop {
+            let piece =
+                tick_until(next_piece(&mut opened.answer, &said), || ticked(&download, watch, &said))
+                    .await?;
+            let Some(piece) = piece else { break };
+            if offset.saturating_add(piece.len() as u64) > bounds.most {
+                let refused = Refused::TooBig { url: said, most: bounds.most, said: None, decoded: false };
+                return Err(refused.into());
+            }
+            sink(offset, &piece).with_context(|| format!("keeping the body of {said}"))?;
+            offset += piece.len() as u64;
+            download.got(piece.len() as u64);
+        }
+        drop(opened);
+        let total = match (status, total) {
+            (206, Some(total)) => total,
+            _ => {
+                watch(&download.line());
+                return Ok(Response { status, headers: head, body: Vec::new() });
+            }
+        };
+        // The rest, `PARALLEL` ranges in flight, handed on in order: memory holds at most
+        // `PARALLEL` ranges.
+        let mut next_from = offset;
+        let mut flying = std::collections::VecDeque::new(); // alloc: at most `PARALLEL` ranges in flight
+        let spawn = |start: u64| {
+            let to = start.saturating_add(PIECE - 1).min(total - 1);
+            let task = tokio::spawn(self.clone().piece(
+                url.to_owned(),
+                owned.clone(), // clone: each range asks with the download's headers
+                (start, to),
+                tag.clone(), // clone: as above
+                bounds,
+                download.counter(),
+            ));
+            (start, to, task)
+        };
+        while next_from < total || !flying.is_empty() {
+            while flying.len() < PARALLEL && next_from < total {
+                let (start, to, task) = spawn(next_from);
+                next_from = to + 1;
+                flying.push_back((start, task));
+            }
+            let Some((start, mut task)) = flying.pop_front() else { break };
+            let joined = tick_until(async { (&mut task).await.map_err(anyhow::Error::from) }, || {
+                ticked(&download, watch, &said)
+            })
+            .await;
+            let bytes = match joined.and_then(|it| it) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    task.abort();
+                    for (_, other) in flying {
+                        other.abort();
+                    }
+                    return Err(error);
+                }
+            };
+            debug_assert_eq!(start, offset);
+            sink(offset, &bytes).with_context(|| format!("keeping the body of {said}"))?;
+            offset += bytes.len() as u64;
+        }
+        watch(&download.line());
+        Ok(Response { status: 206, headers: head, body: Vec::new() })
+    }
+}
+
+/// `work`, with `tick` run every [`TICK`] while it is not done; an error of `tick` (the stall
+/// bound) ends the wait with it.
+async fn tick_until<T>(
+    work: impl Future<Output = anyhow::Result<T>>,
+    mut tick: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    let mut work = std::pin::pin!(work);
+    loop {
+        match tokio::time::timeout(TICK, &mut work).await {
+            Ok(done) => return done,
+            Err(_) => tick()?,
+        }
     }
 }
 
@@ -273,16 +609,10 @@ impl Http for HyperHttp {
         &self,
         url: &str,
         headers: &[(&str, &str)],
+        from: u64,
         sink: Sink<'_>,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.client.fetch(
-            Method::GET,
-            url,
-            headers,
-            Vec::new(),
-            Bounds::NONE,
-            Some(sink),
-        ))
+        self.stream_watched(url, headers, from, Bounds::NONE, sink, named(url), &mut |_| {})
     }
 
     fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
@@ -294,7 +624,7 @@ impl Http for HyperHttp {
             let _turn = in_flight.acquire_owned().await?;
             let headers: Vec<(&str, &str)> =
                 headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-            client.fetch(Method::GET, &url, &headers, Vec::new(), Bounds::NONE, None).await
+            client.fetch(Method::GET, &url, &headers, Vec::new(), Bounds::NONE).await
         });
         Box::pin(async move { task.await.context("a request's task ended")? })
     }
@@ -391,7 +721,7 @@ mod tests {
             .unwrap();
         let http = HyperHttp::new(Duration::from_millis(500)).unwrap();
         let url = format!("http://127.0.0.1:{port}/a?token=secret@x");
-        let got = http.stream(&url, &[], &mut |_| Ok(())).unwrap_err();
+        let got = http.stream(&url, &[], 0, &mut |_, _| Ok(())).unwrap_err();
         let said = format!("{got:#}");
         assert!(got.downcast_ref::<Transport>().is_some(), "{said}");
         assert!(said.contains("stalled"), "{said}");

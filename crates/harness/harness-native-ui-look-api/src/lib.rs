@@ -16,6 +16,13 @@ pub struct Fill {
     pub light: Rgba,
 }
 
+/// The ink a `Vector`'s outline is stroked in, per appearance (sRGB, drawn as given; alpha 0: no stroke).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stroke {
+    pub dark: Rgba,
+    pub light: Rgba,
+}
+
 /// Border colour (panels), ring colour (orbs).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Edge {
@@ -71,6 +78,16 @@ pub struct Inks {
     pub hover: Fill,
 }
 
+/// How a control gives under a press, with no plate (an icon button): held, it scales to `scale` and its opacity to
+/// `dim`, easing there and springing back when let go on the spring `omega`, `zeta`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct PressGive {
+    pub scale: f32,
+    pub dim: f32,
+    pub omega: f32,
+    pub zeta: f32,
+}
+
 /// A control's plate while it is pressed (the colours of a Fill, per appearance).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct PressLook {
@@ -111,15 +128,16 @@ pub struct HoverLook {
     pub radius: f32,
 }
 
-/// A copy's pulse over the selection (`ui.selection` in prims.flecs; den's FlashLook): the selection's shape grows by the share
-/// `grow` at the pulse's peak, and a light of the plate's colour at alpha `light` sweeps across each row over `sweep` seconds,
-/// the rows joining `stagger` seconds apart, each taking `row_in` seconds to come in. The pulse itself is a spring
-/// (`CopyFlash`, on the `ui.spring.copy` token).
+/// A copy's pulse over the selection (`ui.selection` in prims.flecs; den's FlashLook): it lasts `secs`; the selection's
+/// shape and glyphs grow by the share `grow`, peaking `rise` of the way in, and come back; a light of the plate's colour at
+/// alpha `light` crosses each row over the whole pulse, the rows joining `stagger` seconds apart, each taking `row_in`
+/// seconds to come in. The pulse itself is a `CopyFlash` (harness-native-ui-motion-api).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct CopyLook {
+    pub secs: f32,
+    pub rise: f32,
     pub grow: f32,
     pub light: f32,
-    pub sweep: f32,
     pub stagger: f32,
     pub row_in: f32,
 }
@@ -154,12 +172,14 @@ hyperion_api_layouts::api_layouts! {
     "Rgba" => alias Rgba,
     "Fill" => alias Fill,
     "Edge" => alias Edge,
+    "Stroke" => alias Stroke,
     "Shape" => alias Shape,
     "Lift" => alias Lift,
     "Frost" => alias Frost,
     "Lens" => alias Lens,
     "Inks" => alias Inks,
     "PressLook" => alias PressLook,
+    "PressGive" => alias PressGive,
     "OnLook" => alias OnLook,
     "TextStyle" => alias TextStyle,
     "HoverLook" => alias HoverLook,
@@ -172,12 +192,14 @@ pub fn register(world: &World) {
     world.component::<Rgba>().writable();
     world.component::<Fill>().writable();
     world.component::<Edge>().writable();
+    world.component::<Stroke>().writable();
     world.component::<Shape>().writable();
     world.component::<Lift>().writable();
     world.component::<Frost>().writable();
     world.component::<Lens>().writable();
     world.component::<Inks>().writable();
     world.component::<PressLook>().writable();
+    world.component::<PressGive>().writable();
     world.component::<OnLook>().writable();
     world.component::<TextStyle>().writable();
     world.component::<HoverLook>().writable();

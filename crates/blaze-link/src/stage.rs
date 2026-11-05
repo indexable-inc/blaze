@@ -207,11 +207,13 @@ pub(crate) struct Stage<'a> {
 }
 
 /// An AArch64 full link's [`Class::Text`] as laid out ([`crate::thunk`]): its pieces but the
-/// thunks, in order; where each segment of them ends; and each thunk with its island.
+/// thunks, in order; where each segment of them ends; each thunk with its island; and the
+/// pieces of the image's other executable classes, whose far branches the islands serve too.
 pub(crate) struct Text<'a> {
     pub code: FrameVec<'a, PieceId>,
     pub ends: FrameVec<'a, usize>,
     pub thunks: FrameVec<'a, (u32, PieceId)>,
+    pub outside: FrameVec<'a, PieceId>,
 }
 
 pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> LinkError {

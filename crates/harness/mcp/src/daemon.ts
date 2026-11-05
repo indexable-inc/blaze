@@ -63,3 +63,77 @@ export async function req<T = Record<string, unknown>>(body: Request): Promise<T
     }).catch((e) => { if (!settled) { settled = true; reject(new DaemonUnreachable(`harnessd not reachable at ${SOCK()}: ${e}`)); } });
   });
 }
+
+/** What the person did to a cell's UI, as the daemon hands it on (msg.rs `Down::Ui`). */
+export type UiEvent = { cell: string; handler: string; value: unknown };
+
+/** How long to wait before reconnecting a lost UI feed, doubling from the first to the last. */
+const FEED_RETRY_MS = [250, 5000] as const;
+/** Reconnects in a row that fail before the feed gives up (about five minutes at the longest wait). */
+const FEED_TRIES = 64;
+
+/**
+ * Hold a `ui_listen` connection as REPL `repl`'s UI feed: `on` gets each event the app sends for one of its cells. When the
+ * connection drops (the daemon restarted, or a newer listener replaced it) it reconnects, waiting longer each time, and
+ * gives up after FEED_TRIES failures in a row, saying so on stderr. `stop()` ends it.
+ */
+export function listen(repl: string, on: (ev: UiEvent) => void): { stop(): void } {
+  let stopped = false;
+  let failures = 0;
+  let current: { end(): void } | undefined;
+  let timer: Timer | undefined;
+  const retry = (why: string) => {
+    current = undefined;
+    if (stopped) return;
+    failures++;
+    if (failures >= FEED_TRIES) {
+      console.error(`[harness] ui feed for ${repl}: gave up after ${failures} tries (${why}); controls in this kernel's cells do nothing until it restarts`);
+      return;
+    }
+    const wait = Math.min(FEED_RETRY_MS[1], FEED_RETRY_MS[0] * 2 ** Math.min(failures - 1, 8));
+    timer = setTimeout(open, wait);
+  };
+  const open = () => {
+    if (stopped) return;
+    const hello = frame(T_CBOR, encode({ t: "hello", schema: SCHEMA }));
+    const request = frame(T_CBOR, encode({ t: "req", op: "ui_listen", repl }));
+    let buf = new Uint8Array(0);
+    let greeted = false;
+    let ended = false;
+    const end = (s: { end(): void }, why: string) => { if (ended) return; ended = true; s.end(); retry(why); };
+    Bun.connect({
+      unix: SOCK(),
+      socket: {
+        open(s) { current = s; s.write(hello); s.write(request); },
+        data(s, chunk) {
+          const next = new Uint8Array(buf.length + chunk.length);
+          next.set(buf); next.set(chunk, buf.length); buf = next;
+          for (;;) {
+            let f;
+            try { f = split(buf); } catch (e) { return end(s, `a bad frame: ${(e as Error).message}`); }
+            if (!f) return;
+            buf = buf.subarray(f.size);
+            if (f.t !== T_CBOR) return end(s, `a type ${f.t} frame on the feed`);
+            let m: Down;
+            try { m = decode(f.payload) as Down; } catch (e) { return end(s, `a message that is not CBOR: ${(e as Error).message}`); }
+            if (m.t === "error") return end(s, `harnessd: ${m.error}`);
+            if (!greeted) {
+              if (m.t !== "hello") return end(s, `harnessd answered the hello with a \`${m.t}\` message`);
+              if (m.schema !== SCHEMA) return end(s, `harnessd speaks harness schema ${m.schema}, this kernel ${SCHEMA}`);
+              greeted = true;
+              continue;
+            }
+            if (m.t === "reply") { failures = 0; continue; }
+            if (m.t !== "ui") return end(s, `a \`${m.t}\` message on the ui feed`);
+            on({ cell: m.cell, handler: m.handler, value: m.value ?? null });
+          }
+        },
+        close(s) { end(s, "the connection closed"); },
+        error(s, e) { end(s, e.message); },
+        connectError(s, e) { end(s, `not reachable at ${SOCK()}: ${e.message}`); },
+      },
+    }).catch((e) => retry(`connect: ${e}`));
+  };
+  open();
+  return { stop() { stopped = true; clearTimeout(timer); current?.end(); } };
+}

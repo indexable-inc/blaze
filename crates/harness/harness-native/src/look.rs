@@ -4,11 +4,12 @@
 //! reads prefabs by name and keeps only runtime state: a running dot's breath, a part shown while its row is hovered, a
 //! disclosure chevron's turn,.
 use harness_native_api::spring::{Spring, Tune};
-use harness_native_api::{Fold, HoverAmt, moving, settle};
+use harness_native_api::{APP, Fold, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_ui_layout_api::{Padding, Size};
-use harness_native_ui_look_api::{Fill, HoverLook};
-use harness_native_ui_motion_api::{Motion, Reveal};
+use harness_native_ui_input_api::Pressed;
+use harness_native_ui_look_api::{Fill, HoverLook, Inks, PressGive, Rgba};
+use harness_native_ui_motion_api::{Motion, Pose, Reveal};
 use harness_native_ui_text_api::{Icon, Mark};
 use harness_native_ui_view as view;
 
@@ -52,8 +53,15 @@ pub struct SideDrag {
     pub keep: f32,
 }
 
+/// How held a [`PressGive`] control is (0 to 1, on its spring).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct PressAmt {
+    pub spring: Spring,
+}
+
 pub fn register(world: &World) {
     world.component::<SideDrag>().writable();
+    world.component::<PressAmt>();
     // The row templates (scene/widgets/rows.flecs) set these.
     world.component::<Breath>().writable();
     world.component::<HoverShow>().writable();
@@ -108,10 +116,49 @@ pub fn padding(w: WorldRef<'_>, name: &str) -> Padding {
         .unwrap_or_else(|| panic!("hn.Theme.{name} has no Padding"))
 }
 
+fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    Rgba { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: a.a + (b.a - a.a) * t }
+}
+
 /// How near its end a breath turns back (of its 0..1 travel).
 const BREATH_TURN: f32 = 0.04;
-/// The springs: breaths, chevrons' turns.
+/// The springs: breaths, chevrons' turns, icon buttons' inks and presses.
 pub fn install(w: WorldRef<'_>) {
+    // A control with Inks follows its hover spring (the Hover system steps it); one with a PressGive, its press spring.
+    w.observer_named::<&Inks>("InksHover").on_set().each_entity(|e, _| {
+        if !e.has(HoverAmt::id()) {
+            e.set(HoverAmt::default());
+        }
+    });
+    w.observer_named::<&PressGive>("PressGiveAmt").on_set().each_entity(|e, _| {
+        if !e.has(PressAmt::id()) {
+            e.set(PressAmt::default());
+        }
+    });
+    // Its glyph's ink: `rest`, eased to `hover` as the pointer comes on (written only on change).
+    w.system_named::<(&Inks, &HoverAmt)>("InkHover").each_iter(|it, row, (inks, h)| {
+        let k = h.spring.x.clamp(0.0, 1.0);
+        let f = Fill { dark: mix(inks.rest.dark, inks.hover.dark, k), light: mix(inks.rest.light, inks.hover.light, k) };
+        it.entity(row).each_child(|c| {
+            if (c.has(Icon::id()) || c.has(Mark::id())) && c.try_cloned::<&Fill>() != Some(f) {
+                c.set(f);
+            }
+        });
+    });
+    // Held, it scales and dims toward its PressGive, and springs back when let go (its Pose; written only on change).
+    w.system_named::<(&PressGive, &mut PressAmt)>("PressGive").each_iter(|it, row, (g, p)| {
+        let (e, w) = (it.entity(row), it.world());
+        let held = w.lookup(APP).target(Pressed::id(), 0).is_some_and(|t| t.id() == e.id());
+        let tune = Tune { omega: g.omega.max(1.0), zeta: g.zeta.max(0.05) };
+        if settle(&mut p.spring, f32::from(u8::from(held)), tune, it.delta_time()) {
+            moving(&w);
+        }
+        let x = p.spring.x;
+        let pose = Pose { shrink: (1.0 - g.scale) * x, fade: (1.0 - g.dim) * x, ..e.try_cloned::<&Pose>().unwrap_or_default() };
+        if e.try_cloned::<&Pose>() != Some(pose) {
+            e.set(pose);
+        }
+    });
     let breath = tune(w, "breath");
     w.system_named::<&mut Breath>("Breathe").each_iter(move |it, _row, b| {
         let target = f32::from(u8::from(b.up));
@@ -242,3 +289,9 @@ pub fn show_glyph(part: EntityView<'_>, glyph: &str) {
 pub const RUN_ICON: &str = "\u{EB8A}";
 pub const CHEVRON: &str = "\u{EAB6}";
 pub const ARCHIVE_ICON: &str = "\u{EA98}";
+/// The palette's commands, each a codicon like the rest of its icons (one stroke weight, one optical size, outlined): kill
+/// (cod-close), toggle the sidebar (cod-layout-sidebar-left) and zoom in and out (cod-zoom-in, cod-zoom-out).
+pub const KILL_ICON: &str = "\u{EA76}";
+pub const SIDEBAR_ICON: &str = "\u{EBF3}";
+pub const ZOOM_IN_ICON: &str = "\u{EB81}";
+pub const ZOOM_OUT_ICON: &str = "\u{EB82}";

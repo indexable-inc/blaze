@@ -8,14 +8,18 @@ hn {
   prefab ChatPane : hn.Pane {
     list : ui.Scroll {
       Cursor: {shape: Text}
+      ClipFade: {len: $chat_fade_len}
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       rows : ui.LazyList {
         LazyStack: {estimate: $chat_row_estimate, overscan: 600}
-        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w + 2 * $chat_pad}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: $chat_pad, r: $chat_pad, t: 12, b: 20}
       }
     }
+    // The foot is opaque, in the card's own ground: the transcript ends at its top (thinning out under it), and nothing
+    // drawn behind the pane shows under the input or its status line.
     foot : ui.Column {
+      Fill: $tone_term_ground
       Flex: {axis: Column, gap: 6, align: Center, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       Padding: {l: $chat_pad, r: $chat_pad, t: 4, b: 12}
@@ -28,13 +32,13 @@ hn {
         Action: {name: "chat:focus"}
         Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: 14, r: 14, t: 10, b: 10}
+        Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: $chat_input_pad_y, b: $chat_input_pad_y}
         area : ui.TextArea {}
       }
       status : ui.Row {
         Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: 6, r: 6, t: 0, b: 0}
+        Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: 0, b: 0}
         model : ui.Line, Faint {
           TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
         }
@@ -51,15 +55,16 @@ hn {
   prefab ChatUser : ui.Row {
     Flex: {axis: Row, gap: 0, align: Start, justify: End, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 48, r: 0, t: 14, b: 10}
+    Padding: {l: $chat_bubble_lead, r: 0, t: $chat_gap_turn - $chat_block_half, b: $chat_gap_reply - $chat_block_half}
     bubble : ui.Bubble {
       Fill: $tone_chat_bubble
+      Padding: {l: $chat_bubble_pad_x, r: $chat_bubble_pad_x, t: $chat_bubble_pad_y, b: $chat_bubble_pad_y}
       Shape: {radius: $chat_bubble_radius, n: 4, border: 0, feather: 0}
       Size: {w: {kind: Fit, value: 0, min: 0, max: $chat_bubble_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
       text : ui.Words {
         Cursor: {shape: Text}
         Fill: $tone_term_ink
-        TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
+        TextStyle: {size: $size_chat, line: $line_chat_bubble, role: 0, bold: 0}
       }
     }
   }
@@ -68,7 +73,7 @@ hn {
   prefab ChatProse : ui.Column {
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 0, r: 0, t: 4, b: 6}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
     text : ui.Words {
       Fill: $tone_term_ink
       MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light,
@@ -116,7 +121,7 @@ hn {
   prefab ChatQuote : ui.Row {
     Flex: {axis: Row, gap: 12, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 2, r: 0, t: 4, b: 6}
+    Padding: {l: 2, r: 0, t: $chat_block_half, b: $chat_block_half}
     bar : hn.Seam {}
     text : ui.Words {
       Fill: $tone_term_muted
@@ -156,7 +161,7 @@ hn {
     HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
     PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
     Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
     Padding: {l: 6, r: 8, t: 0, b: 0}
     disclose : ui.Symbol, Faint {
       Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
@@ -205,9 +210,22 @@ hn {
     }
   }
 
-  // A harness REPL cell's card (src/app/chat.rs card_rows): what the cell did, in words, never its code. Its head: the
-  // disclosure, its step's icon, the step's words ("Searched Google for ..."), a detail ("5 results") and how long it
-  // took. Pressed, it opens to each step and the full values; folded, the main value shows under it.
+  // A tool call that failed (an error result, a non-zero exit): how it went in the failed tone.
+  prefab ChatToolFailed : hn.ChatTool {
+    head : hn.ChatToolHead {
+      state : ui.Line { Fill: $tone_failed }
+    }
+  }
+  prefab ChatToolOpenFailed : hn.ChatToolOpen {
+    head : hn.ChatToolHead {
+      state : ui.Line { Fill: $tone_failed }
+    }
+  }
+
+  // A harness REPL cell's card (src/app/chat.rs card_rows): what the cell did, in words, never its code. Its head, one
+  // line: the disclosure, its step's icon, the step's words ("Searched Google for ..."), a detail ("5 results"; a command
+  // that exited 0 says nothing) and, quiet, how long it took. Folded, the head alone (and what the cell draws); opened by
+  // default (a failure, the last shell call), a short preview of its value; pressed open, each step and the full values.
   prefab ChatCardHead : ui.Row {
     Pressable
     Action: {name: ""}
@@ -217,7 +235,7 @@ hn {
     HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
     PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
     Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $chat_tool_h, min: 0, max: 0}}
     Padding: {l: 6, r: 8, t: 0, b: 0}
     disclose : ui.Symbol, Faint {
       Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
@@ -246,12 +264,26 @@ hn {
     Padding: {l: 0, r: 0, t: 1, b: 1}
     head : hn.ChatCardHead {}
   }
-  // A cell that threw: its head in the failed tone.
+  // A cell that threw or a step that failed (a non-zero exit): its head in the failed tone.
   prefab ChatCardFailed : hn.ChatCard {
     head : hn.ChatCardHead {
       icon : ui.Symbol { Fill: $tone_failed }
       words : ui.Lead { Fill: $tone_failed }
+      detail : ui.Line { Fill: $tone_failed }
     }
+  }
+
+  // A run of tool calls with no words between them, folded to one line that counts them ("Read 2 files, ran 1 shell
+  // command", src/app/chat.rs rows_nested); pressed, it opens to each call, each folded to its own line. A run holding a
+  // failure says how many failed, in the failed tone. Its calls sit in from it by $chat_nest (hn.ChatNest's padding).
+  prefab ChatRun : hn.ChatCard {}
+  prefab ChatRunFailed : hn.ChatCard {
+    head : hn.ChatCardHead {
+      detail : ui.Line { Fill: $tone_failed }
+    }
+  }
+  prefab ChatNest : ui.Node {
+    Padding: {l: $chat_nest, r: 0, t: 0, b: 0}
   }
 
   // One step of an opened card that took several: its icon, its words, its detail, under the card's icon.
@@ -444,7 +476,7 @@ hn {
   prefab ChatError : ui.Row {
     Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    Padding: {l: 0, r: 0, t: 4, b: 6}
+    Padding: {l: 0, r: 0, t: $chat_block_half, b: $chat_block_half}
     text : ui.Words {
       Fill: $tone_failed
       TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}

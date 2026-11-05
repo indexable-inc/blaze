@@ -78,6 +78,10 @@ pub enum Face {
     CodeWeight(u16),
     /// Code's slant: a comment, the prose the program skips.
     CodeItalic,
+    /// Code amid prose (markdown's `` `code` ``): the code font a little smaller than the words
+    /// ([`crate::markdown::INLINE_CODE_EM`]), so it reads at their size, with room for the chip it is drawn on either side
+    /// of it ([`crate::markdown::chip_room`]).
+    InlineCode,
     /// Level 1 to 6.
     Heading(u8),
     /// A font by its PostScript name (a font setting's preview, plugins/schema.rs `FONTS`); the text font when this
@@ -87,7 +91,7 @@ pub enum Face {
 
 impl Face {
     fn is_code(self) -> bool {
-        matches!(self, Face::Code | Face::CodeWeight(_) | Face::CodeItalic)
+        matches!(self, Face::Code | Face::CodeWeight(_) | Face::CodeItalic | Face::InlineCode)
     }
 }
 
@@ -241,6 +245,30 @@ const TERM_BUNDLED: [(&str, &[u8]); 5] = [
         include_bytes!("../fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf"),
     ),
 ];
+
+/// The character of the bundled Symbols Nerd Font glyph named `name` (its PostScript glyph name, which is the Nerd Fonts
+/// cheat sheet's: `cod-check`, `dev-rust`, `seti-typescript`, `fa-gear`), None when the face has no glyph of that name.
+/// The names are read from the face's `post` and `cmap` tables once.
+#[must_use]
+pub fn nerd_symbol(name: &str) -> Option<char> {
+    use read_fonts::TableProvider;
+    static NAMES: std::sync::OnceLock<HashMap<String, char>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let mut by_name = HashMap::new();
+        let Some((_, bytes)) = TERM_BUNDLED.iter().find(|(n, _)| n.starts_with("SymbolsNerdFont")) else { return by_name };
+        let Ok(font) = read_fonts::FontRef::new(bytes) else { return by_name };
+        let (Ok(post), Ok(cmap)) = (font.post(), font.cmap()) else { return by_name };
+        let Some((_, _, table)) = cmap.best_subtable() else { return by_name };
+        for (cp, gid) in table.iter() {
+            let (Some(c), Ok(g)) = (char::from_u32(cp), u16::try_from(gid.to_u32())) else { continue };
+            if let Some(n) = post.glyph_name(read_fonts::types::GlyphId16::new(g)) {
+                by_name.entry(n.to_owned()).or_insert(c);
+            }
+        }
+        by_name
+    });
+    names.get(name).copied()
+}
 
 /// The Nerd Font symbols face and the colour emoji face, by PostScript name.
 const NERD_FONT: &str = "SymbolsNFM";
@@ -788,6 +816,7 @@ impl Fonts {
             Face::Code => code_font(size * self.look.code_scale, 400, false),
             Face::CodeWeight(weight) => code_font(size * self.look.code_scale, weight, false),
             Face::CodeItalic => code_font(size * self.look.code_scale, 400, true),
+            Face::InlineCode => code_font(size * self.look.code_scale * crate::markdown::INLINE_CODE_EM, 400, false),
             Face::Heading(level) => self.ui_font(self.heading_size(level), true),
             Face::Named(name) => text_font(name, size).unwrap_or_else(|| self.ui_font(size, false)),
         };
@@ -822,6 +851,7 @@ fn typesetter(
         kern: vec![fonts.look.tracking * style.size; len],
         code: vec![false; len],
     };
+    let units: Vec<u16> = text.encode_utf16().collect();
     for r in runs.iter().filter(|r| r.start < r.end.min(len)) {
         let f = fonts.face_font(style.size, r.face);
         let i = attrs.fonts.len() as u16;
@@ -830,6 +860,15 @@ fn typesetter(
         if r.face.is_code() {
             attrs.kern[r.start..r.end.min(len)].fill(0.0);
             attrs.code[r.start..r.end.min(len)].fill(true);
+            if r.face == Face::InlineCode {
+                // The chip's room: after the unit before the span and after its last unit (runs come in order, so the
+                // unit before is already set).
+                let (before, after) = crate::markdown::chip_room(&units, r.start, r.end.min(len), style.size);
+                if r.start > 0 {
+                    attrs.kern[r.start - 1] += before;
+                }
+                attrs.kern[r.end.min(len) - 1] += after;
+            }
         } else if let Face::Heading(level) = r.face {
             attrs.kern[r.start..r.end.min(len)]
                 .fill(fonts.look.heading_tracking * fonts.heading_size(level));
