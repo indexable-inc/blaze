@@ -222,7 +222,8 @@ jobs:
       # SHA256SUMS and B3SUMS, `<hex>  <name>` a line as sha256sum and b3sum write them; BLAKE3 is
       # the uv workspace's `blake3`, so the runner needs no system package for it.
       - name: Checksums
-        run: uv run --frozen python .github/scripts/checksums.py '{"dir": "out"}'
+        run: |
+          uv run --frozen python .github/scripts/checksums.py '{"dir": "out"}'
 
       - name: Release
         env:
