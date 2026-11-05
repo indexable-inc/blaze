@@ -494,10 +494,12 @@ impl fmt::Display for Broken {
 /// break the store as failed IO does ([`FAILURES_MOST`]), naming the error. A commit is
 /// reported durable only once a commit with no error reported during it has written its head.
 ///
-/// When it does not (the daemon lacks `CAP_SYS_ADMIN`, which the mark needs; the file system
-/// reports no errors; the system has no such events) the store says so here and in its log
-/// at open, and fsync's errors alone are its durability signal, as they were before the
-/// events existed. That is a fact about the file system, stated, not a path taken instead:
+/// When it does not (the daemon lacks `CAP_SYS_ADMIN` in the initial user namespace, which the
+/// mark needs, as for every unprivileged user on CI and dev machines; the file system reports
+/// no errors) the store works the same in every other way: it never waits on the watch, and
+/// fsync's and close's errors are its commit-path truth, as they are in both modes. It says so
+/// here and once in its log at open. The events are an extra signal where blaze runs
+/// privileged, never a requirement (docs/kernel.md names both modes). That is a fact about the file system, stated, not a path taken instead:
 /// the store never claims a watch it does not have.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FsErrors {
@@ -2022,8 +2024,10 @@ impl Store {
     }
 
     /// Takes the answer of an [`Effect::Residency`] of `file` (own pack `pack`) for the
-    /// records at `offsets`, of round `round`. One that failed leaves those records' residency
-    /// unknown, named in the problems: nothing is guessed of them.
+    /// records at `offsets`, of round `round`. Every kernel blaze runs on has `cachestat`
+    /// (Linux 6.5, under the 7.3 floor), so one that failed breaks the store, naming the pack
+    /// and the error (`no-fallback`): settles never go on by read flags alone. An answer for a
+    /// pack retired since it was asked is moot and dropped, whatever it says.
     fn residency_answered(
         &mut self,
         round: u64,
@@ -2033,7 +2037,9 @@ impl Store {
         done: Done,
     ) {
         let current = round == self.residency.round;
+        let gone = self.tiers[0].packs.get(pack as usize).is_none_or(|it| it.removed || it.retiring);
         match done {
+            _ if gone => {}
             Done::Resident(pages) if pages.len() == offsets.len() => {
                 if current {
                     for (&at, pages) in offsets.iter().zip(&pages) {
@@ -2041,20 +2047,25 @@ impl Store {
                     }
                 }
             }
-            // alloc: a problem reported
-            Done::Resident(pages) => self.problems.push(format!(
-                "{file}: the page-cache residency of {} records came back as {} counts, so \
-                 settles move them by their reads alone until it is asked again",
-                offsets.len(),
-                pages.len()
-            )),
-            // alloc: a problem reported
-            done => self.problems.push(format!(
-                "{file}: the page-cache residency of {} records is unknown, so settles move \
-                 them by their reads alone until it is asked again: {}",
-                offsets.len(),
-                describe(&done)
-            )),
+            Done::Resident(pages) => {
+                // alloc: the error that breaks the store
+                let what = format!(
+                    "its page-cache residency (cachestat) of {} records came back as {} counts",
+                    offsets.len(),
+                    pages.len()
+                );
+                self.fail(file, what);
+            }
+            done => {
+                // alloc: the error that breaks the store
+                let what = format!(
+                    "its page-cache residency (cachestat, Linux 6.5, under blaze's 7.3 floor) \
+                     of {} records failed: {}",
+                    offsets.len(),
+                    describe(&done)
+                );
+                self.fail(file, what);
+            }
         }
         if current {
             self.residency.waiting -= 1;
