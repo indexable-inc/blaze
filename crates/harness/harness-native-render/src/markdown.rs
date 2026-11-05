@@ -15,6 +15,30 @@ pub struct Inline {
     pub links: Vec<(usize, usize, String)>,
 }
 
+/// An inline code span's chip, in ems of its text's size: the plate reaches `CHIP_INSET_EM` past the span's glyphs each
+/// side, and keeps `CHIP_GAP_EM` clear of a neighbour that is not white space (a word space is gap enough on its own). The
+/// typesetter leaves that room ([`chip_room`]), so the plate never covers the words beside it.
+pub const CHIP_INSET_EM: f32 = 0.3;
+pub const CHIP_GAP_EM: f32 = 0.15;
+/// The chip's corners, points.
+pub const CHIP_RADIUS: f32 = 3.0;
+/// Inline code's size, in ems of its words'. A monospace reads larger than Inter at the same size though its x-height is
+/// lower (Berkeley Mono's is 0.95 of Inter's): its letters are wider (an `a` is 0.60 em against Inter's 0.56), so matching
+/// x-heights would make it larger still. At 0.9 em it reads at the words' size, as GitHub and MDN set it.
+pub const INLINE_CODE_EM: f32 = 0.9;
+
+/// The room (points) the typesetter leaves before and after the code span `lo..hi` of `units` (UTF-16) set at `size`: kerned
+/// in after the unit before it and after its last unit. None before a span that starts the text (no unit to kern; its
+/// plate hangs into the margin there). A caret between two units sits in the middle of the kern between them, so the
+/// span's carets are half of each room outside its glyphs.
+#[must_use]
+pub fn chip_room(units: &[u16], lo: usize, hi: usize, size: f32) -> (f32, f32) {
+    let spaced = |u: Option<&u16>| u.is_none_or(|&u| char::from_u32(u32::from(u)).is_some_and(char::is_whitespace));
+    let side = |spaced: bool| size * (CHIP_INSET_EM + if spaced { 0.0 } else { CHIP_GAP_EM });
+    let before = if lo == 0 { 0.0 } else { side(spaced(units.get(lo - 1))) };
+    (before, side(spaced(units.get(hi))))
+}
+
 /// `src` read as inline markdown.
 #[must_use]
 pub fn inline(src: &str) -> Inline {
@@ -55,7 +79,7 @@ pub fn inline(src: &str) -> Inline {
                         for ch in inner.chars() {
                             push(&mut out, &mut at, ch);
                         }
-                        out.runs.push(Run { start, end: at, face: Face::Code });
+                        out.runs.push(Run { start, end: at, face: Face::InlineCode });
                         out.code.push((start, at));
                         i = j + ticks;
                     }
@@ -375,11 +399,11 @@ mod tests {
         };
         assert_eq!(face("bold"), Some(Face::Bold));
         assert_eq!(face("it "), Some(Face::Italic));
-        assert_eq!(face("co*de*"), Some(Face::Code));
+        assert_eq!(face("co*de*"), Some(Face::InlineCode));
         assert_eq!(m.code.len(), 1);
         let both = inline("***x*** **a `b` c**");
         assert_eq!(both.text, "x a b c");
         assert_eq!(both.runs[0].face, Face::BoldItalic);
-        assert!(both.runs.iter().any(|r| r.face == Face::Code));
+        assert!(both.runs.iter().any(|r| r.face == Face::InlineCode));
     }
 }

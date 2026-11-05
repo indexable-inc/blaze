@@ -1,27 +1,26 @@
-//! The daemon link: harnessd's unix socket (`~/.harness/harnessd.sock`, frames of `[type u8][len u32 BE][payload]`, see
-//! crates/harness/harness/src/proto.rs), spoken from plain threads.
+//! The daemon link: harnessd's unix socket (`~/.harness/harnessd.sock`), harness-proto's schema (deterministic-CBOR
+//! messages in `[type u8][len u32 BE][payload]` frames, each connection opened by a hello naming the schema), spoken from
+//! plain threads.
 //!
 //! - [`ensure_daemon`] connects, or starts `harness daemon` the way the CLI's `ensure_daemon` does (setsid, output appended
 //!   to `~/.harness/daemon.log`) and waits for the socket.
 //! - A list thread asks `list` (with every past chat) and `runs` and sends the world [`Msg::List`] and [`Msg::Runs`]: again each time the
 //!   daemon's change feed (`watch`) says something changed, or every [`POLL`] against an older daemon without one.
-//! - Each attached object has a thread reading its stream (`attach`: a JSON ok, the snapshot, then live bytes and the
-//!   exit) into [`Msg::Data`] and [`Msg::Exit`]; its write half takes the keyboard (`T_DATA`) and resizes (`T_RESIZE`).
+//! - Each attached object has a thread reading its stream (`attach`: `attached`, then the snapshot and live terminal
+//!   bytes, or a chat's T_EVENT frames, and the exit) into [`Msg::Data`] and [`Msg::Exit`]; its write half takes the
+//!   keyboard (`T_DATA`), resizes (`Up::Resize`) and the detach (`Up::Detach`).
 use harness_native_model::{LinkState, Mailbox, Msg};
-use serde_json::{Value, json};
+use harness_proto::frame::{self, T_CBOR, T_DATA, T_EVENT};
+use harness_proto::msg::{Down, Reply, Request, RunReq, Up};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-pub const T_JSON: u8 = 1;
-pub const T_DATA: u8 = 2;
-pub const T_RESIZE: u8 = 3;
-pub const T_EXIT: u8 = 4;
 
 const POLL: Duration = Duration::from_millis(400);
 
@@ -44,37 +43,137 @@ pub fn sock() -> PathBuf {
     home().join("harnessd.sock")
 }
 
-fn write_frame(w: &mut impl Write, t: u8, payload: &[u8]) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.push(t);
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(payload);
-    w.write_all(&buf)?;
-    w.flush()
+/// One message's frame.
+fn up(m: &Up) -> Vec<u8> {
+    frame::frame(T_CBOR, &harness_proto::cbor::encode(m))
 }
 
-fn read_frame(r: &mut impl Read) -> std::io::Result<Option<(u8, Vec<u8>)>> {
-    let mut head = [0u8; 5];
-    match r.read_exact(&mut head) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let len = u32::from_be_bytes(head[1..].try_into().unwrap()) as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(Some((head[0], buf)))
+fn decode_down(payload: &[u8]) -> std::io::Result<Down> {
+    harness_proto::cbor::decode(payload).map_err(|e| {
+        std::io::Error::other(format!("harnessd sent a message that is not harness schema {}'s: {e}", harness_proto::SCHEMA))
+    })
 }
 
-/// One request on a fresh connection, and its JSON answer.
-pub fn request(v: &Value) -> std::io::Result<Value> {
-    let mut s = UnixStream::connect(sock())?;
-    s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    write_frame(&mut s, T_JSON, v.to_string().as_bytes())?;
-    match read_frame(&mut s)? {
-        Some((T_JSON, body)) => serde_json::from_slice(&body).map_err(std::io::Error::other),
-        _ => Err(std::io::Error::other("no answer")),
+/// The daemon's next message.
+fn recv(r: &mut impl Read) -> std::io::Result<Down> {
+    match frame::read(r)? {
+        Some((T_CBOR, body)) => decode_down(&body),
+        Some((t, _)) => Err(std::io::Error::other(format!("harnessd sent a frame of type {t} where a message belongs"))),
+        None => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "harnessd closed the connection")),
     }
+}
+
+/// How long a daemon has to answer the hello (the CLI's `HELLO_WAIT`).
+const HELLO_WAIT: Duration = Duration::from_secs(3);
+
+/// How long a request waits for its answer once the hello is in.
+const REPLY_WAIT: Duration = Duration::from_secs(10);
+
+/// A daemon that took the connection but that this app cannot speak to (no hello in [`HELLO_WAIT`], another schema, a
+/// refusal), as an io error's inner error: the list thread tells it from no daemon at all and shows it, rather than
+/// trying to connect again and again.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn refused(why: String) -> std::io::Error {
+    std::io::Error::other(Refused(why))
+}
+
+/// The reason, when `e` is a [`Refused`].
+fn refusal(e: &std::io::Error) -> Option<&str> {
+    e.get_ref()?.downcast_ref::<Refused>().map(|r| r.0.as_str())
+}
+
+/// The pid at the other end of `s`: macOS's `LOCAL_PEERPID` socket option (sys/un.h).
+fn peer_pid(s: &UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `pid`, which is that size.
+    let r = unsafe {
+        libc::getsockopt(s.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len)
+    };
+    (r == 0 && pid > 0).then_some(pid)
+}
+
+/// A fresh connection: the hello and `first` written together, and the daemon's hello read (an error naming both
+/// schemas when they differ). The answer to `first` is the next message.
+///
+/// # Errors
+/// The socket's (no daemon, a connection closed or reset), or a [`Refused`] naming the daemon's pid and socket: no hello
+/// within [`HELLO_WAIT`] (an older daemon), another schema's, or a hello this app cannot read.
+fn open(first: &Up) -> std::io::Result<UnixStream> {
+    let path = sock();
+    let mut s = UnixStream::connect(&path)?;
+    s.set_read_timeout(Some(HELLO_WAIT))?;
+    let mut out = up(&Up::Hello { schema: harness_proto::SCHEMA });
+    out.extend_from_slice(&up(first));
+    std::io::Write::write_all(&mut s, &out)?;
+    let pid = peer_pid(&s).map_or("unknown".to_owned(), |p| p.to_string());
+    let who = || format!("harnessd (pid {pid}, socket {})", path.display());
+    let hello = match recv(&mut s) {
+        Ok(m) => m,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            return Err(refused(format!(
+                "{} did not answer the hello within {}s: it is likely an older daemon that does not speak harness schema {}; run `harness stop`",
+                who(),
+                HELLO_WAIT.as_secs(),
+                harness_proto::SCHEMA
+            )));
+        }
+        Err(e) if matches!(
+            e.kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        ) => return Err(e),
+        Err(e) => return Err(refused(format!("{} answered the hello with something this app cannot read ({e}); run `harness stop`", who()))),
+    };
+    match hello {
+        Down::Hello { schema, .. } if schema == harness_proto::SCHEMA => {
+            s.set_read_timeout(Some(REPLY_WAIT))?;
+            Ok(s)
+        }
+        Down::Hello { schema, .. } => Err(refused(format!(
+            "{} speaks harness schema {schema}, this app {}: run `harness stop` to restart it",
+            who(),
+            harness_proto::SCHEMA
+        ))),
+        Down::Error { error } => Err(refused(format!("{} refused the connection: {error}", who()))),
+        m => Err(refused(format!("{} answered the hello with {m:?}", who()))),
+    }
+}
+
+/// One request on a fresh connection: its reply, or the daemon's refusal (the inner error, naming why). The outer error
+/// is the socket's (no daemon, a closed connection).
+pub fn request(r: Request) -> std::io::Result<Result<Reply, String>> {
+    let mut s = open(&Up::Req(r))?;
+    match recv(&mut s)? {
+        Down::Reply(reply) => Ok(Ok(reply)),
+        Down::Error { error } => Ok(Err(error)),
+        m => Err(std::io::Error::other(format!("harnessd answered a request with {m:?}"))),
+    }
+}
+
+/// A request whose reply is an open record (runs, objects).
+fn record(r: Request) -> std::io::Result<Result<Value, String>> {
+    Ok(request(r)?.and_then(|reply| match reply {
+        Reply::Record(v) => Ok(v),
+        Reply::Ok => Ok(serde_json::json!({"ok": true})),
+        r => Err(format!("harnessd answered with {r:?} where a record belongs")),
+    }))
+}
+
+/// The newest runs (`before`, `q` as `runs` takes them).
+fn runs(limit: usize, before: Option<u64>, q: Option<String>) -> std::io::Result<Result<Vec<Value>, String>> {
+    Ok(record(Request::Runs(RunReq::Runs { session: None, limit: Some(limit), before, q }))?
+        .map(|v| v["runs"].as_array().cloned().unwrap_or_default()))
 }
 
 /// The `harness` binary to start the daemon with: `$HARNESS_BIN`, else this workspace's `target/release/harness` (or
@@ -135,16 +234,16 @@ pub fn ensure_daemon() -> Result<(), String> {
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
-/// Open the daemon's change feed: `watch` answers ok, then sends a JSON event each time its sessions or runs change.
-/// None when the daemon has no such op (an older one) or is not there.
+/// Open the daemon's change feed: `watch` answers `watching`, then sends `Down::Changed` each time its sessions or runs
+/// change. None when the daemon is not there or refused it.
 fn watch_feed() -> Option<UnixStream> {
-    let mut s = UnixStream::connect(sock()).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
-    write_frame(&mut s, T_JSON, json!({"op": "watch"}).to_string().as_bytes()).ok()?;
-    let (t, body) = read_frame(&mut s).ok()??;
-    let v: Value = serde_json::from_slice(&body).ok()?;
-    if t != T_JSON || v.get("ok").is_none() {
-        return None;
+    let mut s = open(&Up::Req(Request::Watch)).ok()?;
+    match recv(&mut s) {
+        Ok(Down::Reply(Reply::Watching)) => {}
+        other => {
+            eprintln!("harness-native: watch: {other:?}");
+            return None;
+        }
     }
     // Events come only on a change: wait for them as long as it takes.
     s.set_read_timeout(None).ok()?;
@@ -163,13 +262,18 @@ fn follow(
 ) -> bool {
     let mut offset = 0u64;
     while live() {
-        let v = match request(
-            &json!({"op": "run_read", "id": format!("r{run}"), "stage": stage, "stream": stream, "offset": offset, "wait_ms": RUN_WAIT_MS}),
-        ) {
-            Ok(v) if v.get("error").is_none() => v,
-            Ok(v) => {
+        let v = match record(Request::Runs(RunReq::RunRead {
+            id: format!("r{run}"),
+            stage: stage.map(|s| s as usize),
+            stream: stream.to_owned(),
+            offset,
+            max_bytes: None,
+            wait_ms: RUN_WAIT_MS,
+        })) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 if stream != "ordered" {
-                    eprintln!("harness-native: run_read r{run} {stream}: {v}");
+                    eprintln!("harness-native: run_read r{run} {stream}: {e}");
                 }
                 return false;
             }
@@ -233,35 +337,55 @@ impl Link {
                 // The daemon's change feed (`watch`), while it is open; None against a daemon without one (it is polled).
                 let mut feed: Option<UnixStream> = None;
                 let mut polled = false;
+                // The last refusal shown (Msg::Refused), so an unchanged one is not sent again.
+                let mut refused_why: Option<String> = None;
                 loop {
                     let asked = std::time::Instant::now();
                     // Every chat too, from before the daemon's restarts (the Archive files them; opening one asks the
                     // daemon for its log's events, resuming one sends it a message).
-                    let state = match request(&json!({"op": "list", "chats": true})) {
-                        Ok(v) => {
+                    let listed = match request(Request::List { all: false, chats: true }) {
+                        Ok(Ok(Reply::Sessions { sessions })) => Ok(sessions),
+                        Ok(Ok(r)) => Err((format!("list answered {r:?}"), None)),
+                        Ok(Err(e)) => Err((e, None)),
+                        Err(e) => Err((e.to_string(), refusal(&e).map(str::to_owned))),
+                    };
+                    let state = match listed {
+                        Ok(sessions) => {
                             rtt_us.store(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
                             if up != Some(LinkState::Up) {
-                                let p = request(&json!({"op": "info"}))
-                                    .ok()
-                                    .and_then(|v| v["pid"].as_u64())
-                                    .unwrap_or(0);
-                                pid.store(p as u32, Ordering::Relaxed);
+                                let p = match request(Request::Info) {
+                                    Ok(Ok(Reply::Daemon { pid, .. })) => pid,
+                                    _ => 0,
+                                };
+                                pid.store(p, Ordering::Relaxed);
                             }
-                            let sessions = v["sessions"].as_array().cloned().unwrap_or_default();
-                            tx.send(Msg::List(sessions));
+                            // The model reads each row by its fields' names (the schema's SessionInfo).
+                            let rows = sessions.iter().filter_map(|s| serde_json::to_value(s).ok()).collect();
+                            tx.send(Msg::List(rows));
                             // The recent shell runs, beside the sessions they ran in.
-                            match request(&json!({"op": "runs", "limit": RUNS})) {
-                                Ok(v) if v.get("error").is_none() => {
-                                    tx.send(Msg::Runs(
-                                        v["runs"].as_array().cloned().unwrap_or_default(),
-                                    ));
+                            match runs(RUNS, None, None) {
+                                Ok(Ok(r)) => {
+                                    tx.send(Msg::Runs(r));
                                 }
-                                Ok(v) => eprintln!("harness-native: runs: {v}"),
+                                Ok(Err(e)) => eprintln!("harness-native: runs: {e}"),
                                 Err(e) => eprintln!("harness-native: runs: {e}"),
                             }
                             LinkState::Up
                         }
-                        Err(_) => {
+                        // A daemon is there but cannot be spoken to: say so in the window (asked again each POLL, so
+                        // a `harness stop` and a fresh daemon bring the link up), never "connecting" forever.
+                        Err((_, Some(why))) => {
+                            if refused_why.as_deref() != Some(why.as_str()) {
+                                eprintln!("harness-native: {why}");
+                                tx.send(Msg::Refused(why.clone()));
+                                refused_why = Some(why);
+                            }
+                            LinkState::Refused
+                        }
+                        Err((e, None)) => {
+                            if up == Some(LinkState::Up) {
+                                eprintln!("harness-native: list: {e}");
+                            }
                             if up != Some(LinkState::Connecting) {
                                 tx.send(Msg::Link(LinkState::Connecting));
                                 wake();
@@ -275,6 +399,9 @@ impl Link {
                             }
                         }
                     };
+                    if state != LinkState::Refused {
+                        refused_why = None;
+                    }
                     if up != Some(state) {
                         tx.send(Msg::Link(state));
                         up = Some(state);
@@ -297,8 +424,8 @@ impl Link {
                         }
                     }
                     match feed.as_mut() {
-                        Some(s) => match read_frame(s) {
-                            Ok(Some((T_JSON, _))) => {}
+                        Some(s) => match recv(s) {
+                            Ok(Down::Changed { .. }) => {}
                             _ => feed = None,
                         },
                         None => {
@@ -338,22 +465,20 @@ impl Link {
         self.streams.lock().unwrap().contains_key(&id)
     }
 
-    /// Attach to `id` at `cols` x `rows`: its stream's bytes come as `Msg::Data` (a chat session's events as JSON lines, with
-    /// `events`).
+    /// Attach to `id` at `cols` x `rows`: its stream's bytes come as `Msg::Data` (a chat session's events as whole
+    /// T_EVENT frames, with `events`).
     pub fn attach(&self, id: u64, cols: u16, rows: u16, events: bool) {
         if self.attached(id) {
             return;
         }
-        let Ok(mut s) = UnixStream::connect(sock()) else { return };
-        if write_frame(
-            &mut s,
-            T_JSON,
-            json!({"op": "attach", "id": id, "cols": cols, "rows": rows, "events": events}).to_string().as_bytes(),
-        )
-        .is_err()
-        {
-            return;
-        }
+        let s = match open(&Up::Req(Request::Attach { id, cols: Some(cols), rows: Some(rows), events })) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("harness-native: attach {id}: {e}");
+                return;
+            }
+        };
+        let _ = s.set_read_timeout(None);
         let Ok(w) = s.try_clone() else { return };
         // A generation per attach: a stream detached and attached again is not removed by the old reader as it ends.
         static GEN: AtomicU64 = AtomicU64::new(1);
@@ -364,27 +489,45 @@ impl Link {
         std::thread::Builder::new()
             .name(format!("harness-attach-{id}"))
             .spawn(move || {
-                // The ok (or an error) first.
-                if let Ok(Some((T_JSON, body))) = read_frame(&mut s) {
-                    let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-                    if v.get("error").is_some() {
-                        eprintln!("harness-native: attach {id}: {v}");
-                    }
+                let mut s = std::io::BufReader::with_capacity(256 * 1024, s);
+                // `attached` (or an error) first.
+                match recv(&mut s) {
+                    Ok(Down::Reply(Reply::Attached { .. })) => {}
+                    other => eprintln!("harness-native: attach {id}: {other:?}"),
                 }
-                while let Ok(Some((t, body))) = read_frame(&mut s) {
-                    match t {
-                        T_DATA => {
+                // A chat's events, as whole frames, gathered while more are already read (a history comes as one batch).
+                let mut events = Vec::new();
+                loop {
+                    let got = frame::read(&mut s);
+                    if let Ok(Some((T_EVENT, body))) = &got {
+                        events.extend_from_slice(&frame::head(T_EVENT, body.len()));
+                        events.extend_from_slice(body);
+                        if !s.buffer().is_empty() && events.len() < 256 * 1024 {
+                            continue;
+                        }
+                    }
+                    if !events.is_empty() {
+                        counted.fetch_add(events.len() as u64, Ordering::Relaxed);
+                        tx.send(Msg::Data { id, bytes: std::mem::take(&mut events) });
+                    }
+                    match got {
+                        Ok(Some((T_EVENT, _))) => {}
+                        Ok(Some((T_DATA, body))) => {
                             counted.fetch_add(body.len() as u64, Ordering::Relaxed);
                             tx.send(Msg::Data { id, bytes: body });
                         }
-                        T_EXIT => {
-                            let code = serde_json::from_slice::<Value>(&body)
-                                .ok()
-                                .and_then(|v| v["code"].as_i64())
-                                .unwrap_or(0);
-                            tx.send(Msg::Exit { id, code: code as i32 });
+                        Ok(Some((T_CBOR, body))) => match decode_down(&body) {
+                            Ok(Down::Exit { code }) => {
+                                tx.send(Msg::Exit { id, code });
+                            }
+                            other => eprintln!("harness-native: attach {id}: {other:?}"),
+                        },
+                        Ok(Some((t, _))) => eprintln!("harness-native: attach {id}: a frame of type {t}"),
+                        Ok(None) => break,
+                        Err(e) => {
+                            eprintln!("harness-native: attach {id}: {e}");
+                            break;
                         }
-                        _ => {}
                     }
                     wake();
                 }
@@ -399,10 +542,10 @@ impl Link {
             .expect("attach thread");
     }
 
-    /// Detach from `id` (a JSON frame ends the attach; the session keeps running).
+    /// Detach from `id` (`Up::Detach` ends the attach; the session keeps running).
     pub fn detach(&self, id: u64) {
         if let Some((_, mut s)) = self.streams.lock().unwrap().remove(&id) {
-            let _ = write_frame(&mut s, T_JSON, b"{}");
+            let _ = std::io::Write::write_all(&mut s, &up(&Up::Detach));
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
     }
@@ -410,17 +553,13 @@ impl Link {
     /// Keyboard bytes into `id`'s PTY.
     pub fn input(&self, id: u64, bytes: &[u8]) {
         if let Some((_, s)) = self.streams.lock().unwrap().get_mut(&id) {
-            let _ = write_frame(s, T_DATA, bytes);
+            let _ = frame::write(s, T_DATA, bytes);
         }
     }
 
     pub fn resize(&self, id: u64, cols: u16, rows: u16) {
         if let Some((_, s)) = self.streams.lock().unwrap().get_mut(&id) {
-            let _ = write_frame(
-                s,
-                T_RESIZE,
-                json!({"cols": cols, "rows": rows}).to_string().as_bytes(),
-            );
+            let _ = std::io::Write::write_all(s, &up(&Up::Resize { cols, rows }));
         }
     }
 
@@ -428,9 +567,9 @@ impl Link {
     pub fn chat_send(&self, id: u64, text: &str) {
         let (text, poke) = (text.to_owned(), self.poke.clone());
         std::thread::spawn(move || {
-            match request(&json!({"op": "send", "id": id, "text": text})) {
-                Ok(v) if v.get("error").is_some() => eprintln!("harness-native: send {id}: {v}"),
-                Ok(_) => {}
+            match request(Request::Send { id, text, raw: false, submit: None }) {
+                Ok(Err(e)) => eprintln!("harness-native: send {id}: {e}"),
+                Ok(Ok(_)) => {}
                 Err(e) => eprintln!("harness-native: send {id}: {e}"),
             }
             let _ = poke.send(());
@@ -440,8 +579,11 @@ impl Link {
     /// Interrupt chat session `id`'s turn in flight.
     pub fn chat_interrupt(&self, id: u64) {
         std::thread::spawn(move || {
-            if let Err(e) = request(&json!({"op": "rpc", "id": format!("s{id}"), "method": "interrupt"})) {
-                eprintln!("harness-native: interrupt {id}: {e}");
+            let r = Request::Rpc { id: format!("s{id}"), method: "interrupt".into(), args: Value::Null };
+            match request(r) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("harness-native: interrupt {id}: {e}"),
+                Err(e) => eprintln!("harness-native: interrupt {id}: {e}"),
             }
         });
     }
@@ -461,16 +603,24 @@ impl Link {
             let (k, mode) = match kind.as_str() {
                 k => k.strip_suffix("-tui").map_or((k, None), |k| (k, Some("tui"))),
             };
-            match request(
-                &json!({"op": "spawn", "kind": k, "cwd": cwd, "cols": cols, "rows": rows, "mode": mode}),
-            ) {
-                Ok(v) => match v["id"].as_u64() {
-                    Some(id) => {
-                        let _ = poke.send(());
-                        then(id);
-                    }
-                    None => eprintln!("harness-native: spawn {kind}: {v}"),
-                },
+            let r = Request::Spawn {
+                kind: k.to_owned(),
+                args: Vec::new(),
+                parent: None,
+                cwd,
+                prompt: None,
+                name: None,
+                cols: Some(cols),
+                rows: Some(rows),
+                mode: mode.map(str::to_owned),
+            };
+            match request(r) {
+                Ok(Ok(Reply::Spawned { id })) => {
+                    let _ = poke.send(());
+                    then(id);
+                }
+                Ok(Ok(r)) => eprintln!("harness-native: spawn {kind}: answered {r:?}"),
+                Ok(Err(e)) => eprintln!("harness-native: spawn {kind}: {e}"),
                 Err(e) => eprintln!("harness-native: spawn {kind}: {e}"),
             }
         });
@@ -543,12 +693,10 @@ impl Link {
     pub fn runs_page(&self, before: u64) {
         let (tx, wake) = (self.tx.clone(), self.wake.clone());
         std::thread::spawn(move || {
-            let runs = match request(&json!({"op": "runs", "limit": PAGE, "before": before})) {
-                Ok(v) if v.get("error").is_none() => {
-                    v["runs"].as_array().cloned().unwrap_or_default()
-                }
-                Ok(v) => {
-                    eprintln!("harness-native: runs before r{before}: {v}");
+            let runs = match runs(PAGE, Some(before), None) {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    eprintln!("harness-native: runs before r{before}: {e}");
                     Vec::new()
                 }
                 Err(e) => {
@@ -566,12 +714,12 @@ impl Link {
     /// up to [`PAGE`]): they come as `Msg::RunsFound`.
     pub fn runs_search(&self, q: &str) {
         let (tx, wake, q) = (self.tx.clone(), self.wake.clone(), q.to_owned());
-        std::thread::spawn(move || match request(&json!({"op": "runs", "limit": PAGE, "q": q})) {
-            Ok(v) if v.get("error").is_none() => {
-                tx.send(Msg::RunsFound(v["runs"].as_array().cloned().unwrap_or_default()));
+        std::thread::spawn(move || match runs(PAGE, None, Some(q.clone())) {
+            Ok(Ok(r)) => {
+                tx.send(Msg::RunsFound(r));
                 wake();
             }
-            Ok(v) => eprintln!("harness-native: runs matching {q:?}: {v}"),
+            Ok(Err(e)) => eprintln!("harness-native: runs matching {q:?}: {e}"),
             Err(e) => eprintln!("harness-native: runs matching {q:?}: {e}"),
         });
     }
@@ -580,8 +728,10 @@ impl Link {
     pub fn kill_run(&self, n: u64) {
         let poke = self.poke.clone();
         std::thread::spawn(move || {
-            if let Err(e) = request(&json!({"op": "run_kill", "id": format!("r{n}")})) {
-                eprintln!("harness-native: run_kill r{n}: {e}");
+            match request(Request::Runs(RunReq::RunKill { id: format!("r{n}") })) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("harness-native: run_kill r{n}: {e}"),
+                Err(e) => eprintln!("harness-native: run_kill r{n}: {e}"),
             }
             let _ = poke.send(());
         });
@@ -590,8 +740,10 @@ impl Link {
     pub fn kill(&self, id: u64) {
         let poke = self.poke.clone();
         std::thread::spawn(move || {
-            if let Err(e) = request(&json!({"op": "kill", "id": id})) {
-                eprintln!("harness-native: kill {id}: {e}");
+            match request(Request::Kill { id }) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("harness-native: kill {id}: {e}"),
+                Err(e) => eprintln!("harness-native: kill {id}: {e}"),
             }
             // The daemon pushes the exit when it comes; an older one is polled again now.
             let _ = poke.send(());

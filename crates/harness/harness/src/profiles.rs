@@ -10,6 +10,9 @@ pub struct Launch {
     pub program: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// The reasoning effort the agent runs with, when the launch decides it (claude's `--effort`). None for shell and
+    /// cursor, and for codex, whose app-server says its effort in its thread/start answer (chat/codex.rs).
+    pub effort: Option<String>,
 }
 
 pub struct Ctx<'a> {
@@ -35,7 +38,12 @@ that in your reply: no markdown table or list restating results you just fetched
 To show a result as UI instead of prose (a dashboard, a comparison, a summary), write a ts cell that is Svelte 5 markup \
 (start it with <script> or an element) using Column, Row, Text (tone: ink muted strong error accent success warning), \
 Markdown, Code, Table (rows of records), Badge, Stat (label, value, note), Card (title), Divider and Spacer; runes only \
-($state, $derived, $effect, $props), and the person sees it drawn under the cell.";
+($state, $derived, $effect, $props), and the person sees it drawn under the cell. \
+For charts use <Chart kind=\"bar|stacked|line|area|scatter|pie|donut\" data={[...]} or series={[{name, data}]} \
+labels={[...]} unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand. For drawings, \
+SVG (svg, g, path, rect, circle, ellipse, line, polyline, polygon, text) or Canvas (view, Group, Path, Rect, Circle, Line, \
+Polyline, Text); inks are tone names (ink, muted, accent, success, warning, error, faint, series1..series8), never \
+colours. An element or prop not listed is an error naming it and its line.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -46,8 +54,8 @@ fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     env
 }
 
-fn mcp_args() -> Vec<String> {
-    vec!["run".into(), paths::root().join("src/mcp.ts").display().to_string()]
+fn mcp_args() -> anyhow::Result<Vec<String>> {
+    Ok(vec!["run".into(), paths::root()?.join("src/mcp.ts").display().to_string()])
 }
 
 fn common_env(ctx: &Ctx) -> BTreeMap<String, String> {
@@ -69,13 +77,14 @@ fn common_env(ctx: &Ctx) -> BTreeMap<String, String> {
 
 pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut l = match kind {
-        "claude" => claude(ctx),
+        "claude" => claude(ctx)?,
         "codex" => codex(ctx)?,
         "cursor" => cursor(ctx)?,
         "shell" => Launch {
             program: login_shell(),
             args: vec!["-l".into()],
             env: common_env(ctx),
+            effort: None,
         },
         other => anyhow::bail!("unknown agent kind {other:?} (expected one of {KINDS:?})"),
     };
@@ -89,12 +98,43 @@ pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
     Ok(l)
 }
 
-fn claude(ctx: &Ctx) -> Launch {
+/// Claude's effort when neither the user's args nor their own settings name one: passed as `--effort` so the effort the
+/// chat shows is the one it runs with, not claude's unstated built-in default.
+const CLAUDE_EFFORT: &str = "high";
+
+/// The effort a claude launch runs with, and whether the launch must pass it (false when the user's own args already
+/// carry `--effort`). The user's `--effort X` / `--effort=X` first; then `effortLevel` from their real
+/// `~/.claude/settings.json` (which `--setting-sources ""` would otherwise drop, the way cursor() inherits the user's
+/// model); then [`CLAUDE_EFFORT`].
+fn claude_effort(user_args: &[String]) -> (String, bool) {
+    let mut it = user_args.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--effort=") {
+            return (v.to_owned(), false);
+        }
+        if a == "--effort"
+            && let Some(v) = it.next()
+        {
+            return (v.clone(), false);
+        }
+    }
+    let user = std::env::var_os("HOME")
+        .and_then(|h| std::fs::read(PathBuf::from(h).join(".claude/settings.json")).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("effortLevel").and_then(|e| e.as_str()).filter(|e| !e.is_empty()).map(str::to_owned));
+    (user.unwrap_or_else(|| CLAUDE_EFFORT.to_owned()), true)
+}
+
+fn claude(ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut out: Vec<String> = Vec::new();
     if ctx.chat {
         out.extend(crate::chat::claude::ARGS.iter().map(|a| (*a).to_owned()));
     }
-    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args(), "env": mcp_env(ctx) } } });
+    let (effort, pass) = claude_effort(ctx.user_args);
+    if pass {
+        out.extend(["--effort".to_owned(), effort.clone()]);
+    }
+    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": mcp_env(ctx) } } });
     let args = [
         "--strict-mcp-config", "--mcp-config", &mcp.to_string(),
         "--tools", "",                          // no built-in tools (Bash, Read, Edit, WebFetch, ...)
@@ -126,7 +166,7 @@ fn claude(ctx: &Ctx) -> Launch {
         env.insert(k.into(), v.into());
     }
     out.extend(args.iter().map(|s| s.to_string()));
-    Launch { program: "claude".into(), args: out, env }
+    Ok(Launch { program: "claude".into(), args: out, env, effort: Some(effort) })
 }
 
 /// Codex features that add tools or pull in outside config; all switched off.
@@ -156,7 +196,7 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         std::fs::write(&config, format!("{existing}\n{header}\ntrust_level = \"trusted\"\n"))?;
     }
     let env_table = mcp_env(ctx).iter().map(|(k, v)| format!("{k}={}", toml_str(v))).collect::<Vec<_>>().join(",");
-    let args_list = mcp_args().iter().map(|a| toml_str(a)).collect::<Vec<_>>().join(",");
+    let args_list = mcp_args()?.iter().map(|a| toml_str(a)).collect::<Vec<_>>().join(",");
     let mut args: Vec<String> = vec![
         "-c".into(), format!("mcp_servers.harness.command={}", toml_str("bun")),
         "-c".into(), format!("mcp_servers.harness.args=[{args_list}]"),
@@ -202,7 +242,7 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         None => ("bunx".into(), vec!["@openai/codex".to_string()]),
     };
     pre.extend(args);
-    Ok(Launch { program, args: pre, env })
+    Ok(Launch { program, args: pre, env, effort: None })
 }
 
 /// Codex's model catalog decides most built-in tools per model (`tool_mode: code_mode_only` adds
@@ -257,7 +297,7 @@ fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
         "HARNESS_CWD": "${env:HARNESS_CWD}",
         "HARNESS_MCP_INSTRUCTIONS": SYSTEM_NOTE,
     });
-    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args(), "env": env } } });
+    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": env } } });
     let mcp = serde_json::to_vec_pretty(&mcp)?;
     if std::fs::read(dot.join("mcp.json")).ok().as_deref() != Some(&mcp[..]) {
         std::fs::write(dot.join("mcp.json"), mcp)?;
@@ -318,7 +358,7 @@ fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
     env.insert("HOME".into(), home.display().to_string());
     env.insert("HARNESS_CWD".into(), ctx.cwd.into());
     let program = which("cursor-agent").unwrap_or_else(|| real_home.join(".local/bin/cursor-agent").display().to_string());
-    Ok(Launch { program, args, env })
+    Ok(Launch { program, args, env, effort: None })
 }
 
 /// Account-installed marketplace plugins (synced into the private home) bring their own MCP servers,

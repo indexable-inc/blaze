@@ -11,17 +11,19 @@
 //!   rpc {id, method, args} -> per kind:
 //!     sessions: prompt {text, submit?=true} (the daemon's per-kind injection: `send`), input {data},
 //!               interrupt {key?} (Esc for agents, Ctrl-C for shell), resize {cols, rows}, kill,
-//!               signal {sig}, screen, info, sync (bring the messages stream up to date now), forget
+//!               signal {sig}, screen, info, sync (bring a terminal agent's messages stream up to date now), forget
 //!     runs:     stdin {data?, close?}, close_stdin, kill (TERM then KILL), signal {sig}, interrupt (INT),
 //!               info, wait {timeout_ms?}, read {stage?, stream?, offset?, max_bytes?, wait_ms?}
 //!     stages:   info, read {stream?, offset?, ...}
 //! The old ops (send, screen, resize, kill, run_kill, run_read, ...) stay as aliases.
-use crate::daemon::{Daemon, Req};
+use crate::daemon::Daemon;
+use harness_proto::msg::{Reply, Request as Req, RunReq};
 use crate::{db, messages, runs};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 static SPAWN: Mutex<()> = Mutex::new(());
 
@@ -45,7 +47,7 @@ pub fn parse(id: &str) -> Option<Target> {
 
 /// The live object holding `name`.
 fn live_named(d: &Daemon, name: &str) -> Option<String> {
-    let s = d.sessions.lock().unwrap().values().find(|s| s.name.as_deref() == Some(name) && s.exit.lock().unwrap().is_none()).map(|s| s.id);
+    let s = d.sessions.lock().values().find(|s| s.name.as_deref() == Some(name) && s.exit.lock().is_none()).map(|s| s.id);
     s.map(|n| format!("s{n}")).or_else(|| runs::live_named(name))
 }
 
@@ -86,7 +88,7 @@ pub fn spawn(d: &Arc<Daemon>, v: &Value) -> Result<Value> {
     let kind = v["kind"].as_str().context("spawn_object needs kind")?;
     let kind = if kind == "run" { "proc" } else { kind };
     let name = v["name"].as_str().map(str::to_string);
-    let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = SPAWN.lock();
     if let Some(n) = &name
         && let Some(id) = live_named(d, n)
     {
@@ -144,17 +146,17 @@ pub fn info(d: &Daemon, id: &str) -> Result<Value> {
         Some(Target::Session(n)) => match d.get(n) {
             Ok(s) => {
                 let i = s.info();
-                let exit = *s.exit.lock().unwrap();
+                let exit = *s.exit.lock();
                 json!({
                     "id": id, "kind": s.kind, "name": s.name, "parent": s.parent.map(|p| format!("s{p}")), "cwd": s.cwd,
-                    "status": i["status"], "exit_code": exit, "signal": null,
-                    "created_ms": s.created_ms, "title": i["title"], "pid": s.pid(), "cols": i["cols"], "rows": i["rows"],
+                    "status": i.status, "exit_code": exit, "signal": null,
+                    "created_ms": s.created_ms, "title": i.title, "pid": s.pid(), "cols": i.cols, "rows": i.rows,
                 })
             }
             Err(_) => known(&id)?,
         },
         Some(Target::Run(r)) => {
-            let m = runs::handle(runs::RunReq::RunStatus { id: r.clone() })?;
+            let m = runs::handle(RunReq::RunStatus { id: r.clone() })?;
             let parent = m["parent"].as_str().map(str::to_string).or(m["session"].as_u64().map(|s| format!("s{s}")));
             json!({
                 "id": r, "kind": "proc", "name": m["name"], "parent": parent, "cwd": m["cwd"], "cmd": m["cmd"],
@@ -164,7 +166,7 @@ pub fn info(d: &Daemon, id: &str) -> Result<Value> {
             })
         }
         Some(Target::Stage(r, k)) => {
-            let m = runs::handle(runs::RunReq::RunStatus { id: r.clone() })?;
+            let m = runs::handle(RunReq::RunStatus { id: r.clone() })?;
             let s = m["stages"].get(k).cloned().ok_or_else(|| anyhow!("run {r} has no stage {k}"))?;
             json!({
                 "id": id, "kind": "stage", "name": null, "parent": r, "cwd": m["cwd"], "cmd": s["text"], "status": s["status"],
@@ -205,7 +207,7 @@ fn sig_num(v: &Value) -> Result<i32> {
 
 /// Dispatch one RPC. `handle` runs an old-style socket request (so `prompt` goes through the same
 /// per-kind `send` path as every other client).
-pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req) -> Result<Value>) -> Result<Value> {
+pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req) -> Result<Reply>) -> Result<Reply> {
     let id = resolve(d, id)?;
     let a = |k: &str| args[k].as_str().map(str::to_string);
     match parse(&id) {
@@ -218,11 +220,11 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
                 let s = d.get(n)?;
                 if s.chat.is_some() && a("key").is_none() {
                     s.chat_interrupt()?;
-                    return Ok(json!({ "ok": true }));
+                    return Ok(Reply::Ok);
                 }
                 let key = a("key").unwrap_or_else(|| if s.kind == "shell" { "\x03".into() } else { "\x1b".into() });
                 s.write(key.as_bytes())?;
-                Ok(json!({ "ok": true }))
+                Ok(Reply::Ok)
             }
             "resize" => handle(Req::Resize {
                 id: n, cols: args["cols"].as_u64().context("resize needs cols")? as u16, rows: args["rows"].as_u64().context("resize needs rows")? as u16,
@@ -232,36 +234,36 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
             "signal" => {
                 let pid = d.get(n)?.pid().ok_or_else(|| anyhow!("{id} has no pid"))?;
                 unsafe { libc::kill(pid as i32, sig_num(&args["sig"])?) };
-                Ok(json!({ "ok": true }))
+                Ok(Reply::Ok)
             }
             "screen" => handle(Req::Screen { id: n }),
-            "info" | "status" => info(d, &id),
+            "info" | "status" => info(d, &id).map(Reply::Record),
             "sync" => {
                 messages::sync_object(&id)?;
-                Ok(json!({ "ok": true }))
+                Ok(Reply::Ok)
             }
             m => bail!("{id} ({}) has no method {m:?} (prompt input interrupt resize kill signal screen info sync forget)", kind_of(d, &id)),
         },
         Some(Target::Run(r)) => match method {
-            "stdin" => runs::handle(runs::RunReq::RunStdin { id: r, data: a("data"), close: args["close"].as_bool().unwrap_or(false) }),
-            "close_stdin" => runs::handle(runs::RunReq::RunStdin { id: r, data: None, close: true }),
-            "kill" => runs::handle(runs::RunReq::RunKill { id: r }),
-            "interrupt" => runs::signal(&r, libc::SIGINT),
+            "stdin" => runs::handle(RunReq::RunStdin { id: r, data: a("data"), close: args["close"].as_bool().unwrap_or(false) }).map(Reply::Record),
+            "close_stdin" => runs::handle(RunReq::RunStdin { id: r, data: None, close: true }).map(Reply::Record),
+            "kill" => runs::handle(RunReq::RunKill { id: r }).map(Reply::Record),
+            "interrupt" => runs::signal(&r, libc::SIGINT).map(Reply::Record),
             "signal" => {
                 let sig = sig_num(&args["sig"])?;
-                if sig == libc::SIGTERM && args["sig"].is_null() { runs::handle(runs::RunReq::RunKill { id: r }) } else { runs::signal(&r, sig) }
+                if sig == libc::SIGTERM && args["sig"].is_null() { runs::handle(RunReq::RunKill { id: r }).map(Reply::Record) } else { runs::signal(&r, sig).map(Reply::Record) }
             }
-            "info" | "status" => info(d, &id),
+            "info" | "status" => info(d, &id).map(Reply::Record),
             "wait" => {
-                runs::handle(runs::RunReq::RunWait { id: r.clone(), timeout_ms: args["timeout_ms"].as_u64() })?;
-                info(d, &r)
+                runs::handle(RunReq::RunWait { id: r.clone(), timeout_ms: args["timeout_ms"].as_u64() })?;
+                info(d, &r).map(Reply::Record)
             }
-            "read" => read(r, args["stage"].as_u64().map(|k| k as usize), args),
+            "read" => read(r, args["stage"].as_u64().map(|k| k as usize), args).map(Reply::Record),
             m => bail!("{id} (proc) has no method {m:?} (stdin close_stdin kill signal interrupt info wait read)"),
         },
         Some(Target::Stage(r, k)) => match method {
-            "info" | "status" => info(d, &id),
-            "read" => read(r, Some(k), args),
+            "info" | "status" => info(d, &id).map(Reply::Record),
+            "read" => read(r, Some(k), args).map(Reply::Record),
             m => bail!("{id} (stage) has no method {m:?} (info read)"),
         },
         None => bail!("bad object id {id:?}"),
@@ -269,7 +271,7 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
 }
 
 fn read(id: String, stage: Option<usize>, args: &Value) -> Result<Value> {
-    runs::handle(runs::RunReq::RunRead {
+    runs::handle(RunReq::RunRead {
         id, stage, stream: args["stream"].as_str().unwrap_or("out").to_string(), offset: args["offset"].as_u64().unwrap_or(0),
         max_bytes: args["max_bytes"].as_u64().map(|n| n as usize), wait_ms: args["wait_ms"].as_u64().unwrap_or(0),
     })

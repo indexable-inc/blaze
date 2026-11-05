@@ -8,12 +8,11 @@ mod daemon;
 mod inject;
 mod paths;
 mod profiles;
-mod proto;
 mod queries;
 mod runs;
 
 use anyhow::{Result, bail};
-use serde_json::json;
+use harness_proto::msg::{Reply, Request, RunReq};
 
 const USAGE: &str = "\
 harness                       start the daemon if needed, open the native app, return
@@ -24,6 +23,7 @@ harness tui [claude|codex|cursor|shell [args...]]
 harness ls [--all]            print the session tree (--all: past sessions too, from the index)
 harness send <id> <text...>   type a message into a session and press Enter
 harness screen <id>           print a session's current screen
+harness log <id>              print a chat's log, one event per line (JSON; bad records on stderr)
 harness kill <id>             kill a session's process
 harness run '<cmd>'           run a shell command through the daemon (every pipeline stage's output is
                               stored), stream its output, exit with its exit code
@@ -43,11 +43,22 @@ async fn main() -> Result<()> {
         Some(kind @ ("claude" | "codex" | "cursor" | "shell")) => {
             let (cols, rows) = crossterm::terminal::size().unwrap_or((140, 45));
             let cwd = std::env::current_dir()?.display().to_string();
-            let v = client::Ctl::connect()
+            let r = client::Ctl::connect()
                 .await?
-                .req(json!({"op": "spawn", "kind": kind, "args": &args[1..], "cwd": cwd, "cols": cols, "rows": rows}))
+                .req(Request::Spawn {
+                    kind: kind.to_owned(),
+                    args: args[1..].to_vec(),
+                    parent: None,
+                    cwd: Some(cwd),
+                    prompt: None,
+                    name: None,
+                    cols: Some(cols),
+                    rows: Some(rows),
+                    mode: None,
+                })
                 .await?;
-            open_app(v["id"].as_u64())
+            let Reply::Spawned { id } = r else { bail!("harnessd answered spawn with {r:?}") };
+            open_app(Some(id))
         }
         Some("tui") => match args.get(1).map(String::as_str) {
             Some(kind @ ("claude" | "codex" | "cursor" | "shell")) => client::run(Some((kind.to_string(), args[2..].to_vec()))).await,
@@ -56,34 +67,32 @@ async fn main() -> Result<()> {
         Some("daemon") => daemon::run().await,
         Some("ls") => {
             let all = args.get(1).is_some_and(|a| a == "--all" || a == "-a");
-            let v = client::Ctl::connect().await?.req(json!({"op": "list", "all": all})).await?;
-            for (_, line, _) in client::tree_lines(v["sessions"].as_array().map(Vec::as_slice).unwrap_or(&[])) {
+            let sessions = client::Ctl::connect().await?.list(all, false).await?;
+            for (_, line, _) in client::tree_lines(&sessions) {
                 println!("{line}");
             }
             Ok(())
         }
         Some("send") => {
             let id: u64 = arg(1).parse()?;
-            client::Ctl::connect().await?.req(json!({"op": "send", "id": id, "text": args[2..].join(" ")})).await?;
+            client::Ctl::connect().await?.req(Request::Send { id, text: args[2..].join(" "), raw: false, submit: None }).await?;
             Ok(())
         }
         Some("screen") => {
-            let v = client::Ctl::connect().await?.req(json!({"op": "screen", "id": arg(1).parse::<u64>()?})).await?;
-            print!("{}", v["text"].as_str().unwrap_or(""));
+            let r = client::Ctl::connect().await?.req(Request::Screen { id: arg(1).parse::<u64>()? }).await?;
+            let Reply::Screen { text, .. } = r else { bail!("harnessd answered screen with {r:?}") };
+            print!("{text}");
             Ok(())
         }
+        Some("log") => print_log(&arg(1)),
         Some("kill") => {
-            client::Ctl::connect().await?.req(json!({"op": "kill", "id": arg(1).parse::<u64>()?})).await?;
+            client::Ctl::connect().await?.req(Request::Kill { id: arg(1).parse::<u64>()? }).await?;
             Ok(())
         }
         Some("app") => {
             open_app(None)
         }
-        Some("stop") => {
-            let mut ctl = client::Ctl::connect().await?;
-            let _ = ctl.req(json!({"op": "shutdown"})).await;
-            Ok(())
-        }
+        Some("stop") => client::stop().await,
         Some("tee") => runs::tee(&arg(1)),
         Some("run") => {
             if args.len() < 2 {
@@ -93,7 +102,10 @@ async fn main() -> Result<()> {
         }
         Some("runs") => {
             let limit: usize = args.get(1).map(|a| a.parse()).transpose()?.unwrap_or(20);
-            let v = client::Ctl::connect().await?.req(json!({"op": "runs", "limit": limit})).await?;
+            let v = client::Ctl::connect()
+                .await?
+                .record(Request::Runs(RunReq::Runs { session: None, limit: Some(limit), before: None, q: None }))
+                .await?;
             for r in v["runs"].as_array().into_iter().flatten().rev() {
                 let exit = r["exit_code"].as_i64().map(|c| c.to_string()).or_else(|| r["signal"].as_str().map(String::from)).unwrap_or("-".into());
                 let session = r["session"].as_u64().map(|s| s.to_string()).unwrap_or("-".into());
@@ -109,7 +121,16 @@ async fn main() -> Result<()> {
             let mut ctl = client::Ctl::connect().await?;
             let mut offset = 0u64;
             loop {
-                let v = ctl.req(json!({"op": "run_read", "id": arg(1), "stage": stage, "stream": stream, "offset": offset})).await?;
+                let v = ctl
+                    .record(Request::Runs(RunReq::RunRead {
+                        id: arg(1),
+                        stage,
+                        stream: stream.to_owned(),
+                        offset,
+                        max_bytes: None,
+                        wait_ms: 0,
+                    }))
+                    .await?;
                 print!("{}", v["data"].as_str().unwrap_or(""));
                 offset = v["next_offset"].as_u64().unwrap_or(offset);
                 if v["eof"].as_bool() != Some(false) {
@@ -154,7 +175,16 @@ async fn run_cmd(cmd: String) -> Result<i32> {
     let session = std::env::var("HARNESS_SESSION").ok().and_then(|s| s.parse::<u64>().ok());
     let v = client::Ctl::connect()
         .await?
-        .req(json!({"op": "run", "cmd": cmd, "cwd": cwd, "env": env, "clear_env": true, "session": session, "parent": std::env::var("HARNESS_RUN").ok()}))
+        .record(Request::Runs(RunReq::Run {
+            cmd,
+            cwd: Some(cwd),
+            env,
+            clear_env: true,
+            session,
+            parent: std::env::var("HARNESS_RUN").ok(),
+            stdin: None,
+            repl: None,
+        }))
         .await?;
     let id = v["id"].as_str().unwrap_or_default().to_string();
     let pump = |stream: &'static str| {
@@ -163,7 +193,16 @@ async fn run_cmd(cmd: String) -> Result<i32> {
             let mut ctl = client::Ctl::connect().await?;
             let mut offset = 0u64;
             loop {
-                let v = ctl.req(json!({"op": "run_read", "id": id, "stream": stream, "offset": offset, "wait_ms": 1000})).await?;
+                let v = ctl
+                    .record(Request::Runs(RunReq::RunRead {
+                        id: id.clone(),
+                        stage: None,
+                        stream: stream.to_owned(),
+                        offset,
+                        max_bytes: None,
+                        wait_ms: 1000,
+                    }))
+                    .await?;
                 let data = v["data"].as_str().unwrap_or("");
                 if !data.is_empty() {
                     if stream == "out" {
@@ -183,7 +222,7 @@ async fn run_cmd(cmd: String) -> Result<i32> {
         }
     };
     tokio::try_join!(pump("out"), pump("err"))?;
-    let m = client::Ctl::connect().await?.req(json!({"op": "run_status", "id": id})).await?;
+    let m = client::Ctl::connect().await?.record(Request::Runs(RunReq::RunStatus { id: id.clone() })).await?;
     let code = match (m["exit_code"].as_i64(), m["signal"].as_str()) {
         (Some(c), _) => c as i32,
         (None, Some(_)) => 128 + 15,
@@ -193,4 +232,33 @@ async fn run_cmd(cmd: String) -> Result<i32> {
         eprintln!("\x1b[2m[{id} exit {code}; stages: harness out {id} <n>]\x1b[0m");
     }
     Ok(code)
+}
+
+/// `harness log <id>`: chat `s<id>`'s log (or the log at a path), one event per line as JSON on stdout, in the order it
+/// was recorded; a record that is not an event and a torn tail are reported on stderr, naming where.
+fn print_log(what: &str) -> Result<()> {
+    use std::io::Write;
+    if what.is_empty() {
+        bail!("usage: harness log <id>  (a chat session's number, s<n>, or a log's path)");
+    }
+    let path = if what.contains('/') {
+        std::path::PathBuf::from(what)
+    } else {
+        let n = what.strip_prefix('s').unwrap_or(what);
+        n.parse::<u64>().map_err(|_| anyhow::anyhow!("{what:?} is not a session number (s7 or 7) or a path"))?;
+        db::object_dir(&format!("s{n}")).join("chat")
+    };
+    let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let log = harness_proto::log::read(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let mut out = std::io::stdout().lock();
+    for r in &log.records {
+        match &r.event {
+            Ok(ev) => writeln!(out, "{}", serde_json::to_string(ev)?)?,
+            Err(e) => eprintln!("{}: record {} ({} bytes) is not an event: {e}", path.display(), r.n, r.frame.len()),
+        }
+    }
+    if let Some((at, len)) = log.torn {
+        eprintln!("{}: the last {len} bytes (from byte {at}) are a torn frame", path.display());
+    }
+    Ok(())
 }

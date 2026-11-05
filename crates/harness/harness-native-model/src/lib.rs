@@ -13,9 +13,9 @@
 //!   [`Collapsed`] on a node hides all its children (every run group starts so).
 //! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
 //!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
-//!   ended or left the tree, a finished [`Past`] session (one from before the daemon started), an [`Orphan`] run, and a
-//!   finished run on the device [`ArchiveAfter`] it ended. A running object and a finished top-level session of this
-//!   daemon's stay.
+//!   ended or left the tree, an [`Orphan`] run, a finished run on the device [`ArchiveAfter`] it ended, and a finished
+//!   top-level [`Past`] session (one from before the daemon started, a chat restored after a restart) `past_ms` after it
+//!   ended. A running object and any other finished top-level session stay.
 //! - The Archive pane shows the [`ArchiveView`] entity ([`ARCHIVE`]); older runs come a page at a time ([`Paged`],
 //!   [`History`]) rather than all at once.
 //! - `(Selected, object)` on the app entity is the selection (exclusive). Each pane node of the view holds the exclusive
@@ -52,6 +52,16 @@ pub struct Up;
 pub struct Connecting;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Down;
+/// A daemon took the connection but the app cannot speak to it (no hello in time: an older daemon; another schema). The
+/// device's [`LinkError`] says which daemon and what to do.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Refused;
+
+/// On the device while its link is [`Refused`]: the link's error, naming the daemon's pid and socket and `harness stop`.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct LinkError {
+    pub text: ScriptString,
+}
 
 /// A daemon session, by its id there.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -155,7 +165,8 @@ pub struct Closed;
 pub struct Pinned;
 
 /// On a session: it ended before the daemon started (the daemon's `past`: a chat from before a restart, listed from its
-/// index). Finished, it lives in the Archive like any other past object; resumed, it runs in the tree again.
+/// index). The rule treats it as any finished session of this daemon's, except that a top-level one leaves the tree for
+/// the Archive [`ArchiveAfter`]'s `past_ms` after it ended; resumed, it runs again where it is.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Past;
 
@@ -177,6 +188,8 @@ pub struct ChatMode;
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct AgentModel {
     pub s: ScriptString,
+    /// The reasoning effort it runs with (the daemon's `effort`; empty when unknown).
+    pub effort: ScriptString,
 }
 
 /// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
@@ -190,10 +203,18 @@ pub struct ArchiveView;
 /// The Archive pane's entity.
 pub const ARCHIVE: &str = "views::archive";
 
-/// Singleton: how long after it ended a finished run on the device (no session) leaves the tree (the scene's token).
+/// Singleton: how long after they ended finished objects with nothing above them leave the tree (the scene's tokens).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct ArchiveAfter {
+    /// A finished run on the device (no session).
     pub ms: u64,
+    /// A finished top-level [`Past`] session (one from before the daemon started).
+    pub past_ms: u64,
+}
+
+impl ArchiveAfter {
+    /// Ten minutes for a run, a week for a past session.
+    pub const DEFAULT: Self = Self { ms: 600_000, past_ms: 7 * 24 * 3_600_000 };
 }
 
 /// Singleton: the older history's paging: a page asked for and not in yet, and whether the daemon has no older runs.
@@ -279,6 +300,8 @@ pub const SCROLLBACK: usize = 10_000;
 #[derive(Debug)]
 pub enum Msg {
     Link(LinkState),
+    /// The daemon took the connection but the app cannot speak to it: the link is [`Refused`] for this reason.
+    Refused(String),
     /// Every session the daemon has, as its `list` op returns them.
     List(Vec<serde_json::Value>),
     /// The attach stream's bytes (the snapshot first).
@@ -355,10 +378,13 @@ pub enum LinkState {
     Up,
     Connecting,
     Down,
+    /// See [`Refused`]; sent as [`Msg::Refused`] with its reason.
+    Refused,
 }
 
 pub fn register(world: &World) {
     world.component::<Device>().writable();
+    world.component::<LinkError>().writable();
     world.component::<Link>().add_trait::<flecs::Exclusive>();
     for_tags(world);
     world.component::<Object>().writable();
@@ -386,7 +412,7 @@ pub fn register(world: &World) {
     world.component::<ArchiveView>();
     world.component::<ArchiveAfter>().writable();
     world.component::<History>().writable();
-    world.set(ArchiveAfter { ms: 600_000 });
+    world.set(ArchiveAfter::DEFAULT);
     world.set(History::default());
     world.component::<Selected>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
     world.component::<Shows>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Remove);
@@ -399,6 +425,7 @@ fn for_tags(world: &World) {
     world.component::<Up>();
     world.component::<Connecting>();
     world.component::<Down>();
+    world.component::<Refused>();
     world.component::<Claude>();
     world.component::<Codex>();
     world.component::<CursorAgent>();
@@ -541,8 +568,9 @@ pub fn now_ms() -> u64 {
 /// - Running: kept.
 /// - Finished, under a session: archived once that session ended or left the tree (its runs go with it).
 /// - A finished run that is an [`Orphan`]: archived; one on the device: archived [`ArchiveAfter`] it ended.
-/// - A finished [`Past`] session (it ended before the daemon started): archived.
-/// - A finished top-level session: kept until it is closed.
+/// - A finished top-level [`Past`] session (it ended before the daemon started): archived [`ArchiveAfter`]'s `past_ms`
+///   after it ended (so a restart leaves recent chats in the tree, dimmed by their status like any finished session).
+/// - Any other finished top-level session: kept until it is closed.
 ///
 /// One level a frame: a session archived this frame takes its runs with it the next.
 fn install_rule(world: WorldRef<'_>) {
@@ -556,16 +584,13 @@ fn install_rule(world: WorldRef<'_>) {
             true
         } else if e.has(Pinned::id()) || is_running(e) {
             false
-        } else if e.has(Past::id()) {
-            true
         } else {
+            let after = e.world().try_get::<&ArchiveAfter>(|a| *a).unwrap_or(ArchiveAfter::DEFAULT);
+            let ended = || e.try_cloned::<&Ended>().map(|t| t.ms).or_else(|| e.try_cloned::<&Created>().map(|c| c.ms)).unwrap_or(0);
             match e.parent().filter(|p| p.has(Object::id())) {
                 Some(p) => p.has(Archived::id()) || !is_running(p),
-                None if e.has(Run::id()) => {
-                    let after = e.world().try_get::<&ArchiveAfter>(|a| a.ms).unwrap_or(600_000);
-                    let ended = e.try_cloned::<&Ended>().map(|t| t.ms).or_else(|| e.try_cloned::<&Created>().map(|c| c.ms)).unwrap_or(0);
-                    e.has(Orphan::id()) || ended.saturating_add(after) <= now_ms()
-                }
+                None if e.has(Run::id()) => e.has(Orphan::id()) || ended().saturating_add(after.ms) <= now_ms(),
+                None if e.has(Past::id()) => ended().saturating_add(after.past_ms) <= now_ms(),
                 None => false,
             }
         };
@@ -595,8 +620,18 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms, chats): 
                 LinkState::Up => *w.component_id::<Up>(),
                 LinkState::Connecting => *w.component_id::<Connecting>(),
                 LinkState::Down => *w.component_id::<Down>(),
+                LinkState::Refused => *w.component_id::<Refused>(),
             };
-            w.entity_from_id(dev).add((Link::id(), tag));
+            let d = w.entity_from_id(dev);
+            d.add((Link::id(), tag));
+            if s != LinkState::Refused && d.has(LinkError::id()) {
+                d.remove(LinkError::id());
+            }
+        }
+        Msg::Refused(why) => {
+            let d = w.entity_from_id(dev);
+            d.add((Link::id(), Refused::id()));
+            d.set(LinkError { text: why.as_str().into() });
         }
         Msg::List(sessions) => reconcile(w, dev, by_id, &sessions),
         Msg::Data { id, bytes } => {
@@ -621,7 +656,14 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms, chats): 
         // The stream ended (the program exited, or the daemon went): the last screen stays to read; the host attaches
         // again (on a fresh parser) when it wants the live one.
         Msg::Detached { .. } => {}
-        Msg::Runs(runs) => reconcile_runs(w, dev, idx, &runs, false),
+        Msg::Runs(runs) => {
+            // A poll with no runs at all: nothing older exists to page in, so the Archive says it is empty instead of
+            // offering older runs it can never find.
+            if runs.is_empty() && w.try_get::<&History>(|h| !h.exhausted).unwrap_or(true) {
+                w.set(History { loading: false, exhausted: true });
+            }
+            reconcile_runs(w, dev, idx, &runs, false);
+        }
         Msg::RunsPage { runs, full } => {
             reconcile_runs(w, dev, idx, &runs, true);
             w.set(History { loading: false, exhausted: !full });
@@ -878,8 +920,9 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
             }
         }
         let model = s["model"].as_str().unwrap_or("");
-        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model) {
-            e.set(AgentModel { s: model.into() });
+        let effort = s["effort"].as_str().unwrap_or("");
+        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model || m.effort.as_str() != effort) {
+            e.set(AgentModel { s: model.into(), effort: effort.into() });
         }
         let past = s["past"].as_bool().unwrap_or(false);
         if e.has(Past::id()) != past {

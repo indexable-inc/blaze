@@ -30,7 +30,7 @@ parent is the snapshot before it: the branch upstream/library on origin is upstr
 library, one commit a nightly, and the base of every merge.
 
 The JSON is inline, a file's path, or `-` for stdin. Downloads are kept in ~/.cache/blaze-library.
-Python 3.11+, stdlib, git and b3sum (BLAKE3's tool, for library/DIGEST).
+Python 3.11+ under `uv run --frozen` (the workspace's `blake3`, for library/DIGEST) and git.
 """
 import hashlib, io, json, os, re, shutil, stat, subprocess, sys, tarfile, tempfile, tomllib, typing
 import urllib.error, urllib.request
@@ -212,28 +212,16 @@ def files(root):
     return found
 
 
-def b3sum(args, data=None):
-    """`b3sum`'s output for `args`, BLAKE3's own tool (SIMD, threads): blaze's hashes of its own
-    data are BLAKE3, and Python's hashlib has none."""
-    if shutil.which("b3sum") is None:
-        sys.exit("library.py: no `b3sum` on PATH: library/DIGEST is a BLAKE3 hash, which b3sum "
-                 "(the `b3sum` package of nixpkgs, Homebrew and Debian) computes")
-    done = subprocess.run(["b3sum", "--no-names", *args], input=data, capture_output=True)
-    if done.returncode:
-        sys.exit(f"library.py: b3sum {' '.join(args[:3])}...: {done.stderr.decode()}")
-    return done.stdout.decode().split()
-
-
-def b3_of_files(paths):
-    """The BLAKE3 hash, in hex, of each file of `paths`, in their order: 512 files a process."""
-    hashes = []
-    for at in range(0, len(paths), 512):
-        batch = paths[at:at + 512]
-        got = b3sum(["--", *batch])
-        if len(got) != len(batch):
-            sys.exit(f"library.py: b3sum gave {len(got)} hashes for {len(batch)} files")
-        hashes += got
-    return hashes
+def blake3_hex(data):
+    """Plain BLAKE3 of `data` in hex, as blaze's store hashes it (crates/blaze-fetch's digest.rs):
+    the `blake3` package of the uv workspace, the BLAKE3 team's Rust crate through PyO3. Run this
+    script with `uv run --frozen python harness/library.py`; hashlib has no BLAKE3."""
+    try:
+        from blake3 import blake3
+    except ImportError:
+        sys.exit("library.py: no `blake3` module: library/DIGEST is a BLAKE3 hash; run "
+                 "`uv run --frozen python harness/library.py ...` (the workspace pins blake3)")
+    return blake3(data, max_threads=blake3.AUTO).hexdigest()
 
 
 def digest_of(root):
@@ -249,15 +237,14 @@ def digest_of(root):
             if path != "DIGEST":
                 found.append((path.encode(), path, full))
     found.sort()
-    plain = [full for _, _, full in found if not os.path.islink(full)]
-    hashes = dict(zip(plain, b3_of_files(plain)))
     lines = []
     for _, path, full in found:
         if os.path.islink(full):
-            lines.append(f"link {b3sum([], os.readlink(full).encode())[0]} {path}\n")
+            lines.append(f"link {blake3_hex(os.readlink(full).encode())} {path}\n")
         else:
-            lines.append(f"file {hashes[full]} {path}\n")
-    return b3sum([], "".join(lines).encode())[0]
+            with open(full, "rb") as file:
+                lines.append(f"file {blake3_hex(file.read())} {path}\n")
+    return blake3_hex("".join(lines).encode())
 
 
 def write_digest():

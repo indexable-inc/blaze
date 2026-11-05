@@ -28,12 +28,15 @@ pub enum Kind {
 #[serde(tag = "ev", rename_all = "snake_case")]
 pub enum Body {
     /// The agent started (or resumed) with this model; `session_id` is its own id for the conversation, what a resume
-    /// names.
+    /// names. `effort` is the reasoning effort it runs with (claude's `--effort`, codex's `model_reasoning_effort`), when
+    /// known.
     Session {
         agent: String,
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
     },
     /// The person's message (written by the daemon as it sends it).
     User { text: String },
@@ -152,6 +155,7 @@ impl Event {
                 agent: s("agent"),
                 model: s("model"),
                 session_id: v["session_id"].as_str().filter(|i| !i.is_empty()).map(str::to_owned),
+                effort: v["effort"].as_str().filter(|i| !i.is_empty()).map(str::to_owned),
             },
             "user" => Body::User { text: s("text") },
             "busy" => Body::Busy { busy: v["busy"].as_bool().unwrap_or(false) },

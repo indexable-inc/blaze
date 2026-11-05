@@ -102,9 +102,10 @@ ui {
     PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
   }
 
-  // An icon button: a square that hugs its one symbol, its hover and press wash on the square only (never the row it
-  // sits in), with an optional Tooltip. Children: `icon : ui.Symbol`.
-  prefab IconButton : ui.Row, Wash {
+  // An icon button, the borderless way (a macOS toolbar or sidebar button): no plate, at rest or under the pointer. Its
+  // glyph is in muted ink, easing to strong ink on hover (Inks, on the hover spring); held, it gives (PressGive: scaled a
+  // little and dimmed) and springs back. Its square is the hit area, with an optional Tooltip. Children: `icon : ui.Symbol`.
+  prefab IconButton : ui.Row {
     Pressable
     Action: {name: ""}
     Cursor: {shape: Arrow}
@@ -112,9 +113,9 @@ ui {
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
     Size: {w: {kind: Fixed, value: 28, min: 0, max: 0}, h: {kind: Fixed, value: 28, min: 0, max: 0}}
     Padding: {l: 0, r: 0, t: 0, b: 0}
-    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
-    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
-    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Fill: $tone_clear
+    Inks: {rest: $tone_icon_rest, hover: $tone_icon_hover}
+    PressGive: {scale: $icon_press_scale, dim: $icon_press_dim, omega: $spring_press_omega, zeta: $spring_press_zeta}
   }
 
   // A switch or checkbox: a Button that shows OnLook while `(On, Set)` is on it. The knob or tick is a child.
@@ -261,16 +262,20 @@ ui {
     Cursor: {shape: Text}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: $textarea_max_h}}
-    hint : ui.Words, Faint {
+    // The placeholder, behind the words: started $textarea_hint_inset after the caret (which stands at the words' start).
+    hint_at : ui.Row {
       Background
-      TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
+      Flex: {axis: Row, gap: 0, align: Start, justify: Start, wrap: false}
+      Padding: {l: $textarea_hint_inset, r: 0, t: 0, b: 0}
+      hint : ui.Words, Faint {
+        TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
+      }
     }
     text : ui.Words, Strong {
       Cursor: {shape: Text}
       TextStyle: {size: $size_body, line: 20, role: 0, bold: 0}
       TextEdit: {caret: 0, anchor: 0, mark_lo: 0, mark_hi: 0, focused: false,
-        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light,
-        select_dark: $tone_text_select.dark, select_light: $tone_text_select.light}
+        caret_dark: $tone_accent.dark, caret_light: $tone_accent.light}
     }
   }
 
@@ -426,7 +431,18 @@ ui {
 
 @tree ChildOf
 ui {
+  // The selection's one look (harness-native-render select.rs): every surface that selects text draws its plate from
+  // here, and a Cmd+C pulses it with CopyLook on the `copy` spring below.
+  prefab selection {
+    Fill: $plate_selection
+    Shape: {radius: $plate_selection_radius, n: $plate_selection_n, border: 0, feather: 0}
+    CopyLook: {grow: $copy_grow, light: $copy_light, sweep: $copy_sweep, stagger: $copy_stagger, row_in: $copy_row_in}
+  }
   spring {
+    // A copy's pulse (CopyFlash): critically damped, kicked from rest, back at rest in about half a second.
+    prefab copy {
+      Motion: {omega: $copy_omega, zeta: $copy_zeta}
+    }
     // The springs the generic motion falls back on when a node has no Motion of its own.
     prefab transition {
       Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}

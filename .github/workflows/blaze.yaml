@@ -124,6 +124,15 @@ jobs:
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'
+      # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
+      # (.github/scripts/explore_page.py; release.yaml checks every release too).
+      - name: ix.dev/explore reads a new profile schema
+        run: |
+          git fetch -q --depth=1 origin main
+          version() { grep -E '^pub const VERSION: u32' "$@"; }
+          if [ "$(git show FETCH_HEAD:crates/blaze-profile/src/schema.rs | version)" != "$(version crates/blaze-profile/src/schema.rs)" ]; then
+            uv run --frozen python .github/scripts/explore_page.py '{}'
+          fi
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
   # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after

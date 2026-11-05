@@ -33,6 +33,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         busy: true,
         mode: "chat".into(),
         model: Some("opus".into()),
+        effort: None,
         past: false,
     };
     vec![
@@ -70,7 +71,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         one("down-exit", &Down::Exit { code: -1 }),
         one(
             "event-session",
-            &Event { ts: 1, body: Body::Session { agent: "claude".into(), model: "opus".into(), session_id: Some("9f2c".into()) } },
+            &Event { ts: 1, body: Body::Session { agent: "claude".into(), model: "opus".into(), session_id: Some("9f2c".into()), effort: None } },
         ),
         one("event-block", &Event { ts: 5, body: Body::Block { block: "m:0".into(), kind: Kind::Thinking, text: "list them\n\u{2026}".into() } }),
         one(

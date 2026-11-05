@@ -370,6 +370,8 @@ impl App {
             "up"
         } else if link == *w.component_id::<model::Down>() {
             "down"
+        } else if link == *w.component_id::<model::Refused>() {
+            "refused"
         } else {
             "connecting"
         };

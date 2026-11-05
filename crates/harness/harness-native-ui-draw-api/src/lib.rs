@@ -24,6 +24,8 @@ pub enum PaintKind {
     Picture,
     /// A `Ribbon`: a band in its Fill between the nodes its `RibbonFrom` and `RibbonTo` name.
     Ribbon,
+    /// Its `Vector`: SVG path data filled in its `Fill` and stroked in its `Stroke`, and its `VectorText`, if any.
+    Vector,
 }
 
 /// A node as the draw pass resolved it for one frame (written by `harness-native-ui-draw`, read by the host's renderer). Only the nodes
@@ -45,6 +47,9 @@ pub struct Painted {
     pub clip_y: f32,
     pub clip_w: f32,
     pub clip_h: f32,
+    /// How far it thins out from that rectangle's top and foot (points; 0 is a hard cut): its clipping node's `ClipFade`
+    /// at an edge with more scrolled beyond it.
+    pub fade: [f32; 2],
     /// Where it is drawn (window points): its `Laid`, or its `Drawn` mid-slide, moved by every ancestor's transition.
     /// `w` and `h` are before `scale`; the host lays the node out in `w` by `h` at `(x, y)` and scales what it drew about
     /// `(x, y)`.

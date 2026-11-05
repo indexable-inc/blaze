@@ -3,18 +3,20 @@
 //! Everything is an object (like a Durable Object): a PTY agent session (`s7`, kind claude|codex|shell),
 //! a shell run (`r12`, kind proc), each pipeline stage of a run (`r12.0`, kind stage, child of the run),
 //! a REPL cell (`<repl>.t3`, kind repl). Each object has append-only raw streams (pty, stdout, stderr,
-//! stdin, final_err, messages), one file per (object, stream); the `streams` table says where each
+//! stdin, final_err, messages, chat), one file per (object, stream); the `streams` table says where each
 //! file is (new objects: objects/<id>/<stream>; runs keep their runs/rN/ layout), how big, and whether
 //! it has been compacted into archive/objects/<root>.parquet (a top-level object and its children). Two streams are never
-//! compacted: `messages`, and `chat` (a chat session's event log, which stays one NDJSON file for good; chat/mod.rs).
+//! compacted: `messages`, and `chat` (a chat session's event log, which stays one file of CBOR frames for good; chat/mod.rs).
 //! The raw files stay the source of the bytes; meta.json stays authoritative for a live run.
 //! Readers (the REPL's `sql`) attach this file read-only. Write failures are logged, never fatal.
 use crate::paths;
+use harness_proto::msg::SessionInfo;
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use parking_lot::{Mutex, MutexGuard};
+use std::sync::OnceLock;
 
 pub fn path() -> PathBuf { paths::home().join("harness.db") }
 pub fn object_dir(id: &str) -> PathBuf { paths::home().join("objects").join(id) }
@@ -57,7 +59,6 @@ fn conn() -> MutexGuard<'static, Connection> {
         Mutex::new(c)
     })
     .lock()
-    .unwrap_or_else(|e| e.into_inner())
 }
 
 fn log<T>(what: &str, r: rusqlite::Result<T>) -> Option<T> { r.map_err(|e| eprintln!("harness.db {what}: {e}")).ok() }
@@ -284,23 +285,36 @@ pub fn mark_lost_sessions() {
 const SESSION_COLS: &str =
     "select id, kind, name, parent, cwd, args, status, created_ms, ended_ms, exit_code, meta from objects where kind not in ('proc', 'stage', 'repl')";
 
-/// One row of `SESSION_COLS` in the shape of daemon::Session::info: its mode (`chat` or `tui`) and model from its meta.
-fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+/// One row of `SESSION_COLS` as a session row (daemon::Session::info's type): its mode (`chat` or `tui`), title and model
+/// from its meta.
+fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
     let num = |s: Option<String>| s.and_then(|s| s.get(1..)?.parse::<u64>().ok());
+    let object: String = r.get(0)?;
     let args: Option<String> = r.get(5)?;
     let meta: Value = r.get::<_, Option<String>>(10)?.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or(Value::Null);
-    Ok(json!({
-        "id": num(r.get(0)?), "object": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "name": r.get::<_, Option<String>>(2)?,
-        "parent": num(r.get(3)?), "cwd": r.get::<_, Option<String>>(4)?,
-        "argv": args.and_then(|a| serde_json::from_str::<Value>(&a).ok()), "status": r.get::<_, Option<String>>(6)?,
-        "created_ms": r.get::<_, Option<i64>>(7)?, "ended_ms": r.get::<_, Option<i64>>(8)?,
-        "exit": r.get::<_, Option<i64>>(9)?, "title": meta["title"].as_str().unwrap_or(""), "attached": 0,
-        "mode": meta["mode"].as_str().unwrap_or("tui"), "model": meta["model"],
-    }))
+    let u = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+    Ok(SessionInfo {
+        id: num(Some(object.clone())).unwrap_or(0),
+        object,
+        kind: r.get(1)?,
+        name: r.get(2)?,
+        parent: num(r.get(3)?),
+        cwd: r.get(4)?,
+        argv: args.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default(),
+        status: r.get(6)?,
+        created_ms: u(r.get(7)?),
+        ended_ms: u(r.get(8)?),
+        exit: r.get(9)?,
+        title: meta["title"].as_str().unwrap_or("").to_owned(),
+        mode: meta["mode"].as_str().unwrap_or("tui").to_owned(),
+        model: meta["model"].as_str().map(str::to_owned),
+        effort: meta["effort"].as_str().map(str::to_owned),
+        ..SessionInfo::default()
+    })
 }
 
-/// Sessions in the shape of daemon::Session::info (for `list` with all: true).
-pub fn sessions() -> Vec<Value> {
+/// Sessions as `list` rows (for `list` with all: true).
+pub fn sessions() -> Vec<SessionInfo> {
     let c = conn();
     let r = (|| {
         let mut st = c.prepare(&format!("{SESSION_COLS} order by created_ms"))?;
@@ -311,9 +325,28 @@ pub fn sessions() -> Vec<Value> {
 }
 
 /// Session `sN` as the index knows it (one that ended before this daemon started), in the shape of [`sessions`]' rows.
-pub fn session(id: u64) -> Option<Value> {
+pub fn session(id: u64) -> Option<SessionInfo> {
     let r = conn().query_row(&format!("{SESSION_COLS} and id = ?1"), [format!("s{id}")], session_row).optional();
     log("session", r).flatten()
+}
+
+/// Chat sessions whose log the index has not marked as harness schema `schema`'s (chat::migrate_logs).
+pub fn chats_unmarked(schema: u32) -> Vec<String> {
+    let c = conn();
+    let r = (|| {
+        let mut st = c.prepare(
+            "select id from objects where kind not in ('proc', 'stage', 'repl') and json_extract(meta, '$.mode') = 'chat'
+               and coalesce(json_extract(meta, '$.chat_log'), 0) <> ?1",
+        )?;
+        let rows = st.query_map([schema], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+    })();
+    log("chats_unmarked", r).unwrap_or_default()
+}
+
+/// Forget one stream of an object (its file is the caller's).
+pub fn drop_stream(object: &str, stream: &str) {
+    log("drop_stream", conn().execute("delete from streams where object = ?1 and stream = ?2", params![object, stream]));
 }
 
 /// Chat sessions whose index row has no title yet (chat::backfill_titles).

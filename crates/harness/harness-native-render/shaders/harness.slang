@@ -46,6 +46,8 @@ struct LineInst
     float4 col_d;
     float4 col_l;
     float4 shape;    // half width (points), 1 when a segment comes before this one, 1 when one comes after, opacity
+    float4 clip;     // the band it shows in, as a panel's
+    float4 clipx;    // the band across, as a panel's
 };
 
 struct GlyphInst
@@ -240,6 +242,20 @@ float4 panel_shade(PanelV v, ConstantBuffer<Frame> frame, PanelInst p)
         float a = fill.a * cov * opacity;
         return float4(fill.rgb * a, a);
     }
+    if (p.fx.w > 4.5 && p.fx.w < 5.5)
+    {
+        // Copy light (den's selection flash, harness-native-render select.rs): a soft band of the fill across the row, its
+        // centre going left to right as fx2.z goes 0 to 1; the row's corners as the selection's (fx2.w mask).
+        uint lmask = (uint)p.fx2.w;
+        uint lquad = (v.local.x > 0.0 ? 1u : 0u) + (v.local.y > 0.0 ? 2u : 0u);
+        uint lbit = lquad == 0u ? 1u : (lquad == 1u ? 2u : (lquad == 2u ? 8u : 4u));
+        float ld = sd_squircle(v.local, half_size, (lmask & lbit) != 0u ? 0.0 : p.shape.x, p.shape.y);
+        float band = max(12.0, p.rect.z * 0.26);
+        float centre = -band + (p.rect.z + 2.0 * band) * p.fx2.z;
+        float lit = saturate(1.0 - abs(v.local.x + half_size.x - centre) / band);
+        float a = fill.a * saturate(0.5 - ld / aa) * lit * opacity;
+        return float4(fill.rgb * a, a);
+    }
     if (p.fx.w > 3.5)
     {
         // Caret: a thin bar at rest in edge_l, blinking from fx2.w, when it last moved, so it is solid while typed
@@ -397,8 +413,76 @@ float4 line_fs(LineV v, ConstantBuffer<Frame> frame, StructuredBuffer<LineInst> 
     }
     float aa = 1.0 / frame.scale;
     float cov = saturate(0.5 - (sd_stub(v.pt, a, b) - l.shape.x) / aa);
+    cov *= in_band(v.pt.y, l.clip, l.clip.zw, frame.scale) * in_band(v.pt.x, l.clipx, l.clipx.zw, frame.scale);
     float4 col = pick(frame.dark, l.col_d, l.col_l);
     float alpha = col.a * cov * l.shape.w;
+    return float4(col.rgb * alpha, alpha);
+}
+
+// ---- filled paths ---------------------------------------------------------------------------------------------
+//
+// Copied from den-native's den.slang. A filled path is one instance (its bounding box) over a run of straight edges in
+// their own buffer; curves are flattened on the CPU (vector.rs). Each pixel takes its winding number and its distance
+// to the nearest edge: signed by the fill rule, one device pixel of that distance is the edge's ramp, so a path is as
+// crisp as a panel at any scale. It is cut to its clip bands as a panel is.
+
+struct PathInst
+{
+    float4 rect;     // the box round the path (points, y down)
+    float4 col_d;
+    float4 col_l;
+    float4 shape;    // first edge, edge count, rule (0 nonzero, 1 even-odd), opacity
+    float4 clip;     // the band it shows in, as a panel's
+    float4 clipx;    // the band across, as a panel's
+};
+
+[shader("vertex")]
+LineV path_vs(uint vid : SV_VertexID, uint iid : SV_InstanceID, ConstantBuffer<Frame> frame, StructuredBuffer<PathInst> insts)
+{
+    PathInst p = insts[iid];
+    float reach = 2.0 / frame.scale;
+    float2 pt = p.rect.xy - reach + CORNERS[vid] * (p.rect.zw + reach * 2.0);
+    LineV o;
+    o.pos = float4(to_ndc(pt, frame.view), 0, 1);
+    o.pt = pt;
+    o.inst = iid;
+    return o;
+}
+
+[shader("fragment")]
+float4 path_fs(LineV v, ConstantBuffer<Frame> frame, StructuredBuffer<PathInst> insts, StructuredBuffer<float4> edges)
+{
+    PathInst p = insts[v.inst];
+    uint first = uint(p.shape.x);
+    uint count = uint(p.shape.y);
+    float2 q = v.pt;
+    int winding = 0;
+    float d = 1e9;
+    for (uint i = 0; i < count; i++)
+    {
+        float4 e = edges[first + i];
+        float2 a = e.xy;
+        float2 b = e.zw;
+        d = min(d, sd_stub(q, a, b));
+        float side = (b.x - a.x) * (q.y - a.y) - (q.x - a.x) * (b.y - a.y);
+        if (a.y <= q.y)
+        {
+            if (b.y > q.y && side > 0.0)
+            {
+                winding += 1;
+            }
+        }
+        else if (b.y <= q.y && side < 0.0)
+        {
+            winding -= 1;
+        }
+    }
+    bool inside = p.shape.z > 0.5 ? (winding & 1) != 0 : winding != 0;
+    float sd = inside ? -d : d;
+    float cov = saturate(0.5 - sd * frame.scale);
+    cov *= in_band(q.y, p.clip, p.clip.zw, frame.scale) * in_band(q.x, p.clipx, p.clipx.zw, frame.scale);
+    float4 col = pick(frame.dark, p.col_d, p.col_l);
+    float alpha = col.a * cov * p.shape.w;
     return float4(col.rgb * alpha, alpha);
 }
 

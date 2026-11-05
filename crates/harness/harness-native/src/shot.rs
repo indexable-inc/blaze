@@ -21,8 +21,14 @@ pub fn run(path: &str) -> Result<(), String> {
     app.set_gpu_clock(renderer.gpu_clock());
     // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset);
     // `prims`: the primitives gallery.
+    // `genui`: one generative-UI cell's tree (HARNESS_NATIVE_GENUI=<tree.json>), drawn as a chat card draws it.
+    let mut genui = None;
     if let Ok(g) = std::env::var("HARNESS_NATIVE_GALLERY") {
-        crate::gallery::load(&app, 32.0, g == "prims")?;
+        if g == "genui" {
+            genui = Some((crate::gallery::load_genui(&app, 32.0)?, crate::gallery::genui_tree()?));
+        } else {
+            crate::gallery::load(&app, 32.0, g == "prims")?;
+        }
     }
     // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
     app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
@@ -113,6 +119,9 @@ pub fn run(path: &str) -> Result<(), String> {
             s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?)))
         })
         .collect();
+    // HARNESS_NATIVE_SHOT_COPY `t`: Command-C at t seconds, as the window's copy: does, into this offscreen app only: what it
+    // copies is logged, never put on the pasteboard, and what it took pulses (with HARNESS_NATIVE_SHOT_SEQ, mid-pulse).
+    let mut copy_at = std::env::var("HARNESS_NATIVE_SHOT_COPY").ok().and_then(|s| s.trim().parse::<f32>().ok());
     // HARNESS_NATIVE_SHOT_SEQ `t0,t1`: every frame from t0 to t1 seconds also written, as `<path>-<ms>.png` (time is then
     // counted in frames of 1/60 s, so a slow readback does not skip animation).
     let seq =
@@ -130,6 +139,9 @@ pub fn run(path: &str) -> Result<(), String> {
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
+        if let Some((root, tree)) = &genui {
+            app.fill_genui_gallery(*root, tree);
+        }
         let t = if seq.is_some() { frames as f32 / 60.0 } else { start.elapsed().as_secs_f32() };
         frames += 1;
         // The last hover's shape, resolved by the frame after it moved.
@@ -158,6 +170,10 @@ pub fn run(path: &str) -> Result<(), String> {
             if *n > 9 {
                 wheel = None;
             }
+        }
+        if copy_at.take_if(|c| t >= *c).is_some() {
+            let got = app.copy();
+            eprintln!("harness-native: shot copy at {t:.3}: {:?}", got.as_deref().map(|s| s.chars().take(80).collect::<String>()));
         }
         if let Some((text, _)) = typed.take_if(|k| t >= k.1) {
             app.commit_text(&text);

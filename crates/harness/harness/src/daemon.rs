@@ -1,16 +1,19 @@
 //! harnessd: owns every agent PTY, mirrors each into a libghostty terminal (harness-vt) (so a re-attaching client or
 //! the web view can redraw the current screen), records the parent/child tree, and serves the
 //! socket API plus the web UI. Survives client exit like a tmux server.
-use crate::{archive, chat, db, messages, paths, profiles, proto, queries, runs};
+use crate::{archive, chat, db, messages, paths, profiles, queries, runs};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use serde::Deserialize;
+use harness_proto::event::Body;
+use harness_proto::frame::{T_CBOR, T_DATA, aio};
+use harness_proto::msg::{Down, Reply, Request as Req, SessionInfo, Up};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -29,7 +32,10 @@ const BUSY_MS: u64 = 1500;
 
 #[derive(Clone, Debug)]
 pub enum Ev {
+    /// A terminal session's output.
     Data(Bytes),
+    /// A chat session's event: its whole T_EVENT frame, the bytes its log holds (chat/mod.rs).
+    Event(Bytes),
     Exit(i32),
 }
 
@@ -111,11 +117,11 @@ impl Session {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        *self.pid.lock().unwrap()
+        *self.pid.lock()
     }
 
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock();
         w.write_all(bytes)?;
         w.flush()?;
         Ok(())
@@ -125,17 +131,17 @@ impl Session {
         if cols == 0 || rows == 0 {
             return Ok(());
         }
-        let master = self.master.lock().unwrap();
+        let master = self.master.lock();
         let Some(master) = master.as_ref() else { return Ok(()) };
         master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("{e}"))?;
-        self.term.lock().unwrap().resize(cols, rows);
+        self.term.lock().resize(cols, rows);
         Ok(())
     }
 
     /// Escape codes that redraw the current screen on a fresh terminal, plus a receiver for
     /// everything after it. Taken under the emulator lock so nothing is lost or doubled.
     pub fn snapshot_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Ev>) {
-        let mut term = self.term.lock().unwrap();
+        let mut term = self.term.lock();
         let rx = self.tx.subscribe();
         (term.vt_snapshot(), rx)
     }
@@ -144,29 +150,42 @@ impl Session {
         if let Some(c) = &self.chat {
             return c.screen();
         }
-        self.term.lock().unwrap().text()
+        self.term.lock().text()
     }
 
     pub fn size(&self) -> (u16, u16) {
-        self.term.lock().unwrap().size()
+        self.term.lock().size()
     }
 
-    pub fn info(&self) -> Value {
+    pub fn info(&self) -> SessionInfo {
         let (cols, rows) = self.size();
         let title = match &self.chat {
             Some(c) => c.title(),
-            None => self.term.lock().unwrap().title(),
+            None => self.term.lock().title(),
         };
-        let ended = *self.ended.lock().unwrap();
-        json!({
-            "id": self.id, "object": format!("s{}", self.id), "kind": self.kind, "name": self.name, "parent": self.parent, "title": title, "cwd": self.cwd,
-            "argv": self.argv, "created_ms": self.created_ms, "exit": *self.exit.lock().unwrap(),
-            "status": ended.map_or("running", |(s, _)| s), "ended_ms": ended.map(|(_, ms)| ms),
-            "attached": self.attached.load(Ordering::Relaxed), "cols": cols, "rows": rows,
-            "busy": self.busy.load(Ordering::Relaxed),
-            "mode": if self.chat.is_some() { "chat" } else { "tui" },
-            "model": self.chat.as_ref().map(|c| c.model()),
-        })
+        let ended = *self.ended.lock();
+        SessionInfo {
+            id: self.id,
+            object: format!("s{}", self.id),
+            kind: self.kind.clone(),
+            name: self.name.clone(),
+            parent: self.parent,
+            title,
+            cwd: Some(self.cwd.clone()),
+            argv: self.argv.clone(),
+            created_ms: Some(self.created_ms),
+            ended_ms: ended.map(|(_, ms)| ms),
+            exit: self.exit.lock().map(i64::from),
+            status: Some(ended.map_or("running", |(s, _)| s).to_owned()),
+            attached: self.attached.load(Ordering::Relaxed) as u64,
+            cols: Some(cols),
+            rows: Some(rows),
+            busy: self.busy.load(Ordering::Relaxed),
+            mode: if self.chat.is_some() { "chat" } else { "tui" }.to_owned(),
+            model: self.chat.as_ref().map(|c| c.model()),
+            effort: self.chat.as_ref().map(|c| c.effort()).filter(|e| !e.is_empty()),
+            past: false,
+        }
     }
 
     /// Output came: busy now (a change when it was not).
@@ -214,7 +233,7 @@ impl Session {
 
     pub fn kill(&self) {
         self.killed.store(true, Ordering::Relaxed);
-        let _ = self.killer.lock().unwrap().kill();
+        let _ = self.killer.lock().kill();
     }
 }
 
@@ -222,80 +241,6 @@ pub struct Daemon {
     pub sessions: Mutex<BTreeMap<u64, Arc<Session>>>,
     next: AtomicU64,
     pub last: Mutex<Option<u64>>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum Req {
-    /// Live sessions; with all: true also past ones from the index (status exited | lost), with chats: true every past
-    /// chat. Each row says `past`: it ended before this daemon started.
-    List {
-        #[serde(default)]
-        all: bool,
-        #[serde(default)]
-        chats: bool,
-    },
-    Info,
-    Last,
-    Spawn {
-        kind: String,
-        #[serde(default)]
-        args: Vec<String>,
-        parent: Option<u64>,
-        cwd: Option<String>,
-        prompt: Option<String>,
-        name: Option<String>,
-        cols: Option<u16>,
-        rows: Option<u16>,
-        /// `chat` (Claude's and Codex's default) or `tui` (a PTY).
-        mode: Option<String>,
-    },
-    /// `events`: a chat session's events as NDJSON (chat/mod.rs) instead of the conversation as text.
-    Attach {
-        id: u64,
-        cols: Option<u16>,
-        rows: Option<u16>,
-        #[serde(default)]
-        events: bool,
-    },
-    /// The change feed: an ok, then `{"ev":"changed","gen":N}` each time `list` or `runs` would answer differently
-    /// (sessions or runs come, go, or change status, title or busy), coalesced to at most 20 a second. Like `attach`
-    /// it holds the connection; any frame from the client ends it.
-    Watch,
-    /// Type into a session. `submit` (default true) presses Enter afterwards; text goes in as a
-    /// bracketed paste so multi-line messages arrive as one input. `raw` writes bytes verbatim.
-    Send {
-        id: u64,
-        text: String,
-        #[serde(default)]
-        raw: bool,
-        submit: Option<bool>,
-    },
-    Screen { id: u64 },
-    Resize { id: u64, cols: u16, rows: u16 },
-    Kill { id: u64 },
-    Forget { id: u64 },
-    Shutdown,
-    /// A REPL cell started or finished (posted by the MCP process): indexed as a `repl` object.
-    ReplTask {
-        #[serde(flatten)]
-        task: Value,
-    },
-    /// The object API (object.rs): get-or-create any kind, one object's record, and RPC to it.
-    SpawnObject {
-        #[serde(flatten)]
-        opts: Value,
-    },
-    Object { id: String },
-    Rpc {
-        id: String,
-        method: String,
-        #[serde(default)]
-        args: Value,
-    },
-    /// Shell runs with every pipeline stage's output stored: run, run_status, runs, run_read, run_kill, run_wait.
-    #[serde(untagged)]
-    Runs(runs::RunReq),
 }
 
 fn now_ms() -> u64 {
@@ -306,39 +251,37 @@ impl Daemon {
     /// Session `id`: a live one, else a chat from before this daemon started, restored from its log (chat/mod.rs) and kept
     /// from then on as a session whose agent is not running.
     pub fn get(&self, id: u64) -> Result<Arc<Session>> {
-        if let Some(s) = self.sessions.lock().unwrap().get(&id).cloned() {
+        if let Some(s) = self.sessions.lock().get(&id).cloned() {
             return Ok(s);
         }
         let row = db::session(id).ok_or_else(|| anyhow!("no session {id}"))?;
-        if row["mode"] != "chat" {
+        if row.mode != "chat" {
             anyhow::bail!("no session {id}: it ended before this daemon started, and only a chat can be opened again");
         }
         let s = Arc::new(Self::restore_chat(id, &row)?);
-        Ok(self.sessions.lock().unwrap().entry(id).or_insert(s).clone())
+        Ok(self.sessions.lock().entry(id).or_insert(s).clone())
     }
 
     /// A past chat (`row` its index row) as a session: its conversation folded back from its log.
-    fn restore_chat(id: u64, row: &Value) -> Result<Session> {
+    fn restore_chat(id: u64, row: &SessionInfo) -> Result<Session> {
         let oid = format!("s{id}");
         let dir = db::object_dir(&oid);
         let c = chat::Chat::open(&oid, &dir, Box::new(chat::NoAdapter))
             .with_context(|| format!("restoring chat {oid} from {}", dir.join("chat").display()))?;
-        let kind = row["kind"].as_str().unwrap_or("");
-        let status: &'static str = match row["status"].as_str() {
+        let status: &'static str = match row.status.as_deref() {
             Some("killed") => "killed",
             Some("exited") => "exited",
             _ => "lost",
         };
-        let ended = row["ended_ms"].as_u64().or(row["created_ms"].as_u64()).unwrap_or(0);
-        let argv = row["argv"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_owned)).collect();
+        let ended = row.ended_ms.or(row.created_ms).unwrap_or(0);
         Ok(Session::chat(
-            id, kind, row["name"].as_str().map(str::to_owned), row["parent"].as_u64(), row["cwd"].as_str().unwrap_or("/").to_owned(),
-            argv, row["created_ms"].as_u64().unwrap_or(0), Arc::new(c), Some((status, ended)), row["exit"].as_i64().map(|c| c as i32),
+            id, &row.kind, row.name.clone(), row.parent, row.cwd.clone().unwrap_or_else(|| "/".to_owned()),
+            row.argv.clone(), row.created_ms.unwrap_or(0), Arc::new(c), Some((status, ended)), row.exit.map(|c| c as i32),
         ))
     }
 
-    pub fn list(&self) -> Vec<Value> {
-        self.sessions.lock().unwrap().values().map(|s| s.info()).collect()
+    pub fn list(&self) -> Vec<SessionInfo> {
+        self.sessions.lock().values().map(|s| s.info()).collect()
     }
 
     pub fn spawn(
@@ -369,6 +312,8 @@ impl Daemon {
         let chat = matches!(kind, "claude" | "codex") && !tui;
         if chat {
             meta["mode"] = json!("chat");
+            // Its log is written in this schema from the start: nothing for a later start to convert.
+            meta["chat_log"] = json!(harness_proto::SCHEMA);
             // What the person asked for (a model, flags): a resume launches with them again.
             meta["user_args"] = json!(args);
         }
@@ -426,7 +371,7 @@ impl Daemon {
             tx, exit: Mutex::new(None), ended: Mutex::new(None), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
             last_out: AtomicU64::new(0), busy: AtomicBool::new(false), chat: None, resuming: Mutex::new(()),
         });
-        self.sessions.lock().unwrap().insert(id, session.clone());
+        self.sessions.lock().insert(id, session.clone());
         changed();
 
         let s = session.clone();
@@ -444,7 +389,7 @@ impl Daemon {
                 // An OSC in the chunk may set the title `list` reports: compare it around the feed (only then).
                 let osc = buf[..n].windows(2).any(|w| w == b"\x1b]");
                 let (f, retitled) = {
-                    let mut term = s.term.lock().unwrap();
+                    let mut term = s.term.lock();
                     let before = osc.then(|| term.title());
                     let f = queries::filter(&buf[..n], &mut term);
                     if !f.out.is_empty() {
@@ -469,8 +414,8 @@ impl Daemon {
             let signalled = st.as_ref().is_ok_and(|st| st.signal().is_some());
             let status = if signalled || s.killed.load(Ordering::Relaxed) { "killed" } else { "exited" };
             let ended = now_ms();
-            *s.ended.lock().unwrap() = Some((status, ended));
-            *s.exit.lock().unwrap() = Some(code);
+            *s.ended.lock() = Some((status, ended));
+            *s.exit.lock() = Some(code);
             changed();
             let _ = s.tx.send(Ev::Exit(code));
             db::session_end(s.id, code, status, ended);
@@ -488,7 +433,7 @@ impl Daemon {
         prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
     ) -> Result<u64> {
         let adapter: Box<dyn chat::Adapter> = match kind {
-            "claude" => Box::new(chat::claude::Claude::default()),
+            "claude" => Box::new(chat::claude::Claude::new(launch.effort.clone())),
             "codex" => Box::new(chat::codex::Codex::new(&cwd)),
             other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
         };
@@ -500,7 +445,7 @@ impl Daemon {
         });
         let c = Arc::new(chat::Chat::open(&oid, &db::object_dir(&oid), Box::new(chat::NoAdapter))?);
         let session = Arc::new(Session::chat(id, kind, name, parent, cwd, argv, created_ms, c, None, None));
-        self.sessions.lock().unwrap().insert(id, session.clone());
+        self.sessions.lock().insert(id, session.clone());
         self.start_agent(&session, &launch, adapter, env)?;
         changed();
         if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
@@ -520,7 +465,6 @@ impl Daemon {
         let (id, oid) = (s.id, format!("s{}", s.id));
         let dir = db::object_dir(&oid);
         db::index_stream(&oid, "chat", &dir.join("chat"));
-        db::index_stream(&oid, "messages", &dir.join("messages"));
         let mut cmd = std::process::Command::new(&launch.program);
         cmd.args(&launch.args).current_dir(&s.cwd);
         for (k, _) in std::env::vars_os() {
@@ -540,12 +484,12 @@ impl Daemon {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("{oid}: no stdout pipe"))?;
         let pid = child.id();
         c.set_adapter(&dir, adapter)?;
-        *s.writer.lock().unwrap() = Box::new(stdin);
-        *s.killer.lock().unwrap() = Box::new(chat::PidKiller(pid));
-        *s.pid.lock().unwrap() = Some(pid);
+        *s.writer.lock() = Box::new(stdin);
+        *s.killer.lock() = Box::new(chat::PidKiller(pid));
+        *s.pid.lock() = Some(pid);
         s.killed.store(false, Ordering::Relaxed);
-        *s.exit.lock().unwrap() = None;
-        *s.ended.lock().unwrap() = None;
+        *s.exit.lock() = None;
+        *s.ended.lock() = None;
         let reader = {
             let (s, c) = (s.clone(), c.clone());
             std::thread::Builder::new().name(format!("chat-read-{id}")).spawn(move || {
@@ -581,12 +525,12 @@ impl Daemon {
             if let Some(c) = &s.chat {
                 c.ended(&s.tx);
             }
-            *s.writer.lock().unwrap() = Box::new(NoAgent);
-            *s.killer.lock().unwrap() = Box::new(NoAgent);
-            *s.pid.lock().unwrap() = None;
+            *s.writer.lock() = Box::new(NoAgent);
+            *s.killer.lock() = Box::new(NoAgent);
+            *s.pid.lock() = None;
             s.busy.store(false, Ordering::Relaxed);
-            *s.ended.lock().unwrap() = Some((status, ended));
-            *s.exit.lock().unwrap() = Some(code);
+            *s.ended.lock() = Some((status, ended));
+            *s.exit.lock() = Some(code);
             changed();
             let _ = s.tx.send(Ev::Exit(code));
             db::session_end(s.id, code, status, ended);
@@ -598,12 +542,12 @@ impl Daemon {
     /// A message to chat `s`: sent to its agent, which is resumed first when it is not running.
     fn chat_send(self: &Arc<Self>, s: &Arc<Session>, text: &str) -> Result<()> {
         {
-            let _one = s.resuming.lock().unwrap();
-            if s.ended.lock().unwrap().is_some() {
+            let _one = s.resuming.lock();
+            if s.ended.lock().is_some() {
                 if let Err(e) = self.resume(s) {
                     if let Some(c) = &s.chat {
                         let why = format!("Can't resume this chat: {e:#}. The message was not sent.");
-                        c.record(json!({"ev": "error", "text": why}), &s.tx);
+                        c.record(Body::Error { text: why }, &s.tx);
                     }
                     return Err(e.context(format!("resuming chat s{}", s.id)));
                 }
@@ -636,20 +580,23 @@ impl Daemon {
                 a => args.push(a.to_owned()),
             }
         }
-        let adapter: Box<dyn chat::Adapter> = match s.kind.as_str() {
-            "claude" => {
-                args.extend(["--resume".to_owned(), session.clone()]);
-                Box::new(chat::claude::Claude::default())
-            }
-            "codex" => Box::new(chat::codex::Codex::resume(&s.cwd, &session)),
+        match s.kind.as_str() {
+            "claude" => args.extend(["--resume".to_owned(), session.clone()]),
+            "codex" => {}
             other => anyhow::bail!("{other} has no chat adapter to resume with"),
-        };
+        }
         if let Some(n) = &s.name {
             db::check_name(n)?;
         }
         let launch = profiles::launch(
             &s.kind, &profiles::Ctx { session: s.id, cwd: &s.cwd, sock: &paths::sock(), user_args: &args, prompt: None, chat: true },
         )?;
+        // Claude's adapter says the effort its launch passed, so it is made after the launch.
+        let adapter: Box<dyn chat::Adapter> = if s.kind == "claude" {
+            Box::new(chat::claude::Claude::new(launch.effort.clone()))
+        } else {
+            Box::new(chat::codex::Codex::resume(&s.cwd, &session))
+        };
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.iter().cloned());
         db::session_start(&db::SessionRow {
@@ -662,24 +609,26 @@ impl Daemon {
         Ok(())
     }
 
-    fn handle(self: &Arc<Self>, req: Req) -> Result<Value> {
+    fn handle(self: &Arc<Self>, req: Req) -> Result<Reply> {
+        #[cfg(test)]
+        if tests::PANIC_NEXT.swap(false, Ordering::SeqCst) {
+            // The planted panic of `tests::a_panicking_request_fails_only_itself`, holding the lock every request takes.
+            let _held = self.sessions.lock();
+            panic!("planted panic");
+        }
         Ok(match req {
             Req::List { all, chats } => {
                 let mut v = self.list();
                 if all || chats {
-                    let live: std::collections::HashSet<u64> = v.iter().filter_map(|s| s["id"].as_u64()).collect();
-                    v.extend(
-                        db::sessions()
-                            .into_iter()
-                            .filter(|s| s["id"].as_u64().is_some_and(|i| !live.contains(&i)) && (all || s["mode"] == "chat")),
-                    );
-                    v.sort_by_key(|s| s["id"].as_u64());
+                    let live: std::collections::HashSet<u64> = v.iter().map(|s| s.id).collect();
+                    v.extend(db::sessions().into_iter().filter(|s| !live.contains(&s.id) && (all || s.mode == "chat")));
+                    v.sort_by_key(|s| s.id);
                 }
                 let started = STARTED_MS.get().copied().unwrap_or(0);
                 for s in &mut v {
-                    s["past"] = json!(s["ended_ms"].as_u64().is_some_and(|e| e < started));
+                    s.past = s.ended_ms.is_some_and(|e| e < started);
                 }
-                json!({ "sessions": v })
+                Reply::Sessions { sessions: v }
             }
             Req::ReplTask { task } => {
                 db::repl_task(&task)?;
@@ -691,23 +640,23 @@ impl Daemon {
                     c.record(chat::tool_detail(call, &task), &s.tx);
                 }
                 changed();
-                json!({ "ok": true })
+                Reply::Ok
             }
-            Req::Info => json!({ "pid": std::process::id(), "sock": paths::sock() }),
+            Req::Info => Reply::Daemon { pid: std::process::id(), sock: paths::sock().display().to_string() },
             Req::Last => {
-                let last = *self.last.lock().unwrap();
-                let alive = last.and_then(|id| self.get(id).ok()).filter(|s| s.exit.lock().unwrap().is_none()).map(|s| s.id);
-                json!({ "id": alive })
+                let last = *self.last.lock();
+                let alive = last.and_then(|id| self.get(id).ok()).filter(|s| s.exit.lock().is_none()).map(|s| s.id);
+                Reply::Last { id: alive }
             }
-            Req::SpawnObject { opts } => crate::object::spawn(self, &opts)?,
-            Req::Object { id } => crate::object::info(self, &id)?,
+            Req::SpawnObject { opts } => Reply::Record(crate::object::spawn(self, &opts)?),
+            Req::Object { id } => Reply::Record(crate::object::info(self, &id)?),
             Req::Rpc { id, method, args } => crate::object::rpc(self, &id, &method, &args, |r| self.handle(r))?,
             Req::Spawn { kind, mut args, parent, cwd, prompt, name, cols, rows, mode } => {
                 if mode.as_deref() == Some("tui") {
                     args.push("--tui".into());
                 }
                 let id = self.spawn_named(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40))?;
-                json!({ "id": id })
+                Reply::Spawned { id }
             }
             Req::Send { id, text, raw, submit } => {
                 let s = self.get(id)?;
@@ -718,48 +667,53 @@ impl Daemon {
                 } else {
                     crate::inject::send(&s, &text, submit.unwrap_or(true))?;
                 }
-                json!({ "ok": true })
+                Reply::Ok
             }
             Req::Screen { id } => {
                 let s = self.get(id)?;
-                json!({ "text": s.screen_text(), "info": s.info() })
+                Reply::Screen { text: s.screen_text(), info: s.info() }
             }
             Req::Resize { id, cols, rows } => {
                 self.get(id)?.resize(cols, rows)?;
-                json!({ "ok": true })
+                Reply::Ok
             }
             Req::Kill { id } => {
                 self.get(id)?.kill();
-                json!({ "ok": true })
+                Reply::Ok
             }
             Req::Forget { id } => {
                 let s = self.get(id)?;
-                if s.exit.lock().unwrap().is_none() {
+                if s.exit.lock().is_none() {
                     s.kill();
                 }
-                self.sessions.lock().unwrap().remove(&id);
+                self.sessions.lock().remove(&id);
                 changed();
-                json!({ "ok": true })
+                Reply::Ok
             }
             Req::Shutdown => {
-                for s in self.sessions.lock().unwrap().values() {
+                for s in self.sessions.lock().values() {
                     s.kill();
                 }
                 let _ = std::fs::remove_file(paths::sock());
                 std::process::exit(0);
             }
-            Req::Runs(r) => runs::handle(r)?,
-            Req::Attach { .. } | Req::Watch => unreachable!("attach and watch are handled by the connection loop"),
+            Req::Runs(r) => Reply::Record(runs::handle(r)?),
+            Req::Attach { .. } | Req::Watch => anyhow::bail!("attach and watch hold the connection: send them as a connection's request, not through rpc"),
         })
     }
 }
 
 pub async fn run() -> Result<()> {
+    // Every agent's MCP server is the kernel: without it no spawn can work, so say where it was looked for now.
+    let kernel = paths::root().context("harnessd refuses to start")?;
+    eprintln!("harnessd kernel {}", kernel.display());
     std::fs::create_dir_all(paths::home())?;
     let sock = paths::sock();
     if UnixStream::connect(&sock).await.is_ok() {
         anyhow::bail!("harnessd already running at {}", sock.display());
     }
+    // Old chat logs move to this schema before anyone can attach to one (chat/mod.rs `migrate_logs`).
+    chat::migrate_logs();
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     // The object index: session ids continue after the last one ever used; sessions the last daemon
@@ -786,7 +740,7 @@ pub async fn run() -> Result<()> {
                 tick.tick().await;
                 n += 1;
                 let now = now_ms();
-                let sessions: Vec<Arc<Session>> = d.sessions.lock().unwrap().values().cloned().collect();
+                let sessions: Vec<Arc<Session>> = d.sessions.lock().values().cloned().collect();
                 for s in sessions {
                     s.settle(now);
                 }
@@ -801,59 +755,154 @@ pub async fn run() -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let d = d.clone();
-        tokio::spawn(async move {
-            if let Err(e) = conn(d, stream).await {
-                eprintln!("connection error: {e:#}");
-            }
-        });
+        tokio::spawn(guarded(d, stream));
     }
 }
 
+/// One connection in its own task: a panic in it (outside a request, which [`blocking`] already turns into that
+/// request's error) ends only this connection, and its client gets an error frame naming the panic.
+async fn guarded(d: Arc<Daemon>, stream: UnixStream) {
+    use std::os::fd::AsFd;
+    // A second handle on the socket, to report a panic on once the task (and its handle) is gone.
+    let report = stream.as_fd().try_clone_to_owned();
+    match tokio::spawn(conn(d, stream)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("connection error: {e:#}"),
+        Err(e) if e.is_panic() => {
+            let error = format!("harnessd panicked serving this connection: {}; it keeps serving others", panic_text(&*e.into_panic()));
+            eprintln!("{error}");
+            if let Ok(fd) = report {
+                let _ = tokio::task::spawn_blocking(move || report_panic(fd, &error)).await;
+            }
+        }
+        Err(e) => eprintln!("connection task cancelled: {e}"),
+    }
+}
+
+/// An error frame to a client whose connection task panicked, on a blocking copy of its socket (bounded by a write
+/// timeout, so a client that reads nothing cannot hold the thread).
+fn report_panic(fd: std::os::fd::OwnedFd, error: &str) {
+    let mut s = std::os::unix::net::UnixStream::from(fd);
+    let sent = s
+        .set_nonblocking(false)
+        .and_then(|()| s.set_write_timeout(Some(std::time::Duration::from_secs(1))))
+        .and_then(|()| harness_proto::frame::write(&mut s, T_CBOR, &harness_proto::cbor::encode(&Down::Error { error: error.to_owned() })));
+    if let Err(e) = sent {
+        eprintln!("reporting a connection's panic to its client: {e}");
+    }
+}
+
+/// What a panic said.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>().map(|s| (*s).to_owned()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic with no message".to_owned())
+}
+
+/// `f` on the blocking pool; a panic in it is the error of `what` (the request it served), never the connection's or
+/// the daemon's (rule panics-fail-one-job: parking_lot's locks do not poison, so the next request finds them usable).
+async fn blocking<T: Send + 'static>(what: &str, f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(r) => r,
+        Err(e) if e.is_panic() => {
+            let error = anyhow!("harnessd panicked handling {what}: {}; it keeps serving", panic_text(&*e.into_panic()));
+            eprintln!("{error}");
+            Err(error)
+        }
+        Err(e) => Err(anyhow!("harnessd cancelled {what}: {e}")),
+    }
+}
+
+/// A request, named for an error: its first 120 characters.
+fn request_name(req: &Req) -> String {
+    format!("{req:?}").chars().take(120).collect()
+}
+
+/// One message to a client.
+async fn send<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, m: &Down) -> std::io::Result<()> {
+    aio::write(w, T_CBOR, &harness_proto::cbor::encode(m)).await
+}
+
+/// The client's next message: None when it closed the connection.
+///
+/// # Errors
+/// The socket's, or a frame that is not a T_CBOR [`Up`] (named).
+async fn recv<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<Option<Up>> {
+    let Some((t, payload)) = aio::read(r).await? else { return Ok(None) };
+    if t != T_CBOR {
+        anyhow::bail!("a frame of type {t} where a message (type {T_CBOR}) belongs");
+    }
+    Ok(Some(harness_proto::cbor::decode(&payload).map_err(|e| anyhow!("a message that is not harness schema {}'s: {e}", harness_proto::SCHEMA))?))
+}
+
+/// A connection: the client's hello (its schema must be this daemon's, else an error naming both and the connection
+/// closes), then one answer per request, until an `attach` or `watch` turns it into a stream.
 async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let (mut r, mut w) = stream.into_split();
-    while let Some((t, payload)) = proto::read_frame(&mut r).await? {
-        if t != proto::T_JSON {
-            continue;
+    match recv(&mut r).await {
+        Ok(Some(Up::Hello { schema })) if schema == harness_proto::SCHEMA => {
+            send(&mut w, &Down::Hello { schema, pid: std::process::id() }).await?;
         }
-        let req: Req = match serde_json::from_slice(&payload) {
-            Ok(req) => req,
-            Err(e) => {
-                proto::write_json(&mut w, &json!({ "error": format!("bad request: {e}") })).await?;
+        Ok(None) => return Ok(()),
+        other => {
+            let error = match other {
+                Ok(Some(Up::Hello { schema })) => {
+                    format!("this client speaks harness schema {schema}, this daemon {}: update the older side", harness_proto::SCHEMA)
+                }
+                Ok(Some(m)) => format!("the connection must start with a hello naming the schema (harness schema {}), not {m:?}", harness_proto::SCHEMA),
+                Err(e) => format!("{e:#}"),
+                Ok(None) => unreachable!(),
+            };
+            send(&mut w, &Down::Error { error: error.clone() }).await?;
+            anyhow::bail!("refused a client: {error}");
+        }
+    }
+    loop {
+        let req = match recv(&mut r).await {
+            Ok(Some(Up::Req(req))) => req,
+            Ok(None) => return Ok(()),
+            Ok(Some(m)) => {
+                send(&mut w, &Down::Error { error: format!("{m:?} belongs on an attach or watch stream, not as a request") }).await?;
                 continue;
+            }
+            Err(e) => {
+                send(&mut w, &Down::Error { error: format!("bad request: {e:#}") }).await?;
+                return Err(e);
             }
         };
         if let Req::Attach { id, cols, rows, events } = req {
             let got = {
                 let d = d.clone();
-                tokio::task::spawn_blocking(move || d.get(id)).await?
+                blocking(&format!("attach to s{id}"), move || d.get(id)).await
             };
             let s = match got {
                 Ok(s) => s,
                 Err(e) => {
-                    proto::write_json(&mut w, &json!({ "error": format!("{e:#}") })).await?;
+                    send(&mut w, &Down::Error { error: format!("{e:#}") }).await?;
                     continue;
                 }
             };
             if let (Some(c), Some(rw)) = (cols, rows) {
                 s.resize(c, rw)?;
             }
-            *d.last.lock().unwrap() = Some(id);
-            proto::write_json(&mut w, &json!({ "ok": true, "info": s.info() })).await?;
+            *d.last.lock() = Some(id);
+            send(&mut w, &Down::Reply(Reply::Attached { info: s.info() })).await?;
             if let Some(c) = s.chat.clone() {
                 return attach_chat(s, c, events, r, w).await;
             }
             return attach(s, r, w).await;
         }
         if let Req::Watch = req {
-            proto::write_json(&mut w, &json!({ "ok": true })).await?;
+            send(&mut w, &Down::Reply(Reply::Watching)).await?;
             return watch(r, w).await;
         }
         let d2 = d.clone();
-        let resp = tokio::task::spawn_blocking(move || d2.handle(req)).await?;
-        let v = resp.unwrap_or_else(|e| json!({ "error": format!("{e:#}") }));
-        proto::write_json(&mut w, &v).await?;
+        let what = request_name(&req);
+        let resp = blocking(&what, move || d2.handle(req)).await;
+        let m = match resp {
+            Ok(reply) => Down::Reply(reply),
+            Err(e) => Down::Error { error: format!("{e:#}") },
+        };
+        send(&mut w, &m).await?;
     }
-    Ok(())
 }
 
 /// A `watch` connection: an event per change of the tree's generation, at most one each 50 ms (a burst of changes is
@@ -868,10 +917,10 @@ async fn watch(mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::
                     return Ok(());
                 }
                 let generation = *rx.borrow_and_update();
-                proto::write_json(&mut w, &json!({ "ev": "changed", "gen": generation })).await?;
+                send(&mut w, &Down::Changed { generation }).await?;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            _ = proto::read_frame(&mut r) => return Ok(()),
+            _ = aio::read(&mut r) => return Ok(()),
         }
     }
 }
@@ -879,26 +928,27 @@ async fn watch(mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::
 async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {
     s.attached.fetch_add(1, Ordering::Relaxed);
     let (snap, mut rx) = s.snapshot_and_subscribe();
-    let exited = *s.exit.lock().unwrap();
+    let exited = *s.exit.lock();
     let mut out = {
         let s = s.clone();
         tokio::spawn(async move {
-            proto::write_frame(&mut w, proto::T_DATA, &snap).await?;
+            aio::write(&mut w, T_DATA, &snap).await?;
             if let Some(code) = exited {
-                proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+                send(&mut w, &Down::Exit { code }).await?;
                 return Ok::<_, anyhow::Error>(());
             }
             loop {
                 match rx.recv().await {
-                    Ok(Ev::Data(b)) => proto::write_frame(&mut w, proto::T_DATA, &b).await?,
+                    Ok(Ev::Data(b)) => aio::write(&mut w, T_DATA, &b).await?,
+                    Ok(Ev::Event(_)) => {}
                     Ok(Ev::Exit(code)) => {
-                        proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+                        send(&mut w, &Down::Exit { code }).await?;
                         return Ok(());
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let (snap, new_rx) = s.snapshot_and_subscribe();
                         rx = new_rx;
-                        proto::write_frame(&mut w, proto::T_DATA, &snap).await?;
+                        aio::write(&mut w, T_DATA, &snap).await?;
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
@@ -906,20 +956,19 @@ async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: 
         })
     };
     let input = async {
-        while let Some((t, payload)) = proto::read_frame(&mut r).await? {
+        while let Some((t, payload)) = aio::read(&mut r).await? {
             match t {
-                proto::T_DATA => {
+                T_DATA => {
                     let s = s.clone();
-                    tokio::task::spawn_blocking(move || s.write(&payload)).await??;
+                    blocking("keys to an attached session", move || s.write(&payload)).await?;
                 }
-                proto::T_RESIZE => {
-                    let v: Value = serde_json::from_slice(&payload)?;
-                    if let (Some(c), Some(rw)) = (v["cols"].as_u64(), v["rows"].as_u64()) {
-                        s.resize(c as u16, rw as u16)?;
-                    }
-                }
-                proto::T_JSON => break, // detach
-                _ => {}
+                T_CBOR => match harness_proto::cbor::decode::<Up>(&payload) {
+                    Ok(Up::Resize { cols, rows }) => s.resize(cols, rows)?,
+                    Ok(Up::Detach) => break,
+                    Ok(m) => anyhow::bail!("{m:?} on an attach stream (it takes keys, resize and detach)"),
+                    Err(e) => anyhow::bail!("a message on an attach stream that is not harness schema {}'s: {e}", harness_proto::SCHEMA),
+                },
+                t => anyhow::bail!("a frame of type {t} on an attach stream (it takes keys and messages)"),
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -933,37 +982,33 @@ async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: 
     res
 }
 
-/// A chat session's attach: its history, then its events live; as event lines (`events`, the app) or as the
-/// conversation's text (the terminal client). Its agent's exit is a T_EXIT: the terminal client's stream ends there, the
-/// app's stays open (the chat outlives its agent, and a resume's events come on it). Detached by any JSON frame; a
-/// client that falls behind the broadcast is dropped, and attaches again for a fresh history.
+/// A chat session's attach: its history, then its events live; as T_EVENT frames exactly as its log holds them
+/// (`events`, the app), or as the conversation's text in T_DATA frames (the terminal client). Its agent's exit is a
+/// `Down::Exit`: the terminal client's stream ends there, the app's stays open (the chat outlives its agent, and a
+/// resume's events come on it). Detached by `Up::Detach` (or the client going); a client that falls behind the broadcast
+/// is dropped, and attaches again for a fresh history.
 async fn attach_chat(
     s: Arc<Session>, c: Arc<chat::Chat>, events: bool, mut r: tokio::net::unix::OwnedReadHalf,
     mut w: tokio::net::unix::OwnedWriteHalf,
 ) -> Result<()> {
     s.attached.fetch_add(1, Ordering::Relaxed);
     let (history, mut rx) = c.history_and_subscribe(&s.tx);
-    let exited = *s.exit.lock().unwrap();
+    let exited = *s.exit.lock();
     let sid = s.id;
-    let render = chat_render(events);
     let mut out = tokio::spawn(async move {
-        send_history(&mut w, &history, &render).await?;
+        send_history(&mut w, &history, events).await?;
         if let Some(code) = exited {
-            proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+            send(&mut w, &Down::Exit { code }).await?;
             if !events {
                 return Ok::<_, anyhow::Error>(());
             }
         }
         loop {
             match rx.recv().await {
-                Ok(Ev::Data(b)) => {
-                    let bytes = render(&b);
-                    if !bytes.is_empty() {
-                        proto::write_frame(&mut w, proto::T_DATA, &bytes).await?;
-                    }
-                }
+                Ok(Ev::Event(f)) => send_events(&mut w, &f, events).await?,
+                Ok(Ev::Data(_)) => {}
                 Ok(Ev::Exit(code)) => {
-                    proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+                    send(&mut w, &Down::Exit { code }).await?;
                     if !events {
                         return Ok(());
                     }
@@ -976,8 +1021,8 @@ async fn attach_chat(
         }
     });
     let input = async {
-        while let Some((t, _)) = proto::read_frame(&mut r).await? {
-            if t == proto::T_JSON {
+        while let Some((t, payload)) = aio::read(&mut r).await? {
+            if t == T_CBOR && matches!(harness_proto::cbor::decode::<Up>(&payload), Ok(Up::Detach)) {
                 break;
             }
         }
@@ -992,36 +1037,31 @@ async fn attach_chat(
     res
 }
 
-/// How a chat attach sends event lines: as they are (`events`, the app), or as the conversation's text (the terminal
-/// client).
-fn chat_render(events: bool) -> impl Fn(&[u8]) -> Vec<u8> + Send + 'static {
-    move |lines: &[u8]| -> Vec<u8> {
-        if events {
-            return lines.to_vec();
+/// Whole T_EVENT frames to a chat attach: as they are (`events`), or as their text in one T_DATA frame.
+async fn send_events(w: &mut tokio::net::unix::OwnedWriteHalf, frames: &[u8], events: bool) -> Result<()> {
+    if events {
+        aio::write_frames(w, frames).await?;
+    } else {
+        let text = chat::text_of_frames([frames]).replace('\n', "\r\n");
+        if !text.is_empty() {
+            aio::write(w, T_DATA, text.as_bytes()).await?;
         }
-        let mut out = String::new();
-        for l in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-            out.push_str(&chat::text_of(&serde_json::from_slice(l).unwrap_or(Value::Null)));
-        }
-        out.replace('\n', "\r\n").into_bytes()
     }
+    Ok(())
 }
 
-/// A chat's history to an attach, in T_DATA frames of whole lines, about 256 KB each.
-async fn send_history(
-    w: &mut tokio::net::unix::OwnedWriteHalf, history: &[impl AsRef<str>], render: impl Fn(&[u8]) -> Vec<u8>,
-) -> Result<()> {
+/// A chat's history to an attach, about 256 KB of frames at a time.
+async fn send_history(w: &mut tokio::net::unix::OwnedWriteHalf, history: &[Arc<[u8]>], events: bool) -> Result<()> {
     let mut buf = Vec::new();
-    for l in history {
-        buf.extend_from_slice(l.as_ref().as_bytes());
-        buf.push(b'\n');
+    for f in history {
+        buf.extend_from_slice(f);
         if buf.len() >= 256 * 1024 {
-            proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+            send_events(w, &buf, events).await?;
             buf.clear();
         }
     }
     if !buf.is_empty() {
-        proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+        send_events(w, &buf, events).await?;
     }
     Ok(())
 }
@@ -1036,4 +1076,42 @@ fn uuid_v4() -> String {
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{recv, send};
+
+    /// Set: the next request panics while holding the sessions lock.
+    pub(super) static PANIC_NEXT: AtomicBool = AtomicBool::new(false);
+
+    /// A request that panics fails alone: its client gets an error frame naming the panic, and the next request on the
+    /// same connection (and on a new one) is answered. Remove the cause (no planted panic) and the first answer is a
+    /// reply; with std's poisoning locks the second request panicked too and the connection closed.
+    #[tokio::test]
+    async fn a_panicking_request_fails_only_itself() {
+        let d = Arc::new(Daemon { sessions: Mutex::new(BTreeMap::new()), next: AtomicU64::new(1), last: Mutex::new(None) });
+        let list = || Up::Req(Req::List { all: false, chats: false });
+        let open = |d: Arc<Daemon>| async move {
+            let (client, server) = UnixStream::pair().expect("socket pair");
+            tokio::spawn(guarded(d, server));
+            let mut client = client;
+            send(&mut client, &Up::Hello { schema: harness_proto::SCHEMA }).await.expect("hello");
+            assert!(matches!(recv(&mut client).await.expect("hello back"), Down::Hello { .. }));
+            client
+        };
+        let mut c = open(d.clone()).await;
+        PANIC_NEXT.store(true, Ordering::SeqCst);
+        send(&mut c, &list()).await.expect("send");
+        match recv(&mut c).await.expect("an answer to the panicking request") {
+            Down::Error { error } => assert!(error.contains("panicked") && error.contains("planted panic"), "{error}"),
+            m => panic!("the planted panic was not reported: {m:?}"),
+        }
+        send(&mut c, &list()).await.expect("send");
+        assert!(matches!(recv(&mut c).await.expect("the next request answered"), Down::Reply(Reply::Sessions { .. })));
+        let mut c2 = open(d).await;
+        send(&mut c2, &list()).await.expect("send");
+        assert!(matches!(recv(&mut c2).await.expect("a new connection answered"), Down::Reply(Reply::Sessions { .. })));
+    }
 }

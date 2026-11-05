@@ -75,7 +75,7 @@ export const sidebar_zeta = 1
 // left edge does (wider, clear of AppKit's own window-resize band). side_keep is the least the main card keeps beside
 // it, lowering side_max in a narrow window.
 export const side_min = 180
-export const side_max = 480
+export const side_max = 300
 export const side_latch = 8
 export const side_give = 24
 export const side_soft = 48
@@ -138,6 +138,9 @@ export const arch_took_w = 56
 export const arch_time_w = 84
 // A finished run with no session leaves the live tree this long after it ended (seconds).
 export const archive_after_s = 600
+// How long after it ended a top-level session from before the daemon started (a chat restored after a restart) stays in
+// the tree before the Archive files it (seconds; a week).
+export const archive_past_after_s = 604800
 
 // Overlays over the window: the command palette (cmd+K) and the new-object picker (cmd+N), each a card on a scrim
 // (hn.Scrim, hn.OverlayCard in scene/widgets/palette.flecs). They come in on a spring (the scrim fades in, the card
@@ -185,6 +188,16 @@ export const tone_accent: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0
 export const tone_wash: Fill = {dark: {1, 1, 1, 0.06}, light: {0, 0, 0, 0.05}}
 export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.04}}
 export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// An icon button (ui.IconButton) has no plate: its glyph rests in tone_icon_rest and eases to tone_icon_hover under the
+// pointer (tone_icon_on while what it opens is open); held, it scales to icon_press_scale and dims to icon_press_dim, and
+// springs back on the press spring (a little under-damped, so the release has a touch of give).
+export const tone_icon_rest: Fill = $tone_ink_3
+export const tone_icon_hover: Fill = $tone_ink_1
+export const tone_icon_on: Fill = $tone_accent
+export const icon_press_scale = 0.92
+export const icon_press_dim = 0.7
+export const spring_press_omega = 38
+export const spring_press_zeta = 0.62
 // An overlay scroller's knob and the faint track it widens over (ui.Scroller): AppKit's, white over a dark ground and
 // black over a light one (a scroll on the terminal's ground follows its Scheme).
 export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.20}}
@@ -207,11 +220,11 @@ export const tone_plate_line: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.
 export const tone_switch_on: Fill = {dark: {0.580, 0.600, 1.0, 1}, light: {0.369, 0.384, 0.902, 1}}
 // With a Ghostty theme (src/app/ghostty.rs, read live from the user's Ghostty config) the tokens on the terminal's
 // ground are set at runtime from each appearance's theme background and foreground: tone_term_ground (hn.Main),
-// tone_term_ink and tone_term_muted (hn.TitleBar), tone_plate (Plate), tone_card (hn.Palette.card) and tone_side_tint
-// (hn.SideClip). The values here are the built-in theme's, kept for an appearance the config does not theme.
+// tone_term_ink and tone_term_muted (the words on it: the title bar's, the chat's), tone_plate (Plate), tone_card (the
+// palette's and the picker's cards) and tone_side_tint (hn.SideClip); every Fill copied from one follows it. The values here are the built-in theme's, kept for an appearance the config does not theme.
 // The terminal's ground (the built-in theme's bg, #121214): the main card and the title bar over it, in both appearances.
 export mut tone_term_ground: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.071, 0.071, 0.078, 1}}
-// Ink over the terminal's ground (always dark): the title bar's words.
+// Ink over the terminal's ground (the built-in theme's is dark): the title bar's and the chat's words.
 export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
 export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
@@ -266,10 +279,28 @@ export const tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.9
 export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
 export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
 
-// Text being edited (ui.TextArea): the selection's wash and the caret. Inline code's chip (MarkdownText).
-export const tone_text_select: Fill = {dark: {0.580, 0.600, 1.0, 0.32}, light: {0.369, 0.384, 0.902, 0.24}}
+// The selection (harness-native-render's select.rs, den's plate_selection): one plate under the glyphs wherever text is
+// selected (a chat's transcript and input, a table's copied row, the terminal), ink-1 at 22% (18% on the light page),
+// corners of radius 4 on a superellipse of n 2; its rows join into one shape (a corner a touching row covers stays
+// square). Ghostty's selection-background, where the theme sets one, retints it. Cmd+C pulses it (den's FlashLook): the
+// shape grows by copy_grow and back on the copy spring (kicked to peak at 1, settling to rest so the frame goes idle), a
+// light of copy_light sweeps across each row over copy_sweep seconds, the rows joining copy_stagger seconds apart, each
+// taking copy_row_in to come in.
+export const plate_selection: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.18}}
+export const plate_selection_radius = 4
+export const plate_selection_n = 2
+export const copy_omega = 18
+export const copy_zeta = 1
+export const copy_grow = 0.025
+export const copy_light = 0.12
+export const copy_sweep = 0.3
+export const copy_stagger = 0.04
+export const copy_row_in = 0.11
+// Inline code's chip (MarkdownText).
 export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
 export const textarea_max_h = 132
+// How far a text area's placeholder starts after its caret (which stands at the words' start), as a macOS field's does.
+export const textarea_hint_inset = 4
 // ui.Table: a row's height, the room between columns, a row's inset and its words' size; ui.Result: a snippet's two lines.
 export const table_row = 24
 export const table_gap = 14
@@ -279,8 +310,28 @@ export const result_snippet_h = 36
 
 // The chat pane (hn.ChatPane, scene/widgets/chat.flecs, src/app/chat.rs): a column of the transcript as wide as reads
 // well, the user's words on a soft plate, code on a card, tool calls as quiet one-line rows, the input at the foot.
-export const chat_w = 720
+// chat_w is the reading column (the words, the bubble's trailing edge, the input): centred, chat_pad clear of the pane's
+// edges either side when the pane is narrower.
+export const chat_w = 672
 export const chat_pad = 24
+// How far the transcript thins out where it scrolls under the composer (and under the pane's top): soft, never a cut line.
+export const chat_fade_len = 28
+// Vertical rhythm, top to bottom: chat_gap_block between two blocks of a reply (half above a block, half below), the
+// person's message chat_gap_turn below the reply before it and chat_gap_reply above the reply to it (a message sits with
+// its answer).
+export const chat_gap_block = 10
+export const chat_gap_turn = 28
+export const chat_gap_reply = 14
+export const chat_block_half = $chat_gap_block / 2
+// The person's bubble: its words' inset (even to the eye: the line's own leading adds to the vertical), its line, and the
+// least room it leaves at the leading edge.
+export const chat_bubble_pad_x = 12
+export const chat_bubble_pad_y = 7
+export const line_chat_bubble = 20
+export const chat_bubble_lead = 48
+// The input's words' inset on its plate; the status line under it keeps the same inset.
+export const chat_input_pad_x = 14
+export const chat_input_pad_y = 10
 export const size_chat = 14
 export const line_chat = 21
 export const size_chat_h1 = 19
@@ -299,6 +350,22 @@ export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0
 // a Stat's value, set large.
 export const gen_gap = 8
 export const size_gen_stat = 22
+// A chart's series inks (genui chart.rs, `hn.GenTone.series1` on), the dataviz skill's validated categorical palette in its
+// fixed order (blue orange aqua yellow magenta green violet red; never cycled, a ninth folds into "other"), each
+// appearance its own steps. A transcript is drawn in its ground's scheme (dark unless a Ghostty theme makes it light).
+// Checked with validate_palette.js: dark on #121214, worst adjacent CVD dE 8.4, normal-vision 19.3, all >= 3:1; light on
+// white, CVD 9.1, normal-vision 19.6, three slots under 3:1 (aqua, yellow, magenta), so a chart always labels its values
+// (legend, tips).
+export const tone_series1: Fill = {dark: {0.224, 0.529, 0.898, 1}, light: {0.165, 0.471, 0.839, 1}}
+export const tone_series2: Fill = {dark: {0.851, 0.349, 0.149, 1}, light: {0.922, 0.408, 0.204, 1}}
+export const tone_series3: Fill = {dark: {0.098, 0.620, 0.439, 1}, light: {0.106, 0.686, 0.478, 1}}
+export const tone_series4: Fill = {dark: {0.788, 0.522, 0.000, 1}, light: {0.929, 0.631, 0.000, 1}}
+export const tone_series5: Fill = {dark: {0.835, 0.318, 0.506, 1}, light: {0.910, 0.482, 0.643, 1}}
+export const tone_series6: Fill = {dark: {0.000, 0.514, 0.000, 1}, light: {0.000, 0.514, 0.000, 1}}
+export const tone_series7: Fill = {dark: {0.565, 0.522, 0.914, 1}, light: {0.384, 0.314, 0.839, 1}}
+export const tone_series8: Fill = {dark: {0.902, 0.404, 0.404, 1}, light: {0.890, 0.286, 0.282, 1}}
+// The quietest ink on the terminal's ground: a chart's gridlines, a canvas's `faint`.
+export const tone_term_faint: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.12}}
 export const line_gen_stat = 28
 
 // Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):

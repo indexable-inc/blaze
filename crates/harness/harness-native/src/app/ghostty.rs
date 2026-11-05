@@ -1,32 +1,15 @@
 //! The user's Ghostty config, live (crates/harness/harness-ghostty-config): the terminal's colours, font and padding, and the
 //! tokens that sit on the terminal's ground (the main card, the title bar's inks, the sidebar's tint, the plates),
-//! derived from the theme's ground and ink for each appearance whose theme sets a background. Where nothing is set the
-//! scene's tokens and the built-in theme stay.
+//! derived from the theme's ground and ink for each appearance whose theme sets a background, and the selection plate in its
+//! selection-background. Where nothing is set the scene's tokens and the built-in theme stay.
 use super::*;
 
 /// The terminal's padding when the config sets none (points: left, right, top, bottom).
 const DEFAULT_PAD: [f32; 4] = [18.0, 18.0, 16.0, 16.0];
 
-/// The prefabs whose Fill follows the theme, each with the scene's own Fill (kept for an appearance with no theme).
-const TINTED: [&str; 6] = [
-    "Plate",
-    "hn.Main",
-    "hn.Palette.card",
-    "hn.Picker.card",
-    "hn.SideClip",
-    "hn.TitleBar.back",
-];
-/// The `export mut` token (scene/00-tokens.flecs) each of [`TINTED`] reads its Fill from.
-const TOKENS: [&str; 8] = [
-    "tone_plate",
-    "tone_term_ground",
-    "tone_card",
-    "tone_card",
-    "tone_side_tint",
-    "tone_term_ink",
-    "tone_term_muted",
-    "tone_term_muted",
-];
+/// The `export mut` tokens (scene/00-tokens.flecs) on the terminal's ground that follow the theme, in [`derived`]'s order:
+/// the plates, the main card's ground, the overlays' cards, the sidebar's tint, the ink and the muted ink over the ground.
+const TOKENS: [&str; 6] = ["tone_plate", "tone_term_ground", "tone_card", "tone_side_tint", "tone_term_ink", "tone_term_muted"];
 
 /// Each `code_ink` capture (scene/00-tokens.flecs) and the ANSI colour a themed appearance colours it with, as editors
 /// that follow the terminal's palette do: keywords magenta, functions blue, types yellow, strings green, numbers and
@@ -56,10 +39,12 @@ pub(super) struct Look {
     pub size: f32,
     /// Left, right, top, bottom, points.
     pub pad: [f32; 4],
-    /// The scene's Fill of each of [`TINTED`], read before the first tint.
+    /// The scene's value of each of [`TOKENS`], read before the first tint.
     scene: Option<Vec<Fill>>,
     /// The scene's Fill of each of [`CODE_ANSI`]'s captures (None: the scene has none for it).
     code: Option<Vec<Option<Fill>>>,
+    /// The scene's selection plate (`ui.selection`'s Fill), read before the first tint.
+    selection: Option<Fill>,
 }
 
 impl Look {
@@ -73,6 +58,7 @@ impl Look {
             pad: DEFAULT_PAD,
             scene: None,
             code: None,
+            selection: None,
         }
     }
 }
@@ -90,40 +76,82 @@ fn mix(a: term::Rgba, b: term::Rgba, t: f32) -> term::Rgba {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, 1.0]
 }
 
-/// Each of [`TINTED`]'s colour from theme `t` in one appearance (`dark` picks the light or dark variant of the rule).
-fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 8] {
+/// Each of [`TOKENS`]'s colour from theme `t` in one appearance (`dark` picks the light or dark variant of the rule).
+fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 6] {
     let ground = t.bg;
     // The overlays' cards (the palette's, the picker's) a touch off the ground: toward the ink in the dark, toward white in the light.
     let card = if dark { mix(t.bg, t.fg, 0.04) } else { mix(t.bg, [1.0; 4], 0.6) };
     let side = t.bg;
     let ink = alpha(t.fg, 0.92);
     let muted = alpha(t.fg, if dark { 0.5 } else { 0.55 });
-    [ground, ground, card, card, side, ink, muted, muted]
+    [ground, ground, card, side, ink, muted]
 }
 
-/// Token `token` set to `f`: flecs re-runs what reads it (prefab `path`'s Fill, what instances made from now on copy), and
-/// the instances made from `path` so far, which copied the old Fill when they were made, take the new one.
-fn retint(w: WorldRef<'_>, token: &str, path: &str, f: Fill) {
+/// Token `token`'s value (`export mut`), None when the scene has no such token or it is not a Fill.
+fn token(w: WorldRef<'_>, token: &str) -> Option<Fill> {
+    let v: serde_json::Value = serde_json::from_str(&w.var_json(token)?).ok()?;
+    let c = |k: &str| {
+        let c = &v[k];
+        let n = |m: &str| c[m].as_f64().map(|x| x as f32);
+        Some(Rgba { r: n("r")?, g: n("g")?, b: n("b")?, a: n("a")? })
+    };
+    Some(Fill { dark: c("dark")?, light: c("light")? })
+}
+
+/// Every entity with a Fill, prefabs too, by id.
+fn fills(w: WorldRef<'_>) -> Vec<(u64, Fill)> {
+    let mut all = Vec::new();
+    w.new_query::<&Fill>().each_entity(|e, f| all.push((*e.id(), *f)));
+    w.query::<&Fill>().with(flecs::Prefab::ID).build().each_entity(|e, f| all.push((*e.id(), *f)));
+    all.sort_unstable_by_key(|&(e, _)| e);
+    all.dedup_by_key(|&mut (e, _)| e);
+    all
+}
+
+/// Token `token` set to `f`. Flecs re-runs the scripts that read it, which sets the Fill of the prefabs that name it; the
+/// Fills copied from those when something was made from them (a prefab derived from one, a prefab's children inside another,
+/// the instances made so far) do not follow on their own, so each copy that still holds its source's old Fill takes the new
+/// one, down every chain of copies. A copy given its own Fill keeps it.
+fn retint(w: WorldRef<'_>, token: &str, f: Fill) {
     let json =
         |c: Rgba| format!("{{\"r\": {}, \"g\": {}, \"b\": {}, \"a\": {}}}", c.r, c.g, c.b, c.a);
-    if !w.set_mut_var(
-        token,
-        &format!("{{\"dark\": {}, \"light\": {}}}", json(f.dark), json(f.light)),
-    ) {
+    let before = fills(w);
+    if !w.set_mut_var(token, &format!("{{\"dark\": {}, \"light\": {}}}", json(f.dark), json(f.light))) {
         eprintln!("harness-native: no scene token {token} to tint");
         return;
     }
-    let Some(pf) = view::prefab(w, path) else { return };
-    let id = *pf.id();
-    let f = pf.try_cloned::<&Fill>().unwrap_or(f);
-    let mut made = Vec::new();
-    w.new_query::<&Fill>().each_entity(|e, _| {
-        if e.owns((flecs::IsA::ID, id)) {
-            made.push(*e.id());
+    let mut work: Vec<(u64, Fill, Fill)> = before
+        .iter()
+        .filter_map(|&(e, old)| {
+            let now = w.entity_from_id(e).try_cloned::<&Fill>()?;
+            (now != old).then_some((e, old, now))
+        })
+        .collect();
+    // Each Fill's sources: what the entity is made from (IsA), and, under a parent made from a prefab, that prefab's child of
+    // the same name (flecs 4.2 copies a base prefab's children into what is made from it without an IsA to them).
+    let mut copies: Vec<(u64, u64)> = Vec::new();
+    for &(e, _) in &before {
+        let v = w.entity_from_id(e);
+        v.each_target(flecs::IsA::ID, |base| copies.push((*base.id(), e)));
+        if let Some(parent) = v.parent() {
+            let name = v.name();
+            parent.each_target(flecs::IsA::ID, |base| {
+                if let Some(src) = base.lookup_child(&name) {
+                    copies.push((*src.id(), e));
+                }
+            });
         }
-    });
-    for e in made {
-        w.entity_from_id(e).set(f);
+    }
+    copies.sort_unstable();
+    while let Some((base, old, new)) = work.pop() {
+        let from = copies.partition_point(|&(b, _)| b < base);
+        for &(_, e) in copies[from..].iter().take_while(|&&(b, _)| b == base) {
+            let copy = w.entity_from_id(e);
+            if copy.try_cloned::<&Fill>() == Some(old) {
+                copy.set(new);
+                work.push((e, old, new));
+            }
+        }
     }
 }
 
@@ -161,6 +189,7 @@ impl App {
         }
         let themed = [cfg.light.background.is_some(), cfg.dark.background.is_some()];
         self.tint_tokens(themed);
+        self.tint_selection();
         eprintln!(
             "harness-native: ghostty config {} (themed light {} dark {}; font {:?} {size}, cell {}x{} px @{}x, padding {pad:?}, blink {blink})",
             if cfg.found { "read" } else { "not found" },
@@ -179,23 +208,20 @@ impl App {
     /// foreground, the sidebar's tint its ground part see-through.
     fn tint_tokens(&mut self, themed: [bool; 2]) {
         let w = self.world.world_ref();
-        let scene = self.look.scene.get_or_insert_with(|| {
-            TINTED
-                .map(|p| {
-                    view::prefab(w, p).and_then(|e| e.try_cloned::<&Fill>()).unwrap_or_default()
-                })
-                .to_vec()
-        });
+        let scene = self
+            .look
+            .scene
+            .get_or_insert_with(|| TOKENS.map(|t| token(w, t).unwrap_or_default()).to_vec());
         let [l, d] = &self.look.themes;
         let (dl, dd) = (derived(l, false), derived(d, true));
-        for (i, path) in TINTED.iter().enumerate() {
+        for (i, name) in TOKENS.iter().enumerate() {
             let s = scene[i];
             let f = Fill {
                 light: if themed[0] { rgba(dl[i]) } else { s.light },
                 dark: if themed[1] { rgba(dd[i]) } else { s.dark },
             };
-            if view::prefab(w, path).and_then(|e| e.try_cloned::<&Fill>()) != Some(f) {
-                retint(w, TOKENS[i], path, f);
+            if token(w, name) != Some(f) {
+                retint(w, name, f);
             }
         }
         // Code's colours: the theme's ANSI colours where it themes the appearance, else the scene's.
@@ -211,6 +237,19 @@ impl App {
             if e.try_cloned::<&Fill>() != Some(f) {
                 e.set(f);
             }
+        }
+    }
+
+    /// The selection plate (`ui.selection`, every surface's) in Ghostty's selection-background where an appearance's theme
+    /// sets one, else the scene's.
+    fn tint_selection(&mut self) {
+        let w = self.world.world_ref();
+        let scene = *self.look.selection.get_or_insert_with(|| harness_native_render::select::Look::of(w).fill);
+        let e = w.lookup(harness_native_render::select::LOOK);
+        let [l, d] = &self.look.themes;
+        let f = Fill { light: l.select.map_or(scene.light, rgba), dark: d.select.map_or(scene.dark, rgba) };
+        if e.try_cloned::<&Fill>() != Some(f) {
+            e.set(f);
         }
     }
 

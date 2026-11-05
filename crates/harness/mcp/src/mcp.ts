@@ -40,8 +40,10 @@ server.registerTool(
     },
   },
   async ({ code, yield_ms = 10_000, timeout_ms }, extra) => {
-    // Claude names the tool call in the request's _meta; the cell carries it so the app draws the cell as that call.
-    const call = extra._meta?.["claudecode/toolUseId"];
+    // The agent names the tool call in the request's _meta (Claude as `claudecode/toolUseId`, Codex as `callId`, the
+    // same id its app-server gives the mcpToolCall item); the cell carries it so the app draws the cell as that call.
+    const meta = extra._meta ?? {};
+    const call = [meta["claudecode/toolUseId"], meta["callId"]].find((c) => typeof c === "string" && c !== "");
     const t = repl.run(code, timeout_ms, typeof call === "string" ? call : null);
     let timer: Timer | undefined;
     await Promise.race([t.done, new Promise((r) => (timer = setTimeout(r, yield_ms)))]);

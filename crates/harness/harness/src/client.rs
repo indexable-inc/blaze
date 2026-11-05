@@ -1,12 +1,13 @@
 //! `harness` client: talks to harnessd (starting it if needed), shows the session tree, and
 //! attaches to a session with raw passthrough. Ctrl-] inside a session returns to the tree.
-use crate::{paths, proto};
+use crate::paths;
+use harness_proto::frame::{T_CBOR, T_DATA, aio};
+use harness_proto::msg::{Down, Reply, Request, SessionInfo, Up};
 use anyhow::{Context, Result, anyhow, bail};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
-use serde_json::{Value, json};
 use std::io::Write;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -22,21 +23,133 @@ pub struct Ctl {
 
 impl Ctl {
     pub async fn connect() -> Result<Self> {
-        Ok(Self { stream: ensure_daemon().await? })
+        let mut stream = ensure_daemon().await?;
+        hello(&mut stream).await?;
+        Ok(Self { stream })
     }
 
-    pub async fn req(&mut self, v: Value) -> Result<Value> {
-        proto::write_json(&mut self.stream, &v).await?;
-        let (t, payload) = proto::read_frame(&mut self.stream).await?.ok_or_else(|| anyhow!("daemon closed the connection"))?;
-        if t != proto::T_JSON {
-            bail!("unexpected frame type {t}");
+    /// One request and its reply (a refusal as the error it names).
+    pub async fn req(&mut self, r: Request) -> Result<Reply> {
+        send(&mut self.stream, &Up::Req(r)).await?;
+        match recv(&mut self.stream).await? {
+            Down::Reply(reply) => Ok(reply),
+            Down::Error { error } => bail!("{error}"),
+            m => bail!("harnessd answered a request with {m:?}"),
         }
-        let v: Value = serde_json::from_slice(&payload)?;
-        if let Some(e) = v.get("error") {
-            bail!("{}", e.as_str().unwrap_or("error"));
-        }
-        Ok(v)
     }
+
+    /// `list`'s sessions.
+    pub async fn list(&mut self, all: bool, chats: bool) -> Result<Vec<SessionInfo>> {
+        match self.req(Request::List { all, chats }).await? {
+            Reply::Sessions { sessions } => Ok(sessions),
+            r => bail!("harnessd answered list with {r:?}"),
+        }
+    }
+
+    /// A request whose reply is an open record (runs, objects).
+    pub async fn record(&mut self, r: Request) -> Result<serde_json::Value> {
+        match self.req(r).await? {
+            Reply::Record(v) => Ok(v),
+            Reply::Ok => Ok(serde_json::json!({"ok": true})),
+            r => bail!("harnessd answered with {r:?} where a record belongs"),
+        }
+    }
+}
+
+/// One message to the daemon.
+pub async fn send<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, m: &Up) -> Result<()> {
+    aio::write(w, T_CBOR, &harness_proto::cbor::encode(m)).await?;
+    Ok(())
+}
+
+/// The daemon's next message (a T_CBOR frame).
+pub async fn recv<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<Down> {
+    let (t, payload) = aio::read(r).await?.ok_or_else(|| anyhow!("harnessd closed the connection"))?;
+    if t != T_CBOR {
+        bail!("harnessd sent a frame of type {t} where a message (type {T_CBOR}) belongs");
+    }
+    decode_down(&payload)
+}
+
+fn decode_down(payload: &[u8]) -> Result<Down> {
+    harness_proto::cbor::decode(payload).map_err(|e| anyhow!("harnessd sent a message that is not harness schema {}'s: {e}", harness_proto::SCHEMA))
+}
+
+/// How long a daemon has to answer the hello.
+pub const HELLO_WAIT: Duration = Duration::from_secs(3);
+
+/// A daemon that took the connection but did not answer the hello in [`HELLO_WAIT`]: most likely an older one that
+/// predates the CBOR hello. Named by its pid (the socket's peer credentials) and socket.
+#[derive(Debug)]
+pub struct NoHello {
+    pub pid: Option<i32>,
+    pub sock: std::path::PathBuf,
+}
+
+impl std::fmt::Display for NoHello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pid = self.pid.map_or("unknown".to_owned(), |p| p.to_string());
+        write!(
+            f,
+            "harnessd (pid {pid}, socket {}) did not answer the hello within {}s: it is likely an older daemon that does not speak harness schema {}; run `harness stop` and try again",
+            self.sock.display(),
+            HELLO_WAIT.as_secs(),
+            harness_proto::SCHEMA
+        )
+    }
+}
+
+impl std::error::Error for NoHello {}
+
+/// Open a connection: this client's hello, and the daemon's (an error naming both schemas when they differ), within
+/// [`HELLO_WAIT`] ([`NoHello`] past it).
+pub async fn hello(s: &mut UnixStream) -> Result<()> {
+    send(s, &Up::Hello { schema: harness_proto::SCHEMA }).await?;
+    let answer = match tokio::time::timeout(HELLO_WAIT, recv(s)).await {
+        Ok(answer) => answer?,
+        Err(_) => return Err(NoHello { pid: s.peer_cred().ok().and_then(|c| c.pid()), sock: paths::sock() }.into()),
+    };
+    match answer {
+        Down::Hello { schema, .. } if schema == harness_proto::SCHEMA => Ok(()),
+        Down::Hello { schema, .. } => bail!("harnessd speaks harness schema {schema}, this client {}", harness_proto::SCHEMA),
+        Down::Error { error } => bail!("harnessd refused the connection: {error}"),
+        m => bail!("harnessd answered the hello with {m:?}"),
+    }
+}
+
+/// Stop the daemon: `shutdown` (it kills every session first). A daemon this client cannot speak to (no hello in
+/// [`HELLO_WAIT`], or another schema's) is sent SIGTERM, by the pid its socket's peer credentials name, and waited for
+/// a few seconds.
+pub async fn stop() -> Result<()> {
+    let sock = paths::sock();
+    let Ok(mut s) = UnixStream::connect(&sock).await else {
+        println!("harnessd is not running (nothing listens at {})", sock.display());
+        return Ok(());
+    };
+    let refused = match hello(&mut s).await {
+        Ok(()) => {
+            let _ = Ctl { stream: s }.req(Request::Shutdown).await;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    let Some(pid) = s.peer_cred().ok().and_then(|c| c.pid()) else {
+        return Err(refused.context(format!("stopping harnessd at {}: its pid is unknown, so it cannot be signalled", sock.display())));
+    };
+    // SAFETY: kill(2) with a pid and a signal number; no memory is shared.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(refused.context(format!("stopping harnessd pid {pid} ({}): SIGTERM failed: {e}", sock.display())));
+    }
+    for _ in 0..60 {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            println!("stopped harnessd pid {pid} with SIGTERM ({refused:#})");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bail!("harnessd pid {pid} ({}) is still running 3s after SIGTERM; kill it with `kill -9 {pid}`", sock.display())
 }
 
 /// Connect to harnessd, starting it detached (own session, log file) if nothing is listening.
@@ -91,9 +204,14 @@ pub async fn run(spawn: Option<(String, Vec<String>)>) -> Result<()> {
     let mut target = match &spawn {
         Some((kind, args)) => {
             let (cols, rows) = term_size();
-            Some(ctl.req(json!({"op": "spawn", "kind": kind, "args": args, "cwd": cwd, "cols": cols, "rows": rows, "mode": "tui"})).await?["id"].as_u64().unwrap())
+            let r = ctl.req(spawn_req(kind, args.clone(), &cwd, cols, rows)).await?;
+            let Reply::Spawned { id } = r else { bail!("harnessd answered spawn with {r:?}") };
+            Some(id)
         }
-        None => ctl.req(json!({"op": "last"})).await?["id"].as_u64(),
+        None => match ctl.req(Request::Last).await? {
+            Reply::Last { id } => id,
+            r => bail!("harnessd answered last with {r:?}"),
+        },
     };
 
     // One reader owns stdin for the whole run; tree mode and attach mode both consume its bytes.
@@ -143,12 +261,13 @@ pub async fn run(spawn: Option<(String, Vec<String>)>) -> Result<()> {
 
 async fn attach(ui: &mut Ui, id: u64) -> Result<AttachEnd> {
     let mut stream = UnixStream::connect(paths::sock()).await?;
+    hello(&mut stream).await?;
     let (cols, rows) = term_size();
-    proto::write_json(&mut stream, &json!({"op": "attach", "id": id, "cols": cols, "rows": rows})).await?;
-    let (_, payload) = proto::read_frame(&mut stream).await?.ok_or_else(|| anyhow!("daemon closed"))?;
-    let resp: Value = serde_json::from_slice(&payload)?;
-    if let Some(e) = resp.get("error") {
-        bail!("{e}");
+    send(&mut stream, &Up::Req(Request::Attach { id, cols: Some(cols), rows: Some(rows), events: false })).await?;
+    match recv(&mut stream).await? {
+        Down::Reply(Reply::Attached { .. }) => {}
+        Down::Error { error } => bail!("{error}"),
+        m => bail!("harnessd answered attach with {m:?}"),
     }
     let (mut r, mut w) = stream.into_split();
     let mut stdout = tokio::io::stdout();
@@ -156,7 +275,7 @@ async fn attach(ui: &mut Ui, id: u64) -> Result<AttachEnd> {
     // Frames arrive through a channel so the select! below stays cancel-safe.
     let (tx, mut frames) = mpsc::unbounded_channel();
     let pump = tokio::spawn(async move {
-        while let Ok(Some(f)) = proto::read_frame(&mut r).await {
+        while let Ok(Some(f)) = aio::read(&mut r).await {
             if tx.send(f).is_err() {
                 break;
             }
@@ -166,39 +285,57 @@ async fn attach(ui: &mut Ui, id: u64) -> Result<AttachEnd> {
     loop {
         tokio::select! {
             f = frames.recv() => match f {
-                Some((proto::T_DATA, b)) => { stdout.write_all(&b).await?; stdout.flush().await?; }
-                Some((proto::T_EXIT, b)) => {
-                    let code = serde_json::from_slice::<Value>(&b).ok().and_then(|v| v["code"].as_i64()).unwrap_or(-1);
-                    return Ok(AttachEnd::Exited(code as i32));
-                }
-                Some(_) => {}
+                Some((T_DATA, b)) => { stdout.write_all(&b).await?; stdout.flush().await?; }
+                Some((T_CBOR, b)) => match decode_down(&b)? {
+                    Down::Exit { code } => return Ok(AttachEnd::Exited(code)),
+                    m => bail!("harnessd sent {m:?} on an attach stream"),
+                },
+                Some((t, _)) => bail!("harnessd sent a frame of type {t} on a terminal attach stream"),
                 None => bail!("daemon closed the attach stream"),
             },
             k = ui.keys.recv() => {
                 let k = k.ok_or_else(|| anyhow!("stdin closed"))?;
                 if let Some(pos) = k.iter().position(|&b| b == DETACH) {
-                    if pos > 0 { proto::write_frame(&mut w, proto::T_DATA, &k[..pos]).await?; }
-                    proto::write_json(&mut w, &json!({"op": "detach"})).await?;
+                    if pos > 0 { aio::write(&mut w, T_DATA, &k[..pos]).await?; }
+                    send(&mut w, &Up::Detach).await?;
                     return Ok(AttachEnd::Detached);
                 }
-                proto::write_frame(&mut w, proto::T_DATA, &k).await?;
+                aio::write(&mut w, T_DATA, &k).await?;
             }
             _ = ui.winch.recv() => {
                 let (cols, rows) = term_size();
-                proto::write_frame(&mut w, proto::T_RESIZE, json!({"cols": cols, "rows": rows}).to_string().as_bytes()).await?;
+                send(&mut w, &Up::Resize { cols, rows }).await?;
             }
         }
     }
 }
 
+/// A `spawn` of `kind` in its terminal UI.
+fn spawn_req(kind: &str, args: Vec<String>, cwd: &str, cols: u16, rows: u16) -> Request {
+    Request::Spawn {
+        kind: kind.to_owned(),
+        args,
+        parent: None,
+        cwd: Some(cwd.to_owned()),
+        prompt: None,
+        name: None,
+        cols: Some(cols),
+        rows: Some(rows),
+        mode: Some("tui".to_owned()),
+    }
+}
+
 /// Sessions in tree order: (session, depth).
-fn ordered(list: &[Value]) -> Vec<(Value, usize)> {
-    let ids: std::collections::HashSet<u64> = list.iter().filter_map(|s| s["id"].as_u64()).collect();
-    let parent = |s: &Value| s["parent"].as_u64().filter(|p| ids.contains(p));
-    fn walk(list: &[Value], p: Option<u64>, depth: usize, parent: &dyn Fn(&Value) -> Option<u64>, out: &mut Vec<(Value, usize)>) {
+fn ordered(list: &[SessionInfo]) -> Vec<(&SessionInfo, usize)> {
+    let ids: std::collections::HashSet<u64> = list.iter().map(|s| s.id).collect();
+    let parent = |s: &SessionInfo| s.parent.filter(|p| ids.contains(p));
+    fn walk<'a>(
+        list: &'a [SessionInfo], p: Option<u64>, depth: usize, parent: &dyn Fn(&SessionInfo) -> Option<u64>,
+        out: &mut Vec<(&'a SessionInfo, usize)>,
+    ) {
         for s in list.iter().filter(|s| parent(s) == p) {
-            out.push((s.clone(), depth));
-            walk(list, s["id"].as_u64(), depth + 1, parent, out);
+            out.push((s, depth));
+            walk(list, Some(s.id), depth + 1, parent, out);
         }
     }
     let mut out = Vec::new();
@@ -217,23 +354,22 @@ fn age(ms: u64) -> String {
     }
 }
 
-pub fn tree_lines(list: &[Value]) -> Vec<(u64, String, bool)> {
+pub fn tree_lines(list: &[SessionInfo]) -> Vec<(u64, String, bool)> {
     ordered(list)
         .into_iter()
         .map(|(s, depth)| {
             let indent = if depth == 0 { String::new() } else { format!("{}└ ", "  ".repeat(depth - 1)) };
-            let exit = s["exit"].as_i64();
-            let state = match exit {
+            let lost = s.status.as_deref() == Some("lost");
+            let state = match s.exit {
                 Some(c) => format!("exit {c}"),
-                None if s["status"] == "lost" => "lost".into(), // the daemon stopped while it ran
-                None if s["attached"].as_u64().unwrap_or(0) > 0 => "attached".into(),
+                None if lost => "lost".into(), // the daemon stopped while it ran
+                None if s.attached > 0 => "attached".into(),
                 None => "running".into(),
             };
-            let title = s["title"].as_str().unwrap_or("");
             (
-                s["id"].as_u64().unwrap_or(0),
-                format!("{indent}#{} {:<6} {:<9} {:>4}  {}", s["id"], s["kind"].as_str().unwrap_or(""), state, age(s["created_ms"].as_u64().unwrap_or(0)), title),
-                exit.is_some() || s["status"] == "lost",
+                s.id,
+                format!("{indent}#{} {:<6} {:<9} {:>4}  {}", s.id, s.kind, state, age(s.created_ms.unwrap_or(0)), s.title),
+                s.exit.is_some() || lost,
             )
         })
         .collect()
@@ -246,7 +382,7 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
     let mut state = ListState::default().with_selected(Some(0));
     let mut tick = tokio::time::interval(Duration::from_millis(1000));
     loop {
-        let list = ui.ctl.req(json!({"op": "list"})).await?["sessions"].as_array().cloned().unwrap_or_default();
+        let list = ui.ctl.list(false, false).await?;
         let rows = tree_lines(&list);
         if let Some(sel) = state.selected() {
             if sel >= rows.len() {
@@ -283,7 +419,7 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
             _ = ui.winch.recv() => { terminal.autoresize()?; continue }
         };
         let sel_id = state.selected().and_then(|i| rows.get(i)).map(|r| r.0);
-        let spawn = |kind: &str| json!({"op": "spawn", "kind": kind, "cwd": ui.cwd, "cols": term_size().0, "rows": term_size().1, "mode": "tui"});
+        let spawn = |kind: &str| spawn_req(kind, Vec::new(), &ui.cwd, term_size().0, term_size().1);
         match key.as_slice() {
             b"q" | b"\x03" => return Ok(None),
             b"j" | b"\x1b[B" | b"\x1bOB" => state.select_next(),
@@ -298,19 +434,20 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
             b"c" | b"x" | b"u" | b"s" => {
                 let kind = match key[0] { b'c' => "claude", b'x' => "codex", b'u' => "cursor", _ => "shell" };
                 match ui.ctl.req(spawn(kind)).await {
-                    Ok(v) => return Ok(v["id"].as_u64()),
+                    Ok(Reply::Spawned { id }) => return Ok(Some(id)),
+                    Ok(r) => *status = format!("spawn {kind}: harnessd answered {r:?}"),
                     Err(e) => *status = format!("spawn {kind}: {e:#}"),
                 }
             }
             b"d" => {
                 if let Some(id) = sel_id {
-                    ui.ctl.req(json!({"op": "kill", "id": id})).await?;
+                    ui.ctl.req(Request::Kill { id }).await?;
                     *status = format!("killed #{id}");
                 }
             }
             b"D" => {
                 if let Some(id) = sel_id {
-                    ui.ctl.req(json!({"op": "forget", "id": id})).await?;
+                    ui.ctl.req(Request::Forget { id }).await?;
                     *status = format!("removed #{id}");
                 }
             }

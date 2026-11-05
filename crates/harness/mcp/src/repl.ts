@@ -14,7 +14,7 @@ import { req, daemonPresent } from "./daemon.ts";
 import { install as installEffects, fsFor, rawsOf } from "./effects.ts";
 import { shown } from "./shown.ts";
 import { stripCell } from "./ui/compile.ts";
-import { count, installUi, isElement, show } from "./ui/index.ts";
+import { count, installUi, isElement, show, uiError } from "./ui/index.ts";
 
 // This REPL process as the parent of its cells' objects in the harness index (`<repl>.t3`, kind repl).
 export const REPL_ID = `repl-${process.pid}-${Date.now().toString(36)}`;
@@ -31,7 +31,7 @@ export function body(t: Task) {
     : t.status === "error" ? { t: "error" as const, message: t.value instanceof Error ? t.value.message : String(t.value), stack: t.result }
     : shown(t.value);
   return {
-    op: "repl_task", repl: REPL_ID, id: t.id, call: t.call, session: process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null,
+    op: "repl_task" as const, repl: REPL_ID, id: t.id, call: t.call, session: process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null,
     cwd: process.cwd(), code: cap(t.code), status: t.status, started_ms: t.started.getTime(), ended_ms: t.ended?.getTime() ?? null,
     logs: cap(t.logs.join("\n")), result: cap(t.result), effects: t.effects, effects_dropped: t.effectsDropped, value, ui: t.ui ?? null,
   };
@@ -155,6 +155,9 @@ export class Repl {
       if (t.ui !== undefined) return { ok: true, value, result: `UI shown (${count(t.ui)} elements)${value === undefined ? "" : `\n${typeof value === "string" ? value : nuon(value, { maxRows: 100 })}`}` };
       return { ok: true, value, result: value === undefined ? "undefined" : typeof value === "string" ? value : nuon(value, { maxRows: 100 }) };
     } catch (e) {
+      // An error that came through the cell's UI is said at the cell's line, without Svelte's frames or the kernel's (ui/index.ts).
+      const ui = uiError(e);
+      if (ui !== undefined) return { ok: false, value: e, result: ui };
       // Drop the harness frames below the cell.
       const stack = e instanceof Error ? (e.stack ?? e.message).split("\n") : [String(e)];
       const cut = stack.findIndex((l) => l.includes("at #run "));

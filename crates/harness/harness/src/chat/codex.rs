@@ -16,6 +16,7 @@
 //! Codex asks the client too (server requests, each answered at once so a turn never hangs): approvals are approved
 //! (the profile already runs with approval policy never and no sandbox, the TUI's yolo), questions for the user get no
 //! answers, MCP elicitations are declined, and everything else is refused with a JSON-RPC error naming the method.
+use harness_proto::event::{Body, Kind};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -43,7 +44,7 @@ enum Pending {
 
 /// A streaming text or thinking item: its kind, whether its `block_start` went out, and its text so far.
 struct Open {
-    kind: &'static str,
+    kind: Kind,
     /// When it began, so unfinished blocks close in order.
     seq: u64,
     started: bool,
@@ -163,7 +164,7 @@ impl Codex {
         }
     }
 
-    fn answer(&mut self, id: u64, v: &Value) -> Vec<Value> {
+    fn answer(&mut self, id: u64, v: &Value) -> Vec<Body> {
         let Some(what) = self.pending.remove(&id) else { return vec![] };
         let err = v.get("error").map(|e| e["message"].as_str().map_or_else(|| e.to_string(), str::to_owned));
         match what {
@@ -200,68 +201,72 @@ impl Codex {
                 self.thread = r["thread"]["id"].as_str().map(str::to_owned);
                 self.pump();
                 let model = r["model"].as_str().or_else(|| r["thread"]["model"].as_str()).unwrap_or("");
-                vec![json!({"ev": "session", "agent": "codex", "model": model, "session_id": self.thread})]
+                // The v2 ThreadStartResponse and ThreadResumeResponse both carry `reasoningEffort` (a string, or null
+                // when the model has none): the effort the thread runs with.
+                let effort = r["reasoningEffort"].as_str().filter(|e| !e.is_empty()).map(str::to_owned);
+                vec![Body::Session {
+                    agent: "codex".to_owned(),
+                    model: model.to_owned(),
+                    session_id: self.thread.clone().filter(|t| !t.is_empty()),
+                    effort,
+                }]
             }
             Pending::TurnStart => {
                 if let Some(e) = err {
-                    let why = vec![json!({"ev": "error", "text": format!("codex app-server refused turn/start: {e}")})];
-                    return self.turn_over(false, "error", Value::Null, why);
+                    let why = vec![Body::Error { text: format!("codex app-server refused turn/start: {e}") }];
+                    return self.turn_over(false, "error", None, why);
                 }
                 // The answer names the turn, but Codex refuses to interrupt it ("no active turn") until `turn/started`.
                 vec![]
             }
             Pending::Interrupt => match err {
-                Some(e) => vec![json!({"ev": "error", "text": format!("codex app-server refused turn/interrupt: {e}")})],
+                Some(e) => vec![Body::Error { text: format!("codex app-server refused turn/interrupt: {e}") }],
                 None => vec![],
             },
         }
     }
 
     /// The session can't start: every waiting message's turn ends in an error.
-    fn refuse_waiting(&mut self, why: &str) -> Vec<Value> {
-        let mut out = vec![json!({"ev": "error", "text": why})];
+    fn refuse_waiting(&mut self, why: &str) -> Vec<Body> {
+        let mut out = vec![Body::Error { text: why.to_owned() }];
         for _ in std::mem::take(&mut self.queue) {
-            out.push(turn_end(false, "error", Value::Null, Value::Null, ""));
+            out.push(turn_end(false, "error", None, Value::Null, String::new()));
         }
-        out.push(json!({"ev": "busy", "busy": false}));
+        out.push(Body::Busy { busy: false });
         out
     }
 
     /// The turn in flight is over: unfinished blocks closed as they stand, then `why` (an interrupt's note, an error),
     /// its `turn_end`, then the next waiting turn.
-    fn turn_over(&mut self, ok: bool, stop: &str, duration_ms: Value, why: Vec<Value>) -> Vec<Value> {
+    fn turn_over(&mut self, ok: bool, stop: &str, duration_ms: Option<u64>, why: Vec<Body>) -> Vec<Body> {
         let mut out = Vec::new();
         let mut open: Vec<(String, Open)> = self.open.drain().filter(|(_, o)| o.started).collect();
         open.sort_by_key(|(_, o)| o.seq);
         for (block, o) in open {
-            out.push(json!({"ev": "block", "block": block, "kind": o.kind, "text": o.text}));
+            out.push(Body::Block { block, kind: o.kind, text: o.text });
         }
         out.extend(why);
         let usage = usage(&self.total_before, &self.total);
         self.total_before = self.total.clone();
-        out.push(turn_end(ok, stop, duration_ms, usage, &std::mem::take(&mut self.last_text)));
+        out.push(turn_end(ok, stop, duration_ms, usage, std::mem::take(&mut self.last_text)));
         self.in_turn = false;
         self.turn = None;
         self.interrupt_pending = false;
         self.error_said = false;
         self.called.clear();
         self.pump();
-        if self.in_turn {
-            out.push(json!({"ev": "busy", "busy": true}));
-        } else {
-            out.push(json!({"ev": "busy", "busy": false}));
-        }
+        out.push(Body::Busy { busy: self.in_turn });
         out
     }
 
     /// A text or thinking item began; its `block_start` waits for its first text.
-    fn open_item(&mut self, block: &str, kind: &'static str) {
+    fn open_item(&mut self, block: &str, kind: Kind) {
         self.seq += 1;
         self.open.insert(block.to_owned(), Open { kind, seq: self.seq, started: false, text: String::new() });
     }
 
     /// A streaming block's next text, its `block_start` first if it had none.
-    fn more(&mut self, block: &str, kind: &'static str, text: &str) -> Vec<Value> {
+    fn more(&mut self, block: &str, kind: Kind, text: &str) -> Vec<Body> {
         let seq = &mut self.seq;
         let o = self.open.entry(block.to_owned()).or_insert_with(|| {
             *seq += 1;
@@ -270,31 +275,31 @@ impl Codex {
         let mut out = Vec::new();
         if !o.started {
             o.started = true;
-            out.push(json!({"ev": "block_start", "block": block, "kind": o.kind}));
+            out.push(Body::BlockStart { block: block.to_owned(), kind: o.kind });
         }
         o.text.push_str(text);
-        out.push(json!({"ev": "delta", "block": block, "text": text}));
+        out.push(Body::Delta { block: block.to_owned(), text: text.to_owned() });
         out
     }
 
-    fn item_started(&mut self, item: &Value) -> Vec<Value> {
+    fn item_started(&mut self, item: &Value) -> Vec<Body> {
         let id = item["id"].as_str().unwrap_or("").to_owned();
         match item["type"].as_str().unwrap_or("") {
             "agentMessage" => {
-                self.open_item(&id, "text");
+                self.open_item(&id, Kind::Text);
                 vec![]
             }
             "reasoning" => {
-                self.open_item(&id, "thinking");
+                self.open_item(&id, Kind::Thinking);
                 vec![]
             }
-            "contextCompaction" => vec![json!({"ev": "note", "text": "Compacting the context"})],
+            "contextCompaction" => vec![Body::Note { text: "Compacting the context".to_owned() }],
             _ => self.call(item).into_iter().collect(),
         }
     }
 
     /// A tool-like item's `tool_call` (once).
-    fn call(&mut self, item: &Value) -> Option<Value> {
+    fn call(&mut self, item: &Value) -> Option<Body> {
         let id = item["id"].as_str()?.to_owned();
         let (name, input) = match item["type"].as_str()? {
             "mcpToolCall" => (tool_name(item["server"].as_str().unwrap_or(""), item["tool"].as_str().unwrap_or("")), item["arguments"].clone()),
@@ -310,10 +315,10 @@ impl Codex {
         if !self.called.insert(id.clone()) {
             return None;
         }
-        Some(json!({"ev": "tool_call", "block": id, "name": name, "input": input}))
+        Some(Body::ToolCall { block: id, name, input })
     }
 
-    fn item_completed(&mut self, item: &Value) -> Vec<Value> {
+    fn item_completed(&mut self, item: &Value) -> Vec<Body> {
         let id = item["id"].as_str().unwrap_or("").to_owned();
         let open = self.open.remove(&id);
         match item["type"].as_str().unwrap_or("") {
@@ -322,7 +327,7 @@ impl Codex {
                 if !text.trim().is_empty() {
                     self.last_text.clone_from(&text);
                 }
-                vec![json!({"ev": "block", "block": id, "kind": "text", "text": text})]
+                vec![Body::Block { block: id, kind: Kind::Text, text }]
             }
             "reasoning" => {
                 let join = |k: &str| {
@@ -333,11 +338,11 @@ impl Codex {
                 if text.trim().is_empty() && !open.is_some_and(|o| o.started) {
                     return vec![];
                 }
-                vec![json!({"ev": "block", "block": id, "kind": "thinking", "text": text})]
+                vec![Body::Block { block: id, kind: Kind::Thinking, text }]
             }
             "userMessage" | "contextCompaction" | "plan" | "hookPrompt" => vec![],
             _ => {
-                let mut out: Vec<Value> = self.call(item).into_iter().collect();
+                let mut out: Vec<Body> = self.call(item).into_iter().collect();
                 if let Some(r) = tool_result(&id, item) {
                     out.push(r);
                 }
@@ -346,22 +351,22 @@ impl Codex {
         }
     }
 
-    fn notification(&mut self, method: &str, p: &Value) -> Vec<Value> {
+    fn notification(&mut self, method: &str, p: &Value) -> Vec<Body> {
         match method {
             "turn/started" => {
                 if let Some(t) = p["turn"]["id"].as_str() {
                     self.turn_started(t);
                 }
-                vec![json!({"ev": "busy", "busy": true})]
+                vec![Body::Busy { busy: true }]
             }
             "item/started" => self.item_started(&p["item"]),
             "item/completed" => self.item_completed(&p["item"]),
-            "item/agentMessage/delta" => self.more(p["itemId"].as_str().unwrap_or(""), "text", p["delta"].as_str().unwrap_or("")),
+            "item/agentMessage/delta" => self.more(p["itemId"].as_str().unwrap_or(""), Kind::Text, p["delta"].as_str().unwrap_or("")),
             "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-                self.more(p["itemId"].as_str().unwrap_or(""), "thinking", p["delta"].as_str().unwrap_or(""))
+                self.more(p["itemId"].as_str().unwrap_or(""), Kind::Thinking, p["delta"].as_str().unwrap_or(""))
             }
             "item/reasoning/summaryPartAdded" if p["summaryIndex"].as_u64().unwrap_or(0) > 0 => {
-                self.more(p["itemId"].as_str().unwrap_or(""), "thinking", "\n\n")
+                self.more(p["itemId"].as_str().unwrap_or(""), Kind::Thinking, "\n\n")
             }
             "thread/tokenUsage/updated" => {
                 self.total = p["tokenUsage"]["total"].clone();
@@ -381,36 +386,36 @@ impl Codex {
                 };
                 let mut why = Vec::new();
                 if status == "interrupted" {
-                    why.push(json!({"ev": "note", "text": "Interrupted"}));
+                    why.push(Body::Note { text: "Interrupted".to_owned() });
                 } else if stop == "error" && !self.error_said {
                     let msg = turn["error"]["message"].as_str().unwrap_or("the turn failed");
-                    why.push(json!({"ev": "error", "text": msg}));
+                    why.push(Body::Error { text: msg.to_owned() });
                 }
-                self.turn_over(ok, stop, turn["durationMs"].clone(), why)
+                self.turn_over(ok, stop, turn["durationMs"].as_u64(), why)
             }
             "error" => {
                 let msg = p["error"]["message"].as_str().unwrap_or("codex reported an error");
                 if p["willRetry"].as_bool().unwrap_or(false) {
-                    vec![json!({"ev": "note", "text": format!("Retrying: {msg}")})]
+                    vec![Body::Note { text: format!("Retrying: {msg}") }]
                 } else {
                     self.error_said = true;
-                    vec![json!({"ev": "error", "text": msg})]
+                    vec![Body::Error { text: msg.to_owned() }]
                 }
             }
             "warning" | "configWarning" | "deprecationNotice" | "guardianWarning" => {
                 let text = ["message", "summary", "details"].iter().find_map(|k| p[*k].as_str()).map_or_else(|| p.to_string(), str::to_owned);
-                vec![json!({"ev": "note", "text": text})]
+                vec![Body::Note { text }]
             }
             "model/rerouted" => {
                 let s = |k: &str| p[k].as_str().unwrap_or("?").to_owned();
-                vec![json!({"ev": "note", "text": format!("Model rerouted from {} to {}", s("fromModel"), s("toModel"))})]
+                vec![Body::Note { text: format!("Model rerouted from {} to {}", s("fromModel"), s("toModel")) }]
             }
             _ => vec![],
         }
     }
 
     /// Answer a request Codex made, at once.
-    fn server_request(&mut self, id: &Value, method: &str) -> Vec<Value> {
+    fn server_request(&mut self, id: &Value, method: &str) -> Vec<Body> {
         let result = match method {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => Some(json!({"decision": "accept"})),
             "execCommandApproval" | "applyPatchApproval" => Some(json!({"decision": "approved"})),
@@ -422,14 +427,14 @@ impl Codex {
             Some(r) => (json!({"id": id, "result": r}), None),
             None => (
                 json!({"id": id, "error": {"code": -32601, "message": format!("harness does not answer {method}")}}),
-                Some(json!({"ev": "note", "text": format!("Refused codex's {method} request (harness does not answer it)")})),
+                Some(Body::Note { text: format!("Refused codex's {method} request (harness does not answer it)") }),
             ),
         };
         self.out.push(line.to_string());
         let declined = matches!(method, "item/tool/requestUserInput" | "mcpServer/elicitation/request");
         match note {
             Some(n) => vec![n],
-            None if declined => vec![json!({"ev": "note", "text": format!("Declined codex's {method} request")})],
+            None if declined => vec![Body::Note { text: format!("Declined codex's {method} request") }],
             None => vec![],
         }
     }
@@ -440,7 +445,7 @@ fn tool_name(server: &str, tool: &str) -> String {
     if server == "harness" || server.is_empty() { tool.to_owned() } else { format!("{server}.{tool}") }
 }
 
-fn tool_result(block: &str, item: &Value) -> Option<Value> {
+fn tool_result(block: &str, item: &Value) -> Option<Body> {
     let texts = |a: &Value| a.as_array().into_iter().flatten().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
     let (text, error) = match item["type"].as_str()? {
         "mcpToolCall" => {
@@ -457,7 +462,7 @@ fn tool_result(block: &str, item: &Value) -> Option<Value> {
         "webSearch" => (String::new(), false),
         _ => return None,
     };
-    Some(json!({"ev": "tool_result", "block": block, "text": text, "error": error}))
+    Some(Body::ToolResult { block: block.to_owned(), text, error })
 }
 
 /// A turn's usage in Claude's field names (what the app and the messages rows already read), from the thread's token
@@ -476,8 +481,9 @@ fn usage(before: &Value, after: &Value) -> Value {
     })
 }
 
-fn turn_end(ok: bool, stop: &str, duration_ms: Value, usage: Value, text: &str) -> Value {
-    json!({"ev": "turn_end", "ok": ok, "stop": stop, "duration_ms": duration_ms, "cost_usd": null, "usage": usage, "text": text})
+/// A turn's end; Codex reports no cost.
+fn turn_end(ok: bool, stop: &str, duration_ms: Option<u64>, usage: Value, text: String) -> Body {
+    Body::TurnEnd { ok, stop: stop.to_owned(), duration_ms, cost_usd: None, usage, text }
 }
 
 impl super::Adapter for Codex {
@@ -489,9 +495,9 @@ impl super::Adapter for Codex {
         vec![self.request("initialize", params, Pending::Initialize)]
     }
 
-    fn events(&mut self, line: &str) -> Vec<Value> {
+    fn events(&mut self, line: &str) -> Vec<Body> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
-            return vec![json!({"ev": "error", "text": format!("codex app-server wrote a line that is not JSON: {line}")})];
+            return vec![Body::Error { text: format!("codex app-server wrote a line that is not JSON: {line}") }];
         };
         match (v.get("id"), v["method"].as_str()) {
             (Some(id), Some(method)) => self.server_request(id, method),

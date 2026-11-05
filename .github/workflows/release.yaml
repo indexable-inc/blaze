@@ -55,9 +55,15 @@ jobs:
           path: ${{ runner.temp }}/notes.md
           if-no-files-found: error
       # library/, which a blaze with no checkout of its commit downloads once and checks
-      # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs).
+      # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs). The digest is
+      # BLAKE3, by the uv workspace's `blake3` (the Rust crate through PyO3): no system package.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
       - run: |
-          python3 -I harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
+          uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
       - uses: actions/upload-artifact@v7
         with:
           name: library
@@ -190,9 +196,25 @@ jobs:
       - if: failure()
         uses: ./.github/actions/daemon-log
 
+  # ix.dev/explore reads this release's profile schema (.github/scripts/explore_page.py): the
+  # page deploys from indexable-inc/ix and refuses a daemon whose schema it does not read, so a
+  # release ahead of it would show users only that refusal (0.20261105.1, schema 5, page 1).
+  explore-page:
+    name: ix.dev/explore reads this schema
+    runs-on: [ix, arm64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      - run: uv run --frozen python .github/scripts/explore_page.py '{}'
+
   publish:
     name: GitHub release
-    needs: [notes, build]
+    needs: [notes, build, explore-page]
     if: github.ref_type == 'tag'
     runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 10
@@ -205,12 +227,16 @@ jobs:
         with:
           path: out
           merge-multiple: true
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      # SHA256SUMS and B3SUMS, `<hex>  <name>` a line as sha256sum and b3sum write them; BLAKE3 is
+      # the uv workspace's `blake3`, so the runner needs no system package for it.
       - name: Checksums
-        working-directory: out
-        run: |
-          sudo apt-get install -y --no-install-recommends b3sum
-          sha256sum blaze-*.tar.xz blaze-*.tar.gz | tee SHA256SUMS
-          b3sum blaze-*.tar.xz blaze-*.tar.gz | tee B3SUMS
+        run: uv run --frozen python .github/scripts/checksums.py '{"dir": "out"}'
+
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}

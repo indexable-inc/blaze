@@ -6,7 +6,7 @@
 //! shader elements, mascots and 3D scenes are gone. Per-frame CPU-written buffers are rings of [`FRAMES`]
 //! slots gated by a semaphore; the tiny uniforms go by setBytes.
 pub use crate::draw::*;
-use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, SpriteInst};
+use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SpriteInst};
 use block2::RcBlock;
 use bytemuck::Pod;
 use dispatch2::{DispatchData, DispatchRetained, DispatchSemaphore, DispatchTime};
@@ -55,6 +55,7 @@ pub struct Renderer {
     panel: Pso,
     glyph: Pso,
     line: Pso,
+    path: Pso,
     sprite: Pso,
     image: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
@@ -62,7 +63,7 @@ pub struct Renderer {
     /// The brand marks' Slug curves and bands (icons.rs), uploaded once.
     curves: Buf,
     bands: Buf,
-    rings: [Option<Ring>; 5],
+    rings: [Option<Ring>; 7],
     slot: usize,
     sem: DispatchRetained<DispatchSemaphore>,
     /// The last finished command buffer's GPU time (GPUEndTime - GPUStartTime), milliseconds as f32 bits: two reads in
@@ -141,6 +142,7 @@ impl Renderer {
             panel: pipeline(&dev, &lib, "panel_vs", "panel_fs"),
             glyph: pipeline(&dev, &lib, "glyph_vs", "glyph_fs"),
             line: pipeline(&dev, &lib, "line_vs", "line_fs"),
+            path: pipeline(&dev, &lib, "path_vs", "path_fs"),
             sprite: pipeline(&dev, &lib, "sprite_vs", "sprite_fs"),
             image: pipeline(&dev, &lib, "image_vs", "image_fs"),
             dev,
@@ -149,7 +151,7 @@ impl Renderer {
             atlas,
             curves,
             bands,
-            rings: [None, None, None, None, None],
+            rings: [None, None, None, None, None, None, None],
             slot: 0,
             sem: DispatchSemaphore::new(FRAMES as isize),
             gpu_ms: std::sync::Arc::default(),
@@ -264,6 +266,8 @@ impl Renderer {
         let lb = self.ring(2, ring_slot, &draw.lines);
         let sb = self.ring(3, ring_slot, &draw.sprites);
         let ib = self.ring(4, ring_slot, &draw.images);
+        let ab = self.ring(5, ring_slot, &draw.paths);
+        let eb = self.ring(6, ring_slot, &draw.edges);
         // A texture per picture, filled now: small, and alive until the command buffer that reads it is done with it.
         let texs: Vec<Tex> = draw
             .images
@@ -310,6 +314,9 @@ impl Renderer {
                     SegKind::Line => {
                         (&self.line, "line_vs", "line_fs", &lb, std::mem::size_of::<LineInst>())
                     }
+                    SegKind::Path => {
+                        (&self.path, "path_vs", "path_fs", &ab, std::mem::size_of::<PathInst>())
+                    }
                     SegKind::Sprite => (
                         &self.sprite,
                         "sprite_vs",
@@ -350,6 +357,14 @@ impl Renderer {
                                 sg.first as usize * stride,
                                 slot(fs, "insts"),
                             ),
+                        SegKind::Path => {
+                            enc.setFragmentBuffer_offset_atIndex(
+                                Some(buf),
+                                sg.first as usize * stride,
+                                slot(fs, "insts"),
+                            );
+                            enc.setFragmentBuffer_offset_atIndex(Some(&eb), 0, slot(fs, "edges"));
+                        }
                         SegKind::Image => {
                             enc.setFragmentBuffer_offset_atIndex(
                                 Some(buf),

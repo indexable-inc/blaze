@@ -132,6 +132,8 @@ const PALETTE_DEBOUNCE: f32 = 0.2;
 struct Ids {
     tree: u64,
     device: u64,
+    /// `hn.LinkNote` over the Archive row: the link's refusal, when it is refused.
+    link_note: u64,
     /// `hn.Main`: the row of pane nodes.
     main: u64,
     /// The Archive's row pinned to the sidebar's bottom (pressed, the Archive pane opens).
@@ -350,9 +352,11 @@ impl App {
         let world = scene_world()?;
         let app = world.entity_named(APP);
         let w = world.world_ref();
-        // The rule's delay for a finished run with no session, from the scene's token (seconds).
+        // The rule's delays for a finished run with no session and a past top-level session, from the scene's tokens
+        // (seconds).
         world.set(model::ArchiveAfter {
             ms: (crate::look::width(w, "archive_after").max(0.0) * 1000.0) as u64,
+            past_ms: (crate::look::width(w, "archive_past_after").max(0.0) as f64 * 1000.0) as u64,
         });
         harness_native_ui_layout::install(w);
         harness_native_ui_input::install(w);
@@ -411,8 +415,9 @@ impl App {
             set_side_width(side.entity(), w);
         }
         let tree = side.child("hn.Tree");
-        let archive_row = side
-            .child("hn.SideFoot")
+        let foot = side.child("hn.SideFoot");
+        let link_note = foot.child("hn.LinkNote");
+        let archive_row = foot
             .child("hn.ArchiveRow")
             .props("hn.ArchiveRow", &[("selected", Prop::Bool(false))]);
         archive_row.set(HoverAmt::default());
@@ -423,6 +428,7 @@ impl App {
         let ids = Ids {
             tree: tree.id(),
             device: device.id(),
+            link_note: link_note.id(),
             main: main.id(),
             archive_row: archive_row.id(),
             palette: None,
@@ -727,6 +733,8 @@ impl App {
             (tone(w, "running"), format!("{}", rows.len()))
         } else if link == *w.component_id::<model::Down>() {
             (tone(w, "failed"), "offline".to_owned())
+        } else if link == *w.component_id::<model::Refused>() {
+            (tone(w, "failed"), "refused".to_owned())
         } else {
             (tone(w, "lost"), "connecting".to_owned())
         };
@@ -735,6 +743,13 @@ impl App {
         }
         if let Some(n) = device.part("count") {
             n.text(&link_word);
+        }
+        // The refusal in words (which daemon, `harness stop`), in place of a spinner that never ends.
+        let why = dev.try_cloned::<&model::LinkError>().map(|e| e.text.as_str().to_owned()).unwrap_or_default();
+        let note = View::of(w.entity_from_id(self.ids.link_note)).text(&why);
+        let h = if why.is_empty() { Sizing::fixed(0.0) } else { Sizing::FIT };
+        if note.entity().try_cloned::<&Size>().is_none_or(|s| s.h != h) {
+            note.set(Size { w: Sizing::GROW, h });
         }
         if let Some(d) = device.part("dot") {
             // A light only while the daemon is not up.
@@ -1777,8 +1792,8 @@ impl App {
                 }
             }
             if p.clipped && !scroller_part {
-                // Cut to the tree's band: soft at an edge with more of the tree beyond it (not its scroller).
-                if let Some(fade) = self.tree_fade(&p) {
+                // Cut to its band: soft at an edge with more beyond it (the tree's, else its clip's ClipFade; not a scroller).
+                if let Some(fade) = self.tree_fade(&p).or_else(|| (p.fade != [0.0; 2]).then_some(p.fade)) {
                     for panel in &mut d.panels[np..] {
                         panel.clip[2..].copy_from_slice(&fade);
                     }
@@ -2190,6 +2205,10 @@ mod tests {
             "hn.ChatUi", "hn.GenTone.ink",
             "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",
             "hn.GenBadge", "hn.GenStat", "hn.GenCard", "hn.GenDivider", "hn.GenSpacer", "hn.GenUnknown",
+            "hn.GenCanvas", "hn.GenShape", "hn.GenShapeBack", "hn.GenChart", "hn.GenChartPlot", "hn.GenChartTick",
+            "hn.GenChartBar", "hn.GenChartGroup", "hn.GenChartStack", "hn.GenChartHit", "hn.GenChartLabel",
+            "hn.GenChartLegend", "hn.GenChartKey", "hn.GenChartPie", "hn.GenChartCenter", "hn.GenTone.faint",
+            "hn.GenTone.series1", "hn.GenTone.series8",
         ]
         .into_iter()
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())

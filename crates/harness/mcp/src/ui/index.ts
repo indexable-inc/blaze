@@ -1,4 +1,5 @@
 import { SVELTE, isElement } from './element.ts';
+import { UI_FILE, placeOfFrame } from './compile.ts';
 import { cellRuntime, elementGlobals, runtime } from './svelte.ts';
 import { UiTree, interval } from './tree.ts';
 import type { UiNode } from './tree.ts';
@@ -26,7 +27,7 @@ export function show(t: Task, component: unknown, props: Record<string, unknown>
   const tree = new UiTree({
     emit: (ui) => { t.ui = ui; t.touch(); },
     fail: (what, error) => {
-      t.logs.push(`[ui] ${what} failed: ${error instanceof Error ? error.message : String(error)}`);
+      t.logs.push(`[ui] ${what} failed: ${(uiError(error) ?? (error instanceof Error ? `${error.name}: ${error.message}` : String(error))).replace(/\n\s+at repl-cell\.js:.*/, '')}`);
       t.touch();
     },
     enter: (fn) => inTask(t, fn),
@@ -82,4 +83,32 @@ export function count(ui: unknown): number {
   if (Array.isArray(ui)) return ui.reduce((n: number, node) => n + count(node), 0);
   const node = ui as UiNode | undefined;
   return node && typeof node === 'object' ? 1 + count(node.children ?? []) : 0;
+}
+
+/** Hints for what a cell's markup most often throws at run time, by its words. */
+const RUNTIME_HINTS: Array<[RegExp, string]> = [
+  [/is not an object|Cannot read propert|null is not|undefined is not/, 'a value the markup reads is null or undefined: guard it with {#if value} or read value?.field'],
+  [/is not a function/, 'only a function can be called; a prop or a cell variable may be something else'],
+];
+
+const FRAME = new RegExp(`${UI_FILE}(\\d+)\\.js:(\\d+):(\\d+)`);
+const THROUGH_UI = new RegExp(`${UI_FILE}\\d+\\.js|/node_modules/svelte/|/src/ui/`);
+
+/**
+ * What the cell is told for `error` when it came through its UI (its compiled markup, Svelte, this kernel's ui/): one message, the
+ * cell line and column the frame inside its markup or script maps to (compile.ts `placeOfFrame`) with that line's text, a hint, and no
+ * frames of Svelte or the kernel. Undefined for an error that did not (the REPL reports it as ever), and for one already said this
+ * way (a check's, whose stack is its own words).
+ */
+export function uiError(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !error.stack || !THROUGH_UI.test(error.stack)) return undefined;
+  let place: ReturnType<typeof placeOfFrame>;
+  for (const line of error.stack.split('\n')) {
+    const found = FRAME.exec(line);
+    if (found && (place = placeOfFrame(Number(found[1]), Number(found[2]), Number(found[3])))) break;
+  }
+  const hint = RUNTIME_HINTS.find(([words]) => words.test(error.message))?.[1];
+  // The engine's words quote the compiled code: a name read through the props (`$$free.rows`) or a state (`$.get(o)`) is the cell's own.
+  const message = error.message.replace(/\$\$free\./g, '').replace(/\$\.get\(([\w$]+)\)/g, '$1');
+  return `${error.name}: ${message}${place ? ` (${place.at})` : ''}${hint ? `: ${hint}` : ''}${place ? `\n    at repl-cell.js:${place.line}:${place.column}` : ''}`;
 }
