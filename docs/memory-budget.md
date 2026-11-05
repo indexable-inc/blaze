@@ -5,6 +5,8 @@ date: 2026-11-05
 ---
 # Memory as a scheduled budget
 
+Where this leads: [memory-pool.md](memory-pool.md), memory as one buffer pool with one evictor.
+
 blaze must never take a machine down. When what it was asked to build does not fit in the
 memory it may use, it stops with an error that names what did not fit and how much it needed
 (AGENTS.md rule no-fallback), rather than swapping until the runner is lost or the kernel kills
