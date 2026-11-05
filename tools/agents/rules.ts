@@ -208,6 +208,13 @@ export const rules = [
 		reason: "Andrew, 2026-11-01: \"whenever something is slow p0 make sure it is traced properly\". Build 53 ran 917 s on about 2 of 18 cores and its spans could not say why: no span for proc-macro expansion, `self_cpu_ns` NULL in every row, every build script recorded as `build-script-build`, and waits named `scope 13`. A claim that one derive took minutes came from the sampler, and the spans did not back it.",
 	},
 	{
+		id: "ask-the-profile-first",
+		skill: "debugging",
+		line: "Answer why a build was slow, reran or used memory from its profile (`blaze explain`, `blaze debug sql`) before guessing or starting a new measurement.",
+		info: "Every daemon already records, per build, the footprint and live bytes, each task's granted and peak memory, admission waits, spans and reruns, in `<BLAZE_HOME>/v2/profile/*.parquet`. A why question (slow, rerunning, memory-hungry, idle workers) starts with `blaze explain footprint_per_build`, `task_memory`, `admission_waits`, `worker_states` or a `blaze debug sql` query on the daemon that showed it, and quotes the rows. A guess or a fresh experiment comes only after the rows can't answer, and then the gap gets a span or counter.",
+		reason: "2026-11-05: asked why a daemon held 54 to 99 GiB, the agent said nobody had measured it and started a lane to measure, while `blaze explain footprint_per_build` already showed a 101 GiB footprint against 49 GiB live and `task_memory` showed which task kinds peaked.",
+	},
+	{
 		id: "bounded-progress",
 		skill: "runtime-code",
 		line: "Every loop that waits for progress has a bound and ends in a typed outcome; never an open loop or an uncapped spin.",

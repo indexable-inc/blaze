@@ -43,20 +43,20 @@ the blaze version, not Rust's.
 
 See [docs/toolchain.md](../../../docs/toolchain.md).
 
-## measure-the-exact-tree (rule 21)
+## measure-the-exact-tree (rule 22)
 
 A measurement, bisect or checkpoint names the exact tree it ran on (a content digest of the sources
 and the blaze binary's hash) and keeps that tree; never re-sync or rebuild between measuring and
 committing. A result you can't tie to a tree is not evidence.
 
-## work-in-ix-vms (rule 33)
+## work-in-ix-vms (rule 34)
 
 Builds, tests, benchmarks and experiments run on the Mac or in an ix VM (`ix new`, `ix shell`, `ix
 rm`), never on AWS. Where neither can do it, stop and say what is missing.
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 
-## fan-out-write-only (rule 34)
+## fan-out-write-only (rule 35)
 
 Fan out code, not builds. Subagents only read and write code, including the tests for it. They never
 run a build, check, test, clippy, benchmark or any other expensive step, and never start a daemon or
@@ -66,12 +66,12 @@ It hands each failure back to a fresh subagent for the code that broke, with the
 command and the error, and runs again. Checks that need a variant tree, such as reverting a fix to
 show its test fails (test-the-cause), are also run by the main agent, as patches.
 
-## worktree-per-lane (rule 35)
+## worktree-per-lane (rule 36)
 
 One uniquely named worktree per lane; its build directory is its own under blaze's root, never in
 the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
 
-## clean-up-lane (rule 38)
+## clean-up-lane (rule 39)
 
 When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM and merged branch.
 
