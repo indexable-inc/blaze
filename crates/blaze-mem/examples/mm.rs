@@ -12,7 +12,7 @@
 //! virtual-memory call blaze made (`blaze_mem::syscalls`), with its total and slowest time.
 //! Compare two trees' lines.
 //!
-//! Run: `blaze bench -p blaze-mem --bench mm`.
+//! Run: `blaze run --release -p blaze-mem --example mm`.
 
 #![feature(allocator_api)]
 
