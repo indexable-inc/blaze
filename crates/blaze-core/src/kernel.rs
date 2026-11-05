@@ -64,7 +64,11 @@ pub const FEATURES: &[Feature] = &[
         since: v(6, 14),
         used_for: "store writes that should not fill the page cache",
     },
-    Feature { name: "mseal", since: v(6, 10), used_for: "sealing the loader's code mappings" },
+    Feature {
+        name: "mseal",
+        since: v(6, 10),
+        used_for: "sealing the code a dev run's start hook lays over the executable",
+    },
     Feature { name: "cachestat", since: v(6, 5), used_for: "the store's choice of warm entries" },
 ];
 

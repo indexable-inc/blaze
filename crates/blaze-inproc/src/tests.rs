@@ -993,8 +993,9 @@ mod linux {
 
     impl Drop for FileLike {
         fn drop(&mut self) {
-            // SAFETY: the pages this made (or the overlay that replaced them), which no thread
-            // runs any more: the test joined its thread.
+            // SAFETY: the pages this made, which no thread runs any more: the test joined its
+            // thread. Once overlaid they are sealed code (`mseal`), which munmap refuses with
+            // EPERM and leaves mapped for the rest of the test process.
             unsafe { libc::munmap(self.at as *mut libc::c_void, self.len) };
         }
     }
@@ -1078,6 +1079,18 @@ mod linux {
         }
         let (sevens, eights) = runner.join().unwrap();
         assert!(sevens > 0 && eights > 0);
+
+        // The overlay is sealed code: the kernel refuses to make it writable or to unmap it.
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        let (start, len) = (image.at as *mut libc::c_void, image.len);
+        // SAFETY: the overlay's pages, which no thread runs any more (the runner joined); a
+        // refused mprotect changes nothing.
+        let protected = unsafe { libc::mprotect(start, len, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!((protected, errno()), (-1, Some(libc::EPERM)), "mprotect of sealed code");
+        // SAFETY: as above; a refused munmap leaves the pages mapped.
+        let unmapped = unsafe { libc::munmap(start, len) };
+        assert_eq!((unmapped, errno()), (-1, Some(libc::EPERM)), "munmap of sealed code");
+        assert_eq!(image.bytes(), memory.bytes(CodeRange { offset: 0, len: page }).unwrap());
     }
 
     fn connected() -> (Channel, Channel, u32) {
