@@ -35,8 +35,8 @@ env:
 jobs:
   build:
     name: build both blazes
-    runs-on: ubuntu-24.04
-    # A cold build of ours by blaze: about 97 minutes on this runner, then Astral's.
+    runs-on: [ix, arm64, ix-cpu-64, blaze-rival-build]
+    # A cold build of ours by blaze, then Astral's (on a 64-vCPU AArch64 ix runner).
     timeout-minutes: 300
     outputs:
       ours: ${{ steps.commits.outputs.ours }}
@@ -53,6 +53,7 @@ jobs:
           repository: astral-experiments/blaze
           path: astral
           persist-credentials: false
+      - uses: ./ours/.github/actions/rustup
       - id: commits
         run: |
           echo "ours=$(git -C ours rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -62,15 +63,14 @@ jobs:
       # .github/blaze-version names, with its own Rust, and the pinned LLVM below /usr/local/lib
       # (a build script in blaze's sandbox names only system directories of libraries), as
       # .github/actions/blaze sets them up; that action's paths are the workspace's, and this
-      # checkout is under ours/. Swap for a cold build, which outgrows the runner's 16 GB (#1654).
+      # checkout is under ours/. No swap: an ix runner's memory grows on demand.
       - name: our blaze
         working-directory: ours
         run: |
           sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
           sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
-          sudo fallocate -l 20G /mnt/blaze.swap && sudo chmod 600 /mnt/blaze.swap && sudo mkswap /mnt/blaze.swap > /dev/null && sudo swapon /mnt/blaze.swap
-          LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu blaze build --locked --release -p blaze-engine
+          python3 .github/scripts/llvm.py fetch --target aarch64-unknown-linux-gnu --dir /usr/local/lib/blaze-llvm/aarch64-unknown-linux-gnu
+          LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/aarch64-unknown-linux-gnu blaze build --locked --release -p blaze-engine
           blaze stop
           mkdir -p ../bins/ours && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/ours/ \;
       - name: Astral's blaze
@@ -91,7 +91,7 @@ jobs:
   measure:
     name: rival (${{ matrix.project }})
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-16, blaze-rival-measure]
     timeout-minutes: 330
     strategy:
       fail-fast: false
@@ -104,6 +104,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: bins
+      - uses: ./.github/actions/rustup
       - name: toolchains
         run: |
           tar -xzf bins.tar.gz -C "$RUNNER_TEMP"
@@ -128,7 +129,7 @@ jobs:
                          env=dict(RUSTUP_TOOLCHAIN=os.environ["ASTRAL_TOOLCHAIN"])),
                     dict(name="cargo", kind="cargo", bin="", commit=tc, env=dict(RUSTUP_TOOLCHAIN=tc))],
               projects=[os.environ["PROJECT"]], work=f"{tmp}/work", out="rival-out", runs=5, tests=True, interleave=False,
-              machine="GitHub ubuntu-24.04 hosted runner (x86_64, 4 vCPU, 16 GB, shared)")))
+              machine="ix runner (aarch64, 16 vCPU, memory on demand, shared node)")))
           PY
           python3 -u harness/rival.py "$RUNNER_TEMP/input.json"
       - if: always()
@@ -142,7 +143,7 @@ jobs:
     name: rival report
     needs: measure
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     steps:
       - uses: actions/checkout@v7
         with:

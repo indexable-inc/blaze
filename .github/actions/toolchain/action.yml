@@ -20,19 +20,10 @@ inputs:
 runs:
   using: composite
   steps:
+    - uses: ./.github/actions/rustup
     - name: Rust (the nightly in harness/toolchain)
       shell: bash
       run: |
-        # A hosted image has rustup; the ix runner image has none (its seed keeps ~/.cargo and
-        # ~/.rustup once a job on main has put them there). rustup-init from rustup's own
-        # server, with no toolchain: the pinned one is installed below.
-        if ! command -v rustup > /dev/null; then
-          if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
-        fi
         tc=$(cat harness/toolchain)
         # No rust-src: blaze compiles the standard library only from its own library/
         # (docs/toolchain.md) and reads no toolchain's rust-src.

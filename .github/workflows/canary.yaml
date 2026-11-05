@@ -1,5 +1,5 @@
 # A canary of every built main, cheaply (docs/release.md, "Cutting a canary"): on each push to
-# main, `canary.py cut` waits for that push's `linux x64 / build` job of the merge gate
+# main, `canary.py cut` waits for that push's `linux arm64 / build` job of the merge gate
 # (blaze.yaml) to pass, then tags the newest commit of main that main's gate built v0.YYYYMMDD.N
 # through the API and dispatches release.yaml on the tag, which publishes it as a prerelease and
 # starts promote.yaml. It waits for the build alone: not the unit tests, not the other platforms

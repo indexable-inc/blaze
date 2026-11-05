@@ -39,7 +39,7 @@ env:
 
 jobs:
   site:
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     defaults:
       run:
         working-directory: site

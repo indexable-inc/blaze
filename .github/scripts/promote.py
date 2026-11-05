@@ -130,7 +130,8 @@ NOTES_MOST = 2000
 GATE = ".github/workflows/blaze.yaml"
 # Its jobs that must have run and passed on that commit: a run that skipped them (a change to
 # nothing they read) is green without testing the commit.
-GATE_TESTS = ("linux x64 / tests", "linux arm64 / tests", "macos arm64 / tests")
+# TODO(x86-64): `linux x64 / tests` again once ix has x86-64 capacity (docs/harness.md "ix runners").
+GATE_TESTS = ("linux arm64 / tests", "macos arm64 / tests")
 POLL_SECS = 120
 # bench.py counts no difference under 50 ms.
 FLOOR_SECS = 0.05

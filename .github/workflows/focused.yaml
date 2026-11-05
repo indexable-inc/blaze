@@ -20,12 +20,9 @@ on:
       harnesses:
         description: a JSON list of ci.py's harnesses, as `ci.py list '{}'` names them
         required: true
-      linux-x64:
-        type: boolean
-        default: true
       linux-arm64:
         type: boolean
-        default: false
+        default: true
       macos:
         type: boolean
         default: false
@@ -46,16 +43,7 @@ env:
   BLAZE_CORES: all
 
 jobs:
-  linux-x64:
-    name: linux x64
-    if: inputs.linux-x64
-    uses: ./.github/workflows/blaze-platform.yaml
-    with:
-      platform: linux-x64
-      os: ubuntu-24.04
-      tier: full
-      harnesses: ${{ inputs.harnesses }}
-
+  # TODO(x86-64): no Linux x86-64 platform until ix has x86-64 capacity (docs/harness.md "ix runners").
   linux-arm64:
     name: linux arm64
     if: inputs.linux-arm64
@@ -88,7 +76,7 @@ jobs:
 
   focused:
     name: focused
-    needs: [linux-x64, linux-arm64, macos, windows]
+    needs: [linux-arm64, macos, windows]
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5

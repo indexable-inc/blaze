@@ -12,9 +12,8 @@
 # label of its own (`blaze-build`, `blaze-tests`, ...), so each forks its own job's snapshot;
 # main's runs make the snapshots and the pull requests' runs fork them. The build, the unit
 # tests and the larger projects take 64 vCPUs and the other jobs 16, where a hosted runner has 4.
-# The other platforms run on `os`, GitHub's hosted runners: ix serves no x86-64 runner today
-# (its runner plane refuses an `x64` job it has no node for, and the job waits a day), and no
-# macOS or Windows.
+# macOS and Windows run on `os`, GitHub's hosted runners, which ix does not offer. No caller asks
+# for Linux x86-64: ix has no x86-64 capacity today (TODO(x86-64), docs/harness.md "ix runners").
 name: blaze platform
 on:
   workflow_call:
@@ -550,7 +549,7 @@ jobs:
     name: bench (ripgrep)
     if: inputs.bench
     needs: build
-    runs-on: ${{ inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-bench"]') || inputs.os }}
     timeout-minutes: 60
     continue-on-error: true
     steps:

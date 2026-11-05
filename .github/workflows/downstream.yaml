@@ -7,7 +7,7 @@
 #   gh workflow run downstream.yaml --ref <same-branch-or-tag> -f suite=uv -f build-run=<run id>
 #
 # `blaze` is a release (a channel, `canary` or `stable`, or a version): the blaze users get,
-# built where releases are. `build-run` takes the `blaze-linux-x64` build of a run of focused.yaml
+# built where releases are. `build-run` takes the `blaze-linux-arm64` build of a run of focused.yaml
 # or train.yaml instead, which is how a branch is tested before it lands: that build was linked
 # in the flake's dev shell, so it runs with that shell's libraries, from blaze's checkout at the
 # run's commit. Dispatch downstream on that same commit: if the branch has moved, use a
@@ -30,7 +30,7 @@ on:
         description: the release of blaze, a channel (canary, stable) or a version
         default: canary
       build-run:
-        description: or the id of a focused.yaml or train.yaml run whose blaze-linux-x64 build to test
+        description: or the id of a focused.yaml or train.yaml run whose blaze-linux-arm64 build to test
         default: ""
 
 permissions:
@@ -48,7 +48,7 @@ jobs:
   # Validate the build against the trusted dispatch commit before consuming its artifact.
   blaze:
     name: blaze
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     outputs:
       run-id: ${{ steps.build.outputs.run-id }}
@@ -78,7 +78,7 @@ jobs:
   test:
     name: ${{ inputs.suite }}
     needs: blaze
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-32, blaze-downstream]
     timeout-minutes: 300
     defaults:
       run:
@@ -121,7 +121,7 @@ jobs:
           digest-mismatch: error
       # The dev shell's libraries in the Nix store, which that build's programs ask for.
       - if: inputs.build-run != ''
-        uses: DeterminateSystems/nix-installer-action@v23
+        uses: ./blaze/.github/actions/nix
       - if: inputs.build-run != ''
         working-directory: ${{ runner.temp }}/blaze
         run: |
@@ -152,7 +152,7 @@ jobs:
     name: uv copy-on-write (Btrfs)
     needs: [blaze, test]
     if: ${{ !cancelled() && inputs.suite == 'uv' }}
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-16, blaze-downstream-uv-cow]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

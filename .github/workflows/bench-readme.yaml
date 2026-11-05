@@ -140,7 +140,7 @@ jobs:
     name: README, history and regressions
     needs: [platforms, bench]
     if: always() && needs.platforms.outputs.any == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [ix, arm64, ix-mode-cold]
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

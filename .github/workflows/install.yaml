@@ -50,12 +50,16 @@ jobs:
 
   install:
     name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    # A clean machine, as a user's: Linux AArch64 on a cold ix runner, booted from the base image
+    # and never snapshotted (ix-mode-cold), so nothing an earlier job left is there. macOS stays on
+    # a hosted Mac: install.sh's macOS path (the darwin archive, its quarantine and signature) runs
+    # only on macOS. TODO(x86-64): Linux x86-64 again once ix has x86-64 capacity.
+    runs-on: ${{ matrix.os == 'ubuntu-24.04-arm' && fromJSON('["ix", "arm64", "ix-mode-cold"]') || matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04-arm, macos-15]
     env:
       BLAZE_REPO: ${{ github.repository }}
       # A release the workflow was started for, or the one just published.
@@ -129,6 +133,9 @@ jobs:
   # as release.yaml builds it: with a profile older than the crates the build sat silent past
   # every crate for 50 minutes and more, at random (04:27Z and 07:02Z on 2026-10-28).
   # build_release.py refuses a binary that asks for a glibc newer than RHEL 9's.
+  # TODO(sysroot): hosted Ubuntu 22.04 only for its glibc (2.35, near RHEL 9's 2.34). Move to an
+  # ix runner once blaze can link against an older glibc sysroot (docs/v2/plan/toolchain-c.md,
+  # "sysroot"); blaze has no --sysroot today (docs/harness.md "ix runners").
   archive:
     name: this commit's build
     runs-on: ubuntu-22.04
@@ -169,6 +176,7 @@ jobs:
   no-rust:
     name: no Rust installed, ${{ matrix.system }}
     needs: archive
+    # Hosted, as the archive it installs is x86-64 and built there (TODO(sysroot) above).
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:

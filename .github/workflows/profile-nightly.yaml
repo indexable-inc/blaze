@@ -31,7 +31,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [linux-x64, linux-arm64, macos-arm64]
+        # TODO(x86-64): linux-x64 again once ix has x86-64 capacity and main builds there.
+        platform: [linux-arm64, macos-arm64]
     steps:
       - uses: actions/checkout@v7
       # The pinned DuckDB (flake.nix).

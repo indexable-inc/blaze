@@ -60,17 +60,17 @@ jobs:
           git diff --exit-code -- tools/nix/units || { echo "::error::tools/nix/units is stale: run tools/nix/unit_graph.py and commit the result"; exit 1; }
 
   nix:
-    name: nix build (x86_64-linux)
+    # aarch64-linux, on ix: TODO(x86-64) the x86_64-linux build comes back once ix has x86-64
+    # capacity (docs/harness.md "ix runners").
+    name: nix build (aarch64-linux)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-cpu-16, blaze-nix-live]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: DeterminateSystems/nix-installer-action@v23
-      - uses: DeterminateSystems/magic-nix-cache-action@v15
+      - uses: ./.github/actions/nix
         with:
-          use-flakehub: false
-          use-gha-cache: true
+          cache: true
       - name: flake evaluates
         run: nix flake check --print-build-logs
       # The daemon as a package, the demo as a package, and the per-unit builds both are made of.

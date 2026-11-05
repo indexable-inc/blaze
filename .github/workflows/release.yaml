@@ -33,7 +33,7 @@ env:
 jobs:
   notes:
     name: version and notes
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64]
     timeout-minutes: 5
     outputs:
       version: ${{ steps.notes.outputs.version }}
@@ -70,7 +70,8 @@ jobs:
     # On GitHub's hosted runners, Linux too: the binaries are built on the oldest hosted Ubuntu so
     # that they ask for an old glibc (build_release.py refuses one newer than RHEL 9's), and the
     # ix runner image is Ubuntu 24.04, whose glibc 2.39 headers bind C code to newer symbols
-    # (docs/harness.md "ix runners").
+    # (docs/harness.md "ix runners"). TODO(sysroot): build Linux on ix against an older glibc
+    # sysroot (docs/v2/plan/toolchain-c.md) once blaze can target one; it has no --sysroot today.
     runs-on: ${{ matrix.os }}
     # A store blaze's release has not compiled into, which a release's always is: about 97
     # minutes on hosted Linux x86-64 and longer on macOS's 7 GB runner (blaze-platform.yaml's
@@ -150,7 +151,7 @@ jobs:
     # Off: it would publish 60 permanent `blaze-*` names and `blaze`, both retired (#270);
     # whether and under which names blaze goes to crates.io is decided after the rename.
     if: false
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v7
@@ -174,7 +175,7 @@ jobs:
     name: GitHub release
     needs: [notes, build]
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 10
     permissions:
       contents: write
@@ -222,7 +223,7 @@ jobs:
     name: pointers and latest.json
     needs: publish
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
+    runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 10
     # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
     # latest.json from the releases as they are when it runs, so the last one to run is right. A
