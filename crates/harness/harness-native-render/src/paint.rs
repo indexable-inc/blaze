@@ -439,7 +439,7 @@ impl Painter {
                     d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
                 }
                 // A copied plate (a table's row): the selection's plate over it for as long as the copy's pulse lasts.
-                if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.amount() > 0.0) {
+                if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.amount() > 0.0) {
                     let look = select::Look::of(e.world());
                     let plate = [select::Plate::of(rect[0], rect[1], rect[2], rect[3])];
                     select::emit(d, &plate, &look, look.colour(dark), Some(f), p.alpha * f.amount(), sc);

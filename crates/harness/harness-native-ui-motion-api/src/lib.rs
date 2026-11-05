@@ -61,6 +61,9 @@ pub struct Shown {
 pub struct CopyFlash {
     pub spring: Spring,
     pub age: f32,
+    /// What was copied is the node's whole rect (a table's row), drawn as a selection plate over it while the pulse lasts;
+    /// false: only the node's own selection (a `TextEdit`'s words, a terminal's cells), which its painter pulses.
+    pub whole: bool,
 }
 
 impl CopyFlash {
@@ -68,7 +71,7 @@ impl CopyFlash {
     /// `1 / omega` seconds later.
     #[must_use]
     pub fn kicked(omega: f32) -> Self {
-        Self { spring: Spring { x: 0.0, v: omega * std::f32::consts::E }, age: 0.0 }
+        Self { spring: Spring { x: 0.0, v: omega * std::f32::consts::E }, age: 0.0, whole: false }
     }
 
     /// How far into the pulse it is: 0 at rest, 1 at its peak.

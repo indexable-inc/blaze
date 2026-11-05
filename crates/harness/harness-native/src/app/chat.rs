@@ -1347,8 +1347,9 @@ impl App {
             return;
         }
         let omega = w.try_lookup("ui::spring::copy").and_then(|t| t.try_cloned::<&Motion>()).map_or(0.0, |m| m.omega);
+        let whole = matches!(what, Copied::TableRow(..));
         for id in hit {
-            w.entity_from_id(id).set(CopyFlash::kicked(omega));
+            w.entity_from_id(id).set(CopyFlash { whole, ..CopyFlash::kicked(omega) });
         }
     }
 
