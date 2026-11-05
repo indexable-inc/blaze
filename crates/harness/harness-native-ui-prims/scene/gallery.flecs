@@ -9,7 +9,7 @@ gallery : ui.Column, Plate {
 
   title : ui.Words, Strong {
     Text: {s: "Primitives"}
-    TextStyle: {size: $size_h2, line: 28, role: 0, bold: 1}
+    TextStyle: {size: $size_chat_h1, line: 28, role: 0, bold: 1}
   }
   rule : ui.Divider {}
 
@@ -53,7 +53,7 @@ gallery : ui.Column, Plate {
       knob : ui.Words { Text: {s: "On"} }
     }
     field : ui.Field {
-      Placeholder: {text: "Ask anything", follow: ""}
+      hint : ui.Words, Faint { Text: {s: "Ask anything"} }
     }
   }
 

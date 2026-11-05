@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
-const KEYS: &str = include_str!("../../scene/20-keys.flecs");
+pub(super) const KEYS: &str = include_str!("../../scene/20-keys.flecs");
 
 /// What a key or a menu item came to.
 #[derive(Clone, Debug, PartialEq, Eq)]

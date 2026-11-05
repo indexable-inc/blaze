@@ -103,6 +103,9 @@ export const archive_after_s = 600
 
 export const radius_control = 6
 export const radius_card = 12
+// ui.Bubble: its corners and the most it widens to before its words wrap (about 65 characters of body text).
+export const radius_bubble = 12
+export const bubble_max_w = 480
 
 // Vibrant labels: primary, secondary, tertiary, quaternary.
 export const tone_ink_1: Fill = {dark: {1, 1, 1, 0.88}, light: {0, 0, 0, 0.85}}
@@ -208,6 +211,8 @@ export const size_chat_h2 = 16.5
 export const size_chat_h3 = 14.5
 export const line_chat_code = 17
 export const chat_bubble_radius = 12
+// The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
+export const chat_bubble_max_w = 540
 export const chat_input_radius = 12
 export const chat_row_estimate = 44
 export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
