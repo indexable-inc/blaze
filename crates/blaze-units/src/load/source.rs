@@ -436,7 +436,7 @@ fn sparse_base(from: SourceId) -> anyhow::Result<String> {
 
 /// The directory of a `local-registry` or `directory` source, as the load names paths.
 fn local_path(id: SourceId) -> Option<String> {
-    normal(&id.url().to_file_path().ok()?)
+    normal(&blaze_source::url_file(id.url()).ok()?)
 }
 
 /// The sources `config` names and which replaces which, as cargo's `SourceConfigMap::new`

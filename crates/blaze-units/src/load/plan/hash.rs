@@ -370,9 +370,7 @@ pub(super) fn source_stable_hash<H: Hasher>(
     into: &mut H,
 ) -> Result<(), LoadError> {
     if source.is_path() {
-        let path = source
-            .url()
-            .to_file_path()
+        let path = blaze_source::url_file(source.url())
             .map_err(|()| error(format!("the path source `{}` is no file path", source.url())))?;
         if let Ok(relative) = path.strip_prefix(workspace) {
             let relative = relative

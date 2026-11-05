@@ -44,7 +44,7 @@ pub fn registry_source(url: &str) -> anyhow::Result<SourceId> {
 
 /// The directory of a path, directory or local-registry source.
 pub(crate) fn path_of(id: SourceId) -> anyhow::Result<PathBuf> {
-    id.url().to_file_path().map_err(|()| anyhow::anyhow!("{} is not a directory", id.url()))
+    blaze_source::url_file(id.url()).map_err(|()| anyhow::anyhow!("{} is not a directory", id.url()))
 }
 
 /// What fetching reads of cargo's configuration (`[net]`, `[http]`, `--offline`), as a plain

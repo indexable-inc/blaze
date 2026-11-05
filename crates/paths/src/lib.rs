@@ -417,6 +417,21 @@ impl RelPath {
 
 /// Taken from <https://github.com/rust-lang/cargo/blob/79c769c3d7b4c2cf6a93781575b7f592ef974255/src/cargo/util/paths.rs#L60-L85>
 fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
+    // On Windows the daemon's `/C:/a` has no prefix: pushed part by part, its `C:` would take the
+    // root's place (`C:a`). It stays `/`-separated, as the daemon names it.
+    if cfg!(windows) && path.has_root() && !matches!(path.components().next(), Some(Utf8Component::Prefix(..))) {
+        let mut parts: Vec<&str> = Vec::new();
+        for component in path.components() {
+            match component {
+                Utf8Component::ParentDir => {
+                    parts.pop();
+                }
+                Utf8Component::Normal(c) => parts.push(c),
+                _ => {}
+            }
+        }
+        return Utf8PathBuf::from(format!("/{}", parts.join("/")));
+    }
     let mut components = path.components().peekable();
     // Normalizing only drops components and separators, so the result fits in the path's length
     // and is one allocation.
@@ -447,7 +462,8 @@ fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
 /// Whether the path is absolute. Where the standard library knows no file system, as on
 /// `wasm64-unknown-unknown`, it calls no path absolute; a path from the root is one here.
 fn is_absolute(path: &Utf8Path) -> bool {
-    if cfg!(all(target_family = "wasm", target_os = "unknown")) {
+    // On Windows the daemon names `C:\a` as `/C:/a` (one root, the drive its first part).
+    if cfg!(any(windows, all(target_family = "wasm", target_os = "unknown"))) {
         path.has_root()
     } else {
         path.is_absolute()
