@@ -46,8 +46,8 @@ fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     env
 }
 
-fn mcp_args() -> Vec<String> {
-    vec!["run".into(), paths::root().join("src/mcp.ts").display().to_string()]
+fn mcp_args() -> anyhow::Result<Vec<String>> {
+    Ok(vec!["run".into(), paths::root()?.join("src/mcp.ts").display().to_string()])
 }
 
 fn common_env(ctx: &Ctx) -> BTreeMap<String, String> {
@@ -69,7 +69,7 @@ fn common_env(ctx: &Ctx) -> BTreeMap<String, String> {
 
 pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut l = match kind {
-        "claude" => claude(ctx),
+        "claude" => claude(ctx)?,
         "codex" => codex(ctx)?,
         "cursor" => cursor(ctx)?,
         "shell" => Launch {
@@ -89,12 +89,12 @@ pub fn launch(kind: &str, ctx: &Ctx) -> anyhow::Result<Launch> {
     Ok(l)
 }
 
-fn claude(ctx: &Ctx) -> Launch {
+fn claude(ctx: &Ctx) -> anyhow::Result<Launch> {
     let mut out: Vec<String> = Vec::new();
     if ctx.chat {
         out.extend(crate::chat::claude::ARGS.iter().map(|a| (*a).to_owned()));
     }
-    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args(), "env": mcp_env(ctx) } } });
+    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": mcp_env(ctx) } } });
     let args = [
         "--strict-mcp-config", "--mcp-config", &mcp.to_string(),
         "--tools", "",                          // no built-in tools (Bash, Read, Edit, WebFetch, ...)
@@ -126,7 +126,7 @@ fn claude(ctx: &Ctx) -> Launch {
         env.insert(k.into(), v.into());
     }
     out.extend(args.iter().map(|s| s.to_string()));
-    Launch { program: "claude".into(), args: out, env }
+    Ok(Launch { program: "claude".into(), args: out, env })
 }
 
 /// Codex features that add tools or pull in outside config; all switched off.
@@ -156,7 +156,7 @@ fn codex(ctx: &Ctx) -> anyhow::Result<Launch> {
         std::fs::write(&config, format!("{existing}\n{header}\ntrust_level = \"trusted\"\n"))?;
     }
     let env_table = mcp_env(ctx).iter().map(|(k, v)| format!("{k}={}", toml_str(v))).collect::<Vec<_>>().join(",");
-    let args_list = mcp_args().iter().map(|a| toml_str(a)).collect::<Vec<_>>().join(",");
+    let args_list = mcp_args()?.iter().map(|a| toml_str(a)).collect::<Vec<_>>().join(",");
     let mut args: Vec<String> = vec![
         "-c".into(), format!("mcp_servers.harness.command={}", toml_str("bun")),
         "-c".into(), format!("mcp_servers.harness.args=[{args_list}]"),
@@ -257,7 +257,7 @@ fn cursor(ctx: &Ctx) -> anyhow::Result<Launch> {
         "HARNESS_CWD": "${env:HARNESS_CWD}",
         "HARNESS_MCP_INSTRUCTIONS": SYSTEM_NOTE,
     });
-    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args(), "env": env } } });
+    let mcp = json!({ "mcpServers": { "harness": { "command": "bun", "args": mcp_args()?, "env": env } } });
     let mcp = serde_json::to_vec_pretty(&mcp)?;
     if std::fs::read(dot.join("mcp.json")).ok().as_deref() != Some(&mcp[..]) {
         std::fs::write(dot.join("mcp.json"), mcp)?;

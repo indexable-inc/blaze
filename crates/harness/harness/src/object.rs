@@ -22,7 +22,8 @@ use crate::{db, messages, runs};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 static SPAWN: Mutex<()> = Mutex::new(());
 
@@ -46,7 +47,7 @@ pub fn parse(id: &str) -> Option<Target> {
 
 /// The live object holding `name`.
 fn live_named(d: &Daemon, name: &str) -> Option<String> {
-    let s = d.sessions.lock().unwrap().values().find(|s| s.name.as_deref() == Some(name) && s.exit.lock().unwrap().is_none()).map(|s| s.id);
+    let s = d.sessions.lock().values().find(|s| s.name.as_deref() == Some(name) && s.exit.lock().is_none()).map(|s| s.id);
     s.map(|n| format!("s{n}")).or_else(|| runs::live_named(name))
 }
 
@@ -87,7 +88,7 @@ pub fn spawn(d: &Arc<Daemon>, v: &Value) -> Result<Value> {
     let kind = v["kind"].as_str().context("spawn_object needs kind")?;
     let kind = if kind == "run" { "proc" } else { kind };
     let name = v["name"].as_str().map(str::to_string);
-    let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = SPAWN.lock();
     if let Some(n) = &name
         && let Some(id) = live_named(d, n)
     {
@@ -145,7 +146,7 @@ pub fn info(d: &Daemon, id: &str) -> Result<Value> {
         Some(Target::Session(n)) => match d.get(n) {
             Ok(s) => {
                 let i = s.info();
-                let exit = *s.exit.lock().unwrap();
+                let exit = *s.exit.lock();
                 json!({
                     "id": id, "kind": s.kind, "name": s.name, "parent": s.parent.map(|p| format!("s{p}")), "cwd": s.cwd,
                     "status": i.status, "exit_code": exit, "signal": null,

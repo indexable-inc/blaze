@@ -69,6 +69,16 @@ hn {
     Padding: {l: $side_inset, r: 0, t: 0, b: 0}
   }
 
+  // Over the Archive row: why the link is refused (src/link.rs `Refused`: a daemon that never answered the hello, or
+  // speaks another schema), naming its pid and socket and `harness stop`. No room and no words while it is not
+  // (src/app.rs sync_view sets its height and text).
+  prefab LinkNote : ui.Words {
+    Fill: $tone_failed
+    TextStyle: {size: $size_caption, line: 15, role: 0, bold: 0}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+    Padding: {l: $row_pad, r: $row_pad, t: 0, b: 8}
+  }
+
   // The selected tree row's pill: a Background under the row (src/app.rs), matched by id so a new selection's pill
   // springs from where the last one was drawn.
   prefab Selection : ui.Node {

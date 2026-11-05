@@ -92,11 +92,7 @@ async fn main() -> Result<()> {
         Some("app") => {
             open_app(None)
         }
-        Some("stop") => {
-            let mut ctl = client::Ctl::connect().await?;
-            let _ = ctl.req(Request::Shutdown).await;
-            Ok(())
-        }
+        Some("stop") => client::stop().await,
         Some("tee") => runs::tee(&arg(1)),
         Some("run") => {
             if args.len() < 2 {

@@ -753,6 +753,7 @@ dependencies = [
  "harness-proto",
  "harness-vt",
  "libc",
+ "parking_lot",
  "parquet",
  "portable-pty",
  "ratatui",
