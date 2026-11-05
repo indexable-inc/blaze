@@ -12,7 +12,7 @@ use crate::pane::TermNode;
 use crate::term::{self, Button, Grid, KeyAction, MouseAct, Sel};
 use crate::text::TypeLook;
 use harness_native_api::spring::{Spring, Tune};
-use harness_native_api::{APP, Clock, HoverAmt, moving, settle};
+use harness_native_api::{APP, Clock, HoverAmt, HoverSteered, Lit, moving, settle};
 use harness_native_flecs::prelude::*;
 use harness_native_model as model;
 use harness_native_render::paint::{Painter, panel_from};
@@ -388,9 +388,14 @@ impl App {
             let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
             // On it, or on a part of it that takes the pointer itself (a row's disclosure chevron, a control deep in a
             // chat's drawn view, whose hover shows the view's code button).
-            let on = w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| {
-                std::iter::successors(Some(t), |n| n.parent()).take(HOVER_DEPTH).any(|n| n.id() == e.id())
-            });
+            // A menu's item lights where its owner keeps the highlight (`Lit`), which the pointer and the keys move.
+            let on = if e.has(HoverSteered::id()) {
+                e.has(Lit::id())
+            } else {
+                w.entity_from_id(app_id).target(Hovered::id(), 0).is_some_and(|t| {
+                    std::iter::successors(Some(t), |n| n.parent()).take(HOVER_DEPTH).any(|n| n.id() == e.id())
+                })
+            };
             if settle(&mut h.spring, f32::from(u8::from(on)), Tune { omega: 34.0, zeta: 1.0 }, dt) {
                 moving(&w);
             }

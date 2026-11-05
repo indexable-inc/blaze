@@ -16,6 +16,7 @@ use super::*;
 use harness_native_ui_look_api::Stroke;
 use harness_native_ui_text_api::Vector;
 use harness_proto::event::ModelChoice;
+use harness_native_ui_view::menu;
 use std::collections::BTreeMap;
 
 /// The share of the window from which the meter shows in the warning tone, and from which in the failed tone (den's).
@@ -121,7 +122,8 @@ impl App {
     /// `effort` as the status line has them), and its menu while `open`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
-        &self, status: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, model: &str, effort: &str,
+        &self, status: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, model: &str,
+        effort: &str,
     ) {
         let w = self.world.world_ref();
         let kept = self.link.agent_models();
@@ -155,14 +157,16 @@ impl App {
                 }
             }
         });
-        // Open, the menu floats above what opened it (the chevron when the effort's word is not there).
-        let trigger = open.and_then(|p| pick.part(p.trigger()).or_else(|| pick.part("more")));
+        // Open, the menu floats above what opened it, its leading edge on that control's (the whole picker for the
+        // chevron's menu of both, so it lines up with the model's name; the chevron when the effort's word is not there).
+        let trigger = open.and_then(|p| if p == Pick::All { Some(pick) } else { pick.part(p.trigger()).or_else(|| pick.part("more")) });
         let Some(menu) = status.part("menu") else { return };
-        view::for_each_of(menu, trigger.map(|_| ("plate", "hn.ChatPickMenu", ())), |_, (), _| {});
+        view::for_each_of(menu, trigger.map(|_| ("plate", "ui.Menu", ())), |_, (), _| {});
         if let (Some(plate), Some(trigger), Some(page)) = (menu.part("plate"), trigger, open) {
             plate.anchored(trigger.id());
             let kind = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-            menu_rows(plate, sid, models, kind, cur, page, name, effort);
+            let hovered = w.entity_named(APP).target(Hovered::id(), 0);
+            menu_rows(plate, sid, models, kind, cur, page, name, effort, hovered, nav);
         }
     }
 
@@ -177,6 +181,7 @@ impl App {
         }
         let st = states.entry(sid).or_default();
         st.pick = if st.pick == Some(page) { None } else { Some(page) };
+        st.pick_nav = PickNav::default();
         drop(states);
         self.poke();
     }
@@ -223,7 +228,7 @@ impl App {
             return;
         }
         let w = self.world.world_ref();
-        let menu = view::prefab(w, "hn.ChatPickMenu");
+        let menu = view::prefab(w, "ui.Menu");
         let ours = |n: EntityView<'_>| {
             n.try_cloned::<&Action>().is_some_and(|a| a.name.as_str().starts_with("chat:pick:") || a.name.as_str().starts_with("chat:set:"))
                 || menu.is_some_and(|m| n.owns((flecs::IsA::ID, *m.id())))
@@ -258,6 +263,35 @@ impl App {
                 self.poke();
             }
             None => self.chat_pick_toggle(sid, Pick::Effort),
+        }
+    }
+
+    /// A key while chat `sid`'s menu is open: the arrows move its highlight, Return picks the highlighted row (or closes
+    /// the menu when none is). Whether the menu took the key (it is open and the key is one of those).
+    pub(in crate::app) fn chat_pick_nav(&mut self, sid: u64, op: &str) -> bool {
+        let mut states = self.chat.borrow_mut();
+        let Some(st) = states.get_mut(&sid).filter(|st| st.pick.is_some()) else { return false };
+        let n = &mut st.pick_nav;
+        match op {
+            "up" | "down" => {
+                let picks = &n.picks;
+                n.nav.step(op == "down", picks.len(), |i| picks[i].is_some());
+                drop(states);
+                self.poke();
+                true
+            }
+            "send" | "submit" => {
+                let pick = n.nav.hot.and_then(|i| n.picks.get(i).cloned().flatten());
+                drop(states);
+                match pick.as_deref().and_then(|a| a.strip_prefix("chat:set:")) {
+                    Some(rest) => self.chat_pick_set(rest),
+                    None => {
+                        self.chat_pick_close();
+                    }
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -321,6 +355,14 @@ fn meter(v: View<'_>, (used, window): (u64, u64), ink: Fill) {
     }
 }
 
+/// The open menu's highlight (the pointer's and the arrow keys', harness_native_ui_view::menu) and what each of its
+/// rows picks (None for a head, a separator or a note), as last drawn: what Return picks.
+#[derive(Default)]
+pub struct PickNav {
+    nav: menu::Nav,
+    picks: Vec<Option<String>>,
+}
+
 /// A row of the picker's menu.
 enum Row {
     Head(&'static str),
@@ -330,10 +372,14 @@ enum Row {
     Note(String),
 }
 
-/// The open menu's rows on its plate: `models` (`page` Model), the efforts of the current model (Effort), or both under
-/// heads (All); what cannot be chosen says why instead.
+/// The open menu's rows on its plate (prims.flecs ui.Menu's parts): `models` (`page` Model), the efforts of the current
+/// model (Effort), or both under heads (All); what cannot be chosen says why instead. The highlight goes where the
+/// pointer (on `hovered`) or the keys put it (`nav`).
 #[allow(clippy::too_many_arguments)]
-fn menu_rows(plate: View<'_>, sid: u64, models: &[ModelChoice], kind: &str, cur: Option<&ModelChoice>, page: Pick, name: &str, effort: &str) {
+fn menu_rows(
+    plate: View<'_>, sid: u64, models: &[ModelChoice], kind: &str, cur: Option<&ModelChoice>, page: Pick, name: &str,
+    effort: &str, hovered: Option<EntityView<'_>>, nav: &mut PickNav,
+) {
     let mut rows: Vec<Row> = Vec::with_capacity(models.len() + 12); // alloc: the open menu's rows, once a frame
     if models.is_empty() {
         let agent = match kind {
@@ -371,17 +417,30 @@ fn menu_rows(plate: View<'_>, sid: u64, models: &[ModelChoice], kind: &str, cur:
             }
         }
     }
+    nav.picks.clear();
+    nav.picks.extend(rows.iter().map(|r| match r {
+        Row::Choice { action, .. } => Some(action.clone()),
+        _ => None,
+    }));
+    // The row the pointer is on (one of the plate's children, or inside one), if it can be chosen.
+    let plate_id = plate.id();
+    let under = hovered
+        .and_then(|h| std::iter::successors(Some(h), |n| n.parent()).take(16).find(|n| n.parent().is_some_and(|p| p.id() == plate_id)))
+        .and_then(|row| row.name().strip_prefix('r').and_then(|i| i.parse::<usize>().ok()))
+        .filter(|&i| nav.picks.get(i).is_some_and(Option::is_some));
+    nav.nav.pointer(under);
+    let hot = nav.nav.hot;
     let keyed = rows.iter().enumerate().map(|(i, r)| {
         let prefab = match r {
-            Row::Head(_) => "hn.ChatPickHead",
-            Row::Sep => "hn.ChatPickSep",
-            Row::Choice { on: true, .. } => "hn.ChatPickRowOn",
-            Row::Choice { .. } => "hn.ChatPickRow",
-            Row::Note(_) => "hn.ChatPickFixed",
+            Row::Head(_) => "ui.MenuHead",
+            Row::Sep => "ui.MenuSep",
+            Row::Choice { on: true, .. } => "ui.MenuItemOn",
+            Row::Choice { .. } => "ui.MenuItem",
+            Row::Note(_) => "ui.MenuNote",
         };
-        (format!("r{i}"), prefab, r)
+        (format!("r{i}"), prefab, (i, r))
     });
-    view::for_each_of(plate, keyed, |v, r, _| match r {
+    view::for_each_of(plate, keyed, |v, (i, r), _| match r {
         Row::Head(s) => {
             if let Some(l) = v.part("label") {
                 l.text(s);
@@ -393,6 +452,7 @@ fn menu_rows(plate: View<'_>, sid: u64, models: &[ModelChoice], kind: &str, cur:
             }
         }
         Row::Choice { label, about, action, .. } => {
+            menu::light(v.entity(), hot == Some(i));
             v.action(action);
             if let Some(l) = v.part("label") {
                 l.text(label);

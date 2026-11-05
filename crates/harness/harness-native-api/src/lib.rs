@@ -27,6 +27,15 @@ pub struct HoverAmt {
     pub since: f32,
 }
 
+/// A Hoverable whose hover spring follows [`Lit`] instead of the pointer: an item of a menu, whose one highlight the
+/// pointer and the arrow keys both move (its owner keeps `Lit` on the highlighted item; harness_native_ui_view::menu).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct HoverSteered;
+
+/// The highlighted item of a [`HoverSteered`] group (a tag).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Lit;
+
 /// How folded an agent's sub-agents are (0 open to 1 folded, on a spring): its chevron's turn.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Fold(pub Spring);
@@ -40,6 +49,8 @@ hyperion_api_layouts::api_layouts! {
     "HoverAmt" => alias HoverAmt,
     "Fold" => alias Fold,
     "Folded" => alias Folded,
+    "HoverSteered" => alias HoverSteered,
+    "Lit" => alias Lit,
     "Hovered" => alias Hovered,
     Spring,
 }
@@ -50,6 +61,8 @@ pub fn register(world: &World) {
     world.component::<HoverAmt>();
     world.component::<Fold>();
     world.component::<Folded>();
+    world.component::<HoverSteered>();
+    world.component::<Lit>();
     harness_native_ui_input_api::register(world);
 }
 

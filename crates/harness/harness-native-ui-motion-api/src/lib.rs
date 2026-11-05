@@ -274,6 +274,9 @@ pub enum TransitionKind {
     Scale,
     /// In from and out to `from`, by its size along that edge.
     Move,
+    /// Grows from `scale` with its `from` edge held still (a menu opening out of what it hangs from), shrinking back
+    /// toward it going out.
+    Grow,
 }
 
 /// The edge a `Move` transition comes from.
