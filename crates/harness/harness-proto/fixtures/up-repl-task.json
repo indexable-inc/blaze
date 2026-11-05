@@ -1,0 +1,17 @@
+{
+  "big": 4294967296,
+  "effects": [],
+  "ended_ms": 1762300000125,
+  "id": "t3",
+  "neg": -40000,
+  "op": "repl_task",
+  "repl": "r",
+  "started_ms": 1762300000000,
+  "status": "done",
+  "t": "req",
+  "value": {
+    "t": "scalar",
+    "type": "number",
+    "v": 0.5
+  }
+}

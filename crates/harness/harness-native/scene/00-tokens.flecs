@@ -168,8 +168,8 @@ export const tone_wash_hover: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0
 export const tone_wash_press: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
 // An overlay scroller's knob and the faint track it widens over (ui.Scroller): AppKit's, white over a dark ground and
 // black over a light one (a scroll on the terminal's ground follows its Scheme).
-export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.42}, light: {0, 0, 0, 0.40}}
-export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.07}, light: {0, 0, 0, 0.05}}
+export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.20}}
+export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.03}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
 export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
