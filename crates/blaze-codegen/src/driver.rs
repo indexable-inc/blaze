@@ -482,6 +482,7 @@ pub fn subject(identity: ContentId, origin: Origin) -> ContentId {
     origin.hash_into(&mut hasher);
     hasher.finish()
 }
+pub const RELATIVE_FLIGHT_DOMAIN: &str = "blaze v2 relative flight 1";
 pub const GROUP_FLIGHT_DOMAIN: &str = "blaze v2 group flight 2";
 
 /// What a folded group's merge flies under ([`crate::flight`]): its key, and each member with
@@ -502,6 +503,24 @@ impl<I, S> FnNode<I, S> {
     /// What its code is kept under.
     fn stored(&self) -> InstanceKey {
         placed(stored(self.unit.instance.key(), &self.built_in), &self.refs)
+    }
+
+    /// What its dev compile flies under ([`crate::flight`]): [`Self::stored`] and whether its
+    /// template is relative to its own anchors ([`Described::anchors`]). One code is relative
+    /// for one requester and absolute for another (a report or profile names it for one
+    /// origin, or one origin's inliner builds bodies in), so two builds of the memo can compile
+    /// one stored key in the two forms. A landing hands its template to every build that flew
+    /// the key, which keeps it under its own template key: a relative build given an absolute
+    /// template would keep another function's positions under a key with no name or place in
+    /// it (rule 18), as [`Shape::relative`] keeps the two forms apart in the memo.
+    fn flight(&self) -> InstanceKey {
+        let stored = self.stored();
+        if self.described.anchors.is_none() {
+            return stored;
+        }
+        let mut hasher = Hasher::new(RELATIVE_FLIGHT_DOMAIN);
+        hasher.id(&stored.0);
+        InstanceKey(hasher.finish())
     }
 
     /// The store key of its dev template: the kernel's entry of its stored key, of its
@@ -1352,7 +1371,8 @@ impl Out {
                             given: blaze_cas::content_of(&put.bytes),
                         };
                         let kinds = (kept.kind, put.kind);
-                        self.errors.push(put_twice(first, by, kinds, &mismatch, &name_of));
+                        let differ = template_difference(kinds, &kept.bytes, &put.bytes);
+                        self.errors.push(put_twice(first, by, kinds, &mismatch, &differ, &name_of));
                     }
                 }
                 _ => {
@@ -1406,6 +1426,7 @@ fn put_twice<'n>(
     then: By,
     (kept_kind, given_kind): (Kind, Kind),
     mismatch: &blaze_cas::Mismatch,
+    differ: &str,
     name_of: &impl Fn(Of) -> Option<&'n str>,
 ) -> CodegenError {
     let who = |by: By| {
@@ -1439,11 +1460,65 @@ fn put_twice<'n>(
     let refusal = if kept == given { String::new() } else { format!(" {mismatch:?}") };
     // alloc: an error
     let what = format!(
-        "this build is refused, and neither value is put: {} and {} put two values under one store key {key:?}, a {kept_kind:?} value of content {kept:?} and a {given_kind:?} value of content {given:?}, so the key misses an input of its value (rule 18: {why}{refusal})",
+        "this build is refused, and neither value is put: {} and {} put two values under one store key {key:?}, a {kept_kind:?} value of content {kept:?} and a {given_kind:?} value of content {given:?}, so the key misses an input of its value (rule 18: {why}{refusal}){differ}",
         who(first),
         who(then),
     );
     error(then.unit, then.item, what)
+}
+
+/// Where two templates put under one key differ, for [`put_twice`]'s error: the first field
+/// of [`Template`] whose values are not equal, with both values (each cut to its first
+/// differing entry for a list), so the error names the input the key misses. Empty when either
+/// is no template or the two are of other kinds.
+fn template_difference((kept_kind, given_kind): (Kind, Kind), kept: &[u8], given: &[u8]) -> String {
+    if kept_kind != Kind::Code || given_kind != Kind::Code {
+        return String::new();
+    }
+    let (Ok(kept), Ok(given)) = (blob::decode(kept), blob::decode(given)) else {
+        return String::new();
+    };
+    // The first index at which two lists differ, and the entry each has there.
+    fn first<T: std::fmt::Debug + PartialEq>(field: &str, a: &[T], b: &[T]) -> Option<String> {
+        if a == b {
+            return None;
+        }
+        let at = a.iter().zip(b).position(|(a, b)| a != b).unwrap_or(a.len().min(b.len()));
+        // alloc: an error
+        Some(format!(
+            "; they differ in `{field}` (lengths {} and {}) first at {at}: {:?} and {:?}",
+            a.len(),
+            b.len(),
+            a.get(at),
+            b.get(at)
+        ))
+    }
+    fn whole<T: std::fmt::Debug + PartialEq>(field: &str, a: &T, b: &T) -> Option<String> {
+        // alloc: an error
+        (a != b).then(|| format!("; they differ in `{field}`: {a:?} and {b:?}"))
+    }
+    let differ = [
+        whole("arch", &kept.arch, &given.arch),
+        whole("align", &kept.align, &given.align),
+        first("code", &kept.code, &given.code),
+        first("relocation rows", kept.relocs.rows(), given.relocs.rows()),
+        first("relocation targets", kept.relocs.targets(), given.relocs.targets()),
+        (kept.relocs.rows() == given.relocs.rows()
+            && kept.relocs.targets() == given.relocs.targets()
+            && kept.relocs != given.relocs)
+            .then(|| "; they differ in their relocations' wide addends".to_owned()), // alloc: an error
+        first("data", &kept.data, &given.data),
+        first("inlined", &kept.inlined, &given.inlined),
+        whole("side", &kept.side, &given.side),
+        whole("unwind", &kept.unwind, &given.unwind),
+        first("lines", &kept.lines, &given.lines),
+        whole("refs", &kept.refs, &given.refs),
+        first("externs", &kept.externs, &given.externs),
+        whole("coverage", &kept.coverage, &given.coverage),
+        whole("profile", &kept.profile, &given.profile),
+    ];
+    // alloc: an error
+    differ.into_iter().flatten().collect()
 }
 
 /// What a build collected, sorted and each once.
@@ -2651,7 +2726,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alone, once this build's own compiles ended.
         let items: Vec<(InstanceKey, (InstanceKey, Option<(Shape, B::Prepared)>))> =
             // alloc: per build, sized by its store misses
-            missing.into_iter().map(|key| (nodes[&key].stored(), (key, prepared.remove(&key)))).collect();
+            missing.into_iter().map(|key| (nodes[&key].flight(), (key, prepared.remove(&key)))).collect();
         let name = |(key, _): &(InstanceKey, Option<(Shape, B::Prepared)>)| {
             let node = &nodes[key];
             (*key, node.unit.item, node.described.name.as_str())
@@ -2766,13 +2841,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         if let Some(own) = own {
             let own = own.key();
             if own != shape {
-                let (name, stored) = (&node.described.name, node.stored());
+                let (name, stored) = (&node.described.name, node.flight());
                 out.errors.push(error(
                     key,
                     node.unit.item,
                     // alloc: an error
                     format!(
-                        "the function `{name}` is refused: this build prepared it as shape {own:?}, and another build of the memo landed shape {shape:?} under the same stored key {stored:?}, so the key misses an input of its IR (rule 18)"
+                        "the function `{name}` is refused: this build prepared it as shape {own:?}, and another build of the memo landed shape {shape:?} under the same flight key {stored:?}, so the key misses an input of its IR (rule 18)"
                     ),
                 ));
                 return;
