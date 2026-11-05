@@ -590,6 +590,13 @@ pub const HOOK_TRAITS: &[&str] = &[
 /// Implementations of [`HOOK_TRAITS`] past the closure, reviewed: none changes the bytes made.
 pub const REVIEWED_HOOKS: &[Hook] = &[
     Hook {
+        package: "blaze-diagnostics",
+        hook: "DiagnosticHost",
+        why: "`Cx` answers what a diagnostic's printer reads of the checked crate (its trimmed and \
+              visible paths, edition, a closure's span): text of a message to a person, which the \
+              code generator neither prints nor makes a byte from",
+    },
+    Hook {
         package: "blaze-cargo",
         hook: "ImageStore",
         why: "`Images` gets and puts the dependency images hir-def writes and reads, by key: a \

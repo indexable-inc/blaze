@@ -2,7 +2,7 @@
  {
   "args": [],
   "code": 0,
-  "stdout": "registry.credential-provider = [\"cargo:token\", \"cargo:libsecret\"]\ntarget.aarch64-apple-darwin.runner = [\"inner\"]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\"\ntarget.x86_64-unknown-linux-gnu.rustflags = [\"-Couter\", \"-Cinner\"]\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n",
+  "stdout": "registry.credential-provider = [\"cargo:libsecret\"]\ntarget.aarch64-apple-darwin.runner = [\"inner\"]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\"\ntarget.x86_64-unknown-linux-gnu.rustflags = [\"-Couter\", \"-Cinner\"]\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n",
   "stderr": ""
  },
  {
@@ -10,7 +10,7 @@
    "--show-origin"
   ],
   "code": 0,
-  "stdout": "registry.credential-provider = [\n    \"cargo:token\", # $ROOT/.cargo/config.toml\n    \"cargo:libsecret\", # $ROOT/a/.cargo/config.toml\n]\ntarget.aarch64-apple-darwin.runner = [\n    \"inner\", # $ROOT/a/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\" # $ROOT/.cargo/config.toml\ntarget.x86_64-unknown-linux-gnu.rustflags = [\n    \"-Couter\", # $ROOT/.cargo/config.toml\n    \"-Cinner\", # $ROOT/a/.cargo/config.toml\n]\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n",
+  "stdout": "registry.credential-provider = [\n    \"cargo:libsecret\", # $ROOT/a/.cargo/config.toml\n]\ntarget.aarch64-apple-darwin.runner = [\n    \"inner\", # $ROOT/a/.cargo/config.toml\n]\ntarget.x86_64-unknown-linux-gnu.runner = \"outer-str\" # $ROOT/.cargo/config.toml\ntarget.x86_64-unknown-linux-gnu.rustflags = [\n    \"-Couter\", # $ROOT/.cargo/config.toml\n    \"-Cinner\", # $ROOT/a/.cargo/config.toml\n]\n# The following environment variables may affect the loaded values.\n# CARGO_HOME=$CARGO_HOME\n# CARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\n# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n",
   "stderr": ""
  },
  {
@@ -38,7 +38,7 @@
    "json"
   ],
   "code": 0,
-  "stdout": "{\"registry\":{\"credential-provider\":[\"cargo:token\",\"cargo:libsecret\"]},\"target\":{\"aarch64-apple-darwin\":{\"runner\":[\"inner\"]},\"x86_64-unknown-linux-gnu\":{\"runner\":\"outer-str\",\"rustflags\":[\"-Couter\",\"-Cinner\"]}}}\n",
+  "stdout": "{\"registry\":{\"credential-provider\":[\"cargo:libsecret\"]},\"target\":{\"aarch64-apple-darwin\":{\"runner\":[\"inner\"]},\"x86_64-unknown-linux-gnu\":{\"runner\":\"outer-str\",\"rustflags\":[\"-Couter\",\"-Cinner\"]}}}\n",
   "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\nCARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\nCARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n"
  },
  {
@@ -47,7 +47,7 @@
    "json-value"
   ],
   "code": 0,
-  "stdout": "{\"registry\":{\"credential-provider\":[\"cargo:token\",\"cargo:libsecret\"]},\"target\":{\"aarch64-apple-darwin\":{\"runner\":[\"inner\"]},\"x86_64-unknown-linux-gnu\":{\"runner\":\"outer-str\",\"rustflags\":[\"-Couter\",\"-Cinner\"]}}}\n",
+  "stdout": "{\"registry\":{\"credential-provider\":[\"cargo:libsecret\"]},\"target\":{\"aarch64-apple-darwin\":{\"runner\":[\"inner\"]},\"x86_64-unknown-linux-gnu\":{\"runner\":\"outer-str\",\"rustflags\":[\"-Couter\",\"-Cinner\"]}}}\n",
   "stderr": "note: The following environment variables may affect the loaded values.\nCARGO_HOME=$CARGO_HOME\nCARGO_REGISTRY_CREDENTIAL_PROVIDER='cargo:wincred'\nCARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cenv1 -Cenv2'\n"
  },
  {

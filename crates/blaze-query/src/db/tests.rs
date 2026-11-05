@@ -288,7 +288,7 @@ query!(Parity, u64, |db, key| key.a(db) % 2);
 query!(Label, u64, |db, key| get::<Parity>(db, key) * 10 + 1);
 query!(ReadB, u64, |db, key| key.b(db));
 query!(Untracked, u64, |db, key| {
-    report_untracked_read(db);
+    report_untracked_read(db, crate::db::Untracked { what: "the test's own read, which no tracked read stands for" });
     key.b(db)
 });
 
@@ -1972,6 +1972,10 @@ fn counts_of(query: &str) -> Counts {
                 reads_kept: was.reads_kept + counts.reads_kept,
                 reads_most: was.reads_most.max(counts.reads_most),
                 written: was.written + counts.written,
+                ran_new: was.ran_new + counts.ran_new,
+                ran_changed: was.ran_changed + counts.ran_changed,
+                ran_untracked: was.ran_untracked + counts.ran_untracked,
+                ran_cycle: was.ran_cycle + counts.ran_cycle,
             };
         }
         None => taken.push((name, counts)),

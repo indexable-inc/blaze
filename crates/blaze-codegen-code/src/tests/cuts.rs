@@ -1,14 +1,15 @@
 //! An identity's cuts held to the files of its roots that name them (C1 of the overkey review),
 //! on blaze's own tree: a root may call a cut package only from a file [`Cut::named_in`] lists
 //! with why no keyed value depends on it, and never from the code that makes a record. Rust read
-//! as tokens, and only the files a crate is compiled from (tests aside), as the hooks test does.
+//! as tokens, and only the code a crate is compiled from (tests aside, inline `#[cfg(test)]`
+//! modules too), as the hooks test does.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
 
-use super::hooks::{Token, compiled, roots, tokens};
+use super::hooks::{Token, compiled, outside_tests, roots, tokens};
 use crate::{IDENTITIES, Identity};
 
 /// Files of blaze-cargo that make a record: no cut may be named in them, whatever the reason.
@@ -96,7 +97,7 @@ fn uncovered(identities: &[&Identity]) -> Vec<String> {
             files.dedup();
             for file in files {
                 let relative = file.strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
-                let tokens = tokens(&std::fs::read_to_string(&file).unwrap());
+                let tokens = outside_tests(&tokens(&std::fs::read_to_string(&file).unwrap()));
                 for (at, token) in tokens.iter().enumerate() {
                     let Token::Ident(word) = token else { continue };
                     let Some(&package) = by_crate.get(word) else { continue };

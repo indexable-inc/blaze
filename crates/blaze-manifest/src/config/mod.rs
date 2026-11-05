@@ -198,11 +198,14 @@ impl ConfigValue {
                     match old.get_mut(&key) {
                         Some(entry) => {
                             let new_def = value.definition().clone();
-                            // cargo 1.99 pushes and never pops, so the path a list is checked
-                            // against `NON_MERGEABLE_LISTS` with holds every key merged before
-                            // it, in the iteration order of `HashMap`.
+                            // The path of the value merged, popped once it is: cargo 1.99 pushes
+                            // and never pops, so its path holds every key merged before it, in
+                            // its `HashMap`'s order, and whether `target.<triple>.runner` or
+                            // `registry.credential-provider` replaces (as cargo documents) or
+                            // appends turns on that order. Here it always replaces.
                             parts.push(key.clone());
                             let result = entry.merge_helper(value, force, parts);
+                            parts.pop();
                             result.with_context(|| {
                                 format!(
                                     "failed to merge key `{key}` between {} and {new_def}",
