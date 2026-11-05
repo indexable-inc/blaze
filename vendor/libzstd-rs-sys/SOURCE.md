@@ -34,3 +34,11 @@ Changes, each marked `blaze:`:
 4. `lib/decompress/zstd_decompress.rs`: `is_legacy` answers 0 (`LEGACY_SUPPORT` false), so a
    v0.1 to v0.7 frame is a frame of unknown magic, as in the C library blaze builds on native
    targets, which has no legacy decoders: every target reads the same formats.
+5. `Cargo.toml`, `c2rust-lib.rs` and the new `libc_unknown.rs`: on wasm32-unknown-unknown (the
+   explorer's core, crates/blaze-explore-core, runs in a browser), where the libc crate is
+   empty, libc is not a dependency; `extern crate self as libc` makes `libc::` name this
+   crate's root, which re-exports `libc_unknown`'s `ptrdiff_t`, `memcpy`, `memcmp`, `malloc`,
+   `calloc` and `free`, written in Rust over `core::ptr` and `std::alloc` (a 16-byte header
+   holds each block's size for `free`). Only the legacy decoders, which `is_legacy` (change 4)
+   never reaches, and a debug assertion and the pool's growth call them. Every other target is
+   unchanged.

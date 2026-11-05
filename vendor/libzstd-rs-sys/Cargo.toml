@@ -15,7 +15,9 @@ autobenches = false
 name = "libzstd_rs_sys"
 path = "c2rust-lib.rs"
 
-[dependencies]
+# blaze: libc on every wasm target but wasm32-unknown-unknown, where the libc crate is empty;
+# there the crate root names its own copies of what it takes from libc (SOURCE.md change 5).
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 libc = "0.2"
 
 [features]

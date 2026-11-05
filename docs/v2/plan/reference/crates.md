@@ -79,7 +79,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | link | `crates/blaze-link/`, `crates/blaze-live/`, `vendor/cranelift-object/` |
 | usercode | `crates/blaze-usercode/`, `crates/blaze-build-script/`, `crates/proc-macro-api/`, `crates/blaze-cargo/src/sandbox.rs`, `crates/blaze-cargo/src/sandbox/` |
 | ci | `crates/blaze-api/`, `crates/blaze-ci/`, `crates/blaze-protocol/`, `crates/blaze-ui/`, `crates/blaze-web/` |
-| observe | `crates/blaze-profile/`, `crates/blaze-explore/`, `docs/profiling.md` |
+| observe | `crates/blaze-profile/`, `crates/blaze-explore/`, `crates/blaze-explore-core/`, `docs/profiling.md` |
 | proof | `crates/blaze-v2-proof/`, `harness/v2/` |
 | safety | `crates/hir-ty-ub/`, `crates/blaze-check/`, `fuzz/` |
 
@@ -120,6 +120,7 @@ coordinator's: a change there is a request.
 | `blaze-ui`, `blaze-web` | changed: clients of `blaze-api` | ci |
 | `blaze-profile` | changed: blaze's one profiler: the flight recorder, the stall watchdog, the CPU sampler, the Parquet history (thread `blaze-history` in `blaze serve`), SQL over it through the pinned DuckDB (`nix run .#duckdb`, `blaze debug sql`) and the live feed (`blaze debug live`); [docs/profiling.md](../../../profiling.md) | observe |
 | `blaze-explore` | new: the HTTP/3 WebTransport server on 127.0.0.1 that https://ix.dev/explore connects to, pinning its 13-day self-signed P-256 certificate by hash; builds, spans, tiles, views, SQL over the history and the live feed as Arrow IPC; the `blaze-explore-probe` echo server. Started in `blaze serve` at the first `blaze explore` | observe |
+| `blaze-explore-core` | new: the explorer's core, compiled to `wasm32-unknown-unknown` for the page and run on the host in tests: blaze-explore's framing (hello, answers, live frames, JSON headers, `u64` ids), each live table's long-lived Arrow IPC stream across frames (reset at end-of-stream), the live state (open span chains, busy and idle pool workers, recent spans, counters) and Running now's view models in deterministic CBOR, behind a hand-written C ABI over linear memory (explore-core.md) | observe |
 | `hir-ide` | deleted at integration, 2026-10-30: its display and diagnostics moved to `hir-ty`, its tests to `hir-ty-mir` | coordinator |
 | `ide-db` | deleted at integration, 2026-10-30: callers import from `base-db`, `RootDatabase` became `base_db::Db` | coordinator |
 | `test-fixture` | deleted at integration, 2026-10-30: its users run on the v2 fixture, `hir_expand::fixture` (feature `fixture`), which builds a `base_db::Db` through a `blaze-vfs` view | coordinator |

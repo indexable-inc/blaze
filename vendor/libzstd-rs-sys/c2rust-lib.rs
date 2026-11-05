@@ -42,6 +42,16 @@
 // FIXME
 #![allow(clippy::missing_safety_doc)]
 
+// blaze: on wasm32-unknown-unknown the libc crate is empty, so `libc::` names this crate, whose
+// root has Rust copies of the one C type and five C functions the translation takes from libc
+// (`libc_unknown`; SOURCE.md change 5).
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+extern crate self as libc;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod libc_unknown;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) use libc_unknown::{calloc, free, malloc, memcmp, memcpy, ptrdiff_t};
+
 pub mod lib {
     pub mod common {
         pub(crate) mod allocations;

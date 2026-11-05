@@ -892,6 +892,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-explore-core"
+version = "0.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-schema",
+ "blaze-explore",
+ "blaze-profile",
+ "blaze-protocol",
+ "blaze-serde",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "blaze-fetch"
 version = "0.0.0"
 dependencies = [
