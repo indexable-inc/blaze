@@ -19,30 +19,20 @@ pub fn alive(pid: u32) -> bool {
 }
 
 /// Waits at most `long` for `fd` to be readable, or closed at its other end: whether it is.
+/// The wait is one deadline on a clock made here, so an interrupted or early return waits only
+/// for what is left of `long` (`blaze_core::wait`).
 #[cfg(unix)]
 pub fn readable_within(fd: std::os::fd::BorrowedFd<'_>, long: Duration) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd as _;
-    let until = std::time::Instant::now() + long;
-    loop {
-        let left = until.saturating_duration_since(std::time::Instant::now());
-        // Rounded up: a wait of less than a millisecond left is one, not none.
-        let ms = libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX);
-        let mut watched = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: `watched` is one live `pollfd` for the call to read and write, and its
-        // descriptor is borrowed open for the call.
-        match unsafe { libc::poll(&mut watched, 1, ms) } {
-            // A timeout may come a little early (macOS's): the wait is `long`, waited again
-            // for what is left.
-            0 if std::time::Instant::now() < until => {}
-            0 => return Ok(false),
-            ready if ready > 0 => return Ok(true),
-            _ => {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
+
+    use blaze_core::wait::{self, Clock as _, Deadline, Monotonic, Waited};
+    let clock = Monotonic::new();
+    let deadline = Deadline::after(clock.now(), long);
+    let mut watched = [libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+    match wait::readable("a descriptor to be readable", &mut watched, Some(deadline), &clock) {
+        Ok(Waited::Ready(_)) => Ok(true),
+        Ok(Waited::Deadline) => Ok(false),
+        Err(error) => Err(std::io::Error::other(error)),
     }
 }
 
@@ -89,10 +79,14 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     change.fflags = libc::NOTE_EXIT;
     // SAFETY: registers the one live `change`, read only, and asks for no event back: a null
     // list of none and no timeout are allowed.
-    if unsafe {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "registers a change only: with no event list kevent returns at once and does not wait (rule deadline-waits)"
+    )]
+    let registered = unsafe {
         libc::kevent(queue.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
-    } < 0
-    {
+    };
+    if registered < 0 {
         let error = std::io::Error::last_os_error();
         return if error.raw_os_error() == Some(libc::ESRCH) { Ok(true) } else { Err(error) };
     }
@@ -143,7 +137,12 @@ pub fn wait_exited(pid: u32) -> std::io::Result<()> {
     // SAFETY: `process` is an open handle that nothing else owns: `OpenProcess` just made it.
     let process = unsafe { OwnedHandle::from_raw_handle(process) };
     // SAFETY: the handle is open for as long as `process` lives, which outlives the call.
-    match unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a child's exit has no deadline and `blaze_core::wait` has no handle wait yet: child waits move to the driver in deadline-waits step 5 (docs/v2/plan/design/deadline-waits.md)"
+    )]
+    let ended = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+    match ended {
         WAIT_OBJECT_0 => Ok(()),
         _ => Err(std::io::Error::last_os_error()),
     }
@@ -205,7 +204,12 @@ pub fn alive(pid: u32) -> bool {
     let process = unsafe { OwnedHandle::from_raw_handle(process) };
     // SAFETY: the handle is open for as long as `process` lives, which outlives the call; a
     // wait of no time only asks whether the process ended.
-    unsafe { WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_TIMEOUT }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a timeout of 0 asks whether the process ended and never blocks, so no deadline applies (rule deadline-waits)"
+    )]
+    let ended = unsafe { WaitForSingleObject(process.as_raw_handle(), 0) };
+    ended == WAIT_TIMEOUT
 }
 
 #[cfg(not(any(unix, windows)))]

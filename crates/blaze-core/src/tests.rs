@@ -10,6 +10,7 @@ use crate::{
     Completion, Done, Driver, Effect, FileName, Tag, run_until_idle,
     sim::{Faults, Sim},
     threads::Threads,
+    wait::Deadline,
 };
 
 fn name(it: &str) -> FileName {
@@ -391,7 +392,7 @@ fn every_driver_fires_timers_in_their_order() {
         let mut out = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while driver.in_flight() > 1 && std::time::Instant::now() < deadline {
-            driver.poll(&mut out, Duration::from_millis(100));
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(100)));
             for it in out.drain(..) {
                 assert_eq!(it.done, Done::Fired);
                 fired.push(it.tag.0);
@@ -438,7 +439,7 @@ fn watches_hear_a_file_written_under_them() {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !ended && std::time::Instant::now() < deadline {
             driver.submit(&mut effects);
-            driver.poll(&mut done, Duration::from_millis(50));
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
             for it in done.drain(..) {
                 match it.done {
                     Done::Changed { files, .. } => heard.extend(files),
@@ -487,7 +488,7 @@ fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::
         let mut flushed = 0;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while flushed < 2 && std::time::Instant::now() < deadline {
-            driver.poll(&mut done, Duration::from_millis(50));
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
             for it in done.drain(..) {
                 match it.done {
                     Done::Changed { files, .. } => heard.extend(files),
@@ -807,7 +808,7 @@ fn poll_for(driver: &mut impl Driver, out: &mut Vec<Completion>, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while out.len() < n {
         assert!(Instant::now() < deadline, "{} of {n} completions: {out:?}", out.len());
-        driver.poll(out, Duration::from_millis(50));
+        driver.poll(out, Deadline::after(driver.now(), Duration::from_millis(50)));
     }
 }
 
@@ -933,8 +934,9 @@ fn watch_rounds<D: Driver>(driver: &mut D, rounds: u64, mut edit: impl FnMut(&mu
         while !heard {
             assert!(Instant::now() < deadline, "round {round}: the change was never heard");
             edit(driver);
+            let until = Deadline::after(driver.now(), Duration::from_millis(50));
             let (_, polled) =
-                blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
+                blaze_alloc_count::measure(|| driver.poll(&mut out, until));
             used += polled.allocations;
             for it in out.drain(..) {
                 match it.done {
@@ -949,7 +951,7 @@ fn watch_rounds<D: Driver>(driver: &mut D, rounds: u64, mut edit: impl FnMut(&mu
             let deadline = Instant::now() + Duration::from_secs(10);
             while !matches!(out.last(), Some(Completion { done: Done::Unwatched, .. })) {
                 assert!(Instant::now() < deadline, "round {round}: the watch never ended");
-                driver.poll(&mut out, Duration::from_millis(50));
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
             }
         });
         used += removed.allocations;

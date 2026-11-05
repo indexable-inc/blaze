@@ -2098,19 +2098,25 @@ fn supervise(
     raw::set_notif_flags(listener, SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP);
     let mut scratch = Scratch::default();
     let pidfd = raw::pidfd_open(first);
-    // `poll` passes over a negative descriptor, whose `revents` stays 0: no pidfd.
+    // The wait passes over a negative descriptor, whose `revents` stays 0: no pidfd.
     let ended_fd = pidfd.as_ref().map_or(-1, |it| it.as_raw_fd());
     let mut fds = [
         libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: ended_fd, events: libc::POLLIN, revents: 0 },
     ];
+    // No deadline: the supervisor runs as long as the program does, and the pidfd says when
+    // that ends. An interrupted wait is retried inside `wait::readable`.
+    let clock = blaze_core::wait::Monotonic::new();
     loop {
         fds.iter_mut().for_each(|it| it.revents = 0);
-        let ready = raw::poll(&mut fds, -1);
-        if ready < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
+        if blaze_core::wait::readable(
+            "the sandbox's seccomp notifications or its program's end",
+            &mut fds,
+            None,
+            &clock,
+        )
+        .is_err()
+        {
             break;
         }
         if fds[0].revents & libc::POLLIN != 0 {

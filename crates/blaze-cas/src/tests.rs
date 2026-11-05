@@ -1802,7 +1802,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
             for _ in 0..polls {
                 sim.submit(&mut effects);
                 let mut out = Vec::new();
-                sim.poll(&mut out, Duration::ZERO);
+                sim.poll(&mut out, blaze_core::wait::Deadline::NEVER);
                 for completion in out {
                     if store.owns(completion.tag) {
                         for ticket in store.complete(completion, &mut effects) {
@@ -3826,7 +3826,7 @@ fn what_a_task_read_stays_whole_through_every_step_of_commits_and_is_freed_after
                 0 => store.flush(&mut effects),
                 _ => {
                     sim.submit(&mut effects);
-                    sim.poll(&mut out, Duration::ZERO);
+                    sim.poll(&mut out, blaze_core::wait::Deadline::NEVER);
                     for completion in out.drain(..) {
                         if store.owns(completion.tag) {
                             store.complete(completion, &mut effects);

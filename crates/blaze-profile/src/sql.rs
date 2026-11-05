@@ -278,6 +278,10 @@ fn exit_heard(pid: u32) -> io::Result<()> {
 
 /// Waits until the process of `handle` has ended.
 #[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a child's exit on a scoped thread of its own, no pool thread or fiber; blocking child waits move to the driver in step 5 of docs/v2/plan/design/deadline-waits.md"
+)]
 fn exit_heard(handle: usize) -> io::Result<()> {
     use windows_sys::Win32::{
         Foundation::WAIT_OBJECT_0,

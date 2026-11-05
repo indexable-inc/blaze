@@ -828,12 +828,10 @@ fn named(error: &io::Error, what: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet,
-        time::{Duration, Instant},
-    };
+    use std::{collections::BTreeSet, time::Duration};
 
     use super::*;
+    use crate::wait::Clock as _;
 
     fn event(mask: u64, info: &[u8]) -> Vec<u8> {
         let len = METADATA + info.len();
@@ -1042,12 +1040,23 @@ mod tests {
             std::fs::write(root.join("outside"), b"not watched").unwrap();
             let mut heard = BTreeSet::new();
             let mut buffer = vec![0u8; crate::watch::BUFFER];
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // One deadline for the whole watch, on a clock made as it begins.
+            let clock = crate::wait::Monotonic::new();
+            let deadline = crate::wait::Deadline::after(clock.now(), Duration::from_secs(10));
             let want = FileName::new(&format!("{deep}/lib.rs")).unwrap();
-            while !heard.contains(&want) && Instant::now() < deadline {
+            while !heard.contains(&want) {
                 let mut fds = [libc::pollfd { fd: watch.raw(), events: libc::POLLIN, revents: 0 }];
-                // SAFETY: one pollfd of an open descriptor.
-                unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) };
+                // Until an event comes or the deadline passes; the watch reads nonblocking.
+                let waited = crate::wait::readable(
+                    "the fanotify watch's events",
+                    &mut fds,
+                    Some(deadline),
+                    &clock,
+                )
+                .unwrap();
+                if matches!(waited, crate::wait::Waited::Deadline) {
+                    break;
+                }
                 // SAFETY: the buffer has room for what is read.
                 let n =
                     unsafe { libc::read(watch.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };

@@ -141,14 +141,39 @@ mod unix {
             .map(drop)
     }
 
-    /// `poll` of `fds`, waiting up to `ms` milliseconds (-1: no limit): how many are ready.
-    /// Memory-safe for any descriptor numbers (a closed one reports `POLLNVAL`).
+    /// Waits for one of `fds` to be ready, up to `ms` milliseconds from now (negative: no
+    /// limit; 0: a look that does not wait): how many are ready, 0 when the time ran out.
+    /// Memory-safe for any descriptor numbers (a closed one reports `POLLNVAL`). A wait goes
+    /// through `crate::wait::readable` on a deadline made here, so an interrupted wait goes on
+    /// for what is left of `ms`, never anew; a caller that waits again in a loop holds its own
+    /// `Deadline` and calls `wait::readable` itself.
     pub(crate) fn poll(fds: &mut [libc::pollfd], ms: libc::c_int) -> io::Result<usize> {
+        use crate::wait::{self, Clock as _, Deadline, Monotonic, Waited};
+        if ms == 0 {
+            return ready_now(fds);
+        }
+        let clock = Monotonic::new();
+        let deadline = u64::try_from(ms)
+            .ok()
+            .map(|ms| Deadline::after(clock.now(), std::time::Duration::from_millis(ms)));
+        match wait::readable("the descriptors of a blaze-core poll", fds, deadline, &clock) {
+            Ok(Waited::Ready(ready)) => Ok(ready),
+            Ok(Waited::Deadline) => Ok(0),
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+
+    /// Which of `fds` are ready now: one `poll` with a timeout of 0, which never blocks.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a timeout of 0 asks which descriptors are ready now and never blocks, so no deadline applies (rule deadline-waits)"
+    )]
+    fn ready_now(fds: &mut [libc::pollfd]) -> io::Result<usize> {
         let n = libc::nfds_t::try_from(fds.len())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `fds` is a live, exclusive slice of `n` pollfds; the kernel writes only their
         // `revents` and keeps no pointer after the call returns.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), n, ms) };
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), n, 0) };
         checked(ready).map(|it| it as usize)
     }
 

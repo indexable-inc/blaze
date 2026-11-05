@@ -4506,6 +4506,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "blake3",
+ "blaze-core",
  "blaze-inproc-rt",
  "crossbeam-queue",
  "flate2",
