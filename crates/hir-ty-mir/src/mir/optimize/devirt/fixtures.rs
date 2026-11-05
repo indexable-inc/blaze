@@ -64,6 +64,21 @@ impl dep::Shape for Mine { fn area(&self) -> u32 { self.0 * 2 } }
 pub fn run() -> u32 { dep::through(&Mine(1)) + dep::through(&dep::Own(2)) }
 "#;
 
+/// The same with a blanket impl in `dep`: `dep` finds `Shape::area` for `main`'s `Mine`, as it
+/// finds a closure's `Fn::call` (hashbrown's `rehash_in_place` calling its `&dyn Fn` hasher, a
+/// closure over a member's key type), but a direct call would be an instance of `Mine` worked
+/// out in `dep`, which does not load `main` and so sees none of its impls.
+const BLANKET: &str = r#"
+//- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn
+//- /dep.rs crate:dep
+pub trait Shape { fn area(&self) -> u32; }
+impl<T> Shape for T { fn area(&self) -> u32 { 5 } }
+pub fn through(shape: &dyn Shape) -> u32 { shape.area() }
+//- /main.rs crate:main deps:dep
+pub struct Mine(pub u32);
+pub fn run() -> u32 { dep::through(&Mine(1)) }
+"#;
+
 /// A `#[track_caller]` method whose trait's declaration is not: through `&dyn Lines` it
 /// reports the location a `dyn` call gives it, never the call's.
 const TRACKED: &str = r#"
@@ -333,6 +348,33 @@ fn a_type_of_a_crate_the_body_does_not_depend_on_stays_virtual() {
             let unseen = devirt::site_digest(&object.digest, &[4]).0;
             assert_eq!(body.inlined.devirtualized, [unseen], "{events:?}");
             assert_ne!(unseen, object.digest.0);
+        },
+    );
+}
+
+/// A type of `main` stays virtual in `dep` though `dep`'s blanket impl gives its method: the
+/// direct callee would be resolved in `dep`, which does not load `main`.
+#[test]
+fn a_type_of_a_crate_the_body_does_not_load_stays_virtual_under_a_blanket_impl() {
+    devirtualized_in(
+        BLANKET,
+        "through",
+        &[("Shape", &["Mine"], Made::Closed)],
+        |_, body, object, events| {
+            assert_eq!(calls(body), [true], "{events:?}");
+            let kept = events
+                .iter()
+                .find(|it| it.contains("outcome=\"kept\""))
+                .expect("the kept call's event");
+            assert!(
+                kept.contains("names the crate main") && kept.contains("does not load"),
+                "{kept}"
+            );
+            assert_eq!(
+                body.inlined.devirtualized,
+                [devirt::site_digest(&object.digest, &[4]).0],
+                "{events:?}"
+            );
         },
     );
 }

@@ -172,7 +172,8 @@ fn counts_are_rustcs() {
         ]
     );
     assert_eq!(group("unused").unwrap().lints.len(), 24);
-    assert_eq!(renamed().len(), 18);
+    // rustc's renames; blaze's own (`blaze::`) are blaze-lints'.
+    assert_eq!(renamed().iter().filter(|(old, _)| !old.starts_with("blaze::")).count(), 18);
     assert_eq!(removed().len(), 66);
 }
 

@@ -136,6 +136,98 @@ fn is(token: Option<&Token>, word: &str) -> bool {
     matches!(token, Some(Token::Ident(it)) if it == word)
 }
 
+/// `tokens` without the body of each inline module under `#[cfg(test)]` (or
+/// `#[cfg(all(test, ...))]`): code a crate's tests are built from, never the crate, as
+/// [`compiled`] leaves out such a module's file.
+pub(super) fn outside_tests(tokens: &[Token]) -> Vec<Token> {
+    let attr_end = |at: usize| -> Option<usize> {
+        if !punct(tokens.get(at), '#') || !punct(tokens.get(at + 1), '[') {
+            return None;
+        }
+        let mut nested = 0i32;
+        let mut end = at + 1;
+        while end < tokens.len() {
+            match tokens[end] {
+                Token::Punct('[') => nested += 1,
+                Token::Punct(']') => nested -= 1,
+                _ => {}
+            }
+            end += 1;
+            if nested == 0 {
+                return Some(end);
+            }
+        }
+        None
+    };
+    let is_test = |at: usize| {
+        let word = |i: usize, w: &str| matches!(tokens.get(at + i), Some(Token::Ident(x)) if x == w);
+        word(2, "cfg")
+            && punct(tokens.get(at + 3), '(')
+            && ((word(4, "test") && punct(tokens.get(at + 5), ')'))
+                || (word(4, "all") && punct(tokens.get(at + 5), '(') && word(6, "test")))
+    };
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut at = 0;
+    while at < tokens.len() {
+        if let Some(end) = attr_end(at)
+            && is_test(at)
+        {
+            // Past this and any further attributes and a visibility, to `mod name {`.
+            let mut next = end;
+            while let Some(end) = attr_end(next) {
+                next = end;
+            }
+            if matches!(tokens.get(next), Some(Token::Ident(it)) if it == "pub") {
+                next += 1;
+                if punct(tokens.get(next), '(') {
+                    while next < tokens.len() && !punct(tokens.get(next), ')') {
+                        next += 1;
+                    }
+                    next += 1;
+                }
+            }
+            if matches!(tokens.get(next), Some(Token::Ident(it)) if it == "mod")
+                && matches!(tokens.get(next + 1), Some(Token::Ident(_)))
+                && punct(tokens.get(next + 2), '{')
+            {
+                let mut nested = 0i32;
+                let mut end = next + 2;
+                while end < tokens.len() {
+                    match tokens[end] {
+                        Token::Punct('{') => nested += 1,
+                        Token::Punct('}') => nested -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                    if nested == 0 {
+                        break;
+                    }
+                }
+                at = end;
+                continue;
+            }
+        }
+        out.push(tokens[at].clone());
+        at += 1;
+    }
+    out
+}
+
+#[test]
+fn a_test_module_is_outside_and_the_rest_is_kept() {
+    let text = "use a::B;\n#[cfg(test)]\nmod tests { use c::D; fn f() { {} } }\n\
+                #[cfg(all(test, unix))] pub(crate) mod more { e::F }\nfn g() { h::I }";
+    let kept = outside_tests(&tokens(text));
+    let words: Vec<&str> = kept
+        .iter()
+        .filter_map(|it| match it {
+            Token::Ident(it) => Some(it.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(words, ["use", "a", "B", "fn", "g", "h", "I"]);
+}
+
 fn punct(token: Option<&Token>, c: char) -> bool {
     token == Some(&Token::Punct(c))
 }

@@ -2147,6 +2147,18 @@ impl<'a> Stage<'a> {
             }
             self.thunks_of(sym, &mut cells);
         }
+        // A slot emptied and not filled again ([`Stage::unslot`]) keeps its symbol, so the
+        // walk above never meets it: its thunks, made for callers out of reach of the cells
+        // piece, go as a removed function's do, and a caller still reaching one is
+        // [`Stage::dangling`]'s to name, as a removed piece's referrer.
+        for slot in self.emptied.iter() {
+            if self.new.cell(*slot).is_some() {
+                continue;
+            }
+            if let Some(slot_sym) = self.new.slot_syms.get(*slot as usize).copied() {
+                self.thunks_of(slot_sym, &mut cells);
+            }
+        }
         // A going PLT stub's thunks go too.
         for at in 0..cells.len() {
             if let Some(What::Plt { .. }) = self.new.piece(cells[at]).map(|it| it.what()) {

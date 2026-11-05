@@ -1277,7 +1277,17 @@ fn a_release_key_covers_the_bodies_its_imports_build_in() {
     let g_refs: [&[Target]; 1] = [&[]];
     let (h, edited) = ([InstanceKey(ContentId([3; 32]))], [InstanceKey(ContentId([4; 32]))]);
     let key = |built_in: &[InstanceKey]| {
-        release_template_key(&instance, &[], &refs, &imports, &[g], &g_refs, &[built_in]).1
+        release_template_key(
+            &instance,
+            instance.key(),
+            &[],
+            &refs,
+            &imports,
+            &[g],
+            &g_refs,
+            &[built_in],
+        )
+        .1
     };
     assert_ne!(key(&h), key(&edited), "an edit of `h`, which `g` builds in");
     assert_ne!(key(&h), key(&[]), "`g` building `h` in or not");
@@ -1308,7 +1318,17 @@ fn a_release_key_covers_its_imports_settings() {
         .key()
     };
     let key = |unit: InstanceKey| {
-        release_template_key(&instance, &[], &refs, &imports, &[unit], &g_refs, &[&[]]).1
+        release_template_key(
+            &instance,
+            instance.key(),
+            &[],
+            &refs,
+            &imports,
+            &[unit],
+            &g_refs,
+            &[&[]],
+        )
+        .1
     };
     assert_ne!(
         key(g_at(2)),
@@ -1316,6 +1336,53 @@ fn a_release_key_covers_its_imports_settings() {
         "`g`'s export at opt level 2 and 3, under one walk name"
     );
     assert_eq!(key(g_at(3)), key(g_at(3)));
+}
+
+/// Two functions of one template code (one non-generic body in a library and in its `--test`
+/// crate) whose place 0 the walk resolved to one's own instance and to another instance for
+/// the other: the first's template holds its own code there
+/// (`Ref::Own`), the second's the place (the template test of a call of itself), so their dev
+/// and release keys and their memo shapes differ. Two that each call themselves
+/// keep one key: their templates are one (rule 20, and name-free sharing kept).
+#[test]
+fn a_template_key_covers_which_place_is_the_function_itself() {
+    let template = Instance {
+        code: CodeHash(ContentId([1; 32])),
+        args: ContentId::default(),
+        settings: crate::Settings(ContentId::default()),
+    };
+    let (a, b, c) = (
+        InstanceKey(ContentId([2; 32])),
+        InstanceKey(ContentId([3; 32])),
+        InstanceKey(ContentId([4; 32])),
+    );
+    let toolchain = ContentId([5; 32]);
+    let dev = |own: InstanceKey, callee: InstanceKey| {
+        dev_template_key(&template, own, &[], &[Target::Direct(callee)], &toolchain)
+    };
+    assert_ne!(dev(a, a), dev(b, a), "`a` calling itself, `b` calling `a`");
+    assert_eq!(dev(a, a), dev(b, b), "each calling itself");
+    assert_eq!(dev(b, c), dev(a, c), "each calling another");
+    let release = |own: InstanceKey, refs: &[Target], imported: &[Target]| {
+        let imports = Imports { imported: vec![c], ..Imports::default() };
+        let imported: [&[Target]; 1] = [imported];
+        release_template_key(&template, own, &[], refs, &imports, &[c], &imported, &[&[]]).1
+    };
+    let calls = |it: InstanceKey| [Target::Function(c), Target::Direct(it)];
+    assert_ne!(release(a, &calls(a), &[]), release(b, &calls(a), &[]));
+    assert_eq!(release(a, &calls(a), &[]), release(b, &calls(b), &[]));
+    // An import's call back into the function is a place of the template too.
+    let (own, back) = ([Target::Function(c)], |it: InstanceKey| [Target::Direct(it)]);
+    assert_ne!(release(a, &own, &back(a)), release(b, &own, &back(a)), "`c` calls `a` back");
+    let unit = Unit {
+        instance: template,
+        backend: Backend::Cranelift { speed: false },
+        arch: Arch::X86_64,
+        item: ItemKey(ContentId([6; 32])),
+    };
+    let shape = crate::backend::Shape::of(&unit, &[7]);
+    assert_ne!(shape.own_place(Some(0)), shape.own_place(None));
+    assert_eq!(shape.own_place(None), shape);
 }
 
 /// A stored template's function, read in place, is the one decoding it and instantiating

@@ -571,14 +571,29 @@ fn switch(account: Account) -> Account {
     })
 }
 
+/// Runs `f`, the account table's own bookkeeping (the free slots' queue, which allocates a
+/// block per 31 pushes and frees it once popped empty, and a new segment of slots), charging no
+/// account: what the table holds is no task's work. Charged to the account opening or closing
+/// one, a block freed by an inner open counted against the outer account, whose peak then fell
+/// short of what its inner account held by the block (504 bytes), as other tasks' frees left
+/// the queue.
+fn uncharged<R>(f: impl FnOnce() -> R) -> R {
+    let was = with_local(|local| local.account.replace(0));
+    let result = f();
+    with_local(|local| local.account.set(was));
+    result
+}
+
 /// Opens an account inside `parent` (or none) in a free slot, or a new one when none is free.
 /// It never fails and never waits: the table grows to the most accounts open at once
 /// ([`SEGMENTS`]), and accounts nest as deep as the work does.
 fn open(parent: Account) -> Account {
     let depth =
         parent.slot().map_or(0, |slot| slot.depth.load(Ordering::Relaxed).saturating_add(1));
-    let index = FREE_SLOTS.pop().unwrap_or_else(|| MADE_SLOTS.fetch_add(1, Ordering::Relaxed));
-    let slot = make_slot(index);
+    let (index, slot) = uncharged(|| {
+        let index = FREE_SLOTS.pop().unwrap_or_else(|| MADE_SLOTS.fetch_add(1, Ordering::Relaxed));
+        (index, make_slot(index))
+    });
     slot.net.store(0, Ordering::Relaxed);
     slot.peak.store(0, Ordering::Relaxed);
     slot.depth.store(depth, Ordering::Relaxed);
@@ -594,7 +609,7 @@ fn close(account: Account) -> u64 {
     let peak = slot.peak.load(Ordering::Relaxed);
     slot.generation.fetch_add(1, Ordering::Release);
     // alloc: a free slot's place in the queue, a block per 31 frees (crossbeam), reused
-    FREE_SLOTS.push(index);
+    uncharged(|| FREE_SLOTS.push(index));
     u64::try_from(peak).unwrap_or(0)
 }
 

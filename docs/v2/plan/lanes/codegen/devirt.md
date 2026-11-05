@@ -44,7 +44,12 @@ each match a direct call.
   `#[track_caller]` while the trait's declaration is not (a `dyn` call reports the
   declaration's location, a direct one the call site's; `Specialize` refuses the same), and
   one whose method a downstream impl may specialize (a `default fn`, or an item of a `default
-  impl`). A closed object with one such type is kept (`seen`). Resolving an unseen method in
+  impl`). So does a type that names a crate the body's crate does not load, even where a
+  blanket impl or the compiler gives the method (hashbrown's `rehash_in_place` calling its
+  `&dyn Fn` hasher, a closure over a member's key type): the direct callee is an instance of
+  that type worked out in the body's crate (`home::env_of`: no crate that loads the type's
+  crates stands for an upstream asker), where the type's own impls are not seen
+  (`home::unloaded_crate`). A closed object with one such type is kept (`seen`). Resolving an unseen method in
   the crate that made the vtable, so that it becomes a direct call too, is open.
 
   Each site records the digest it read in `Inlined::devirtualized`, or `ABSENT` when the
@@ -171,7 +176,8 @@ never devirtualized.
 - `crates/hir-ty-mir/src/mir/optimize/devirt/fixtures.rs` covers: one type becomes direct;
   three types are compared with the `dyn` call last; an open object stays virtual with its
   reason under the span; an absent object is read as `ABSENT`; the same bytes come out twice;
-  a type of a crate the body's crate does not depend on stays virtual, and one beside a seen
+  a type of a crate the body's crate does not depend on stays virtual, even with a blanket
+  impl's method the body's crate finds, and one beside a seen
   type is left to the `dyn` call after the seen one's compare, each with a site digest of its
   own; a `#[track_caller]` method behind a declaration without it stays virtual, naming the
   rule. What such a call reports when run (rustc: the method's own definition, through its

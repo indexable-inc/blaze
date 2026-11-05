@@ -436,12 +436,12 @@ pub enum Request {
     /// bytes out, named by their BLAKE3 (with none, they are only kept in the store). Answered
     /// with [`Response::Stored`] by the daemon's loop, which holds the store.
     FetchUrl {
+        out: Option<String>,
+        rev: Option<String>,
         url: Option<String>,
         repo: Option<String>,
-        rev: Option<String>,
         digest: String,
         most_bytes: Option<u64>,
-        out: Option<String>,
     },
     /// `blaze lock`: the workspace resolved as `targets` asks and its lock files (`Cargo.lock`,
     /// `blaze.lock`) written when they change, whatever `CI` or `lock = "required"` says
@@ -459,11 +459,11 @@ pub enum Request {
     ClientRows {
         build: u64,
         #[serde(with = "blaze_protocol::bytes")]
+        spans: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
         events: Vec<u8>,
         #[serde(with = "blaze_protocol::bytes")]
         folded: Vec<u8>,
-        #[serde(with = "blaze_protocol::bytes")]
-        spans: Vec<u8>,
         ended_ns: i64,
         started_ns: i64,
     },
@@ -1135,12 +1135,12 @@ pub struct Unchecked {
     /// Each unit that failed only in its bodies or lints, its items sound: under
     /// keep-going (the default) what depends on it was checked against its items, while it stays failed.
     pub open: Vec<OpenFailure>,
-    /// Each failure units were not checked behind.
-    pub behind: Vec<Behind>,
     /// Each test executable or doc test unit that never built, with the failure that held it
     /// back (its own, or the unit it was skipped behind), in the plan's order: what the end of
     /// `blaze test` lists as never run.
     pub tests: Vec<Unbuilt>,
+    /// Each failure units were not checked behind.
+    pub behind: Vec<Behind>,
     /// The build stopped at its first failure (`--fail-fast`): the units [`Unchecked::behind`]
     /// names under it were skipped for that, whether or not they depend on it.
     pub stopped: bool,
@@ -1149,12 +1149,12 @@ pub struct Unchecked {
 /// A test unit of [`Unchecked::tests`].
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Unbuilt {
+    /// Why that one failed, as its node says.
+    pub why: String,
     /// The test unit, as blaze's spans name it: `calc v0.1.0 (test "it")`.
     pub unit: String,
     /// The unit whose failure held it back: itself when its own compile failed.
     pub behind: String,
-    /// Why that one failed, as its node says.
-    pub why: String,
 }
 
 /// A failure of [`Unchecked::behind`].

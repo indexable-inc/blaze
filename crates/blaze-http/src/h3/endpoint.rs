@@ -1233,7 +1233,11 @@ impl Conn {
                 self.fail(code::H3_CLOSED_CRITICAL_STREAM, Step::Stream, why, cx);
             }
             Kind::Request => {
-                if self.sessions.contains_key(&id) {
+                // H3_NO_ERROR only says the peer wants no more of this side's request (RFC 9114
+                // 4.1): its answer, a close capsule or its FIN still comes on the stream and ends
+                // the session, and may already be here, behind this event. Read it first.
+                self.read(id, cx);
+                if code.into_inner() != code::H3_NO_ERROR && self.sessions.contains_key(&id) {
                     // alloc: an error's message, made only when it fails.
                     let error = self.error(
                         Step::Session,

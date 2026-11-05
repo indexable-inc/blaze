@@ -94,6 +94,7 @@ pub(crate) fn h3_to_wt(code: u64) -> Option<u32> {
 pub(crate) const MOST_FRAME: u64 = 64 << 10;
 
 /// One frame at the start of a stream's buffered bytes.
+#[derive(Debug)]
 pub(crate) struct Frame<'a> {
     pub(crate) ty: u64,
     pub(crate) payload: &'a [u8],
