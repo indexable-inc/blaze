@@ -18,6 +18,87 @@ pub fn alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// When the process `pid` started, in the unit the machine's memory ledger keeps
+/// (`blaze_graph::ledger::Process::start`), so that a pid the system gave again is told from
+/// the process that had it: field 22 of `/proc/<pid>/stat`, clock ticks after boot. `None` when
+/// no process has `pid`, or only a zombie (it holds no memory).
+#[cfg(target_os = "linux")]
+pub fn started(pid: u32) -> std::io::Result<Option<u64>> {
+    // alloc: a path, once a pid a ledger turn asks of
+    let path = format!("/proc/{pid}/stat");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            // alloc: the error's message
+            return Err(std::io::Error::new(error.kind(), format!("{path}: {error}")));
+        }
+    };
+    // Field 2, the command, is in parentheses and may hold any byte, `)` and spaces too: the
+    // fields after it start after its last `)`, field 3 (the state) first, field 22 the 20th.
+    let mut fields = text.rfind(')').map(|at| text[at + 1..].split_ascii_whitespace());
+    let state = fields.as_mut().and_then(Iterator::next);
+    let start = fields.as_mut().and_then(|it| it.nth(18)).and_then(|it| it.parse::<u64>().ok());
+    match (state, start) {
+        (Some("Z" | "X"), _) => Ok(None),
+        (Some(_), Some(start)) => Ok(Some(start)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            // alloc: the error's message
+            format!("{path}: no start time in field 22 of `{}`", text.trim_end()),
+        )),
+    }
+}
+
+/// When the process `pid` started, in the unit the machine's memory ledger keeps
+/// (`blaze_graph::ledger::Process::start`), so that a pid the system gave again is told from
+/// the process that had it: `proc_pidinfo`'s `PROC_PIDTBSDINFO`, microseconds since the
+/// epoch. `None` when no process has `pid`, only a zombie does, or another user's process does
+/// (`EPERM`: then it is not the daemon of this user that had it).
+#[cfg(target_os = "macos")]
+#[allow(clippy::cast_possible_wrap, reason = "the size of a small C struct")]
+pub fn started(pid: u32) -> std::io::Result<Option<u64>> {
+    let Ok(pid) = libc::c_int::try_from(pid) else { return Ok(None) };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `proc_bsdinfo` is a C struct of integers and byte arrays, for which all-zero
+    // bytes is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live local of `size` bytes that the call writes and does not keep.
+    let got = unsafe {
+        libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+    };
+    if got == size {
+        return Ok(Some(info.pbi_start_tvsec.saturating_mul(1_000_000) + info.pbi_start_tvusec));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH | libc::EPERM) => Ok(None),
+        _ => Err(std::io::Error::new(
+            error.kind(),
+            // alloc: the error's message
+            format!("proc_pidinfo(PROC_PIDTBSDINFO) of pid {pid} gave {got} of {size} bytes: {error}"),
+        )),
+    }
+}
+
+/// Where blaze reads no process's start time: an error naming it, never a guess.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub fn started(pid: u32) -> std::io::Result<Option<u64>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        // alloc: the error's message
+        format!(
+            "blaze reads when a process (pid {pid}) started only on Linux and macOS, not {}",
+            std::env::consts::OS
+        ),
+    ))
+}
+
 /// Waits at most `long` for `fd` to be readable, or closed at its other end: whether it is.
 #[cfg(unix)]
 pub fn readable_within(fd: std::os::fd::BorrowedFd<'_>, long: Duration) -> std::io::Result<bool> {

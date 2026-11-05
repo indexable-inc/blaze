@@ -20,6 +20,9 @@
 //! steps 4 to 7). [`par`] is the parallel loops of every crate, on the same pool: blaze has no
 //! other.
 //!
+//! [`ledger`] is the machine's memory ledger (docs/memory-budget.md, section 7): every daemon of
+//! the user on the host admits against one machine budget, each its [`ledger::Allowance`].
+//!
 //! [`sched`] is the scheduler the pool and the pump are to become (docs/v2/plan/lanes/sched.md):
 //! a state machine with no thread, clock or sleep, in which a waiting job holds no thread.
 //!
@@ -30,10 +33,11 @@
 //! the kernel calls of `arena` and [`topology`], each in a small module of its own.
 
 #![deny(unsafe_code)]
-#![feature(allocator_api, register_tool)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
 // wasm: the fibers' switch of `__stack_pointer` (`sched::stack`'s wasm layer).
 #![cfg_attr(target_family = "wasm", feature(asm_experimental_arch))]
-// `#[blaze::nonblocking]` / `#[blaze::noalloc]` (docs/v2/plan/lanes/effects.md); inert under rustc.
+// `#[blaze::nonblocking]` / `#[blaze::noalloc]` (docs/v2/plan/lanes/effects.md) and
+// `#![blaze::sans_io]` (`ledger`); inert under rustc.
 #![register_tool(blaze)]
 
 pub mod admission;
@@ -41,6 +45,7 @@ pub mod arena;
 pub mod build;
 #[allow(unsafe_code)]
 pub mod exec;
+pub mod ledger;
 pub mod machine;
 #[allow(unsafe_code)]
 pub mod par;

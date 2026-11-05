@@ -752,6 +752,21 @@ pub fn machine_budget(margin: u64, told: Option<(u64, String)>) -> io::Result<Bu
     least(limits, in_use.as_ref(), margin)
 }
 
+/// The machine budget every blaze daemon of the user on the host shares (docs/memory-budget.md,
+/// section 7, [`crate::ledger`]): the least of the machine's limits ([`machine_budget`]'s, not
+/// `RLIMIT_AS` or a limit the daemon was told, which are one process's) times 3/4, less what
+/// others use within it and `margin`. `blaze` is what the ledger's other daemons hold now: in
+/// use, but not by others, since the budget is theirs too.
+pub fn machine_wide(margin: u64, blaze: u64) -> io::Result<Budget> {
+    let limits = machine_limits()?
+        .into_iter()
+        // alloc: a limit's name, once per daemon start
+        .map(|(bytes, from)| (bytes / 4 * 3, format!("3/4 of {from} ({})", gb(bytes))))
+        .collect();
+    let in_use = machine_in_use(own().saturating_add(blaze))?;
+    least(limits, in_use.as_ref(), margin)
+}
+
 #[cfg(target_os = "linux")]
 fn machine_in_use(own: u64) -> io::Result<Option<(u64, String)>> {
     linux_in_use(Path::new("/"), own)
@@ -861,32 +876,38 @@ fn linux_limits(root: &Path) -> io::Result<Vec<(u64, String)>> {
             // alloc: the error's message
             return Err(invalid(&cgroup, format!("a line `{line}`")));
         };
-        let (mount, file) = if hierarchy == "0" && controllers.is_empty() {
-            ("sys/fs/cgroup", "memory.max")
+        // cgroup v2's `memory.high` is a limit too: past it the kernel throttles and reclaims,
+        // the slow death a budget is to keep a build from (docs/memory-budget.md, section 1).
+        let (mount, files): (_, &[&str]) = if hierarchy == "0" && controllers.is_empty() {
+            ("sys/fs/cgroup", &["memory.max", "memory.high"])
         } else if controllers.split(',').any(|it| it == "memory") {
-            ("sys/fs/cgroup/memory", "memory.limit_in_bytes")
+            ("sys/fs/cgroup/memory", &["memory.limit_in_bytes"])
         } else {
             continue;
         };
         let mut at = Some(path);
         while let Some(group) = at {
-            let limit = root.join(mount).join(group.trim_start_matches('/')).join(file);
-            match std::fs::read_to_string(&limit) {
-                Ok(text) if text.trim() == "max" => {}
-                Ok(text) => {
-                    let bytes = text
-                        .trim()
-                        .parse::<u64>()
-                        // alloc: the error's message
-                        .map_err(|_| invalid(&limit, format!("a limit of `{}`", text.trim())))?;
-                    // alloc: a limit's name, once per cgroup level per daemon start
-                    limits.push((bytes, format!("{file} of cgroup {group}")));
-                }
-                // A cgroup has no limit file at the root of its hierarchy.
-                Err(why) if why.kind() == io::ErrorKind::NotFound => {}
-                Err(why) => {
-                    // alloc: the error's message
-                    return Err(io::Error::new(why.kind(), format!("{}: {why}", limit.display())));
+            for file in files {
+                let limit = root.join(mount).join(group.trim_start_matches('/')).join(file);
+                match std::fs::read_to_string(&limit) {
+                    Ok(text) if text.trim() == "max" => {}
+                    Ok(text) => {
+                        let bytes = text.trim().parse::<u64>().map_err(|_| {
+                            // alloc: the error's message
+                            invalid(&limit, format!("a limit of `{}`", text.trim()))
+                        })?;
+                        // alloc: a limit's name, once per cgroup level per daemon start
+                        limits.push((bytes, format!("{file} of cgroup {group}")));
+                    }
+                    // A cgroup has no limit file at the root of its hierarchy.
+                    Err(why) if why.kind() == io::ErrorKind::NotFound => {}
+                    Err(why) => {
+                        return Err(io::Error::new(
+                            why.kind(),
+                            // alloc: the error's message
+                            format!("{}: {why}", limit.display()),
+                        ));
+                    }
                 }
             }
             at = match group.rfind('/') {

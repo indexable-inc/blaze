@@ -978,6 +978,35 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.graph.short()
     }
 
+    /// The machine ledger's word on what this daemon may grant now, taken at `at` while the
+    /// daemon holds the ledger's lock ([`PlaneInput::Allowance`], `super::machine`): what now
+    /// fits starts, and until the next one the plane grants no more than it then holds.
+    pub fn allow(&mut self, at: Duration, bytes: u64) {
+        self.step(PlaneInput::Allowance { at_ns: ns(at), bytes })
+            .unwrap_or_else(|error| panic!("the plane refused the machine's allowance: {error}"));
+    }
+
+    /// What the process held at the plane's last measure ([`Plane::poll`]).
+    pub fn held(&self) -> u64 {
+        self.graph.held()
+    }
+
+    /// What the tasks running now were granted.
+    pub fn granted(&self) -> u64 {
+        self.graph.granted()
+    }
+
+    /// The most the plane grants until the next [`Plane::allow`]
+    /// ([`blaze_graph::Plane::room`]).
+    pub fn room(&self) -> u64 {
+        self.graph.room()
+    }
+
+    /// Whether a task with memory was held back for it as the plane last dispatched.
+    pub fn held_back(&self) -> bool {
+        self.graph.held_back()
+    }
+
     /// The next node of `fresh`, a part of a program's build of `kind` ([`kinds::PROGRAM`], its
     /// codegen, or [`kinds::PROGRAM_LINK`], its link), task `arg` of the batch's work. It is
     /// predicted and taught by `program`, the key of that part of the program, which the plane
