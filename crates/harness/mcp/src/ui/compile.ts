@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { parse } from 'acorn';
-import type { Comment } from 'acorn';
-import { ELEMENT_NAMES, SVELTE, TONED, bindError, toneError } from './element.ts';
+import { AT, CANVAS_TEXT_PROPS, DRAWING, PROPS, SVELTE, bindError, isKnownElement, unknownPropError } from './element.ts';
+import { SVG_SAID, attributeError, isSvgTag, svgSizeError, unknownTagError } from './draw.ts';
 import { svelteSpecifier } from './files.ts';
 
 /*
@@ -55,21 +55,29 @@ export interface Compiled {
 
 const syntaxError = (message: string) => Object.assign(new SyntaxError(message), { stack: `SyntaxError: ${message}` });
 
-function position(error: Anything, shift: number): string {
+/** ` (line:column)` of a compiler error or warning in the cell; `edits` are what the passes before the compiler inserted into `source`, whose columns they move. */
+function position(error: Anything, shift: number, source?: string, edits?: Splice[][]): string {
   const line = error?.start?.line;
   const column = error?.start?.column;
-  return typeof line === 'number' ? ` (${line + shift}:${(column ?? 0) + 1})` : '';
+  if (typeof line !== 'number') return '';
+  const character = error?.start?.character;
+  if (source !== undefined && edits && typeof character === 'number') {
+    const at = back(edits, character);
+    const before = source.slice(0, at);
+    return ` (${before.split('\n').length + shift}:${at - (before.lastIndexOf('\n') + 1) + 1})`;
+  }
+  return ` (${line + shift}:${(column ?? 0) + 1})`;
 }
 
 /** `shift` moves the lines of an error or a warning from the template's to the cell's; `source` is the template. */
-function describe(error: unknown, shift: number, source = ''): Error {
+function describe(error: unknown, shift: number, source = '', edits?: Splice[][]): Error {
   if (!(error instanceof Error)) return syntaxError(String(error));
   const code = Reflect.get(error, 'code') as string | undefined;
   const first = error.message.split('\n', 1)[0] ?? error.message;
   const frame = Reflect.get(error, 'frame');
   const awaits = /\bawait\b/.test(source) && (code === 'js_parse_error' || /\bawait\b/.test(first));
   const hint = code && SVELTE_4.has(code) ? `\n${SVELTE_4_HINT}` : awaits ? `\n${AWAIT_HINT}` : '';
-  return syntaxError(`${first}${position(error as Anything, shift)}${typeof frame === 'string' && !shift ? `\n${frame}` : ''}${hint}`);
+  return syntaxError(`${first}${position(error as Anything, shift, source, edits)}${typeof frame === 'string' && !shift && !edits?.some(splices => splices.length) ? `\n${frame}` : ''}${hint}`);
 }
 
 const children = (node: Node): Node[] => {
@@ -82,38 +90,36 @@ const children = (node: Node): Node[] => {
 };
 
 interface Splice { start: number; end: number; text: string }
-function apply(code: string, splices: Splice[]): string {
+/** `code` with `splices` made; `log`, when given, keeps them, so a place in the result can be found again in `code` (`back`). */
+function apply(code: string, splices: Splice[], log?: Splice[][]): string {
   let result = code;
-  for (const splice of [...splices].sort((a, b) => b.start - a.start)) result = result.slice(0, splice.start) + splice.text + result.slice(splice.end);
+  const sorted = [...splices].sort((a, b) => b.start - a.start);
+  for (const splice of sorted) result = result.slice(0, splice.start) + splice.text + result.slice(splice.end);
+  log?.push(sorted.reverse());
   return result;
 }
 
-/** The same JavaScript on one line: a newline is a space, except inside a template literal (where it becomes `\n`) and a comment (which becomes a block one). */
-function oneLine(code: string): string {
-  const comments: Comment[] = [];
-  const tree = parse(code, { ecmaVersion: 'latest', sourceType: 'module', onComment: comments }) as unknown as Node;
-  const splices: Splice[] = [];
-  const skip: Array<[number, number]> = comments.map(comment => [comment.start, comment.end]);
-  for (const comment of comments) {
-    splices.push({ start: comment.start, end: comment.end, text: `/*${comment.value.replace(/\*\//g, '* /').replace(/\s*\n\s*/g, ' ')}*/` });
-  }
-  const visit = (node: Node): void => {
-    if (node.type === 'TemplateElement') {
-      skip.push([node.start, node.end]);
-      const raw = code.slice(node.start, node.end);
-      if (raw.includes('\n')) splices.push({ start: node.start, end: node.end, text: raw.replace(/\r?\n/g, '\\n') });
-    } else if (node.type === 'Literal' && typeof node.value === 'string' && /\\\r?\n/.test(code.slice(node.start, node.end))) {
-      skip.push([node.start, node.end]);
-      splices.push({ start: node.start, end: node.end, text: code.slice(node.start, node.end).replace(/\\\r?\n/g, '') });
+/** The offset in the text before `edits` (each a pass's splices, in the order made) of `offset` in the text after; text a splice put in is at its start. */
+function back(edits: Splice[][], offset: number): number {
+  let at = offset;
+  for (const splices of [...edits].reverse()) {
+    let delta = 0;
+    for (const splice of splices) {
+      const start = splice.start + delta;
+      if (at < start) break;
+      if (at < start + splice.text.length) { at = splice.start + delta; delta = 0; break; }
+      delta += splice.text.length - (splice.end - splice.start);
     }
-    for (const child of children(node)) visit(child);
-  };
-  visit(tree);
-  const inside = (index: number) => skip.some(([start, end]) => index >= start && index < end);
-  for (let at = code.indexOf('\n'); at !== -1; at = code.indexOf('\n', at + 1)) {
-    if (!inside(at)) splices.push({ start: at, end: at + 1, text: ' ' });
+    at -= delta;
   }
-  return apply(code, splices).replace(/\r/g, '');
+  return at;
+}
+
+/** The offset of a line (from 1) and column (from 1) in `text`. */
+function offsetOf(text: string, line: number, column: number): number {
+  let at = 0;
+  for (let n = 1; n < line; n++) { const next = text.indexOf('\n', at); if (next < 0) break; at = next + 1; }
+  return at + column - 1;
 }
 
 /** A name the compiled component reads or assigns that nothing in it declares. */
@@ -123,7 +129,7 @@ const FUNCTIONS = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFu
 const CLASSES = new Set(['ClassDeclaration', 'ClassExpression']);
 /**
  * Names that are values of the language, not variables anyone supplies (and `arguments` and `eval` cannot be assigned through a wrapper),
- * and the preloaded runtime, which a `tone={...}` is checked through (`checkTones`).
+ * and the preloaded runtime, which a prop's `{...}` is checked through (`checkElements`).
  */
 /** What the cell's `$` (Bun's shell) is called inside a component, since Svelte keeps the name `$` for itself (`aliasDollar`). */
 const DOLLAR = '__repl_dollar';
@@ -298,48 +304,10 @@ function whereIs(name: string, context: { source: string; shift: number }): { li
 }
 
 /**
- * A `tone` on an element that takes one (element.ts `TONED`), checked at the line the cell writes it: a literal that is not a tone
- * (`tone="amber"`) is an error now, and an expression (`tone={pick}`, `{tone}`) is wrapped in `__repl_svelte.tone(...)` (svelte.ts),
- * so a value that is not one is the same error at that line when it comes. The wrap only inserts text, so no line moves.
- */
-function checkTones(source: string, shift: number): string {
-  if (!/\btone\b/.test(source)) return source;
-  let ast: Anything;
-  // What does not parse is the compiler's to report, with its own words.
-  try { ast = svelteCompiler().parse(source, { modern: true }); } catch { return source; }
-  const lines = source.split('\n');
-  const splices: Splice[] = [];
-  const visit = (node: unknown): void => {
-    if (Array.isArray(node)) { for (const item of node) visit(item); return; }
-    if (!node || typeof node !== 'object') return;
-    const element = node as Anything;
-    if (element.type === 'Component' && TONED.has(element.name)) {
-      for (const attribute of element.attributes as Anything[]) {
-        if (attribute.type !== 'Attribute' || attribute.name !== 'tone') continue;
-        const { line, at } = lineAt(lines, lineOf(source, attribute.start) - 1, shift);
-        const value = attribute.value as true | Anything | Anything[];
-        if (value === true || (Array.isArray(value) && value.every(part => part.type === 'Text'))) {
-          const error = toneError(element.name, value === true ? true : value.map(part => part.data).join(''), at);
-          if (error) throw syntaxError(error.message);
-        } else if (!Array.isArray(value) && value.type === 'ExpressionTag') {
-          // `{tone}` is `tone={tone}`: its name goes in front, or the wrap would leave the prop without one.
-          if (source[attribute.start] === '{') splices.push({ start: attribute.start, end: attribute.start, text: 'tone=' });
-          splices.push({ start: value.expression.start, end: value.expression.start, text: `${SVELTE}.tone(` });
-          splices.push({ start: value.expression.end, end: value.expression.end, text: `, ${JSON.stringify(element.name)}, ${line}, ${JSON.stringify(at)})` });
-        }
-      }
-    }
-    for (const [key, child] of Object.entries(element)) if (key !== 'metadata' && child && typeof child === 'object') visit(child);
-  };
-  visit(ast.fragment);
-  return apply(source, splices);
-}
-
-/**
  * The cell's `$` (Bun's shell: `` await $`df -k /`.text() ``) used in a component's script or markup: Svelte refuses `$` as a name, so
  * each use becomes `__repl_dollar`, which `toExpression` binds to the cell's `$`. A property named `$` (`x.$`, `{ $: 1 }`) stays.
  */
-function aliasDollar(source: string): { source: string; aliased: boolean } {
+function aliasDollar(source: string, log: Splice[][]): { source: string; aliased: boolean } {
   if (!/(?<![\w$])\$(?![\w$])/.test(source)) return { source, aliased: false };
   let ast: Anything;
   try { ast = svelteCompiler().parse(source, { modern: true }); } catch { return { source, aliased: false }; }
@@ -360,7 +328,7 @@ function aliasDollar(source: string): { source: string; aliased: boolean } {
   visit([ast.instance, ast.module, ast.fragment]);
   // A shorthand property is its key and its value at once: one splice for it, not two.
   const unique = splices.filter((splice, index) => splices.findIndex(other => other.start === splice.start) === index);
-  return { source: apply(source, unique), aliased: unique.length > 0 };
+  return { source: apply(source, unique, log), aliased: unique.length > 0 };
 }
 
 /** What a boundary shows while it waits when it does not say: a quiet line. */
@@ -372,7 +340,7 @@ export const FAILED_SNIPPET = `{#snippet failed(error)}<svelte:element this="Tex
  * A `<svelte:boundary>` that does not say what to show while it waits or once it fails gets the app's (`PENDING_SNIPPET`,
  * `FAILED_SNIPPET`). The snippets go on the line of the boundary's first child, so no line moves.
  */
-function withBoundaryDefaults(source: string): string {
+function withBoundaryDefaults(source: string, log: Splice[][]): string {
   if (!source.includes('svelte:boundary')) return source;
   let ast: Anything;
   try { ast = svelteCompiler().parse(source, { modern: true }); } catch { return source; }
@@ -392,35 +360,222 @@ function withBoundaryDefaults(source: string): string {
     for (const [name, child] of Object.entries(it)) if (name !== 'metadata' && child && typeof child === 'object') visit(child);
   };
   visit(ast.fragment);
-  return apply(source, splices);
+  return apply(source, splices, log);
 }
 
-const BUILT_IN: ReadonlySet<string> = new Set(ELEMENT_NAMES);
+/** The place an error names: the cell line and column of `index` in the template, and that line's text, `line 5:3: <Image src={p} />`. */
+function placeOf(source: string, lines: string[], index: number, shift: number): { line: number; at: string } {
+  const line = lineOf(source, index);
+  const column = index - (source.lastIndexOf('\n', index - 1) + 1) + 1;
+  const { line: cell, at } = lineAt(lines, line - 1, shift);
+  return { line: cell, at: at.replace(/^line (\d+):/, `line $1:${column}:`) };
+}
+
+/** Where markup is: among the app's elements, inside a drawing (a Canvas or an `<svg>`), or where the pass cannot tell (a snippet, a component of the cell's own). */
+type Within = 'page' | 'draw' | 'unknown';
+
+/** The value of an attribute written as text (`fill="ink"`, a bare `legend`), or undefined when any of it is an expression. */
+function textValue(value: true | Anything | Anything[]): string | true | undefined {
+  if (value === true) return true;
+  if (Array.isArray(value) && value.every(part => part.type === 'Text')) return value.map(part => part.data as string).join('');
+  return undefined;
+}
 
 /**
- * Each `bind:` on one of the app's own elements, checked at the line the cell writes it: one the element does not have
- * (`<Toggle bind:checked>`, `<Text bind:text>`) is an error now (element.ts `bindError`), since Svelte would pass it on as a prop
- * that nothing reads or writes back. A component of the cell's own, or one made with `element()`, is not checked.
+ * Every element of the markup that is the app's (`<Code>`, `<Rect>`) or an SVG tag (draw.ts), checked at the line and column the
+ * cell writes it, before anything runs:
+ * - a lowercase element that is neither (`<div>`) is an error naming what to use, and one that draws only in a drawing (`<rect>`,
+ *   `<Rect>`) outside one, or one that does not draw (`<Row>`) inside one, is an error too;
+ * - an attribute the element does not read is an error naming what it reads (Svelte would pass it on to nothing), and so is markup
+ *   between the tags of one that takes no children;
+ * - a value written as text is checked now (element.ts `checkProp`, draw.ts `svgError`), and a `{...}` value is wrapped in
+ *   `__repl_svelte.prop(...)` (svelte.ts), so a value that is not one is the same error at that line when it comes;
+ * - each `bind:` is checked as before (element.ts `bindError`);
+ * - each element is given its place as the attribute `__at` (element.ts `AT`), for the checks that can only run once the markup has
+ *   (a spread, a Chart's data against its kind), which then name the same place.
+ * Only text is inserted, on the lines it is about, so no line moves. A component of the cell's own, or `<svelte:element>`, is not checked.
  */
-function checkBindings(source: string, shift: number): void {
-  if (!/\bbind:/.test(source)) return;
+function checkElements(source: string, shift: number, log: Splice[][]): string {
   let ast: Anything;
-  try { ast = svelteCompiler().parse(source, { modern: true }); } catch { return; }
+  // What does not parse is the compiler's to report, with its own words.
+  try { ast = svelteCompiler().parse(source, { modern: true }); } catch { return source; }
   const lines = source.split('\n');
-  const visit = (node: unknown): void => {
-    if (Array.isArray(node)) { for (const item of node) visit(item); return; }
-    if (!node || typeof node !== 'object') return;
-    const element = node as Anything;
-    if (element.type === 'Component' && BUILT_IN.has(element.name)) {
-      for (const attribute of element.attributes as Anything[]) {
-        if (attribute.type !== 'BindDirective') continue;
-        const error = bindError(element.name, attribute.name, lineAt(lines, lineOf(source, attribute.start) - 1, shift).at);
-        if (error) throw syntaxError(error.message);
+  const splices: Splice[] = [];
+  const fail = (error: Error) => syntaxError(error.message);
+
+  const element = (node: Anything, within: Within): Within => {
+    const name = node.name as string;
+    const svg = node.type === 'RegularElement';
+    const { at } = placeOf(source, lines, node.start, shift);
+    const said = `<${name}>`;
+    // Where it is, and so where what it holds is.
+    let inner: Within = 'page';
+    if (svg && !isSvgTag(name)) throw fail(unknownTagError(name, at));
+    if (name === 'svg' || name === 'Canvas') {
+      if (within === 'draw') throw fail(new TypeError(`${said} inside a drawing (${at}): a drawing holds no other; group shapes with ${name === 'svg' ? '<g>' : '<Group>'}`));
+      inner = 'draw';
+    } else if (svg || DRAWING.has(name)) {
+      if (within === 'page') throw fail(new TypeError(`${said} draws only inside ${svg ? 'an <svg viewBox="...">' : 'a <Canvas view="...">'} (${at}): put it in one`));
+      inner = 'draw';
+    } else if (within === 'draw' && name !== 'Text') {
+      throw fail(new TypeError(`${said} inside a drawing (${at}): a drawing holds only ${SVG_SAID} (or Group, Path, Rect, Circle, Line, Polyline and Text); put the drawing in a Row or Column beside it`));
+    }
+    if (!svg && !PROPS[name as keyof typeof PROPS].includes('children')) {
+      const kids = (node.fragment?.nodes ?? []) as Anything[];
+      if (kids.some(kid => kid.type !== 'Comment' && !(kid.type === 'Text' && !(kid.data as string).trim()))) {
+        throw fail(unknownPropError(name as keyof typeof PROPS, 'children', undefined, at));
       }
     }
-    for (const [key, child] of Object.entries(element)) if (key !== 'metadata' && child && typeof child === 'object') visit(child);
+    // The text values of its attributes, for the checks that read two together (a Chart's kind with its data).
+    const known: Record<string, unknown> = {};
+    for (const attribute of node.attributes as Anything[]) {
+      if (attribute.type === 'Attribute' && textValue(attribute.value) !== undefined) known[attribute.name] = textValue(attribute.value);
+    }
+    let spread = false;
+    for (const attribute of node.attributes as Anything[]) {
+      const { at: here } = placeOf(source, lines, attribute.start, shift);
+      if (attribute.type === 'SpreadAttribute') { spread = true; continue; }
+      if (attribute.type === 'BindDirective') {
+        const error = bindError(name, attribute.name, here);
+        if (error) throw fail(error);
+        continue;
+      }
+      if (attribute.type === 'StyleDirective') throw fail(new TypeError(`style:${attribute.name} on ${said} is not drawn (${here}): no styles; colour comes from tone= on words and fill= and stroke= (an ink) on shapes`));
+      if (attribute.type !== 'Attribute') continue;
+      const prop = attribute.name as string;
+      if (prop === AT) continue;
+      if (name === 'Text' && within === 'page' && CANVAS_TEXT_PROPS.has(prop)) {
+        throw fail(new TypeError(`<Text ${prop}=...> outside a drawing (${here}): only a Text in a Canvas or an <svg> takes x, y, anchor, size and fill; words elsewhere take tone and bold`));
+      }
+      if (name === 'Text' && within === 'draw' && prop === 'tone') {
+        throw fail(new TypeError(`<Text tone=...> inside a drawing (${here}): words in a drawing take fill= (an ink), not tone`));
+      }
+      const text = textValue(attribute.value);
+      // The name first (a prop it has not), then, written as text, the value.
+      const error = attributeError(name, prop, text, here, known);
+      if (error) throw fail(error);
+      const value = attribute.value as Anything;
+      if (text !== undefined || /^on/.test(prop) || Array.isArray(value) || value.type !== 'ExpressionTag') continue;
+      // `{tip}` is `tip={tip}`: its name goes in front, or the wrap would leave the prop without one.
+      if (source[attribute.start] === '{') splices.push({ start: attribute.start, end: attribute.start, text: `${prop}=` });
+      const also = name === 'Chart' && (prop === 'data' || prop === 'series') && Object.keys(known).length > 0 ? `, ${JSON.stringify(known)}` : '';
+      splices.push({ start: value.expression.start, end: value.expression.start, text: `${SVELTE}.prop(` });
+      splices.push({ start: value.expression.end, end: value.expression.end, text: `, ${JSON.stringify(name)}, ${JSON.stringify(prop)}, ${JSON.stringify(here)}${also})` });
+    }
+    if (name === 'svg' && !spread) {
+      const dynamic = (node.attributes as Anything[]).some(a => a.type === 'Attribute' && ['viewBox', 'width', 'height'].includes(a.name) && textValue(a.value) === undefined);
+      const error = dynamic ? undefined : svgSizeError(known, at);
+      if (error) throw fail(error);
+    }
+    // Its place goes first, so it is set before the attributes whose errors name it.
+    splices.push({ start: node.start + 1 + name.length, end: node.start + 1 + name.length, text: ` ${AT}={${JSON.stringify(at)}}` });
+    return inner;
   };
-  visit(ast.fragment);
+
+  const visit = (node: unknown, within: Within): void => {
+    if (Array.isArray(node)) { for (const item of node) visit(item, within); return; }
+    if (!node || typeof node !== 'object') return;
+    const it = node as Anything;
+    if (it.type === 'RegularElement' || (it.type === 'Component' && isKnownElement(it.name))) {
+      visit(it.fragment, element(it, within));
+      return;
+    }
+    // What a snippet or a component of the cell's own holds may be drawn anywhere.
+    const next: Within = it.type === 'SnippetBlock' || it.type === 'Component' || it.type === 'SvelteElement' || it.type === 'SvelteComponent' ? 'unknown' : within;
+    for (const [key, child] of Object.entries(it)) if (key !== 'metadata' && child && typeof child === 'object') visit(child, next);
+  };
+  visit(ast.fragment, 'page');
+  return apply(source, splices, log);
+}
+
+/** The file name a compiled component's frames carry (`repl-ui-3.js:12:40`), its number the one `remember` gave it. */
+export const UI_FILE = 'repl-ui-';
+
+/** What finds a place in a compiled component again in the cell: see `placeOfFrame`. */
+interface Origin {
+  /** The text evaluated, and how long its head is (on its first line) before the body: the compiler's code as `toExpression` changed it. */
+  head: number;
+  text: string;
+  /** What `toExpression` changed, the compiler's code, and its source map (VLQ mappings) into `input`, what the compiler read. */
+  moved: Splice[][];
+  code: string;
+  map: string;
+  input: string;
+  /** What the passes before the compiler inserted into `source`, the template as the cell writes it; `shift` its first line's place. */
+  edits: Splice[][];
+  source: string;
+  shift: number;
+}
+
+/** The components compiled most recently, by number; the oldest is forgotten past this many (its frames then say only its file). */
+const ORIGINS_KEPT = 512;
+const origins = new Map<number, Origin>();
+let originSeq = 0;
+function remember(origin: Origin): number {
+  origins.set(++originSeq, origin);
+  for (const id of origins.keys()) { if (origins.size <= ORIGINS_KEPT) break; origins.delete(id); }
+  return originSeq;
+}
+
+const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+/** The segments of one line of a source map (`[generated column, source, source line, source column]`, absolute), from its VLQ text and the source line and column running across lines. */
+function segments(line: string, state: { line: number; column: number }): number[][] {
+  const out: number[][] = [];
+  let column = 0;
+  for (const segment of line.split(',')) {
+    if (!segment) continue;
+    const values: number[] = [];
+    let value = 0;
+    let bits = 0;
+    for (const char of segment) {
+      const digit = BASE64.indexOf(char);
+      value += (digit & 31) << bits;
+      if (digit & 32) { bits += 5; continue; }
+      values.push(value & 1 ? -(value >>> 1) : value >>> 1);
+      value = 0;
+      bits = 0;
+    }
+    column += values[0] ?? 0;
+    if (values.length >= 4) {
+      state.line += values[2]!;
+      state.column += values[3]!;
+      out.push([column, 0, state.line, state.column]);
+    }
+  }
+  return out;
+}
+
+/**
+ * The cell line and column, and the place as errors name it (`line 5:9: <Text>{rows.length}</Text>`), of a frame inside a compiled
+ * component: `id` from its file name, `line` and `column` (from 1) within it. Undefined when the component is forgotten or the
+ * place is code the compiler made up (its runtime calls, not the cell's markup or script).
+ */
+export function placeOfFrame(id: number, line: number, column: number): { line: number; column: number; at: string } | undefined {
+  const origin = origins.get(id);
+  if (!origin) return undefined;
+  // Back from the evaluated text to the body (the head is on the first line only), then to the compiler's code.
+  const inBody = offsetOf(origin.text, line, column) - origin.head;
+  if (inBody < 0) return undefined;
+  const inCode = back(origin.moved, inBody);
+  const before = origin.code.slice(0, inCode);
+  const genLine = before.split('\n').length - 1;
+  const genColumn = inCode - (before.lastIndexOf('\n') + 1);
+  // The compiler's source map: the last segment on that line at or before the column.
+  const state = { line: 0, column: 0 };
+  const lines = origin.map.split(';');
+  let found: number[] | undefined;
+  for (let n = 0; n <= genLine && n < lines.length; n++) {
+    const segs = segments(lines[n]!, state);
+    if (n === genLine) for (const seg of segs) if (seg[0]! <= genColumn) found = seg;
+  }
+  if (!found) return undefined;
+  // From what the compiler read back to the template the cell wrote.
+  const inSource = back(origin.edits, offsetOf(origin.input, found[2]! + 1, found[3]! + 1));
+  const lead = origin.source.slice(0, inSource);
+  const sourceLine = lead.split('\n').length;
+  const sourceColumn = inSource - (lead.lastIndexOf('\n') + 1) + 1;
+  const { line: cellLine, at } = lineAt(origin.source.split('\n'), sourceLine - 1, origin.shift);
+  return { line: cellLine, column: sourceColumn, at: at.replace(/^line (\d+):/, `line $1:${sourceColumn}:`) };
 }
 
 /**
@@ -429,7 +584,7 @@ function checkBindings(source: string, shift: number): void {
  * declare are read through `__repl_svelte.free(props, table)` (svelte.ts): the props it is mounted with first, the cell's own
  * variable (the table's getter and setter, closures in the cell's scope) second.
  */
-function toExpression(code: string, context: { source: string; shift: number; dollar?: boolean }): { expression: string; imports: string[] } {
+function toExpression(code: string, context: { source: string; shift: number; dollar?: boolean; map?: string; input?: string; edits?: Splice[][] }): { expression: string; imports: string[] } {
   const tree = parse(code, { ecmaVersion: 'latest', sourceType: 'module' }) as unknown as Node;
   const header: string[] = [];
   const imports: string[] = [];
@@ -479,10 +634,16 @@ function toExpression(code: string, context: { source: string; shift: number; do
     }
     header.push(`const ${TABLE} = { ${table.join(', ')} };`);
   }
-  const body = oneLine(apply(code, splices));
+  const moved: Splice[][] = [];
+  const body = apply(code, splices, moved);
   // Markup's `{await ...}` compiles to thunks with no `await` left in them, so the template is what says it.
   const awaits = /\bawait\b/.test(context.source);
-  const expression = `(() => { ${header.join(' ')} ${body.trim()} return ${SVELTE}.component(${name}, ${awaits}); })()`;
+  const head = `(() => { ${header.join(' ')} `;
+  const id = remember({ head: head.length, text: head + body, moved, code, map: context.map ?? '', input: context.input ?? '', edits: context.edits ?? [], source: context.source, shift: context.shift });
+  // Evaluated where it stands (a direct eval sees the cell's names), as its own file: a frame inside it says `repl-ui-<id>.js` and
+  // where, which `placeOfFrame` finds again in the cell. The string is one line, so no line of the cell moves.
+  const evaluated = `${head}${body} return ${SVELTE}.component(${name}, ${awaits}); })()\n//# sourceURL=${UI_FILE}${id}.js`;
+  const expression = `eval(${JSON.stringify(evaluated)})`;
   // The cell's `$` is read where the cell's names are, outside the function whose header names Svelte's runtime `$`.
   return { expression: context.dollar ? `((${DOLLAR}) => ${expression})(typeof $ === 'undefined' ? undefined : $)` : expression, imports };
 }
@@ -492,13 +653,13 @@ function toExpression(code: string, context: { source: string; shift: number; do
  * it sees them imported, and without one their effects would hang on the parent and outlive the component. The import goes on the
  * `<script>` line, so no line moves.
  */
-function withLifecycleImports(source: string): string {
+function withLifecycleImports(source: string, log: Splice[][]): string {
   const script = /<script(?![^>]*\bmodule\b)[^>]*>/.exec(source);
   if (!script) return source;
   const missing = ['onMount', 'onDestroy'].filter(name => new RegExp(`\\b${name}\\s*\\(`).test(source) && !new RegExp(`import\\s*\\{[^}]*\\b${name}\\b`).test(source));
   if (missing.length === 0) return source;
   const at = script.index + script[0].length;
-  return `${source.slice(0, at)} import { ${missing.join(', ')} } from 'svelte';${source.slice(at)}`;
+  return apply(source, [{ start: at, end: at, text: ` import { ${missing.join(', ')} } from 'svelte';` }], log);
 }
 
 /** The elements whose children, written between their tags, are their code as written, and the prop that code becomes. */
@@ -616,21 +777,24 @@ export function compileComponent(original: string, options: { filename?: string;
   let result: Anything;
   let dollar = false;
   let source = original;
+  // What each pass inserted, so a place in what the compiler read is found again in the cell (`back`).
+  const edits: Splice[][] = [];
+  let input = '';
   try {
     source = rawText(original);
-    checkBindings(source, shift);
-    const aliased = aliasDollar(source);
+    const aliased = aliasDollar(checkElements(source, shift, edits), edits);
     dollar = aliased.aliased;
-    result = svelteCompiler().compile(withLifecycleImports(checkTones(withBoundaryDefaults(aliased.source), shift)), {
+    input = withLifecycleImports(withBoundaryDefaults(aliased.source, edits), edits);
+    result = svelteCompiler().compile(input, {
       generate: 'client', runes: true, dev: false, css: 'external', filename: options.filename ?? 'Cell.svelte',
       experimental: { customRenderer: RENDERER, async: true },
     });
-  } catch (error) { throw describe(error, shift, source); }
+  } catch (error) { throw describe(error, shift, source, edits); }
   const warnings = (result.warnings as Anything[])
     .filter(warning => !IGNORED.test(warning.code))
-    .map(warning => `${(warning.message as string).split('\n', 1)[0]}${position(warning, shift)}${SVELTE_4.has(warning.code) ? ` (${SVELTE_4_HINT})` : ''}`);
+    .map(warning => `${(warning.message as string).split('\n', 1)[0]}${position(warning, shift, source, edits)}${SVELTE_4.has(warning.code) ? ` (${SVELTE_4_HINT})` : ''}`);
   if (result.css?.code) warnings.push('<style> does nothing here: there is no stylesheet, so look comes from props (gap, pad, tone, bold)');
-  return { ...toExpression(result.js.code, { source, shift, dollar }), warnings };
+  return { ...toExpression(result.js.code, { source, shift, dollar, map: result.js.map?.mappings, input, edits }), warnings };
 }
 
 /** True when a cell is itself a component: its first thing is markup. */

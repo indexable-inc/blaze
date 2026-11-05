@@ -137,6 +137,61 @@ pub struct TextRange {
     pub to: u32,
 }
 
+/// How a `Vector`'s view box sits in its node's box (less its inset).
+#[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum VectorFit {
+    /// Uniformly scaled to fit and centred (SVG's `xMidYMid meet`): a drawing.
+    #[default]
+    Meet,
+    /// Each axis scaled to fill (SVG's `none`): a chart's plot, whose strokes stay their width in points.
+    Stretch,
+}
+
+/// A shape drawn from SVG path data (`d`: M L H V C S Q T A Z, absolute and relative) in its own user units, filled in
+/// the node's `Fill` and stroked in its `Stroke` (look api) `stroke_w` wide. The user units go through the transform
+/// `ma .. mf` (SVG's `matrix(a b c d e f)`; all four of `ma .. md` at 0 is no transform), then the view box `view_*` is fitted into
+/// the node's box less `inset_*` (points) as `fit` says. `stroke_fixed` keeps the stroke `stroke_w` points wide and a
+/// `VectorText` `size` points tall whatever the scale (a chart's lines and labels); else both scale with the drawing, as
+/// SVG's do. Drawn by the host's path pass: fills
+/// with their winding (`even_odd` for the even-odd rule) and an edge one device pixel soft, strokes round at their ends
+/// and joins, both cut to the clip the node sits in.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Vector {
+    pub d: ScriptString,
+    pub view_x: f32,
+    pub view_y: f32,
+    pub view_w: f32,
+    pub view_h: f32,
+    pub fit: VectorFit,
+    pub ma: f32,
+    pub mb: f32,
+    pub mc: f32,
+    pub md: f32,
+    pub me: f32,
+    pub mf: f32,
+    pub inset_l: f32,
+    pub inset_t: f32,
+    pub inset_r: f32,
+    pub inset_b: f32,
+    pub stroke_w: f32,
+    pub stroke_fixed: bool,
+    pub even_odd: bool,
+}
+
+/// Words at a point of a `Vector`'s user space (SVG's `<text>`): `s` set `size` user units tall (bold when said), its
+/// baseline at `y`, starting at, centred on or ending at `x` (`anchor` 0, 1, 2), in the node's `Fill`. The point goes
+/// through the node's `Vector` (its transform, view box and fit) as a path's would; its `d` may be empty.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct VectorText {
+    pub s: ScriptString,
+    pub x: f32,
+    pub y: f32,
+    pub anchor: u8,
+    pub size: f32,
+    pub bold: bool,
+}
+
 hyperion_api_layouts::api_layouts! {
     "Text" => alias Text,
     "MarkdownText" => alias MarkdownText,
@@ -153,7 +208,10 @@ hyperion_api_layouts::api_layouts! {
     "LineNumbers" => alias LineNumbers,
     "TextRange" => alias TextRange,
     "Truncate" => alias Truncate,
+    "Vector" => alias Vector,
+    "VectorText" => alias VectorText,
     TruncateMode,
+    VectorFit,
 }
 
 /// Register content components before any scene resolves them.
@@ -173,4 +231,6 @@ pub fn register(world: &World) {
     world.component::<LineNumbers>().writable();
     world.component::<TextRange>().writable();
     world.component::<Truncate>().writable();
+    world.component::<Vector>().writable();
+    world.component::<VectorText>().writable();
 }

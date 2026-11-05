@@ -21,8 +21,14 @@ pub fn run(path: &str) -> Result<(), String> {
     app.set_gpu_clock(renderer.gpu_clock());
     // HARNESS_NATIVE_GALLERY=1: the layout-vocabulary examples instead of the app's view (a 32-point title strip as inset);
     // `prims`: the primitives gallery.
+    // `genui`: one generative-UI cell's tree (HARNESS_NATIVE_GENUI=<tree.json>), drawn as a chat card draws it.
+    let mut genui = None;
     if let Ok(g) = std::env::var("HARNESS_NATIVE_GALLERY") {
-        crate::gallery::load(&app, 32.0, g == "prims")?;
+        if g == "genui" {
+            genui = Some((crate::gallery::load_genui(&app, 32.0)?, crate::gallery::genui_tree()?));
+        } else {
+            crate::gallery::load(&app, 32.0, g == "prims")?;
+        }
     }
     // HARNESS_NATIVE_APPEARANCE=light: the light appearance (the window follows the system's or NSApp's).
     app.dark = std::env::var("HARNESS_NATIVE_APPEARANCE").as_deref() != Ok("light");
@@ -133,6 +139,9 @@ pub fn run(path: &str) -> Result<(), String> {
     let start = Instant::now();
     let tex = renderer.offscreen((w * backing) as usize, (h * backing) as usize);
     loop {
+        if let Some((root, tree)) = &genui {
+            app.fill_genui_gallery(*root, tree);
+        }
         let t = if seq.is_some() { frames as f32 / 60.0 } else { start.elapsed().as_secs_f32() };
         frames += 1;
         // The last hover's shape, resolved by the frame after it moved.

@@ -24,6 +24,8 @@ pub enum PaintKind {
     Picture,
     /// A `Ribbon`: a band in its Fill between the nodes its `RibbonFrom` and `RibbonTo` name.
     Ribbon,
+    /// Its `Vector`: SVG path data filled in its `Fill` and stroked in its `Stroke`, and its `VectorText`, if any.
+    Vector,
 }
 
 /// A node as the draw pass resolved it for one frame (written by `harness-native-ui-draw`, read by the host's renderer). Only the nodes

@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
-import { ELEMENT_NAMES, COMPONENT, TONED, ViewNode, isKnownElement, propError, tableError, toneError } from './element.ts';
+import { AT, ELEMENT_NAMES, COMPONENT, ViewNode, cellError, isKnownElement } from './element.ts';
 import type { CellComponent, Handler } from './element.ts';
+import { SVG_TAGS, attributeError, isSvgTag, unknownTagError } from './draw.ts';
 import { FAILED_SNIPPET, PENDING_SNIPPET, compileComponent } from './compile.ts';
 import { sveltePath } from './files.ts';
 
@@ -87,7 +88,13 @@ const sibling = (node: ViewNode): ViewNode | null => {
 const renderer = {
   createFragment: () => ViewNode.fragment(),
   createElement(name: string): ViewNode {
-    if (!isKnownElement(name)) throw new TypeError(`unknown element ${JSON.stringify(name)}; the elements are ${ELEMENT_NAMES.join(', ')}`);
+    // An SVG tag is the Canvas element it is sent as, keeping its tag so its attributes are read as SVG's (draw.ts).
+    if (isSvgTag(name)) {
+      const node = ViewNode.element(SVG_TAGS[name]!);
+      node.from = name;
+      return node;
+    }
+    if (!isKnownElement(name)) throw cellError(unknownTagError(name));
     return ViewNode.element(name);
   },
   createTextNode: (data: string) => ViewNode.text(String(data)),
@@ -96,11 +103,11 @@ const renderer = {
   getNodeValue: (node: ViewNode) => node.kind === 'text' || node.kind === 'comment' ? node.text : null,
   getAttribute: (node: ViewNode, name: string) => node.props[name] ?? null,
   setAttribute(node: ViewNode, name: string, value: unknown) {
-    // A tone the compiler could not wrap (one in a spread) is still refused, only without its line.
-    const error = name === 'tone' && TONED.has(node.type) ? toneError(node.type, value)
-      : node.type === 'Table' && (name === 'columns' || name === 'rows') ? tableError(name === 'columns' ? value : node.props.columns, name === 'rows' ? value : node.props.rows)
-      : propError(node.type, name, value);
-    if (error) throw error;
+    // Where the cell writes the element (compile.ts gives each its place first), kept off the wire for the errors below.
+    if (name === AT) { node.at = typeof value === 'string' ? value : undefined; return; }
+    // What compile.ts could not check at its line (a spread, a value made of text and expressions) is checked here, at the element's.
+    const error = attributeError(node.from ?? node.type, name, value, node.at, node.props);
+    if (error) throw placed(error, node.at);
     node.setProp(name, value);
   },
   removeAttribute(node: ViewNode, name: string) { node.setProp(name, undefined); },
@@ -116,9 +123,20 @@ const renderer = {
   insert: insertNode,
   remove: removeNode,
   getParent: (node: ViewNode) => node.parent ?? null,
-  addEventListener(node: ViewNode, type: string, handler: unknown) { node.listen(type, handler as Handler); },
+  addEventListener(node: ViewNode, type: string, handler: unknown) {
+    // An event the element has not (`onclick` on a Text, any on a shape) would never be called: refused, as a prop it has not is.
+    const error = attributeError(node.from ?? node.type, `on${type}`, handler, node.at);
+    if (error) throw placed(error, node.at);
+    node.listen(type, handler as Handler);
+  },
   removeEventListener(node: ViewNode, type: string, handler: unknown) { node.unlisten(type, handler as Handler); },
 };
+
+/** `error` as the cell's, at the line and column `at` (`line 5:3: ...`) names. */
+export function placed<E extends Error>(error: E, at: string | undefined): E {
+  const found = at ? /^line (\d+)(?::(\d+))?/.exec(at) : null;
+  return cellError(error, found ? Number(found[1]) : undefined, found?.[2] ? Number(found[2]) : 1);
+}
 
 const components = new Map<string, CellComponent>();
 
@@ -213,12 +231,15 @@ function free(given: Anything | undefined, table: Record<string, CellName>): Any
   });
 }
 
-/** A `tone={...}` of `element` at cell line `line` (compile.ts `checkTones`): the value when it is a tone or none, else the error at that line. */
-function tone(value: unknown, element: string, line: number, at: string): unknown {
-  const error = toneError(element, value, at);
+/**
+ * A prop's `{...}` value on an element of the app's (or an SVG tag) at cell line `line` (compile.ts `checkElements`): the value when it
+ * is one the element reads, else the error at that line and column. `known` holds the element's other props whose values the markup
+ * writes as text (a Chart's `kind`), for the checks that read two together.
+ */
+function prop(value: unknown, element: string, name: string, at: string, known?: Record<string, unknown>): unknown {
+  const error = attributeError(element, name, value, at, known);
   if (!error) return value;
-  error.stack = `TypeError: ${error.message}\n    at repl-cell.js:${line}:1`;
-  throw error;
+  throw placed(error, at);
 }
 
 /** Marks a component that awaits (compile.ts): mounted on its own, it is drawn inside `root()`, which shows a pending line while it loads. */
@@ -243,11 +264,11 @@ export function rooted(body: unknown, given: Record<string, unknown>, onerror: (
 /** The words a failed boundary shows for `error`: its message's first line. */
 const said = (error: unknown): string => String((error as Error | undefined)?.message ?? error).split('\n', 1)[0]!;
 
-/** What compiled components are given as `__repl_svelte` (compile.ts): Svelte's client runtime, the renderer, the brand of a component, the names it reads, its tone check and a failed boundary's words. */
-export function cellRuntime(): { client: Anything; renderer: Anything; component: (fn: unknown, awaits?: boolean) => CellComponent; free: typeof free; tone: typeof tone; said: typeof said } {
+/** What compiled components are given as `__repl_svelte` (compile.ts): Svelte's client runtime, the renderer, the brand of a component, the names it reads, its prop check and a failed boundary's words. */
+export function cellRuntime(): { client: Anything; renderer: Anything; component: (fn: unknown, awaits?: boolean) => CellComponent; free: typeof free; prop: typeof prop; said: typeof said } {
   const { client } = runtime();
   return {
-    client, renderer, free, tone, said,
+    client, renderer, free, prop, said,
     component: (fn: unknown, awaits = false) => Object.defineProperties(fn as CellComponent, {
       [COMPONENT]: { value: true }, [AWAITS]: { value: awaits },
     }),

@@ -2,7 +2,7 @@
 //! a GPU. Copied from den-native's draw.rs (github.com/andrewgazelka/den) and stripped to panels, glyphs and lines.
 use std::rc::Rc;
 
-use crate::pack::{Frame, GlyphInst, ImageInst, LineInst, PanelInst, SpriteInst};
+use crate::pack::{Frame, GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SpriteInst};
 
 pub const ATLAS_SIZE: u32 = 2048;
 
@@ -14,6 +14,8 @@ pub enum SegKind {
     Line,
     /// Indices into [`Draw::sprites`]: procedural cells (box drawing, blocks, braille, sextants, powerline).
     Sprite,
+    /// Indices into [`Draw::paths`]: filled polygons over [`Draw::edges`], anti-aliased, blended in draw order.
+    Path,
     /// One index into [`Draw::images`] (each binds its own texture, so a run is never more than one).
     Image,
 }
@@ -35,6 +37,9 @@ pub struct Draw {
     pub glyphs: Vec<GlyphInst>,
     pub lines: Vec<LineInst>,
     pub sprites: Vec<SpriteInst>,
+    pub paths: Vec<PathInst>,
+    /// Every path's edges (ax, ay, bx, by in points), each path a run of them.
+    pub edges: Vec<[f32; 4]>,
     /// Pictures and their straight RGBA8 texels (`size` wide and high), one texture each.
     pub images: Vec<ImageInst>,
     pub texels: Vec<Rc<[u8]>>,
@@ -68,6 +73,11 @@ impl Draw {
     pub fn line(&mut self, l: LineInst) {
         self.lines.push(l);
         self.push_seg(SegKind::Line, self.lines.len() - 1);
+    }
+
+    pub fn path(&mut self, p: PathInst) {
+        self.paths.push(p);
+        self.push_seg(SegKind::Path, self.paths.len() - 1);
     }
 
     pub fn sprite(&mut self, s: SpriteInst) {

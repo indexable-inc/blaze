@@ -14,3 +14,4 @@ pub mod paint;
 pub mod select;
 pub mod slug;
 pub mod text;
+pub mod vector;
