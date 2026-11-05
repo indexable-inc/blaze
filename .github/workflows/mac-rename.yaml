@@ -1,0 +1,31 @@
+# Temporary (boot-canary lane): does macos-15 let a read-only directory be renamed within its parent?
+name: mac-rename
+on:
+  push:
+    branches: [boot-canary-mac-rename]
+permissions:
+  contents: read
+jobs:
+  t:
+    runs-on: macos-15
+    steps:
+      - run: |
+          sw_vers; diskutil info / | grep -i personality || true
+          cd ~ && mkdir -p .t && cd .t
+          python3 - <<'PY'
+          import os, stat
+          def case(name, fill):
+              os.makedirs(name + "/sub", exist_ok=True)
+              if fill:
+                  open(name + "/f", "w").write("x")
+              os.chmod(name + "/sub", 0o555)
+              os.chmod(name, 0o555)
+              try:
+                  os.rename(name, name + ".final"); print(name, "renamed ok")
+              except OSError as e:
+                  print(name, "rename failed:", e)
+          case(".a.part-1", True)
+          case(".b.part-1", False)
+          os.makedirs(".c.part-1"); os.chmod(".c.part-1", 0o755)
+          os.rename(".c.part-1", "c.final"); print("writable dir renamed ok")
+          PY
