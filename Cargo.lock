@@ -874,15 +874,19 @@ name = "blaze-explore"
 version = "0.0.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
+ "blaze-fetch",
  "blaze-hash",
  "blaze-http",
  "blaze-profile",
+ "blaze-protocol",
  "blaze-rng",
  "blaze-serde",
  "blaze-web",
  "crossbeam-channel",
  "ix-prof",
+ "parking_lot",
  "serde",
  "serde_derive",
  "serde_json",
@@ -901,6 +905,7 @@ dependencies = [
  "blaze-profile",
  "blaze-protocol",
  "blaze-serde",
+ "ix-prof",
  "serde",
  "serde_json",
 ]
