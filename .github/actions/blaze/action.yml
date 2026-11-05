@@ -1,21 +1,14 @@
 # blaze to build and test blaze with (AGENTS.md rule blaze-builds-blaze): the release
 # .github/blaze-version names, installed by site/install.sh into ~/.cargo/bin with the Rust it builds
-# with (its own toolchain, ~/.blaze/toolchains, docs/self-contained.md: no rustup), and blaze's
-# store, the one cache, pulled from the shared remote (.github/actions/blaze-remote) that main's
-# runs push to after their tests. With `llvm: true`, also the LLVM blaze pins
+# with (its own toolchain, ~/.blaze/toolchains, docs/self-contained.md: no rustup), and an empty
+# store at BLAZE_CACHE. With `llvm: true`, also the LLVM blaze pins
 # (crates/hir-ty-codegen/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
 # a build of blaze, which links it (blaze-engine's default `native`). No Nix: the C compiler and linker are the runner's own (gcc and
 # glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
-# The remote's project is the job's, the platform's, and what the store's keys are made with
-# (`blaze-engine cache build`: the store's format and the hash of every source blaze is compiled
-# from, its pinned nightly and LLVM among them), not the release. A key already holds all of
-# those, so the name only picks which packs are worth pulling, never what a key finds: two
-# releases built from the same crates, as most of the release train's are, share their store, and
-# a release whose sources changed starts a project of its own, as its keys would miss every older
-# pack anyway and a project's manifest only grows. A project with no manifest yet pulls nothing.
-# A job reads no other job's project but the one `also` names.
+# No shared remote: the v2 blaze pinned since 0.20261105.0 has no `blaze cache build|pull|push`
+# (its `blaze cache` is `gc` alone), so every run starts from an empty store until v2 has a remote.
 name: blaze
-description: the release of blaze .github/blaze-version names, its toolchain, and the store main's runs pushed
+description: the release of blaze .github/blaze-version names, its toolchain, and an empty store
 inputs:
   job:
     description: the job whose store this is (build, tests)
@@ -23,13 +16,6 @@ inputs:
   llvm:
     description: also the pinned LLVM, as LLVM_SYS_231_PREFIX (true or false)
     default: "false"
-  also:
-    description: another job whose store is pulled too (the tests job takes the build job's), or empty
-    default: ""
-outputs:
-  project:
-    description: the remote's project of this job's store, for the push after it
-    value: ${{ steps.install.outputs.project }}
 runs:
   using: composite
   steps:
@@ -52,7 +38,6 @@ runs:
       shell: bash
       env:
         JOB: ${{ inputs.job }}
-        ALSO: ${{ inputs.also }}
       run: |
         # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
         # as a user's install does, rather than at the first build.
@@ -77,12 +62,7 @@ runs:
           # lives for one job, so nothing needs collecting.
           echo "BLAZE_CACHE_MAX=off" >> "$GITHUB_ENV"
         fi
-        build=$(blaze-engine cache build) || { echo "::error::blaze-engine cache build failed: blaze $version cannot say what its store keys are made with"; exit 1; }
-        [[ "$build" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::blaze-engine cache build said '$build', not sixteen hex digits"; exit 1; }
-        echo "project=blaze-$RUNNER_OS-$RUNNER_ARCH-$JOB-$build" | tee -a "$GITHUB_OUTPUT"
-        if [ -n "$ALSO" ]; then
-          echo "also=blaze-$RUNNER_OS-$RUNNER_ARCH-$ALSO-$build" | tee -a "$GITHUB_OUTPUT"
-        fi
+        mkdir -p "$(grep -m1 '^BLAZE_CACHE=' "$GITHUB_ENV" | cut -d= -f2-)"
     # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
     # sha256 and unpacks it; crates/hir-ty-codegen/build.rs refuses any other prefix. Below
     # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
@@ -129,14 +109,3 @@ runs:
         sudo mkswap "$swap" > /dev/null
         sudo swapon "$swap"
         free -g
-    - uses: ./.github/actions/blaze-remote
-      with:
-        mode: pull
-        project: ${{ steps.install.outputs.project }}
-    # What the other job compiled that this one asks for by the same keys, such as the
-    # libraries the build job compiled for the tests job's programs (harness/unittests.py).
-    - if: inputs.also != ''
-      uses: ./.github/actions/blaze-remote
-      with:
-        mode: pull
-        project: ${{ steps.install.outputs.also }}

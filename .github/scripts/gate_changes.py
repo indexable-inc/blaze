@@ -64,7 +64,6 @@ CODE = (
     ".github/workflows/blaze-platform.yaml",
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
-    ".github/actions/blaze-remote/",
 )
 # What the warm tier (a push to main) reads besides: the std cases of the smoke corpus, run
 # against the blaze that build built.
