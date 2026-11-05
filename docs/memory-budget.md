@@ -211,7 +211,10 @@ are its driver. A daemon that cannot open or lock the ledger stops with an error
   - On macOS, `memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES)` on the daemon's
     own pid, with a fatal active and inactive limit. This is private (rule
     macos-private-apis): the kernel kills the daemon instead of the machine paging itself to
-    death, and a test checks the symbol is there.
+    death, and a test checks the symbol is there. XNU allows it only to root or to a process
+    with the `com.apple.private.memorystatus` entitlement, even on its own pid
+    (`kern_memorystatus.c`). A daemon run by a user gets `EPERM`, says so once in its log, and
+    the watch below is its bound.
   - On Linux, `memory.max` of the daemon's own cgroup where one is delegated
     (`blaze_core::cgroup`), `memory.high` at 15/16 of it.
   - Where neither applies, the daemon's watch thread (100 ms, the footprint
