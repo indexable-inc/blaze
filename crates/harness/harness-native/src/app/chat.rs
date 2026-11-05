@@ -28,9 +28,6 @@ mod pick;
 pub(super) use genui::Live as GenLive;
 pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};
 
-/// A thought's line's icon (cod-lightbulb).
-const THOUGHT: &str = "\u{EA61}";
-
 /// The text being written in a chat's input: its words, the caret and the selection's other end (byte offsets), and an
 /// input method's marked text at the caret.
 #[derive(Clone, Debug, Default)]
@@ -292,16 +289,16 @@ enum Row {
     ListItem { depth: usize, mark: String, text: String },
     Quote(String),
     Code { lang: String, text: String },
-    /// An agent's own tool call: its line (its act's icon, the tool's name, its main argument, how it is going: running,
+    /// An agent's own tool call: its line (the tool's name, its main argument, how it is going: running,
     /// no result) and, opened, its input and result.
-    Tool { block: String, icon: &'static str, name: String, arg: String, state: String, shown: Shown, failed: bool, input: String, result: String },
-    /// A harness REPL cell's line: its step's icon, what it did in words, a detail ("5 results"), and how long it took as
+    Tool { block: String, name: String, arg: String, state: String, shown: Shown, failed: bool, input: String, result: String },
+    /// A harness REPL cell's line (`open`: shown past its line): what it did in words, a detail ("5 results"), and how long it took as
     /// the line's tooltip ([`line`]).
-    Card { block: String, icon: &'static str, words: String, detail: String, tip: String, error: bool },
-    /// A run of tool calls folded to one line ([`Run::summary`]): how many failed, whether one still runs.
-    Run { key: String, icon: &'static str, words: String, failed: usize, running: bool },
+    Card { block: String, words: String, detail: String, tip: String, error: bool, open: bool },
+    /// A run of tool calls folded to one line ([`Run::summary`]): how many failed, whether one still runs, whether it is open.
+    Run { key: String, words: String, failed: usize, running: bool, open: bool },
     /// One step of an opened card that took several.
-    Step { icon: &'static str, words: String, detail: String, error: bool },
+    Step { words: String, detail: String, error: bool },
     /// A table, record or list (the kernel's shown value), its first `cap` rows.
     Grid { v: Arc<Value>, cap: usize },
     /// A markdown table in the agent's words.
@@ -559,40 +556,8 @@ fn step_detail(d: &str) -> String {
     if d == "exit 0" { String::new() } else { d.to_owned() }
 }
 
-/// The icon of a run whose calls all did one kind of thing; a mixed run's is the cell's.
-fn act_icon(a: Act) -> &'static str {
-    kind_icon(match a {
-        Act::Shell => "exec",
-        Act::Read => "read",
-        Act::Edit | Act::Write => "write",
-        Act::Delete => "delete",
-        Act::Search => "search",
-        Act::List => "list",
-        Act::Build => "build",
-        Act::Fetch => "net",
-        Act::Query => "sql",
-        Act::Spawn => "spawn",
-        Act::Cell | Act::Other => "",
-    })
-}
-
-/// codicons by step kind (mcp/src/effects.ts), and for a cell that took no step, an error, a running cell.
-fn kind_icon(kind: &str) -> &'static str {
-    match kind {
-        "exec" => "\u{EA85}",   // cod-terminal
-        "read" => "\u{EA7B}",   // cod-file
-        "write" => "\u{EA73}",  // cod-edit
-        "delete" => "\u{EA81}", // cod-trash
-        "net" => "\u{EB01}",    // cod-globe
-        "search" => "\u{EA6D}", // cod-search
-        "list" => "\u{EA83}",   // cod-folder
-        "build" => "\u{EB6D}",  // cod-tools
-        "spawn" => "\u{EC10}",  // cod-sparkle
-        "sql" => "\u{EACE}",    // cod-database
-        "error" => "\u{EA87}",  // cod-error
-        _ => "\u{EAC4}",        // cod-code
-    }
-}
+/// A drawn view's code button's glyph (cod-code).
+const CODE_ICON: &str = "\u{EAC4}";
 
 /// A line's words with the dot that parts them from its detail ("Ran 2 cells · 2 failed"), when it has one.
 fn dotted(words: String, detail: &str) -> String {
@@ -626,18 +591,18 @@ fn head_lines(s: &str, n: usize) -> String {
 }
 
 /// A card's head: the step running now, else the one step it took, else how many of one kind, else its value.
-fn headline(d: &Detail) -> (&'static str, String, String, bool) {
+fn headline(d: &Detail) -> (String, String, bool) {
     if let Some(e) = d.effects.iter().rev().find(|e| e.status == "running") {
-        return (kind_icon(&e.kind), format!("{}\u{2026}", e.doing), String::new(), false);
+        return (format!("{}\u{2026}", e.doing), String::new(), false);
     }
     if d.status == "error" {
         let why = d.value["message"].as_str().map_or_else(|| "failed".to_owned(), first_line);
-        // One sign of the failure: its words in the failed tone (hn.ChatLineFailed); its icon stays the cell's.
-        return (kind_icon(""), why, String::new(), true);
+        // One sign of the failure: its words in the failed tone (hn.ChatLineFailed).
+        return (why, String::new(), true);
     }
     let failed = d.effects.iter().any(|e| e.status == "error");
     match d.effects.as_slice() {
-        [] if d.status == "running" => (kind_icon(""), "Running\u{2026}".into(), String::new(), false),
+        [] if d.status == "running" => ("Running\u{2026}".into(), String::new(), false),
         [] => {
             let v = &d.value;
             let n = v["total"].as_u64().unwrap_or(0);
@@ -650,12 +615,12 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
                 _ if !empty_value(&d.ui) => "Drew a view".into(),
                 _ => "Done".into(),
             };
-            (kind_icon(""), words, String::new(), false)
+            (words, String::new(), false)
         }
-        [e] => (kind_icon(&e.kind), e.done.clone(), step_detail(&e.detail), failed),
-        [e, rest @ ..] if rest.iter().all(|r| r.kind == e.kind) => (kind_icon(&e.kind), group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
+        [e] => (e.done.clone(), step_detail(&e.detail), failed),
+        [e, rest @ ..] if rest.iter().all(|r| r.kind == e.kind) => (group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
         // Steps of more than one kind: what they did, counted by kind ("Read 3 files, searched 2 times"), as a run sums its calls.
-        [..] => (kind_icon(""), group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
+        [..] => (group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
     }
 }
 
@@ -734,7 +699,7 @@ fn opens(t: &Transcript, g: &Grouped, n: usize, c: &group::Call) -> bool {
 /// however it is folded. A cell that drew (and did not fail) is its view alone, no line over it: the view is the message,
 /// and its code shows under it from the view's hover-only code button.
 fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>, out: &mut Vec<Row>) {
-    let (icon, words, detail, error) = headline(d);
+    let (words, detail, error) = headline(d);
     let code = fold.get(&code_key(block)).copied().unwrap_or(false);
     let draws = !empty_value(&d.ui);
     // A cell that drew is its view: no line over it. Its code is a hover-only button beside the view.
@@ -746,7 +711,7 @@ fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>
         return;
     }
     let tip = d.ms.filter(|_| d.status != "running").map(|ms| format!("Took {}", secs(ms))).unwrap_or_default();
-    out.push(Row::Card { block: block.to_owned(), icon, words: dotted(words, &detail), detail, tip, error });
+    out.push(Row::Card { block: block.to_owned(), words: dotted(words, &detail), detail, tip, error, open: shown != Shown::Folded });
     if draws {
         out.push(Row::Ui { v: d.ui.clone(), cell: d.cell.clone(), block: block.to_owned(), code: false });
     }
@@ -767,12 +732,12 @@ fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>
                 if many {
                     let words = if e.status == "running" { format!("{}\u{2026}", e.doing) } else { e.done.clone() };
                     let detail = step_detail(&e.detail);
-                    out.push(Row::Step { icon: kind_icon(&e.kind), words: dotted(words, &detail), detail, error: e.status == "error" });
+                    out.push(Row::Step { words: dotted(words, &detail), detail, error: e.status == "error" });
                 }
                 value_rows(&e.value, usize::MAX, out);
             }
             if d.dropped > 0 {
-                out.push(Row::Step { icon: kind_icon(""), words: format!("{} more steps, not kept", d.dropped), detail: String::new(), error: false });
+                out.push(Row::Step { words: format!("{} more steps, not kept", d.dropped), detail: String::new(), error: false });
             }
             if d.value["t"] == "scalar" && !d.effects.is_empty() {
                 out.push(Row::Output { text: cell_text(&d.value["v"]), error: false });
@@ -818,10 +783,8 @@ fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>
                 let result = result.as_ref().map(|r| r.text.clone()).unwrap_or_default();
                 // Previewed: the head of its output under its line.
                 let preview = (shown == Shown::Preview && !result.trim().is_empty()).then(|| head_lines(&result, PREVIEW_ROWS));
-                let icon = call.and_then(|c| c.acts.first().copied()).map_or_else(|| kind_icon(""), act_icon);
                 part.push(Row::Tool {
                     block: block.clone(),
-                    icon,
                     name: name.clone(),
                     arg: model::chat::main_arg(input),
                     state,
@@ -859,12 +822,9 @@ fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Ro
             Piece::Run(run) => {
                 let key = run.key();
                 let open = fold.get(&key).copied().unwrap_or(false);
-                let first = run.calls[0].1.acts.first().copied().unwrap_or(Act::Other);
-                let one_kind = run.calls.iter().flat_map(|(_, c)| &c.acts).all(|a| *a == first);
-                let icon = if one_kind { act_icon(first) } else { kind_icon("") };
                 let (failed, running) = (run.failed(), run.running());
                 let words = if failed > 0 || running { dotted(run.summary(), "x") } else { run.summary() };
-                out.push((key.clone(), Row::Run { key, icon, words, failed, running }));
+                out.push((key.clone(), Row::Run { key, words, failed, running, open }));
                 for &n in &run.items {
                     let call = run.calls.iter().find(|(i, _)| *i == n).map(|(_, c)| c);
                     let shows = open
@@ -948,7 +908,7 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
             (&["body", "input"], input.clone(), false),
             (&["body", "result"], tool_result(result).to_owned(), false),
         ],
-        Row::Thinking { open: true, text, .. } => vec![(&["text"], text.trim().to_owned(), false)],
+        Row::Thinking { open: true, text, .. } => vec![(&["body", "text"], text.trim().to_owned(), false)],
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Card { words, .. } | Row::Run { words, .. } => vec![(&["head", "words"], words.clone(), false)],
         Row::Step { words, .. } => vec![(&["words"], words.clone(), false)],
@@ -1282,6 +1242,19 @@ impl App {
                     }
                     if row.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
                         row.set(pad);
+                    }
+                }
+                // A line's own guide (hn.ChatGuideOff, clear) shows as hn.ChatGuide's when the line is one of an opened
+                // run's calls, so the run's calls hang on one guide with what they opened.
+                if matches!(rows[i].1, Row::Tool { .. } | Row::Card { .. } | Row::Thinking { .. })
+                    && let Some(g) = row.part("guide").and_then(|g| g.part("line"))
+                {
+                    let look = if nested.contains(&rows[i].0) { "hn.ChatGuide" } else { "hn.ChatGuideOff" };
+                    let want = view::prefab(w, look).and_then(|p| View::of(p).part("line")).and_then(|l| l.entity().try_cloned::<&Fill>());
+                    if let Some(f) = want
+                        && g.entity().try_cloned::<&Fill>() != Some(f)
+                    {
+                        g.set(f);
                     }
                 }
                 if atomic(&rows[i].1) {
@@ -2139,10 +2112,10 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
                 }
             }
         }
-        Row::Tool { block, icon, name, arg, state, input, result, .. } => {
+        Row::Tool { block, name, arg, state, shown, input, result, .. } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, icon, name, arg, state, "");
+                line(h, name, arg, state, "", Some(*shown != Shown::Folded));
             }
             if let Some(c) = row.part("body").and_then(|b| b.part("card")) {
                 if let Some(i) = c.part("input") {
@@ -2153,27 +2126,29 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
                 }
             }
         }
-        Row::Thinking { block, text: s, live, .. } => {
+        Row::Thinking { block, text: s, live, open } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, THOUGHT, if *live { "Thinking\u{2026}" } else { "Thought" }, "", "", "");
+                line(h, if *live { "Thinking\u{2026}" } else { "Thought" }, "", "", "", Some(*open));
             }
-            text("text", s.trim());
+            if let Some(t) = row.part("body").and_then(|b| b.part("text")) {
+                t.text(s.trim());
+            }
         }
-        Row::Card { block, icon, words, detail, tip, .. } => {
+        Row::Card { block, words, detail, tip, open, .. } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, icon, words, "", detail, tip);
+                line(h, words, "", detail, tip, Some(*open));
             }
         }
-        Row::Run { key, icon, words, failed, running } => {
+        Row::Run { key, words, failed, running, open } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{key}"));
                 let detail = if *failed > 0 { format!("{failed} failed") } else if *running { "running\u{2026}".into() } else { String::new() };
-                line(h, icon, words, "", &detail, "");
+                line(h, words, "", &detail, "", Some(*open));
             }
         }
-        Row::Step { icon, words, detail, .. } => line(row, icon, words, "", detail, ""),
+        Row::Step { words, detail, .. } => line(row, words, "", detail, "", None),
         Row::Grid { v, cap } => fill_grid(row, v, *cap, ctx, measure),
         Row::Table(t) => {
             if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
@@ -2190,7 +2165,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
                 b.action(&format!("chat:open:{}", code_key(block)));
                 tooltip(b, if *code { "Hide code" } else { "Show code" });
                 if let Some(i) = b.part("icon") {
-                    i.icon(kind_icon(""));
+                    i.icon(CODE_ICON);
                     crate::look::hover_show(i.entity(), *row.entity().id(), *code);
                 }
             }
@@ -2374,11 +2349,13 @@ fn select_all_words(e: EntityView<'_>, on: bool) {
     }
 }
 
-/// Fill one line (hn.ChatLine: a call's, a run's, a step's, a thought's): its icon, words, argument in the code face, detail
-/// and, on hover, `tip` (how long it took; none when empty).
-fn line(h: View<'_>, icon: &str, words: &str, arg: &str, detail: &str, tip: &str) {
-    if let Some(p) = h.part("icon") {
-        p.icon(icon);
+/// Fill one line (hn.ChatLine: a call's, a run's, a step's, a thought's): its words, argument in the code face, detail,
+/// on hover `tip` (how long it took; none when empty), and its hover-only chevron turned to `open` (None: a step, which
+/// opens nothing).
+fn line(h: View<'_>, words: &str, arg: &str, detail: &str, tip: &str, open: Option<bool>) {
+    if let (Some(p), Some(open)) = (h.part("chevron"), open) {
+        p.icon(crate::look::CHEVRON);
+        crate::look::disclose(p.entity(), open);
     }
     for (part, s) in [("words", words), ("detail", detail)] {
         if let Some(p) = h.part(part) {

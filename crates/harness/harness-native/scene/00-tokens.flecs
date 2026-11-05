@@ -366,17 +366,22 @@ export const chat_pick_menu_radius = 12
 export const chat_pick_row_h = 30
 export const chat_pick_head_h = 24
 export const chat_row_estimate = 44
-// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): its height, its lead-in, its icon and the
-// gap after it. What sits under a line (its output, its table, its steps) starts under its words (chat_line_inset); a
-// run's calls sit in from its line by its icon's place (chat_nest).
+// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, no icon. Its height, its
+// lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its
+// table, its steps, a run's calls) starts chat_line_inset in, with a faint guide (tone_chat_guide, chat_guide_w wide)
+// at chat_guide_x; a run's calls sit in from its line by chat_nest, so their words start where the content does.
 export const chat_tool_h = 24
 export const chat_line_pad = 4
-export const chat_line_icon = 14
-export const chat_line_gap = 7
+export const chat_line_chevron = 10
+export const chat_guide_x = 8
+export const chat_guide_w = 1
+export const chat_line_inset = 22
+export const chat_nest = $chat_line_inset - $chat_line_pad
 // Between a line's words, its argument and its detail.
 export const chat_line_word_gap = 5
-export const chat_line_inset = $chat_line_pad + $chat_line_icon + $chat_line_gap
-export const chat_nest = $chat_line_icon + $chat_line_gap
+export const tone_chat_guide: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.09}}
+// A drawn view's code button's glyph.
+export const chat_line_icon = 14
 // A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.
 export const chat_view_code = 20
 export const chat_view_code_hang = $chat_view_code + 2
