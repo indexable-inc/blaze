@@ -1,8 +1,14 @@
-//! A chat session's transcript, read from the daemon's agent-neutral chat events (harness/src/chat/mod.rs has the
-//! model): one JSON object a line, `ev` naming it. The attach replays the whole conversation, then streams what comes;
-//! partials (`block_start`, `delta`, `tool_start`, `tool_delta`) grow an item, and the final (`block`, `tool_call`)
+//! A chat session's state from its agent-neutral event log (harness/src/chat/mod.rs has the event model): one JSON object
+//! a line, `ev` naming it. This is the one reducer of that log: the daemon folds every event it records through it (the
+//! chat's title, model, busy state and the agent's own session id for a resume), the daemon's restore of a past chat folds
+//! the log file through it, and the app folds the events an attach sends through it to draw the transcript.
+//!
+//! Partials (`block_start`, `delta`, `tool_start`, `tool_delta`) grow an item, and the final (`block`, `tool_call`)
 //! replaces what they grew. A `tool_detail` (what a harness REPL cell a tool call ran did: its steps and value) is kept by
 //! its call's block beside the items, whole each time, whichever comes first. Nothing here knows which agent wrote it.
+//!
+//! [`lines`] splits a log's bytes into its events, reporting a line that is not whole JSON (the torn last line a crash
+//! mid-append leaves) instead of dropping the log.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -108,6 +114,11 @@ pub struct Transcript {
     pub busy: bool,
     pub agent: String,
     pub model: String,
+    /// The agent's own id for the conversation (Claude's session id, Codex's thread id): what resumes it. Empty when the
+    /// log never said (a chat recorded before `session` events carried it).
+    pub session_id: String,
+    /// The first user message's first line, cut to [`TITLE_CHARS`].
+    pub title: String,
     /// Moves on every change (what the view redraws on).
     pub rev: u64,
     /// Each tool call's REPL cell, by the call's block.
@@ -118,7 +129,51 @@ pub struct Transcript {
     buf: Vec<u8>,
 }
 
+/// Two transcripts are equal when they hold the same conversation: the redraw counter and a part line not finished yet
+/// are bookkeeping, not state.
+impl PartialEq for Transcript {
+    fn eq(&self, o: &Self) -> bool {
+        (&self.items, self.busy, &self.agent, &self.model, &self.session_id, &self.title, &self.details, &self.at)
+            == (&o.items, o.busy, &o.agent, &o.model, &o.session_id, &o.title, &o.details, &o.at)
+    }
+}
+
+/// How many characters of the first user line a title keeps.
+pub const TITLE_CHARS: usize = 60;
+
+/// A chat's title from its first user message: the first non-blank line, cut to [`TITLE_CHARS`] with an ellipsis.
+#[must_use]
+pub fn title_of(text: &str) -> String {
+    let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let mut s: String = first.chars().take(TITLE_CHARS).collect();
+    if first.chars().count() > TITLE_CHARS {
+        s.push('\u{2026}');
+    }
+    s
+}
+
+/// One line of a chat log: its number (from 1), its bytes as written, and its event (None when it is not whole JSON
+/// naming an `ev`: the torn last line a crash mid-append leaves).
+pub type Line<'a> = (usize, &'a [u8], Option<Value>);
+
+/// A chat log's lines (split on `\n`, a trailing piece without one counted as a line), each parsed, blank lines left
+/// out. A line that is not an event comes back with None, for the reader to report and skip; the rest of the log stands.
+pub fn lines(bytes: &[u8]) -> impl Iterator<Item = Line<'_>> {
+    bytes.split(|&b| b == b'\n').enumerate().filter(|(_, l)| !l.iter().all(u8::is_ascii_whitespace)).map(|(i, l)| {
+        (i + 1, l, serde_json::from_slice::<Value>(l).ok().filter(|v| v.get("ev").is_some_and(Value::is_string)))
+    })
+}
+
 impl Transcript {
+    /// The name of tool call `block`, once its call came.
+    #[must_use]
+    pub fn tool_name(&self, block: &str) -> Option<&str> {
+        match self.items.get(*self.at.get(block)?)? {
+            Item::Tool { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
     /// Bytes of the attach stream: whole lines are applied, a part line waits for the rest.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
@@ -154,8 +209,16 @@ impl Transcript {
             "session" => {
                 self.agent = s("agent");
                 self.model = s("model");
+                if let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty()) {
+                    self.session_id = id.to_owned();
+                }
             }
-            "user" => self.push("", Item::User { text: s("text") }),
+            "user" => {
+                if self.title.is_empty() {
+                    self.title = title_of(v["text"].as_str().unwrap_or(""));
+                }
+                self.push("", Item::User { text: s("text") });
+            }
             "busy" => self.busy = v["busy"].as_bool().unwrap_or(false),
             "block_start" => {
                 let item = if v["kind"] == "thinking" {
@@ -202,9 +265,11 @@ impl Transcript {
             "tool_call" => {
                 let (name, input) = (s("name"), v["input"].clone());
                 match self.get(&block) {
-                    Some(Item::Tool { name: n, input: i, done, .. }) => {
+                    Some(Item::Tool { name: n, input: i, partial, done, .. }) => {
                         *n = name;
                         *i = input;
+                        // The whole call replaces its streamed arguments (a replay that left them out holds the same).
+                        partial.clear();
                         *done = true;
                     }
                     _ => self.push(

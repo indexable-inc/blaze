@@ -3,7 +3,7 @@
 //! protocol is `codex app-server generate-ts` (openai/codex `codex-rs/app-server-protocol`, v2).
 //!
 //! The session: `initialize` (answered), the `initialized` notification, `thread/start` in the session's cwd (answered
-//! with the thread and its model); then each user message is a `turn/start` on that thread. Messages sent before the
+//! with the thread and its model), or for a resumed chat `thread/resume` of its thread (answered the same way); then each user message is a `turn/start` on that thread. Messages sent before the
 //! thread exists, or while a turn is in flight, wait here and go one turn each, in order (as Claude queues them).
 //!
 //! What Codex sends per turn: `turn/started`, then per item `item/started` / `item/completed` (an `agentMessage`, a
@@ -35,6 +35,7 @@ const OPT_OUT: &[&str] = &[
 /// What a request of ours was, so its answer can be read.
 enum Pending {
     Initialize,
+    /// `thread/start`, or `thread/resume` (answered alike).
     ThreadStart,
     TurnStart,
     Interrupt,
@@ -51,6 +52,8 @@ struct Open {
 
 pub struct Codex {
     cwd: String,
+    /// The thread to resume instead of starting one.
+    resume: Option<String>,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     thread: Option<String>,
@@ -79,8 +82,19 @@ pub struct Codex {
 impl Codex {
     #[must_use]
     pub fn new(cwd: &str) -> Self {
+        Self::with_thread(cwd, None)
+    }
+
+    /// A chat that resumes Codex's thread `thread` (its id from the chat's log).
+    #[must_use]
+    pub fn resume(cwd: &str, thread: &str) -> Self {
+        Self::with_thread(cwd, Some(thread.to_owned()))
+    }
+
+    fn with_thread(cwd: &str, resume: Option<String>) -> Self {
         Self {
             cwd: cwd.to_owned(),
+            resume,
             next_id: 0,
             pending: HashMap::new(),
             thread: None,
@@ -159,21 +173,34 @@ impl Codex {
                     return self.refuse_waiting(&format!("codex app-server refused initialize: {e}"));
                 }
                 self.out.push(json!({"method": "initialized"}).to_string());
-                let params = json!({"cwd": self.cwd, "approvalPolicy": "never", "sandbox": "danger-full-access"});
-                let line = self.request("thread/start", params, Pending::ThreadStart);
+                let mut params = json!({"cwd": self.cwd, "approvalPolicy": "never", "sandbox": "danger-full-access"});
+                let method = match &self.resume {
+                    Some(thread) => {
+                        // Its turns are already in the chat's log: only the thread's state comes back.
+                        params["threadId"] = json!(thread);
+                        params["excludeTurns"] = json!(true);
+                        "thread/resume"
+                    }
+                    None => "thread/start",
+                };
+                let line = self.request(method, params, Pending::ThreadStart);
                 self.out.push(line);
                 vec![]
             }
             Pending::ThreadStart => {
                 if let Some(e) = err {
                     self.dead = true;
-                    return self.refuse_waiting(&format!("codex app-server refused thread/start: {e}"));
+                    let what = match &self.resume {
+                        Some(t) => format!("thread/resume of thread {t}"),
+                        None => "thread/start".to_owned(),
+                    };
+                    return self.refuse_waiting(&format!("codex app-server refused {what}: {e}"));
                 }
                 let r = &v["result"];
                 self.thread = r["thread"]["id"].as_str().map(str::to_owned);
                 self.pump();
                 let model = r["model"].as_str().or_else(|| r["thread"]["model"].as_str()).unwrap_or("");
-                vec![json!({"ev": "session", "agent": "codex", "model": model})]
+                vec![json!({"ev": "session", "agent": "codex", "model": model, "session_id": self.thread})]
             }
             Pending::TurnStart => {
                 if let Some(e) = err {

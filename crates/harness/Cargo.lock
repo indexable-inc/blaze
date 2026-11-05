@@ -722,6 +722,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "crossterm",
+ "harness-chat",
  "harness-vt",
  "libc",
  "parquet",
@@ -731,6 +732,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "harness-chat"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -843,6 +851,7 @@ dependencies = [
 name = "harness-native-model"
 version = "0.1.0"
 dependencies = [
+ "harness-chat",
  "harness-native-api",
  "harness-native-flecs",
  "harness-vt",

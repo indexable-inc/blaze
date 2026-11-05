@@ -13,8 +13,9 @@
 //!   [`Collapsed`] on a node hides all its children (every run group starts so).
 //! - [`Archived`] on an object takes it out of the tree and into the Archive pane. The `ArchiveRule` system sets it from
 //!   tags and relations alone: [`Closed`] (cmd+W) always, [`Pinned`] never, else a finished object whose parent session
-//!   ended or left the tree, an [`Orphan`] run, and a finished run on the device [`ArchiveAfter`] it ended. A running
-//!   object and a finished top-level session stay.
+//!   ended or left the tree, a finished [`Past`] session (one from before the daemon started), an [`Orphan`] run, and a
+//!   finished run on the device [`ArchiveAfter`] it ended. A running object and a finished top-level session of this
+//!   daemon's stay.
 //! - The Archive pane shows the [`ArchiveView`] entity ([`ARCHIVE`]); older runs come a page at a time ([`Paged`],
 //!   [`History`]) rather than all at once.
 //! - `(Selected, object)` on the app entity is the selection (exclusive). Each pane node of the view holds the exclusive
@@ -23,7 +24,7 @@
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
 //!
 //! The daemon link (a thread in the app) sends [`Msg`]s; the `DaemonInbox` system applies them to the world each frame.
-pub mod chat;
+pub use harness_chat as chat;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -150,6 +151,11 @@ pub struct Closed;
 /// On an object: "Keep in tree" (or Unarchive): the rule never archives it. The host keeps these.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Pinned;
+
+/// On a session: it ended before the daemon started (the daemon's `past`: a chat from before a restart, listed from its
+/// index). Finished, it lives in the Archive like any other past object; resumed, it runs in the tree again.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Past;
 
 /// On a run: it names a session (its own or its REPL's owner) that the daemon no longer lists.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -317,6 +323,7 @@ pub fn register(world: &World) {
     world.component::<Pinned>();
     world.component::<Orphan>();
     world.component::<Busy>();
+    world.component::<Past>();
     world.component::<ChatMode>();
     world.component::<AgentModel>().writable();
     world.component::<Paged>();
@@ -441,7 +448,7 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
 }
 
 /// The session fields [`reconcile`] reads.
-const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy", "mode", "model"];
+const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy", "mode", "model", "past"];
 /// The run fields [`reconcile_runs`] reads, and each stage's.
 const RUN_KEYS: &[&str] = &["id", "status", "exit_code", "cmd", "cwd", "start_ms", "end_ms", "session", "owner"];
 const STAGE_KEYS: &[&str] = &["status", "exit_code", "text", "start_ms", "end_ms"];
@@ -478,6 +485,7 @@ pub fn now_ms() -> u64 {
 /// - Running: kept.
 /// - Finished, under a session: archived once that session ended or left the tree (its runs go with it).
 /// - A finished run that is an [`Orphan`]: archived; one on the device: archived [`ArchiveAfter`] it ended.
+/// - A finished [`Past`] session (it ended before the daemon started): archived.
 /// - A finished top-level session: kept until it is closed.
 ///
 /// One level a frame: a session archived this frame takes its runs with it the next.
@@ -492,6 +500,8 @@ fn install_rule(world: WorldRef<'_>) {
             true
         } else if e.has(Pinned::id()) || is_running(e) {
             false
+        } else if e.has(Past::id()) {
+            true
         } else {
             match e.parent().filter(|p| p.has(Object::id())) {
                 Some(p) => p.has(Archived::id()) || !is_running(p),
@@ -814,6 +824,14 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         let model = s["model"].as_str().unwrap_or("");
         if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model) {
             e.set(AgentModel { s: model.into() });
+        }
+        let past = s["past"].as_bool().unwrap_or(false);
+        if e.has(Past::id()) != past {
+            if past {
+                e.add(Past::id());
+            } else {
+                e.remove(Past::id());
+            }
         }
         let busy = s["busy"].as_bool().unwrap_or(true);
         if e.has(Busy::id()) != busy {

@@ -1,0 +1,10 @@
+[package]
+name = "harness-chat"
+description = "A harness chat's state from its agent-neutral event log: the one reducer the daemon, its restore and the app all use"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde_json = "1"

@@ -10,7 +10,7 @@
 //!
 //! | `ev` | fields | |
 //! | --- | --- | --- |
-//! | `session` | `agent`, `model` | the agent started a turn with this model |
+//! | `session` | `agent`, `model`, `session_id` | the agent started (or resumed) with this model; `session_id` is its own id for the conversation (Claude's session id, Codex's thread id), what a resume names |
 //! | `user` | `text` | the user's message (written by the daemon as it sends it) |
 //! | `busy` | `busy` | a turn started (true) or ended (false) |
 //! | `block_start` | `block`, `kind` (`text` \| `thinking`) | a block began streaming *(partial)* |
@@ -23,7 +23,7 @@
 //! | `tool_detail` | `block`, `cell`, `status`, `ms`, `code`, `effects`, `effects_dropped`, `value`, `ui`, `logs` | what a harness REPL cell the call ran did, whole each time (see below) |
 //! | `note` | `text` | something the agent said that is not the assistant's words (an interrupt) |
 //! | `error` | `text` | the agent reported an error |
-//! | `turn_end` | `ok`, `stop` (`end_turn` \| `interrupted` \| `error` \| ...), `duration_ms`, `cost_usd`, `usage`, `text` | the turn is over; `text` its last assistant words |
+//! | `turn_end` | `ok`, `stop` (`end_turn` \| `interrupted` \| `error` \| ...), `duration_ms`, `cost_usd` (the turn's own; null when the agent says none), `usage`, `text` | the turn is over; `text` its last assistant words |
 //!
 //! ## `tool_detail`: a REPL cell's steps and value
 //!
@@ -52,21 +52,36 @@
 //!   appended to `objects/sN/raw` as it came (the agent's own protocol, kept whole), and every event to
 //!   `objects/sN/chat`, the conversation's record (indexed as the `chat` stream).
 //! - `attach` with `events: true` answers its ok (info `mode: "chat"`), then T_DATA frames of whole event lines: the
-//!   history, then each event live, then T_EXIT. The history leaves out the partials of every block that came whole
-//!   since, so a reattach is the finished conversation plus what is still streaming. Without `events` (the terminal
-//!   client) the same events come as plain text.
+//!   history, then each event live. When the agent exits a T_EXIT says so, and the stream stays open: a chat outlives its
+//!   agent's process, and a resume's events come on the same stream. The history replaces the partials of every block
+//!   that came whole since by that whole event, in the place its first partial took, so a reattach folds to the same
+//!   conversation the live events did (harness-chat's reducer). Without `events` (the terminal client) the same events
+//!   come as plain text, and the stream ends at the agent's exit.
 //! - `send` writes the adapter's user lines and records a `user` event; `interrupt` writes the adapter's interrupt. An
 //!   adapter may also write lines of its own: a handshake as the child starts ([`Adapter::start`]) and answers to what
 //!   the child asks or queued messages once it can take them ([`Adapter::replies`], drained after every line read).
 //! - Busy (the sidebar's breathing dot) is a turn in flight, from a `user` until its `turn_end`. The title is the first
-//!   user message's first line.
+//!   user message's first line (kept in the index's meta too, so `list` names a past chat without reading its log).
 //! - The `messages` stream (what `Obj.reply()` reads) is written here from the events, `turn_end` on each turn's end;
 //!   messages.rs leaves chat sessions alone. `screen` is [`Chat::screen`]: the conversation as plain text.
+//!
+//! # Restore and resume
+//!
+//! The log is the chat: one NDJSON file per session, appended to forever (never compacted). A chat from before this
+//! daemon started is loaded from it on its first attach, send or screen ([`Chat::open`] folds the file through the same
+//! [`Store::absorb`] a live event goes through), and is then a session like any other, its agent not running. A message
+//! to a chat whose agent is not running resumes it: the agent starts again on the same log with its own session id from
+//! the log (Claude: `--resume <session_id>`; Codex: `thread/resume`). A chat that cannot be resumed (no session id in its
+//! log, an agent kind with no resume) gets an `error` event naming why, and the message is not sent; it never starts a
+//! fresh conversation in its place.
 pub mod claude;
 pub mod codex;
 
-use crate::{daemon::Ev, db};
+use crate::daemon::Ev;
 use bytes::Bytes;
+use harness_chat::Transcript;
+#[cfg(test)]
+use harness_chat::Item;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::File;
@@ -99,9 +114,41 @@ pub trait Adapter: Send {
     fn interrupt(&mut self) -> Vec<String>;
 }
 
+/// The adapter of a chat whose agent is not running (restored from its log, before a resume): it reads and writes
+/// nothing.
+pub struct NoAdapter;
+
+impl Adapter for NoAdapter {
+    fn events(&mut self, _: &str) -> Vec<Value> {
+        Vec::new()
+    }
+    fn user(&mut self, _: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn interrupt(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Startup: chats indexed before the index kept titles get theirs, from the first `user` event of their log.
+pub fn backfill_titles() {
+    for oid in crate::db::chats_without_title() {
+        let Ok(log) = std::fs::read(crate::db::object_dir(&oid).join("chat")) else { continue };
+        let first = harness_chat::lines(&log).find_map(|(_, _, ev)| ev.filter(|e| e["ev"] == "user"));
+        if let Some(t) = first.map(|e| harness_chat::title_of(e["text"].as_str().unwrap_or(""))).filter(|t| !t.is_empty()) {
+            crate::db::set_meta(&oid, "title", &json!(t));
+        }
+    }
+}
+
 /// Whether event `ev` is a partial a whole block replaces.
 fn partial(ev: &str) -> bool {
     matches!(ev, "block_start" | "delta" | "tool_start" | "tool_delta")
+}
+
+/// Whether event `ev` starts a block's partials (the place in the conversation its whole form takes).
+fn starts(ev: &str) -> bool {
+    matches!(ev, "block_start" | "tool_start")
 }
 
 /// Whether event `ev` is a block that came whole (it replaces its partials).
@@ -109,56 +156,58 @@ fn whole(ev: &str) -> bool {
     matches!(ev, "block" | "tool_call")
 }
 
-/// A chat's history from its record (`objects/sN/chat`) as a reattach to it live gives it: every event but the partials
-/// of each block that came whole since, and every block's `tool_detail` but its latest. For a chat that ended before this
-/// daemon started.
-pub fn history_of(path: &Path) -> std::io::Result<Vec<String>> {
-    let text = std::fs::read_to_string(path)?;
-    let mut out: Vec<Option<String>> = Vec::new();
-    let mut partials: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut details: HashMap<String, usize> = HashMap::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let ev: Value = serde_json::from_str(line).unwrap_or(Value::Null);
-        let kind = ev["ev"].as_str().unwrap_or("");
-        if let Some(b) = ev["block"].as_str() {
-            if partial(kind) {
-                partials.entry(b.to_owned()).or_default().push(out.len());
-            } else if kind == "tool_detail" {
-                if let Some(i) = details.insert(b.to_owned(), out.len()) {
-                    out[i] = None;
-                }
-            } else if whole(kind) {
-                for i in partials.remove(b).unwrap_or_default() {
-                    out[i] = None;
-                }
-            }
-        }
-        out.push(Some(line.to_owned()));
-    }
-    Ok(out.into_iter().flatten().collect())
-}
-
-/// The history a reattach replays.
+/// A chat's state, folded from its events one at a time: the same fold for an event recorded live and for a line of its
+/// log read back, so a restored chat is the chat it was.
 struct Store {
-    raw: File,
+    raw: Option<File>,
     events: File,
     messages: File,
-    /// Every event, a partial gone (None) once its block came whole.
+    /// The history a reattach replays: every event, a block's partials replaced by its whole form in the place its first
+    /// partial took (so the conversation's order is the live one), every block's `tool_detail` but its latest gone.
     replay: Vec<Option<Arc<str>>>,
     /// Where each block's partials are in `replay`.
     partials: HashMap<String, Vec<usize>>,
-    /// Where each block's latest `tool_detail` is in `replay` (an earlier one is gone once a later came).
+    /// Where each block's latest `tool_detail` is in `replay`.
     details: HashMap<String, usize>,
-    /// Tool call (block) to tool name, for the messages rows of their results.
-    tools: HashMap<String, String>,
+    /// The conversation (the one reducer, harness-chat): title, model, busy, the agent's session id, tool names.
+    transcript: Transcript,
     adapter: Box<dyn Adapter>,
+}
+
+impl Store {
+    /// Fold one event (its line as written, and parsed).
+    fn absorb(&mut self, line: Arc<str>, ev: &Value) {
+        let kind = ev["ev"].as_str().unwrap_or("");
+        let at = self.replay.len();
+        let mut slot = None;
+        if let Some(b) = ev["block"].as_str() {
+            if partial(kind) {
+                self.partials.entry(b.to_owned()).or_default().push(at);
+            } else if kind == "tool_detail" {
+                if let Some(i) = self.details.insert(b.to_owned(), at) {
+                    self.replay[i] = None;
+                }
+            } else if whole(kind) {
+                for i in self.partials.remove(b).unwrap_or_default() {
+                    let first = self.replay[i].as_deref().and_then(|l| serde_json::from_str::<Value>(l).ok());
+                    if slot.is_none() && first.is_some_and(|f| starts(f["ev"].as_str().unwrap_or(""))) {
+                        slot = Some(i);
+                    }
+                    self.replay[i] = None;
+                }
+            }
+        }
+        self.transcript.apply(ev);
+        match slot {
+            Some(i) => self.replay[i] = Some(line),
+            None => self.replay.push(Some(line)),
+        }
+    }
 }
 
 pub struct Chat {
     oid: String,
     store: Mutex<Store>,
-    title: Mutex<String>,
-    model: Mutex<String>,
     /// A turn is in flight.
     pub busy: AtomicBool,
 }
@@ -168,37 +217,67 @@ fn now_ms() -> u64 {
 }
 
 impl Chat {
-    /// A chat's record in `dir` (`objects/sN`), opened for appending, read through `adapter`.
+    /// Chat `oid`'s record in `dir` (`objects/sN`), opened for appending, its log folded back in (a past chat restored, a
+    /// chat resumed; nothing for a new one). A line of the log that is not whole JSON (torn by a crash mid-append) is
+    /// reported, to the daemon's log and as an `error` in the history a reattach replays, and skipped; the rest of the log
+    /// stands. Read through `adapter` from here on.
     pub fn open(oid: &str, dir: &Path, adapter: Box<dyn Adapter>) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let open = |name: &str| std::fs::OpenOptions::new().create(true).append(true).open(dir.join(name));
-        let (raw, events, messages) = (open("raw")?, open("chat")?, open("messages")?);
-        db::index_stream(oid, "chat", &dir.join("chat"));
-        db::index_stream(oid, "messages", &dir.join("messages"));
-        Ok(Self {
-            oid: oid.to_owned(),
-            store: Mutex::new(Store {
-                raw,
-                events,
-                messages,
-                replay: Vec::new(),
-                partials: HashMap::new(),
-                details: HashMap::new(),
-                tools: HashMap::new(),
-                adapter,
-            }),
-            title: Mutex::new(String::new()),
-            model: Mutex::new(String::new()),
-            busy: AtomicBool::new(false),
-        })
+        let log = std::fs::read(dir.join("chat")).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(Vec::new()) } else { Err(e) })?;
+        let mut events = open("chat")?;
+        // A torn last line stays one bad line: what is appended next starts a line of its own.
+        if log.last().is_some_and(|&b| b != b'\n') {
+            events.write_all(b"\n")?;
+        }
+        let mut store = Store {
+            raw: None,
+            events,
+            messages: open("messages")?,
+            replay: Vec::new(),
+            partials: HashMap::new(),
+            details: HashMap::new(),
+            transcript: Transcript::default(),
+            adapter,
+        };
+        for (n, bytes, ev) in harness_chat::lines(&log) {
+            match ev {
+                Some(ev) => store.absorb(Arc::from(String::from_utf8_lossy(bytes).as_ref()), &ev),
+                None => {
+                    let why = format!(
+                        "line {n} of this chat's log ({} bytes) is not a whole event, likely torn by a crash mid-append; skipped",
+                        bytes.len()
+                    );
+                    eprintln!("{oid} chat: {why}");
+                    let ev = json!({"ev": "error", "text": why});
+                    store.replay.push(Some(Arc::from(ev.to_string())));
+                }
+            }
+        }
+        let busy = AtomicBool::new(store.transcript.busy);
+        Ok(Self { oid: oid.to_owned(), store: Mutex::new(store), busy })
+    }
+
+    /// The agent's process (re)starts: its protocol from here on, its raw lines appended to `objects/sN/raw`.
+    pub fn set_adapter(&self, dir: &Path, adapter: Box<dyn Adapter>) -> anyhow::Result<()> {
+        let raw = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("raw"))?;
+        let mut st = self.store.lock().unwrap();
+        st.adapter = adapter;
+        st.raw = Some(raw);
+        Ok(())
     }
 
     pub fn title(&self) -> String {
-        self.title.lock().unwrap().clone()
+        self.store.lock().unwrap().transcript.title.clone()
     }
 
     pub fn model(&self) -> String {
-        self.model.lock().unwrap().clone()
+        self.store.lock().unwrap().transcript.model.clone()
+    }
+
+    /// The agent's own id for this conversation (what resumes it), when its log said one.
+    pub fn session_id(&self) -> Option<String> {
+        Some(self.store.lock().unwrap().transcript.session_id.clone()).filter(|s| !s.is_empty())
     }
 
     /// The lines to write to the child as it starts.
@@ -215,7 +294,9 @@ impl Chat {
         }
         let (evs, replies) = {
             let mut st = self.store.lock().unwrap();
-            if let Err(e) = st.raw.write_all(format!("{line}\n").as_bytes()) {
+            if let Some(raw) = st.raw.as_mut()
+                && let Err(e) = raw.write_all(format!("{line}\n").as_bytes())
+            {
                 eprintln!("{} raw: {e}", self.oid);
             }
             let evs = st.adapter.events(line);
@@ -247,35 +328,22 @@ impl Chat {
         }
     }
 
-    /// Record one event: stamped, appended to the record, kept for reattaches, sent to the attached clients, its messages
-    /// rows written. Whether the busy state changed.
+    /// Record one event: stamped, appended to the log, folded into the chat's state, sent to the attached clients, its
+    /// messages rows written. Whether the busy state or the title changed (what `list` says of it).
     pub fn record(&self, mut ev: Value, tx: &broadcast::Sender<Ev>) -> bool {
         ev["ts"] = json!(now_ms());
-        let kind = ev["ev"].as_str().unwrap_or("").to_owned();
-        let block = ev["block"].as_str().map(str::to_owned);
         let line = ev.to_string();
         let mut st = self.store.lock().unwrap();
         if let Err(e) = st.events.write_all(format!("{line}\n").as_bytes()) {
             eprintln!("{} chat: {e}", self.oid);
         }
-        let at = st.replay.len();
-        st.replay.push(Some(Arc::from(line.as_str())));
-        if let Some(b) = &block {
-            if partial(&kind) {
-                st.partials.entry(b.clone()).or_default().push(at);
-            } else if kind == "tool_detail" {
-                if let Some(i) = st.details.insert(b.clone(), at) {
-                    st.replay[i] = None;
-                }
-            } else if whole(&kind) {
-                for i in st.partials.remove(b).unwrap_or_default() {
-                    st.replay[i] = None;
-                }
-            }
-        }
+        let title = st.transcript.title.is_empty();
+        st.absorb(Arc::from(line.as_str()), &ev);
+        let retitled = title && !st.transcript.title.is_empty();
+        let busy = st.transcript.busy;
         // Sent under the lock, so a reattach's history and its live events neither miss nor double one.
         let _ = tx.send(Ev::Data(Bytes::from(format!("{line}\n"))));
-        let rows = rows(&ev, &mut st.tools);
+        let rows = rows(&ev, &st.transcript);
         if !rows.is_empty() {
             let mut out = Vec::new();
             for mut r in rows {
@@ -289,33 +357,8 @@ impl Chat {
             }
         }
         drop(st);
-        match kind.as_str() {
-            "session" => {
-                if let Some(m) = ev["model"].as_str() {
-                    *self.model.lock().unwrap() = m.to_owned();
-                }
-                false
-            }
-            "user" => {
-                let mut t = self.title.lock().unwrap();
-                if t.is_empty() {
-                    let text = ev["text"].as_str().unwrap_or("");
-                    let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-                    let mut s: String = first.chars().take(60).collect();
-                    if first.chars().count() > 60 {
-                        s.push('\u{2026}');
-                    }
-                    *t = s;
-                    return true;
-                }
-                false
-            }
-            "busy" => {
-                let b = ev["busy"].as_bool().unwrap_or(false);
-                self.busy.swap(b, Ordering::Relaxed) != b
-            }
-            _ => false,
-        }
+        let flipped = self.busy.swap(busy, Ordering::Relaxed) != busy;
+        flipped || retitled
     }
 
     /// The history a reattach starts with, and a receiver for every event after it.
@@ -336,8 +379,8 @@ impl Chat {
     }
 }
 
-/// The messages rows (messages.rs's shape) of one event.
-fn rows(ev: &Value, tools: &mut HashMap<String, String>) -> Vec<Value> {
+/// The messages rows (messages.rs's shape) of one event, `t` the chat with it folded in.
+fn rows(ev: &Value, t: &Transcript) -> Vec<Value> {
     let row = |role: &str, kind: &str, tool: Option<&str>, text: &str| {
         json!({"role": role, "kind": kind, "tool": tool, "text": text})
     };
@@ -346,14 +389,8 @@ fn rows(ev: &Value, tools: &mut HashMap<String, String>) -> Vec<Value> {
         "user" => vec![row("user", "text", None, s("text"))],
         "block" if s("kind") == "thinking" => vec![row("assistant", "thinking", None, s("text"))],
         "block" => vec![row("assistant", "text", None, s("text"))],
-        "tool_call" => {
-            tools.insert(s("block").to_owned(), s("name").to_owned());
-            vec![row("assistant", "tool_call", Some(s("name")), &ev["input"].to_string())]
-        }
-        "tool_result" => {
-            let name = tools.get(s("block")).cloned();
-            vec![row("user", "tool_result", name.as_deref(), s("text"))]
-        }
+        "tool_call" => vec![row("assistant", "tool_call", Some(s("name")), &ev["input"].to_string())],
+        "tool_result" => vec![row("user", "tool_result", t.tool_name(s("block")), s("text"))],
         "turn_end" => vec![row("system", "turn_end", None, s("text"))],
         _ => vec![],
     }
@@ -449,52 +486,126 @@ mod tests {
         fn events(&mut self, _: &str) -> Vec<Value> {
             Vec::new()
         }
-        fn user(&mut self, _: &str) -> String {
-            String::new()
+        fn user(&mut self, _: &str) -> Vec<String> {
+            Vec::new()
         }
-        fn interrupt(&mut self) -> String {
-            String::new()
+        fn interrupt(&mut self) -> Vec<String> {
+            Vec::new()
         }
     }
 
-    /// An ended chat's history read back from its record is the history a live reattach gave, line for line: the
-    /// partials of every block that came whole left out, a block still streaming kept.
+    fn dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("harness-chat-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Two turns as the adapters write them: partials growing blocks and calls (a text block and a tool call streaming at
+    /// once, the call whole before the text), a REPL cell's detail before its call and again after, a result, and a
+    /// second turn cut off with a block still streaming.
+    fn events() -> Vec<Value> {
+        vec![
+            json!({"ev": "session", "agent": "claude", "model": "opus", "session_id": "9f2c"}),
+            json!({"ev": "user", "text": "count the files\nin src"}),
+            json!({"ev": "busy", "busy": true}),
+            json!({"ev": "block_start", "block": "m1:0", "kind": "thinking"}),
+            json!({"ev": "delta", "block": "m1:0", "text": "list "}),
+            json!({"ev": "block", "block": "m1:0", "kind": "thinking", "text": "list them"}),
+            json!({"ev": "block_start", "block": "m1:1", "kind": "text"}),
+            json!({"ev": "delta", "block": "m1:1", "text": "Count"}),
+            json!({"ev": "tool_start", "block": "t1", "name": "ts"}),
+            json!({"ev": "tool_delta", "block": "t1", "json": "{\"code\":"}),
+            json!({"ev": "tool_detail", "block": "t1", "cell": "r.t1", "status": "running", "effects": [], "value": null}),
+            json!({"ev": "tool_call", "block": "t1", "name": "ts", "input": {"code": "await glob('src/*')"}}),
+            json!({"ev": "delta", "block": "m1:1", "text": "ing"}),
+            json!({"ev": "block", "block": "m1:1", "kind": "text", "text": "Counting."}),
+            json!({"ev": "tool_detail", "block": "t1", "cell": "r.t1", "status": "done", "ms": 4,
+                "effects": [{"kind": "search", "done": "Found 3", "status": "ok"}], "value": {"t": "scalar", "type": "number", "v": 3},
+                "ui": {"type": "Text", "props": {"text": "3"}, "children": []}}),
+            json!({"ev": "tool_result", "block": "t1", "text": "3", "error": false}),
+            json!({"ev": "turn_end", "ok": true, "stop": "end_turn", "duration_ms": 900, "cost_usd": 0.02, "text": "Counting."}),
+            json!({"ev": "busy", "busy": false}),
+            json!({"ev": "user", "text": "and tests?"}),
+            json!({"ev": "busy", "busy": true}),
+            json!({"ev": "block_start", "block": "m2:0", "kind": "text"}),
+            json!({"ev": "delta", "block": "m2:0", "text": "Look"}),
+        ]
+    }
+
+    /// persisted-state-round-trips: a chat restored from its log (a fresh daemon's `Chat::open`, then the history a
+    /// reattach sends) folds, through the one reducer, to exactly the state the same events gave fed live, and the
+    /// daemon's own fold of the file equals its fold of the live events. Resume appends to the same log, so a chat
+    /// restored again after more events still matches.
     #[test]
-    fn a_record_replays_as_the_live_history() {
-        let dir = std::env::temp_dir().join(format!("harness-chat-replay-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let open = |n: &str| std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(dir.join(n)).unwrap();
-        let chat = Chat {
-            oid: "s1".into(),
-            store: Mutex::new(Store {
-                raw: open("raw"),
-                events: open("chat"),
-                messages: open("messages"),
-                replay: Vec::new(),
-                partials: HashMap::new(),
-                tools: HashMap::new(),
-                adapter: Box::new(Quiet),
-            }),
-            title: Mutex::new(String::new()),
-            model: Mutex::new(String::new()),
-            busy: AtomicBool::new(false),
+    fn a_restored_chat_is_the_chat_it_was() {
+        let d = dir("roundtrip");
+        let (tx, mut rx) = broadcast::channel(1024);
+        let chat = Chat::open("s1", &d, Box::new(Quiet)).unwrap();
+        let mut live = Transcript::default();
+        let check = |chat: &Chat, live: &Transcript| {
+            let back = Chat::open("s1", &d, Box::new(Quiet)).unwrap();
+            let (history, _) = back.history_and_subscribe(&tx);
+            let mut restored = Transcript::default();
+            restored.feed((history.iter().map(|l| format!("{l}\n")).collect::<String>()).as_bytes());
+            assert_eq!(&restored, live, "restored from the log vs fed live");
+            assert_eq!(back.store.lock().unwrap().transcript, *live, "the daemon's fold of the file");
+            assert_eq!(chat.store.lock().unwrap().transcript, *live, "the daemon's fold of the live events");
+            let (again, _) = chat.history_and_subscribe(&tx);
+            assert_eq!(history, again, "a reattach to the live chat sends the restore's history, byte for byte");
+            back
         };
-        let (tx, _rx) = broadcast::channel(64);
-        for ev in [
-            json!({"ev": "user", "text": "hi"}),
-            json!({"ev": "block_start", "block": "b1", "kind": "text"}),
-            json!({"ev": "delta", "block": "b1", "text": "hel"}),
-            json!({"ev": "tool_start", "block": "t1", "name": "Bash"}),
-            json!({"ev": "block", "block": "b1", "kind": "text", "text": "hello"}),
-            json!({"ev": "tool_delta", "block": "t1", "json": "{"}),
-        ] {
-            chat.record(ev, &tx);
+        let evs = events();
+        let (first, second) = evs.split_at(18);
+        for ev in first {
+            chat.record(ev.clone(), &tx);
         }
-        let (live, _) = chat.history_and_subscribe(&tx);
-        let live: Vec<String> = live.iter().map(|l| l.to_string()).collect();
-        let read = history_of(&dir.join("chat")).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(read, live);
-        assert_eq!(read.len(), 4, "{read:?}");
+        while let Ok(Ev::Data(b)) = rx.try_recv() {
+            live.feed(&b);
+        }
+        assert_eq!(live.items.len(), 5, "{:#?}", live.items);
+        assert!(matches!(&live.items[2], Item::Text { text, .. } if text == "Counting."), "the text before the call it streamed beside");
+        assert_eq!((live.title.as_str(), live.session_id.as_str(), live.busy), ("count the files", "9f2c", false));
+        let back = check(&chat, &live);
+        // Resumed: the restored chat takes the next events, appended to the same log.
+        drop(chat);
+        for ev in second {
+            back.record(ev.clone(), &tx);
+        }
+        while let Ok(Ev::Data(b)) = rx.try_recv() {
+            live.feed(&b);
+        }
+        assert!(live.busy);
+        check(&back, &live);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A crash mid-append leaves a torn last line: a restore reports it (an `error` in the history, naming the line) and
+    /// keeps every whole event before it, and what is recorded next starts a line of its own.
+    #[test]
+    fn a_torn_last_line_is_reported_and_skipped() {
+        let d = dir("torn");
+        let (tx, _rx) = broadcast::channel(1024);
+        let chat = Chat::open("s1", &d, Box::new(Quiet)).unwrap();
+        for ev in &events()[..6] {
+            chat.record(ev.clone(), &tx);
+        }
+        drop(chat);
+        let mut f = std::fs::OpenOptions::new().append(true).open(d.join("chat")).unwrap();
+        f.write_all(br#"{"ev":"block","block":"m1:1","kind":"te"#).unwrap();
+        drop(f);
+        let back = Chat::open("s1", &d, Box::new(Quiet)).unwrap();
+        let (history, _) = back.history_and_subscribe(&tx);
+        let mut t = Transcript::default();
+        t.feed((history.iter().map(|l| format!("{l}\n")).collect::<String>()).as_bytes());
+        assert_eq!(t.title, "count the files");
+        assert!(matches!(t.items.last(), Some(Item::Error { text }) if text.starts_with("line 7 of this chat's log")), "{:#?}", t.items);
+        assert_eq!(t.items.len(), 3, "user, thinking, the report: {:#?}", t.items);
+        back.record(json!({"ev": "note", "text": "after the crash"}), &tx);
+        drop(back);
+        let log = std::fs::read(d.join("chat")).unwrap();
+        let bad: Vec<usize> = harness_chat::lines(&log).filter(|l| l.2.is_none()).map(|l| l.0).collect();
+        assert_eq!(bad, [7], "only the torn line is bad; the next event is whole on its own line");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

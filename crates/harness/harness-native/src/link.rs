@@ -3,7 +3,7 @@
 //!
 //! - [`ensure_daemon`] connects, or starts `harness daemon` the way the CLI's `ensure_daemon` does (setsid, output appended
 //!   to `~/.harness/daemon.log`) and waits for the socket.
-//! - A list thread asks `list` and `runs` and sends the world [`Msg::List`] and [`Msg::Runs`]: again each time the
+//! - A list thread asks `list` (with every past chat) and `runs` and sends the world [`Msg::List`] and [`Msg::Runs`]: again each time the
 //!   daemon's change feed (`watch`) says something changed, or every [`POLL`] against an older daemon without one.
 //! - Each attached object has a thread reading its stream (`attach`: a JSON ok, the snapshot, then live bytes and the
 //!   exit) into [`Msg::Data`] and [`Msg::Exit`]; its write half takes the keyboard (`T_DATA`) and resizes (`T_RESIZE`).
@@ -235,7 +235,9 @@ impl Link {
                 let mut polled = false;
                 loop {
                     let asked = std::time::Instant::now();
-                    let state = match request(&json!({"op": "list"})) {
+                    // Every chat too, from before the daemon's restarts (the Archive files them; opening one asks the
+                    // daemon for its log's events, resuming one sends it a message).
+                    let state = match request(&json!({"op": "list", "chats": true})) {
                         Ok(v) => {
                             rtt_us.store(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
                             if up != Some(LinkState::Up) {
