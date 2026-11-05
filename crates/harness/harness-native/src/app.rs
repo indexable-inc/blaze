@@ -14,7 +14,7 @@ use crate::text::TypeLook;
 use harness_native_api::spring::{Spring, Tune};
 use harness_native_api::{APP, Clock, HoverAmt, moving, settle};
 use harness_native_flecs::prelude::*;
-use harness_native_model::{self as model, Msg};
+use harness_native_model as model;
 use harness_native_render::paint::{Painter, panel_from};
 use harness_native_ui_draw_api::{Paint, PaintKind};
 use harness_native_ui_input_api::{Action, Activated, Hovered, Pointer, PointerState, Pressed};
@@ -381,7 +381,8 @@ impl App {
                 moving(&w);
             }
         });
-        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let rx = model::Mailbox::default();
+        let tx = rx.clone();
         let host = std::process::Command::new("scutil")
             .args(["--get", "ComputerName"])
             .output()
@@ -2031,6 +2032,60 @@ fn set_if(v: View<'_>, fill: Fill) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tree as the daemon's `list` and `runs` tell it, at change `n` (the title and the newest run move each time).
+    fn tree(n: usize) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let sessions = (1..=3)
+            .map(|id| serde_json::json!({"id": id, "kind": "shell", "status": "running", "title": format!("t{n}"), "busy": n % 2 == 0}))
+            .collect();
+        let runs = (0..100)
+            .map(|r| serde_json::json!({"id": format!("r{}", n + r), "status": "done", "cmd": "echo hi", "session": "s1", "stages": []}))
+            .collect();
+        (sessions, runs)
+    }
+
+    /// Property `stalled-inbox-holds-one-tree`: while no frame takes the mail (a window out of sight, so its display link
+    /// stops calling), the daemon announcing a change 20 times a second for ten minutes leaves at most one `list` and
+    /// one `runs` answer waiting, not one per change (each a copy of every session and the last 100 runs: what grew the
+    /// app to 176 GB); and the frame that comes after applies the newest of each, so the world's entities are the same
+    /// as after a frame per change.
+    #[test]
+    fn stalled_inbox_holds_one_tree() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let mail = model::Mailbox::default();
+        let _ = model::install(world.world_ref(), "test", "/nonexistent", mail.clone());
+        mail.send(model::Msg::Link(model::LinkState::Up));
+        let changes = 20 * 600;
+        for n in 0..changes {
+            let (sessions, runs) = tree(n);
+            mail.send(model::Msg::List(sessions));
+            mail.send(model::Msg::Runs(runs));
+            mail.send(model::Msg::Data { id: 1, bytes: b"x".to_vec() });
+            assert!(mail.len() <= 3 + n + 1, "change {n}: {} messages wait", mail.len());
+        }
+        // Only the streamed bytes queue (one per change here): the tree is one answer of each, not `changes` of each.
+        assert_eq!(mail.len(), 1 + 2 + changes, "the link state, one list, one runs and the bytes");
+        world.progress_time(1.0 / 60.0);
+        assert!(mail.is_empty());
+        let stalled = world.world_ref().alive_count();
+        let mut titles = Vec::new();
+        world.new_query::<&model::Title>().each_entity(|_, t| titles.push(t.s.as_str().to_owned()));
+        let title = titles.first().cloned();
+        assert_eq!(title.as_deref(), Some(format!("t{}", changes - 1).as_str()), "the newest list was applied");
+
+        // The same changes, a frame after each: the world ends with as many entities.
+        let world2 = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let mail2 = model::Mailbox::default();
+        let _ = model::install(world2.world_ref(), "test", "/nonexistent", mail2.clone());
+        mail2.send(model::Msg::Link(model::LinkState::Up));
+        for n in 0..changes {
+            let (sessions, runs) = tree(n);
+            mail2.send(model::Msg::List(sessions));
+            mail2.send(model::Msg::Runs(runs));
+            world2.progress_time(1.0 / 60.0);
+        }
+        assert_eq!(world2.world_ref().alive_count(), stalled, "a stalled inbox ends with the same world");
+    }
 
     /// Zoom is a uniform scale with nothing sliding: the picker's highlight (a MatchedGeometry pill on a row of a card
     /// centred in the window, so the zoom moves the row in view points) is mid-slide to a new row when cmd+= lands; in that
