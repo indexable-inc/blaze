@@ -168,7 +168,7 @@ key {
   quit { Keybind: {key: "q", cmd: 1}
     (Does, act.Quit) }
 
-  new { Keybind: {key: "n", cmd: 1}
+  pick_new { Keybind: {key: "n", cmd: 1}
     (Does, act.Picker) }
   new_shell { Keybind: {key: "n", cmd: 1, shift: 1}
     (Does, act.SpawnShell) }
