@@ -115,6 +115,12 @@ const STACK_FRAMES: usize = 8;
 /// A sampled stack's innermost [`STACK_FRAMES`] frames, innermost first, `<` between: where
 /// the time went, then what called it; `< ...` when there are more.
 fn innermost(stack: &StackSeen) -> String {
+    if stack.frames.is_empty() {
+        // Linux's blocked samples: the kernel gives the time of a block, not its stack
+        // (`sampler/linux.rs`), so the span it was inside is what says where.
+        // alloc: a line
+        return "no stack (Linux samples where a thread blocked by its span alone)".to_owned();
+    }
     // alloc: a line
     let mut line = String::new();
     for (i, frame) in stack.frames.iter().rev().take(STACK_FRAMES).enumerate() {

@@ -47,6 +47,9 @@ pub mod json;
 #[cfg(feature = "layer")]
 pub mod layer;
 pub mod live;
+/// blaze's one `perf_event_open` reader, ix-prof's sampler's and blaze-profile's.
+#[cfg(target_os = "linux")]
+pub mod perf;
 pub mod pprof;
 pub mod profile;
 pub mod report;

@@ -320,6 +320,8 @@ pub(crate) fn samples(
         column(UInt64Array::from_iter(samples.iter().map(|it| (it.span != 0).then_some(it.span)))),
         dict(samples.iter().map(|it| if it.on_cpu { "on" } else { "off" })),
         column(pcs.finish()),
+        column(UInt64Array::from_iter(samples.iter().map(|it| (it.job != 0).then_some(it.job)))),
+        column(UInt32Array::from_iter(samples.iter().map(|it| (it.fiber != 0).then_some(it.fiber)))),
     ];
     RecordBatch::try_new(schema, columns)
 }
@@ -611,7 +613,17 @@ mod tests {
         let mut pcs = [0; crate::sampler::DEPTH];
         // Innermost first: 0x10 is where the thread was, 0x21 and 0x31 return addresses.
         pcs[..3].copy_from_slice(&[0x10, 0x21, 0x31]);
-        let sample = Sample { at: now, tid: 12, depth: 3, pcs, span: 41, build: 9, on_cpu: false };
+        let sample = Sample {
+            at: now,
+            tid: 12,
+            depth: 3,
+            pcs,
+            span: 41,
+            build: 9,
+            on_cpu: false,
+            job: 5 << 32 | 3,
+            fiber: 2,
+        };
         let frames: HashMap<u64, Vec<String>, Global> = [
             (0x10, &["typeck", "typeck::inlined"][..]),
             (0x20, &["build"][..]),
@@ -641,6 +653,11 @@ mod tests {
         assert_eq!(cpu.values().as_string::<i32>().value(cpu.keys().value(0) as usize), "off");
         let t_ns = column("t_ns");
         assert_eq!(t_ns.as_primitive::<arrow_array::types::Int64Type>().value(0), 1_000);
+        assert_eq!(
+            column("job").as_primitive::<arrow_array::types::UInt64Type>().value(0),
+            5 << 32 | 3
+        );
+        assert_eq!(column("fiber").as_primitive::<arrow_array::types::UInt32Type>().value(0), 2);
     }
 
     /// A sample outside any span and build has those columns null, not 0.
@@ -655,11 +672,15 @@ mod tests {
             span: 0,
             build: 0,
             on_cpu: true,
+            job: 0,
+            fiber: 0,
         };
         let process = Process { pid: 7, name: "blaze serve", commit: None };
         let batch = samples(&[sample], &HashMap::new_in(Global), (now, 1_000), process).unwrap();
         assert!(batch.column(schema::SAMPLES.column("span_id").unwrap()).is_null(0));
         assert!(batch.column(schema::SAMPLES.column("build_id").unwrap()).is_null(0));
+        assert!(batch.column(schema::SAMPLES.column("job").unwrap()).is_null(0));
+        assert!(batch.column(schema::SAMPLES.column("fiber").unwrap()).is_null(0));
     }
 
     #[test]

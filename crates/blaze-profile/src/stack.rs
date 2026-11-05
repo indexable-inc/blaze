@@ -5,12 +5,12 @@
 //!
 //! A walk reads each record through its caller's `read`, which gives the record's two words or
 //! says it is not readable. The macOS sampler knows the stopped thread's stack bounds and loads
-//! a record inside them ([`load`]); the Linux sampler's handler copies records through
-//! `process_vm_readv` (its `Window`); the panic hook and the signal handler know no bounds (a job
-//! runs on a fiber's stack, a signal's handler on the thread's alternate stack), so they ask
-//! [`probe`] first ([`probed`]): the kernel copies the 16 bytes of a frame record into a pipe,
-//! and refuses with `EFAULT` where they are not readable (unmapped, or a guard page), so a wild
-//! frame pointer ends the walk instead of faulting. Every step is a system call or a plain
+//! a record inside them ([`load`]); on Linux the kernel walks a sampled thread's frame pointers
+//! itself (`perf_event_open`'s user call chains); the panic hook and the signal handler know no
+//! bounds (a job runs on a fiber's stack, a signal's handler on the thread's alternate stack),
+//! so they ask [`probe`] first ([`probed`]): the kernel copies the 16 bytes of a frame record
+//! into a pipe, and refuses with `EFAULT` where they are not readable (unmapped, or a guard
+//! page), so a wild frame pointer ends the walk instead of faulting. Every step is a system call or a plain
 //! load: async-signal-safe, no lock, no allocation.
 
 use std::sync::atomic::{AtomicI32, Ordering};

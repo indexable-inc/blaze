@@ -160,6 +160,15 @@ impl Scale {
         self.mono - (ago as f64 * self.ns_per_tick) as i64
     }
 
+    /// The tick the counter read at `mono` on the schema's clock ([`mono_ns`]): the inverse of
+    /// [`Scale::mono`], before or after [`Scale::now`]. On Linux that clock is
+    /// `CLOCK_MONOTONIC`, the one perf stamps its samples with (`use_clockid`), so a sample's
+    /// time finds its moment in a ring's context log ([`crate::flight`]).
+    pub fn ticks_at(&self, mono: i64) -> u64 {
+        let ago = (self.mono - mono) as f64 / self.ns_per_tick;
+        self.ticks.wrapping_sub(ago as i64 as u64)
+    }
+
     /// The nanoseconds `ticks` ticks last.
     pub fn ns(&self, ticks: u64) -> u64 {
         (ticks as f64 * self.ns_per_tick) as u64

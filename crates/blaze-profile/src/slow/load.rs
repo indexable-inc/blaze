@@ -213,7 +213,7 @@ fn span_stacks_sql(build: u64, window: Option<(i64, i64)>, of: &str, spans: &str
         "WITH RECURSIVE sampled AS (\
            SELECT row_number() OVER () AS sample, process, span_id, \
              CAST(CASE WHEN cpu = 'off' THEN 0 ELSE 1 END AS BIGINT) AS on_cpu, \
-             array_to_string(stack, chr(10)) AS frames \
+             coalesce(array_to_string(stack, chr(10)), '') AS frames \
            FROM samples WHERE span_id IS NOT NULL AND {which}\
          ), up AS (\
            SELECT sampled.sample, s.process, s.span_id, s.parent, CAST(s.name AS VARCHAR) AS name \
@@ -245,8 +245,10 @@ fn span_stacks(batches: &[RecordBatch]) -> Result<Vec<SpanStack>, TimeError> {
         out.push(SpanStack {
             name,
             on_cpu: int(batch, T, "on_cpu", row)? != Some(0),
+            // A blocked sample on Linux has no stack (`sampler/linux.rs`): no frames, not one
+            // empty frame.
             // alloc: a stack's frames, once a stack a report
-            frames: frames.split('\n').map(str::to_owned).collect(),
+            frames: frames.split('\n').filter(|it| !it.is_empty()).map(str::to_owned).collect(),
             samples: uint(batch, T, "samples", row)?.unwrap_or(0),
         });
     }

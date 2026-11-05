@@ -45,12 +45,16 @@ pub(crate) struct Counter {
     pub(crate) value: u64,
 }
 
-/// A CPU sample: the thread, the moment, and the functions on its stack, innermost first.
+/// A CPU sample: the thread, the moment, and the functions on its stack, innermost first; the
+/// span, job and fiber it was taken in (0: none).
 #[derive(Clone, Debug)]
 pub(crate) struct Sampled {
     pub(crate) tid: u64,
     pub(crate) at_us: u64,
     pub(crate) stack: Vec<String>,
+    pub(crate) span: u64,
+    pub(crate) job: u64,
+    pub(crate) fiber: u32,
 }
 
 /// The Chrome trace event format: complete events, with names for the processes and threads.
@@ -131,11 +135,14 @@ pub(crate) fn chrome(
                     "args": {"name": thread}}),
                 )?;
             }
-            let name = it.stack.first().map_or("?", String::as_str);
+            // A blocked sample on Linux has no stack (`sampler/linux.rs` says why): its span
+            // says where it blocked.
+            let name = it.stack.first().map_or("blocked (no stack)", String::as_str);
             put(
                 &mut *out,
                 json!({"ph": "X", "name": name, "cat": "sample", "pid": part.pid, "tid": tid,
-                "ts": it.at_us, "dur": 1, "args": {"stack": it.stack.join("\n")}}),
+                "ts": it.at_us, "dur": 1, "args": {"stack": it.stack.join("\n"), "span": it.span,
+                "job": it.job, "fiber": it.fiber}}),
             )?;
         }
         for it in &part.fibers {
