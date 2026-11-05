@@ -1,5 +1,5 @@
 # Temporary (boot-canary lane, 2026-11-05): one cargo bootstrap build of blaze-engine for
-# x86_64-unknown-linux-gnu, because no ix x86_64 VM can be placed. Deleted with its branch.
+# aarch64-unknown-linux-gnu, because no ix x86_64 VM can be placed. Deleted with its branch.
 name: boot-canary-x64
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-arm
     timeout-minutes: 340
     steps:
       - uses: actions/checkout@v7
@@ -20,10 +20,10 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-10-27 --profile minimal
           sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
+          python3 .github/scripts/llvm.py fetch --target aarch64-unknown-linux-gnu --dir /usr/local/lib/blaze-llvm/aarch64-unknown-linux-gnu
       - name: cargo build
         env:
-          LLVM_SYS_231_PREFIX: /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
+          LLVM_SYS_231_PREFIX: /usr/local/lib/blaze-llvm/aarch64-unknown-linux-gnu
           CARGO_INCREMENTAL: "0"
           BLAZE_RELEASE: v0.20261105.1
           BLAZE_GIT_SHA: cb18c54
@@ -38,6 +38,6 @@ jobs:
           ./out/blaze-engine --version
       - uses: actions/upload-artifact@v7
         with:
-          name: x86_64-unknown-linux-gnu
+          name: aarch64-unknown-linux-gnu
           path: out/
           if-no-files-found: error
