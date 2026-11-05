@@ -115,7 +115,8 @@ jobs:
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site
-      - run: site/node_modules/.bin/tsc -p tools/agents
+      # Under bun: tsc's script asks for node, which ix's runner image does not have.
+      - run: bun site/node_modules/.bin/tsc -p tools/agents
       - run: bun tools/agents/rules.ts --check
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
       # their index (tools/docs.py).
