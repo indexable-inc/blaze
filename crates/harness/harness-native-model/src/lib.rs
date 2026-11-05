@@ -23,6 +23,8 @@
 //!   host's, in [`Terms`] by session id (a parser is no plain data a component can hold).
 //!
 //! The daemon link (a thread in the app) sends [`Msg`]s; the `DaemonInbox` system applies them to the world each frame.
+pub mod chat;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -158,6 +160,17 @@ pub struct Orphan;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Busy;
 
+/// On a session: it runs in chat mode (the daemon's `mode`): its agent speaks structured events, not a terminal, and a chat
+/// pane draws it from its [`Chats`] transcript.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ChatMode;
+
+/// On a chat session: the model its agent said it runs (the daemon's `model`).
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct AgentModel {
+    pub s: ScriptString,
+}
+
 /// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Paged;
@@ -208,6 +221,8 @@ pub enum PaneKind {
     Run,
     /// The Archive (ArchiveView).
     Archive,
+    /// A chat session's transcript and its input ([`ChatMode`]).
+    Chat,
 }
 
 /// The pane kind for `e`. A session whose kind the daemon named something unknown is `(Kind, Proc)` too, but it is a
@@ -218,6 +233,8 @@ pub fn pane_kind(e: EntityView<'_>) -> PaneKind {
     let k = e.target(Kind::id(), 0).map_or(0, |t| *t.id());
     if k == *w.component_id::<ArchiveView>() {
         PaneKind::Archive
+    } else if e.has(ChatMode::id()) {
+        PaneKind::Chat
     } else if k == *w.component_id::<Stage>() || (k == *w.component_id::<Proc>() && !e.has(Object::id())) {
         PaneKind::Run
     } else {
@@ -243,6 +260,9 @@ pub struct Inbox {
 
 /// The terminals of attached objects, by session id.
 pub type Terms = Rc<RefCell<HashMap<u64, harness_vt::Term>>>;
+
+/// The transcripts of attached chat sessions, by session id.
+pub type Chats = Rc<RefCell<HashMap<u64, chat::Transcript>>>;
 
 /// Rows of scrollback a terminal keeps.
 pub const SCROLLBACK: usize = 10_000;
@@ -297,6 +317,8 @@ pub fn register(world: &World) {
     world.component::<Pinned>();
     world.component::<Orphan>();
     world.component::<Busy>();
+    world.component::<ChatMode>();
+    world.component::<AgentModel>().writable();
     world.component::<Paged>();
     world.component::<ArchiveView>();
     world.component::<ArchiveAfter>().writable();
@@ -350,15 +372,16 @@ pub fn nz(n: u16) -> std::num::NonZeroU16 {
 pub const LOCAL: &str = "devices::local";
 
 /// Make the local device and install the inbox: each frame it drains `rx` into the world. Returns the terminal parsers:
-/// the sessions' (by session id) and the runs' and stages' (by entity id).
-pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -> (Terms, Terms) {
+/// the sessions' (by session id) and the runs' and stages' (by entity id), and the chat sessions' transcripts.
+pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -> (Terms, Terms, Chats) {
     let dev = world.entity_named(LOCAL);
     dev.set(Device { host: host.into(), sock: sock.into() });
     dev.add((Link::id(), Connecting::id()));
     let dev = *dev.id();
     let terms: Terms = Rc::default();
     let run_terms: Terms = Rc::default();
-    let parsers = (terms.clone(), run_terms.clone());
+    let chats: Chats = Rc::default();
+    let parsers = (terms.clone(), run_terms.clone(), chats.clone());
     let view = world.entity_named(ARCHIVE);
     view.add((Kind::id(), *world.component_id::<ArchiveView>()));
     view.set(Name { s: "Archive".into() });
@@ -414,11 +437,11 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, rx: Receiver<Msg>) -
         }
         flush(&mut data, &mut idx, inbox);
     });
-    (terms, run_terms)
+    (terms, run_terms, chats)
 }
 
 /// The session fields [`reconcile`] reads.
-const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy"];
+const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy", "mode", "model"];
 /// The run fields [`reconcile_runs`] reads, and each stage's.
 const RUN_KEYS: &[&str] = &["id", "status", "exit_code", "cmd", "cwd", "start_ms", "end_ms", "session", "owner"];
 const STAGE_KEYS: &[&str] = &["status", "exit_code", "text", "start_ms", "end_ms"];
@@ -498,7 +521,7 @@ struct Index {
     stages: HashMap<(u64, u32), u64>,
 }
 
-fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms, Terms), msg: Msg) {
+fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms, chats): &(Terms, Terms, Chats), msg: Msg) {
     let by_id = &mut idx.sessions;
     match msg {
         Msg::Link(s) => {
@@ -512,6 +535,10 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms): &(Terms
         Msg::List(sessions) => reconcile(w, dev, by_id, &sessions),
         Msg::Data { id, bytes } => {
             let Some(e) = by_id.get(&id).map(|&e| w.entity_from_id(e)).filter(|e| e.is_alive()) else { return };
+            if e.has(ChatMode::id()) {
+                chats.borrow_mut().entry(id).or_default().feed(&bytes);
+                return;
+            }
             let mut t = e.try_cloned::<&Term>().unwrap_or(Term { cols: 80, rows: 24, scroll: 0, seq: 0 });
             let mut map = terms.borrow_mut();
             let p = map.entry(id).or_insert_with(|| harness_vt::Term::new(t.cols, t.rows, SCROLLBACK));
@@ -776,6 +803,17 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         let cwd = s["cwd"].as_str().unwrap_or("");
         if e.try_cloned::<&Cwd>().is_none_or(|n| n.s.as_str() != cwd) {
             e.set(Cwd { s: cwd.into() });
+        }
+        if (s["mode"] == "chat") != e.has(ChatMode::id()) {
+            if s["mode"] == "chat" {
+                e.add(ChatMode::id());
+            } else {
+                e.remove(ChatMode::id());
+            }
+        }
+        let model = s["model"].as_str().unwrap_or("");
+        if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model) {
+            e.set(AgentModel { s: model.into() });
         }
         let busy = s["busy"].as_bool().unwrap_or(true);
         if e.has(Busy::id()) != busy {

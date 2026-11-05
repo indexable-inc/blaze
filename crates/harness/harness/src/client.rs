@@ -91,7 +91,7 @@ pub async fn run(spawn: Option<(String, Vec<String>)>) -> Result<()> {
     let mut target = match &spawn {
         Some((kind, args)) => {
             let (cols, rows) = term_size();
-            Some(ctl.req(json!({"op": "spawn", "kind": kind, "args": args, "cwd": cwd, "cols": cols, "rows": rows})).await?["id"].as_u64().unwrap())
+            Some(ctl.req(json!({"op": "spawn", "kind": kind, "args": args, "cwd": cwd, "cols": cols, "rows": rows, "mode": "tui"})).await?["id"].as_u64().unwrap())
         }
         None => ctl.req(json!({"op": "last"})).await?["id"].as_u64(),
     };
@@ -283,7 +283,7 @@ async fn tree(ui: &mut Ui, status: &mut String) -> Result<Option<u64>> {
             _ = ui.winch.recv() => { terminal.autoresize()?; continue }
         };
         let sel_id = state.selected().and_then(|i| rows.get(i)).map(|r| r.0);
-        let spawn = |kind: &str| json!({"op": "spawn", "kind": kind, "cwd": ui.cwd, "cols": term_size().0, "rows": term_size().1});
+        let spawn = |kind: &str| json!({"op": "spawn", "kind": kind, "cwd": ui.cwd, "cols": term_size().0, "rows": term_size().1, "mode": "tui"});
         match key.as_slice() {
             b"q" | b"\x03" => return Ok(None),
             b"j" | b"\x1b[B" | b"\x1bOB" => state.select_next(),

@@ -14,6 +14,7 @@ fn pane_prefab(kind: Option<PaneKind>) -> &'static str {
     match kind {
         Some(PaneKind::Run) => "hn.RunPane",
         Some(PaneKind::Archive) => "hn.ArchivePane",
+        Some(PaneKind::Chat) => "hn.ChatPane",
         _ => "hn.TermPane",
     }
 }
@@ -144,6 +145,7 @@ impl App {
             match shown.map(|e| (e, model::pane_kind(w.entity_from_id(e)))) {
                 Some((e, PaneKind::Run)) => self.fill_run_pane(pane, e),
                 Some((_, PaneKind::Archive)) => self.fill_archive_pane(pane),
+                Some((e, PaneKind::Chat)) => self.fill_chat_pane(pane, e),
                 _ => {}
             }
         }
@@ -341,7 +343,7 @@ impl App {
                 // A fresh parser for the snapshot the attach starts with.
                 self.terms.borrow_mut().remove(&sid);
                 o.set(model::Term { cols, rows, scroll: 0, seq: 0 });
-                self.link.attach(sid, cols, rows);
+                self.link.attach(sid, cols, rows, false);
                 continue;
             }
             let Some(mut tm) = o.try_cloned::<&model::Term>() else { continue };
@@ -748,6 +750,9 @@ impl App {
 
     /// Command-A: everything in the focused terminal, history and screen.
     pub(super) fn select_all(&mut self) {
+        if self.chat_select_all() {
+            return;
+        }
         let Some(t) = self.focused_term() else { return };
         let input = self.input_of(t);
         let (cols, rows) = input.size;
@@ -856,7 +861,13 @@ impl App {
             if self.tree_focus && !k.mods.cmd && !k.mods.ctrl {
                 self.tree_focus = false;
             }
-        } else if self.palette.is_some() {
+            if self.chat_focused() {
+                if !k.mods.cmd && !k.mods.ctrl {
+                    self.chat_type(k.text);
+                }
+                return;
+            }
+        } else if self.palette.is_some() || self.chat_focused() {
             return;
         }
         let Some(t) = self.focused_term() else { return };
@@ -889,7 +900,7 @@ impl App {
             p.at = 0;
             return;
         }
-        if self.archive_text(text) {
+        if self.archive_text(text) || self.chat_type(text) {
             return;
         }
         self.typed();
@@ -898,6 +909,9 @@ impl App {
 
     /// An input method's uncommitted text on the focused terminal (None: none).
     pub fn set_marked(&mut self, text: Option<String>) {
+        if self.chat_set_marked(text.as_deref()) {
+            return;
+        }
         if let Some(t) = self.focused_term() {
             let te = self.world.entity_from_id(t);
             match text.filter(|s| !s.is_empty()) {
@@ -912,6 +926,9 @@ impl App {
     }
 
     pub fn marked(&self) -> Option<String> {
+        if let Some(m) = self.chat_marked() {
+            return m;
+        }
         let t = self.focused_term()?;
         self.world
             .entity_from_id(t)
@@ -923,6 +940,9 @@ impl App {
     /// Where typed text goes (window points): the cell after the focused terminal's cursor and any marked text, for the
     /// input method's candidate window.
     pub fn caret_rect(&self) -> Option<[f32; 4]> {
+        if let Some(r) = self.chat_caret_rect() {
+            return r;
+        }
         let t = self.focused_term()?;
         let g = self.get::<TermGrid>(t);
         if g.w <= 0.0 {
@@ -939,6 +959,9 @@ impl App {
 
     /// The text of the focused terminal's selection, for the pasteboard (None: nothing selected, so Command-C does nothing).
     pub fn copy(&self) -> Option<String> {
+        if let Some(c) = self.chat_copy() {
+            return c;
+        }
         let t = self.focused_term()?;
         let sel = self.get::<TermSelection>(t).get()?;
         self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())
@@ -952,7 +975,7 @@ impl App {
             self.poke();
             return;
         }
-        if self.archive_text(text) {
+        if self.archive_text(text) || self.chat_type(text) {
             return;
         }
         let Some(t) = self.focused_term() else { return };

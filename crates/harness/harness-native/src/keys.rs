@@ -46,6 +46,13 @@ pub struct Bytes {
     pub bytes: ScriptString,
 }
 
+/// An `act.Edit`'s edit of the chat input (src/app/chat.rs `Edit::of`): `left`, `word_left`, `line_start`, `select_left`,
+/// `backspace`, `newline`, `send`, `interrupt`...
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct EditOp {
+    pub op: ScriptString,
+}
+
 /// An action's place in the menu bar: its menu (`bar`), its title, and a separator above it when `sep` is 1.
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct MenuItem {
@@ -68,6 +75,7 @@ pub fn register(world: &World) {
     world.component::<SelectN>().writable();
     world.component::<ZoomStep>().writable();
     world.component::<Bytes>().writable();
+    world.component::<EditOp>().writable();
     world.component::<MenuItem>().writable();
     world.component::<Selector>().writable();
 }
@@ -80,6 +88,7 @@ pub const TERMINAL: &str = "ctx::Terminal";
 pub const TREE: &str = "ctx::Tree";
 pub const PALETTE: &str = "ctx::Palette";
 pub const ARCHIVE: &str = "ctx::Archive";
+pub const CHAT: &str = "ctx::Chat";
 
 /// Keys pressed together, as a binding names them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

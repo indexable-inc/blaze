@@ -16,8 +16,8 @@ use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, S
 use harness_native_ui_motion_api::Pose;
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Caret, Frames, Highlight, Mark, OneLine, Picture, Pixelated, Text, Truncate,
-    TruncateMode,
+    BlazeMark, Caret, Frames, Highlight, Mark, MarkdownText, OneLine, Picture, Pixelated, Text,
+    TextEdit, Truncate, TruncateMode,
 };
 use harness_native_ui_timeline_api::GlyphsIn;
 
@@ -213,6 +213,11 @@ impl Painter {
 
     /// `text` in `style`, broken to `width` points, cached by all three.
     pub fn layout(&mut self, text: &str, style: &TextStyle, width: f32) -> Rc<Layout> {
+        self.layout_as(text, style, width, false)
+    }
+
+    /// [`Painter::layout`], of inline markdown when `md` (`MarkdownText`: the markers out, the faces they ask for in).
+    pub fn layout_as(&mut self, text: &str, style: &TextStyle, width: f32, md: bool) -> Rc<Layout> {
         let st = set_of(style);
         let code = style.role == 9;
         let medium = !code && !st.bold && style.weight == 500;
@@ -221,13 +226,16 @@ impl Painter {
             st.size.to_bits(),
             st.line.to_bits(),
             st.bold,
-            u8::from(code) | u8::from(medium) << 1,
+            u8::from(code) | u8::from(medium) << 1 | u8::from(md) << 2,
             width.to_bits(),
         );
         if let Some(l) = self.layouts.get(&key) {
             return l.clone();
         }
-        let lay = Rc::new(if code {
+        let lay = Rc::new(if md {
+            let m = crate::markdown::inline(text);
+            Layout::rich(&mut self.fonts, &m.text, &m.runs, &[], st, 0.0, width)
+        } else if code {
             Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
         } else if medium {
             Layout::in_face(&mut self.fonts, text, Face::Medium, st, width)
@@ -244,13 +252,13 @@ impl Painter {
         let sizes: Vec<Intrinsic> = wanted
             .iter()
             .map(|t| {
-                let one = self.layout(&t.text, &t.style, 1.0e5);
+                let one = self.layout_as(&t.text, &t.style, 1.0e5, t.markdown);
                 let w = one.lines.iter().map(|l| l.width).fold(0.0, f32::max).ceil();
                 let at = t.at.unwrap_or(w);
                 let lay = if t.one_line || at + 0.5 >= w {
                     one
                 } else {
-                    self.layout(&t.text, &t.style, at)
+                    self.layout_as(&t.text, &t.style, at, t.markdown)
                 };
                 let st = set_of(&t.style);
                 let h = lay.lines.last().map_or(st.line, |l| l.top + l.height).max(st.line);
@@ -344,6 +352,8 @@ impl Painter {
             PaintKind::Glyphs => {
                 let Some(text) = e.try_cloned::<&Text>() else { return Ok(at) };
                 let style = e.try_cloned::<&TextStyle>().unwrap_or_default();
+                let md = e.try_cloned::<&MarkdownText>();
+                let edit = e.try_cloned::<&TextEdit>();
                 let truncate = e
                     .try_cloned::<&Truncate>()
                     .map(|t| t.mode)
@@ -360,7 +370,7 @@ impl Painter {
                     });
                     self.layout(&cut, &style, 1.0e5)
                 } else {
-                    self.layout(text.s.as_str(), &style, laid.w.max(1.0) + 0.5)
+                    self.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md.is_some())
                 };
                 // A Pose's `cut`: that share of its glyphs, from the end, not drawn yet (words typed on). Layout keeps
                 // their room, so nothing moves as they arrive.
@@ -409,6 +419,20 @@ impl Painter {
                     upload,
                     &mut look,
                 );
+                if let Some(m) = md {
+                    // Code spans on a chip, a plate per line they cover.
+                    let chip = rgba(if dark { m.chip_dark } else { m.chip_light });
+                    let shape = Shape { radius: 3.0, n: 4.0, border: 0.0, feather: 0.0 };
+                    for (lo, hi) in crate::markdown::inline(text.s.as_str()).code {
+                        for r in spans_of(&lay, lo, hi) {
+                            let rect = [laid.x + r[0] - 3.0, laid.y + r[1] + 1.0, r[2] + 6.0, r[3] - 2.0];
+                            d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));
+                        }
+                    }
+                }
+                if let Some(t) = edit {
+                    emit_edit(d, &lay, &t, laid, &style, dark, sc, p.alpha);
+                }
                 if let Some(c) =
                     e.try_cloned::<&Caret>().filter(|c| (c.at..c.until).contains(&time))
                 {
@@ -660,5 +684,58 @@ impl Painter {
         let sheet = Rc::new(Sheet { w: info.width, h, frames });
         self.sheets.insert(handle.to_owned(), sheet.clone());
         Ok(sheet)
+    }
+}
+
+/// The rects (x, y from the layout's origin, w, h) of UTF-16 units `lo..hi` of `lay`, one per line they cover.
+fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
+    let mut out = Vec::new();
+    if lo >= hi || lay.lines.is_empty() {
+        return out;
+    }
+    let (x0, l0) = lay.caret(lo);
+    let (x1, l1) = lay.caret(hi);
+    for li in l0..=l1.min(lay.lines.len() - 1) {
+        let l = &lay.lines[li];
+        let a = if li == l0 { x0 } else { 0.0 };
+        let b = if li == l1 { x1 } else { l.width };
+        if b > a {
+            out.push([a, l.top, b - a, l.height]);
+        }
+    }
+    out
+}
+
+/// A `TextEdit`'s selection wash, marked text's underline and caret bar over its words' layout.
+#[allow(clippy::too_many_arguments)]
+fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32) {
+    let square = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
+    let snap = |v: f32| (v * sc).round() / sc;
+    let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
+    if t.focused && lo < hi {
+        let wash = rgba(if dark { t.select_dark } else { t.select_light });
+        for r in spans_of(lay, lo, hi) {
+            d.panel(panel_from(wash, [0.0; 4], square, [laid.x + r[0], laid.y + r[1], r[2], r[3]], alpha));
+        }
+    }
+    let ink = rgba(if dark { t.caret_dark } else { t.caret_light });
+    if t.mark_hi > t.mark_lo {
+        for r in spans_of(lay, t.mark_lo as usize, t.mark_hi as usize) {
+            let y = snap(laid.y + r[1] + r[3] - 2.0);
+            d.panel(panel_from(ink, [0.0; 4], square, [laid.x + r[0], y, r[2], 1.0], alpha));
+        }
+    }
+    if t.focused && lo == hi {
+        let line = set_of(style).line;
+        let (x, top, h) = if lay.lines.is_empty() {
+            (0.0, 0.0, line)
+        } else {
+            let (x, li) = lay.caret(t.caret as usize);
+            let l = &lay.lines[li];
+            (x, l.top, l.height)
+        };
+        let w = (2.0 * sc).round().max(1.0) / sc;
+        let rect = [snap(laid.x + x), snap(laid.y + top + 1.0), w, snap(h - 2.0)];
+        d.panel(panel_from(ink, [0.0; 4], square, rect, alpha));
     }
 }

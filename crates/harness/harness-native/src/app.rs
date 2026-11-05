@@ -27,6 +27,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 mod archive;
+mod chat;
 mod fold;
 mod keys;
 mod panes;
@@ -52,6 +53,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/rows.flecs", include_str!("../scene/widgets/rows.flecs")),
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
+    ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
     ("scene/widgets/stats.flecs", include_str!("../scene/widgets/stats.flecs")),
@@ -142,6 +144,9 @@ pub struct App {
     terms: model::Terms,
     /// The parsers of runs and stages being read, by entity id.
     run_terms: model::Terms,
+    /// The chat sessions' transcripts, by session id, and each chat pane's own state (src/app/chat.rs).
+    chats: model::Chats,
+    chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
     /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
     watching: HashMap<u64, (u64, Option<u32>)>,
     /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
@@ -345,7 +350,7 @@ impl App {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "This Mac".into());
-        let (terms, run_terms) =
+        let (terms, run_terms, chats) =
             model::install(w, &host, &crate::link::sock().display().to_string(), rx);
         let key_file = keys::KeyFile::watch(wake.clone());
         let look = ghostty::Look::new(wake.clone());
@@ -389,6 +394,8 @@ impl App {
             paint,
             terms,
             run_terms,
+            chats,
+            chat: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
             side_w,
@@ -1102,6 +1109,13 @@ impl App {
                 Do::New("claude"),
             ),
             (
+                "new-claude-tui".into(),
+                PalGlyph::Kind("claude"),
+                "New claude (terminal)".into(),
+                self.hint("SpawnClaudeTui"),
+                Do::New("claude-tui"),
+            ),
+            (
                 "new-codex".into(),
                 PalGlyph::Kind("codex"),
                 "New codex".into(),
@@ -1327,6 +1341,7 @@ impl App {
         self.lay_chrome(z);
         self.step_fold();
         self.step_tree_scroll(dt);
+        self.step_chat_scroll();
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
             self.world.set(Viewport { w: view.0, h: view.1 });
@@ -1537,6 +1552,10 @@ impl App {
                 self.set_archive_chip(i);
             } else if a == "arch:more" {
                 self.request_older();
+            } else if let Some(b) = a.strip_prefix("chat:open:") {
+                self.chat_toggle(b);
+            } else if a == "chat:focus" {
+                self.tree_focus = false;
             } else if a == "pal:close" {
                 self.palette = None;
             } else if let Some(i) = a.strip_prefix("pal:").and_then(|s| s.parse::<usize>().ok()) {

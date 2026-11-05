@@ -210,6 +210,8 @@ pub struct SessionRow<'a> {
     pub argv: &'a [String],
     pub created_ms: u64,
     pub meta: Value,
+    /// Its output's stream: `pty` (a terminal session), or `chat` (a chat session's events, chat/mod.rs).
+    pub stream: &'a str,
 }
 
 /// Reserve `name` among running objects; errors with the holder's id if taken.
@@ -233,7 +235,7 @@ pub fn session_start(s: &SessionRow) {
             args: json!(s.argv), created_ms: Some(s.created_ms as i64), status: Some("running"), meta: s.meta.clone(),
             ..Default::default()
         })?;
-        put_stream(&tx, &id, "pty", &object_dir(&id).join("pty"))?;
+        put_stream(&tx, &id, s.stream, &object_dir(&id).join(s.stream))?;
         tx.commit()
     })();
     log("session_start", r);
@@ -250,7 +252,12 @@ pub fn session_end(id: u64, code: i32, status: &str, ended_ms: u64) {
             params![oid, code, ended_ms as i64, status],
         ),
     );
-    log("session_end bytes", c.execute("update streams set bytes = ?2 where object = ?1 and stream = 'pty'", params![oid, size(&object_dir(&oid).join("pty"))]));
+    for stream in ["pty", "chat"] {
+        let path = object_dir(&oid).join(stream);
+        if path.exists() {
+            log("session_end bytes", c.execute("update streams set bytes = ?3 where object = ?1 and stream = ?2", params![oid, stream, size(&path)]));
+        }
+    }
 }
 
 /// At startup nothing is running yet: sessions the last daemon left open died with it, last heard from when their pty
@@ -261,7 +268,7 @@ pub fn mark_lost_sessions() {
         let mut st = c.prepare("select id from objects where status = 'running' and kind not in ('proc', 'stage', 'repl')")?;
         let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for id in ids {
-            let heard = std::fs::metadata(object_dir(&id).join("pty")).and_then(|m| m.modified()).ok();
+            let heard = ["pty", "chat"].iter().find_map(|f| std::fs::metadata(object_dir(&id).join(f)).and_then(|m| m.modified()).ok());
             let ms = heard.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or_else(crate::runs::now_ms, |d| d.as_millis() as u64);
             c.execute("update objects set status = 'lost', ended_ms = coalesce(ended_ms, ?2) where id = ?1", params![id, ms as i64])?;
         }

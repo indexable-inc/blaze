@@ -1,4 +1,5 @@
 mod archive;
+mod chat;
 mod client;
 mod db;
 mod messages;
