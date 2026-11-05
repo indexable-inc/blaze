@@ -2,6 +2,7 @@
 //! the focused one following the app's `(Selected, object)`; and every terminal's sync, drawing and input, which read
 //! and write the `hn.Terminal` node's components rather than any one terminal's fields on the App.
 use super::*;
+use harness_native_ui_motion_api::{CopyFlash, Motion};
 use crate::pane::{
     MarkedText, PaneFocus, PaneNode, TermCursor, TermFocus, TermGrid, TermInput, TermMouse,
     TermNode, TermScroll, TermSelection, Unit,
@@ -448,6 +449,7 @@ impl App {
             .map(|m| m.s.as_str().to_owned())
             .filter(|s| focus && !s.is_empty());
         let sel = self.get::<TermSelection>(t).get();
+        let select = harness_native_render::select::Look::of(self.world.world_ref());
         let paint = term::Paint {
             origin: (g.x, st.top),
             scale: sc,
@@ -457,6 +459,9 @@ impl App {
             theme: &self.look.themes[usize::from(self.dark)],
             time: self.time,
             marked: marked.as_deref(),
+            select: &select,
+            select_ink: select.colour(self.term_ground_dark()),
+            flash: te.try_cloned::<&CopyFlash>(),
         };
         let paint_ = self.paint.get_mut();
         term::draw(
@@ -617,14 +622,8 @@ impl App {
     pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
         self.set_pointer(x, y);
         self.mods = m;
-        if self.resizing {
-            if let Some(side) = self.sidebar() {
-                let left = side.try_cloned::<&Laid>().map_or(0.0, |l| l.x);
-                let v = (self.pointer.x - left).clamp(SIDE_MIN, SIDE_MAX).round();
-                set_side_width(side, v);
-                self.side_w = Some(v);
-            }
-            self.poke();
+        if self.drag.active() {
+            self.side_drag_move();
             return;
         }
         if self.chat_pointer_drag() {
@@ -665,9 +664,9 @@ impl App {
         self.mods = m;
         self.poke();
         self.press = (clicks, m);
-        // On the sidebar's right edge: drag it wider or narrower.
+        // On the sidebar's right edge (or the window's left edge, folded): drag it wider, narrower, shut or open.
         if b == Button::Left && self.on_side_edge() {
-            self.resizing = true;
+            self.side_drag_start();
             return;
         }
         if b == Button::Left {
@@ -718,15 +717,8 @@ impl App {
     pub fn pointer_up(&mut self, x: f32, y: f32, b: Button, m: KeyMods) {
         self.set_pointer(x, y);
         self.mods = m;
-        if self.resizing {
-            self.resizing = false;
-            // Kept for the next launch, but not from an offscreen shot's drag (`persist` off).
-            if self.persist
-                && let Some(v) = self.side_w
-            {
-                crate::prefs::set("sidebar_width", serde_json::json!(v));
-            }
-            self.poke();
+        if self.drag.active() {
+            self.side_drag_end();
             return;
         }
         if b == Button::Left {
@@ -1033,14 +1025,23 @@ impl App {
         Some([x * z, y * z, self.grid.cw * z, self.grid.ch * z])
     }
 
-    /// The text of the focused terminal's selection, for the pasteboard (None: nothing selected, so Command-C does nothing).
-    pub fn copy(&self) -> Option<String> {
+    /// What Command-C puts on the pasteboard: the focused chat's selection, else the focused terminal's (None: nothing
+    /// selected, so it does nothing). What it took pulses (`CopyFlash`, harness-native-render select.rs).
+    pub fn copy(&mut self) -> Option<String> {
         if let Some(c) = self.chat_copy() {
-            return c;
+            let (text, what) = c?;
+            self.chat_flash(&what);
+            self.poke();
+            return Some(text);
         }
         let t = self.focused_term()?;
         let sel = self.get::<TermSelection>(t).get()?;
-        self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())
+        let text = self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())?;
+        let w = self.world.world_ref();
+        let omega = w.try_lookup("ui::spring::copy").and_then(|e| e.try_cloned::<&Motion>()).map_or(0.0, |m| m.omega);
+        self.put(t, CopyFlash::kicked(omega));
+        self.poke();
+        Some(text)
     }
 
     pub fn paste(&mut self, text: &str) {

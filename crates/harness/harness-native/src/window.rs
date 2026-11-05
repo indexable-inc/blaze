@@ -64,6 +64,8 @@ struct State {
     /// The pointer is over the view in the key window (between mouseEntered/mouseMoved and mouseExited or resigning key): only
     /// then does the app set the system pointer, so it never takes it from the window's resize edges or another window.
     inside: bool,
+    /// Where the window rests while the sidebar's over-drag pulls it aside (`App::window_shift`).
+    rest: Option<NSPoint>,
 }
 
 thread_local! {
@@ -655,7 +657,11 @@ impl HarnessView {
     fn pointer_move(&self, event: &NSEvent) {
         let p = self.local(event);
         let m = mods_of(event.modifierFlags());
-        with(|st| st.app.pointer_move(p.x as f32, p.y as f32, m));
+        let pulses = with(|st| {
+            st.app.pointer_move(p.x as f32, p.y as f32, m);
+            st.app.take_haptics()
+        });
+        play(&pulses.unwrap_or_default());
         wake();
     }
 
@@ -770,6 +776,7 @@ impl HarnessView {
                 st.window.setTitle(&NSString::from_str(&st.title));
             }
             apply_cursor(st);
+            shift_window(st);
             let tip = st.app.tooltip();
             if tip != st.tip {
                 st.tip = tip;
@@ -922,6 +929,48 @@ fn ns_cursor(p: Pointer) -> Retained<NSCursor> {
         Pointer::ResizeRight => NSCursor::columnResizeCursorInDirections(NSHorizontalDirections::Right),
         Pointer::ResizeUpDown => NSCursor::rowResizeCursorInDirections(NSVerticalDirections::All),
         Pointer::NotAllowed => NSCursor::operationNotAllowedCursor(),
+    }
+}
+
+/// The whole window rubber-bands after the sidebar is dragged past its widest (den's, after os's `ElasticWindow`):
+/// moved right of where it rested by the app's shift, not draggable meanwhile, and put back exactly there once it
+/// settles. Never in full screen. The app is told the shift applied, so it reads the pointer where the window rests.
+fn shift_window(st: &mut State) {
+    let window = &st.window;
+    let full = window.styleMask().contains(NSWindowStyleMask::FullScreen);
+    let zoom = f64::from(st.app.zoom());
+    let dx = if full { 0.0 } else { (f64::from(st.app.window_shift()) * zoom).round() };
+    match st.rest {
+        None if dx == 0.0 => {}
+        None => {
+            let at = window.frame().origin;
+            st.rest = Some(at);
+            window.setMovable(false);
+            window.setFrameOrigin(NSPoint::new(at.x + dx, at.y));
+        }
+        Some(at) if dx == 0.0 => {
+            window.setFrameOrigin(at);
+            window.setMovable(true);
+            st.rest = None;
+        }
+        Some(at) => window.setFrameOrigin(NSPoint::new(at.x + dx, at.y)),
+    }
+    st.app.set_window_moved((dx / zoom) as f32);
+}
+
+/// Play trackpad pulses (Force Touch trackpads; nothing elsewhere).
+fn play(pulses: &[crate::haptic::Haptic]) {
+    use objc2_app_kit::{
+        NSHapticFeedbackManager, NSHapticFeedbackPattern, NSHapticFeedbackPerformanceTime,
+        NSHapticFeedbackPerformer,
+    };
+    for p in pulses {
+        let pattern = match p {
+            crate::haptic::Haptic::Alignment => NSHapticFeedbackPattern::Alignment,
+            crate::haptic::Haptic::LevelChange => NSHapticFeedbackPattern::LevelChange,
+        };
+        NSHapticFeedbackManager::defaultPerformer()
+            .performFeedbackPattern_performanceTime(pattern, NSHapticFeedbackPerformanceTime::Now);
     }
 }
 
@@ -1131,6 +1180,7 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
             menu_gen,
             cursor: None,
             inside: false,
+            rest: None,
         })
     });
     // The sidebar's material behind the whole window (Finder's, Zed's): the main card covers it with an opaque plate.

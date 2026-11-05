@@ -6,6 +6,7 @@
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
 //! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts.
 use super::*;
+use harness_native_ui_motion_api::{CopyFlash, Motion};
 use harness_native_scroll_physics::{Engine, Input, Mutation, Phase, Vec2};
 use harness_native_ui_layout_api::{ScrollState, ScrollerGrip, scroll_quietly};
 use harness_native_ui_text_api::{Highlight, TextEdit};
@@ -196,6 +197,15 @@ pub struct ChatState {
     drag: Option<Drag>,
     /// The table rows opened below their rows as records, by the transcript row the table is (its key).
     rows_open: HashMap<String, usize>,
+}
+
+/// What a Cmd+C in a chat took, so its pulse plays there: the transcript's selection, the input's, or row `.1` of the
+/// table in transcript row `.0` (its key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Copied {
+    Transcript,
+    Input,
+    TableRow(String, usize),
 }
 
 /// A place in a chat's transcript: row `row`, its `part`th words ([`texts`]), UTF-16 unit `at` of what they show (the
@@ -925,9 +935,8 @@ impl App {
         {
             let room = list.entity().try_cloned::<&Laid>().map_or(600.0, |l| l.h);
             let pad = stack.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().unwrap_or_default();
-            // The transcript's selection, a wash over the words it covers in the input's selection colours.
+            // The transcript's selection: the selection plate under the words it covers (harness-native-render select.rs).
             let sel = st.sel.map(|(a, b)| (a.min(b), a.max(b))).filter(|(a, b)| a != b);
-            let wash = input_text(w, pane).and_then(|t| t.entity().try_cloned::<&TextEdit>()).unwrap_or_default();
             // Tables measure their columns with the typesetter.
             let mut paint = self.paint.borrow_mut();
             let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
@@ -947,13 +956,7 @@ impl App {
                     let range = sel.and_then(|(lo, hi)| covered(lo, hi, i, k, units(&shown(src, *md))));
                     match range.filter(|(a, b)| a < b) {
                         Some((a, b)) => {
-                            let te = TextEdit {
-                                caret: b as u32,
-                                anchor: a as u32,
-                                select_dark: wash.select_dark,
-                                select_light: wash.select_light,
-                                ..TextEdit::default()
-                            };
+                            let te = TextEdit { caret: b as u32, anchor: a as u32, ..TextEdit::default() };
                             if e.try_cloned::<&TextEdit>() != Some(te) {
                                 e.set(te);
                             }
@@ -1283,7 +1286,7 @@ impl App {
 
     /// What the focused chat has selected, for Command-C: its transcript's selection (a row taken whole as markdown),
     /// else its input's.
-    pub(super) fn chat_copy(&self) -> Option<Option<String>> {
+    pub(super) fn chat_copy(&self) -> Option<Option<(String, Copied)>> {
         let (_, _, sid) = self.focused_chat()?;
         let states = self.chat.borrow();
         let Some(st) = states.get(&sid) else { return Some(None) };
@@ -1291,11 +1294,12 @@ impl App {
             let chats = self.chats.borrow();
             let empty = Transcript::default();
             let rows = rows(chats.get(&sid).unwrap_or(&empty), &st.open);
-            return Some(Some(transcript_text(&rows, a.min(b), a.max(b))).filter(|s| !s.is_empty()));
+            let text = transcript_text(&rows, a.min(b), a.max(b));
+            return Some((!text.is_empty()).then_some((text, Copied::Transcript)));
         }
         let picked = st.draft.selected();
         if !picked.is_empty() {
-            return Some(Some(picked.to_owned()));
+            return Some(Some((picked.to_owned(), Copied::Input)));
         }
         // A table row: the one under the pointer, else the first one opened, as a markdown table of its header and it.
         let chats = self.chats.borrow();
@@ -1303,14 +1307,50 @@ impl App {
         let rows = rows(chats.get(&sid).unwrap_or(&empty), &st.open);
         let at = |key: &str, r: usize| {
             let t = rows.iter().find(|(k, _)| k == key).and_then(|(_, row)| row_table(row))?;
-            (r < t.rows.len()).then(|| t.row_markdown(r))
+            (r < t.rows.len()).then(|| (t.row_markdown(r), Copied::TableRow(key.to_owned(), r)))
         };
         if let Some((key, r)) = self.hovered_table_row()
-            && let Some(md) = at(&key, r)
+            && let Some(copied) = at(&key, r)
         {
-            return Some(Some(md));
+            return Some(Some(copied));
         }
         Some(rows.iter().find_map(|(k, _)| st.rows_open.get(k).and_then(|&r| at(k, r))))
+    }
+
+    /// Pulse what a copy in the focused chat took (`what`, from [`Self::chat_copy`]): the transcript's selected words, the
+    /// input's, or a table's row. Each gets a fresh `CopyFlash` on the `ui.spring.copy` spring.
+    pub(super) fn chat_flash(&self, what: &Copied) {
+        let Some((pane, _, _)) = self.focused_chat() else { return };
+        let w = self.world.world_ref();
+        let pv = View::of(w.entity_from_id(pane));
+        let list = pv.part("list").and_then(|l| l.part("rows"));
+        let mut hit: Vec<u64> = Vec::new(); // alloc: the few nodes one copy pulses
+        match what {
+            Copied::Input => hit.extend(input_text(w, pane).map(|t| t.id())),
+            Copied::Transcript => {
+                if let Some(list) = list {
+                    let root = list.id();
+                    w.new_query::<&TextEdit>().each_entity(|e, te| {
+                        if te.anchor != te.caret && std::iter::successors(e.parent(), |n| n.parent()).take(16).any(|n| *n.id() == root) {
+                            hit.push(*e.id());
+                        }
+                    });
+                }
+            }
+            Copied::TableRow(key, r) => {
+                if let Some(row) = list.and_then(|l| l.part(key)) {
+                    hit.extend(view::table::row_node(row.entity(), *r).map(|n| *n.id()));
+                }
+            }
+        }
+        if hit.is_empty() {
+            return;
+        }
+        let omega = w.try_lookup("ui::spring::copy").and_then(|t| t.try_cloned::<&Motion>()).map_or(0.0, |m| m.omega);
+        let whole = matches!(what, Copied::TableRow(..));
+        for id in hit {
+            w.entity_from_id(id).set(CopyFlash { whole, ..CopyFlash::kicked(omega) });
+        }
     }
 
     /// The transcript row (its key) and table row under the pointer, when it is over a table in a chat.

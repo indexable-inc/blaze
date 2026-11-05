@@ -34,7 +34,26 @@ pub struct Disclose {
     pub open: bool,
 }
 
+/// Dragging the sidebar's edge (src/resize.rs, src/app/side_drag.rs), all points: its width's range, the extra travel
+/// past half of `min` that closes or reopens it (`latch`), the most an over-drag past `max` stretches and how soon
+/// (`give`, `soft`), how far back from `max` before touching it pulses again (`rearm`), how near the edge a press grabs
+/// it (`grab`; folded, a press within `reach` of the window's left edge, clear of AppKit's own resize band), and the
+/// least the main card keeps beside it (`keep`, which lowers `max` in a narrow window).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct SideDrag {
+    pub min: f32,
+    pub max: f32,
+    pub latch: f32,
+    pub give: f32,
+    pub soft: f32,
+    pub rearm: f32,
+    pub grab: f32,
+    pub reach: f32,
+    pub keep: f32,
+}
+
 pub fn register(world: &World) {
+    world.component::<SideDrag>().writable();
     // The row templates (scene/widgets/rows.flecs) set these.
     world.component::<Breath>().writable();
     world.component::<HoverShow>().writable();
@@ -75,6 +94,11 @@ pub fn width(w: WorldRef<'_>, name: &str) -> f32 {
         .unwrap_or_else(|| panic!("hn.Theme.{name} has no Size"))
         .w
         .value
+}
+
+/// The sidebar drag's numbers (`hn.Theme.side_drag`).
+pub fn side_drag(w: WorldRef<'_>) -> SideDrag {
+    role(w, "side_drag").try_cloned::<&SideDrag>().unwrap_or_else(|| panic!("hn.Theme.side_drag has no SideDrag"))
 }
 
 /// A role's padding (`badge_on`).

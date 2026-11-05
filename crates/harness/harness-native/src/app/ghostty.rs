@@ -1,7 +1,7 @@
 //! The user's Ghostty config, live (crates/harness/harness-ghostty-config): the terminal's colours, font and padding, and the
 //! tokens that sit on the terminal's ground (the main card, the title bar's inks, the sidebar's tint, the plates),
-//! derived from the theme's ground and ink for each appearance whose theme sets a background. Where nothing is set the
-//! scene's tokens and the built-in theme stay.
+//! derived from the theme's ground and ink for each appearance whose theme sets a background, and the selection plate in its
+//! selection-background. Where nothing is set the scene's tokens and the built-in theme stay.
 use super::*;
 
 /// The terminal's padding when the config sets none (points: left, right, top, bottom).
@@ -60,6 +60,8 @@ pub(super) struct Look {
     scene: Option<Vec<Fill>>,
     /// The scene's Fill of each of [`CODE_ANSI`]'s captures (None: the scene has none for it).
     code: Option<Vec<Option<Fill>>>,
+    /// The scene's selection plate (`ui.selection`'s Fill), read before the first tint.
+    selection: Option<Fill>,
 }
 
 impl Look {
@@ -73,6 +75,7 @@ impl Look {
             pad: DEFAULT_PAD,
             scene: None,
             code: None,
+            selection: None,
         }
     }
 }
@@ -161,6 +164,7 @@ impl App {
         }
         let themed = [cfg.light.background.is_some(), cfg.dark.background.is_some()];
         self.tint_tokens(themed);
+        self.tint_selection();
         eprintln!(
             "harness-native: ghostty config {} (themed light {} dark {}; font {:?} {size}, cell {}x{} px @{}x, padding {pad:?}, blink {blink})",
             if cfg.found { "read" } else { "not found" },
@@ -211,6 +215,19 @@ impl App {
             if e.try_cloned::<&Fill>() != Some(f) {
                 e.set(f);
             }
+        }
+    }
+
+    /// The selection plate (`ui.selection`, every surface's) in Ghostty's selection-background where an appearance's theme
+    /// sets one, else the scene's.
+    fn tint_selection(&mut self) {
+        let w = self.world.world_ref();
+        let scene = *self.look.selection.get_or_insert_with(|| harness_native_render::select::Look::of(w).fill);
+        let e = w.lookup(harness_native_render::select::LOOK);
+        let [l, d] = &self.look.themes;
+        let f = Fill { light: l.select.map_or(scene.light, rgba), dark: d.select.map_or(scene.dark, rgba) };
+        if e.try_cloned::<&Fill>() != Some(f) {
+            e.set(f);
         }
     }
 

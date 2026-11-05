@@ -52,6 +52,12 @@ hn {
     turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
     sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
     lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
+    // Dragging the sidebar's edge (src/resize.rs): its range, latch, stretch, pulse rearm, grab band and the main card's
+    // least; and the spring the window rides back on after an over-drag pulled it aside.
+    side_drag {
+      SideDrag: {min: $side_min, max: $side_max, latch: $side_latch, give: $side_give, soft: $side_soft, rearm: $side_rearm, grab: $side_grab, reach: $side_reach, keep: $side_keep}
+    }
+    window_back { Motion: {omega: $window_back_omega, zeta: $window_back_zeta} }
     // A tree row folding in or away (its height and opacity).
     tree_fold { Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta} }
     // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it), and how

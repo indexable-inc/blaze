@@ -30,8 +30,9 @@ pub struct Theme {
     pub accent: Rgba,
     /// Whether that default cursor blinks (Ghostty's cursor-style-blink = true).
     pub blink: bool,
-    /// Laid over a selected cell's ground (an opaque colour replaces it: Ghostty's selection-background).
-    pub select: Rgba,
+    /// Ghostty's selection-background, when the theme sets one: it retints the app's one selection plate (`ui.selection`,
+    /// src/app/ghostty.rs); None: the scene's.
+    pub select: Option<Rgba>,
     /// A selected cell's ink (Ghostty's selection-foreground); None: its own.
     pub select_fg: Option<Rgba>,
 }
@@ -64,7 +65,7 @@ impl Theme {
             cursor_text: None,
             accent: hex(0x8b9cff),
             blink: false,
-            select: [0.533, 0.553, 1.0, 0.28],
+            select: None,
             select_fg: None,
         }
     }
@@ -82,7 +83,7 @@ impl Theme {
             cursor_text: t.cursor_text.map(rgb),
             accent: cursor.unwrap_or(b.accent),
             blink,
-            select: t.selection_bg.map_or(b.select, rgb),
+            select: t.selection_bg.map(rgb),
             select_fg: t.selection_fg.map(rgb),
         }
     }
@@ -344,6 +345,10 @@ pub struct Paint<'a> {
     pub time: f32,
     /// An input method's uncommitted text, drawn underlined at the cursor.
     pub marked: Option<&'a str>,
+    /// The selection's look (the app's one, harness-native-render select.rs), its colour on this ground, and a copy's pulse.
+    pub select: &'a harness_native_render::select::Look,
+    pub select_ink: Rgba,
+    pub flash: Option<harness_native_ui_motion_api::CopyFlash>,
 }
 
 /// One cell as the drawing reads it, colours resolved (inverse applied): the only thing drawing knows of the parser.
@@ -519,11 +524,8 @@ pub fn draw(
         };
         for (c, cell) in row.iter().enumerate() {
             let c = c as u16;
-            let bg = if p.sel.is_some_and(|s| s.holds(srow, c)) {
-                Some(blend(cell.bg.unwrap_or(theme.bg), theme.select))
-            } else {
-                cell.bg
-            };
+            // The selection is a plate over the grounds (after the rows), not a part of them.
+            let bg = cell.bg;
             if run.map(|r| r.1) != bg {
                 flush(d, &mut run, c);
                 if let Some(bg) = bg {
@@ -553,11 +555,11 @@ pub fn draw(
             let w = if cell.wide { 2 * cw } else { cw };
             let ink = ink_at(cell, r, cu);
             if let Some(sh) = cell.procedural() {
-                // Its own ground under it (selection included), except under the cursor, whose plate shows instead.
-                let bg = if p.sel.is_some_and(|s| s.holds(srow, cu)) {
-                    Some(blend(cell.bg.unwrap_or(theme.bg), theme.select))
-                } else {
-                    cell.bg
+                // Its own ground under it, except under the cursor, whose plate shows instead. A ground of its own hides the
+                // selection's plate drawn before it, so a selected one takes the plate's colour over it.
+                let bg = match cell.bg {
+                    Some(g) if p.sel.is_some_and(|s| s.holds(srow, cu)) => Some(blend(g, p.select_ink)),
+                    g => g,
                 };
                 let under_cursor = show_cursor && (r, cu) == cursor;
                 sprites.push(SpriteInst {
@@ -651,6 +653,25 @@ pub fn draw(
                 }
             }
         }
+    }
+    // The selection: one joined plate over the grounds and under the text, each row from its first selected cell to its
+    // last (a row it runs through whole, the grid's width), pulsing after a copy.
+    if let Some(sel) = p.sel {
+        let ((r0, c0), (r1, c1)) = sel.ordered();
+        let cols = snap.rows.first().map_or(0, Vec::len) as i32;
+        let plates: Vec<harness_native_render::select::Plate> = (0..snap.rows.len() as i64)
+            .filter_map(|r| {
+                let srow = r - p.scroll as i64;
+                if srow < r0 || srow > r1 {
+                    return None;
+                }
+                let a = if srow == r0 { i32::from(c0) } else { 0 };
+                let b = if srow == r1 { i32::from(c1) + 1 } else { cols };
+                let y = oy + r as i32 * ch;
+                (b > a).then(|| harness_native_render::select::Plate::of(pt(ox + a * cw), pt(y), pt((b - a) * cw), pt(ch)))
+            })
+            .collect();
+        harness_native_render::select::emit(d, &plates, p.select, p.select_ink, p.flash, 1.0, sc);
     }
     if let (Some(m), Some((r, a, b))) = (marked, marked_span) {
         // Marked text inline at the cursor on the ground colour, underlined, with a bar caret after it.

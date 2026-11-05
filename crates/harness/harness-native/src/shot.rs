@@ -113,6 +113,9 @@ pub fn run(path: &str) -> Result<(), String> {
             s.split_once(',').and_then(|(k, t)| Some((k.to_owned(), t.trim().parse::<f32>().ok()?)))
         })
         .collect();
+    // HARNESS_NATIVE_SHOT_COPY `t`: Command-C at t seconds, as the window's copy: does, into this offscreen app only: what it
+    // copies is logged, never put on the pasteboard, and what it took pulses (with HARNESS_NATIVE_SHOT_SEQ, mid-pulse).
+    let mut copy_at = std::env::var("HARNESS_NATIVE_SHOT_COPY").ok().and_then(|s| s.trim().parse::<f32>().ok());
     // HARNESS_NATIVE_SHOT_SEQ `t0,t1`: every frame from t0 to t1 seconds also written, as `<path>-<ms>.png` (time is then
     // counted in frames of 1/60 s, so a slow readback does not skip animation).
     let seq =
@@ -159,6 +162,10 @@ pub fn run(path: &str) -> Result<(), String> {
                 wheel = None;
             }
         }
+        if copy_at.take_if(|c| t >= *c).is_some() {
+            let got = app.copy();
+            eprintln!("harness-native: shot copy at {t:.3}: {:?}", got.as_deref().map(|s| s.chars().take(80).collect::<String>()));
+        }
         if let Some((text, _)) = typed.take_if(|k| t >= k.1) {
             app.commit_text(&text);
         }
@@ -167,6 +174,7 @@ pub fn run(path: &str) -> Result<(), String> {
             press(&mut app, &k);
         }
         if up_next {
+            eprintln!("harness-native: drag let go at {:.0} window shift {:.1}", at.0, app.window_shift());
             app.pointer_up(at.0, at.1, left, none);
             up_next = false;
         } else if let Some(d) = drag.take_if(|d| t >= d.get(4).copied().unwrap_or(0.8)) {
@@ -175,6 +183,10 @@ pub fn run(path: &str) -> Result<(), String> {
                 let f = k as f32 / 8.0;
                 at = (d[0] + (d[2] - d[0]) * f, d[1] + (d[3] - d[1]) * f);
                 app.pointer_move(at.0, at.1, none);
+                // The trackpad pulses the drag asked for (window.rs plays them; here they are logged).
+                for h in app.take_haptics() {
+                    eprintln!("harness-native: haptic {h:?} at {:.0}", at.0);
+                }
             }
             up_next = true;
         } else if clicks.first().is_some_and(|c| t >= c.0) {
@@ -197,7 +209,7 @@ pub fn run(path: &str) -> Result<(), String> {
                 (w * backing) as u32,
                 (h * backing) as u32,
             )?;
-            eprintln!("harness-native: seq t={t:.3} {}", app.probe());
+            eprintln!("harness-native: seq t={t:.3} {} shift={:.2}", app.probe(), app.window_shift());
         }
         if t >= secs {
             renderer.render(&draw, Dest::Texture(tex.clone()));

@@ -3,7 +3,7 @@
 version = 1
 
 [blaze]
-release = "0.20261105.0"
+release = "0.20261105.1"
 toolchain = "nightly-2026-10-27"
 
 [native.llvm]

@@ -2,11 +2,13 @@
 mod app;
 use harness_native_render::{boxdraw, draw, gpu, pack, text};
 mod gallery;
+mod haptic;
 mod keys;
 mod link;
 mod look;
 mod pane;
 mod prefs;
+mod resize;
 mod shot;
 mod single;
 mod term;

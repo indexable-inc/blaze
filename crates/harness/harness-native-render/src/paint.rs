@@ -13,7 +13,7 @@ use harness_native_ui_draw_api::{PaintKind, Painted};
 use harness_native_ui_layout::typeset;
 use harness_native_ui_layout_api::Intrinsic;
 use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, Shape, TextStyle};
-use harness_native_ui_motion_api::Pose;
+use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
     BlazeMark, Caret, Frames, Highlight, Mark, MarkdownText, OneLine, Picture, Pixelated, Text,
@@ -22,6 +22,7 @@ use harness_native_ui_text_api::{
 use harness_native_ui_timeline_api::GlyphsIn;
 
 use crate::draw::{ATLAS_SIZE, Draw};
+use crate::select;
 use crate::pack::{GlyphInst, ImageInst, PanelInst};
 use crate::text::{Face, Fonts, Glyph, GlyphCache, Layout, SUBPX, Style, TypeLook};
 
@@ -437,6 +438,12 @@ impl Painter {
                 if let Some(l) = e.try_cloned::<&PressLook>().filter(|_| held) {
                     d.panel(wash(if dark { l.dark } else { l.light }, rect, shape.radius, 1.0));
                 }
+                // A copied plate (a table's row): the selection's plate over it for as long as the copy's pulse lasts.
+                if let Some(f) = e.try_cloned::<&CopyFlash>().filter(|f| f.whole && f.amount() > 0.0) {
+                    let look = select::Look::of(e.world());
+                    let plate = [select::Plate::of(rect[0], rect[1], rect[2], rect[3])];
+                    select::emit(d, &plate, &look, look.colour(dark), Some(f), p.alpha * f.amount(), sc);
+                }
             }
             PaintKind::Glyphs => {
                 let Some(text) = e.try_cloned::<&Text>() else { return Ok(at) };
@@ -516,6 +523,16 @@ impl Painter {
                     let col = std::array::from_fn(|k| col[k] + (hot[k] - col[k]) * heat);
                     Some((col, p.alpha * a, dy))
                 };
+                // The selection, under the words: one joined shape over the rows it covers, pulsing after a copy.
+                if let Some(t) = edit.filter(|t| t.anchor != t.caret) {
+                    let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
+                    let plates: Vec<select::Plate> = spans_of(&lay, lo, hi)
+                        .into_iter()
+                        .map(|r| select::Plate::of(laid.x + r[0], laid.y + r[1], r[2], r[3]))
+                        .collect();
+                    let look = select::Look::of(e.world());
+                    select::emit(d, &plates, &look, look.colour(dark), e.try_cloned::<&CopyFlash>(), p.alpha, sc);
+                }
                 let pen = emit_glyphs(
                     d,
                     &self.fonts,
@@ -820,18 +837,12 @@ fn spans_of(lay: &Layout, lo: usize, hi: usize) -> Vec<[f32; 4]> {
     out
 }
 
-/// A `TextEdit`'s selection wash, marked text's underline and caret bar over its words' layout.
+/// A `TextEdit`'s marked text's underline and caret bar over its words' layout (its selection is drawn under the words).
 #[allow(clippy::too_many_arguments)]
 fn emit_edit(d: &mut Draw, lay: &Layout, t: &TextEdit, laid: Laid, style: &TextStyle, dark: bool, sc: f32, alpha: f32, time: f32) {
     let square = Shape { radius: 0.0, n: 4.0, border: 0.0, feather: 0.0 };
     let snap = |v: f32| (v * sc).round() / sc;
     let (lo, hi) = (t.anchor.min(t.caret) as usize, t.anchor.max(t.caret) as usize);
-    if lo < hi {
-        let wash = rgba(if dark { t.select_dark } else { t.select_light });
-        for r in spans_of(lay, lo, hi) {
-            d.panel(panel_from(wash, [0.0; 4], square, [laid.x + r[0], laid.y + r[1], r[2], r[3]], alpha));
-        }
-    }
     let ink = rgba(if dark { t.caret_dark } else { t.caret_light });
     if t.mark_hi > t.mark_lo {
         for r in spans_of(lay, t.mark_lo as usize, t.mark_hi as usize) {

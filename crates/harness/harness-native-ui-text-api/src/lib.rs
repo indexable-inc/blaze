@@ -97,8 +97,8 @@ pub struct Caret {
 /// Words being edited (a `ui.TextArea`'s): the caret at UTF-16 unit `caret`, the selection from `anchor` to it, an input
 /// method's marked text at `mark_lo..mark_hi` (underlined). The caret is a bar in `caret_*`, drawn while `focused`; with
 /// `blink` it fades on the `Clock` as the terminal's cursor does, solid for a moment after `since` (the clock's time
-/// when it last moved). The selection is a wash in `select_*` (dark, light), drawn focused or not (a transcript's
-/// selection is never focused).
+/// when it last moved). The selection is the scene's one selection plate (`ui.selection`, harness-native-render select.rs),
+/// drawn focused or not (a transcript's selection is never focused), pulsing under a `CopyFlash` on the node.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct TextEdit {
     pub caret: u32,
@@ -110,8 +110,6 @@ pub struct TextEdit {
     pub since: f32,
     pub caret_dark: harness_native_ui_look_api::Rgba,
     pub caret_light: harness_native_ui_look_api::Rgba,
-    pub select_dark: harness_native_ui_look_api::Rgba,
-    pub select_light: harness_native_ui_look_api::Rgba,
 }
 
 /// Words that are code from `file` (a path or a name: its kind says the language): the host colours each stretch in its

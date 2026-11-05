@@ -53,6 +53,34 @@ pub struct Shown {
     pub started: bool,
 }
 
+/// A copy's pulse on what was copied (a selected run of words, a table's row, a terminal): a spring at rest at 0, kicked so
+/// it peaks at 1 and settles back (critically damped on the `ui.spring.copy` token, stepped by harness-native-ui-motion),
+/// and `age`, the seconds since the kick, which the light sweeping each row follows. harness-native-render's select.rs
+/// draws it over the selection plate; at rest it draws nothing and asks for no frames.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct CopyFlash {
+    pub spring: Spring,
+    pub age: f32,
+    /// What was copied is the node's whole rect (a table's row), drawn as a selection plate over it while the pulse lasts;
+    /// false: only the node's own selection (a `TextEdit`'s words, a terminal's cells), which its painter pulses.
+    pub whole: bool,
+}
+
+impl CopyFlash {
+    /// A pulse kicked now on a spring of `omega` rad/s: a critically damped spring pushed at `omega * e` from rest peaks at 1,
+    /// `1 / omega` seconds later.
+    #[must_use]
+    pub fn kicked(omega: f32) -> Self {
+        Self { spring: Spring { x: 0.0, v: omega * std::f32::consts::E }, age: 0.0, whole: false }
+    }
+
+    /// How far into the pulse it is: 0 at rest, 1 at its peak.
+    #[must_use]
+    pub fn amount(&self) -> f32 {
+        self.spring.x.clamp(0.0, 1.0)
+    }
+}
+
 /// The host's target for a node's spring when no state decides it (the composer's height, the scroller's fade).
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Target(pub f32);
@@ -200,6 +228,7 @@ hyperion_api_layouts::api_layouts! {
     "ShownWhen" => alias ShownWhen,
     "Shown" => alias Shown,
     "Target" => alias Target,
+    "CopyFlash" => alias CopyFlash,
 }
 
 /// Register the vocabulary before scenes and systems, retaining writable scene properties.
@@ -211,6 +240,7 @@ pub fn register(world: &World) {
     world.component::<ShownWhen>().writable();
     world.component::<Shown>();
     world.component::<Target>();
+    world.component::<CopyFlash>();
     world.component::<MatchedGeometry>().writable();
     world.component::<Matched>();
     world.component::<Drawn>();
