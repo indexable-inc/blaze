@@ -8,6 +8,7 @@
 //! (`subtype` success or error_*, `duration_ms`, `total_cost_usd` (since the process started), `usage`, `result`, `terminal_reason`). An interrupt
 //! (`control_request` subtype interrupt) is answered by a `control_response`, the partial block whole, a `user` line
 //! "[Request interrupted by user]" and a `result` with terminal_reason `aborted_streaming`.
+use harness_proto::event::{Body, Kind};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -34,7 +35,7 @@ pub struct Claude {
 }
 
 impl Claude {
-    fn partial(&mut self, e: &Value) -> Vec<Value> {
+    fn partial(&mut self, e: &Value) -> Vec<Body> {
         match e["type"].as_str().unwrap_or("") {
             "message_start" => {
                 self.message = e["message"]["id"].as_str().unwrap_or("").to_owned();
@@ -45,15 +46,15 @@ impl Claude {
                 let i = e["index"].as_u64().unwrap_or(0);
                 let b = &e["content_block"];
                 match b["type"].as_str().unwrap_or("") {
-                    kind @ ("text" | "thinking") => {
+                    k @ ("text" | "thinking") => {
                         let block = format!("{}:{i}", self.message);
                         self.at.insert(i, block.clone());
-                        vec![json!({"ev": "block_start", "block": block, "kind": kind})]
+                        vec![Body::BlockStart { block, kind: kind(k) }]
                     }
                     "tool_use" => {
                         let block = b["id"].as_str().unwrap_or("").to_owned();
                         self.at.insert(i, block.clone());
-                        vec![json!({"ev": "tool_start", "block": block, "name": tool_name(b["name"].as_str().unwrap_or(""))})]
+                        vec![Body::ToolStart { block, name: tool_name(b["name"].as_str().unwrap_or("")) }]
                     }
                     _ => vec![],
                 }
@@ -64,10 +65,11 @@ impl Claude {
                     return vec![];
                 }
                 let d = &e["delta"];
+                let s = |k: &str| d[k].as_str().unwrap_or("").to_owned();
                 match d["type"].as_str().unwrap_or("") {
-                    "text_delta" => vec![json!({"ev": "delta", "block": block, "text": d["text"]})],
-                    "thinking_delta" => vec![json!({"ev": "delta", "block": block, "text": d["thinking"]})],
-                    "input_json_delta" => vec![json!({"ev": "tool_delta", "block": block, "json": d["partial_json"]})],
+                    "text_delta" => vec![Body::Delta { block, text: s("text") }],
+                    "thinking_delta" => vec![Body::Delta { block, text: s("thinking") }],
+                    "input_json_delta" => vec![Body::ToolDelta { block, json: s("partial_json") }],
                     _ => vec![],
                 }
             }
@@ -75,7 +77,7 @@ impl Claude {
         }
     }
 
-    fn assistant(&mut self, v: &Value) -> Vec<Value> {
+    fn assistant(&mut self, v: &Value) -> Vec<Body> {
         let id = v["message"]["id"].as_str().unwrap_or("").to_owned();
         let mut out = Vec::new();
         for b in v["message"]["content"].as_array().into_iter().flatten() {
@@ -83,22 +85,23 @@ impl Claude {
             let index = *n;
             *n += 1;
             match b["type"].as_str().unwrap_or("") {
-                kind @ ("text" | "thinking") => {
+                k @ ("text" | "thinking") => {
                     let block = format!("{id}:{index}");
-                    let text = b[kind].as_str().unwrap_or("").to_owned();
-                    if kind == "text" && !text.trim().is_empty() {
+                    let text = b[k].as_str().unwrap_or("").to_owned();
+                    if k == "text" && !text.trim().is_empty() {
                         self.last_text.clone_from(&text);
                     }
                     self.done.insert(block.clone());
-                    out.push(json!({"ev": "block", "block": block, "kind": kind, "text": text}));
+                    out.push(Body::Block { block, kind: kind(k), text });
                 }
                 "tool_use" => {
                     let block = b["id"].as_str().unwrap_or("").to_owned();
                     self.done.insert(block.clone());
-                    out.push(json!({
-                        "ev": "tool_call", "block": block, "name": tool_name(b["name"].as_str().unwrap_or("")),
-                        "input": b["input"],
-                    }));
+                    out.push(Body::ToolCall {
+                        block,
+                        name: tool_name(b["name"].as_str().unwrap_or("")),
+                        input: b["input"].clone(),
+                    });
                 }
                 _ => {}
             }
@@ -106,25 +109,26 @@ impl Claude {
         out
     }
 
-    fn from_user(&mut self, v: &Value) -> Vec<Value> {
+    fn from_user(&mut self, v: &Value) -> Vec<Body> {
         let mut out = Vec::new();
         let content = &v["message"]["content"];
         if let Some(s) = content.as_str() {
-            return vec![json!({"ev": "note", "text": s})];
+            return vec![Body::Note { text: s.to_owned() }];
         }
         for b in content.as_array().into_iter().flatten() {
             match b["type"].as_str().unwrap_or("") {
-                "tool_result" => out.push(json!({
-                    "ev": "tool_result", "block": b["tool_use_id"], "text": result_text(&b["content"]),
-                    "error": b["is_error"].as_bool().unwrap_or(false),
-                })),
+                "tool_result" => out.push(Body::ToolResult {
+                    block: b["tool_use_id"].as_str().unwrap_or("").to_owned(),
+                    text: result_text(&b["content"]),
+                    error: b["is_error"].as_bool().unwrap_or(false),
+                }),
                 "text" => {
                     let t = b["text"].as_str().unwrap_or("");
                     if t.starts_with("[Request interrupted") {
                         self.interrupted = true;
-                        out.push(json!({"ev": "note", "text": "Interrupted"}));
+                        out.push(Body::Note { text: "Interrupted".to_owned() });
                     } else {
-                        out.push(json!({"ev": "note", "text": t}));
+                        out.push(Body::Note { text: t.to_owned() });
                     }
                 }
                 _ => {}
@@ -133,7 +137,7 @@ impl Claude {
         out
     }
 
-    fn result(&mut self, v: &Value) -> Vec<Value> {
+    fn result(&mut self, v: &Value) -> Vec<Body> {
         let ok = v["subtype"] == "success" && !v["is_error"].as_bool().unwrap_or(false);
         let stop = if self.interrupted || v["terminal_reason"] == "aborted_streaming" {
             "interrupted".to_owned()
@@ -143,7 +147,7 @@ impl Claude {
             "error".to_owned()
         };
         let text = v["result"].as_str().map_or_else(|| std::mem::take(&mut self.last_text), str::to_owned);
-        let cost = v["total_cost_usd"].as_f64().map(|total| {
+        let cost_usd = v["total_cost_usd"].as_f64().map(|total| {
             let turn = ((total - self.cost_before) * 1e9).round() / 1e9;
             self.cost_before = total;
             turn
@@ -151,13 +155,17 @@ impl Claude {
         let mut out = Vec::new();
         if stop == "error" {
             let why = v["errors"].as_array().and_then(|e| e.first()).and_then(Value::as_str).unwrap_or("the turn failed");
-            out.push(json!({"ev": "error", "text": why}));
+            out.push(Body::Error { text: why.to_owned() });
         }
-        out.push(json!({
-            "ev": "turn_end", "ok": ok, "stop": stop, "duration_ms": v["duration_ms"], "cost_usd": cost,
-            "usage": v["usage"], "text": text,
-        }));
-        out.push(json!({"ev": "busy", "busy": false}));
+        out.push(Body::TurnEnd {
+            ok,
+            stop,
+            duration_ms: v["duration_ms"].as_u64(),
+            cost_usd,
+            usage: v["usage"].clone(),
+            text,
+        });
+        out.push(Body::Busy { busy: false });
         self.last_text.clear();
         self.interrupted = false;
         self.done.clear();
@@ -171,6 +179,11 @@ fn tool_name(n: &str) -> String {
     n.strip_prefix("mcp__harness__").or_else(|| n.strip_prefix("mcp__")).unwrap_or(n).to_owned()
 }
 
+/// A content block's kind: `thinking`, else text.
+fn kind(k: &str) -> Kind {
+    if k == "thinking" { Kind::Thinking } else { Kind::Text }
+}
+
 fn result_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -181,14 +194,16 @@ fn result_text(v: &Value) -> String {
 }
 
 impl super::Adapter for Claude {
-    fn events(&mut self, line: &str) -> Vec<Value> {
+    fn events(&mut self, line: &str) -> Vec<Body> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
-            return vec![json!({"ev": "error", "text": format!("claude wrote a line that is not JSON: {line}")})];
+            return vec![Body::Error { text: format!("claude wrote a line that is not JSON: {line}") }];
         };
         match v["type"].as_str().unwrap_or("") {
-            "system" if v["subtype"] == "init" => {
-                vec![json!({"ev": "session", "agent": "claude", "model": v["model"], "session_id": v["session_id"]})]
-            }
+            "system" if v["subtype"] == "init" => vec![Body::Session {
+                agent: "claude".to_owned(),
+                model: v["model"].as_str().unwrap_or("").to_owned(),
+                session_id: v["session_id"].as_str().filter(|i| !i.is_empty()).map(str::to_owned),
+            }],
             "stream_event" => self.partial(&v["event"]),
             "assistant" => self.assistant(&v),
             "user" => self.from_user(&v),
