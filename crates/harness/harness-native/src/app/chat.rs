@@ -664,10 +664,41 @@ fn empty_value(v: &Value) -> bool {
     }
 }
 
+/// A cell's result when it is the turn's content rather than plumbing: a table, records or a list (what a person asked
+/// to see), never a command's stdout or a scalar its head already says. It shows under the call however it is folded.
+fn result_value(d: &Detail) -> Option<&Arc<Value>> {
+    Some(&d.value).filter(|v| matches!(v["t"].as_str(), Some("table" | "record" | "list")) && !empty_value(v))
+}
+
+/// The value a previewed card shows under its head: the cell's own, else its last step's; none when it draws (the view is
+/// its preview) or its whole value is its head ("42").
+fn preview_value(d: &Detail) -> Option<&Arc<Value>> {
+    if !empty_value(&d.ui) {
+        return None;
+    }
+    let main = if empty_value(&d.value) { d.effects.iter().rev().map(|e| &e.value).find(|v| !empty_value(v)) } else { Some(&d.value) };
+    main.filter(|m| !(d.effects.is_empty() && m["t"] == "scalar"))
+}
+
+/// Whether call item `n` opens by default: it would ([`Grouped::default_open`]) and its preview has something to show. A
+/// failed command with no output is one line, never an open chevron over nothing.
+fn opens(t: &Transcript, g: &Grouped, n: usize, c: &group::Call) -> bool {
+    if !g.default_open(n, c) {
+        return false;
+    }
+    match t.items.get(n) {
+        Some(Item::Tool { block, result, .. }) => match t.details.get(block) {
+            Some(d) => preview_value(d).is_some(),
+            None => result.as_ref().is_some_and(|r| !r.text.trim().is_empty()),
+        },
+        _ => false,
+    }
+}
+
 /// A harness REPL cell's card (`tool_detail`): what it did in words, never its code. Folded, its head alone; previewed
 /// (opened by default), its head and its main value (the cell's own, else its last step's), [`PREVIEW_ROWS`] of it; opened,
-/// each step and its value, the cell's value and logs in full, then "Show code". What it draws shows under its head
-/// however it is folded: the view is the point of the call.
+/// each step and its value, the cell's value and logs in full, then "Show code". What it draws, and its result
+/// ([`result_value`]), show under its head however it is folded: they are the point of the call.
 fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>, out: &mut Vec<Row>) {
     let (icon, words, detail, error) = headline(d);
     let state = d.ms.filter(|_| d.status != "running").map(secs).unwrap_or_default();
@@ -677,12 +708,13 @@ fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>
         out.push(Row::Ui { v: d.ui.clone() });
     }
     match shown {
-        Shown::Folded => {}
-        Shown::Preview if draws => {}
+        Shown::Folded => {
+            if let Some(v) = result_value(d) {
+                value_rows(v, PREVIEW_ROWS, out);
+            }
+        }
         Shown::Preview => {
-            let main = if empty_value(&d.value) { d.effects.iter().rev().map(|e| &e.value).find(|v| !empty_value(v)) } else { Some(&d.value) };
-            // A cell whose whole value is its head ("42") shows nothing more.
-            if let Some(main) = main.filter(|m| !(d.effects.is_empty() && m["t"] == "scalar")) {
+            if let Some(main) = preview_value(d) {
                 value_rows(main, PREVIEW_ROWS, out);
             }
         }
@@ -727,7 +759,7 @@ fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>
             }
         }
         Item::Tool { block, name, input, partial, result, done } => {
-            let shown = group::call(t, n).map_or(Shown::Folded, |c| Shown::of(fold, block, g.default_open(n, &c)));
+            let shown = group::call(t, n).map_or(Shown::Folded, |c| Shown::of(fold, block, opens(t, g, n, &c)));
             if let Some(d) = t.details.get(block) {
                 card_rows(block, d, shown, fold, &mut part);
             } else {
@@ -768,8 +800,9 @@ fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>
 }
 
 /// The transcript as rows ([`Grouped`]: runs of calls under one line), and the keys of the rows nested under a run.
-/// A folded run shows its line and its calls that are open (a failure, the last shell call, one the person opened); an
-/// opened one, every call and the reasoning between them, each folded as it is.
+/// A folded run shows its line, its calls that failed or are open (the last shell call, one the person opened), and under
+/// it the results of the rest ([`result_value`]: a table a call returned is the answer, not plumbing); an opened one,
+/// every call and the reasoning between them, each folded as it is.
 fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Row)>, HashSet<String>) {
     let g = Grouped::of(t);
     let mut out = Vec::new();
@@ -788,15 +821,17 @@ fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Ro
                     Row::Run { key, icon, words: run.summary(), failed: run.failed(), running: run.running(), open },
                 ));
                 for &n in &run.items {
+                    let call = run.calls.iter().find(|(i, _)| *i == n).map(|(_, c)| c);
                     let shows = open
-                        || run.calls.iter().find(|(i, _)| *i == n).is_some_and(|(i, c)| {
-                            fold.get(&c.block).copied().unwrap_or_else(|| g.default_open(*i, c))
-                        });
-                    if !shows {
-                        continue;
-                    }
+                        || call.is_some_and(|c| c.failed || fold.get(&c.block).copied().unwrap_or_else(|| opens(t, &g, n, c)));
                     let from = out.len();
-                    item_rows(t, &g, n, fold, &mut out);
+                    if shows {
+                        item_rows(t, &g, n, fold, &mut out);
+                    } else if let Some(v) = call.and_then(|c| t.details.get(&c.block)).and_then(result_value) {
+                        let mut part = Vec::new();
+                        value_rows(v, PREVIEW_ROWS, &mut part);
+                        out.extend(part.into_iter().enumerate().map(|(k, r)| (format!("i{n}.r{k}"), r)));
+                    }
                     nested.extend(out[from..].iter().map(|(k, _)| k.clone()));
                 }
             }
@@ -818,7 +853,7 @@ fn is_open(t: &Transcript, fold: &HashMap<String, bool>, key: &str) -> bool {
     }
     let g = Grouped::of(t);
     t.items.iter().enumerate().find_map(|(i, it)| match it {
-        Item::Tool { block, .. } if block == key => group::call(t, i).map(|c| g.default_open(i, &c)),
+        Item::Tool { block, .. } if block == key => group::call(t, i).map(|c| opens(t, &g, i, &c)),
         _ => None,
     }) == Some(true)
 }
@@ -2115,6 +2150,48 @@ fn head(h: View<'_>, icon: &str, name: &str, arg: &str, state: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In a folded run, a call's table (the answer the person asked for) shows under the run's line without opening it,
+    /// and a failed command with no output is one closed line, not an open chevron over nothing.
+    #[test]
+    fn folded_runs_keep_results_and_failures_show_one_line() {
+        let cell = |id: &str, exec: Value, value: Value| {
+            vec![
+                serde_json::json!({"ev": "tool_call", "block": id, "name": "ts", "input": {"code": "x"}}),
+                serde_json::json!({"ev": "tool_result", "block": id, "text": "", "error": false}),
+                serde_json::json!({"ev": "tool_detail", "block": id, "status": "done", "ms": 3, "code": "x",
+                    "effects": [exec], "value": value, "ui": null}),
+            ]
+        };
+        let exec = |code: u8, out: &str| {
+            serde_json::json!({"kind": "exec", "done": "Ran x", "status": if code == 0 { "ok" } else { "error" },
+                "detail": format!("exit {code}"), "value": {"t": "text", "v": out}})
+        };
+        let table = serde_json::json!({"t": "table", "total": 1, "rows": [["abc", "t"]],
+            "cols": [{"name": "hash", "type": "string"}, {"name": "author", "type": "string"}]});
+        let mut lines = vec![serde_json::json!({"ev": "user", "text": "go"})];
+        lines.extend(cell("a", exec(1, ""), Value::Null));
+        lines.extend(cell("b", exec(0, "abc|t"), table));
+        lines.extend(cell("c", exec(0, "ok"), Value::Null));
+        lines.push(serde_json::json!({"ev": "block", "block": "m", "kind": "text", "text": "Done."}));
+        lines.push(serde_json::json!({"ev": "turn_end", "ok": true, "stop": "end_turn"}));
+        let mut t = Transcript::default();
+        for l in &lines {
+            t.apply(&harness_proto::event::Event::from_json(l).unwrap());
+        }
+        let (rows, nested) = rows_nested(&t, &HashMap::new());
+        let kinds: Vec<(&str, &str)> = rows.iter().map(|(k, r)| (k.as_str(), r.prefab())).collect();
+        assert_eq!(kinds[1].1, "hn.ChatRunFailed", "{kinds:?}");
+        // The failed call: its line alone, closed.
+        let (k, failed) = &rows[2];
+        assert!(matches!(failed, Row::Card { open: false, error: true, .. }), "{kinds:?}");
+        assert_eq!(k, "i1.0");
+        // The table under the run's line, without the call's own line; the echo's output folds away.
+        assert_eq!(rows[3].0, "i2.r0");
+        assert!(matches!(&rows[3].1, Row::Grid { cap: PREVIEW_ROWS, .. }), "{kinds:?}");
+        assert!(nested.contains("i1.0") && nested.contains("i2.r0"));
+        assert_eq!(rows.len(), 5, "user, run, failure, table, prose: {kinds:?}");
+    }
 
     #[test]
     fn markdown_splits_into_rows() {
