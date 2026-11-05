@@ -54,7 +54,15 @@ fn corpus() -> Vec<(PathBuf, String)> {
 }
 
 fn parses(text: &str) -> [Parse<SourceFile>; 2] {
-    [SourceFile::parse(text, Edition::CURRENT), SourceFile::parse_outline(text, Edition::CURRENT)]
+    [parse(text, false), parse(text, true)]
+}
+
+/// `text` parsed in full, or as an outline.
+fn parse(text: &str, outline: bool) -> Parse<SourceFile> {
+    match outline {
+        false => SourceFile::parse(text, Edition::CURRENT),
+        true => SourceFile::parse_outline(text, Edition::CURRENT),
+    }
 }
 
 type Key = (syntax::SyntaxKind, TextRange);
@@ -83,6 +91,32 @@ fn view_tokens(it: &TokenAtOffset<view::Token<'_>>) -> Vec<Key> {
         TokenAtOffset::Single(it) => vec![key(it)],
         TokenAtOffset::Between(l, r) => vec![key(l), key(r)],
     }
+}
+
+/// The tokens at `offset` in `node` as a walk of every child of every node on the way down
+/// finds them: the children of non-empty range that hold `offset`, one or two, and the tokens
+/// at `offset` in each. What `token_at_offset`'s binary search is checked against.
+fn tokens_at_offset_by_walk(node: view::Node<'_>, offset: TextSize) -> Vec<Key> {
+    let range = node.text_range();
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let holding: Vec<view::Element<'_>> = node
+        .children_with_tokens()
+        .filter(|it| {
+            let it = it.text_range();
+            !it.is_empty() && it.start() <= offset && offset <= it.end()
+        })
+        .collect();
+    assert!(matches!(holding.len(), 1 | 2), "{} children hold {offset:?}", holding.len());
+    let mut out = Vec::new();
+    for child in holding {
+        match child {
+            NodeOrToken::Token(it) => out.push((it.kind(), it.text_range())),
+            NodeOrToken::Node(it) => out.extend(tokens_at_offset_by_walk(it, offset)),
+        }
+    }
+    out
 }
 
 /// Every answer of the views of `parse` against the handles'.
@@ -169,6 +203,17 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
                     "{}",
                     at()
                 );
+                // The walk is linear in the parent's children, which for the root are a file's
+                // items: one token in 64 of the root's is enough there.
+                if let Some(parent) = v.parent().filter(|it| it.parent().is_some() || i % 64 == 0)
+                {
+                    assert_eq!(
+                        view_tokens(&parent.token_at_offset(offset)),
+                        tokens_at_offset_by_walk(parent, offset),
+                        "{}: the binary search finds what a walk of every child finds",
+                        at()
+                    );
+                }
                 let range = h.text_range();
                 assert!(
                     same(Some(root.covering_element(range)), Some(handle.covering_element(range))),
@@ -202,19 +247,21 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
 
 #[test]
 fn views_answer_as_handles_on_every_fixture_and_file() {
-    // Each file is parsed and checked on its own, so the corpus is shared out to every core:
-    // asking every token's position of the root is quadratic in a file's top-level items, and
-    // one core takes a quarter of an hour of a debug build.
+    // Each parse of each file is checked on its own, so the work is shared out to every core,
+    // the largest files first: the two generated `nodes.rs` take minutes each in a debug build,
+    // and one core checking both parses of one of them after the rest was the whole run's tail.
     let corpus = corpus();
+    let mut work: Vec<(usize, bool)> =
+        (0..corpus.len()).flat_map(|file| [(file, false), (file, true)]).collect();
+    work.sort_by_key(|&(file, _)| std::cmp::Reverse(corpus[file].1.len()));
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(1, usize::from);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                while let Some((path, text)) = corpus.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    for parse in parses(text) {
-                        check(path, &parse);
-                    }
+                while let Some(&(file, outline)) = work.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let (path, text) = &corpus[file];
+                    check(path, &parse(text, outline));
                 }
             });
         }
