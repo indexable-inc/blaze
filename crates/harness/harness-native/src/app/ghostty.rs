@@ -8,15 +8,13 @@ use super::*;
 const DEFAULT_PAD: [f32; 4] = [18.0, 18.0, 16.0, 16.0];
 
 /// The prefabs whose Fill follows the theme, each with the scene's own Fill (kept for an appearance with no theme).
-const TINTED: [&str; 8] = [
+const TINTED: [&str; 6] = [
     "Plate",
     "hn.Main",
     "hn.Palette.card",
     "hn.Picker.card",
     "hn.SideClip",
-    "hn.TitleBar.title",
     "hn.TitleBar.back",
-    "hn.TitleBar.sub",
 ];
 /// The `export mut` token (scene/00-tokens.flecs) each of [`TINTED`] reads its Fill from.
 const TOKENS: [&str; 8] = [
