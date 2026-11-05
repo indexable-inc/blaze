@@ -70,6 +70,7 @@ since the release before and the title of each change merged since.
 - Subprocess tools are found using the command's PATH and working directory, including
   relative and empty PATH entries. An unset PATH no longer searches the daemon's PATH (#805).
 - Borrow checking distinguishes a by-value reference receiver from `&self`: returned input borrows no longer inherit the receiver lifetime, and returning the receiver with the input lifetime is rejected.
+- Borrow checking promotes arrays that mix associated constants with const constructor calls in const and static initializers, instead of reporting a false E0716.
 
 - A borrow of a record literal with a constant base, `&Migrator { .., ..Migrator::DEFAULT }`, or of a `const { .. }` block is promoted to `'static`, as rustc does: blaze's borrow checker refused every `#[sqlx::test(migrations = ..)]` test with E0716 (`a_record_literal_with_a_constant_base_is_promoted` in blaze-engine's repro tests).
 - A build script or proc macro blaze could not build because it panicked says the panic, where and with what message, and where all blaze said is kept. It said only its last line, `a scoped thread panicked` or the note on backtraces, as each of dynamo's jobs in canary v0.20261029.7's gate did of `pear_codegen` (#1486, #1549); a worker that panicked in loading the workspace said the scope's panic in the same way.

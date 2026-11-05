@@ -142,6 +142,49 @@ impl<'a> Drop for Foo<'a> { fn drop(&mut self) { } }
     assert_eq!(errors(Some("option, drop"), source), ["E0597 8:16 `y` does not live long enough"]);
 }
 
+/// rustc's `promote_consts` promotes an array of associated constants and const calls in a
+/// const or static initializer: type inference resolves `A::ITEM`, `<A as HasItem>::ITEM` and
+/// `Self::ITEM`, which value-name lookup does not, so none is a temporary dropped (E0716).
+#[test]
+fn associated_constants_promote_in_const_and_static_initializers() {
+    let source = r#"struct Item(u8);
+const fn item(value: u8) -> Item { Item(value) }
+trait HasItem {
+    const ITEM: Item;
+    const ITEMS: &'static [Item] = &[Self::ITEM, item(2)];
+}
+struct A;
+impl HasItem for A { const ITEM: Item = item(1); }
+impl A { const INHERENT: Item = item(3); }
+const QUALIFIED: &[Item] = &[<A as HasItem>::ITEM, item(2)];
+const TRAIT: &[Item] = &[A::ITEM, item(2)];
+const INHERENT: &[Item] = &[A::INHERENT, item(2)];
+static STATIC: &[Item] = &[A::ITEM, item(2)];
+fn main() {}
+"#;
+    assert_eq!(errors(Some("sized, copy, unsize, coerce_unsized"), source), [] as [&str; 0]);
+}
+
+/// The same array in a function body is not promoted: its const call runs at run time, so
+/// returning a borrow of it is E0515.
+#[test]
+fn associated_constants_do_not_promote_a_runtime_const_call() {
+    let source = r#"struct Item(u8);
+const fn item(value: u8) -> Item { Item(value) }
+trait HasItem { const ITEM: Item; }
+struct A;
+impl HasItem for A { const ITEM: Item = item(1); }
+fn runtime() -> &'static [Item] {
+    &[A::ITEM, item(2)]
+}
+fn main() {}
+"#;
+    assert_eq!(
+        errors(Some("sized, copy, unsize, coerce_unsized"), source),
+        ["E0515 7:5 returns a value referencing data owned by the current function"]
+    );
+}
+
 #[test]
 fn an_immutable_pattern_binding_assigned_again() {
     // tests/ui/borrowck/borrowck-match-binding-is-assignment.rs
