@@ -78,6 +78,16 @@ pub struct Inks {
     pub hover: Fill,
 }
 
+/// How a control gives under a press, with no plate (an icon button): held, it scales to `scale` and its opacity to
+/// `dim`, easing there and springing back when let go on the spring `omega`, `zeta`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct PressGive {
+    pub scale: f32,
+    pub dim: f32,
+    pub omega: f32,
+    pub zeta: f32,
+}
+
 /// A control's plate while it is pressed (the colours of a Fill, per appearance).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct PressLook {
@@ -168,6 +178,7 @@ hyperion_api_layouts::api_layouts! {
     "Lens" => alias Lens,
     "Inks" => alias Inks,
     "PressLook" => alias PressLook,
+    "PressGive" => alias PressGive,
     "OnLook" => alias OnLook,
     "TextStyle" => alias TextStyle,
     "HoverLook" => alias HoverLook,
@@ -187,6 +198,7 @@ pub fn register(world: &World) {
     world.component::<Lens>().writable();
     world.component::<Inks>().writable();
     world.component::<PressLook>().writable();
+    world.component::<PressGive>().writable();
     world.component::<OnLook>().writable();
     world.component::<TextStyle>().writable();
     world.component::<HoverLook>().writable();
