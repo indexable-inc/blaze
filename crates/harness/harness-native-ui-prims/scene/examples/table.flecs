@@ -1,0 +1,13 @@
+// ui.Table in a ui.Scroll: 1 000 rows of a search's results, Nushell's way (an index column, a header, numbers at the
+// end, long cells cut); only the rows in view exist (the gallery fills it with harness_native_ui_view::table).
+
+@tree ChildOf
+ex {
+  prefab TableDemo : ex.Card {
+    label : ui.Label { Text: {s: "TABLE 1 000 ROWS"} }
+    scroll : ui.Scroll {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 154, min: 0, max: 0}}
+      grid : ui.Table {}
+    }
+  }
+}

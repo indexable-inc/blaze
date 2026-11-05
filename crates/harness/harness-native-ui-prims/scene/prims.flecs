@@ -244,6 +244,37 @@ ui {
     }
   }
 
+  // A data table, Nushell's: a header over rows of one line each in the code face, every column as wide as its widest
+  // cell (up to a cap; all shrink in proportion when the table is narrower), long cells cut with an ellipsis. Only the
+  // rows in view exist: `body` is a lazy column laid against the nearest clipping ancestor (the ui.Scroll it sits in).
+  // harness_native_ui_view::table fills it: `head` and each row of `body` are ui.TableRows of cells, each a
+  // ui.TableHead or ui.TableCell (or a prefab made from one), given its column's width and alignment (numbers at the end).
+  prefab TableRow : ui.Row {
+    Flex: {axis: Row, gap: $table_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $table_row, min: 0, max: 0}}
+  }
+  prefab TableCell : ui.Row {
+    Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+    text : ui.Line {
+      TextStyle: {size: $size_code, line: 16, role: 9, bold: 0}
+    }
+  }
+  prefab TableHead : ui.TableCell {
+    text : ui.Line {
+      Fill: $tone_ink_3
+      TextStyle: {size: $size_code, line: 16, role: 9, bold: 1}
+    }
+  }
+  prefab Table : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    head : ui.TableRow {}
+    rule : ui.Divider {}
+    body : ui.LazyColumn {
+      Lazy: {count: 0, row: $table_row, overscan: 8}
+    }
+  }
+
   // Words on one line cut in the middle (a path), or at the start (a tail that matters).
   prefab LineMiddle : ui.Line {
     Truncate: {mode: Middle}

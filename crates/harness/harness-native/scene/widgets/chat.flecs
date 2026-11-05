@@ -202,6 +202,162 @@ hn {
     }
   }
 
+  // A harness REPL cell's card (src/app/chat.rs card_rows): what the cell did, in words, never its code. Its head: the
+  // disclosure, its step's icon, the step's words ("Searched Google for ..."), a detail ("5 results") and how long it
+  // took. Pressed, it opens to each step and the full values; folded, the main value shows under it.
+  prefab ChatCardHead : ui.Row {
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Hand}
+    Fill: $tone_clear
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+    HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 26, min: 0, max: 0}}
+    Padding: {l: 6, r: 8, t: 0, b: 0}
+    disclose : ui.Symbol, Faint {
+      Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+    }
+    icon : ui.Symbol {
+      Fill: $tone_term_muted
+    }
+    words : ui.Lead {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0, weight: $weight_row}
+    }
+    detail : ui.Line {
+      Fill: $tone_term_muted
+      LayoutPriority: {value: 1}
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+    spacer : ui.Spacer {}
+    state : ui.Line, Faint {
+      LayoutPriority: {value: 1}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  prefab ChatCard : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 1, b: 1}
+    head : hn.ChatCardHead {}
+  }
+  // A cell that threw: its head in the failed tone.
+  prefab ChatCardFailed : hn.ChatCard {
+    head : hn.ChatCardHead {
+      icon : ui.Symbol { Fill: $tone_failed }
+      words : ui.Lead { Fill: $tone_failed }
+    }
+  }
+
+  // One step of an opened card that took several: its icon, its words, its detail, under the card's icon.
+  prefab ChatStep : ui.Row {
+    Flex: {axis: Row, gap: 7, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 22, min: 0, max: 0}}
+    Padding: {l: 25, r: 8, t: 0, b: 0}
+    icon : ui.Symbol {
+      Fill: $tone_term_muted
+    }
+    words : ui.Lead {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+    spacer : ui.Spacer {}
+    detail : ui.Line, Faint {
+      LayoutPriority: {value: 1}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+  prefab ChatStepFailed : hn.ChatStep {
+    icon : ui.Symbol { Fill: $tone_failed }
+    words : ui.Lead { Fill: $tone_failed }
+  }
+
+  // A table, record or list a cell gave, as a ui.Table on the card's plate (src/app/chat.rs fill_grid), and a foot saying
+  // how many rows. Its cells: words in the ink, nulls and the index dim, links in the accent, the header muted.
+  prefab ChatCell : ui.TableCell {
+    text : ui.Line { Fill: $tone_term_ink }
+  }
+  prefab ChatCellDim : ui.TableCell {
+    text : ui.Line { Fill: $tone_term_muted }
+  }
+  prefab ChatCellLink : ui.TableCell {
+    text : ui.Line { Fill: $tone_accent }
+  }
+  prefab ChatHead : ui.TableHead {
+    text : ui.Line { Fill: $tone_term_muted }
+  }
+  prefab ChatGrid : ui.Column {
+    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 25, r: 0, t: 2, b: 6}
+    card : ui.Column {
+      Clip
+      Fill: $tone_chat_card
+      Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+      Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 2, b: 4}
+      grid : ui.Table {}
+    }
+    foot : ui.Line, Faint {
+      Padding: {l: 4, r: 0, t: 0, b: 0}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // Text a cell printed or returned (a command's output, a string), in the code face on the card's plate; an error's
+  // stack in the failed tone.
+  prefab ChatOutput : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 25, r: 0, t: 2, b: 6}
+    card : ui.Column {
+      Fill: $tone_chat_card
+      Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+      Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 10, r: 10, t: 7, b: 8}
+      text : ui.Words {
+        Fill: $tone_term_ink
+        TextStyle: {size: $size_code, line: $line_chat_code, role: 9, bold: 0}
+      }
+    }
+  }
+  prefab ChatOutputError : hn.ChatOutput {
+    card : ui.Column {
+      text : ui.Words { Fill: $tone_failed }
+    }
+  }
+
+  // "Show code" under an opened card: quiet, pressed it shows the cell's code (a hn.ChatCode row) under it.
+  prefab ChatCodeToggle : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 19, r: 0, t: 0, b: 2}
+    head : ui.Row {
+      Pressable
+      Action: {name: ""}
+      Cursor: {shape: Hand}
+      Fill: $tone_clear
+      Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
+      HoverLook: {dark: $tone_wash_hover.dark, light: $tone_wash_hover.light, pad: 0, radius: -1}
+      PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+      Flex: {axis: Row, gap: 5, align: Center, justify: Start, wrap: false}
+      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 22, min: 0, max: 0}}
+      Padding: {l: 6, r: 8, t: 0, b: 0}
+      disclose : ui.Symbol, Faint {
+        Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+      }
+      words : ui.Line, Faint {
+        TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      }
+    }
+  }
+
   // The agent's reasoning, folded to one dim line; pressed, it opens to its words, dim.
   prefab ChatThinking : ui.Column {
     Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}

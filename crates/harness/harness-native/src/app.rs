@@ -2039,5 +2039,15 @@ mod tests {
             }
         });
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+        // Prefabs the code names (a missing one would draw as a bare node, silently).
+        let missing: Vec<&str> = [
+            "ui.Table", "ui.TableRow", "ui.TableCell", "ui.TableHead", "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep",
+            "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput", "hn.ChatOutputError", "hn.ChatCodeToggle", "hn.ChatCell",
+            "hn.ChatCellDim", "hn.ChatCellLink", "hn.ChatHead", "ex.TableDemo",
+        ]
+        .into_iter()
+        .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())
+        .collect();
+        assert!(missing.is_empty(), "prefabs the code names but no scene has: {missing:?}");
     }
 }

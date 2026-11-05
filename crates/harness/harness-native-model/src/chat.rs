@@ -1,8 +1,10 @@
 //! A chat session's transcript, read from the daemon's agent-neutral chat events (harness/src/chat/mod.rs has the
 //! model): one JSON object a line, `ev` naming it. The attach replays the whole conversation, then streams what comes;
 //! partials (`block_start`, `delta`, `tool_start`, `tool_delta`) grow an item, and the final (`block`, `tool_call`)
-//! replaces what they grew. Nothing here knows which agent wrote it.
+//! replaces what they grew. A `tool_detail` (what a harness REPL cell a tool call ran did: its steps and value) is kept by
+//! its call's block beside the items, whole each time, whichever comes first. Nothing here knows which agent wrote it.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -31,6 +33,69 @@ pub struct ToolResult {
     pub error: bool,
 }
 
+/// What a harness REPL cell a tool call ran did (`tool_detail`, harness/src/chat/mod.rs): its steps outside the REPL and
+/// its value. Values (`value`, a step's `value`) stay JSON in the kernel's shape (mcp/src/shown.ts): `{t: table | record |
+/// list, cols, rows, total}`, `{t: scalar, type, v}`, `{t: text, v, total}`, `{t: error, message, stack}`, or null; shared,
+/// so a row that draws one holds it without a copy.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Detail {
+    /// `running`, `done` or `error`.
+    pub status: String,
+    pub ms: Option<u64>,
+    pub code: String,
+    pub effects: Vec<Effect>,
+    /// Steps past the kernel's cap, not kept.
+    pub dropped: u64,
+    pub value: Arc<Value>,
+    pub logs: String,
+}
+
+/// One step a cell took outside the REPL (mcp/src/effects.ts).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Effect {
+    /// `exec`, `read`, `write`, `delete`, `net`, `search`, `spawn` or `sql`.
+    pub kind: String,
+    /// Its words while it runs and once it is done.
+    pub doing: String,
+    pub done: String,
+    pub target: String,
+    /// `running`, `ok` or `error`.
+    pub status: String,
+    pub ms: Option<u64>,
+    pub detail: String,
+    pub value: Arc<Value>,
+}
+
+impl Detail {
+    fn of(v: &Value) -> Self {
+        let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_owned();
+        let effects = v["effects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| Effect {
+                kind: s(e, "kind"),
+                doing: s(e, "doing"),
+                done: s(e, "done"),
+                target: s(e, "target"),
+                status: s(e, "status"),
+                ms: e["ms"].as_u64(),
+                detail: s(e, "detail"),
+                value: Arc::new(e["value"].clone()),
+            })
+            .collect();
+        Self {
+            status: s(v, "status"),
+            ms: v["ms"].as_u64(),
+            code: s(v, "code"),
+            effects,
+            dropped: v["effects_dropped"].as_u64().unwrap_or(0),
+            value: Arc::new(v["value"].clone()),
+            logs: s(v, "logs"),
+        }
+    }
+}
+
 /// A session's transcript and what the status line shows.
 #[derive(Debug, Default)]
 pub struct Transcript {
@@ -41,6 +106,8 @@ pub struct Transcript {
     pub model: String,
     /// Moves on every change (what the view redraws on).
     pub rev: u64,
+    /// Each tool call's REPL cell, by the call's block.
+    pub details: HashMap<String, Detail>,
     /// The item each block id is, for its deltas and its final form.
     at: HashMap<String, usize>,
     /// Bytes of a line not finished yet.
@@ -149,6 +216,9 @@ impl Transcript {
                     _ => self.push("", Item::Note { text: r.text }),
                 }
             }
+            "tool_detail" => {
+                self.details.insert(block, Detail::of(v));
+            }
             "note" => self.push("", Item::Note { text: s("text") }),
             "error" => self.push("", Item::Error { text: s("text") }),
             "turn_end" => {
@@ -202,6 +272,7 @@ mod tests {
             r#"{"ev":"tool_start","block":"t1","name":"ts"}"#,
             r#"{"ev":"block","block":"m:0","kind":"text","text":"Hello!"}"#,
             r#"{"ev":"tool_call","block":"t1","name":"ts","input":{"code":"1+1"}}"#,
+            r#"{"ev":"tool_detail","block":"t1","status":"done","ms":3,"code":"1+1","effects":[{"kind":"read","done":"Read a","status":"ok"}],"value":{"t":"scalar","type":"number","v":2}}"#,
             r#"{"ev":"tool_result","block":"t1","text":"2","error":false}"#,
             r#"{"ev":"turn_end","ok":true,"stop":"end_turn","duration_ms":1200,"cost_usd":0.01}"#,
             r#"{"ev":"busy","busy":false}"#,
@@ -215,6 +286,7 @@ mod tests {
         assert_eq!(t.items[1], Item::Text { block: "m:0".into(), text: "Hello!".into(), done: true });
         assert!(matches!(&t.items[2], Item::Tool { result: Some(r), done: true, .. } if r.text == "2"));
         assert!(!t.busy);
+        assert_eq!(t.details["t1"].effects[0].done, "Read a");
         assert_eq!(main_arg(&serde_json::json!({"code": "1 +\n 1"})), "1 + 1");
     }
 }

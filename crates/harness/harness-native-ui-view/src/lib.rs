@@ -412,3 +412,95 @@ pub fn lazy_stack<'a, 'p, K: AsRef<str>>(
     });
     Stacked { content: total, shift }
 }
+
+/// A column of a [`table`]: its header, its widest cell in characters, and whether its cells sit at the end (numbers).
+#[derive(Clone, Copy, Debug)]
+pub struct TableColumn<'s> {
+    pub name: &'s str,
+    pub chars: usize,
+    pub end: bool,
+}
+
+/// The most characters a [`table`] column is wide; a longer cell is cut with an ellipsis.
+pub const TABLE_MAX_CHARS: usize = 48;
+/// The fewest characters a column shrinks to when the table is short of room.
+const TABLE_MIN_CHARS: usize = 4;
+/// The advance of the code face a table is set in, in ems (every monospace face the app picks is 0.6 em, to a hundredth).
+const MONO_EM: f32 = 0.6;
+
+/// Fill a `ui.Table` (prims.flecs) with `rows` rows of `cols`: its header from the column names in cells made from `head`
+/// (none: no header, as a record is shown), and each row in view of its lazy body, every other row only counted. Cell
+/// (`row`, `col`) is made from `prefab(row, col)` (a `ui.TableCell` or one made from it), given its column's width and
+/// alignment here, and filled by `cell` (its words in its `text`, its look). Column `c` is `chars` characters of the
+/// cells' code face wide, at most [`TABLE_MAX_CHARS`]; when the table is narrower than its columns, each shrinks from
+/// its share toward [`TABLE_MIN_CHARS`], the same in every row, so the columns stay aligned.
+pub fn table<'a, 'p>(
+    t: View<'a>, cols: &[TableColumn<'_>], rows: u32, head: Option<&'p str>, prefab: impl Fn(u32, usize) -> &'p str,
+    mut cell: impl FnMut(View<'a>, u32, usize),
+) {
+    use harness_native_ui_layout_api::{Flex, Justify, Size, SizeKind, Sizing};
+    use harness_native_ui_look_api::TextStyle;
+    let (Some(head_row), Some(rule), Some(body)) = (t.part("head"), t.part("rule"), t.part("body")) else { return };
+    let row_h = body.0.try_cloned::<&Lazy>().map_or(22.0, |l| l.row);
+    // The code face's size, from the first cell made (the header's, or the body's first): its advance makes widths.
+    let size = |v: View<'_>| v.part("c0").and_then(|c| c.part("text")).and_then(|x| x.0.try_cloned::<&TextStyle>()).map(|s| s.size);
+    let shape = |v: View<'_>, c: usize, em: f32| {
+        let col = cols[c];
+        let w = col.chars.clamp(1, TABLE_MAX_CHARS) as f32 * em * MONO_EM;
+        let min = col.chars.clamp(1, TABLE_MIN_CHARS) as f32 * em * MONO_EM;
+        let want = Size { w: Sizing { kind: SizeKind::Grow, value: w, min, max: w }, h: Sizing::GROW };
+        if v.0.try_cloned::<&Size>() != Some(want) {
+            v.0.set(want);
+        }
+        let mut f = v.0.try_cloned::<&Flex>().unwrap_or_default();
+        let j = if col.end { Justify::End } else { Justify::Start };
+        if f.justify != j {
+            f.justify = j;
+            v.0.set(f);
+        }
+    };
+    let fold = |v: View<'_>, h: f32| {
+        let want = Size { w: Sizing::GROW, h: Sizing::fixed(h) };
+        if v.0.try_cloned::<&Size>() != Some(want) {
+            v.0.set(want);
+        }
+    };
+    let mut em = 0.0;
+    match head {
+        Some(pf) => {
+            fold(head_row, row_h);
+            fold(rule, 1.0);
+            for_each(head_row, pf, cols.iter().enumerate().map(|(c, col)| (format!("c{c}"), (c, col.name))), |v, (_, name), _| {
+                if let Some(x) = v.part("text") {
+                    x.text(name);
+                }
+            });
+            em = size(head_row).unwrap_or(0.0);
+            if em > 0.0 {
+                for c in 0..cols.len() {
+                    if let Some(v) = head_row.part(&format!("c{c}")) {
+                        shape(v, c, em);
+                    }
+                }
+            }
+        }
+        None => {
+            for_each(head_row, "ui.TableCell", std::iter::empty::<(String, ())>(), |_, (), _| {});
+            fold(head_row, 0.0);
+            fold(rule, 0.0);
+        }
+    }
+    lazy_for_each(body, "ui.TableRow", rows, |i| format!("r{i}"), |row, i, _| {
+        for_each_of(row, (0..cols.len()).map(|c| (format!("c{c}"), prefab(i, c), c)), |v, c, _| cell(v, i, c));
+        if em <= 0.0 {
+            em = size(row).unwrap_or(0.0);
+        }
+        if em > 0.0 {
+            for c in 0..cols.len() {
+                if let Some(v) = row.part(&format!("c{c}")) {
+                    shape(v, c, em);
+                }
+            }
+        }
+    });
+}
