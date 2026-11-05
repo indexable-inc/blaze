@@ -10,6 +10,8 @@
   let size = $state('medium');
   let shape = $state('pie');
   let region = $state('us-east');
+  let colour = $state('accent');
+  let last = $state('');
   const sizes = ['small', 'medium', 'large'];
   const regions = [
     { label: 'US East', value: 'us-east' },
@@ -37,12 +39,13 @@
     <Choice options={sizes} bind:selected={size} />
     <Radio options={['pie', 'donut']} bind:selected={shape} row />
     <Select options={regions} bind:selected={region} placeholder="Region" />
+    <ColorPicker bind:selected={colour} label="Colour" options={['accent', 'success', 'warning', 'error', '#5e5ce6', '#ff9f0a']} />
     <Row gap={8}>
-      <Button tone="accent" disabled={!agree} onclick={() => presses++}>Pressed {presses}</Button>
-      <Button onclick={() => { presses = 0; cpu = 40; copies = 2; size = 'medium'; }}>Reset</Button>
+      <Button tone="accent" disabled={!agree} value="press" onclick={(v) => { presses++; last = v; }}>Pressed {presses}</Button>
+      <Button value="reset" onclick={(v) => { presses = 0; cpu = 40; copies = 2; size = 'medium'; last = v; }}>Reset</Button>
     </Row>
   </Card>
-  <Card title={`${name || 'Nobody'}: ${size} in ${region}${notify ? ', notified' : ''}`}>
+  <Card title={`${name || 'Nobody'}: ${size} in ${region}${notify ? ', notified' : ''}, in ${colour}${last ? `, last ${last}` : ''}`}>
     <Chart kind={shape} data={share} height={120} />
   </Card>
 </Column>

@@ -4,7 +4,8 @@
 // The kernel owns the exit points from a cell's JavaScript to the world, so it records them there, in one place: the
 // running cell's effect log (Task.effects). Two kinds of exit point append to it:
 //
-// - The typed calls, each with its own words: googleSearch, sh, spawn, sql (`step`/`effect` at their entry).
+// - The typed calls, each with its own words: rg, glob, ls, du, gitLog, follow and cargo.*, vfs, image, googleSearch, sh,
+//   spawn, sql (`step`/`effect` at their entry).
 // - Thin wrappers over the globals a cell reaches the world through, with generic words: fetch, Bun.write, the reads of
 //   Bun.file (text, json, bytes, arrayBuffer), Bun.spawn and Bun.spawnSync (installed once, globally, by `install`), and
 //   the node:fs and node:fs/promises a cell imports (the REPL hands cells `fsFor(spec)` in place of the builtin).
@@ -23,7 +24,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { currentTask, type Task } from "./tasks.ts";
 import { shown, type Shown, type ShownKind } from "./shown.ts";
 
-export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "spawn" | "sql";
+/** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow, cargo.*). */
+export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "list" | "build" | "spawn" | "sql";
 
 /** One step, as it is posted (the raw result is kept on the side, for telling a cell's value apart from its steps'). */
 export type Effect = {
@@ -53,6 +55,15 @@ export const rawsOf = (t: Task): unknown[] => raws.get(t) ?? [];
 /** A running step; `end` it once. */
 export class Step {
   constructor(readonly task: Task, readonly e: Effect) {}
+  /** While it runs: new words for what it is doing now ("Checking blaze-core · 132/388") and/or a value to show so far. */
+  update(u: { doing?: string; detail?: string; show?: unknown; kind?: ShownKind }) {
+    const { task, e } = this;
+    if (e.status !== "running") return;
+    if (u.doing !== undefined) e.doing = u.doing;
+    if (u.detail !== undefined) e.detail = u.detail;
+    if (u.show !== undefined) e.value = shown(u.show, 16 << 10, u.kind);
+    task.touch();
+  }
   end(ok: boolean, detail = "", result?: unknown, show?: unknown, kind?: ShownKind) {
     const { task, e } = this;
     e.status = ok ? "ok" : "error";

@@ -22,12 +22,14 @@ use std::{
         LazyLock, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use blaze_mem::scratch;
 use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
+
+use crate::wait::{Clock as _, Deadline};
 
 static MADE: AtomicU64 = AtomicU64::new(0);
 
@@ -231,19 +233,21 @@ impl Drop for Cgroup {
     /// the next one made.
     fn drop(&mut self) {
         _ = self.file("cgroup.kill", |it| write(it, b"1"));
-        let deadline = Instant::now() + EMPTYING;
-        self.file("cgroup.events", |it| wait_empty(it, deadline));
+        let clock = crate::wait::Monotonic::new();
+        let deadline = Deadline::after(clock.now(), EMPTYING);
+        self.file("cgroup.events", |it| wait_empty(it, deadline, &clock));
         loop {
             match std::fs::remove_dir(self.dir()) {
                 Ok(()) => break,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-                // Empty, but the kernel has not let go of it yet.
-                Err(_) if Instant::now() < deadline => {
-                    #[allow(
-                        clippy::disallowed_methods,
-                        reason = "the rmdir's timer: `cgroup.events` says empty, and nothing says when the kernel lets go"
-                    )]
-                    std::thread::sleep(Duration::from_millis(1));
+                // Empty, but the kernel has not let go of it yet: a ring timeout, as nothing
+                // says when it does.
+                Err(_) if !deadline.passed(clock.now()) => {
+                    let next = Deadline::after(clock.now(), Duration::from_millis(1)).min(deadline);
+                    let what = "the kernel to let go of an emptied cgroup";
+                    if crate::wait::sleep_until(what, next, &clock).is_err() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -340,7 +344,7 @@ fn decimal(value: u64, digits: &mut [u8; 20]) -> io::Result<&[u8]> {
 }
 
 /// Waits until `events` says `populated 0`, or until `deadline`.
-fn wait_empty(events: &Path, deadline: Instant) {
+fn wait_empty(events: &Path, deadline: Deadline, clock: &crate::wait::Monotonic) {
     let Ok(file) = std::fs::File::open(events) else { return };
     let mut bytes = [0u8; 256];
     loop {
@@ -350,14 +354,18 @@ fn wait_empty(events: &Path, deadline: Instant) {
         if !populated(&String::from_utf8_lossy(&bytes[..n])) {
             return;
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if deadline.passed(clock.now()) {
             return;
         }
-        let mut fds = [libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLPRI, revents: 0 }];
-        let ms = left.as_millis().clamp(1, 100) as libc::c_int;
-        // A failed or interrupted wait reads the events again, as a timeout does.
-        _ = crate::raw::poll(&mut fds, ms);
+        // A ring poll for the change, at most 100 ms before the events are read again; a
+        // failed wait reads them again, as a timeout does.
+        let next = Deadline::after(clock.now(), Duration::from_millis(100)).min(deadline);
+        let what = "a cgroup to be empty (cgroup.events)";
+        if crate::wait::pollable(what, file.as_raw_fd(), libc::POLLPRI, Some(next), clock).is_err()
+            && deadline.passed(clock.now())
+        {
+            return;
+        }
     }
 }
 

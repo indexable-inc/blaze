@@ -118,6 +118,21 @@ pub struct TextStyle {
     pub weight: i32,
 }
 
+/// The inks a node takes under the pointer, mixed in by its `HoverAmt` (0 off it, 1 on it): its `Fill` (a plate's, a
+/// vector's, words') toward `fill` when `set` has [`HoverInk::FILL`], its outline (a plate's `Edge`, a vector's `Stroke`)
+/// toward `stroke` when it has [`HoverInk::STROKE`]. harness-native-render mixes them as it paints.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct HoverInk {
+    pub fill: Fill,
+    pub stroke: Fill,
+    pub set: u8,
+}
+
+impl HoverInk {
+    pub const FILL: u8 = 1;
+    pub const STROKE: u8 = 2;
+}
+
 /// A hover affordance: the overlay drawn over (or around, `pad`) the node while the pointer is on it, fading on a
 /// spring. `radius` < 0 keeps the node's own corner radius.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -253,6 +268,7 @@ hyperion_api_layouts::api_layouts! {
     "Ribbon" => alias Ribbon,
     "Rgba" => alias Rgba,
     "Fill" => alias Fill,
+    "HoverInk" => alias HoverInk,
     "Edge" => alias Edge,
     "Stroke" => alias Stroke,
     "Shape" => alias Shape,
@@ -289,6 +305,7 @@ pub fn register(world: &World) {
     world.component::<OnLook>().writable();
     world.component::<TextStyle>().writable();
     world.component::<HoverLook>().writable();
+    world.component::<HoverInk>().writable();
     world.component::<CopyLook>().writable();
     world.component::<Ribbon>().writable();
     world.component::<Scheme>().writable();

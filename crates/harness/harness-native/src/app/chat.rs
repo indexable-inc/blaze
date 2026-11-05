@@ -23,11 +23,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod genui;
+mod pick;
 
 pub(super) use genui::Live as GenLive;
-
-/// A thought's line's icon (cod-lightbulb).
-const THOUGHT: &str = "\u{EA61}";
+pub(super) use genui::{GenFeel, GenOn, Prims as GenPrims};
 
 /// The text being written in a chat's input: its words, the caret and the selection's other end (byte offsets), and an
 /// input method's marked text at the caret.
@@ -223,6 +222,9 @@ pub struct ChatState {
     /// not) and when (the clock), while he still shows it.
     kip_busy: bool,
     kip_end: Option<(bool, f32)>,
+    /// The model and effort picker's menu open under the composer (chat/pick.rs), and which; its highlight.
+    pick: Option<pick::Pick>,
+    pick_nav: pick::PickNav,
 }
 
 /// What a Cmd+C in a chat took, so its pulse plays there: the transcript's selection, the input's, or row `.1` of the
@@ -274,6 +276,8 @@ impl Default for ChatState {
             rows_open: HashMap::new(),
             kip_busy: false,
             kip_end: None,
+            pick: None,
+            pick_nav: pick::PickNav::default(),
         }
     }
 }
@@ -287,16 +291,16 @@ enum Row {
     ListItem { depth: usize, mark: String, text: String },
     Quote(String),
     Code { lang: String, text: String },
-    /// An agent's own tool call: its line (its act's icon, the tool's name, its main argument, how it is going: running,
+    /// An agent's own tool call: its line (the tool's name, its main argument, how it is going: running,
     /// no result) and, opened, its input and result.
-    Tool { block: String, icon: &'static str, name: String, arg: String, state: String, shown: Shown, failed: bool, input: String, result: String },
-    /// A harness REPL cell's line: its step's icon, what it did in words, a detail ("5 results"), and how long it took as
+    Tool { block: String, name: String, arg: String, state: String, shown: Shown, failed: bool, input: String, result: String },
+    /// A harness REPL cell's line (`open`: shown past its line): what it did in words, a detail ("5 results"), and how long it took as
     /// the line's tooltip ([`line`]).
-    Card { block: String, icon: &'static str, words: String, detail: String, tip: String, error: bool },
-    /// A run of tool calls folded to one line ([`Run::summary`]): how many failed, whether one still runs.
-    Run { key: String, icon: &'static str, words: String, failed: usize, running: bool },
+    Card { block: String, words: String, detail: String, tip: String, error: bool, open: bool },
+    /// A run of tool calls folded to one line ([`Run::summary`]): how many failed, whether one still runs, whether it is open.
+    Run { key: String, words: String, failed: usize, running: bool, open: bool },
     /// One step of an opened card that took several.
-    Step { icon: &'static str, words: String, detail: String, error: bool },
+    Step { words: String, detail: String, error: bool },
     /// A table, record or list (the kernel's shown value), its first `cap` rows.
     Grid { v: Arc<Value>, cap: usize },
     /// A markdown table in the agent's words.
@@ -554,51 +558,8 @@ fn step_detail(d: &str) -> String {
     if d == "exit 0" { String::new() } else { d.to_owned() }
 }
 
-/// The icon of a run whose calls all did one kind of thing; a mixed run's is the cell's.
-fn act_icon(a: Act) -> &'static str {
-    kind_icon(match a {
-        Act::Shell => "exec",
-        Act::Read => "read",
-        Act::Edit | Act::Write => "write",
-        Act::Delete => "delete",
-        Act::Search => "search",
-        Act::Fetch => "net",
-        Act::Query => "sql",
-        Act::Spawn => "spawn",
-        Act::Cell | Act::Other => "",
-    })
-}
-
-/// codicons by step kind (mcp/src/effects.ts), and for a cell that took no step, an error, a running cell.
-fn kind_icon(kind: &str) -> &'static str {
-    match kind {
-        "exec" => "\u{EA85}",   // cod-terminal
-        "read" => "\u{EA7B}",   // cod-file
-        "write" => "\u{EA73}",  // cod-edit
-        "delete" => "\u{EA81}", // cod-trash
-        "net" => "\u{EB01}",    // cod-globe
-        "search" => "\u{EA6D}", // cod-search
-        "spawn" => "\u{EC10}",  // cod-sparkle
-        "sql" => "\u{EACE}",    // cod-database
-        "error" => "\u{EA87}",  // cod-error
-        _ => "\u{EAC4}",        // cod-code
-    }
-}
-
-/// How many steps of one kind did, in words: "Wrote 3 files".
-fn steps_of(kind: &str, n: usize) -> String {
-    match kind {
-        "exec" => format!("Ran {n} commands"),
-        "read" => format!("Read {n} files"),
-        "write" => format!("Wrote {n} files"),
-        "delete" => format!("Deleted {n} files"),
-        "net" => format!("Fetched {n} URLs"),
-        "search" => format!("Ran {n} searches"),
-        "spawn" => format!("Started {n} objects"),
-        "sql" => format!("Ran {n} queries"),
-        _ => format!("{n} steps"),
-    }
-}
+/// A drawn view's code button's glyph (cod-code).
+const CODE_ICON: &str = "\u{EAC4}";
 
 /// A line's words with the dot that parts them from its detail ("Ran 2 cells · 2 failed"), when it has one.
 fn dotted(words: String, detail: &str) -> String {
@@ -632,18 +593,18 @@ fn head_lines(s: &str, n: usize) -> String {
 }
 
 /// A card's head: the step running now, else the one step it took, else how many of one kind, else its value.
-fn headline(d: &Detail) -> (&'static str, String, String, bool) {
+fn headline(d: &Detail) -> (String, String, bool) {
     if let Some(e) = d.effects.iter().rev().find(|e| e.status == "running") {
-        return (kind_icon(&e.kind), format!("{}\u{2026}", e.doing), String::new(), false);
+        return (format!("{}\u{2026}", e.doing), String::new(), false);
     }
     if d.status == "error" {
         let why = d.value["message"].as_str().map_or_else(|| "failed".to_owned(), first_line);
-        // One sign of the failure: its words in the failed tone (hn.ChatLineFailed); its icon stays the cell's.
-        return (kind_icon(""), why, String::new(), true);
+        // One sign of the failure: its words in the failed tone (hn.ChatLineFailed).
+        return (why, String::new(), true);
     }
     let failed = d.effects.iter().any(|e| e.status == "error");
     match d.effects.as_slice() {
-        [] if d.status == "running" => (kind_icon(""), "Running\u{2026}".into(), String::new(), false),
+        [] if d.status == "running" => ("Running\u{2026}".into(), String::new(), false),
         [] => {
             let v = &d.value;
             let n = v["total"].as_u64().unwrap_or(0);
@@ -656,11 +617,12 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
                 _ if !empty_value(&d.ui) => "Drew a view".into(),
                 _ => "Done".into(),
             };
-            (kind_icon(""), words, String::new(), false)
+            (words, String::new(), false)
         }
-        [e] => (kind_icon(&e.kind), e.done.clone(), step_detail(&e.detail), failed),
-        [e, rest @ ..] if rest.iter().all(|r| r.kind == e.kind) => (kind_icon(&e.kind), steps_of(&e.kind, rest.len() + 1), String::new(), failed),
-        [e, rest @ ..] => (kind_icon(&e.kind), format!("{} and {} more", e.done, rest.len()), String::new(), failed),
+        [e] => (e.done.clone(), step_detail(&e.detail), failed),
+        [e, rest @ ..] if rest.iter().all(|r| r.kind == e.kind) => (group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
+        // Steps of more than one kind: what they did, counted by kind ("Read 3 files, searched 2 times"), as a run sums its calls.
+        [..] => (group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
     }
 }
 
@@ -739,7 +701,7 @@ fn opens(t: &Transcript, g: &Grouped, n: usize, c: &group::Call) -> bool {
 /// however it is folded. A cell that drew (and did not fail) is its view alone, no line over it: the view is the message,
 /// and its code shows under it from the view's hover-only code button.
 fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>, out: &mut Vec<Row>) {
-    let (icon, words, detail, error) = headline(d);
+    let (words, detail, error) = headline(d);
     let code = fold.get(&code_key(block)).copied().unwrap_or(false);
     let draws = !empty_value(&d.ui);
     // A cell that drew is its view: no line over it. Its code is a hover-only button beside the view.
@@ -751,7 +713,7 @@ fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>
         return;
     }
     let tip = d.ms.filter(|_| d.status != "running").map(|ms| format!("Took {}", secs(ms))).unwrap_or_default();
-    out.push(Row::Card { block: block.to_owned(), icon, words: dotted(words, &detail), detail, tip, error });
+    out.push(Row::Card { block: block.to_owned(), words: dotted(words, &detail), detail, tip, error, open: shown != Shown::Folded });
     if draws {
         out.push(Row::Ui { v: d.ui.clone(), cell: d.cell.clone(), block: block.to_owned(), code: false });
     }
@@ -772,12 +734,12 @@ fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>
                 if many {
                     let words = if e.status == "running" { format!("{}\u{2026}", e.doing) } else { e.done.clone() };
                     let detail = step_detail(&e.detail);
-                    out.push(Row::Step { icon: kind_icon(&e.kind), words: dotted(words, &detail), detail, error: e.status == "error" });
+                    out.push(Row::Step { words: dotted(words, &detail), detail, error: e.status == "error" });
                 }
                 value_rows(&e.value, usize::MAX, out);
             }
             if d.dropped > 0 {
-                out.push(Row::Step { icon: kind_icon(""), words: format!("{} more steps, not kept", d.dropped), detail: String::new(), error: false });
+                out.push(Row::Step { words: format!("{} more steps, not kept", d.dropped), detail: String::new(), error: false });
             }
             if d.value["t"] == "scalar" && !d.effects.is_empty() {
                 out.push(Row::Output { text: cell_text(&d.value["v"]), error: false });
@@ -823,10 +785,8 @@ fn item_rows(t: &Transcript, g: &Grouped, n: usize, fold: &HashMap<String, bool>
                 let result = result.as_ref().map(|r| r.text.clone()).unwrap_or_default();
                 // Previewed: the head of its output under its line.
                 let preview = (shown == Shown::Preview && !result.trim().is_empty()).then(|| head_lines(&result, PREVIEW_ROWS));
-                let icon = call.and_then(|c| c.acts.first().copied()).map_or_else(|| kind_icon(""), act_icon);
                 part.push(Row::Tool {
                     block: block.clone(),
-                    icon,
                     name: name.clone(),
                     arg: model::chat::main_arg(input),
                     state,
@@ -864,12 +824,9 @@ fn rows_nested(t: &Transcript, fold: &HashMap<String, bool>) -> (Vec<(String, Ro
             Piece::Run(run) => {
                 let key = run.key();
                 let open = fold.get(&key).copied().unwrap_or(false);
-                let first = run.calls[0].1.acts.first().copied().unwrap_or(Act::Other);
-                let one_kind = run.calls.iter().flat_map(|(_, c)| &c.acts).all(|a| *a == first);
-                let icon = if one_kind { act_icon(first) } else { kind_icon("") };
                 let (failed, running) = (run.failed(), run.running());
                 let words = if failed > 0 || running { dotted(run.summary(), "x") } else { run.summary() };
-                out.push((key.clone(), Row::Run { key, icon, words, failed, running }));
+                out.push((key.clone(), Row::Run { key, words, failed, running, open }));
                 for &n in &run.items {
                     let call = run.calls.iter().find(|(i, _)| *i == n).map(|(_, c)| c);
                     let shows = open
@@ -953,7 +910,7 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
             (&["body", "input"], input.clone(), false),
             (&["body", "result"], tool_result(result).to_owned(), false),
         ],
-        Row::Thinking { open: true, text, .. } => vec![(&["text"], text.trim().to_owned(), false)],
+        Row::Thinking { open: true, text, .. } => vec![(&["body", "text"], text.trim().to_owned(), false)],
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
         Row::Card { words, .. } | Row::Run { words, .. } => vec![(&["head", "words"], words.clone(), false)],
         Row::Step { words, .. } => vec![(&["words"], words.clone(), false)],
@@ -1189,7 +1146,9 @@ impl App {
         let Some(ui) = v.part("ui") else { return };
         let mut paint = self.paint.borrow_mut();
         let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
-        genui::fill(ui, tree, "gallery.0", Some(&self.genui), true, &mut measure);
+        // HARNESS_NATIVE_GENUI_CELLS: the cells a CellRef in the tree shows (checked as the shot starts).
+        let cells = crate::gallery::genui_cells().ok().flatten();
+        genui::fill_in(ui, tree, "gallery.0", cells, Some(&self.genui), true, &mut measure);
     }
 
     /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
@@ -1277,7 +1236,7 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy };
+                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy, cells: Some(&t.details) };
                 fill_row(row, &rows[i].1, &ctx, &mut measure);
                 if let Some(mut pad) = view::prefab(w, rows[i].1.prefab()).and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()) {
                     if nested.contains(&rows[i].0) {
@@ -1285,6 +1244,19 @@ impl App {
                     }
                     if row.entity().try_cloned::<&harness_native_ui_layout_api::Padding>() != Some(pad) {
                         row.set(pad);
+                    }
+                }
+                // A line's own guide (hn.ChatGuideOff, clear) shows as hn.ChatGuide's when the line is one of an opened
+                // run's calls, so the run's calls hang on one guide with what they opened.
+                if matches!(rows[i].1, Row::Tool { .. } | Row::Card { .. } | Row::Thinking { .. })
+                    && let Some(g) = row.part("guide").and_then(|g| g.part("line"))
+                {
+                    let look = if nested.contains(&rows[i].0) { "hn.ChatGuide" } else { "hn.ChatGuideOff" };
+                    let want = view::prefab(w, look).and_then(|p| View::of(p).part("line")).and_then(|l| l.entity().try_cloned::<&Fill>());
+                    if let Some(f) = want
+                        && g.entity().try_cloned::<&Fill>() != Some(f)
+                    {
+                        g.set(f);
                     }
                 }
                 if atomic(&rows[i].1) {
@@ -1365,8 +1337,8 @@ impl App {
         }
         if let Some(status) = pv.part("foot").and_then(|f| f.part("status")) {
             let o = w.entity_from_id(e);
-            // The model and the effort it runs with ("claude-opus-5-5 · high"): the transcript's when its `session`
-            // event said them, else the daemon's listing; the model alone when the effort is unknown.
+            // The model and the effort it runs with, as den's picker (chat/pick.rs): the transcript's when its `session`
+            // event (or a choice) said them, else the daemon's listing; the model alone when the effort is unknown.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let (model, effort) = if t.model.is_empty() {
                 (listed.s.as_str().to_owned(), listed.effort.as_str().to_owned())
@@ -1374,10 +1346,7 @@ impl App {
                 let effort = if t.effort.is_empty() { listed.effort.as_str() } else { t.effort.as_str() };
                 (t.model.clone(), effort.to_owned())
             };
-            let shown = if model.is_empty() || effort.is_empty() { model } else { format!("{model} \u{00B7} {effort}") };
-            if let Some(m) = status.part("model") {
-                m.text(&shown);
-            }
+            self.fill_chat_pick(status, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &model, &effort);
             let state = if self.status_of(e) != "running" {
                 "ended \u{00B7} a message resumes it"
             } else if t.busy {
@@ -1472,6 +1441,9 @@ impl App {
         }
         // A cell's controls: its field's typing, a dragged slider, an open select.
         self.step_genui();
+        // A press off the picker's open menu closes it.
+        self.step_chat_pick();
+        self.step_genui_common();
     }
 
     /// A scroll over a chat pane's transcript: its physics take it (scrolling up lets go of the bottom). Whether it was
@@ -1552,8 +1524,18 @@ impl App {
         if self.genui_editing() {
             return self.genui_edit(op);
         }
-        // Escape closes what a cell floats over the transcript (a popover, a menu, a dialog) before it interrupts.
-        if op == "interrupt" && self.genui_escape() {
+        if op == "pick_model" || op == "effort_next" {
+            return self.chat_pick_key(op);
+        }
+        // An open picker menu takes the arrows and Return (chat/pick.rs).
+        if let Some((_, _, sid)) = self.focused_chat()
+            && self.chat_pick_nav(sid, op)
+        {
+            return;
+        }
+        // Escape closes the picker's menu, and what a cell floats over the transcript (a popover, a menu, a dialog),
+        // before it interrupts.
+        if op == "interrupt" && (self.chat_pick_close() || self.genui_escape()) {
             return;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return };
@@ -1920,7 +1902,8 @@ impl App {
     /// its transcript it starts a selection there; a drag extends either. A press on a cell's field is the field's
     /// ([`Self::genui_pointer_down`]). Whether a chat took it.
     pub(super) fn chat_pointer_down(&mut self, clicks: isize) -> bool {
-        if self.genui_pointer_down(clicks) {
+        let took = self.genui_common_down();
+        if self.genui_pointer_down(clicks) || took {
             return true;
         }
         let Some((p, _, sid)) = self.focused_chat() else { return false };
@@ -1970,7 +1953,7 @@ impl App {
     /// The pointer moved with a chat's press held: its selection follows (the press's own span kept whole), a cell's
     /// field's as well ([`Self::genui_pointer_drag`]). Whether a chat is being dragged in.
     pub(super) fn chat_pointer_drag(&mut self) -> bool {
-        if self.genui_pointer_drag() {
+        if self.genui_common_drag() || self.genui_pointer_drag() {
             return true;
         }
         let held = self.chat.borrow().iter().find_map(|(sid, st)| st.drag.map(|d| (*sid, d)));
@@ -2004,7 +1987,7 @@ impl App {
     /// The press let go: a drag ends (a cell's field's too), and a transcript selection that covers nothing goes. Whether
     /// a chat was dragged in.
     pub(super) fn chat_pointer_up(&mut self) -> bool {
-        let mut any = self.genui_pointer_up();
+        let mut any = self.genui_common_up() | self.genui_pointer_up();
         for st in self.chat.borrow_mut().values_mut() {
             if st.drag.take().is_some() {
                 any = true;
@@ -2076,11 +2059,13 @@ struct RowCtx<'k> {
     ui: Option<&'k std::cell::RefCell<GenLive>>,
     /// Its agent is at work: a cell's UI new to the transcript plays (genui's `playing`).
     playing: bool,
+    /// The transcript's cells by tool call, for a cell's UI that shows another (a CellRef).
+    cells: Option<&'k HashMap<String, Detail>>,
 }
 
 impl RowCtx<'static> {
     /// A row drawn outside the transcript (in a cell's generated UI): its tables' rows do not open.
-    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None, playing: false };
+    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None, playing: false, cells: None };
 }
 
 impl RowCtx<'_> {
@@ -2135,10 +2120,10 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
                 }
             }
         }
-        Row::Tool { block, icon, name, arg, state, input, result, .. } => {
+        Row::Tool { block, name, arg, state, shown, input, result, .. } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, icon, name, arg, state, "");
+                line(h, name, arg, state, "", Some(*shown != Shown::Folded));
             }
             if let Some(c) = row.part("body").and_then(|b| b.part("card")) {
                 if let Some(i) = c.part("input") {
@@ -2149,44 +2134,46 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
                 }
             }
         }
-        Row::Thinking { block, text: s, live, .. } => {
+        Row::Thinking { block, text: s, live, open } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, THOUGHT, if *live { "Thinking\u{2026}" } else { "Thought" }, "", "", "");
+                line(h, if *live { "Thinking\u{2026}" } else { "Thought" }, "", "", "", Some(*open));
             }
-            text("text", s.trim());
+            if let Some(t) = row.part("body").and_then(|b| b.part("text")) {
+                t.text(s.trim());
+            }
         }
-        Row::Card { block, icon, words, detail, tip, .. } => {
+        Row::Card { block, words, detail, tip, open, .. } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{block}"));
-                line(h, icon, words, "", detail, tip);
+                line(h, words, "", detail, tip, Some(*open));
             }
         }
-        Row::Run { key, icon, words, failed, running } => {
+        Row::Run { key, words, failed, running, open } => {
             if let Some(h) = row.part("head") {
                 h.action(&format!("chat:open:{key}"));
                 let detail = if *failed > 0 { format!("{failed} failed") } else if *running { "running\u{2026}".into() } else { String::new() };
-                line(h, icon, words, "", &detail, "");
+                line(h, words, "", &detail, "", Some(*open));
             }
         }
-        Row::Step { icon, words, detail, .. } => line(row, icon, words, "", detail, ""),
+        Row::Step { words, detail, .. } => line(row, words, "", detail, "", None),
         Row::Grid { v, cap } => fill_grid(row, v, *cap, ctx, measure),
         Row::Table(t) => {
             if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
                 let action = ctx.row_action();
-                let opts = view::table::Opts { look: "hn.ChatTable", shown: t.rows.len(), action: action.as_deref(), open: ctx.open };
+                let opts = view::table::Opts { look: "hn.ChatTable", shown: t.rows.len(), action: action.as_deref(), open: ctx.open, ..view::table::Opts::default() };
                 view::table(grid, t, opts, measure);
             }
         }
         Row::Results { v, cap } => fill_results(row, v, *cap),
         Row::Ui { v, cell, block, code } => {
-            genui::fill(row, v, cell, ctx.ui, ctx.playing, measure);
+            genui::fill_in(row, v, cell, ctx.cells, ctx.ui, ctx.playing, measure);
             // Its code: a quiet button in the gutter, shown while the view is hovered or its code is open.
             if let Some(b) = row.part("code_at").and_then(|z| z.part("code")) {
                 b.action(&format!("chat:open:{}", code_key(block)));
                 tooltip(b, if *code { "Hide code" } else { "Show code" });
                 if let Some(i) = b.part("icon") {
-                    i.icon(kind_icon(""));
+                    i.icon(CODE_ICON);
                     crate::look::hover_show(i.entity(), *row.entity().id(), *code);
                 }
             }
@@ -2304,7 +2291,7 @@ fn fill_grid(row: View<'_>, v: &Value, cap: usize, ctx: &RowCtx<'_>, measure: &m
     let shown = data.rows.len().min(cap);
     if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
         let action = ctx.row_action().filter(|_| kind != "record");
-        let opts = view::table::Opts { look: "hn.ChatTable", shown, action: action.as_deref(), open: ctx.open };
+        let opts = view::table::Opts { look: "hn.ChatTable", shown, action: action.as_deref(), open: ctx.open, ..view::table::Opts::default() };
         view::table(grid, &data, opts, measure);
     }
     if let Some(f) = row.part("foot") {
@@ -2370,11 +2357,13 @@ fn select_all_words(e: EntityView<'_>, on: bool) {
     }
 }
 
-/// Fill one line (hn.ChatLine: a call's, a run's, a step's, a thought's): its icon, words, argument in the code face, detail
-/// and, on hover, `tip` (how long it took; none when empty).
-fn line(h: View<'_>, icon: &str, words: &str, arg: &str, detail: &str, tip: &str) {
-    if let Some(p) = h.part("icon") {
-        p.icon(icon);
+/// Fill one line (hn.ChatLine: a call's, a run's, a step's, a thought's): its words, argument in the code face, detail,
+/// on hover `tip` (how long it took; none when empty), and its hover-only chevron turned to `open` (None: a step, which
+/// opens nothing).
+fn line(h: View<'_>, words: &str, arg: &str, detail: &str, tip: &str, open: Option<bool>) {
+    if let (Some(p), Some(open)) = (h.part("chevron"), open) {
+        p.icon(crate::look::CHEVRON);
+        crate::look::disclose(p.entity(), open);
     }
     for (part, s) in [("words", words), ("detail", detail)] {
         if let Some(p) = h.part(part) {

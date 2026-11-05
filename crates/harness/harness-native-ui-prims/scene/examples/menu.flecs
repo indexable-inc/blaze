@@ -1,0 +1,30 @@
+// ui.MenuPlate and its parts, as the model and effort picker shows them: a head over each section, the chosen item's
+// check in the leading gutter (every label starts in the same place), a model's line muted at the end, a hairline
+// between sections, the highlighted item's pill (`Lit`: what the pointer or the arrow keys are on), and a note where
+// nothing can be chosen. The plate hugs its widest item.
+
+@tree ChildOf
+ex {
+  prefab MenuDemo : ex.Card {
+    label : ui.Label { Text: {s: "MENU"} }
+    menu : ui.MenuPlate {
+      model : ui.MenuHead { label { Text: {s: "Model"} } }
+      opus : ui.MenuItem { label { Text: {s: "Opus"} }; about { Text: {s: "Best for complex tasks"} } }
+      sonnet : ui.MenuItemOn { label { Text: {s: "Sonnet"} }; about { Text: {s: "Efficient for routine tasks"} } }
+      haiku : ui.MenuItem { label { Text: {s: "Haiku"} }; about { Text: {s: "Fastest"} } }
+      sep : ui.MenuSep {}
+      effort : ui.MenuHead { label { Text: {s: "Effort"} } }
+      low : ui.MenuItem { label { Text: {s: "Low"} } }
+      medium : ui.MenuItemOn { Lit; label { Text: {s: "Medium"} } }
+      high : ui.MenuItem { label { Text: {s: "High"} }; keys { Text: {s: "⇧⌘/"} } }
+    }
+    short : ui.MenuPlate {
+      low : ui.MenuItem { label { Text: {s: "Low"} } }
+      medium : ui.MenuItemOn { label { Text: {s: "Medium"} } }
+      high : ui.MenuItem { label { Text: {s: "High"} } }
+    }
+    none : ui.MenuPlate {
+      note : ui.MenuNote { label { Text: {s: "Model list arrives when a Claude chat starts."} } }
+    }
+  }
+}

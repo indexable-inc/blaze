@@ -1,0 +1,7 @@
+{
+  "effort": "xhigh",
+  "id": 7,
+  "model": "haiku",
+  "op": "set_model",
+  "t": "req"
+}

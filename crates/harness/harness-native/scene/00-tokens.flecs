@@ -12,25 +12,51 @@ export const size_row = 13
 export const size_run = 12
 export const size_label = 11
 export const size_code = 11.5
-// Weights (CSS numbers): a session's name medium, a section label semibold.
+// Weights (CSS numbers): a row's name medium (the Archive's, the palette's, the picker's), a section label semibold; a
+// sidebar tree row's name regular, medium while selected.
 export const weight_row = 500
+export const weight_tree = 400
+export const weight_tree_on = 560
 export const weight_label = 600
 
-// Rows: a session 24 tall, a run 20, the fold 20 (packed: the tree has no gap between rows); children indented 16 a level; icons 14 in a 16 box.
+// The Archive's rows (hn.Arch*): 24 tall, children indented indent_step a level (the tree's step too), icons 14 in a 16
+// box, its disclosure slot disclose_w wide with a chevron_box chevron. The sidebar's tree has its own (tree_* below).
 export const row_h = 24
-export const run_h = 20
-export const more_h = 20
 export const indent_step = 16
 export const icon_box = 16
 export const chevron_box = 12
-// A tree row's disclosure slot: the chevron's hit target, left of the row's icon. In the sidebar it hangs in the gutter
-// left of the icon (never pushing the row's content right).
 export const disclose_w = 18
-// The sidebar's side margin: the tree pads itself by it (so a depth-0 chevron hangs in it, inside the tree's clip), and
-// the section label and the Archive row sit in from it. label_inset is side_inset + row_pad: the section label's left
-// edge, where depth-0 icons start.
-export const side_inset = 10
-export const label_inset = 18
+// The sidebar's tree, a source list (Finder's, Xcode's): a session row tree_row_h tall, a run tree_run_h, the fold
+// tree_more_h, packed (the air between rows is the pill's inset). Each row starts its chevron gutter (tree_gutter wide)
+// tree_pad in from its left edge plus indent_step a level, so a child's chevron sits under its parent's icon (gutter and
+// step are equal) and the icon column never moves; then its icon (tree_icon box), tree_gap, its name; tree_pad_r on the
+// right for the trailing shortcut and status mark. The chevron is a thin vector mark tree_chevron across (its ink about
+// 7.5 tall), always shown in tone_chevron where the row has rows under it: hover-only hid which rows fold.
+export const tree_row_h = 28
+export const tree_run_h = 24
+export const tree_more_h = 22
+export const tree_gutter = 16
+export const tree_icon = 16
+export const tree_chevron = 9
+export const tree_pad = 2
+export const tree_pad_r = 8
+export const tree_gap = 6
+export const line_row = 16
+// The selection pill and the hover wash hug the row pill_inset in from its frame (4 points of air between neighbours),
+// corners radius_row.
+export const pill_inset = 2
+export const radius_row = 6
+// How a row stands (hn.Status): a dot status_size across, or a ring status_ring wide.
+export const status_size = 6
+export const status_ring = 1.25
+// The group header (the device's name) over the tree, group_h tall, its words label_inset in from the sidebar's edge:
+// in line with the depth-0 chevrons.
+export const group_h = 28
+
+// The sidebar's side margin: the tree pads itself by it, and the Archive row sits in from it. label_inset is the group
+// header's left edge: side_inset + tree_pad + the chevron's inset in its gutter, in line with the depth-0 chevrons.
+export const side_inset = 8
+export const label_inset = 16
 // The seam between the sidebar and the main card: a soft shadow off the card's left edge.
 export const seam_blur = 14
 export const seam_alpha = 0
@@ -127,6 +153,9 @@ export const spring_matched_omega = 26
 export const spring_matched_zeta = 0.84
 export const spring_layout_omega = 18
 export const spring_layout_zeta = 1
+// A Posed node's glide to its pose (prims.flecs ui.spring.pose, motion's Posing): den's `smooth` GenSpring.
+export const spring_pose_omega = 22
+export const spring_pose_zeta = 1
 
 // The Archive pane: its title, search line, filter chips, day headings and the right-hand columns (duration, time).
 export const size_title = 15
@@ -153,6 +182,44 @@ export const overlay_pad = 6
 export const overlay_lift_blur = 24
 export const overlay_lift_alpha = 0.5
 export const overlay_lift_dy = 8
+
+// Menus (prims.flecs ui.Menu and its parts), macOS NSMenu's: a plate menu_radius round that hugs its widest item (at
+// least menu_min_w, at most menu_max_w), menu_pad in from its edge, hung menu_gap off what opened it, its shadow
+// menu_lift_*; it opens growing from menu_in_scale out of that edge and fading in, on the menu spring. An item is
+// menu_item_h tall at size_menu, its highlight a pill menu_item_radius round in tone_menu_hot (on the hover spring);
+// a ticked item's check sits in the leading gutter (menu_gutter_l in, menu_check across, menu_gutter_gap before the
+// label), so every label starts at menu_label_x whether ticked or not. Its trailing words (a model's line, a key) are
+// muted, at least menu_trail_gap after the label. A section's head is size_menu_head, muted; a separator is a hairline
+// menu_sep_pad above and below.
+export const menu_radius = 10
+export const menu_pad = 5
+export const menu_gap = 6
+export const menu_min_w = 120
+export const menu_max_w = 380
+export const menu_lift_blur = 18
+export const menu_lift_alpha = 0.28
+export const menu_lift_dy = 6
+export const menu_in_scale = 0.94
+export const menu_omega = 34
+export const menu_zeta = 1
+export const menu_item_h = 22
+export const menu_item_radius = 5
+export const menu_item_pad_r = 10
+export const menu_gutter_l = 6
+export const menu_check = 11
+export const menu_gutter_gap = 5
+export const menu_label_x = $menu_gutter_l + $menu_check + $menu_gutter_gap
+export const menu_trail_gap = 20
+export const menu_head_h = 20
+export const menu_sep_pad = 5
+export const size_menu = 13
+export const line_menu = 16
+export const size_menu_head = 11
+export const tone_menu: Fill = {dark: {0.157, 0.157, 0.169, 1}, light: {0.988, 0.988, 0.992, 1}}
+export const tone_menu_edge: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.11}}
+export const tone_menu_hot: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.07}}
+export const tone_menu_press: Fill = {dark: {1, 1, 1, 0.16}, light: {0, 0, 0, 0.11}}
+export const tone_menu_rule: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.09}}
 // The palette: a wide card near the window's top, its query line, its entries.
 export const palette_w = 560
 export const palette_top = 96
@@ -203,7 +270,16 @@ export const spring_press_zeta = 0.62
 export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.22}, light: {0, 0, 0, 0.20}}
 export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.03}}
 // The selected row: a soft accent-tinted pill over the vibrancy.
-export const tone_select: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.075}}
+export const tone_select: Fill = {dark: {1, 1, 1, 0.10}, light: {0, 0, 0, 0.08}}
+// The tree's rows (hn.ObjRow, hn.RunRow): a name's ink at rest and selected; the hover wash, softer than the selection;
+// the selection while the tree has the keyboard (the accent's wash, so focus reads apart from a selection elsewhere); the
+// disclosure chevron; how a row stands: a live session's dot, an exited one's ring.
+export const tone_row: Fill = {dark: {1, 1, 1, 0.78}, light: {0, 0, 0, 0.76}}
+export const tone_row_on: Fill = {dark: {1, 1, 1, 0.94}, light: {0, 0, 0, 0.90}}
+export const tone_row_hover: Fill = {dark: {1, 1, 1, 0.04}, light: {0, 0, 0, 0.035}}
+export const tone_select_focus: Fill = {dark: {0.580, 0.600, 1.0, 0.24}, light: {0.369, 0.384, 0.902, 0.16}}
+export const tone_chevron: Fill = {dark: {1, 1, 1, 0.42}, light: {0, 0, 0, 0.40}}
+export const tone_status_ring: Fill = {dark: {1, 1, 1, 0.36}, light: {0, 0, 0, 0.34}}
 // The sidebar's tint plate over the window vibrancy: the terminal ground (dark) or the light ground, part see-through.
 export mut tone_side_tint: Fill = {dark: {0.071, 0.071, 0.078, 1}, light: {0.965, 0.965, 0.970, 1}}
 // The one hairline between the sidebar and the main card.
@@ -229,6 +305,8 @@ export mut tone_term_ink: Fill = {dark: {1, 1, 1, 0.86}, light: {1, 1, 1, 0.86}}
 export mut tone_term_muted: Fill = {dark: {1, 1, 1, 0.45}, light: {1, 1, 1, 0.45}}
 
 export const tone_running: Fill = {dark: {0.298, 0.718, 0.510, 1}, light: {0.18, 0.60, 0.38, 1}}
+// A live session's status dot on its tree row (hn.ObjRow): the running green.
+export const tone_status_running: Fill = $tone_running
 export const tone_exited: Fill = {dark: {1, 1, 1, 0.32}, light: {0, 0, 0, 0.30}}
 export const tone_failed: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {0.84, 0.22, 0.20, 1}}
 export const tone_failed_wash: Fill = {dark: {1.0, 0.45, 0.43, 0.13}, light: {0.84, 0.22, 0.20, 0.10}}
@@ -343,18 +421,36 @@ export const chat_bubble_radius = 12
 // The widest a user's bubble gets before its words wrap: about three quarters of the column, as iMessage and ChatGPT do.
 export const chat_bubble_max_w = 540
 export const chat_input_radius = 12
+// The status line under the composer (hn.ChatPane's foot.status): its words, and den's model and effort picker in it
+// (hn.ChatPick, src/app/chat/pick.rs): each word its own control chat_pick_h tall, chat_pick_gap apart, the chevron
+// chat_pick_chevron across; the context meter after them (hn.ChatContext) a ring chat_ring across, its stroke
+// chat_ring_stroke, chat_context_gap from its percentage. The picker's menu is a ui.Menu (the menu_* tokens).
+export const size_chat_status = 12.5
+export const line_chat_status = 16
+export const chat_pick_h = 20
+export const chat_pick_gap = 6
+export const chat_pick_chevron = 10
+export const chat_ring = 12
+export const chat_ring_stroke = 2
+export const chat_context_gap = 5
+export const chat_context_lead = 4
 export const chat_row_estimate = 44
-// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): its height, its lead-in, its icon and the
-// gap after it. What sits under a line (its output, its table, its steps) starts under its words (chat_line_inset); a
-// run's calls sit in from its line by its icon's place (chat_nest).
+// A tool call's, a run's or a thought's line (hn.ChatLine, one look for all): plain words, no icon. Its height, its
+// lead-in, and the chevron that shows on hover only (chat_line_chevron across). What sits under a line (its output, its
+// table, its steps, a run's calls) starts chat_line_inset in, with a faint guide (tone_chat_guide, chat_guide_w wide)
+// at chat_guide_x; a run's calls sit in from its line by chat_nest, so their words start where the content does.
 export const chat_tool_h = 24
 export const chat_line_pad = 4
-export const chat_line_icon = 14
-export const chat_line_gap = 7
+export const chat_line_chevron = 10
+export const chat_guide_x = 8
+export const chat_guide_w = 1
+export const chat_line_inset = 22
+export const chat_nest = $chat_line_inset - $chat_line_pad
 // Between a line's words, its argument and its detail.
 export const chat_line_word_gap = 5
-export const chat_line_inset = $chat_line_pad + $chat_line_icon + $chat_line_gap
-export const chat_nest = $chat_line_icon + $chat_line_gap
+export const tone_chat_guide: Fill = {dark: {1, 1, 1, 0.09}, light: {0, 0, 0, 0.09}}
+// A drawn view's code button's glyph.
+export const chat_line_icon = 14
 // A drawn view's code button: hung in the column's gutter, left of the view, shown while the view is hovered.
 export const chat_view_code = 20
 export const chat_view_code_hang = $chat_view_code + 2
@@ -522,3 +618,90 @@ export const kip_outcome_secs = 2.6
 export const kip_outcome_fade = 0.4
 export const kip_empty = 72
 export const kip_archive = 44
+
+// genui new elements (lane E: File, CellRef, ColorPicker and DropZone; widgets/genui.flecs's "New elements" section,
+// src/app/chat/genui/{files,cellref,color,dropzone}.rs), after den's 30-genui.flecs and 33-genui-prims.flecs.
+// A File row: its height, inset and gap, its kind's icon, the hover wash it takes when pressable (6% ink, its corners).
+export const gen_file_row_h = 32
+export const gen_file_pad = 8
+export const gen_file_gap = 8
+export const gen_file_icon = 16
+export const gen_file_radius = 8
+export const line_gen_file = 22
+export const line_gen_meta = 16
+export const tone_gen_file_hover: Fill = {dark: {0.922, 0.918, 0.902, 0.06}, light: {0.086, 0.086, 0.090, 0.06}}
+// A CellRef's card: the space between its head (the cell's name and its badge) and the cell's view or output.
+export const gen_cell_gap = 6
+export const gen_cell_head_gap = 8
+// A ColorPicker, after macOS's accent picker: round swatches gen_swatch across (a hairline round each), gen_swatch_gap
+// apart in boxes the ring's size; the picked one ringed (gen_swatch_ring across, gen_swatch_ring_border thick, in the
+// ink), the ring sliding to a new pick on the matched spring; a hover wash gen_swatch_hover across. The last well is a
+// wheel of hues that opens the system colour panel; a colour picked there shows as a dot gen_swatch_custom across in it.
+export const gen_swatch = 22
+export const gen_swatch_radius = 11
+export const gen_swatch_ring = 30
+export const gen_swatch_ring_radius = 15
+export const gen_swatch_ring_border = 2
+export const gen_swatch_gap = 2
+export const gen_swatch_hover_pad = -1
+export const gen_swatch_hover_radius = 14
+export const gen_swatch_custom = 10
+export const gen_swatch_custom_radius = 5
+export const tone_gen_swatch_edge: Fill = {dark: {1, 1, 1, 0.14}, light: {0, 0, 0, 0.14}}
+export const tone_gen_swatch_ring: Fill = {dark: {0.922, 0.918, 0.902, 0.9}, light: {0.086, 0.086, 0.090, 0.85}}
+export const tone_gen_swatch_hover: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.08}}
+export const tone_gen_swatch_custom_edge: Fill = {dark: {1, 1, 1, 0.9}, light: {1, 1, 1, 0.95}}
+// The well's hues, a turn of the colour wheel from red (HSV saturation 0.78, value 0.95), the same in both appearances.
+export const tone_gen_wheel_0: Fill = {dark: {0.950, 0.209, 0.209, 1}, light: {0.950, 0.209, 0.209, 1}}
+export const tone_gen_wheel_1: Fill = {dark: {0.950, 0.580, 0.209, 1}, light: {0.950, 0.580, 0.209, 1}}
+export const tone_gen_wheel_2: Fill = {dark: {0.950, 0.950, 0.209, 1}, light: {0.950, 0.950, 0.209, 1}}
+export const tone_gen_wheel_3: Fill = {dark: {0.580, 0.950, 0.209, 1}, light: {0.580, 0.950, 0.209, 1}}
+export const tone_gen_wheel_4: Fill = {dark: {0.209, 0.950, 0.209, 1}, light: {0.209, 0.950, 0.209, 1}}
+export const tone_gen_wheel_5: Fill = {dark: {0.209, 0.950, 0.580, 1}, light: {0.209, 0.950, 0.580, 1}}
+export const tone_gen_wheel_6: Fill = {dark: {0.209, 0.950, 0.950, 1}, light: {0.209, 0.950, 0.950, 1}}
+export const tone_gen_wheel_7: Fill = {dark: {0.209, 0.580, 0.950, 1}, light: {0.209, 0.580, 0.950, 1}}
+export const tone_gen_wheel_8: Fill = {dark: {0.209, 0.209, 0.950, 1}, light: {0.209, 0.209, 0.950, 1}}
+export const tone_gen_wheel_9: Fill = {dark: {0.580, 0.209, 0.950, 1}, light: {0.580, 0.209, 0.950, 1}}
+export const tone_gen_wheel_10: Fill = {dark: {0.950, 0.209, 0.950, 1}, light: {0.950, 0.209, 0.950, 1}}
+export const tone_gen_wheel_11: Fill = {dark: {0.950, 0.209, 0.580, 1}, light: {0.950, 0.209, 0.580, 1}}
+// A DropZone: a sunk plate (a field's ground, a hairline at 16% ink) with its words in the middle, gen_drop_min_h tall
+// at least; lit while Finder files are carried over it (8% ink over it, the hairline at 60% ink, thicker), the light
+// fading in and out on the transition spring.
+export const gen_drop_radius = 10
+export const gen_drop_pad = 16
+export const gen_drop_gap = 8
+export const gen_drop_min_h = 96
+export const gen_drop_hot_border = 1.5
+export const tone_gen_drop_edge: Fill = {dark: {1, 1, 1, 0.16}, light: {0, 0, 0, 0.16}}
+export const tone_gen_drop_hot: Fill = {dark: {0.922, 0.918, 0.902, 0.08}, light: {0.086, 0.086, 0.090, 0.07}}
+export const tone_gen_drop_hot_edge: Fill = {dark: {0.922, 0.918, 0.902, 0.6}, light: {0.086, 0.086, 0.090, 0.55}}
+
+// genui element props and motion (scene/widgets/genui.flecs, "Element props and motion"). A Progress glides to a new
+// value on the gen_glide spring; below its max a sheen sweeps along its fill (den ui/progress.rs's shimmer): across in
+// gen_sweep_period seconds, gen_sweep_share of the fill long, fading to gen_sweep_low as an end cuts it, in
+// tone_gen_sheen. A Loading or a Skeleton stays unseen for gen_pending_delay seconds, then fades in on the gen_pending
+// spring (den's PendingLook), so a wait that ends at once never flickers. A Table's query marks what it found in each
+// cell with a tone_gen_match plate, gen_match_radius round.
+export const gen_glide_omega = 18
+export const gen_glide_zeta = 1
+export const gen_sweep_period = 1.4
+export const gen_sweep_share = 0.34
+export const gen_sweep_low = 0.25
+export const tone_gen_sheen: Fill = {dark: {1, 1, 1, 0.28}, light: {1, 1, 1, 0.35}}
+export const gen_pending_delay = 0.15
+export const gen_pending_omega = 14
+export const gen_pending_zeta = 1
+export const tone_gen_match: Fill = {dark: {0.580, 0.600, 1.0, 0.28}, light: {0.369, 0.384, 0.902, 0.22}}
+export const gen_match_radius = 3
+
+// ---- genui universal props ----------------------------------------------------------------------------------------
+// The props every element of a cell's UI takes (src/app/chat/genui/common.rs, canvas.rs; hn.GenUniversal in widgets/genui.flecs),
+// after den's genui_prims.rs. An element's pose glides on the pose spring (spring_pose_*), except while an `enter` or
+// `exit` plays: a spring that settles in its `ms`, omega gen_settle_rate * 1000 / ms, critically damped (gen_settle_zeta).
+// A press on an element with onDrag is a drag once it moves gen_drag_slop points. A Canvas shape's or Group's pose and
+// turn spring on gen_shape_omega / gen_shape_zeta (den's `smooth` too).
+export const gen_settle_rate = 6.6
+export const gen_settle_zeta = 1
+export const gen_drag_slop = 3
+export const gen_shape_omega = 22
+export const gen_shape_zeta = 1

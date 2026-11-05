@@ -19,6 +19,7 @@ use harness_native_flecs::prelude::*;
 use harness_native_ui_input_api::{Action, Tooltip};
 use harness_native_ui_layout_api::{AlignmentGuide, Flex, Intrinsic, Justify, ScrollState, Size, SizeKind, Sizing};
 use harness_native_ui_look_api::TextStyle;
+use harness_native_ui_text_api::TextRange;
 use harness_native_ui_node_api::Laid;
 
 use crate::{View, for_each_of, lazy_for_each, prefab};
@@ -42,16 +43,31 @@ pub enum Kind {
     Dim,
 }
 
-/// One cell: what it holds and its value as text (a url whole, a bool `true`/`false`, markdown as written).
+/// One cell: what it holds, its value as text (a url whole, a bool `true`/`false`, markdown as written), and what a press
+/// on it sends (an action name; a url cell opens its url without one).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cell {
     pub kind: Kind,
     pub text: String,
+    pub press: Option<String>,
 }
 
 impl Cell {
     pub fn new(kind: Kind, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into() }
+        Self { kind, text: text.into(), press: None }
+    }
+
+    /// The cell sending `action` on a press, drawn as a link.
+    #[must_use]
+    pub fn with_press(mut self, action: impl Into<String>) -> Self {
+        self.press = Some(action.into());
+        self
+    }
+
+    /// What a press on it does: a url cell opens its url, else its own action.
+    #[must_use]
+    pub fn action(&self) -> Option<Cow<'_, str>> {
+        self.link().map(|u| Cow::Owned(format!("open:{u}"))).or_else(|| self.press.as_deref().map(Cow::Borrowed))
     }
 
     /// What the cell shows in its row: a url's host, a bool's mark, the rest as it is.
@@ -114,7 +130,7 @@ pub struct Table {
     pub head: bool,
 }
 
-static EMPTY: Cell = Cell { kind: Kind::Text, text: String::new() };
+static EMPTY: Cell = Cell { kind: Kind::Text, text: String::new(), press: None };
 
 impl Table {
     /// Row `r`'s cell in column `c` (an empty one past a short row's end).
@@ -184,13 +200,40 @@ impl Table {
 /// How a table is drawn: `look` is the prefix of its prefabs (`ui.Table`: `ui.TableHead`, `ui.TableCell`,
 /// `ui.TableCellMd`, `ui.TableCellCode`, `ui.TableCellNum`, `ui.TableCellDim`, `ui.TableCellLink`, `ui.TableCellMark`,
 /// `ui.TableField`, `ui.TableFieldMd`; a view gives its own made from them, for its inks), `shown` how many rows show,
-/// `action` what a row's press sends (`{action}:{row}`; None: rows do not open) and `open` the row opened below.
-#[derive(Clone, Copy, Debug)]
+/// `action` what a row's press sends (`{action}:{row}`; None: rows do not open), `presses` each row's own press in its place
+/// (row `r` sends `presses[r]`), `open` the row opened below, and `find` words to mark in every cell they are in (in the
+/// look's `Match` prefab; none when blank).
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Opts<'s> {
     pub look: &'s str,
     pub shown: usize,
     pub action: Option<&'s str>,
+    pub presses: Option<&'s [String]>,
     pub open: Option<usize>,
+    pub find: &'s str,
+}
+
+/// Where `query` first is in `text`, ignoring case, as UTF-16 units `from..to` of `text` (what a `TextRange` counts). None
+/// when it is blank or not there.
+#[must_use]
+pub fn find(text: &str, query: &str) -> Option<(u32, u32)> {
+    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect(); // alloc: one query's few chars
+    if q.iter().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    // Each char of `text` lowered (a char may lower to several), with where it starts in UTF-16 units.
+    let mut low: Vec<(char, u32)> = Vec::new(); // alloc: one cell's chars
+    let mut at = 0u32;
+    for ch in text.chars() {
+        for l in ch.to_lowercase() {
+            low.push((l, at));
+        }
+        at += ch.len_utf16() as u32;
+    }
+    let end_of = |k: usize| low.get(k).map_or(at, |&(_, u)| u);
+    (0..=low.len().checked_sub(q.len())?)
+        .find(|&k| low[k..k + q.len()].iter().map(|&(c, _)| c).eq(q.iter().copied()))
+        .map(|k| (low[k].1, end_of(k + q.len())))
 }
 
 /// A column at most this many ems wide hugs its widest cell, never cut.
@@ -262,6 +305,11 @@ fn cell_prefab(look: &str, kind: Kind) -> String {
         Kind::Dim => "CellDim",
     };
     format!("{look}{part}")
+}
+
+/// The prefab of `cell` in look `look`: a cell with a press of its own reads as a link.
+fn prefab_of(look: &str, cell: &Cell) -> String {
+    cell_prefab(look, if cell.press.is_some() && cell.kind != Kind::Markdown { Kind::Url } else { cell.kind })
 }
 
 /// The text style of prefab `name`'s `text` part (or `part`), as a scene wrote it.
@@ -359,25 +407,42 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
         shape(v, c);
     });
     let open = opts.open.filter(|&o| o < shown);
+    let match_pf = format!("{look}Match");
     let fill_row = |row: View<'_>, r: usize, fresh: bool| {
         if fresh {
             row.set(HoverAmt::default());
         }
-        let act = opts.action.map(|a| format!("{a}:{r}")).unwrap_or_default();
+        let act = match opts.presses {
+            Some(p) => p.get(r).cloned().unwrap_or_default(),
+            None => opts.action.map(|a| format!("{a}:{r}")).unwrap_or_default(),
+        };
         if row.entity().try_cloned::<&Action>().is_none_or(|x| x.name.as_str() != act) {
             row.set(Action { name: act.as_str().into() });
         }
-        let cells = (0..n).map(|c| (format!("c{c}"), of(data.cell(r, c).kind).1.as_str(), c));
-        for_each_of(row, cells, |v, c, _| {
+        let cells = (0..n).map(|c| (format!("c{c}"), prefab_of(look, data.cell(r, c)), c));
+        let cells: Vec<(String, String, usize)> = cells.collect(); // alloc: one row's few cells
+        for_each_of(row, cells.iter().map(|(k, p, c)| (k.as_str(), p.as_str(), *c)), |v, c, _| {
             let cell = data.cell(r, c);
             let shown = cell.shown();
             let text = v.part("text");
             if let Some(x) = text {
                 x.text(&shown);
+                // The words found, marked under them (markdown's glyphs are not its source's: not marked).
+                let hit = if cell.kind == Kind::Markdown { None } else { find(&shown, opts.find) };
+                for_each_of(x, hit.map(|h| ("match", match_pf.as_str(), h)), |m, (from, to), fresh| {
+                    // It stands on its parent's glyphs (the painter plates them), not in the layout: no `Node`.
+                    if fresh {
+                        m.entity().remove(harness_native_ui_node_api::Node::id());
+                    }
+                    let want = TextRange { from, to };
+                    if m.entity().try_cloned::<&TextRange>() != Some(want) {
+                        m.set(want);
+                    }
+                });
             }
             shape(v, c);
-            if let Some(url) = cell.link() {
-                v.action(&format!("open:{url}"));
+            if let Some(a) = cell.action() {
+                v.action(&a);
             }
             // The whole value on hover: a url's, else the words when the column cuts them.
             let cut = text.is_some_and(|x| {
@@ -569,6 +634,11 @@ mod tests {
         assert_eq!(allot(&[400.0], -20.0), vec![0.0]);
         assert_eq!(host("https://www.corrosionhour.com/rust-november-2024/?x=1"), "corrosionhour.com");
         assert_eq!(host("http://user@docs.rs:8080/a"), "docs.rs:8080");
+        // A find ignores case and counts UTF-16 units.
+        assert_eq!(find("Hello World", "world"), Some((6, 11)));
+        assert_eq!(find("\u{1F600}ab", "B"), Some((3, 4)));
+        assert_eq!(find("abc", " "), None);
+        assert_eq!(find("ab", "abc"), None);
     }
 
     #[test]

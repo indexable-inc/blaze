@@ -12,3 +12,6 @@ openai.svg  https://cdn.jsdelivr.net/npm/simple-icons@15.22.0/icons/openai.svg  
             removed in 16.0.0, so this is its last published version; it is not on simpleicons.org today)
 
 The files are unmodified.
+
+chevron.svg is not from Simple Icons: harness's own disclosure chevron (a 3-unit stroke, round caps and join, a right
+angle pointing right), written for this repo (CC0).

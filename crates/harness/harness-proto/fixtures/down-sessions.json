@@ -1,4 +1,18 @@
 {
+  "models": {
+    "claude": [
+      {
+        "about": "",
+        "efforts": [
+          "low",
+          "high"
+        ],
+        "id": "sonnet",
+        "model": "claude-sonnet-5",
+        "name": "Sonnet 5"
+      }
+    ]
+  },
   "reply": "sessions",
   "sessions": [
     {

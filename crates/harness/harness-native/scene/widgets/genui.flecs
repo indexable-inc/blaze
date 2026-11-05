@@ -985,12 +985,27 @@ hn {
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 6, min: 0, max: 0}}
     fill : ui.Node {
+      Animate
+      Motion: {omega: $gen_glide_omega, zeta: $gen_glide_zeta}
       Fill: $tone_gen_on
       Shape: {radius: 3, n: 2, border: 0, feather: 0}
       Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     }
     rest : ui.Node {
+      Animate
+      Motion: {omega: $gen_glide_omega, zeta: $gen_glide_zeta}
       Size: {w: {kind: Grow, value: 0.5, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    }
+    // The sweep (genui/media.rs progress): over the track, its band placed by the row's padding.
+    sheen : ui.Row {
+      Overlay
+      Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Padding: {l: 0, r: 0, t: 0, b: 0}
+      band : ui.Node {
+        Fill: $tone_gen_sheen
+        Shape: {radius: 3, n: 2, border: 0, feather: 0}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+      }
     }
   }
   // A spinner (a quiet ring, an arc of it turning once a second: genui/media.rs turns the arc's transform on the clock)
@@ -1270,5 +1285,167 @@ hn {
   prefab GenUnknown : ui.Words {
     Fill: $tone_failed
     TextStyle: {size: $size_body, line: 19, role: 0, bold: 0}
+  }
+
+  // ---- New elements (lane E): File, CellRef, ColorPicker and DropZone (src/app/chat/genui/{files,cellref,color,
+  // dropzone}.rs), after den's 30-genui.flecs and 33-genui-prims.flecs. ----
+
+  // A File: one row of a listing (den's GenFile). Its kind's icon in the kind's colour (hn.GenFileKind), its name, then
+  // its size and when it changed, quiet, in tabular figures. A trailing / on its name makes it a folder. With an onClick
+  // it is hn.GenFileOn: it shows the hover, and a press sends its value, else its name.
+  prefab GenFile : ui.Row {
+    Flex: {axis: Row, gap: $gen_file_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $gen_file_row_h, min: 0, max: 0}}
+    Padding: {l: $gen_file_pad, r: $gen_file_pad, t: 0, b: 0}
+    Shape: {radius: $gen_file_radius, n: 4, border: 0, feather: 0}
+    icon : ui.Symbol {
+      Fill: $tone_file_text
+      Size: {w: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}, h: {kind: Fixed, value: $gen_file_icon, min: 0, max: 0}}
+    }
+    name : ui.Lead {
+      Fill: $tone_term_ink
+      TextStyle: {size: $size_body, line: $line_gen_file, role: 0, bold: 0}
+    }
+    meta : ui.Line {
+      Fill: $tone_term_muted
+      TextStyle: {size: $size_gen_small, line: $line_gen_meta, role: 10, bold: 0}
+    }
+  }
+  prefab GenFileOn : hn.GenFile {
+    HoverLook: {dark: $tone_gen_file_hover.dark, light: $tone_gen_file_hover.light, pad: 0, radius: -1}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+  }
+
+  // A CellRef: another cell of this chat on a card (den's link.rs cell card): its head (the cell's name, muted, and a
+  // badge while it runs or once it failed), then the view it draws, live, its events going to it, or what it printed as
+  // code. genui/cellref.rs fills both parts through genui.rs's own children, so the head is a GenText and a GenBadge.
+  prefab GenCellRef : hn.GenCard {
+    Flex: {axis: Column, gap: $gen_cell_gap, align: Stretch, justify: Start, wrap: false}
+  }
+  prefab GenCellRefHead : ui.Row {
+    Flex: {axis: Row, gap: $gen_cell_head_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenCellRefBody : ui.Column {
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // A ColorPicker, after macOS's accent picker: its label over a row of round swatches (genui/color.rs `s<i>`), each a
+  // box the ring's size with its colour's dot in the middle; the picked one carries the ring, which slides to a new pick
+  // on the matched spring (one id per picker). The last swatch is the well: a wheel of hues that opens the system colour
+  // panel, with the colour picked there as a dot in it.
+  prefab GenColorPicker : hn.GenLabelled {
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenColorRow : ui.Row {
+    Flex: {axis: Row, gap: $gen_swatch_gap, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenSwatch : ui.ZStack {
+    Fill: $tone_clear
+    Shape: {radius: $gen_swatch_ring_radius, n: 2, border: 0, feather: 0}
+    HoverLook: {dark: $tone_gen_swatch_hover.dark, light: $tone_gen_swatch_hover.light, pad: $gen_swatch_hover_pad, radius: $gen_swatch_hover_radius}
+    PressLook: {dark: $tone_wash_press.dark, light: $tone_wash_press.light}
+    Cursor: {shape: Arrow}
+    Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: $gen_swatch_ring, min: 0, max: 0}, h: {kind: Fixed, value: $gen_swatch_ring, min: 0, max: 0}}
+  }
+  prefab GenSwatchDot : ui.Node {
+    Fill: $tone_term_ink
+    Edge: {dark: $tone_gen_swatch_edge.dark, light: $tone_gen_swatch_edge.light}
+    Shape: {radius: $gen_swatch_radius, n: 2, border: 1, feather: 0}
+    Size: {w: {kind: Fixed, value: $gen_swatch, min: 0, max: 0}, h: {kind: Fixed, value: $gen_swatch, min: 0, max: 0}}
+  }
+  prefab GenSwatchRing : ui.Node {
+    Fill: $tone_clear
+    Edge: {dark: $tone_gen_swatch_ring.dark, light: $tone_gen_swatch_ring.light}
+    Shape: {radius: $gen_swatch_ring_radius, n: 2, border: $gen_swatch_ring_border, feather: 0}
+    Size: {w: {kind: Fixed, value: $gen_swatch_ring, min: 0, max: 0}, h: {kind: Fixed, value: $gen_swatch_ring, min: 0, max: 0}}
+    Motion: {omega: $spring_matched_omega, zeta: $spring_matched_zeta}
+  }
+  // The well's wheel: one wedge (a hn.GenShape) per hue of hn.GenColorWheel, in the dot's box.
+  prefab GenSwatchWheel : ui.Node {
+    Size: {w: {kind: Fixed, value: $gen_swatch, min: 0, max: 0}, h: {kind: Fixed, value: $gen_swatch, min: 0, max: 0}}
+  }
+  prefab GenSwatchCustom : ui.Node {
+    Edge: {dark: $tone_gen_swatch_custom_edge.dark, light: $tone_gen_swatch_custom_edge.light}
+    Shape: {radius: $gen_swatch_custom_radius, n: 2, border: 1, feather: 0}
+    Size: {w: {kind: Fixed, value: $gen_swatch_custom, min: 0, max: 0}, h: {kind: Fixed, value: $gen_swatch_custom, min: 0, max: 0}}
+  }
+  prefab GenColorWheel {
+    w0 { Fill: $tone_gen_wheel_0 }
+    w1 { Fill: $tone_gen_wheel_1 }
+    w2 { Fill: $tone_gen_wheel_2 }
+    w3 { Fill: $tone_gen_wheel_3 }
+    w4 { Fill: $tone_gen_wheel_4 }
+    w5 { Fill: $tone_gen_wheel_5 }
+    w6 { Fill: $tone_gen_wheel_6 }
+    w7 { Fill: $tone_gen_wheel_7 }
+    w8 { Fill: $tone_gen_wheel_8 }
+    w9 { Fill: $tone_gen_wheel_9 }
+    w10 { Fill: $tone_gen_wheel_10 }
+    w11 { Fill: $tone_gen_wheel_11 }
+  }
+
+  // A DropZone (den's GenDropZone): a sunk plate with its words in the middle (its label, else "Drop files here") over
+  // what it holds. While Finder files are carried over it, `hot` (hn.GenDropHot) lights it: a wash and a firmer line laid
+  // to the plate, fading in and out on the transition spring.
+  prefab GenDropZone : ui.Column {
+    Fill: $tone_gen_field
+    Edge: {dark: $tone_gen_drop_edge.dark, light: $tone_gen_drop_edge.light}
+    Shape: {radius: $gen_drop_radius, n: 4, border: 1, feather: 0}
+    Flex: {axis: Column, gap: $gen_drop_gap, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: $gen_drop_min_h, max: 0}}
+    Padding: {l: $gen_drop_pad, r: $gen_drop_pad, t: $gen_drop_pad, b: $gen_drop_pad}
+  }
+  prefab GenDropHot : ui.Node {
+    Background
+    Fill: $tone_gen_drop_hot
+    Edge: {dark: $tone_gen_drop_hot_edge.dark, light: $tone_gen_drop_hot_edge.light}
+    Shape: {radius: $gen_drop_radius, n: 4, border: $gen_drop_hot_border, feather: 0}
+    Transition: {kind: Opacity, from: Top, scale: 1, fade: true}
+    Motion: {omega: $spring_transition_omega, zeta: $spring_transition_zeta}
+  }
+  prefab GenDropLabel : ui.Line {
+    Fill: $tone_term_muted
+    TextStyle: {size: $size_body, line: $line_gen_file, role: 0, bold: 0}
+  }
+  prefab GenDropBody : ui.Column {
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+
+  // Element props and motion (lane P): a Progress's sweep, a Loading's and a Skeleton's wait before they show
+  // (genui/media.rs), a context Menu's region and the point it opens at (genui/float.rs), a Table's query match.
+  prefab GenProgressSweep {
+    Sweep: {period: $gen_sweep_period, share: $gen_sweep_share, low: $gen_sweep_low}
+    Fill: $tone_gen_sheen
+  }
+  prefab GenPending {
+    ShowAfter: {delay: $gen_pending_delay}
+    Motion: {omega: $gen_pending_omega, zeta: $gen_pending_zeta}
+  }
+  prefab GenRegion : ui.Column {
+    Hoverable
+    Flex: {axis: Column, gap: $gen_gap, align: Start, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab GenPoint : ui.Node {
+    Placed
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 0, min: 0, max: 0}}
+  }
+  prefab ChatTableMatch {
+    TextRange: {from: 0, to: 0}
+    Fill: $tone_gen_match
+    Shape: {radius: $gen_match_radius, n: 2, border: 0, feather: 0}
+  }
+}
+
+// The feel of the props every element takes (genui/common.rs GenFeel, read from hn.GenUniversal; tokens under "genui universal props").
+hn {
+  prefab GenUniversal {
+    GenFeel: {settle_rate: $gen_settle_rate, settle_zeta: $gen_settle_zeta, drag_slop: $gen_drag_slop, shape_omega: $gen_shape_omega, shape_zeta: $gen_shape_zeta}
   }
 }

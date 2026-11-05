@@ -22,7 +22,7 @@ use std::rc::Rc;
 use harness_native_flecs::prelude::*;
 use harness_native_api::APP;
 use harness_native_ui_input_api::{
-    Activated, Cursor, Focusable, Focused, Hoverable, Hovered, Pointer, PointerShape, PointerState, Pressable, Pressed,
+    Activated, Cursor, Focusable, Focused, HitBox, Hoverable, Hovered, Pointer, PointerShape, PointerState, Pressable, Pressed,
 };
 use harness_native_ui_layout_api::{
     NoScroller, ScrollAxis, ScrollExtent, ScrollState, Scroller, ScrollerGrip, ScrollerPart, ScrollerState, axis_bit, scroller_axis,
@@ -84,9 +84,11 @@ pub fn install(world: WorldRef<'_>) {
         }
         let level = level.unwrap_or_default();
         let z = e.try_cloned::<&Z>().map_or(0.0, |z| z.z);
+        // A HitBox narrows it to its part of its rectangle.
+        let laid = e.try_cloned::<&HitBox>().map_or(*laid, |b| Laid { x: laid.x + b.x, y: laid.y + b.y, w: b.w, h: b.h });
         sink.borrow_mut().push(Hit {
             id: *e.id(),
-            laid: *laid,
+            laid,
             clip,
             key: (level, z, depth, *e.id()),
             pressable: e.has(Pressable::id()),

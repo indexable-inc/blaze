@@ -2,7 +2,8 @@
 use harness_native_flecs::prelude::*;
 use harness_native_ui_spring_api::Spring;
 
-/// Which way a container lays its children: along a row, down a column, or on top of one another (`ZStack`).
+/// Which way a container lays its children: along a row, down a column, or on top of one another (`ZStack`: placed across
+/// by its `Flex.align` and down by its `Flex.justify`).
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FlexAxis {
@@ -375,12 +376,15 @@ pub enum Opens {
     Right,
 }
 
-/// The side an anchored node opens on, its nudge, and whether it may flip or slide to stay on screen.
+/// The side an anchored node opens on, its nudge, and where along that side it sits against its anchor: `align` Start
+/// lines up their leading edges (left, or top on a Left or Right side), Center centres it on the anchor, End lines up
+/// their trailing edges (any other `Align` is Start). Layout flips it to the other side and slides it to stay on screen.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Side {
     pub edge: Opens,
     pub dx: f32,
     pub dy: f32,
+    pub align: Align,
 }
 
 /// One child's cross-axis alignment, instead of its container's `Flex.align` (SwiftUI's per-child alignment).
