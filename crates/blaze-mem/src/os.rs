@@ -7,9 +7,16 @@
 //! `blaze_seed::decommit`. Elsewhere (wasm32, whose hosts have no such import) a reservation is
 //! memory taken whole from the global allocator.
 //!
-//! A reservation is `PROT_NONE` (`PAGE_NOACCESS`, `MEM_RESERVE`): it costs address space and a
-//! mapping, no memory. Committing makes a prefix readable and writable; Linux backs it with
-//! pages on first touch, macOS and Windows also charge it to the commit limit. Every Unix
+//! A reservation costs address space and a mapping, no memory. On macOS it is `PROT_NONE`
+//! (Windows `PAGE_NOACCESS`, `MEM_RESERVE`), and committing makes a prefix readable and
+//! writable and charges it to the commit limit. On Linux it is readable and writable from the
+//! start (`MAP_NORESERVE`, so nothing is charged before a page is touched), and committing is
+//! a prefault of the pages about to be used (`MADV_POPULATE_WRITE`), never an `mprotect`:
+//! every `mprotect`, `munmap` and `MAP_FIXED` takes the process's `mmap_lock` for writing,
+//! and on 2026-11-05 a cold `blaze check` on 64 cores spent 99.7% of its CPU in the fault
+//! handler behind those writers (each `madvise` and `mmap` taking 4 to 5 s), every worker's
+//! first touch of the node column falling back to the lock its growth's `mprotect` held. A
+//! populate and a decommit (`MADV_DONTNEED`) take the lock for reading only. Every Unix
 //! reservation is aligned to [`HUGE_PAGE`](crate::HUGE_PAGE). On Linux one made of
 //! transparent huge pages is advised `MADV_HUGEPAGE`, so the kernel backs each 2 MB of it
 //! committed whole with one huge page; one made of the reserved pool commits its huge pages
@@ -73,8 +80,16 @@ fn query_page_size() -> usize {
 /// transparent huge pages where it can.
 #[cfg(unix)]
 pub(crate) fn reserve(bytes: usize, huge: bool) -> io::Result<NonNull<u8>> {
-    reserve_with(bytes, huge, libc::PROT_NONE)
+    #[cfg(target_os = "linux")]
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    #[cfg(not(target_os = "linux"))]
+    let prot = libc::PROT_NONE;
+    reserve_with(bytes, huge, prot)
 }
+
+/// Whether a reservation is readable and writable from the start, so a commit only counts and
+/// prefaults ([`commit`]) and may come after the length that covers it is published: Linux.
+pub(crate) const RESERVATION_WRITABLE: bool = cfg!(target_os = "linux");
 
 /// Reserves `bytes` (a multiple of [`page_size`]) of address space, aligned to
 /// [`RESERVE_ALIGN`], readable and writable from the start and reading zeros: a sparse table's
@@ -125,7 +140,7 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
         )
     });
     if base == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
+        return Err(refused_reservation(padded, prot, io::Error::last_os_error()));
     }
     let base = base.cast::<u8>();
     let head = base.align_offset(RESERVE_ALIGN);
@@ -147,6 +162,31 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
     NonNull::new(aligned).ok_or_else(|| io::Error::other("mmap returned null"))
 }
 
+/// A refused reservation, named: on Linux a writable one is charged to the commit limit at once
+/// when the system ignores `MAP_NORESERVE` (`vm.overcommit_memory = 2`), which a reservation of
+/// tens of GiB passes.
+#[cfg(unix)]
+#[cold]
+fn refused_reservation(bytes: usize, prot: libc::c_int, why: io::Error) -> io::Error {
+    if !(cfg!(target_os = "linux")
+        && prot != libc::PROT_NONE
+        && why.raw_os_error() == Some(libc::ENOMEM))
+    {
+        return why;
+    }
+    let mode = std::fs::read_to_string("/proc/sys/vm/overcommit_memory")
+        .map(|it| it.trim().to_owned()) // alloc: the error of a refused reservation, once
+        .unwrap_or_else(|read| format!("unreadable: {read}")); // alloc: as above
+    // alloc: the error of a refused reservation, once
+    io::Error::new(
+        why.kind(),
+        format!(
+            "reserving {bytes} bytes of address space readable and writable (mmap MAP_NORESERVE): {why}; \
+             vm.overcommit_memory is {mode}, and blaze needs 0 or 1 (2 charges every reservation whole)"
+        ),
+    )
+}
+
 /// Tells Linux which pages `[ptr, ptr + bytes)` is made of: with `huge`, transparent huge
 /// pages (`MADV_HUGEPAGE`); without, base pages only (`MADV_NOHUGEPAGE`), whatever the host's
 /// `transparent_hugepage/enabled` says. A base-page region is touched sparsely (a table's
@@ -156,8 +196,8 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
 /// 25 GiB under `madvise`. Advice only: a kernel without transparent huge pages says EINVAL,
 /// and has the base pages asked for.
 ///
-/// A fresh mapping over part of a range (a decommit's `MAP_FIXED`) loses the advice, so each
-/// such mapping is advised again.
+/// A fresh mapping over part of a range (a hugetlb range's `MAP_FIXED`) loses the advice, so
+/// each such mapping is advised again.
 #[cfg(target_os = "linux")]
 fn advise_pages(ptr: *mut u8, bytes: usize, huge: bool) {
     let advice = if huge { libc::MADV_HUGEPAGE } else { libc::MADV_NOHUGEPAGE };
@@ -498,13 +538,30 @@ fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))
 }
 
-/// Makes `[ptr, ptr + bytes)` readable and writable.
+/// Makes `[ptr, ptr + bytes)` readable and writable. On Linux it is already
+/// ([`RESERVATION_WRITABLE`]), and this prefaults it (`MADV_POPULATE_WRITE`, Linux 5.14): the
+/// pages about to be used made in one call that takes the `mmap_lock` for reading, rather than
+/// one fault a page from whichever worker touches it first. Advice: a refusal (memory short
+/// now) leaves the pages to their first touch, as before, so it is not an error.
 ///
 /// # Safety
 ///
 /// The range is page-aligned and inside one reservation of [`reserve`] that is not released.
-/// Committing a range that is already committed is allowed and leaves its contents alone.
-#[cfg(unix)]
+/// Committing a range that is already committed is allowed and leaves its contents alone
+/// (a populate never replaces a page that is there).
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
+    /// `mman-common.h`'s `MADV_POPULATE_WRITE`.
+    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    // SAFETY: the caller says the range is inside a live reservation of ours, readable and
+    // writable; populating makes zero pages where there are none and leaves the rest alone.
+    let _ = timed(Kind::Populate, || unsafe {
+        libc::madvise(ptr.as_ptr().cast(), bytes, MADV_POPULATE_WRITE)
+    });
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // SAFETY: the caller says the range is inside a live reservation of ours, which nothing
     // else maps; changing its protection touches no other memory.
@@ -648,7 +705,7 @@ pub(crate) unsafe fn commit_reserved(
     if let Err(why) = made {
         // SAFETY: the same range, ours alone, whose contents nobody reads; this maps it back to
         // reserved space and returns what pages it took to the pool.
-        unsafe { decommit(ptr, bytes, false) }?;
+        unsafe { decommit(ptr, bytes, crate::huge::Pages::Reserved) }?;
         return Err(why);
     }
     Ok(())
@@ -702,14 +759,56 @@ pub(crate) unsafe fn collapse(ptr: NonNull<u8>, bytes: usize) {
 #[cfg(not(target_os = "linux"))]
 pub(crate) unsafe fn collapse(_ptr: NonNull<u8>, _bytes: usize) {}
 
-/// Gives `[ptr, ptr + bytes)` back to the kernel and makes it inaccessible again, still
-/// reserved.
+/// Gives `[ptr, ptr + bytes)` back to the kernel, still reserved, reading zeros when it is
+/// committed again. On Linux the range stays readable and writable and its pages are dropped
+/// (`MADV_DONTNEED`, the `mmap_lock` for reading; its advice and NUMA placement kept), but a
+/// range of the reserved pool (`pages` [`Pages::Reserved`](crate::huge::Pages::Reserved)) is
+/// mapped afresh over it, as base pages, so its 2 MiB pages go back to the pool and a later
+/// commit can map the pool's again; then it says `true`: the new mapping lost the placement.
+/// Elsewhere a fresh `PROT_NONE` mapping replaces it (`true`).
 ///
 /// # Safety
 ///
 /// As for [`commit`], and nothing reads or writes the range until it is committed again.
-#[cfg(unix)]
-pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, huge: bool) -> io::Result<()> {
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn decommit(
+    ptr: NonNull<u8>,
+    bytes: usize,
+    pages: crate::huge::Pages,
+) -> io::Result<bool> {
+    if pages != crate::huge::Pages::Reserved {
+        // SAFETY: the caller says the range is inside a live reservation of ours that nothing
+        // uses; dropping its pages loses only contents nobody reads.
+        let rc = timed(Kind::Purge, || unsafe {
+            libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTNEED)
+        });
+        return if rc == 0 { Ok(false) } else { Err(io::Error::last_os_error()) };
+    }
+    // SAFETY: as above; a fixed mapping over it replaces only those pages.
+    let got = timed(Kind::MapFixed, || unsafe {
+        libc::mmap(
+            ptr.as_ptr().cast(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    });
+    if got == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // The same range, mapped afresh just now: the new mapping lost the advice.
+    advise_pages(ptr.as_ptr(), bytes, false);
+    Ok(true)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) unsafe fn decommit(
+    ptr: NonNull<u8>,
+    bytes: usize,
+    _pages: crate::huge::Pages,
+) -> io::Result<bool> {
     // SAFETY: the caller says the range is inside a live reservation of ours that nothing uses;
     // a fixed mapping over it replaces only those pages.
     let got = timed(Kind::MapFixed, || unsafe {
@@ -725,38 +824,45 @@ pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, huge: bool) -> io:
     if got == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    // The same range, mapped afresh just now: the new mapping lost the advice.
-    #[cfg(target_os = "linux")]
-    advise_pages(ptr.as_ptr(), bytes, huge);
-    #[cfg(not(target_os = "linux"))]
-    let _ = huge;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(windows)]
-pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io::Result<()> {
+pub(crate) unsafe fn decommit(
+    ptr: NonNull<u8>,
+    bytes: usize,
+    _pages: crate::huge::Pages,
+) -> io::Result<bool> {
     use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
     // SAFETY: the caller says the range is inside a live reservation of ours that nothing uses.
     let ok = unsafe { VirtualFree(ptr.as_ptr().cast(), bytes, MEM_DECOMMIT) };
-    if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if ok != 0 { Ok(false) } else { Err(io::Error::last_os_error()) }
 }
 
 /// Gives the pages back through the runner, which leaves them reading zeros, as on Linux.
 #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
-pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io::Result<()> {
+pub(crate) unsafe fn decommit(
+    ptr: NonNull<u8>,
+    bytes: usize,
+    _pages: crate::huge::Pages,
+) -> io::Result<bool> {
     // SAFETY: the caller says the range is inside a live reservation of ours, grown linear
     // memory, that nothing uses.
     unsafe { runner::decommit(ptr.as_ptr(), bytes) };
-    Ok(())
+    Ok(false)
 }
 
 /// Keeps the memory and zeroes it, so a range committed again reads zeros as on Linux.
 #[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
-pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io::Result<()> {
+pub(crate) unsafe fn decommit(
+    ptr: NonNull<u8>,
+    bytes: usize,
+    _pages: crate::huge::Pages,
+) -> io::Result<bool> {
     // SAFETY: the caller says the range is inside a live reservation of ours that nothing
     // uses; the reservation is memory we own, so it is writable.
     unsafe { ptr.as_ptr().write_bytes(0, bytes) };
-    Ok(())
+    Ok(false)
 }
 
 /// Lets the kernel take the pages of `[ptr, ptr + bytes)` back while they stay reserved: the

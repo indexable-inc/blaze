@@ -5,6 +5,10 @@
 //! stays valid for its life and nothing is ever copied to grow. Commits are geometric (a
 //! quarter of what is committed, at least a granule, at most 64 MB), so a region that grows to
 //! `n` bytes makes `O(log n)` system calls before it reaches 64 MB and one per 64 MB after.
+//! On Linux the reservation is readable and writable from the start, so growing publishes the
+//! new length first and then prefaults it (`os::commit`): no `mprotect`, so no writer of the
+//! process's `mmap_lock` that every other thread's faults would queue behind, and no worker
+//! waits for the pages, which the one grower makes in a batch while the rest go on.
 //!
 //! A region of huge pages ([`crate::huge`]) commits base pages while it is at most one huge
 //! page long and whole huge pages past it, so a small one costs a few base pages and a big
@@ -319,6 +323,23 @@ impl Region {
             self.publish(target);
             return Ok(());
         }
+        if os::RESERVATION_WRITABLE {
+            // Readable and writable already (Linux, `os::reserve`), so the length is published
+            // first and the pages it adds prefaulted after, by the one thread whose publish
+            // moved it: a grower that lost the race, and every thread that touches the new
+            // pages meanwhile, goes on (a touch before the prefault faults its page in, which
+            // the prefault then leaves alone). No `MADV_COLLAPSE` either: the reservation was
+            // advised huge pages whole, so the first touch of each 2 MiB already makes one.
+            if let Some(before) = self.publish(target) {
+                let start = crate::align::align_down(before, self.granule);
+                // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
+                // reservation (`target <= reserved`), which lives as long as `self`.
+                unsafe { os::commit(self.at(start), target - start) }.map_err(|os| {
+                    MemError::Commit { tag: self.tag, bytes: target - start, os }
+                })?;
+            }
+            return Ok(());
+        }
         let start = crate::align::align_down(from, self.granule);
         // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
         // reservation (`target <= reserved`), which lives as long as `self`.
@@ -373,8 +394,8 @@ impl Region {
     /// it is published, so a thread whose `ensure` sees the new length (and hands the bytes on
     /// to another tag, as `chunks::take` does) comes after the count, and a tag's live bytes
     /// never fall below zero. A grower that loses the race takes its count back; meanwhile the
-    /// high-water mark may read high.
-    fn publish(&self, target: usize) {
+    /// high-water mark may read high. Says what was committed before, when this call moved it.
+    fn publish(&self, target: usize) -> Option<usize> {
         let mut before = self.committed.load(Ordering::Acquire);
         while target > before {
             tag::add(self.tag, target - before);
@@ -388,7 +409,7 @@ impl Region {
             ) {
                 Ok(_) => {
                     tag::committed(target - before);
-                    return;
+                    return Some(before);
                 }
                 Err(now) => {
                     tag::sub(self.tag, target - before);
@@ -396,6 +417,7 @@ impl Region {
                 }
             }
         }
+        None
     }
 
     /// Gives every page past the first `keep` bytes (rounded up to a granule, or to a huge page
@@ -427,16 +449,18 @@ impl Region {
         // SAFETY: `[keep, committed)` is aligned to its unit (huge-aligned where it covers pool
         // pages, which start at a huge page and end at a committed length past it), inside the
         // reservation, and `&mut self` says nothing borrows the region's memory.
-        unsafe { os::decommit(self.at(keep), committed - keep, self.pages == Pages::Transparent) }?;
+        let remapped = unsafe { os::decommit(self.at(keep), committed - keep, self.pages) }?;
         *self.committed.get_mut() = keep;
         tag::sub(self.tag, committed - keep);
         tag::decommitted(committed - keep);
         #[cfg(target_os = "linux")]
-        if let Some(node) = self.node {
+        if remapped && let Some(node) = self.node {
             // SAFETY: the range just mapped afresh, inside this live reservation and holding no
             // page; the new mapping lost the placement, which this puts back.
             unsafe { os::bind(self.at(keep), committed - keep, node) }?;
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = remapped;
         Ok(())
     }
 
