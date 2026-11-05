@@ -49,7 +49,9 @@ or bind:selected (Select, Choice, Radio); what the person does runs the cell's h
 and redraws it. Layout: Grid (columns), Wrap, Scroll, Split (bind:ratio), Stack with Layer (anchor); folding and floating: \
 Tabs (tabs, bind:selected; pick the body with {#if}), Disclosure (title) in an Accordion, Popover, Menu (items), Dialog \
 and Sheet (bind:open on each) and Toast; status and pictures: Progress, Loading, Skeleton, Icon, Image (src: a file \
-path), Chip, Tile (onclick) and FileRef (path). To ask the person and wait for the answer, await ask(text, {options, \
+path), Chip, Tile (onclick) and FileRef (path); Kip, the app's mascot, in a mood (mood: wave happy celebrate \
+thinking working oops sleepy idle, a few in turn as \"thinking then celebrate\"; size 20 to 160) for a greeting or an \
+outcome, sparingly. To ask the person and wait for the answer, await ask(text, {options, \
 default}). An element or prop not listed is an error naming it and its line.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {

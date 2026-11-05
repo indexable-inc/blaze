@@ -177,6 +177,16 @@ export interface ChipProps { label?: string; selected?: boolean; value?: unknown
 export interface TileProps { gap?: number; pad?: number; value?: unknown; onclick?: Handle }
 /** A file chip, its kind's icon and its name; a press opens the file (at `line`) as the transcript's file chips do. */
 export interface FileRefProps { path: FileSource; line?: number }
+/**
+ * The agent as the app shows it: Kip, the voxel mascot, standing at the column's left edge. It plays its moods in turn the first time
+ * it is seen live (a reply read from history shows the last one), again when the pointer comes over it, and rests off-screen.
+ */
+export interface KipProps {
+  /** `'wave'`, `'happy'`, `'celebrate'`, `'thinking'`, `'working'`, `'oops'`, `'sleepy'`, `'idle'`; several (`'wave then idle'` or a list) play in turn. Waves when not given. */
+  mood?: string | string[];
+  /** How tall Kip stands, in points: 20 to 160, 64 when not given. */
+  size?: number;
+}
 
 /** Every built-in element's props, by element name. */
 export interface ElementProps {
@@ -188,7 +198,7 @@ export interface ElementProps {
   Grid: GridProps; Stack: StackProps; Layer: LayerProps; Wrap: WrapProps; Scroll: ScrollProps; Split: SplitProps; Tabs: TabsProps;
   Accordion: AccordionProps; Disclosure: DisclosureProps; Popover: PopoverProps; Menu: MenuProps; Dialog: DialogProps; Sheet: SheetProps;
   Toast: ToastProps; Progress: ProgressProps; Loading: LoadingProps; Skeleton: SkeletonProps; Icon: IconProps; Image: ImageProps;
-  Chip: ChipProps; Tile: TileProps; FileRef: FileRefProps;
+  Chip: ChipProps; Tile: TileProps; FileRef: FileRefProps; Kip: KipProps;
 }
 
 /** True when ElementProps names exactly the elements element.ts draws; the constant under it fails to type-check otherwise. */

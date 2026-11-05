@@ -219,6 +219,10 @@ pub struct ChatState {
     reading: bool,
     /// The table rows opened below their rows as records, by the transcript row the table is (its key).
     rows_open: HashMap<String, usize>,
+    /// Kip on the composer ([`App::chat_kip`]): this pane saw its agent at work, and how the turn it ended ended (ok or
+    /// not) and when (the clock), while he still shows it.
+    kip_busy: bool,
+    kip_end: Option<(bool, f32)>,
 }
 
 /// What a Cmd+C in a chat took, so its pulse plays there: the transcript's selection, the input's, or row `.1` of the
@@ -268,6 +272,8 @@ impl Default for ChatState {
             drag: None,
             reading: false,
             rows_open: HashMap::new(),
+            kip_busy: false,
+            kip_end: None,
         }
     }
 }
@@ -1123,7 +1129,54 @@ fn input_text(w: WorldRef<'_>, p: u64) -> Option<View<'_>> {
     View::of(w.entity_from_id(p)).part("foot")?.part("input")?.part("area")?.part("text")
 }
 
+/// How a turn that just ended ended, for Kip: false when the agent failed, None when the person stopped it (or no turn
+/// end came).
+fn turn_outcome(t: &Transcript) -> Option<bool> {
+    let turn = t.items.iter().rposition(|i| matches!(i, Item::User { .. })).map_or(&t.items[..], |u| &t.items[u..]);
+    let failed = turn.iter().any(|i| matches!(i, Item::Error { .. }));
+    match turn.iter().rev().find(|i| matches!(i, Item::TurnEnd { .. })) {
+        Some(Item::TurnEnd { stop, .. }) if stop == "interrupted" => None,
+        Some(Item::TurnEnd { ok, .. }) => Some(*ok && !failed),
+        _ => failed.then_some(false),
+    }
+}
+
+/// How long a chat must have been attached and still empty before Kip greets in it: a past chat's log replays in less.
+const KIP_GREET_AFTER: f32 = 0.35;
+
 impl App {
+    /// Kip on a chat pane's composer, as its transcript `t` stands (`attached`: its stream is in): the look and mood to
+    /// show him in (None: not there) and his fade. Perched while the agent works (busy with a tool: working; else
+    /// thinking); happy, or oops on an error, for a moment after a turn this pane saw ends; greeting in an empty chat.
+    fn chat_kip(&self, st: &mut ChatState, t: &Transcript, attached: bool) -> (Option<(&'static str, Option<&'static str>)>, f32) {
+        if t.busy {
+            st.kip_busy = true;
+            st.kip_end = None;
+            let tool = matches!(t.items.last(), Some(Item::Tool { result: None, .. }));
+            return (Some(("hn.KipPerch", Some(if tool { "working" } else { "thinking" }))), 0.0);
+        }
+        if std::mem::take(&mut st.kip_busy) {
+            st.kip_end = turn_outcome(t).map(|ok| (ok, self.time));
+        }
+        if let Some((ok, at)) = st.kip_end {
+            let w = self.world.world_ref();
+            let linger = view::prefab(w, "hn.KipPerch")
+                .and_then(|p| p.try_cloned::<&harness_native_ui_text_api::KipLinger>())
+                .unwrap_or_else(|| panic!("the scene's hn.KipPerch has no KipLinger"));
+            let since = self.time - at;
+            if since < linger.secs {
+                let fade = (since - (linger.secs - linger.fade)) / linger.fade.max(1e-3);
+                return (Some(("hn.KipPerch", Some(if ok { "happy" } else { "oops" }))), fade);
+            }
+            st.kip_end = None;
+        }
+        let settled = attached && st.tried.is_some_and(|at| self.time - at > KIP_GREET_AFTER);
+        if t.items.is_empty() && settled {
+            return (Some(("hn.KipGreet", None)), 0.0);
+        }
+        (None, 0.0)
+    }
+
     /// The genui gallery (`HARNESS_NATIVE_GALLERY=genui`, src/gallery.rs): fill its `hn.ChatUi` with `tree`, a cell's
     /// tree as the kernel sends it, measured by this app's typesetter and drawn in its ground's scheme, as a chat card's is.
     pub(crate) fn fill_genui_gallery(&self, root: u64, tree: &Value) {
@@ -1136,7 +1189,7 @@ impl App {
         let Some(ui) = v.part("ui") else { return };
         let mut paint = self.paint.borrow_mut();
         let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
-        genui::fill(ui, tree, "gallery.0", Some(&self.genui), &mut measure);
+        genui::fill(ui, tree, "gallery.0", Some(&self.genui), true, &mut measure);
     }
 
     /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
@@ -1224,7 +1277,7 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui) };
+                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy };
                 fill_row(row, &rows[i].1, &ctx, &mut measure);
                 if let Some(mut pad) = view::prefab(w, rows[i].1.prefab()).and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()) {
                     if nested.contains(&rows[i].0) {
@@ -1303,6 +1356,12 @@ impl App {
                     scroll_quietly(area.entity(), ScrollState { x: 0.0, y });
                 }
             }
+        }
+        if let Some(kip) = pv.part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("kip")) {
+            // Its own stream is in (a transcript gets an entry only once an event comes, and a new chat may send none).
+            let attached = st.ours && self.link.attached(sid);
+            let (look, fade) = self.chat_kip(st, t, attached);
+            panes::show_kip(kip, look, fade);
         }
         if let Some(status) = pv.part("foot").and_then(|f| f.part("status")) {
             let o = w.entity_from_id(e);
@@ -2015,11 +2074,13 @@ struct RowCtx<'k> {
     open: Option<usize>,
     /// The app's cell controls in use, for a cell's UI (None: drawn from the tree alone).
     ui: Option<&'k std::cell::RefCell<GenLive>>,
+    /// Its agent is at work: a cell's UI new to the transcript plays (genui's `playing`).
+    playing: bool,
 }
 
 impl RowCtx<'static> {
     /// A row drawn outside the transcript (in a cell's generated UI): its tables' rows do not open.
-    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None };
+    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None, playing: false };
 }
 
 impl RowCtx<'_> {
@@ -2119,7 +2180,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
         }
         Row::Results { v, cap } => fill_results(row, v, *cap),
         Row::Ui { v, cell, block, code } => {
-            genui::fill(row, v, cell, ctx.ui, measure);
+            genui::fill(row, v, cell, ctx.ui, ctx.playing, measure);
             // Its code: a quiet button in the gutter, shown while the view is hovered or its code is open.
             if let Some(b) = row.part("code_at").and_then(|z| z.part("code")) {
                 b.action(&format!("chat:open:{}", code_key(block)));

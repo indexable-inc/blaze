@@ -3,7 +3,7 @@
 //! Copied from den-native's gpu.rs (github.com/andrewgazelka/den) and stripped to what harness draws: panels, glyphs and
 //! lines in paint order over a clear colour, plus den's outline glyphs (Slug) for the brand marks (icons.rs), whose curves
 //! and bands are one static pair of buffers. den's backdrop blur chain, Apple glass, art cache, live textures, image atlas,
-//! shader elements, mascots and 3D scenes are gone. Per-frame CPU-written buffers are rings of [`FRAMES`]
+//! shader elements and 3D scenes are gone; den's mascot, Kip, is back (kip.rs). Per-frame CPU-written buffers are rings of [`FRAMES`]
 //! slots gated by a semaphore; the tiny uniforms go by setBytes.
 pub use crate::draw::*;
 use crate::pack::{GlyphInst, ImageInst, LineInst, PanelInst, PathInst, SpriteInst};
@@ -59,6 +59,8 @@ pub struct Renderer {
     sprite: Pso,
     image: Pso,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
+    /// Kip's pictures and pipelines (kip.rs, shaders/mascot.slang).
+    kips: crate::kip::Mascots,
     pub atlas: Tex,
     /// The brand marks' Slug curves and bands (icons.rs), uploaded once.
     curves: Buf,
@@ -145,6 +147,7 @@ impl Renderer {
             path: pipeline(&dev, &lib, "path_vs", "path_fs"),
             sprite: pipeline(&dev, &lib, "sprite_vs", "sprite_fs"),
             image: pipeline(&dev, &lib, "image_vs", "image_fs"),
+            kips: crate::kip::Mascots::new(&dev),
             dev,
             queue,
             sampler,
@@ -275,6 +278,8 @@ impl Renderer {
             .zip(&draw.texels)
             .map(|(m, px)| self.picture(m.size[0] as usize, m.size[1] as usize, px))
             .collect();
+        // Kips whose pose changed render their pictures first, in a command buffer committed before the frame's.
+        self.kips.prepare(&self.queue, &draw.kips);
         let Some(cmd) = self.queue.commandBuffer() else {
             self.sem.signal();
             return;
@@ -304,7 +309,13 @@ impl Renderer {
                 if sg.count == 0 {
                     continue;
                 }
+                if sg.kind == SegKind::Kip {
+                    let (lo, hi) = (sg.first as usize, (sg.first + sg.count) as usize);
+                    self.kips.draw(&enc, &draw.frame, &draw.kips[lo..hi]);
+                    continue;
+                }
                 let (pso, vs, fs, buf, stride) = match sg.kind {
+                    SegKind::Kip => continue,
                     SegKind::Panel => {
                         (&self.panel, "panel_vs", "panel_fs", &pb, std::mem::size_of::<PanelInst>())
                     }
@@ -351,6 +362,8 @@ impl Renderer {
                         slot(vs, "insts"),
                     );
                     match sg.kind {
+                        // Drawn by kip.rs above, never here.
+                        SegKind::Kip => {}
                         SegKind::Panel | SegKind::Line | SegKind::Sprite => enc
                             .setFragmentBuffer_offset_atIndex(
                                 Some(buf),

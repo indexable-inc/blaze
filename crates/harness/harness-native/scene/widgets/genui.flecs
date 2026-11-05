@@ -106,6 +106,14 @@ hn {
     }
   }
 
+  // A toned Badge's plate, by its tone (the others keep hn.GenBadge's).
+  prefab GenBadgeTone {
+    accent { Fill: $tone_gen_badge_accent }
+    success { Fill: $tone_gen_badge_success }
+    warning { Fill: $tone_gen_badge_warning }
+    error { Fill: $tone_gen_badge_error }
+  }
+
   // A number to read at a glance: its label over it, the value large (in its tone), a note under it.
   prefab GenStat : ui.Column {
     Flex: {axis: Column, gap: 1, align: Start, justify: Start, wrap: false}
@@ -1094,6 +1102,11 @@ hn {
     Cursor: {shape: Arrow}
   }
   // A file chip: its kind's icon, its name and line; a press opens the file.
+  // Kip, the app's mascot (ui.Mascot, harness-native-kip): genui.rs sets his `Kip` (mood, size, and whether he plays). He
+  // measures himself, standing at the column's left edge.
+  prefab GenKip : ui.Mascot {
+    AlignSelf: {align: Start}
+  }
   prefab GenFileRef : ui.Row {
     Fill: $tone_code_chip
     Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}

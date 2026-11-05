@@ -6,7 +6,7 @@ use control::{arm, handler, send};
 use harness_native_ui_input_api::Tooltip;
 use harness_native_ui_layout_api::{Aspect, SizeKind};
 use harness_native_ui_motion_api::Pose;
-use harness_native_ui_text_api::{Picture, Vector};
+use harness_native_ui_text_api::{Kip, Picture, Vector};
 
 /// The file kinds (den's filetype.rs) and each one's Nerd Font glyph; coloured by the scene's `hn.GenFileKind.<kind>`.
 const KINDS: [(&str, char); 20] = [
@@ -158,11 +158,11 @@ fn sized(v: View<'_>, want: Size) {
 }
 
 /// The Fill of the scene's prefab `name`.
-fn fill_of(world: WorldRef<'_>, name: &str) -> Option<Fill> {
+pub(super) fn fill_of(world: WorldRef<'_>, name: &str) -> Option<Fill> {
     view::prefab(world, name).and_then(|p| p.try_cloned::<&Fill>())
 }
 
-fn filled(v: View<'_>, f: Option<Fill>) {
+pub(super) fn filled(v: View<'_>, f: Option<Fill>) {
     if let Some(f) = f
         && v.entity().try_cloned::<&Fill>() != Some(f)
     {
@@ -238,6 +238,17 @@ pub(super) fn element(v: View<'_>, node: &Value, kind: &str, kids: &[&Value], de
             filled(v, f);
         }
         "Image" => image(v, node),
+        "Kip" => {
+            // What it plays is set once, as it first shows: live (its agent at work) it plays its moods in turn, from history
+            // it stands in its last. A tree redrawn later keeps that, so a reply that grows does not replay it.
+            let had = v.entity().try_cloned::<&Kip>();
+            let size = control::number(node, "size").filter(|s| props::KIP_SIZES.contains(s)).unwrap_or(64.0) as f32;
+            let settle = had.as_ref().map_or(!b.playing, |k| k.settle);
+            let kip = Kip { mood: words(node, "mood").as_str().into(), size, centre: false, settle };
+            if had.as_ref() != Some(&kip) {
+                v.set(kip);
+            }
+        }
         "Chip" => {
             if let Some(l) = v.part("label") {
                 l.text(&words(node, "label"));

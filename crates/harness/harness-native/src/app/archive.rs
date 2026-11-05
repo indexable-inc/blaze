@@ -10,6 +10,9 @@ use super::*;
 use crate::pane::Back;
 use std::collections::HashSet;
 
+/// The Archive's note when its filter matches nothing (Kip puzzles over it).
+const NOTHING_MATCHES: &str = "Nothing matches";
+
 /// On the Archive's entity: which chip is on (0 All, 1 Sessions, 2 Runs, 3 Failed).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct ArchiveFilter {
@@ -293,7 +296,7 @@ impl App {
         let exhausted = w.try_get::<&model::History>(|h| h.exhausted).unwrap_or(false);
         // "Nothing archived yet" only once every older page is in: before that the foot's "Load older runs" is the truth.
         let note = (out.is_empty() && (exhausted || !items.is_empty()))
-            .then_some(if items.is_empty() { "Nothing archived yet" } else { "Nothing matches" });
+            .then_some(if items.is_empty() { "Nothing archived yet" } else { NOTHING_MATCHES });
         if !exhausted && chip != 1 {
             out.push(("more".into(), "hn.ArchMore", ARow::More));
         }
@@ -353,6 +356,11 @@ impl App {
             for_each(empty, "hn.ArchNote", note.map(|n| ("note", n)), |row, n, _| {
                 if let Some(p) = row.part("label") {
                     p.text(n);
+                }
+                // Asleep over an empty Archive, puzzled by a filter that matches nothing.
+                if let Some(k) = row.part("kip") {
+                    let mood = (n == NOTHING_MATCHES).then_some("thinking");
+                    super::panes::show_kip(k, Some(("hn.KipArchive", mood)), 0.0);
                 }
             });
         }

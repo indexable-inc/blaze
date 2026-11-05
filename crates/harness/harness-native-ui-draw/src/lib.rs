@@ -10,7 +10,7 @@ use harness_native_ui_look_api::{Edge, Fill, Ribbon, Scheme};
 use harness_native_ui_layout_api::{Background, Overlay, ScrollExtent, ScrollState, ScrollerPart};
 use harness_native_ui_motion_api::{Drawn, Pose, Reveal, Shown};
 use harness_native_ui_node_api::{Clip, ClipFade, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
-use harness_native_ui_text_api::{BlazeMark, Icon, Mark, Picture, Text, Vector};
+use harness_native_ui_text_api::{BlazeMark, Icon, Kip, Mark, Picture, Text, Vector};
 
 /// A clip rectangle in window points.
 #[derive(Clone, Copy)]
@@ -141,7 +141,7 @@ fn walk(
         Some(PaintKind::Mark)
     } else if e.has(Icon::id()) {
         Some(PaintKind::Icon)
-    } else if e.has(Picture::id()) || e.has(BlazeMark::id()) {
+    } else if e.has(Picture::id()) || e.has(BlazeMark::id()) || e.has(Kip::id()) {
         Some(PaintKind::Picture)
     } else if e.has(Ribbon::id()) {
         Some(PaintKind::Ribbon)

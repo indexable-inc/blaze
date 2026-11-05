@@ -1,0 +1,167 @@
+// Kip, den's mascot (harness-native-kip; copied from den-native's scene/45-mascot.flecs): the `ui.Mascot` primitive (a node with `Kip`) and his one
+// look and motion, `ui.kip`. A small voxel creature drawn by harness-native-render's mascot pass (shaders/mascot.slang),
+// live: he breathes, blinks, looks toward the pointer and plays moods (`Kip.mood`). Every timing is a token (`kip_*`, below); colours are sRGB per appearance, the den palette's periwinkle and ink. Loaded after prims.flecs.
+
+// Kip's tokens: his default height, his shading and every timing of his motion (den's values; MascotMotion and
+// MascotClip in harness-native-ui-look-api say what each does). Seconds, hertz, cells and degrees as named.
+export const kip_size = 64
+export const kip_ao = 0.45
+export const kip_seams = 0.1
+export const kip_fade = 0.35
+export const kip_breath_hz = 0.32
+export const kip_breath = 0.025
+export const kip_blink_min = 2.4
+export const kip_blink_max = 5.5
+export const kip_blink_len = 0.16
+export const kip_look_omega = 9
+export const kip_look_yaw = 32
+export const kip_look_pitch = 14
+export const kip_turn_omega = 10
+export const kip_antenna_hz = 3.2
+export const kip_antenna_damping = 0.18
+export const kip_antenna_gain = 0.5
+export const kip_arm_hz = 2.6
+export const kip_arm_damping = 0.3
+export const kip_arm_gain = 0.25
+export const kip_stride = 1.2
+export const kip_cadence = 1.8
+export const kip_accel = 30
+export const kip_hop_height = 0.45
+export const kip_hop_time = 0.42
+export const kip_anticipation = 0.12
+export const kip_sleep_after = 90
+export const kip_awake = 1.6
+export const kip_fidget_every = 6
+// Each mood's crossfade in (`_blend`) and how long a one-shot plays or confused takes to settle (`_len`; 0 holds).
+export const kip_idle_blend = 0.35
+export const kip_idle_len = 0
+export const kip_thinking_blend = 0.4
+export const kip_thinking_len = 0
+export const kip_working_blend = 0.3
+export const kip_working_len = 0
+export const kip_happy_blend = 0.15
+export const kip_happy_len = 1.1
+export const kip_confused_blend = 0.25
+export const kip_confused_len = 2.5
+export const kip_sleeping_blend = 1.2
+export const kip_sleeping_len = 0
+export const kip_wave_blend = 0.25
+export const kip_wave_len = 1.4
+
+@tree ChildOf
+ui {
+  // Kip `size` points tall in a box that measures itself (room for a hop, his shadow and a waving arm); `centre` stands
+  // him in its middle. A KipStand puts his feet on another node's edge instead (the composer's), measuring nothing.
+  // Hoverable: the pointer coming onto him plays his moods again once they have ended.
+  prefab Mascot : ui.Node {
+    Kip: {mood: "", size: $kip_size, centre: false, settle: false}
+    Hoverable
+  }
+
+  // His look and motion: one entity, its colours and inks its children, a child per mood with its clip.
+  prefab kip {
+
+    // Seen from 16 degrees above and turned 22 degrees, the toy view; the key light high at the left and in front, a
+    // cool fill from the sky and a dim one from the ground, a rim from behind at the right. Corners between cells darken by
+    // 0.45; the line between cells is faint and only shows once a cell is big. He fades in and out over 0.35 s.
+    MascotLook: {
+      pitch: 16, yaw: -22,
+      key_x: -0.45, key_y: 0.8, key_z: 0.6, key: 0.95, fill: 0.7,
+      rim_x: 0.75, rim_y: 0.35, rim_z: -0.5, rim: 0.55, rim_power: 2,
+      ao: $kip_ao, seams: $kip_seams, fade: $kip_fade
+    }
+    // A breath every 3.1 s, swelling 2.5%; a blink every 2.4 to 5.5 s, 0.16 s each. The look follows on omega 9 (about a
+    // third of a second), 32 degrees aside and 14 up or down. Antennae ring at 3.2 Hz, lightly damped so they wobble; arms
+    // at 2.6 Hz, damped more. A walk is strides of 1.2 cells at 1.8 a second (8.6 cells a second at most), reached at 30
+    // cells a second squared; a hop crouches 0.12 s and flies 0.42 s, as high as 45% of its height. Idle for 90 s it dozes;
+    // it breathes for 1.6 s after something happens, then rests still with a breath or a glance about every 6 s.
+    MascotMotion: {
+      breath_hz: $kip_breath_hz, breath: $kip_breath, blink_min: $kip_blink_min, blink_max: $kip_blink_max, blink_len: $kip_blink_len,
+      look_omega: $kip_look_omega, look_yaw: $kip_look_yaw, look_pitch: $kip_look_pitch, turn_omega: $kip_turn_omega,
+      antenna_hz: $kip_antenna_hz, antenna_damping: $kip_antenna_damping, antenna_gain: $kip_antenna_gain,
+      arm_hz: $kip_arm_hz, arm_damping: $kip_arm_damping, arm_gain: $kip_arm_gain,
+      stride: $kip_stride, cadence: $kip_cadence, accel: $kip_accel,
+      hop_height: $kip_hop_height, hop_time: $kip_hop_time, anticipation: $kip_anticipation,
+      sleep_after: $kip_sleep_after, awake: $kip_awake, fidget_every: $kip_fidget_every
+    }
+
+    // Its colours are entities of their own names (`mascot_*`): every entity with a Fill is a style by its name.
+    mascot_key_light {
+      Fill: {dark: {r: 1, g: 1, b: 1, a: 1}, light: {r: 1, g: 1, b: 1, a: 1}}
+    }
+    mascot_sky {
+      Fill: {dark: {r: 0.62, g: 0.68, b: 0.95, a: 1}, light: {r: 0.8, g: 0.84, b: 1, a: 1}}
+    }
+    mascot_ground {
+      Fill: {dark: {r: 0.24, g: 0.22, b: 0.32, a: 1}, light: {r: 0.55, g: 0.53, b: 0.64, a: 1}}
+    }
+    mascot_rim {
+      Fill: {dark: {r: 0.66, g: 0.8, b: 1, a: 1}, light: {r: 1, g: 1, b: 1, a: 1}}
+    }
+    mascot_shadow {
+      Fill: {dark: {r: 0, g: 0, b: 0, a: 0.45}, light: {r: 0.12, g: 0.14, b: 0.3, a: 0.2}}
+    }
+
+    // Kip's inks, `mascot_ink_<name>` for the names in mascot/kip.voxels: periwinkle (the accent's family), a lighter
+    // belly, deeper stalks and feet, near-black eyes with a white glint, lavender-pink cheeks, and pale cyan antenna tips
+    // that glow while it thinks.
+    inks {
+      mascot_ink_body {
+        Fill: {dark: {r: 0.498, g: 0.584, b: 0.961, a: 1}, light: {r: 0.42, g: 0.51, b: 0.93, a: 1}}
+        MascotInk: {glow: 0}
+      }
+      mascot_ink_belly {
+        Fill: {dark: {r: 0.639, g: 0.702, b: 1, a: 1}, light: {r: 0.58, g: 0.65, b: 0.98, a: 1}}
+        MascotInk: {glow: 0}
+      }
+      mascot_ink_stalk {
+        Fill: {dark: {r: 0.384, g: 0.463, b: 0.863, a: 1}, light: {r: 0.33, g: 0.41, b: 0.82, a: 1}}
+        MascotInk: {glow: 0}
+      }
+      mascot_ink_foot {
+        Fill: {dark: {r: 0.298, g: 0.361, b: 0.737, a: 1}, light: {r: 0.26, g: 0.32, b: 0.69, a: 1}}
+        MascotInk: {glow: 0}
+      }
+      mascot_ink_eye {
+        Fill: {dark: {r: 0.11, g: 0.129, b: 0.251, a: 1}, light: {r: 0.11, g: 0.129, b: 0.251, a: 1}}
+        MascotInk: {glow: 0}
+      }
+      mascot_ink_glint {
+        Fill: {dark: {r: 0.957, g: 0.965, b: 1, a: 1}, light: {r: 0.957, g: 0.965, b: 1, a: 1}}
+        MascotInk: {glow: 0}
+      }
+      mascot_ink_cheek {
+        Fill: {dark: {r: 0.933, g: 0.651, b: 0.824, a: 1}, light: {r: 0.93, g: 0.6, b: 0.8, a: 1}}
+        MascotInk: {glow: 0}
+      }
+      mascot_ink_tip {
+        Fill: {dark: {r: 0.71, g: 0.925, b: 1, a: 1}, light: {r: 0.55, g: 0.85, b: 0.98, a: 1}}
+        MascotInk: {glow: 1}
+      }
+    }
+
+    // The moods. Idle and the busy ones fade in over about a third of a second; happy (a hop in place with its arms up)
+    // lasts 1.1 s and wave 1.4 s; confused tilts its head, settling after 2.5 s; it falls asleep over 1.2 s.
+    idle {
+      MascotClip: {blend: $kip_idle_blend, speed: 1, amount: 1, length: $kip_idle_len}
+    }
+    thinking {
+      MascotClip: {blend: $kip_thinking_blend, speed: 1, amount: 1, length: $kip_thinking_len}
+    }
+    working {
+      MascotClip: {blend: $kip_working_blend, speed: 1, amount: 1, length: $kip_working_len}
+    }
+    happy {
+      MascotClip: {blend: $kip_happy_blend, speed: 1, amount: 1, length: $kip_happy_len}
+    }
+    confused {
+      MascotClip: {blend: $kip_confused_blend, speed: 1, amount: 1, length: $kip_confused_len}
+    }
+    sleeping {
+      MascotClip: {blend: $kip_sleeping_blend, speed: 1, amount: 1, length: $kip_sleeping_len}
+    }
+    wave {
+      MascotClip: {blend: $kip_wave_blend, speed: 1, amount: 1, length: $kip_wave_len}
+    }
+  }
+}

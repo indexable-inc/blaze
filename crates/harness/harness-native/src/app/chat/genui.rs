@@ -29,7 +29,7 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 45] = [
+const ELEMENTS: [(&str, &str); 46] = [
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -75,6 +75,7 @@ const ELEMENTS: [(&str, &str); 45] = [
     ("Chip", "hn.GenChip"),
     ("Tile", "hn.GenTile"),
     ("FileRef", "hn.GenFileRef"),
+    ("Kip", "hn.GenKip"),
 ];
 /// The elements that take input (genui/control.rs).
 const CONTROLS: [&str; 10] = ["Button", "Toggle", "Checkbox", "Slider", "NumberField", "Input", "TextArea", "Select", "Choice", "Radio"];
@@ -96,6 +97,9 @@ struct Budget<'a, 'm> {
     pane: Laid,
     /// The clock (seconds), for what moves on it (a spinner, a skeleton's breath, a toast's time).
     now: f32,
+    /// The tree is drawn as it is made (its agent is at work): a Kip new to it plays its moods, where one drawn from
+    /// history stands in its last.
+    playing: bool,
 }
 
 /// What an element sits in, when that changes how it is drawn or what a press on it sends.
@@ -112,13 +116,21 @@ enum Within {
 }
 
 /// Fill a `hn.ChatUi` row with the tree `ui` that cell `cell` (`<repl>.<task>`) drew. `live` is the app's controls in use
-/// (a field being typed in shows its own words); None draws the tree's values.
-pub(super) fn fill(row: View<'_>, ui: &Value, cell: &str, live: Option<&std::cell::RefCell<Live>>, measure: &mut Measure<'_>) {
+/// (a field being typed in shows its own words); None draws the tree's values. `playing`: the agent is at work, so what is
+/// new plays (a Kip's moods).
+pub(super) fn fill(
+    row: View<'_>,
+    ui: &Value,
+    cell: &str,
+    live: Option<&std::cell::RefCell<Live>>,
+    playing: bool,
+    measure: &mut Measure<'_>,
+) {
     let mut guard = live.map(std::cell::RefCell::borrow_mut);
     let world = row.entity().world();
     let now = world.try_get::<&harness_native_api::Clock>(|c| c.time).unwrap_or(0.0);
     let pane = float::pane_of(row);
-    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure, cell, live: guard.as_deref_mut(), within: Within::Flow, next: Within::Flow, pane, now };
+    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure, cell, live: guard.as_deref_mut(), within: Within::Flow, next: Within::Flow, pane, now, playing };
     if let Some(body) = row.part("body") {
         let nodes: Vec<&Value> = match ui {
             Value::Array(a) => a.iter().collect(),
@@ -254,7 +266,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
             layout::element(v, node, kind, &kids, depth, &within, b);
         }
         "Popover" | "Menu" | "Dialog" | "Sheet" | "Toast" => float::element(v, node, kind, &kids, depth, b),
-        "Progress" | "Loading" | "Skeleton" | "Icon" | "Image" | "Chip" | "Tile" | "FileRef" => {
+        "Progress" | "Loading" | "Skeleton" | "Icon" | "Image" | "Chip" | "Tile" | "FileRef" | "Kip" => {
             media::element(v, node, kind, &kids, depth, b);
         }
         "Column" | "Row" => {
@@ -288,9 +300,17 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
         }
         "Table" => table(v, node, b),
         "Badge" => {
+            let tone = words(node, "tone");
             if let Some(t) = v.part("text") {
-                toned(t, &words(node, "text"), &words(node, "tone"));
+                toned(t, &words(node, "text"), &tone);
             }
+            // Its plate in its tone, faint (den's toned badges); ink, muted and strong keep the plain one.
+            let world = v.entity().world();
+            let plate = match tone.as_str() {
+                "accent" | "success" | "warning" | "error" => media::fill_of(world, &format!("hn.GenBadgeTone.{tone}")),
+                _ => media::fill_of(world, "hn.GenBadge"),
+            };
+            media::filled(v, plate);
         }
         "Stat" => {
             for (part, name) in [("label", "label"), ("note", "note")] {
@@ -468,7 +488,7 @@ mod tests {
                 "columns": ["", "part", "tokens", "share"]}, "children": []}]});
         let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
         for _ in 0..6 {
-            fill(row, &ui, "test.0", None, &mut measure);
+            fill(row, &ui, "test.0", None, false, &mut measure);
             world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
             world.progress_time(1.0 / 60.0);
         }
@@ -523,7 +543,7 @@ mod tests {
         ]);
         let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
         for _ in 0..6 {
-            fill(row, &ui, "test.0", None, &mut measure);
+            fill(row, &ui, "test.0", None, false, &mut measure);
             world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
             world.progress_time(1.0 / 60.0);
         }
@@ -603,7 +623,7 @@ mod tests {
             if let Some(p) = pointer {
                 world.set(p);
             }
-            fill(row, &ui, "test.0", None, &mut measure);
+            fill(row, &ui, "test.0", None, false, &mut measure);
             world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
             world.progress_time(1.0 / 60.0);
         };
@@ -753,7 +773,7 @@ mod tests {
             if let Some(p) = pointer {
                 world.set(p);
             }
-            fill(row, ui, "test.0", Some(&live), &mut measure);
+            fill(row, ui, "test.0", Some(&live), true, &mut measure);
             harness_native_ui_layout::typeset::typeset(w, &mut harness_native_ui_layout::typeset::Estimate);
             world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
             world.progress_time(1.0 / 60.0);

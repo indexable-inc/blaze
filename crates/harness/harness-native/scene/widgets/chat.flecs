@@ -34,6 +34,12 @@ hn {
         Size: {w: {kind: Grow, value: 1, min: 0, max: $chat_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: $chat_input_pad_x, r: $chat_input_pad_x, t: $chat_input_pad_y, b: $chat_input_pad_y}
         area : ui.TextArea {}
+        // Kip on the composer (chat.rs `chat_kip`): the app sets his Kip and KipStand from hn.KipGreet or hn.KipPerch,
+        // and takes them off when he is not there.
+        kip : ui.Node {
+          Overlay
+          Hoverable
+        }
       }
       status : ui.Row {
         Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
@@ -48,6 +54,19 @@ hn {
         }
       }
     }
+  }
+
+  // Kip on the composer, as chat.rs `chat_kip` copies him onto its `kip`: greeting over an empty chat, his feet above
+  // the composer's middle; perched on its top edge at the right while the agent works, then happy or oops for a moment
+  // as the turn ends (KipLinger). Moods are the app's; these are where he stands and how tall.
+  prefab KipGreet {
+    Kip: {mood: "wave then idle", size: $kip_greet, centre: true, settle: false}
+    KipStand: {x: 0.5, y: 0, dx: 0, dy: 0 - $kip_greet_lift}
+  }
+  prefab KipPerch {
+    Kip: {mood: "thinking", size: $kip_perch, centre: false, settle: false}
+    KipStand: {x: 1, y: 0, dx: 0 - $kip_perch_in, dy: 0}
+    KipLinger: {secs: $kip_outcome_secs, fade: $kip_outcome_fade}
   }
 
   // What the person sent: their words in a bubble at the trailing edge, as wide as they are up to $chat_bubble_max_w,

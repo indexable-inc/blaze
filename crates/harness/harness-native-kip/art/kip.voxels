@@ -1,0 +1,88 @@
+voxels 1
+// Kip, den's mascot: a chunky periwinkle block of a creature with two antennae whose tips light up while it thinks.
+// Ten cells wide, eighteen tall with its antennae. x is right, y up, z toward the viewer; see src/mascot/model.rs.
+// The scene (scene/45-mascot.flecs) recolours each ink per theme; these are its colours with no scene.
+
+ink body   #7f95f5
+ink belly  #a3b3ff
+ink stalk  #6276dc
+ink foot   #4c5cbc
+ink eye    #1c2140
+ink glint  #f4f6ff
+ink cheek  #eea6d2
+ink tip    #b5ecff
+
+// The body stands on its feet, two cells up. Rounded by taking the edges off a block.
+part body parent root at 0 2 0
+  fill box -5 0 -3  4 9 2 body
+  cut box -5 0 -3  -5 9 -3
+  cut box  4 0 -3   4 9 -3
+  cut box -5 0  2  -5 9  2
+  cut box  4 0  2   4 9  2
+  cut box -5 9 -3   4 9 -3
+  cut box -5 9  2   4 9  2
+  cut box -5 9 -3  -5 9  2
+  cut box  4 9 -3   4 9  2
+  cut box -5 0 -3   4 0 -3
+  cut box -5 0  2   4 0  2
+  cut box -5 0 -3  -5 0  2
+  cut box  4 0 -3   4 0  2
+  paint box -2 1 2  1 3 2 belly
+  paint box -4 3 2  -4 3 2 cheek
+  paint box  3 3 2   3 3 2 cheek
+  // Sockets the eyes and mouth sit in; a blink shows the socket behind.
+  cut box -3 4 2  -2 6 2
+  cut box  1 4 2   2 6 2
+  cut box -1 3 2   0 3 2
+
+// Two cells wide and three tall, a glint in the top corner; a blink squeezes them toward the brow.
+part eye_l parent body at -2 6 2.1
+  fill box -1 -2 0  0 0 0 eye
+  cell 0 0 0 glint
+
+part eye_r parent body at 2 6 2.1
+  fill box -1 -2 0  0 0 0 eye
+  cell 0 0 0 glint
+
+part mouth parent body at 0 3 2.1
+  fill box -1 0 0  0 0 0 eye
+
+// Antennae hang on the top's outer edges and lean out a little; each ends in a bulb, a block with its corners off.
+part antenna_l parent body at -3 10 0
+  rest 0 0 14
+  fill box 0 0 0  0 2 0 stalk
+  fill box -1 3 -1  1 5 1 tip
+  cut box -1 3 -1  -1 3 -1
+  cut box  1 3 -1   1 3 -1
+  cut box -1 3  1  -1 3  1
+  cut box  1 3  1   1 3  1
+  cut box -1 5 -1  -1 5 -1
+  cut box  1 5 -1   1 5 -1
+  cut box -1 5  1  -1 5  1
+  cut box  1 5  1   1 5  1
+
+part antenna_r parent body at 3 10 0
+  rest 0 0 -14
+  fill box -1 0 0  -1 2 0 stalk
+  fill box -2 3 -1  0 5 1 tip
+  cut box -2 3 -1  -2 3 -1
+  cut box  0 3 -1   0 3 -1
+  cut box -2 3  1  -2 3  1
+  cut box  0 3  1   0 3  1
+  cut box -2 5 -1  -2 5 -1
+  cut box  0 5 -1   0 5 -1
+  cut box -2 5  1  -2 5  1
+  cut box  0 5  1   0 5  1
+
+// Stubby arms swing from the shoulders.
+part arm_l parent body at -5 6 0
+  fill box -1 -3 -1  -1 -1 0 body
+
+part arm_r parent body at 5 6 0
+  fill box 0 -3 -1  0 -1 0 body
+
+part foot_l parent root at -3 0 0
+  fill box -1 0 -2  1 1 1 foot
+
+part foot_r parent root at 3 0 0
+  fill box -2 0 -2  0 1 1 foot

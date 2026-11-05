@@ -167,6 +167,88 @@ pub struct RibbonFrom;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct RibbonTo;
 
+/// How Kip (harness-native-kip, the `Kip` content) is seen and lit, on the scene's `ui.kip` (kip.flecs; den's
+/// MascotLook). The view looks down on him by `pitch` degrees with him turned `yaw` degrees from facing you. The key light
+/// comes from `key_x`, `key_y`, `key_z` (the view's space: x right, y up, z toward you) at `key` strength; the fill from
+/// the sky and the ground at `fill`; the rim from `rim_x`, `rim_y`, `rim_z` behind him at `rim`, as tight as `rim_power`. A
+/// corner between cells darkens by `ao` (0 never, 1 to black) and a line shows between cells by `seams` once a cell is
+/// several pixels across. His colours are `ui.kip`'s children's `Fill`s (`mascot_key_light`, `mascot_sky`,
+/// `mascot_ground`, `mascot_rim`, and `mascot_shadow` for the contact shadow, its alpha how dark), his inks the
+/// `MascotInk` children of `inks`. He comes and goes over `fade` seconds where a view shows and hides him.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MascotLook {
+    pub pitch: f32,
+    pub yaw: f32,
+    pub key_x: f32,
+    pub key_y: f32,
+    pub key_z: f32,
+    pub key: f32,
+    pub fill: f32,
+    pub rim_x: f32,
+    pub rim_y: f32,
+    pub rim_z: f32,
+    pub rim: f32,
+    pub rim_power: f32,
+    pub ao: f32,
+    pub seams: f32,
+    pub fade: f32,
+}
+
+/// How Kip moves, on `ui.kip` (harness-native-kip's anim.rs; den's MascotMotion). He breathes `breath_hz` times a second,
+/// swelling by `breath` of his height; he blinks every `blink_min` to `blink_max` seconds (sometimes twice), each blink
+/// `blink_len` seconds. His look turns toward the pointer on a critically damped spring of `look_omega` (radians a
+/// second), as far as `look_yaw` degrees aside and `look_pitch` up or down, and his body turns to walk on one of
+/// `turn_omega`. The antennae and arms are springs ringing at `*_hz` with damping ratio `*_damping`, pushed by the body's
+/// acceleration times `*_gain`. A walk's stride is `stride` cells each way at `cadence` steps a second, reached and lost
+/// at `accel` cells a second squared; a hop crouches for `anticipation` seconds, then flies `hop_time` seconds as high as
+/// `hop_height` of his height. Idle for `sleep_after` seconds he dozes off; after something happens he breathes for
+/// `awake` seconds, then rests still with a breath or a glance every `fidget_every`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MascotMotion {
+    pub breath_hz: f32,
+    pub breath: f32,
+    pub blink_min: f32,
+    pub blink_max: f32,
+    pub blink_len: f32,
+    pub look_omega: f32,
+    pub look_yaw: f32,
+    pub look_pitch: f32,
+    pub turn_omega: f32,
+    pub antenna_hz: f32,
+    pub antenna_damping: f32,
+    pub antenna_gain: f32,
+    pub arm_hz: f32,
+    pub arm_damping: f32,
+    pub arm_gain: f32,
+    pub stride: f32,
+    pub cadence: f32,
+    pub accel: f32,
+    pub hop_height: f32,
+    pub hop_time: f32,
+    pub anticipation: f32,
+    pub sleep_after: f32,
+    pub awake: f32,
+    pub fidget_every: f32,
+}
+
+/// One of Kip's moods (a child of `ui.kip` named for it: idle, thinking, working, happy, confused, sleeping, wave): a
+/// change to it crossfades over `blend` seconds; it plays `speed` times as fast and moves `amount` as much as it was made
+/// to; a one-shot (happy, wave) lasts `length` seconds, and confused settles after it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MascotClip {
+    pub blend: f32,
+    pub speed: f32,
+    pub amount: f32,
+    pub length: f32,
+}
+
+/// One of Kip's inks (a child of `ui.kip.inks` named `mascot_ink_<name>` for the ink his model names), coloured by its
+/// `Fill`: it glows by `glow` (0 to 1) while he does (thinking).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct MascotInk {
+    pub glow: f32,
+}
+
 hyperion_api_layouts::api_layouts! {
     "Ribbon" => alias Ribbon,
     "Rgba" => alias Rgba,
@@ -185,6 +267,10 @@ hyperion_api_layouts::api_layouts! {
     "HoverLook" => alias HoverLook,
     "CopyLook" => alias CopyLook,
     "Scheme" => alias Scheme,
+    "MascotLook" => alias MascotLook,
+    "MascotMotion" => alias MascotMotion,
+    "MascotClip" => alias MascotClip,
+    "MascotInk" => alias MascotInk,
 }
 
 /// Register the appearance vocabulary before scenes or systems resolve it.
@@ -206,6 +292,10 @@ pub fn register(world: &World) {
     world.component::<CopyLook>().writable();
     world.component::<Ribbon>().writable();
     world.component::<Scheme>().writable();
+    world.component::<MascotLook>().writable();
+    world.component::<MascotMotion>().writable();
+    world.component::<MascotClip>().writable();
+    world.component::<MascotInk>().writable();
     world.component::<RibbonFrom>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Delete);
     world.component::<RibbonTo>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Delete);
 }

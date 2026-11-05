@@ -1532,6 +1532,11 @@ impl App {
         if self.paint.get_mut().end_frame() {
             self.poke();
         }
+        // A Kip in view that hops, waves or crossfades wants every frame (kips.rs `Wake`); one that only breathes is
+        // drawn at the calm rate ([`Self::breathing`]), one at rest wakes the window for his next blink ([`Self::kip_nap`]).
+        if self.paint.get_mut().kip_wake == harness_native_render::kips::Wake::Lively {
+            self.poke_why("kip");
+        }
         self.stats_end(&d);
         d
     }
@@ -1634,9 +1639,25 @@ impl App {
         self.side_x.x.max(self.corner_x.x).clamp(0.0, 1.0)
     }
 
-    /// Whether a running dot breathes (the window keeps drawing, at a calm rate, while the app is otherwise idle).
+    /// Whether a running dot breathes or a Kip in view breathes, blinks or springs (the window keeps drawing, at a calm
+    /// rate, while the app is otherwise idle).
     pub fn breathing(&self) -> bool {
         crate::look::breathing(self.world.world_ref())
+            || matches!(self.paint.borrow().kip_wake, harness_native_render::kips::Wake::Calm(_))
+    }
+
+    /// The Kips in view all rest: how long until one of them blinks or fidgets (the window, idle, wakes then).
+    pub fn kip_nap(&self) -> Option<f64> {
+        match self.paint.borrow().kip_wake {
+            harness_native_render::kips::Wake::Rest(s) if s.is_finite() => Some(s.max(0.05)),
+            _ => None,
+        }
+    }
+
+    /// The window slept `secs` while the Kips in view rested: their clocks move on and a frame draws their blink.
+    pub fn kip_woke(&mut self, secs: f64) {
+        self.paint.get_mut().rest_kips(secs);
+        self.poke_why("kip");
     }
 
     /// Size every `Text` node with the typesetter; how many changed.
