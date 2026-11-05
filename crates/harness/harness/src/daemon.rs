@@ -1,7 +1,7 @@
 //! harnessd: owns every agent PTY, mirrors each into a libghostty terminal (harness-vt) (so a re-attaching client or
 //! the web view can redraw the current screen), records the parent/child tree, and serves the
 //! socket API plus the web UI. Survives client exit like a tmux server.
-use crate::{archive, db, messages, paths, profiles, proto, queries, runs};
+use crate::{archive, chat, db, messages, paths, profiles, proto, queries, runs};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -45,8 +45,10 @@ pub struct Session {
     /// The agent process (for `signal`).
     pub pid: Option<u32>,
     pub term: Mutex<harness_vt::Term>,
+    /// The PTY's input, or a chat child's stdin.
     writer: Mutex<Box<dyn Write + Send>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    /// None for a chat session (no PTY).
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pub tx: broadcast::Sender<Ev>,
     pub exit: Mutex<Option<i32>>,
@@ -58,6 +60,8 @@ pub struct Session {
     /// When its program last wrote output (ms since the epoch), and whether `list` last said it was busy.
     last_out: AtomicU64,
     busy: AtomicBool,
+    /// A chat session's conversation (chat/mod.rs): it has no PTY, and its terminal mirror stays blank.
+    pub chat: Option<Arc<chat::Chat>>,
 }
 
 impl Session {
@@ -72,7 +76,9 @@ impl Session {
         if cols == 0 || rows == 0 {
             return Ok(());
         }
-        self.master.lock().unwrap().resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("{e}"))?;
+        let master = self.master.lock().unwrap();
+        let Some(master) = master.as_ref() else { return Ok(()) };
+        master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(|e| anyhow!("{e}"))?;
         self.term.lock().unwrap().resize(cols, rows);
         Ok(())
     }
@@ -86,6 +92,9 @@ impl Session {
     }
 
     pub fn screen_text(&self) -> String {
+        if let Some(c) = &self.chat {
+            return c.screen();
+        }
         self.term.lock().unwrap().text()
     }
 
@@ -95,7 +104,10 @@ impl Session {
 
     pub fn info(&self) -> Value {
         let (cols, rows) = self.size();
-        let title = self.term.lock().unwrap().title();
+        let title = match &self.chat {
+            Some(c) => c.title(),
+            None => self.term.lock().unwrap().title(),
+        };
         let ended = *self.ended.lock().unwrap();
         json!({
             "id": self.id, "object": format!("s{}", self.id), "kind": self.kind, "name": self.name, "parent": self.parent, "title": title, "cwd": self.cwd,
@@ -103,6 +115,8 @@ impl Session {
             "status": ended.map_or("running", |(s, _)| s), "ended_ms": ended.map(|(_, ms)| ms),
             "attached": self.attached.load(Ordering::Relaxed), "cols": cols, "rows": rows,
             "busy": self.busy.load(Ordering::Relaxed),
+            "mode": if self.chat.is_some() { "chat" } else { "tui" },
+            "model": self.chat.as_ref().map(|c| c.model()),
         })
     }
 
@@ -116,9 +130,24 @@ impl Session {
 
     /// No output for [`BUSY_MS`]: not busy any more (a change when it was).
     fn settle(&self, now: u64) {
-        if self.busy.load(Ordering::Relaxed) && now.saturating_sub(self.last_out.load(Ordering::Relaxed)) >= BUSY_MS && self.busy.swap(false, Ordering::Relaxed) {
+        if self.chat.is_none() && self.busy.load(Ordering::Relaxed) && now.saturating_sub(self.last_out.load(Ordering::Relaxed)) >= BUSY_MS && self.busy.swap(false, Ordering::Relaxed) {
             changed();
         }
+    }
+
+    /// A chat session's message: its user line to the agent (Err: not a chat session).
+    pub fn chat_send(&self, text: &str) -> Result<()> {
+        let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
+        let line = c.user_line(text, &self.tx);
+        self.busy.store(true, Ordering::Relaxed);
+        changed();
+        self.write(format!("{line}\n").as_bytes())
+    }
+
+    /// Stop a chat session's turn in flight.
+    pub fn chat_interrupt(&self) -> Result<()> {
+        let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
+        self.write(format!("{}\n", c.interrupt_line()).as_bytes())
     }
 
     pub fn kill(&self) {
@@ -153,8 +182,17 @@ pub enum Req {
         name: Option<String>,
         cols: Option<u16>,
         rows: Option<u16>,
+        /// `chat` (Claude's default) or `tui` (a PTY).
+        mode: Option<String>,
     },
-    Attach { id: u64, cols: Option<u16>, rows: Option<u16> },
+    /// `events`: a chat session's events as NDJSON (chat/mod.rs) instead of the conversation as text.
+    Attach {
+        id: u64,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        #[serde(default)]
+        events: bool,
+    },
     /// The change feed: an ok, then `{"ev":"changed","gen":N}` each time `list` or `runs` would answer differently
     /// (sessions or runs come, go, or change status, title or busy), coalesced to at most 20 a second. Like `attach`
     /// it holds the connection; any frame from the client ends it.
@@ -230,13 +268,25 @@ impl Daemon {
         // A known Claude session id ties this object to its transcript (the messages stream).
         let mut args = args.to_vec();
         let mut meta = json!({ "session": id, "cwd": cwd, "created_ms": created_ms });
+        // Claude runs as a chat (stream-json, drawn by the app) unless `--tui` asks for its terminal UI.
+        let tui = args.iter().position(|a| a == "--tui").map(|i| args.remove(i)).is_some();
+        let chat = kind == "claude" && !tui;
+        if chat {
+            meta["mode"] = json!("chat");
+        }
         let resumes = args.iter().any(|a| matches!(a.as_str(), "-r" | "--resume" | "-c" | "--continue" | "--session-id"));
         if kind == "claude" && !resumes {
             let uuid = uuid_v4();
             args.splice(0..0, ["--session-id".to_string(), uuid.clone()]);
             meta["claude_session"] = json!(uuid);
         }
-        let launch = profiles::launch(kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt })?;
+        let mut launch = profiles::launch(
+            kind, &profiles::Ctx { session: id, cwd: &cwd, sock: &sock, user_args: &args, prompt: if chat { None } else { prompt } },
+        )?;
+        if chat {
+            launch.args.splice(0..0, chat::claude::ARGS.iter().map(|a| a.to_string()));
+            return self.spawn_chat(id, kind, launch, parent, cwd, prompt, name, env, meta, created_ms);
+        }
         let mut cmd = CommandBuilder::new(&launch.program);
         cmd.args(&launch.args);
         cmd.cwd(&cwd);
@@ -270,14 +320,14 @@ impl Daemon {
         std::fs::create_dir_all(raw_path.parent().unwrap())?;
         let mut raw = std::fs::OpenOptions::new().create(true).append(true).open(&raw_path)?;
         db::session_start(&db::SessionRow {
-            id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta,
+            id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta, stream: "pty",
         });
         let session = Arc::new(Session {
             id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid,
             term: Mutex::new(harness_vt::Term::new(if cols == 0 { 80 } else { cols }, if rows == 0 { 24 } else { rows }, 10_000)),
-            writer: Mutex::new(writer), master: Mutex::new(pair.master), killer: Mutex::new(killer),
+            writer: Mutex::new(writer), master: Mutex::new(Some(pair.master)), killer: Mutex::new(killer),
             tx, exit: Mutex::new(None), ended: Mutex::new(None), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
-            last_out: AtomicU64::new(0), busy: AtomicBool::new(false),
+            last_out: AtomicU64::new(0), busy: AtomicBool::new(false), chat: None,
         });
         self.sessions.lock().unwrap().insert(id, session.clone());
         changed();
@@ -333,6 +383,92 @@ impl Daemon {
         Ok(id)
     }
 
+    /// A chat session (chat/mod.rs): `launch` run with stdin and stdout piped, each line it writes recorded through
+    /// Claude's adapter; `prompt`, if any, sent as its first message.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_chat(
+        self: &Arc<Self>, id: u64, kind: &str, launch: profiles::Launch, parent: Option<u64>, cwd: String,
+        prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
+    ) -> Result<u64> {
+        use std::io::BufRead;
+        let oid = format!("s{id}");
+        let dir = db::object_dir(&oid);
+        std::fs::create_dir_all(&dir)?;
+        let mut cmd = std::process::Command::new(&launch.program);
+        cmd.args(&launch.args).current_dir(&cwd);
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy();
+            if k == "CLAUDECODE" || k == "AI_AGENT" || k.starts_with("CLAUDE_CODE_") || k.starts_with("CODEX_") {
+                cmd.env_remove(k.as_ref());
+            }
+        }
+        cmd.envs(launch.env.iter().chain(env));
+        if let Some(p) = parent {
+            cmd.env("HARNESS_PARENT", p.to_string());
+        }
+        let stderr = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("stderr"))?;
+        cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(stderr);
+        let mut child = cmd.spawn().with_context(|| format!("spawn {}", launch.program))?;
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("{oid}: no stdin pipe"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("{oid}: no stdout pipe"))?;
+        let pid = child.id();
+        let mut argv = vec![launch.program.clone()];
+        argv.extend(launch.args.iter().cloned());
+        db::session_start(&db::SessionRow {
+            id, kind, name: name.as_deref(), parent, cwd: &cwd, argv: &argv, created_ms, meta, stream: "chat",
+        });
+        let c = Arc::new(chat::Chat::open(&oid, &dir, Box::new(chat::claude::Claude::default()))?);
+        let (tx, _) = broadcast::channel(16384);
+        let session = Arc::new(Session {
+            id, kind: kind.into(), name, parent, cwd, argv, created_ms, pid: Some(pid),
+            term: Mutex::new(harness_vt::Term::new(80, 24, 0)),
+            writer: Mutex::new(Box::new(stdin)), master: Mutex::new(None), killer: Mutex::new(Box::new(chat::PidKiller(pid))),
+            tx, exit: Mutex::new(None), ended: Mutex::new(None), killed: AtomicBool::new(false), attached: AtomicUsize::new(0),
+            last_out: AtomicU64::new(0), busy: AtomicBool::new(false), chat: Some(c.clone()),
+        });
+        self.sessions.lock().unwrap().insert(id, session.clone());
+        changed();
+        let s = session.clone();
+        std::thread::Builder::new().name(format!("chat-read-{id}")).spawn(move || {
+            let mut r = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if c.agent_line(&line, &s.tx) {
+                    s.busy.store(c.busy.load(Ordering::Relaxed), Ordering::Relaxed);
+                    changed();
+                }
+            }
+        })?;
+        let s = session.clone();
+        std::thread::Builder::new().name(format!("chat-wait-{id}")).spawn(move || {
+            let st = child.wait();
+            let code = st.as_ref().ok().and_then(std::process::ExitStatus::code).unwrap_or(-1);
+            let signalled = st.as_ref().is_ok_and(|st| std::os::unix::process::ExitStatusExt::signal(st).is_some());
+            let status = if signalled || s.killed.load(Ordering::Relaxed) { "killed" } else { "exited" };
+            let ended = now_ms();
+            if let Some(c) = &s.chat {
+                c.ended(&s.tx);
+            }
+            s.busy.store(false, Ordering::Relaxed);
+            *s.ended.lock().unwrap() = Some((status, ended));
+            *s.exit.lock().unwrap() = Some(code);
+            changed();
+            let _ = s.tx.send(Ev::Exit(code));
+            db::session_end(s.id, code, status, ended);
+            archive::compact_bg(format!("s{}", s.id));
+        })?;
+        if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
+            session.chat_send(p)?;
+        }
+        eprintln!("spawned chat session {id}: {kind} (parent {parent:?})");
+        Ok(id)
+    }
+
     fn handle(self: &Arc<Self>, req: Req) -> Result<Value> {
         Ok(match req {
             Req::List { all } => {
@@ -358,7 +494,10 @@ impl Daemon {
             Req::SpawnObject { opts } => crate::object::spawn(self, &opts)?,
             Req::Object { id } => crate::object::info(self, &id)?,
             Req::Rpc { id, method, args } => crate::object::rpc(self, &id, &method, &args, |r| self.handle(r))?,
-            Req::Spawn { kind, args, parent, cwd, prompt, name, cols, rows } => {
+            Req::Spawn { kind, mut args, parent, cwd, prompt, name, cols, rows, mode } => {
+                if mode.as_deref() == Some("tui") {
+                    args.push("--tui".into());
+                }
                 let id = self.spawn_named(&kind, &args, parent, cwd, prompt.as_deref(), name, &BTreeMap::new(), cols.unwrap_or(120), rows.unwrap_or(40))?;
                 json!({ "id": id })
             }
@@ -366,6 +505,8 @@ impl Daemon {
                 let s = self.get(id)?;
                 if raw {
                     s.write(text.as_bytes())?;
+                } else if s.chat.is_some() {
+                    s.chat_send(&text)?;
                 } else {
                     crate::inject::send(&s, &text, submit.unwrap_or(true))?;
                 }
@@ -471,7 +612,7 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 continue;
             }
         };
-        if let Req::Attach { id, cols, rows } = req {
+        if let Req::Attach { id, cols, rows, events } = req {
             let s = match d.get(id) {
                 Ok(s) => s,
                 Err(e) => {
@@ -484,6 +625,9 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             }
             *d.last.lock().unwrap() = Some(id);
             proto::write_json(&mut w, &json!({ "ok": true, "info": s.info() })).await?;
+            if let Some(c) = s.chat.clone() {
+                return attach_chat(s, c, events, r, w).await;
+            }
             return attach(s, r, w).await;
         }
         if let Req::Watch = req {
@@ -562,6 +706,81 @@ async fn attach(s: Arc<Session>, mut r: tokio::net::unix::OwnedReadHalf, mut w: 
                 }
                 proto::T_JSON => break, // detach
                 _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let res = tokio::select! {
+        r = input => r,
+        r = &mut out => r.map_err(anyhow::Error::from).and_then(|x| x),
+    };
+    out.abort();
+    s.attached.fetch_sub(1, Ordering::Relaxed);
+    res
+}
+
+/// A chat session's attach: its history, then its events live, then its exit; as event lines (`events`, the app) or
+/// as the conversation's text (the terminal client). Detached by any JSON frame; a client that falls behind the
+/// broadcast is dropped, and attaches again for a fresh history.
+async fn attach_chat(
+    s: Arc<Session>, c: Arc<chat::Chat>, events: bool, mut r: tokio::net::unix::OwnedReadHalf,
+    mut w: tokio::net::unix::OwnedWriteHalf,
+) -> Result<()> {
+    s.attached.fetch_add(1, Ordering::Relaxed);
+    let (history, mut rx) = c.history_and_subscribe(&s.tx);
+    let exited = *s.exit.lock().unwrap();
+    let sid = s.id;
+    let render = move |lines: &[u8]| -> Vec<u8> {
+        if events {
+            return lines.to_vec();
+        }
+        let mut out = String::new();
+        for l in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            out.push_str(&chat::text_of(&serde_json::from_slice(l).unwrap_or(Value::Null)));
+        }
+        out.replace('\n', "\r\n").into_bytes()
+    };
+    let mut out = tokio::spawn(async move {
+        // The history in frames of whole lines, about 256 KB each.
+        let mut buf = Vec::new();
+        for l in &history {
+            buf.extend_from_slice(l.as_bytes());
+            buf.push(b'\n');
+            if buf.len() >= 256 * 1024 {
+                proto::write_frame(&mut w, proto::T_DATA, &render(&buf)).await?;
+                buf.clear();
+            }
+        }
+        if !buf.is_empty() {
+            proto::write_frame(&mut w, proto::T_DATA, &render(&buf)).await?;
+        }
+        if let Some(code) = exited {
+            proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+            return Ok::<_, anyhow::Error>(());
+        }
+        loop {
+            match rx.recv().await {
+                Ok(Ev::Data(b)) => {
+                    let bytes = render(&b);
+                    if !bytes.is_empty() {
+                        proto::write_frame(&mut w, proto::T_DATA, &bytes).await?;
+                    }
+                }
+                Ok(Ev::Exit(code)) => {
+                    proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
+                    return Ok(());
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    return Err(anyhow!("chat attach to s{sid} fell {n} events behind; attach again"));
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    });
+    let input = async {
+        while let Some((t, _)) = proto::read_frame(&mut r).await? {
+            if t == proto::T_JSON {
+                break;
             }
         }
         Ok::<_, anyhow::Error>(())

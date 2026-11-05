@@ -47,6 +47,15 @@ const HANDLERS: &[(&str, Handler)] = &[
     }),
     ("Archive", |a, _, _| a.kill()),
     ("SelectAll", |a, _, _| a.select_all()),
+    ("Edit", |a, act, _| {
+        let op = a
+            .world
+            .entity_from_id(act)
+            .try_cloned::<&keys::EditOp>()
+            .map(|k| k.op.as_str().to_owned())
+            .unwrap_or_default();
+        a.chat_edit(&op);
+    }),
     ("ToggleSidebar", |a, _, _| a.toggle_sidebar()),
     // cmd+K: the palette, or closed again (over the picker, the palette takes its place).
     ("Palette", |a, _, _| {
@@ -222,6 +231,8 @@ impl App {
             &[keys::PALETTE]
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
+        } else if self.chat_focused() {
+            if self.tree_focus { &[keys::TREE, keys::CHAT] } else { &[keys::CHAT] }
         } else if self.tree_focus {
             &[keys::TREE, keys::TERMINAL]
         } else {

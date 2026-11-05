@@ -15,8 +15,37 @@ fn language(file: &str) -> Option<(&'static str, tree_sitter::Language, &'static
         "sh" | "bash" | "zsh" | "shell" => {
             Some(("bash", tree_sitter_bash::LANGUAGE.into(), tree_sitter_bash::HIGHLIGHT_QUERY))
         }
+        "rs" | "rust" => {
+            Some(("rust", tree_sitter_rust::LANGUAGE.into(), tree_sitter_rust::HIGHLIGHTS_QUERY))
+        }
+        "ts" | "typescript" | "mts" | "cts" => {
+            Some(("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), TS_QUERY.as_str()))
+        }
+        "tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY.as_str())),
+        "js" | "javascript" | "mjs" | "cjs" | "jsx" => Some((
+            "javascript",
+            tree_sitter_javascript::LANGUAGE.into(),
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+        )),
+        "py" | "python" => {
+            Some(("python", tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY))
+        }
+        "json" | "jsonc" => {
+            Some(("json", tree_sitter_json::LANGUAGE.into(), tree_sitter_json::HIGHLIGHTS_QUERY))
+        }
         _ => None,
     }
+}
+
+/// TypeScript's highlight query extends JavaScript's: both, JavaScript's first.
+static TS_QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("{}\n{}", tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY)
+});
+
+/// Whether blaze has a grammar for `file`'s kind (a code card colours only those).
+#[must_use]
+pub fn knows(file: &str) -> bool {
+    language(file).is_some()
 }
 
 /// A stretch of the words, as UTF-16 units `start..end`, and which of the names it was asked about it is.
@@ -49,7 +78,7 @@ impl Highlighter {
         }
         let Some((lang_name, lang, query)) = language(file) else {
             return Err(format!(
-                "Highlight {file:?}: no grammar for this file's kind (only shell so far: .sh, .bash, .zsh)"
+                "Highlight {file:?}: no grammar for this file's kind (shell, rust, typescript, javascript, python, json)"
             ));
         };
         let config = match self.configs.get(&(lang_name, names.to_vec())) {

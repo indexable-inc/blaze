@@ -3,7 +3,7 @@
 //! running objects), a parent, append-only streams (indexed in db.rs) and RPC methods.
 //!
 //! Socket ops (daemon.rs routes them here):
-//!   spawn_object {kind, name?, prompt?, cmd?, cwd?, env?, args?, parent?: "s5"|"r9"|5, session?, stdin?, live_stdin?, cols?, rows?}
+//!   spawn_object {kind, name?, prompt?, cmd?, cwd?, env?, args?, parent?: "s5"|"r9"|5, session?, stdin?, live_stdin?, cols?, rows?, mode?: "chat"|"tui"}
 //!       -> {id, kind, name, existing}. Get-or-create: a live object holding `name` is returned instead
 //!       (error if it is another kind). Atomic: one lock covers the lookup and the start.
 //!       Procs get a live stdin pipe unless live_stdin: false.
@@ -123,7 +123,11 @@ pub fn spawn(d: &Arc<Daemon>, v: &Value) -> Result<Value> {
         )?;
         r["id"].as_str().unwrap_or_default().to_string()
     } else {
-        let args: Vec<String> = serde_json::from_value(v["args"].clone()).unwrap_or_default();
+        let mut args: Vec<String> = serde_json::from_value(v["args"].clone()).unwrap_or_default();
+        // Claude is a chat session unless asked for its terminal UI (`mode: "tui"`, or `--tui` in args).
+        if v["mode"] == "tui" {
+            args.push("--tui".into());
+        }
         let parent = session_num(&v["parent"])?;
         let cols = v["cols"].as_u64().map_or(140, |c| c as u16);
         let rows = v["rows"].as_u64().map_or(45, |r| r as u16);
@@ -212,6 +216,10 @@ pub fn rpc(d: &Daemon, id: &str, method: &str, args: &Value, handle: impl Fn(Req
             "input" => handle(Req::Send { id: n, text: a("data").context("input needs args.data")?, raw: true, submit: None }),
             "interrupt" => {
                 let s = d.get(n)?;
+                if s.chat.is_some() && a("key").is_none() {
+                    s.chat_interrupt()?;
+                    return Ok(json!({ "ok": true }));
+                }
                 let key = a("key").unwrap_or_else(|| if s.kind == "shell" { "\x03".into() } else { "\x1b".into() });
                 s.write(key.as_bytes())?;
                 Ok(json!({ "ok": true }))

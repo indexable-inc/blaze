@@ -51,7 +51,7 @@ impl Default for TreeScroll {
     }
 }
 
-fn config(
+pub(super) fn config(
     w: f32,
     viewport: f32,
     content: f32,
@@ -93,6 +93,9 @@ impl App {
             self.tree.engine.wheel(input, t);
             self.tree.active_at = self.time;
             self.poke();
+            return;
+        }
+        if self.chat_wheel(&ev, z) {
             return;
         }
         if self.archive_wheel(if ev.precise { ev.dy / z } else { ev.dy }, ev.precise) {

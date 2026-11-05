@@ -221,3 +221,25 @@ export const tone_stats_plate: Fill = {dark: {0, 0, 0, 0.62}, light: {0, 0, 0, 0
 export const tone_stats_ink: Fill = {dark: {1, 1, 1, 0.90}, light: {1, 1, 1, 0.90}}
 export const tone_stats_bar: Fill = {dark: {0.298, 0.718, 0.510, 0.85}, light: {0.298, 0.718, 0.510, 0.85}}
 export const tone_stats_hot: Fill = {dark: {1.0, 0.45, 0.43, 1}, light: {1.0, 0.45, 0.43, 1}}
+
+// Text being edited (ui.TextArea): the selection's wash and the caret. Inline code's chip (MarkdownText).
+export const tone_text_select: Fill = {dark: {0.580, 0.600, 1.0, 0.32}, light: {0.369, 0.384, 0.902, 0.24}}
+export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
+export const textarea_max_h = 132
+
+// The chat pane (hn.ChatPane, scene/widgets/chat.flecs, src/app/chat.rs): a column of the transcript as wide as reads
+// well, the user's words on a soft plate, code on a card, tool calls as quiet one-line rows, the input at the foot.
+export const chat_w = 720
+export const chat_pad = 24
+export const size_chat = 14
+export const line_chat = 21
+export const size_chat_h1 = 19
+export const size_chat_h2 = 16.5
+export const size_chat_h3 = 14.5
+export const line_chat_code = 17
+export const chat_bubble_radius = 12
+export const chat_input_radius = 12
+export const chat_row_estimate = 44
+export const tone_chat_bubble: Fill = {dark: {1, 1, 1, 0.075}, light: {0, 0, 0, 0.055}}
+export const tone_chat_card: Fill = {dark: {1, 1, 1, 0.045}, light: {0, 0, 0, 0.035}}
+export const tone_chat_input: Fill = {dark: {1, 1, 1, 0.055}, light: {0, 0, 0, 0.04}}

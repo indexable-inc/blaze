@@ -27,6 +27,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 mod archive;
+mod chat;
 mod fold;
 mod keys;
 mod panes;
@@ -52,6 +53,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/rows.flecs", include_str!("../scene/widgets/rows.flecs")),
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
+    ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
@@ -86,12 +88,15 @@ enum Mode {
     New,
 }
 
-/// A row of the new-object picker: an act.Spawn action, the kind it makes and its title, the keys that run it from
-/// anywhere (`hint`) and the key that picks it in the picker (`cap`).
+/// An act.Spawn action: the kind it makes and whose mark shows it (`claude-tui` shows Claude's), its name in the picker
+/// (`title`, empty: not in the picker) and in the palette (`menu`), the keys that run it from anywhere (`hint`) and the
+/// key that picks it in the picker (`cap`).
 struct Pick {
     act: u64,
     kind: String,
+    mark: String,
     title: String,
+    menu: String,
     hint: String,
     cap: String,
 }
@@ -171,6 +176,9 @@ pub struct App {
     terms: model::Terms,
     /// The parsers of runs and stages being read, by entity id.
     run_terms: model::Terms,
+    /// The chat sessions' transcripts, by session id, and each chat pane's own state (src/app/chat.rs).
+    chats: model::Chats,
+    chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
     /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
     watching: HashMap<u64, (u64, Option<u32>)>,
     /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
@@ -374,7 +382,7 @@ impl App {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "This Mac".into());
-        let (terms, run_terms) =
+        let (terms, run_terms, chats) =
             model::install(w, &host, &crate::link::sock().display().to_string(), rx);
         let key_file = keys::KeyFile::watch(wake.clone());
         let look = ghostty::Look::new(wake.clone());
@@ -418,6 +426,8 @@ impl App {
             paint,
             terms,
             run_terms,
+            chats,
+            chat: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
             side_w,
@@ -1125,7 +1135,7 @@ impl App {
                 .picks()
                 .into_iter()
                 .map(|p| {
-                    (format!("a{}", p.act), PalGlyph::Kind(p.kind), p.title, p.hint, Do::Act(p.act))
+                    (format!("a{}", p.act), PalGlyph::Kind(p.mark), p.title, p.hint, Do::Act(p.act))
                 })
                 .collect();
         }
@@ -1133,16 +1143,10 @@ impl App {
         // A new object of each kind, run as its act.Spawn (as its keys and the picker run it); each hint is the binding
         // that runs the same action (scene/20-keys.flecs, or the user's keys.flecs).
         let mut out: Vec<(String, PalGlyph, String, String, Do)> = self
-            .picks()
+            .spawns()
             .into_iter()
             .map(|p| {
-                (
-                    format!("new-{}", p.kind),
-                    PalGlyph::Kind(p.kind),
-                    format!("New {}", p.title),
-                    p.hint,
-                    Do::Act(p.act),
-                )
+                (format!("new-{}", p.kind), PalGlyph::Kind(p.mark), p.menu, p.hint, Do::Act(p.act))
             })
             .collect();
         for (i, e) in self.objects().into_iter().enumerate() {
@@ -1347,7 +1351,7 @@ impl App {
                     ("obj", Prop::Uint(i as u64)),
                     ("name", Prop::Str(&p.title)),
                     ("selected", Prop::Bool(i == at)),
-                    ("kind", Prop::Str(&p.kind)),
+                    ("kind", Prop::Str(&p.mark)),
                     ("hint", Prop::Str(&p.hint)),
                     ("cap", Prop::Str(&p.cap)),
                 ],
@@ -1355,8 +1359,13 @@ impl App {
         });
     }
 
-    /// The picker's rows: every act.Spawn action (scene/20-keys.flecs and the user's keys.flecs), in their order.
+    /// The picker's rows: the act.Spawn actions with a title, in their order.
     fn picks(&self) -> Vec<Pick> {
+        self.spawns().into_iter().filter(|p| !p.title.is_empty()).collect()
+    }
+
+    /// Every act.Spawn action (scene/20-keys.flecs and the user's keys.flecs), in their order.
+    fn spawns(&self) -> Vec<Pick> {
         let w = self.world.world_ref();
         let ctx = w.try_lookup(crate::keys::PICKER).map(|e| *e.id());
         self.keymap
@@ -1365,9 +1374,12 @@ impl App {
             .filter_map(|a| {
                 let k = w.entity_from_id(a.id).try_cloned::<&crate::keys::SpawnKind>()?;
                 let kind = k.kind.as_str().to_owned();
-                let title = match k.title.as_str() {
-                    "" => capitalised(&kind),
-                    t => t.to_owned(),
+                let title = k.title.as_str().to_owned();
+                let mark = kind.split('-').next().unwrap_or_default().to_owned();
+                let menu = match &a.menu {
+                    Some((_, t, _)) => t.clone(),
+                    None if !title.is_empty() => format!("New {title}"),
+                    None => format!("New {}", capitalised(&kind)),
                 };
                 let hint =
                     self.keymap.primary(a.id).map(crate::keys::Chord::hint).unwrap_or_default();
@@ -1375,7 +1387,7 @@ impl App {
                     .and_then(|c| self.keymap.in_context(a.id, c))
                     .map(crate::keys::Chord::hint)
                     .unwrap_or_default();
-                Some(Pick { act: a.id, kind, title, hint, cap })
+                Some(Pick { act: a.id, kind, mark, title, menu, hint, cap })
             })
             .collect()
     }
@@ -1456,6 +1468,7 @@ impl App {
         self.lay_chrome(z);
         self.step_fold();
         self.step_tree_scroll(dt);
+        self.step_chat_scroll();
         let w = self.world.world_ref();
         if w.try_get::<&Viewport>(|v| (v.w, v.h)) != Some(view) {
             self.world.set(Viewport { w: view.0, h: view.1 });
@@ -1666,6 +1679,10 @@ impl App {
                 self.set_archive_chip(i);
             } else if a == "arch:more" {
                 self.request_older();
+            } else if let Some(b) = a.strip_prefix("chat:open:") {
+                self.chat_toggle(b);
+            } else if a == "chat:focus" {
+                self.tree_focus = false;
             } else if a == "pal:close" {
                 self.palette = None;
             } else if let Some(i) = a.strip_prefix("pal:").and_then(|s| s.parse::<usize>().ok()) {
