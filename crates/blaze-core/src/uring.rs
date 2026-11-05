@@ -819,7 +819,11 @@ impl ReservedCheck {
             0.. => None,
             _ => io::Error::last_os_error().raw_os_error(),
         };
-        ReservedCheck::answered(errno).map_err(|answer| {
+        ReservedCheck::answered(errno).ok_or_else(|| {
+            let answer = match errno {
+                Some(errno) => io::Error::from_raw_os_error(errno).to_string(), // alloc: an error.
+                None => "success, unregistering a group that is not there".to_owned(), // alloc: an error.
+            };
             io::Error::other(
                 // alloc: the error of a setup that failed.
                 format!(
@@ -834,16 +838,13 @@ impl ReservedCheck {
         })
     }
 
-    /// The check the unregister probe's answer (`None` for a success) shows, or what was
-    /// answered instead.
-    fn answered(errno: Option<i32>) -> Result<ReservedCheck, String> {
+    /// The check the unregister probe's answer (its errno, `None` for a success) shows, if it
+    /// shows one.
+    fn answered(errno: Option<i32>) -> Option<ReservedCheck> {
         match errno {
-            Some(libc::ENOENT) => Ok(ReservedCheck::Upstream),
-            Some(libc::EINVAL) => Ok(ReservedCheck::Inverted),
-            // alloc: the error of a setup that failed.
-            Some(errno) => Err(io::Error::from_raw_os_error(errno).to_string()),
-            // alloc: the error of a setup that failed.
-            None => Err("success, unregistering a group that is not there".to_owned()),
+            Some(libc::ENOENT) => Some(ReservedCheck::Upstream),
+            Some(libc::EINVAL) => Some(ReservedCheck::Inverted),
+            _ => None,
         }
     }
 
@@ -4675,6 +4676,41 @@ mod tests {
         storm.join().unwrap();
         assert!(out.is_empty(), "nothing was sent, and the poll ended with {out:?}");
         assert!(took < Duration::from_secs(2), "a 50 ms poll under signals every 5 ms took {took:?}");
+    }
+
+    /// The reserved-word check `ReservedCheck::of` reads is the one this kernel applies: a
+    /// ring registers with the words it chose and is refused (EINVAL) with the other choice,
+    /// upstream's zeroes on an inverted kernel (Ubuntu's linux-azure 6.8.0-1063 and later)
+    /// and a set word on any other.
+    #[test]
+    fn the_reserved_check_is_the_kernels() {
+        let ring = Ring::new(ENTRIES, COMPLETIONS).unwrap();
+        let fd = ring.fd.as_raw_fd();
+        let check = ReservedCheck::of(fd).unwrap();
+        let other = match check {
+            ReservedCheck::Upstream => ReservedCheck::Inverted,
+            ReservedCheck::Inverted => ReservedCheck::Upstream,
+        };
+        let map = anonymous(RECV_BUFFERS as usize * size_of::<ProvidedBuf>()).unwrap();
+        let reg = |bgid: u16, check: ReservedCheck| BufReg {
+            ring_addr: map.at as u64,
+            ring_entries: RECV_BUFFERS.into(),
+            bgid,
+            flags: 0,
+            resv: check.reserved(),
+        };
+        let call = |reg: BufReg| {
+            // SAFETY: `reg` is the `io_uring_buf_reg` the call reads, alive for it; the ring
+            // it names is `map`, mapped for `RECV_BUFFERS` entries and kept past the ring.
+            let got = unsafe {
+                libc::syscall(libc::SYS_io_uring_register, fd, REGISTER_PBUF_RING, &raw const reg, 1)
+            };
+            if got < 0 { io::Error::last_os_error().raw_os_error() } else { None }
+        };
+        let kernel = crate::cgroup::kernel();
+        assert_eq!(call(reg(1, other)), Some(libc::EINVAL), "{other:?} on Linux {kernel}");
+        assert_eq!(call(reg(1, check)), None, "{check:?} on Linux {kernel}");
+        drop(ring);
     }
 
     /// The provided buffers a pass of completions gives back are shown to the kernel together,
