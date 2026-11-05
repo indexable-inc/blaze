@@ -34,7 +34,10 @@ use blaze_graph::{
 };
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64 as Rng;
-use blaze_protocol::events::{Event, NodeState};
+use blaze_protocol::{
+    events::{Event, NodeState},
+    now::{self, Fold, Now},
+};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 /// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
@@ -680,6 +683,47 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each node ready and not started: its `admission` span, open from the step it became
     /// ready, and that step's time ([`Plane::admitting`]).
     admitting: HashMap<NodeId, Admitting, Global>, // alloc: the plane's, an entry a ready node
+    /// Each request's live model, fed every record the plane says of it ([`Folds`]).
+    folds: Folds,
+}
+
+/// Each plane request's live model (`blaze_protocol::now`, docs/v2/plan/observe/build-view.md):
+/// a [`Fold`] made as the request opens ([`Plane::open`]), fed every record the plane says of
+/// it ([`PlaneOutput::Said`]), looked at once a second while its job runs
+/// (`super::job::doing`) and dropped as its job ends ([`Plane::forget`]).
+pub struct Folds {
+    // alloc: the plane's, an entry a request whose job has not ended
+    by: HashMap<RequestId, Live, Global>,
+}
+
+/// One request's fold and when it opened on the plane's clock: a record's `at_ns` is the
+/// plane's clock, the fold's is since the request began.
+struct Live {
+    fold: Fold,
+    began_ns: u64,
+}
+
+impl Folds {
+    fn new() -> Folds {
+        Folds { by: HashMap::new_in(Global) } // alloc: the plane's, once
+    }
+
+    /// One record of `request`, at `at_ns` of the plane's clock. A request with no fold is one
+    /// whose job ended ([`Plane::forget`]): what the plane still says of it (its cancel's
+    /// moves) is no live view's, and is dropped.
+    fn said(&mut self, request: RequestId, at_ns: u64, event: &Event) {
+        let Some(live) = self.by.get_mut(&request) else { return };
+        live.fold.advance_clock(at_ns.saturating_sub(live.began_ns));
+        live.fold.take_event(event);
+    }
+
+    /// `request`'s build as of `at` on the plane's clock, with what one look found; `None` when
+    /// the plane holds no fold of it (no such request was opened, or its job ended).
+    pub fn look(&mut self, request: RequestId, at: Duration, look: &now::Look<'_>) -> Option<Now> {
+        let live = self.by.get_mut(&request)?;
+        live.fold.advance_clock(ns(at).saturating_sub(live.began_ns));
+        Some(live.fold.look(look))
+    }
 }
 
 /// A ready node's wait for admission, as its profile span says it ([`Plane::admitting`]).
@@ -759,6 +803,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             replays: HashSet::new_in(Global), // alloc: the plane's, once
             per_kib: HashMap::new_in(Global), // alloc: the plane's, once
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
+            folds: Folds::new(),
         })
     }
 
@@ -1079,9 +1124,23 @@ impl<W: Work, P: Predict> Plane<W, P> {
         let request = RequestId(self.next_request);
         self.next_request = self.next_request.wrapping_add(1).max(1);
         let input = PlaneInput::Open { at_ns: ns(at), request, weight: 1, keep_going, idle };
+        // alloc: a request's live model, once per request
+        self.folds.by.insert(request, Live { fold: Fold::new(), began_ns: ns(at) });
         self.step(input)
             .unwrap_or_else(|error| panic!("the plane refused to open {request}: {error}"));
         request
+    }
+
+    /// Every request's live model, for a look ([`Folds::look`]).
+    pub fn folds(&mut self) -> &mut Folds {
+        &mut self.folds
+    }
+
+    /// The job of `request` ended, or the request was its job's and the job opened another:
+    /// its live model goes. A request no job looks at (a kept front end's store) goes as it
+    /// finishes.
+    pub fn forget(&mut self, request: RequestId) {
+        self.folds.by.remove(&request);
     }
 
     /// The nodes of `fresh` added to `request`, in one input to the plane, their thread tasks
@@ -1323,7 +1382,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
     fn outputs(&mut self, outputs: &mut Vec<PlaneOutput>) {
         for output in outputs.drain(..) {
             match output {
-                PlaneOutput::Said { record, .. } => {
+                PlaneOutput::Said { request, record } => {
+                    self.folds.said(request, record.at_ns, &record.event);
                     let Event::Moved { id, state } = record.event else { continue };
                     match state {
                         NodeState::Ready => self.admitting(NodeId(id)),

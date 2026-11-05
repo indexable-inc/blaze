@@ -10,6 +10,12 @@
 //! span ([`OpenSpan::node`]), never by its name. Downloads are the process's
 //! (`blaze_fetch::downloads`), which no request owns: a build that waits on nothing else
 //! while one is in flight is said to wait on it, as a cold build waits on its pinned LLVM.
+//!
+//! Each look also builds the build's live model ([`Doing::now`], [`Building::now`]): its plane
+//! request's [`blaze_protocol::now::Fold`] (fed every record the plane says of it,
+//! [`crate::serve::plane::Folds`]) looked at with its busy workers' open spans, the downloads,
+//! its stage's words and the daemon's memory. The strings above stay for a client that draws
+//! no view.
 
 use std::{fmt::Write as _, time::Duration};
 
@@ -20,8 +26,10 @@ use blaze_fetch::{
 };
 use blaze_graph::{RequestId, machine::NodeId};
 use blaze_profile::flight::{OpenSpan, ThreadNow};
+use blaze_protocol::now::{self, Fold, Now};
 
 use super::{Job, Jobs, Said, Stage, StageSaid, Steps, command_line, targets_of};
+use crate::serve::plane::Folds;
 
 /// How often a build's [`Response::Doing`] is said, and how long a build runs before its
 /// first: a warm build that ends within it says none.
@@ -45,13 +53,27 @@ pub struct Look<'a> {
     /// The worker pool's workers running a job's code, and the rest.
     pub busy: u32,
     pub idle: u32,
+    /// The worker pool's workers, busy or not (`blaze_graph::exec::shared().workers()`).
+    pub workers: u32,
+    /// `downloads` as the live model says them ([`fetching`]).
+    pub fetching: &'a [now::Download],
+    /// The daemon's memory now, the same for every build's model ([`memory`]).
+    pub memory: &'a now::Memory,
 }
 
 impl<S: Steps> Jobs<S> {
     /// One look at every build a client waits on: each due one ([`EVERY`] since its last, and
     /// running at least that long) said its [`Response::Doing`] into `said`, and every one
     /// put into `builds`, in the order the jobs started, for `blaze status`.
-    pub fn doing(&mut self, look: &Look<'_>, said: &mut Vec<Said>, builds: &mut Vec<Building>) {
+    ///
+    /// Each build's live model is its plane request's fold ([`Folds::look`]) looked at now.
+    pub fn doing(
+        &mut self,
+        look: &Look<'_>,
+        folds: &mut Folds,
+        said: &mut Vec<Said>,
+        builds: &mut Vec<Building>,
+    ) {
         for id in &self.order {
             let Some(job) = self.jobs.get_mut(super::key_of(*id)) else { continue };
             if job.idle || matches!(job.stage, Stage::Over) || targets_of(&job.work).is_none() {
@@ -60,14 +82,18 @@ impl<S: Steps> Jobs<S> {
             let seen = Seen::of(job, look);
             let for_ms = u64::try_from(look.now.saturating_sub(job.began).as_millis())
                 .unwrap_or(u64::MAX);
-            builds.push(seen.building(job, look, for_ms));
+            let model = seen.now(job, look, folds);
             let due = look.now.saturating_sub(job.began) >= EVERY
                 && job.doing_said.is_none_or(|at| look.now.saturating_sub(at) >= EVERY);
             if !due {
+                builds.push(seen.building(job, look, for_ms, model));
                 continue;
             }
             job.doing_said = Some(look.now);
+            // clone: the model, kept for `blaze status` and said to the client, once a second
+            builds.push(seen.building(job, look, for_ms, model.clone()));
             let doing = Doing {
+                now: model,
                 on: (!seen.compiling).then(|| seen.on(job, look)),
                 busy: look.busy,
                 idle: look.idle,
@@ -157,8 +183,63 @@ impl<'a> Seen<'a> {
         StageSaid(&job.stage).to_string() // alloc: a look, once a second while a build waits
     }
 
-    /// The job as `blaze status` lists it.
-    fn building<S: Steps>(&self, job: &Job<S>, look: &Look<'_>, for_ms: u64) -> Building {
+    /// The build's live model now: its plane request's fold looked at with its busy workers,
+    /// the downloads, its stage's words and the daemon's memory.
+    ///
+    /// A worker is a thread of the build whose innermost span is work, not a wait: the rule
+    /// [`Doing::running`] names a busy worker by, so a thread parked on what another computes
+    /// is not counted busy twice. Its task is the plane node of its `task` span
+    /// ([`OpenSpan::node`]), its spans those from its outermost of the build in.
+    ///
+    /// `closed` is 0: the flight recorder counts no spans closed per build that a look could
+    /// read without walking every ring's closed spans, so the model's quiet time counts from
+    /// the last task settled or download byte.
+    fn now<S: Steps>(&self, job: &Job<S>, look: &Look<'_>, folds: &mut Folds) -> Now {
+        let build = self.request.unwrap_or(0);
+        // alloc: a look, once a second while a build runs
+        let threads: Vec<now::Worker> = self
+            .threads
+            .iter()
+            .filter(|thread| thread.open.last().is_some_and(|span| span.awaits.is_none()))
+            .map(|thread| worker(thread, build))
+            .collect();
+        let stage = match &job.stage {
+            Stage::Units(_) => String::new(), // alloc: none, empty
+            stage => StageSaid(stage).to_string(), // alloc: a look, once a second
+        };
+        let model = now::Look {
+            workers: look.workers,
+            threads: &threads,
+            downloads: look.fetching,
+            stage: &stage,
+            closed: 0,
+            memory: look.memory,
+        };
+        match job.request {
+            Some(request) => folds.look(request, look.now, &model).unwrap_or_else(|| {
+                // The plane makes a request's fold as it opens and drops it only as its job
+                // ends, so a job looked at holds one: one missing is a daemon bug, said, and
+                // the build's model is of no task rather than of another's.
+                tracing::error!(
+                    target: "blaze",
+                    "the plane holds no live model of {request}, the request of `{}`, which is still under way",
+                    command_line(&job.work)
+                );
+                Fold::new().look(&model)
+            }),
+            // Before its plane request: no task yet, the build is starting.
+            None => Fold::new().look(&model),
+        }
+    }
+
+    /// The job as `blaze status` lists it, `now` its live model.
+    fn building<S: Steps>(
+        &self,
+        job: &Job<S>,
+        look: &Look<'_>,
+        for_ms: u64,
+        now: Now,
+    ) -> Building {
         let phase = match &job.stage {
             // alloc: a look, once a second while a build runs
             Stage::Units(build) => format!(
@@ -183,11 +264,70 @@ impl<'a> Seen<'a> {
         }
         Building {
             id: self.request.unwrap_or(0),
+            now,
             what: command_line(&job.work),
             phase,
             spans,
             for_ms,
         }
+    }
+}
+
+/// A thread of build `build` as the live model reads it: its name, the plane node of its
+/// `task` span, and its spans from its outermost of the build in.
+fn worker(thread: &ThreadNow, build: u32) -> now::Worker {
+    let outer = thread.open.iter().position(|span| span.build == build).unwrap_or(0);
+    let open = &thread.open[outer..];
+    now::Worker {
+        thread: thread.name.clone(), // alloc: a look, once a second
+        task: open.iter().find_map(|span| span.node),
+        open: open.iter().map(model_span).collect(), // alloc: a look, as above
+    }
+}
+
+/// An open span as the live model names it.
+fn model_span(span: &OpenSpan) -> now::Span {
+    // alloc: a look's spans, once a second, each owning its strings
+    now::Span {
+        name: span.name.to_owned(),
+        item: span.function.as_deref().map(str::to_owned),
+        krate: span.krate.as_deref().map(str::to_owned),
+        awaits: span.awaits.as_deref().map(str::to_owned),
+        for_ms: span.for_ns / 1_000_000,
+    }
+}
+
+/// Every download in flight as the live model says it, read once a look for every build.
+pub fn fetching(downloads: &[Shown]) -> Vec<now::Download> {
+    let ms = |it: Duration| u64::try_from(it.as_millis()).unwrap_or(u64::MAX);
+    downloads
+        .iter()
+        .map(|it| now::Download {
+            what: it.what.clone(), // alloc: a look, once a second, a handful
+            done: it.line.done,
+            total: it.line.total,
+            rate: it.line.rate.map(|rate| rate as u64),
+            idle_ms: ms(it.line.idle),
+            elapsed_ms: ms(it.line.elapsed),
+        })
+        .collect() // alloc: as above
+}
+
+/// The daemon's memory as every build's live model says it, read once a look: what blaze holds
+/// ([`blaze_graph::arena::own`], what `blaze status` says it holds), its limit (0 for none),
+/// and the subsystem over its share. `held_back` is 0: the plane says how many bytes held back
+/// a task for memory in its last dispatch ([`blaze_graph::Plane::short`]), not how many tasks
+/// it held back. `peak` and `releases` are the fold's to keep, and `releases` stays 0: a release
+/// runs inside a front end's writer (`serve::unit::release`), which reaches no build's fold.
+pub fn memory() -> now::Memory {
+    let limit = blaze_graph::admission::limit();
+    now::Memory {
+        held: blaze_graph::arena::own(),
+        peak: 0,
+        limit: if limit == u64::MAX { 0 } else { limit },
+        over: blaze_graph::admission::Pressure::now().over.map(|tag| tag.name().to_owned()), // alloc: a look, once a second
+        held_back: 0,
+        releases: 0,
     }
 }
 

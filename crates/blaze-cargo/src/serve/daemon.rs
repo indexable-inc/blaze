@@ -2038,7 +2038,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// What each build is doing, looked at once each [`doing::EVERY`] of the driver's clock
     /// while a job runs ([`Jobs::doing`]): said to its client as `Response::Doing`, and kept in
     /// `builds` for `blaze status`. Reads the plane's running nodes, the recorder's open spans
-    /// and the downloads in flight once for every build; blocks on nothing.
+    /// and the downloads in flight once for every build, and feeds each build's live model
+    /// (the plane's folds) what it found; blocks on nothing.
     fn doing(&mut self) {
         let now = self.driver.now();
         if now.saturating_sub(self.looked) < doing::EVERY {
@@ -2061,6 +2062,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         });
         let threads = blaze_profile::flight::threads_now();
         let downloads = blaze_fetch::downloads::Downloads::process().shown();
+        let fetching = doing::fetching(&downloads);
+        let memory = doing::memory();
         let pool = blaze_graph::exec::shared();
         let working = pool.working();
         let look = doing::Look {
@@ -2070,10 +2073,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             downloads: &downloads,
             busy: u32::try_from(working).unwrap_or(u32::MAX),
             idle: u32::try_from(pool.workers().saturating_sub(working)).unwrap_or(u32::MAX),
+            workers: u32::try_from(pool.workers()).unwrap_or(u32::MAX),
+            fetching: &fetching,
+            memory: &memory,
         };
         let mut said = self.spare.said.pop().unwrap_or_default();
         let mut builds = std::mem::take(&mut self.builds);
-        self.jobs.doing(&look, &mut said, &mut builds);
+        self.jobs.doing(&look, self.plane.folds(), &mut said, &mut builds);
         self.builds = builds;
         self.said(said);
     }
