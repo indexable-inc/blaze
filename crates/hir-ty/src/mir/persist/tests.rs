@@ -489,7 +489,7 @@ fn sample<'db>(db: &'db Db, it: &Items<'db>) -> MirBody<'db> {
         param_locals: vec![s, f],
         promoted_locals: vec![(bytes, idx(4))],
         closures: vec![it.closure, it.closure],
-        coroutine: Some(CoroutineLocals { poll, context }),
+        coroutine: Some(CoroutineLocals { poll, context, span: MirSpan::ExprId(idx(1)) }),
         unreached: vec![block(2)],
         scope_ends: vec![index, pair, s],
         inherits_overflow_checks: true,
