@@ -17,6 +17,7 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 | `Cargo.toml`, `Cargo.lock` | the workspace: every `harness*` directory below is a member |
 | `.cargo/config.toml` | `ZIG=scripts/zig` for libghostty-vt-sys's build |
 | `harness/` | the daemon and CLI |
+| `harness-proto/` | the one schema the daemon, every client and the chat logs speak: deterministic CBOR, frames, messages, chat events, the log format and its migration |
 | `harness-vt/` | terminal state through libghostty-vt (built by zig) |
 | `harness-ghostty-config/` | reads the user's Ghostty config |
 | `harness-native/` | the macOS app: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders |
@@ -31,3 +32,30 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 
 The daemon finds the TypeScript kernel at `$HARNESS_ROOT/src/mcp.ts`, by default `crates/harness/mcp`
 in the checkout it was built from. UI work: the `flecs-ui` skill (`.agents/skills/flecs-ui`).
+
+## Protocol and chat logs
+
+One versioned schema, `harness-proto` (its `SCHEMA`, now 1), covers the daemon socket and every chat
+log. There is no JSON path. Its encoding is deterministic CBOR (ciborium plus a canonicalizing pass:
+map keys sorted by encoded bytes, shortest integers and floats, definite lengths, integral floats
+written as integers), so Rust and the kernel write the same bytes for the same value.
+
+- Socket frames are `[type u8][len u32 BE][payload]`. `T_CBOR` (6) carries a message: `Up` from a
+  client, `Down` from the daemon. `T_EVENT` (7) carries a chat event. `T_DATA` (2) carries raw
+  terminal bytes. Any other type is refused by name.
+- Every connection opens with the client's `Up::Hello { schema }`. The daemon answers with
+  `Down::Hello { schema, pid }`, or with an error naming both versions, and then closes.
+- A chat's log is `objects/<id>/chat`: the magic `harness-chat/1\n`, then the `T_EVENT` frames the
+  socket carried, appended. Attaching replays those frames as they are, so the history is the same
+  bytes as the live feed. A torn last frame (a crash mid-append) is cut off at open and reported as
+  an error event.
+- An NDJSON log from before schema 1 is converted once, at daemon start: write `chat.migrating`,
+  fsync it, rename it over `chat`, fsync the directory, then set `meta.chat_log` in SQLite. The steps
+  come from `harness_proto::migrate::plan`, a sans-IO plan. Its test crashes at every step and checks
+  that every event survives exactly once, and planted bugs (a missing sync, marking first, trusting
+  the mark) must each fail it.
+- `harness log <id|s<n>|path>` prints a log as one JSON event per line. Bad records and a torn tail
+  go to stderr.
+- The kernel mirrors the types once, in `mcp/src/cbor.ts` and `mcp/src/wire.ts`.
+  `mcp/src/wire.test.ts` round-trips the crate's `fixtures/` byte for byte. The kernel's `sql`
+  decodes the logs into the `chat`, `chats` and `messages` views.
