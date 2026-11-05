@@ -426,6 +426,11 @@ function checkElements(source: string, shift: number, log: Splice[][]): string {
         throw fail(unknownPropError(name as keyof typeof PROPS, 'children', undefined, at));
       }
     }
+    // A Button's children are its label: words and {expressions}, never another element.
+    if (name === 'Button') {
+      const inner = ((node.fragment?.nodes ?? []) as Anything[]).find(kid => kid.type === 'RegularElement' || kid.type === 'Component' || kid.type === 'SvelteElement');
+      if (inner) throw fail(new TypeError(`<Button> holds <${inner.name ?? 'svelte:element'}> (${at}): a Button holds only its words, <Button>Save</Button> or label="Save"`));
+    }
     // The text values of its attributes, for the checks that read two together (a Chart's kind with its data).
     const known: Record<string, unknown> = {};
     for (const attribute of node.attributes as Anything[]) {

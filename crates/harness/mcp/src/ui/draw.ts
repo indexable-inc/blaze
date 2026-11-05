@@ -169,7 +169,7 @@ const INSTEAD: Readonly<Record<string, string>> = {
   b: 'Text bold', em: 'Text', i: 'Text', small: 'Text tone="muted"', h1: 'Text bold', h2: 'Text bold', h3: 'Text bold', h4: 'Text bold',
   h5: 'Text bold', h6: 'Text bold', hr: 'Divider', br: 'a new Text', pre: 'Code', code: 'Code', table: 'Table', tr: 'Table rows={...}',
   td: 'Table rows={...}', th: 'Table columns={...}', ul: 'Column of Text', ol: 'Column of Text', li: 'Text', img: 'nothing yet (no images)',
-  button: 'nothing yet (no inputs)', input: 'nothing yet (no inputs)', foreignObject: 'no HTML inside a drawing: words in an <svg> are <text x y>',
+  button: 'Button', input: 'Input (words), Slider or NumberField (a number), Checkbox or Toggle (on or off)', textarea: 'TextArea', select: 'Select', form: 'Column', foreignObject: 'no HTML inside a drawing: words in an <svg> are <text x y>',
   tspan: 'one <text> per run of words', defs: 'nothing: no gradients or patterns, colour is an ink', linearGradient: 'an ink: no gradients',
   radialGradient: 'an ink: no gradients', clipPath: 'nothing yet: no clipping', mask: 'nothing yet: no masks', use: 'the shape written again',
   title: 'tip="..." on the shape', image: 'nothing yet (no images)', marker: 'a small <path> at the line\'s end',

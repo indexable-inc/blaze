@@ -94,11 +94,43 @@ export interface CircleProps extends ShapeProps { cx: number; cy: number; r?: nu
 export interface LineProps extends ShapeProps { x1: number; y1: number; x2: number; y2: number }
 export interface PolylineProps extends ShapeProps { points: string | number[] | Array<[number, number]>; closed?: boolean }
 
+/**
+ * The controls. Each sends what the person did back to its handler (index.ts `dispatch`): a press is `onclick` (called with null), a
+ * change `onchange` (with the new value), Enter in an Input or Cmd+Enter in a TextArea `onsubmit` (with the text). The bindable one
+ * of each (`bind:value`, `bind:checked`, `bind:selected`) is written back first, then the handler runs. A control with neither a
+ * binding nor a handler only shows its value. On the wire (element.ts `controlWire`) a handler is its id as `onClick`, `onChange`,
+ * `onSubmit`, and defaults are filled in.
+ */
+/** A press. Its label is `label`, or the words between its tags (`<Button>Save</Button>`); its plate is plain unless `tone` says. */
+export interface ButtonProps { label?: string; tone?: 'accent' | 'error' | 'success' | 'warning' | 'muted'; disabled?: boolean; onclick?: Handle<null> }
+/** A switch, on or off. Binds `value`. */
+export interface ToggleProps { value?: boolean; label?: string; disabled?: boolean; onchange?: Handle<boolean> }
+/** A box ticked or not. Binds `checked`. */
+export interface CheckboxProps { checked?: boolean; label?: string; disabled?: boolean; onchange?: Handle<boolean> }
+/** A number dragged from `min` (0) to `max` (100), snapped to `step`. Binds `value` (`min` when not said). */
+export interface SliderProps { value?: number; min?: number; max?: number; step?: number; label?: string; disabled?: boolean; onchange?: Handle<number> }
+/** A number typed or stepped by `step` (1) within `min` and `max`. Binds `value` (`min`, else 0, when not said). */
+export interface NumberFieldProps { value?: number; min?: number; max?: number; step?: number; label?: string; disabled?: boolean; onchange?: Handle<number> }
+/** One line of words; `onchange` hears them while typing (at most every 150 ms) and on leaving, `onsubmit` on Enter. Binds `value`. */
+export interface InputProps { value?: string; placeholder?: string; label?: string; disabled?: boolean; onchange?: Handle<string>; onsubmit?: Handle<string> }
+/** Words over `lines` (3) lines; `onsubmit` on Cmd+Enter. Binds `value`. */
+export interface TextAreaProps { value?: string; placeholder?: string; lines?: number; disabled?: boolean; onchange?: Handle<string>; onsubmit?: Handle<string> }
+/** An option: words (its label and its value), or a label with any JSON value. At most 200 options. */
+export type ControlOption = string | number | { label: string; value?: unknown };
+/** A field that drops its options to pick one. Binds `selected` (the picked option's value, null when none). */
+export interface SelectProps { options: ControlOption[]; selected?: unknown; placeholder?: string; disabled?: boolean; onchange?: Handle }
+/** Options side by side as segments, one picked. Binds `selected`. */
+export interface ChoiceProps { options: ControlOption[]; selected?: unknown; disabled?: boolean; onchange?: Handle }
+/** Options each with its round mark, one picked, in a column (or a `row`). Binds `selected`. */
+export interface RadioProps { options: ControlOption[]; selected?: unknown; row?: boolean; disabled?: boolean; onchange?: Handle }
+
 /** Every built-in element's props, by element name. */
 export interface ElementProps {
   Column: ColumnProps; Row: RowProps; Text: TextProps; Markdown: MarkdownProps; Code: CodeProps; Table: TableProps;
   Badge: BadgeProps; Stat: StatProps; Card: CardProps; Divider: DividerProps; Spacer: SpacerProps; Chart: ChartProps;
   Canvas: CanvasProps; Group: GroupProps; Path: PathProps; Rect: RectProps; Circle: CircleProps; Line: LineProps; Polyline: PolylineProps;
+  Button: ButtonProps; Toggle: ToggleProps; Checkbox: CheckboxProps; Slider: SliderProps; NumberField: NumberFieldProps; Input: InputProps;
+  TextArea: TextAreaProps; Select: SelectProps; Choice: ChoiceProps; Radio: RadioProps;
 }
 
 /** True when ElementProps names exactly the elements element.ts draws; the constant under it fails to type-check otherwise. */

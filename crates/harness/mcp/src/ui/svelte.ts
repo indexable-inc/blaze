@@ -1,9 +1,10 @@
 import { createRequire } from 'node:module';
-import { AT, ELEMENT_NAMES, COMPONENT, ViewNode, cellError, isKnownElement } from './element.ts';
+import { AT, BINDABLE, ELEMENT_NAMES, COMPONENT, ViewNode, cellError, isKnownElement } from './element.ts';
 import type { CellComponent, Handler } from './element.ts';
 import { SVG_TAGS, attributeError, isSvgTag, unknownTagError } from './draw.ts';
 import { FAILED_SNIPPET, PENDING_SNIPPET, compileComponent } from './compile.ts';
 import { sveltePath } from './files.ts';
+import { ASK_SOURCE } from './ask.ts';
 
 /*
  * Svelte 5 for a cell's UI: runes (`$state`, `$derived`, `$effect`, `$props`) with fine-grained updates, rendering into `ViewNode`s
@@ -11,7 +12,7 @@ import { sveltePath } from './files.ts';
  * the object `renderer` below (createElement, insert, setAttribute, addEventListener, ...) wherever the browser's would call the DOM.
  * This file loads that Svelte, gives the renderer nodes to work on, and makes every element name a preloaded component. Copied
  * from den's repl/src/ui/svelte.ts (den's docs/ui-runtime.md says why Svelte and which Svelte: the custom renderer is a pull
- * request that has not landed), without den's transitions, bindings and own elements.
+ * request that has not landed), without den's transitions and own elements.
  *
  * Which svelte: the package's own `exports` map hands a server build to anything that does not set the `custom-renderer` (or
  * `browser`) condition, and a server build has no reactivity, so the UI would draw once and never move. The client build is
@@ -140,9 +141,22 @@ export function placed<E extends Error>(error: E, at: string | undefined): E {
 
 const components = new Map<string, CellComponent>();
 
-/** Svelte source for one element as a component: its props are the element's, reactive ones updating just that attribute. */
+/**
+ * Svelte source for one element as a component: its props are the element's, reactive ones updating just that attribute. A bindable
+ * control (element.ts `BINDABLE`) declares its bound prop `$bindable()` and always listens for `change`: the event's value is written
+ * back to the prop first (so `bind:value` follows the person, and a plain `value={x}` still moves under their hand), then the cell's
+ * own `onchange` runs. So a bound control always carries its `onChange` handler id. Copied from den's repl/src/ui/svelte.ts.
+ */
 export function hostSource(name: string): string {
-  return `<script>let { children, ...rest } = $props();</script><svelte:element this={${JSON.stringify(name)}} {...rest}>{@render children?.()}</svelte:element>`;
+  const bound = BINDABLE[name];
+  if (!bound) {
+    return `<script>let { children, ...rest } = $props();</script><svelte:element this={${JSON.stringify(name)}} {...rest}>{@render children?.()}</svelte:element>`;
+  }
+  return `<script>
+  let { ${bound} = $bindable(), onchange, children, ...rest } = $props();
+  const change = (v) => { ${bound} = v; return onchange?.(v); };
+</script>
+<svelte:element this={${JSON.stringify(name)}} ${bound}={${bound}} onchange={change} {...rest}>{@render children?.()}</svelte:element>`;
 }
 
 /** The component of a source Svelte compiled, as the preloaded runtime would evaluate it. */
@@ -252,6 +266,9 @@ export const OWN_SOURCES = {
   Root: `<script>let { body: Body, given, onerror, onloaded, settle: Settle } = $props();</script>
 <svelte:boundary {onerror}><Body {...given} /><Settle done={onloaded} />${PENDING_SNIPPET}${FAILED_SNIPPET}</svelte:boundary>`,
 };
+
+/** The question `ask` shows (ask.ts): its elements are handed to it as props when it is mounted (index.ts). */
+export const askComponent: CellComponent = lazy('Ask', ASK_SOURCE);
 
 const settle = lazy('Settle', OWN_SOURCES.Settle);
 const root = lazy('Root', OWN_SOURCES.Root);

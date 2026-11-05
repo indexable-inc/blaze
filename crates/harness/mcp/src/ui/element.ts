@@ -12,6 +12,8 @@ export const ELEMENT_NAMES = [
   'Column', 'Row', 'Text', 'Markdown', 'Code', 'Table', 'Badge', 'Stat', 'Card', 'Divider', 'Spacer',
   // Charts, and drawing: shapes in a Canvas's own coordinates, in the scene's inks (draw.ts maps SVG onto these).
   'Chart', 'Canvas', 'Group', 'Path', 'Rect', 'Circle', 'Line', 'Polyline',
+  // Controls: what the person presses, drags, types and picks; each sends its event back by handler id (index.ts `dispatch`).
+  'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio',
 ] as const;
 export type ElementName = typeof ELEMENT_NAMES[number];
 
@@ -51,6 +53,17 @@ export const PROPS: Record<ElementName, readonly string[]> = {
   Circle: ['cx', 'cy', 'r', 'rx', 'ry', ...SHAPE_PROPS],
   Line: ['x1', 'y1', 'x2', 'y2', ...SHAPE_PROPS],
   Polyline: ['points', 'closed', ...SHAPE_PROPS],
+  // The controls take exactly what the app reads of them (CONTROLS below says what goes on the wire), so no tip.
+  Button: ['label', 'tone', 'disabled', 'onclick', 'children'],
+  Toggle: ['value', 'label', 'disabled', 'onchange'],
+  Checkbox: ['checked', 'label', 'disabled', 'onchange'],
+  Slider: ['value', 'min', 'max', 'step', 'label', 'disabled', 'onchange'],
+  NumberField: ['value', 'min', 'max', 'step', 'label', 'disabled', 'onchange'],
+  Input: ['value', 'placeholder', 'label', 'disabled', 'onchange', 'onsubmit'],
+  TextArea: ['value', 'placeholder', 'lines', 'disabled', 'onchange', 'onsubmit'],
+  Select: ['options', 'selected', 'placeholder', 'disabled', 'onchange'],
+  Choice: ['options', 'selected', 'disabled', 'onchange'],
+  Radio: ['options', 'selected', 'row', 'disabled', 'onchange'],
 };
 /** The props only a Text inside a Canvas reads. */
 export const CANVAS_TEXT_PROPS: ReadonlySet<string> = new Set(['x', 'y', 'anchor', 'size', 'fill']);
@@ -72,6 +85,12 @@ export const CHART_KINDS = ['bar', 'line', 'pie', 'donut', 'area', 'scatter', 's
 /** The most series a Chart draws, and the most points in one. */
 export const MAX_SERIES = 8;
 export const MAX_POINTS = 2000;
+/** The most options a Select, Choice or Radio offers, the longest label a control or an option shows, and the most lines a TextArea is tall. */
+export const MAX_OPTIONS = 200;
+export const MAX_LABEL = 200;
+export const MAX_LINES = 40;
+/** The tones a Button takes: its plate is plain when none is said. */
+export const BUTTON_TONES = ['accent', 'error', 'success', 'warning', 'muted'] as const;
 
 const said = (v: unknown): string => typeof v === 'string' || (typeof v === 'object' && v !== null) ? JSON.stringify(v) : String(v);
 /** `name=value` as markup would say it: `fill="#fff"`, `width={-2}`. */
@@ -116,14 +135,31 @@ export function tableError(columns: unknown, rows: unknown, where?: string): Typ
   return undefined;
 }
 
-/** The error for `bind:<name>` on one of the app's elements: none takes a binding yet (there are no inputs). */
+/**
+ * What a bindable element is: `<Slider bind:value={v}>` is the value the person sets, `<Choice bind:selected={s}>` the one they pick.
+ * Its change event writes the prop back (svelte.ts `hostSource`), then the cell's own `onchange` runs, so a binding follows the person
+ * and a plain `value={x}` still shows what is written. Copied from den's repl/src/ui/element.ts, cut to the app's controls.
+ */
+export const BINDABLE: Partial<Record<string, string>> = {
+  Input: 'value', Slider: 'value', Toggle: 'value', NumberField: 'value', TextArea: 'value', Checkbox: 'checked',
+  Choice: 'selected', Radio: 'selected', Select: 'selected',
+};
+
+/**
+ * The error for `bind:<name>` on the element `element` when it binds nothing, or undefined when it is the element's binding (or
+ * `bind:this`); `where` is the cell's line. Svelte passes any other name on as a prop no element reads, and nothing writes it back,
+ * so the variable would never follow the person.
+ */
 export function bindError(element: string, name: string, where?: string): TypeError | undefined {
-  if (name === 'this') return undefined;
-  return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: the harness app's elements show values and take no input yet`);
+  const bound = BINDABLE[element];
+  if (name === 'this' || name === bound) return undefined;
+  if (bound) return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: a ${element}'s binding is bind:${bound}={...}`);
+  const takers = Object.entries(BINDABLE).map(([el, prop]) => `${el} (bind:${prop})`).join(', ');
+  return new TypeError(`bind:${name} on <${element}> binds nothing${at(where)}: only ${takers} take a binding; pass ${name}={...} and an on-handler instead`);
 }
 
 /** The props whose value children text becomes: `<Text>hi</Text>` is `{text: 'hi'}`. */
-export const TEXT_PROP: Partial<Record<string, string>> = { Text: 'text', Badge: 'text', Code: 'text', Markdown: 'text' };
+export const TEXT_PROP: Partial<Record<string, string>> = { Text: 'text', Badge: 'text', Code: 'text', Markdown: 'text', Button: 'label' };
 
 const article = (word: string) => /^[AEIOU]/.test(word) ? 'an' : 'a';
 const squash = (name: string) => name.toLowerCase().replace(/[-_:]/g, '');
@@ -162,6 +198,41 @@ export const numbers = (v: unknown): number[] | undefined => typeof v === 'strin
 const affine: Rule = v => typeof v === 'string' || (Array.isArray(v) && v.length === 6 && v.every(numeric)) ? undefined
   : `an SVG transform, "translate(10 20) rotate(45)", or six numbers [a, b, c, d, e, f]`;
 
+const label: Rule = v => (typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v))) && String(v).length <= MAX_LABEL ? undefined : `words (a string) of at most ${MAX_LABEL} characters`;
+const text: Rule = v => typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)) ? undefined : 'words (a string)';
+const positive: Rule = v => numeric(v) && asNumber(v) > 0 ? undefined : 'a number above 0';
+const lines: Rule = v => numeric(v) && Number.isInteger(asNumber(v)) && asNumber(v) >= 1 && asNumber(v) <= MAX_LINES ? undefined : `a whole number of lines, 1 to ${MAX_LINES}`;
+
+/** One option of a Select, Choice or Radio as the app reads it. */
+export interface WireOption { label: string; value: unknown }
+
+/** The problem with `option` as an option (index `i`), or the option as the app reads it: words are both its label and its value. */
+function optionOf(option: unknown, i: number): WireOption | string {
+  if (typeof option === 'string' || (typeof option === 'number' && Number.isFinite(option))) {
+    return String(option).length <= MAX_LABEL ? { label: String(option), value: option } : `options[${i}] is longer than ${MAX_LABEL} characters`;
+  }
+  if (typeof option !== 'object' || option === null || Array.isArray(option)) return `options[${i}] is ${said(option)}: an option is words or {label, value}`;
+  const o = option as Record<string, unknown>;
+  const stray = Object.keys(o).find(key => key !== 'label' && key !== 'value');
+  if (stray) return `options[${i}] has ${JSON.stringify(stray)}: an option is words or {label, value}`;
+  if (typeof o.label !== 'string' || o.label.length > MAX_LABEL) return `options[${i}] has label ${said(o.label)}: an option's label is words of at most ${MAX_LABEL} characters`;
+  return { label: o.label, value: 'value' in o && o.value !== undefined ? o.value : o.label };
+}
+
+/** The problem with a Select's, Choice's or Radio's `options`, or the options as the app reads them. */
+export function optionsOf(value: unknown): WireOption[] | string {
+  if (!Array.isArray(value)) return `a list of options, each words or {label, value}: options={['small', 'large']}`;
+  if (value.length > MAX_OPTIONS) return `at most ${MAX_OPTIONS} options (it has ${value.length}): narrow them first, or show them as a Table`;
+  const out: WireOption[] = [];
+  for (const [i, option] of value.entries()) {
+    const one = optionOf(option, i);
+    if (typeof one === 'string') return `a list of options: ${one}`;
+    out.push(one);
+  }
+  return out;
+}
+const options: Rule = v => { const o = optionsOf(v); return typeof o === 'string' ? o : undefined; };
+
 /** What each prop must be, on every element; a prop not here (and not in `ELEMENT_RULES`) is not checked beyond being one it reads. */
 const COMMON_RULES: Record<string, Rule> = { gap: size, pad: size, size, width: size, height: size, tip: words };
 
@@ -193,7 +264,97 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
     ...SHAPE_RULES, closed: flag,
     points: v => { const n = numbers(v); return n && n.length % 2 === 0 && n.every(Number.isFinite) ? undefined : `points as x,y pairs: [[0, 0], [10, 5]], [0, 0, 10, 5] or "0,0 10,5"`; },
   },
+  Button: { label, tone: v => v === '' ? undefined : oneOf(BUTTON_TONES)(v), disabled: flag },
+  Toggle: { value: flag, label, disabled: flag },
+  Checkbox: { checked: flag, label, disabled: flag },
+  Slider: { value: number, min: number, max: number, step: positive, label, disabled: flag },
+  NumberField: { value: number, min: number, max: number, step: positive, label, disabled: flag },
+  Input: { value: text, placeholder: label, label, disabled: flag },
+  TextArea: { value: text, placeholder: label, lines, disabled: flag },
+  Select: { options, placeholder: label, disabled: flag },
+  Choice: { options, disabled: flag },
+  Radio: { options, row: flag, disabled: flag },
 };
+
+/** The controls: each goes to the app as exactly the props `controlWire` gives it. */
+export const CONTROLS: ReadonlySet<string> = new Set(['Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio']);
+
+/**
+ * A control's props as the app reads them (the harness app's genui controls are written from this exact shape), once all are known:
+ * defaults filled in, words that are numbers made numbers, options as `{label, value}`, and its handler ids as `onClick`, `onChange`
+ * and `onSubmit`. Throws the error naming what is wrong (a Button with no label, a Slider whose min is not below its max) at `where`.
+ */
+export function controlWire(element: string, props: Record<string, unknown>, where?: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const given = (name: string) => props[name] !== undefined && props[name] !== null && props[name] !== '';
+  const put = (...names: string[]) => { for (const name of names) if (given(name)) out[name] = props[name]; };
+  const num = (name: string): number | undefined => given(name) ? asNumber(props[name]) : undefined;
+  const fail = (problem: string, hint?: string) => new TypeError(`<${element}> ${problem}${at(where)}${hint ? `: ${hint}` : ''}`);
+  switch (element) {
+    case 'Button': {
+      if (!given('label') || String(props.label).trim() === '') throw fail('has no label', 'say label="Save", or write its words between its tags, <Button>Save</Button>');
+      const words = String(props.label);
+      if (words.length > MAX_LABEL) throw fail(`has a label of ${words.length} characters; a Button's is at most ${MAX_LABEL}`);
+      out.label = words;
+      put('tone', 'disabled', 'onClick');
+      break;
+    }
+    case 'Toggle':
+      out.value = props.value === true;
+      put('label', 'disabled', 'onChange');
+      break;
+    case 'Checkbox':
+      out.checked = props.checked === true;
+      put('label', 'disabled', 'onChange');
+      break;
+    case 'Slider': {
+      const min = num('min') ?? 0;
+      const max = num('max') ?? 100;
+      if (!(min < max)) throw fail(`has min=${min} and max=${max}`, `a Slider's min is below its max (0 and 100 when not said)`);
+      out.value = num('value') ?? min;
+      out.min = min;
+      out.max = max;
+      if (given('step')) out.step = num('step');
+      put('label', 'disabled', 'onChange');
+      break;
+    }
+    case 'NumberField': {
+      const min = num('min');
+      const max = num('max');
+      if (min !== undefined && max !== undefined && min > max) throw fail(`has min=${min} and max=${max}`, 'its min is at most its max');
+      out.value = num('value') ?? min ?? 0;
+      if (min !== undefined) out.min = min;
+      if (max !== undefined) out.max = max;
+      out.step = num('step') ?? 1;
+      put('label', 'disabled', 'onChange');
+      break;
+    }
+    case 'Input':
+    case 'TextArea':
+      out.value = given('value') ? String(props.value) : '';
+      put('placeholder');
+      if (element === 'Input') put('label');
+      else out.lines = num('lines') ?? 3;
+      put('disabled', 'onChange', 'onSubmit');
+      break;
+    case 'Select':
+    case 'Choice':
+    case 'Radio': {
+      if (!given('options')) throw fail('has no options', `options={['small', 'large']} (words, or {label, value})`);
+      const list = optionsOf(props.options);
+      if (typeof list === 'string') throw fail(`options are not ${list}`);
+      out.options = list;
+      out.selected = props.selected ?? null;
+      if (element === 'Select') put('placeholder');
+      if (element === 'Radio') put('row');
+      put('disabled', 'onChange');
+      break;
+    }
+    default:
+      throw new Error(`controlWire: <${element}> is not a control`);
+  }
+  return out;
+}
 
 const ruleFor = (element: string, name: string): Rule | undefined => ELEMENT_RULES[element as ElementName]?.[name] ?? COMMON_RULES[name];
 
@@ -220,7 +381,7 @@ export function propError(element: string, name: string, value: unknown, where?:
 export function wireValue(element: string, name: string, value: unknown): unknown {
   const rule = ruleFor(element, name);
   if (typeof value !== 'string' || !rule) return value;
-  if ((rule === number || rule === share || rule === size) && numeric(value)) return asNumber(value);
+  if ((rule === number || rule === share || rule === size || rule === positive || rule === lines) && numeric(value)) return asNumber(value);
   if (rule === flag) return value === 'true';
   return value;
 }
@@ -299,7 +460,7 @@ export function wholeChartError(props: Record<string, unknown>, where?: string):
  */
 export function checkProp(element: ElementName, name: string, value: unknown, where?: string, props: Record<string, unknown> = {}): TypeError | undefined {
   if (!PROPS[element].includes(name)) return unknownPropError(element, name, value, where);
-  if (name === 'tone') return toneError(element, value, where);
+  if (name === 'tone' && element !== 'Button') return toneError(element, value, where);
   if (element === 'Table' && (name === 'columns' || name === 'rows')) return tableError(name === 'columns' ? value : props.columns, name === 'rows' ? value : props.rows, where);
   if (element === 'Chart' && (name === 'data' || name === 'series')) return chartError(name, value, props, where);
   return propError(element, name, value, where);
