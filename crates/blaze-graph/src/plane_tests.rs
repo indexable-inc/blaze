@@ -898,6 +898,38 @@ fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
     assert_eq!(runs(&built(&mut plane, 2)), [3]);
 }
 
+/// Under a pressure cap the budget is held at the cap: tasks start only within it, none starts
+/// alone past it, a task too big is still judged against the configured budget, and lifting
+/// the cap starts what waited for it.
+#[test]
+fn under_a_pressure_cap_nothing_starts_past_it() {
+    let config = PlaneConfig { budget: budget(10), starve_after: 100, ..config(1, 4) };
+    let mut plane = Plane::new(config).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
+    plane.step(PlaneInput::Cap { at_ns: 0, bytes: Some(6) }).unwrap();
+    // 6 capped, 4 held: 2 free. Nothing granted, yet 3 does not start alone; 2 fits.
+    let out = add(
+        &mut plane,
+        1,
+        vec![node(1, &[], Pool::Work, 100, None, 3), node(2, &[], Pool::Work, 10, None, 2)],
+    );
+    assert_eq!(runs(&out), [2]);
+    assert_eq!(plane.short(), 1, "of the 4 held besides, 1 let go makes room for 3");
+    // Released down to 1: 6 capped less 2 granted is 4 free, and 3 starts within the cap.
+    let out = plane.step(PlaneInput::Held { at_ns: 0, bytes: 1 }).unwrap();
+    assert_eq!(runs(&out), [1]);
+    // 8 fits the configured 10, never the cap, and is not refused for it.
+    let out = add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 8)]);
+    assert!(runs(&out).is_empty(), "{out:?}");
+    assert_eq!(plane.state(NodeId(3)), Some(&NodeState::Ready));
+    built(&mut plane, 1);
+    built(&mut plane, 2);
+    // Nothing granted, 8 over the cap: it waits until the pressure passes.
+    let out = plane.step(PlaneInput::Cap { at_ns: 0, bytes: None }).unwrap();
+    assert_eq!(runs(&out), [3]);
+}
+
 /// A task passed over for memory `starve_after` times holds back every task with memory, of
 /// any pool, until it fits, and then starts before the smaller ones behind it.
 #[test]
@@ -1491,6 +1523,9 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
         };
     let mut at = 0u64;
     let mut steps = 0u64;
+    // Whether a pressure cap is on ([`PlaneInput::Cap`]): under one, nothing running is no
+    // stall but the pause it asks for, until it is lifted.
+    let mut capped = false;
     loop {
         let all_over = planned
             .iter()
@@ -1514,9 +1549,18 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             driver.act(Act::Cancel(at, RequestId(r)), next_id)
         } else if roll < 8 && budget.is_some() {
             let budget = budget.unwrap_or(0);
-            let bytes =
-                if random.one_in(10) { random.below(budget * 2) } else { random.below(budget / 3) };
-            driver.act(Act::Step(PlaneInput::Held { at_ns: at, bytes }), next_id)
+            if random.one_in(5) {
+                capped = !capped;
+                let bytes = capped.then(|| random.below(budget + budget / 4));
+                driver.act(Act::Step(PlaneInput::Cap { at_ns: at, bytes }), next_id)
+            } else {
+                let bytes = if random.one_in(10) {
+                    random.below(budget * 2)
+                } else {
+                    random.below(budget / 3)
+                };
+                driver.act(Act::Step(PlaneInput::Held { at_ns: at, bytes }), next_id)
+            }
         } else if roll < 10 && !model.db.lock().is_empty() {
             let dropped = {
                 let db = model.db.lock();
@@ -1579,6 +1623,10 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
                     planned[r].closed = true;
                     driver.act(Act::Step(PlaneInput::Close { at_ns: at, request }), next_id)
                 }
+            } else if capped && model.running.is_empty() {
+                // The pressure passes: what waited for it starts.
+                capped = false;
+                driver.act(Act::Step(PlaneInput::Cap { at_ns: at, bytes: None }), next_id)
             } else {
                 assert!(
                     !model.running.is_empty(),

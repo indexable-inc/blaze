@@ -69,6 +69,21 @@ const SPARE_WATCHES: usize = 64;
 /// Tags watched, spawned or listening at once that the maps hold before they grow.
 const TAGS: usize = 256;
 
+/// The kernel's filter of memory pressure (`<sys/event_private.h>`, private, rule
+/// macos-private-apis): libdispatch's `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` is a knote of it,
+/// on a dispatch queue's thread of its own. Registered on the driver's own kqueue, the
+/// pressure comes as one more event of the wait the loop already makes, with no thread, no
+/// queue and no hand-back through a channel. `EVFILT_VM` with `NOTE_VM_PRESSURE`, the public
+/// header's, is no filter any more: XNU's table maps it to `bad_filtops`
+/// (`bsd/kern/kern_event.c`), so a registration of it fails. Any process may register this
+/// one: `memorystatus_knote_register` (`bsd/kern/kern_memorystatus_notify.c`) checks only
+/// that the flags asked are userspace's.
+const EVFILT_MEMORYSTATUS: i16 = -14;
+/// The system's pressure has changed to its warning level.
+const NOTE_MEMORYSTATUS_PRESSURE_WARN: u32 = 0x0000_0002;
+/// The system's pressure has changed to its critical level.
+const NOTE_MEMORYSTATUS_PRESSURE_CRITICAL: u32 = 0x0000_0004;
+
 /// `struct kevent` as the system lays it out (`<sys/event.h>` packs it to 4), with `udata` the
 /// driver's handle, so the lists of changes and events are plain data of the driver's own.
 #[repr(C, packed(4))]
@@ -181,6 +196,8 @@ enum Owner {
     Connecting(ConnectId),
     Read(ConnId),
     Write(ConnId),
+    /// The [`Effect::Pressure`] of this tag: its `EVFILT_MEMORYSTATUS` knote.
+    Pressure(Tag),
 }
 
 /// What each registration's `udata` names. Ids are handles' bits: one of a registration that
@@ -319,6 +336,9 @@ pub struct Kqueue {
     conns: Slab<Connection>,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
+    /// The [`Effect::Pressure`] in flight and its registration's id: one a kqueue, since the
+    /// kernel keys a knote by its filter and ident, and a second `EV_ADD` would take the first's.
+    pressure: Option<(Tag, u64)>,
     in_flight: usize,
     /// What the watches' callbacks allocated beyond their payloads, as each watch stopped.
     #[cfg(test)]
@@ -404,6 +424,7 @@ impl Kqueue {
             connecting: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
             conns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
             locks: crate::locks::Locks::new(),
+            pressure: None,
             in_flight: 0,
             #[cfg(test)]
             watch_overhead: 0,
@@ -535,6 +556,23 @@ impl Kqueue {
                 Ok(())
             }
             Effect::Hangup { conn, tag } => self.hangup(conn, tag),
+            Effect::Pressure { tag } => {
+                if let Some((watching, _)) = self.pressure {
+                    return Err(io::Error::other(format!(
+                        "memory pressure is watched as {watching:?} already, and a kqueue has one \
+                         knote of EVFILT_MEMORYSTATUS"
+                    ))); // alloc: an error path.
+                }
+                let id = self.register(
+                    Owner::Pressure(tag),
+                    0,
+                    EVFILT_MEMORYSTATUS,
+                    libc::EV_ADD | libc::EV_CLEAR,
+                    NOTE_MEMORYSTATUS_PRESSURE_WARN | NOTE_MEMORYSTATUS_PRESSURE_CRITICAL,
+                );
+                self.pressure = Some((tag, id));
+                Ok(())
+            }
             Effect::Kill { .. } | Effect::Unwatch { .. } | Effect::Unlisten { .. } => {
                 unreachable!("taken where they are submitted")
             }
@@ -1084,6 +1122,10 @@ impl Kqueue {
             }
             Owner::Read(conn) => self.serve_recvs(conn),
             Owner::Write(conn) => self.serve_sends(conn),
+            Owner::Pressure(tag) => {
+                let critical = event.fflags & NOTE_MEMORYSTATUS_PRESSURE_CRITICAL != 0;
+                self.ready.push(Completion { tag, done: Done::Pressed { critical } });
+            }
         }
     }
 
@@ -1151,6 +1193,16 @@ impl Kqueue {
                 }
                 self.serve_sends(conn);
             }
+            Owner::Pressure(tag) => {
+                self.disown(id);
+                self.pressure = None;
+                // alloc: an error path.
+                let done = Done::Failed(IoError(format!(
+                    "watching the system's memory pressure (a kqueue knote of \
+                     EVFILT_MEMORYSTATUS): {error}"
+                )));
+                self.ready.push(Completion { tag, done });
+            }
         }
     }
 
@@ -1209,6 +1261,14 @@ impl Driver for Kqueue {
                     if let Some(spawned) = spawn {
                         process::kill(spawned.pid);
                     }
+                }
+                // Its knote deleted with the next wait; an event of it already taken is told
+                // before this end, and one in that wait's list names no owner, so is dropped.
+                Effect::Unwatch { tag } if self.pressure.is_some_and(|(it, _)| it == tag) => {
+                    let (_, id) = self.pressure.take().expect("matched above");
+                    self.disown(id);
+                    self.change(0, EVFILT_MEMORYSTATUS, libc::EV_DELETE, 0, 0, id);
+                    self.ready.push(Completion { tag, done: Done::Unwatched });
                 }
                 // Its end after every change it told, which `retire` moves to `ready` first.
                 Effect::Unwatch { tag } => match self.watch_tags.remove(&tag) {
@@ -1273,7 +1333,10 @@ impl Driver for Kqueue {
             .filter(|it| {
                 !matches!(
                     it.done,
-                    Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                    Done::Changed { .. }
+                        | Done::Journaled(_)
+                        | Done::Accepted { .. }
+                        | Done::Pressed { .. }
                 )
             })
             .count();
@@ -1661,6 +1724,28 @@ mod tests {
         );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `EVFILT_MEMORYSTATUS` is private (rule macos-private-apis): its knote is registered on
+    /// this macOS and taken, or this fails naming it. Then its watch ends as asked.
+    #[test]
+    fn the_memory_pressure_filter_is_there() {
+        let mut driver = Kqueue::new(dir("pressure"), 1).unwrap();
+        driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
+        let mut out = Vec::new();
+        // The registration is made with this wait; a refusal comes back as its event.
+        driver.poll(&mut out, Duration::from_millis(20));
+        assert!(
+            out.iter().all(|it| matches!(it.done, Done::Pressed { .. })),
+            "the kernel refused a knote of EVFILT_MEMORYSTATUS (-14), the filter of \
+             DISPATCH_SOURCE_TYPE_MEMORYPRESSURE: {out:?}"
+        );
+        assert_eq!(driver.in_flight(), 1, "the watch stays in flight");
+        out.clear();
+        driver.submit(&mut vec![Effect::Unwatch { tag: Tag(1) }]);
+        poll_for(&mut driver, &mut out, 1);
+        assert!(matches!(out.last().map(|it| &it.done), Some(Done::Unwatched)), "{out:?}");
+        assert_eq!(driver.in_flight(), 0);
     }
 
     #[test]

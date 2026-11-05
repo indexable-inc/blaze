@@ -220,16 +220,32 @@ are its driver. A daemon that cannot open or lock the ledger stops with an error
   ceiling, as a typed failure (`the daemon (pid N) was stopped at its memory ceiling of 48
   GiB`), never a bare hang-up.
 
-**Pressure.** The system says before a budget can:
-- macOS: a `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` source (warn, critical).
-- Linux: a PSI trigger on `/proc/pressure/memory` (`some 150000 1000000`), or the cgroup's
-  `memory.pressure` where one is delegated.
+**Pressure.** The system says before a budget can (`blaze_core::Effect::Pressure`, one more
+event of the driver's own wait, no thread):
+- macOS: a kqueue knote of `EVFILT_MEMORYSTATUS` (warn, critical), the private filter
+  `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` is made of; the public `EVFILT_VM` is `bad_filtops` in
+  XNU now.
+- Linux: a PSI trigger, `some 300000 2000000` (15% of a 2 s window: a process without
+  `CAP_SYS_RESOURCE` may arm only whole multiples of 2 s, Linux 6.5+), on the daemon's cgroup's
+  `memory.pressure` where the memory controller is delegated to it, else on
+  `/proc/pressure/memory`, polled through the ring for `POLLPRI`.
+- Where there is none (no PSI, a kernel before 6.5, Windows for now), the daemon says so once in
+  its log and admits by its budget alone.
 
 Either event makes the daemon act as at the soft ceiling now: no admission, release, give
-back. It keeps its allowance at what it holds until 10 s pass with no event.
+back. It keeps its allowance at what it holds until 10 s pass with no event
+(`blaze_graph::pressure::Pressured`, a sans-IO core). The plane takes it as
+`PlaneInput::Cap`; its budget is `min(allowance, cap)` (`blaze_graph::pressure::budget_under`,
+`Plane::budget_now`, the one join), every admission decision reads that, and under a cap no
+task starts alone (waiting does make room there). A task is refused as too big only against the
+allowance, never the cap. The front ends are asked for a release at the first event of a run
+and once each 10 s of it after.
 
-**What the client is told.** A build held back for memory for more than a second prints, once,
-then again when it changes:
+**What the client is told.** A build held back for memory for more than a second (a task of it
+ready, a thread of its pool free, and no room: `Plane::waits_for_memory`) is told, as a note
+(`Response::Diagnostic` of `Diagnostic::note`, no new protocol), once, then again when what the
+daemon holds moves by more than a 64th of the budget or the tasks it waits on change, and
+`build resumed` once none of it is held back (`blaze_graph::pressure::Paused`):
 `build paused: daemon at 47.9 of 48 GiB (machine 96 GiB, 40.1 held by pid 4242 of
 /Users/a/.blaze), waiting on 3 tasks: codegen of hir-ty, ...`. It names what waits, on what,
 and who holds the rest.

@@ -110,6 +110,8 @@ pub(crate) struct Plane<M = NoMemo> {
     running: [usize; 2],
     granted: u64,
     held: u64,
+    /// The pressure cap on the budget ([`PlaneInput::Cap`]).
+    cap: Option<u64>,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests.
@@ -171,6 +173,7 @@ impl<M: Memo> Plane<M> {
             running: [0; 2],
             granted: 0,
             held: 0,
+            cap: None,
             vclock: [0; 2],
             idle_vclock: [0; 2],
             idle_running: Vec::new(),
@@ -358,6 +361,7 @@ impl<M: Memo> Plane<M> {
                 touched.push(r);
             }
             PlaneInput::Held { bytes, .. } => self.held = bytes,
+            PlaneInput::Cap { bytes, .. } => self.cap = bytes,
             PlaneInput::Promote { request, .. } => {
                 if let Some(&r) = self.request_index.get(&request)
                     && self.requests[r].idle
@@ -944,9 +948,14 @@ impl<M: Memo> Plane<M> {
         }
     }
 
+    /// The configured budget, held to the pressure cap while there is one.
+    fn budget_now(&self) -> Option<u64> {
+        let budget = self.config.budget.as_ref()?.bytes;
+        Some(self.cap.map_or(budget, |cap| budget.min(cap)))
+    }
+
     fn memory_free(&self) -> Option<u64> {
-        let budget = self.config.budget.as_ref()?;
-        Some(budget.bytes.saturating_sub(self.granted.max(self.held)))
+        Some(self.budget_now()?.saturating_sub(self.granted.max(self.held)))
     }
 
     /// The task that holds back the others, while it is still to start and wanted by a
@@ -1012,12 +1021,12 @@ impl<M: Memo> Plane<M> {
         let pool = if p == 0 { Pool::Io } else { Pool::Work };
         let mut thread = self.running[p] - self.yielding[p] >= self.threads(pool);
         let mut memory = 0;
-        if let Some(budget) = &self.config.budget {
+        if let Some(budget) = self.budget_now() {
             let needs = self.tasks[wants].memory;
-            if needs > budget.bytes.saturating_sub(self.held) {
+            if needs > budget.saturating_sub(self.held) {
                 return false;
             }
-            memory = (self.granted - self.yielding_memory).saturating_sub(budget.bytes - needs);
+            memory = (self.granted - self.yielding_memory).saturating_sub(budget - needs);
         }
         if !thread && memory == 0 {
             return true;
@@ -1109,9 +1118,10 @@ impl<M: Memo> Plane<M> {
             };
         };
         // A task that fits the budget starts once nothing granted memory runs, whatever the
-        // process holds besides: waiting could never make room for it.
-        let whole = self.config.budget.as_ref().expect("a budget").bytes;
-        let alone = self.granted == 0;
+        // process holds besides: waiting could never make room for it. Under pressure it
+        // could, so none does.
+        let whole = self.budget_now().expect("a budget");
+        let alone = self.granted == 0 && self.cap.is_none();
         let hold = self.hold();
         let counts = !self.requests[r].idle;
         for &(_, _, me) in &self.requests[r].ready[p] {

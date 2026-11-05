@@ -1019,6 +1019,13 @@ impl Iocp {
                 Ok(())
             }
             Effect::Hangup { conn, tag } => self.hangup(conn, tag),
+            // Not yet: `CreateMemoryResourceNotification` is the source to wait on here. Until
+            // then it ends at once, naming why, and the daemon runs without it.
+            Effect::Pressure { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the IOCP driver watches no memory pressure yet \
+                 (CreateMemoryResourceNotification is not waited on)",
+            )),
             Effect::Kill { .. } | Effect::Unwatch { .. } | Effect::Unlisten { .. } => {
                 unreachable!("taken where they are submitted")
             }

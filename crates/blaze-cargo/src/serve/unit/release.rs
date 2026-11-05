@@ -405,6 +405,15 @@ impl<K: Copy + Eq + Hash> Release<K> {
         }
     }
 
+    /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): a
+    /// release is due now, past [`Squeeze`]'s step, which counts only this daemon's growth. The
+    /// daemon asks at most once per [`blaze_graph::pressure::HOLD_NS`] of a run of events
+    /// ([`blaze_graph::pressure::Pressured::pressed`]), so a long run does not sweep the front
+    /// end over and over.
+    pub(crate) fn pressed(&mut self) {
+        self.pressed = true;
+    }
+
     /// The build is over and its front end is about to be kept, no reader alive: the next
     /// release lets go of every MIR, of a check as of any build, under any limit or none. What
     /// a build made of MIR is the build's: kept, it is only what the next build would verify

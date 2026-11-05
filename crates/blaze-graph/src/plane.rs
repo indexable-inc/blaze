@@ -228,6 +228,14 @@ pub enum PlaneInput {
     },
     /// The bytes the process holds now, measured.
     Held { at_ns: u64, bytes: u64 },
+    /// The most the budget may be while the system says memory is short (docs/memory-budget.md
+    /// section 7, "Pressure"; [`crate::pressure::Pressured::cap`]); `None` once it no longer
+    /// does. While there is one the budget is the least of it and [`PlaneConfig::budget`]
+    /// ([`crate::pressure::budget_under`]), and a task no longer starts alone past it: under
+    /// pressure waiting does make room, as the system or the releases give memory back. What a
+    /// task is refused for being too big ([`PlaneOutput`]'s failure of one over the budget)
+    /// is still against the configured budget, never the cap, which passes.
+    Cap { at_ns: u64, bytes: Option<u64> },
 }
 
 impl PlaneInput {
@@ -239,6 +247,7 @@ impl PlaneInput {
             | PlaneInput::Close { at_ns, .. }
             | PlaneInput::Done { at_ns, .. }
             | PlaneInput::Held { at_ns, .. }
+            | PlaneInput::Cap { at_ns, .. }
             | PlaneInput::Promote { at_ns, .. }
             | PlaneInput::Yielded { at_ns, .. } => *at_ns,
         }
@@ -999,6 +1008,9 @@ pub struct Plane<M = NoMemo> {
     running: [usize; 2],
     granted: u64,
     held: u64,
+    /// The pressure cap on the budget, from [`PlaneInput::Cap`]; `None` while the system says
+    /// nothing of memory.
+    cap: Option<u64>,
     /// What the process holds besides the tasks granted memory that kept the best task held
     /// back for memory in the last dispatch from starting: the bytes of it to let go for that
     /// task to start now; 0 when none was held back, or only granted tasks held it back
@@ -1088,6 +1100,7 @@ impl<M: Memo> Plane<M> {
             running: [0; 2],
             granted: 0,
             held: 0,
+            cap: None,
             short: 0,
             vclock: [0; 2],
             idle_vclock: [0; 2],
@@ -1126,6 +1139,42 @@ impl<M: Memo> Plane<M> {
     /// The memory granted to the tasks running now.
     pub fn granted(&self) -> u64 {
         self.granted
+    }
+
+    /// The bytes the process held at the last [`PlaneInput::Held`].
+    pub fn held(&self) -> u64 {
+        self.held
+    }
+
+    /// The pressure cap on the budget ([`PlaneInput::Cap`]), while there is one.
+    pub fn cap(&self) -> Option<u64> {
+        self.cap
+    }
+
+    /// Whether the ready node `id` is held back for memory alone now: its task asks memory
+    /// that does not fit beside what is granted and held, it may not start alone, and a thread
+    /// of its pool is free. `false` for a node not ready, a task with no memory, or a plane
+    /// with no budget.
+    pub fn waits_for_memory(&self, id: NodeId) -> bool {
+        let (Some(free), Some(whole)) = (self.memory_free(), self.budget_now()) else {
+            return false;
+        };
+        let Some(&node) = self.index.get(&id) else { return false };
+        let m = node.index() as usize;
+        if self.states[m] != NodeState::Ready {
+            return false;
+        }
+        let task = self.rows[m].task;
+        if task == NO_TASK || !self.task_slots.live(task) {
+            return false;
+        }
+        let t = &self.tasks[row_of(task)];
+        let p = pool_at(t.pool);
+        let alone = self.granted == 0 && self.cap.is_none();
+        !t.running
+            && t.memory > free
+            && !(t.memory <= whole && alone)
+            && self.running[p] < self.threads_of(p)
     }
 
     /// The bytes of what the process holds besides its granted tasks (a front end kept, values
@@ -1421,6 +1470,7 @@ impl<M: Memo> Plane<M> {
                 touched.push(r);
             }
             PlaneInput::Held { bytes, .. } => self.held = bytes,
+            PlaneInput::Cap { bytes, .. } => self.cap = bytes,
         }
         Ok(())
     }
@@ -2266,9 +2316,16 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    fn memory_free(&self) -> Option<u64> {
+    /// The budget admission counts against now: the configured one (the daemon's allowance),
+    /// held to the pressure cap while there is one. Every admission decision reads it, and
+    /// only [`too_big`] reads the configured budget alone.
+    pub fn budget_now(&self) -> Option<u64> {
         let budget = self.config.budget.as_ref()?;
-        Some(budget.bytes.saturating_sub(self.granted.max(self.held)))
+        Some(crate::pressure::budget_under(budget.bytes, self.cap))
+    }
+
+    fn memory_free(&self) -> Option<u64> {
+        Some(self.budget_now()?.saturating_sub(self.granted.max(self.held)))
     }
 
     /// The task that holds back the others, while it is still to start and wanted by a
@@ -2366,12 +2423,12 @@ impl<M: Memo> Plane<M> {
         let Some(wants) = self.waiting(p) else { return false };
         let mut thread = self.running[p] - self.yielding[p] >= self.threads_of(p);
         let mut memory = 0;
-        if let Some(budget) = &self.config.budget {
+        if let Some(budget) = self.budget_now() {
             let needs = self.tasks[row_of(wants)].memory;
-            if needs > budget.bytes.saturating_sub(self.held) {
+            if needs > budget.saturating_sub(self.held) {
                 return false;
             }
-            memory = (self.granted - self.yielding_memory).saturating_sub(budget.bytes - needs);
+            memory = (self.granted - self.yielding_memory).saturating_sub(budget - needs);
         }
         if !thread && memory == 0 {
             return true;
@@ -2479,11 +2536,13 @@ impl<M: Memo> Plane<M> {
     /// granted) would fail a unit that waiting could never help, since nothing granted is left
     /// to end and give memory back; what the process holds besides is the driver's to let go
     /// ([`Plane::short`]), and a prediction is a guess, not a measure (rule 15: the wait ends,
-    /// in a start).
+    /// in a start). Under a pressure cap ([`PlaneInput::Cap`]) the budget is the cap and no task
+    /// starts alone: there the wait does end, as the pressure passes or what is held is let go.
     fn pick(&mut self, r: u32, p: usize, passed: &mut Vec<TaskHandle>) -> Pick {
         let free = self.memory_free().expect("a budget");
-        let whole = self.config.budget.as_ref().expect("a budget").bytes;
-        let alone = self.granted == 0;
+        let whole = self.budget_now().expect("a budget");
+        // Not under pressure: there waiting does make room ([`PlaneInput::Cap`]).
+        let alone = self.granted == 0 && self.cap.is_none();
         let hold = self.hold();
         // An idle request's task passed over holds back no other.
         let counts = !self.requests[r as usize].idle;
