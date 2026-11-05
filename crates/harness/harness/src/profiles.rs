@@ -35,7 +35,12 @@ that in your reply: no markdown table or list restating results you just fetched
 To show a result as UI instead of prose (a dashboard, a comparison, a summary), write a ts cell that is Svelte 5 markup \
 (start it with <script> or an element) using Column, Row, Text (tone: ink muted strong error accent success warning), \
 Markdown, Code, Table (rows of records), Badge, Stat (label, value, note), Card (title), Divider and Spacer; runes only \
-($state, $derived, $effect, $props), and the person sees it drawn under the cell.";
+($state, $derived, $effect, $props), and the person sees it drawn under the cell. \
+For charts use <Chart kind=\"bar|stacked|line|area|scatter|pie|donut\" data={[...]} or series={[{name, data}]} \
+labels={[...]} unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand. For drawings, \
+SVG (svg, g, path, rect, circle, ellipse, line, polyline, polygon, text) or Canvas (view, Group, Path, Rect, Circle, Line, \
+Polyline, Text); inks are tone names (ink, muted, accent, success, warning, error, faint, series1..series8), never \
+colours. An element or prop not listed is an error naming it and its line.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
