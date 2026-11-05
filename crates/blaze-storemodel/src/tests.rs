@@ -339,6 +339,7 @@ fn a_crash_keeps_what_the_file_system_model_says() {
     fs.submit(&mut vec![Effect::Write {
         file: FileName::new("d/g").expect("a name"),
         bytes: vec![1],
+        cache: blaze_core::Cache::Keep,
         tag: Tag(2),
     }]);
     fs.complete(0);

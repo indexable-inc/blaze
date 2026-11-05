@@ -320,6 +320,7 @@ impl Images {
                 parts.effects.push(Effect::Write {
                     file: self.file.clone(),
                     bytes,
+                    cache: blaze_core::Cache::Keep,
                     tag: self.write,
                 });
                 self.made += 1;

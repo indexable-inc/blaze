@@ -181,7 +181,7 @@ impl Store {
                 // holds nothing yet.
                 let file = self.tiers[0].file(HEAD_FILE);
                 let tag = self.tags.ask(Op::Announce);
-                effects.push(Effect::Write { file, bytes: Head::default().encode(), tag });
+                effects.push(Effect::Write { file, bytes: Head::default().encode(), cache: blaze_core::Cache::Keep, tag });
             } else {
                 self.start_look(effects);
             }
@@ -305,7 +305,7 @@ impl Store {
         let file = self.tiers[0].file(HEAD_FILE);
         if self.retry(&file, done) {
             let tag = self.tags.ask(Op::Announce);
-            effects.push(Effect::Write { file, bytes: Head::default().encode(), tag });
+            effects.push(Effect::Write { file, bytes: Head::default().encode(), cache: blaze_core::Cache::Keep, tag });
         }
     }
 

@@ -40,6 +40,7 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
     let mut effects = vec![Effect::Write {
         file: name("store/a/value"),
         bytes: b"compiled".to_vec(),
+        cache: crate::Cache::Keep,
         tag: Tag(1),
     }];
     run_until_idle(driver, &mut effects, |done, effects| {
@@ -65,7 +66,7 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
         seen.insert(done.tag.0, shown);
         let next = match done.tag.0 {
             1 => {
-                Effect::Write { file: name("store/a/value"), bytes: b"again".to_vec(), tag: Tag(2) }
+                Effect::Write { file: name("store/a/value"), bytes: b"again".to_vec(), cache: crate::Cache::Keep, tag: Tag(2) }
             }
             2 => Effect::Clone { from: name("store/a/value"), to: name("out/c"), tag: Tag(3) },
             3 => Effect::Link { from: name("store/a/value"), to: name("out/l"), tag: Tag(4) },
@@ -86,6 +87,7 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
                 file: name("store/a/value"),
                 at: 4,
                 bytes: b"XYZ".to_vec(),
+                cache: crate::Cache::Keep,
                 tag: Tag(16),
             },
             16 => Effect::ReadAll { file: name("store/a/value"), tag: Tag(17) },
@@ -97,7 +99,7 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             },
             19 => Effect::Stat { file: name("store/a/value"), tag: Tag(20) },
             20 => Effect::List { dir: name("store"), tag: Tag(21) },
-            21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
+            21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], cache: crate::Cache::Keep, tag: Tag(22) },
             22 => Effect::Rename { from: name("missing"), to: name("out/m"), tag: Tag(23) },
             23 => Effect::List { dir: name("missing"), tag: Tag(24) },
             _ => return,
@@ -201,6 +203,7 @@ fn times(driver: &mut impl Driver) -> BTreeMap<u64, String> {
     let mut effects = vec![Effect::Write {
         file: name("target/build/output"),
         bytes: b"cargo::rerun-if-changed=build.rs\n".to_vec(),
+        cache: crate::Cache::Keep,
         tag: Tag(1),
     }];
     run_until_idle(driver, &mut effects, |done, effects| {
@@ -314,7 +317,7 @@ fn times_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
 fn a_warm_times_set_allocates_nothing() {
     fn write(driver: &mut impl Driver) {
         let mut effects =
-            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
     }
     let mut sim = Sim::new(15, Faults::default());
@@ -419,12 +422,13 @@ fn every_driver_fires_timers_in_their_order() {
 fn watches_hear_a_file_written_under_them() {
     fn run(driver: &mut impl Driver, root: Option<&std::path::Path>) -> Vec<FileName> {
         let mut effects =
-            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |_, _| {});
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         let mut effects = vec![Effect::Write {
             file: name("src/deep/lib.rs"),
             bytes: b"fn f() {}".to_vec(),
+            cache: crate::Cache::Keep,
             tag: Tag(2),
         }];
         let mut heard = Vec::new();
@@ -469,7 +473,7 @@ fn watches_hear_a_file_written_under_them() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::path::Path) {
     let mut effects =
-        vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
+        vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(1) }];
     run_until_idle(driver, &mut effects, |_, _| {});
     driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
     let mut done = Vec::new();
@@ -549,7 +553,7 @@ fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
     });
     let mut seen = Vec::new();
     let mut effects = vec![
-        Effect::Write { file: name("store/pack"), bytes: b"packed".to_vec(), tag: Tag(1) },
+        Effect::Write { file: name("store/pack"), bytes: b"packed".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) },
         Effect::Spawn { command: sh, tag: Tag(3) },
         Effect::Listen { at: at.clone(), tag: Tag(4) },
     ];
@@ -854,7 +858,7 @@ fn file_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
 fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
     fn write(driver: &mut impl Driver) {
         let mut effects =
-            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) }];
         run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
     }
     let mut sim = Sim::new(11, Faults::default());

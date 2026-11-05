@@ -147,7 +147,9 @@ fn moved(from: &Path, to: &Path) -> io::Result<()> {
 
 /// `bytes` as the whole of `path`: a temporary file next to it, written and flushed, moved
 /// over it with the move written through, so a crash leaves the old contents or the new.
-pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// `cache` asks nothing of Windows, which has no write that leaves the cache alone short of
+/// unbuffered IO's alignment.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], _cache: crate::Cache) -> io::Result<()> {
     crate::fs::make_parent(path)?;
     let temporary = crate::fs::temporary_next_to(path);
     let written = (|| {

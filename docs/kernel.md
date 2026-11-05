@@ -70,7 +70,7 @@ not built), **next** (an opportunity found, unowned).
 | `statx` `STATX_MNT_ID` | 5.8 | ix-prof's FUSE check | ix-prof | in use |
 | `openat2` `OPENAT2_REGULAR` | 7.2 | store and cache reads open only a regular file (`EFTYPE` otherwise) | blaze-core | in use (this lane) |
 | file IO error reporting (`fserror`, delivered as fanotify `FAN_FS_ERROR`) | 7.0 | the store's durability path learns of a write the file system lost | blaze-core, blaze-cas | in use (this lane) |
-| `RWF_DONTCACHE` | 6.14 (XFS 6.15, ext4 6.17, NFS 6.18) | store writes the build won't read back soon stay out of the page cache, on a file system that takes it | blaze-core | in use (this lane) |
+| `RWF_DONTCACHE` | 6.14 (XFS 6.15, ext4 6.17, NFS 6.18) | store writes the build won't read back soon (`Cache::Drop`: a pack write holding only records a settle moved colder, a `placed/` file only cloned from) stay out of the page cache: io_uring `rw_flags` and `pwritev2` on ext4, XFS and NFS (`kernel::DONTCACHE`, by `statfs` `f_type`), a plain write on any other file system, and an `EOPNOTSUPP` from a listed one an error naming it, never a retry without the flag | blaze-core, blaze-cas | in use |
 | `mseal` | 6.10 | sealing the loader's code mappings that are never changed | blaze-live | in use (this lane) |
 | `cachestat` | 6.5 | which store entries are warm (resident in the page cache) | blaze-cas | in use (this lane) |
 

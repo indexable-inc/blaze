@@ -123,6 +123,11 @@ pub(super) const NO_FOLLOW: u8 = 1 << 3;
 /// [`crate::CLONE_OF_NO_FILE`] once its target is unlinked (the bit [`WHOLE`] is).
 pub(super) const NOT_REGULAR: u8 = 1 << 3;
 
+/// A write ([`Kind::WriteAt`]'s or [`Kind::Write`]'s) with `RWF_DONTCACHE` in its
+/// `rw_flags`: [`crate::Cache::Drop`] on a file system that takes it (the bit [`WHOLE`] is). A
+/// write at an offset that bypasses the page cache ([`DIRECT`]) drops it.
+pub(super) const DONTCACHE: u8 = 1 << 3;
+
 /// In [`Hot::buffer`]: none.
 pub(super) const NO_BUFFER: u16 = u16::MAX;
 /// In [`Cold::slots`]: none.
@@ -144,9 +149,9 @@ pub(super) struct Hot {
     pub of: u64,
     pub kind: Kind,
     /// [`ABANDONED`], [`STOPPING`], [`DIRECT`], [`STDERR`], [`SECOND`], [`ZERO_COPY`],
-    /// [`FINISHED`], [`WHOLE`], [`MAKE`], [`MADE`], [`NO_FOLLOW`] (a [`Kind::Stat`]'s) and
-    /// [`NOT_REGULAR`] (a [`Kind::Clone`]'s). The last two share [`WHOLE`]'s (and [`STDERR`]'s)
-    /// bit, read only for those kinds.
+    /// [`FINISHED`], [`WHOLE`], [`MAKE`], [`MADE`], [`NO_FOLLOW`] (a [`Kind::Stat`]'s),
+    /// [`NOT_REGULAR`] (a [`Kind::Clone`]'s) and [`DONTCACHE`] (a write's). The last three
+    /// share [`WHOLE`]'s (and [`STDERR`]'s) bit, read only for those kinds.
     pub flags: u8,
     /// The links asked of the kernel whose last completion is not in yet, a bit each.
     pub links: u8,

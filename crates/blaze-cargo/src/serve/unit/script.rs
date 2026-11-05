@@ -1454,6 +1454,7 @@ impl Writing {
                     file: name,
                     at: 0,
                     bytes,
+                    cache: blaze_core::Cache::Keep,
                     tag: Tag(tag.0 + BYTES + file as u64),
                 });
                 self.left += 1;

@@ -105,7 +105,7 @@ fn cargos_files_are_cut_then_written_and_output_dated_when_the_run_began() {
     let printed = b"cargo:rustc-cfg=has_z\n".to_vec();
     assert_eq!(
         effects,
-        [Effect::WriteAt { file: output.clone(), at: 0, bytes: printed, tag: Tag(RUN.0 + BYTES) }]
+        [Effect::WriteAt { file: output.clone(), at: 0, bytes: printed, cache: blaze_core::Cache::Keep, tag: Tag(RUN.0 + BYTES) }]
     );
     effects.clear();
     // An empty `stderr` is done once cut.
@@ -115,7 +115,7 @@ fn cargos_files_are_cut_then_written_and_output_dated_when_the_run_began() {
     let out_dir = b"/w/target/debug/build/z-sys-0123456789abcdef/out".to_vec();
     assert_eq!(
         effects,
-        [Effect::WriteAt { file: root_output, at: 0, bytes: out_dir, tag: Tag(RUN.0 + BYTES + 2) }]
+        [Effect::WriteAt { file: root_output, at: 0, bytes: out_dir, cache: blaze_core::Cache::Keep, tag: Tag(RUN.0 + BYTES + 2) }]
     );
     effects.clear();
 

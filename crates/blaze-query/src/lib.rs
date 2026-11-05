@@ -3017,7 +3017,7 @@ impl Database {
             .expect("a name under the database's directory");
         io.cold_files += 1;
         let tag = io.tag(self.config.tags);
-        effects.push(Effect::Write { file: file.clone(), bytes, tag }); // clone: see above
+        effects.push(Effect::Write { file: file.clone(), bytes, cache: blaze_core::Cache::Keep, tag }); // clone: see above
         io.pending.insert(tag, Pending::ColdWrite { file, entries });
     }
 

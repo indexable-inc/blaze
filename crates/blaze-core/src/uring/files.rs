@@ -31,7 +31,10 @@ use blaze_mem::RegionVec;
 
 use super::{
     flight::{error, failed, filled, raw, spare_of},
-    ops::{DIRECT, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, WHOLE, arena_of},
+    ops::{
+        DIRECT, DONTCACHE, LINKS, MADE, MAKE, NO_FOLLOW, NO_SLOT, NOT_REGULAR, SECOND, WHOLE,
+        arena_of,
+    },
     *,
 };
 
@@ -144,6 +147,11 @@ fn two_names(opcode: u8, from: *const u8, to: *const u8, link: u8, user_data: u6
         user_data,
         ..Sqe::default()
     }
+}
+
+/// The `rw_flags` of the write of `hot`: `RWF_DONTCACHE` where it asks for it ([`DONTCACHE`]).
+fn rw_flags(hot: &Hot) -> u32 {
+    if hot.flags & DONTCACHE != 0 { libc::RWF_DONTCACHE as u32 } else { 0 }
 }
 
 /// Which name of a request of `kind` the directories it makes are those of.
@@ -291,6 +299,35 @@ impl Uring {
         Step::Ends(Some(Done::Failed(IoError(format!("{what} {name}: {}", error(res))))))
     }
 
+    /// Whether a write asking `cache` goes with `RWF_DONTCACHE`: a [`crate::Cache::Drop`] one
+    /// where the root's file system takes it ([`crate::kernel::dontcache`]), which the `statfs`
+    /// of the root says once, at the first such write. An error names the root where it fails.
+    fn dontcache(&mut self, cache: crate::Cache) -> io::Result<bool> {
+        if cache == crate::Cache::Keep {
+            return Ok(false);
+        }
+        let fs = match self.dontcache {
+            Some(fs) => fs,
+            None => {
+                let fs = crate::fs::dontcache_at(&self.root)?;
+                self.dontcache = Some(fs);
+                fs
+            }
+        };
+        Ok(fs.is_some())
+    }
+
+    /// Why the write `id` failed with `EOPNOTSUPP` for its `RWF_DONTCACHE`, naming its name
+    /// `n` and the root's file system.
+    fn refused_dontcache(&self, id: Id, n: usize) -> Step {
+        let fs = self
+            .dontcache
+            .flatten()
+            .expect("a write with RWF_DONTCACHE is on a file system that takes it");
+        let name = self.name_of(id, n).to_string_lossy();
+        Step::Ends(Some(Done::Failed(IoError(fs.refused(&name)))))
+    }
+
     /// Starts [`Effect::WriteAt`] `tag` of `bytes` at `at` of `file`: a `statx` first where
     /// the write may bypass the page cache, then the open into a slot linked to the write.
     pub(super) fn write_at(
@@ -299,12 +336,16 @@ impl Uring {
         file: &FileName,
         at: u64,
         bytes: Vec<u8>,
+        cache: crate::Cache,
     ) -> io::Result<()> {
         const SECTOR: u64 = 512;
         let len = bytes.len();
         let candidate = len >= DIRECT_LEAST && at % SECTOR == 0 && len as u64 % SECTOR == 0;
         let mut hot = Hot::new(tag, Kind::WriteAt, 0);
         hot.phase = if candidate { STATTING } else { OPENING };
+        if self.dontcache(cache)? {
+            hot.flags |= DONTCACHE;
+        }
         let cold = Cold { at, ..Cold::EMPTY };
         self.named(
             hot,
@@ -325,9 +366,18 @@ impl Uring {
     /// Starts [`Effect::Write`] `tag` of `bytes` over `file`: the chain that opens its
     /// directory, makes its temporary next to it, writes, syncs and renames it over the file
     /// and syncs the directory.
-    pub(super) fn write(&mut self, tag: Tag, file: FileName, bytes: Vec<u8>) -> io::Result<()> {
+    pub(super) fn write(
+        &mut self,
+        tag: Tag,
+        file: FileName,
+        bytes: Vec<u8>,
+        cache: crate::Cache,
+    ) -> io::Result<()> {
         let mut hot = Hot::new(tag, Kind::Write, 0);
         hot.flags |= MAKE;
+        if self.dontcache(cache)? {
+            hot.flags |= DONTCACHE;
+        }
         let push = |path: &Path, names: &mut RegionVec<u8>, at: &mut [u32; 5]| {
             at[0] = push_temporary(names, path)?;
             at[1] = push_c(names, path.as_os_str().as_bytes())?;
@@ -757,7 +807,13 @@ impl Uring {
                     }
                 } else {
                     let off = cold.at + hot.done;
-                    Sqe { off, addr: rest, len: left, ..on_slot(OP_WRITE, slot, 0, ud(1)) }
+                    Sqe {
+                        off,
+                        addr: rest,
+                        len: left,
+                        op_flags: rw_flags(hot),
+                        ..on_slot(OP_WRITE, slot, 0, ud(1))
+                    }
                 };
                 if hot.phase == OPENED {
                     sqes[0] = write;
@@ -791,6 +847,7 @@ impl Uring {
                     off: hot.done,
                     addr: rest,
                     len: left,
+                    op_flags: rw_flags(hot),
                     ..on_slot(OP_WRITE, temporary, SQE_IO_LINK, ud(2))
                 };
                 sqes[n + 1] = on_slot(OP_FSYNC, temporary, SQE_IO_LINK, ud(3));
@@ -969,7 +1026,8 @@ impl Uring {
             let hot = self.ops.get_mut(id).expect("in flight");
             if align != 0 && DIRECT_PIECE as u64 % align == 0 && at % align == 0 && len % align == 0
             {
-                hot.flags |= DIRECT;
+                // Out of the page cache already: no `RWF_DONTCACHE` to ask, or refuse.
+                hot.flags = hot.flags & !DONTCACHE | DIRECT;
             }
             hot.phase = OPENING;
             return Step::Again;
@@ -986,6 +1044,9 @@ impl Uring {
             return Step::Ends(Some(Done::Written));
         }
         let res = results[1];
+        if res == -libc::EOPNOTSUPP && hot.flags & DONTCACHE != 0 {
+            return self.refused_dontcache(id, 0);
+        }
         if res < 0 {
             return Step::Ends(failed(res));
         }
@@ -1001,6 +1062,9 @@ impl Uring {
     fn wrote(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
         if hot.phase == UNLINKING {
             // The temporary is gone, or never renamed: the old file is as it was.
+            if hot.flags & DONTCACHE != 0 {
+                return self.refused_dontcache(id, 1);
+            }
             return Step::Ends(failed(-(self.ops.cold(id).at as i32)));
         }
         if hot.phase == OPENING {
@@ -1028,7 +1092,12 @@ impl Uring {
         }
         let wrote = if wrote == 0 && put < len { -libc::EIO } else { wrote };
         if let Some(res) = [wrote, synced, renamed].into_iter().find(|it| *it < 0) {
-            self.ops.get_mut(id).expect("in flight").phase = UNLINKING;
+            let hot = self.ops.get_mut(id).expect("in flight");
+            // Kept only where the write itself refused its `RWF_DONTCACHE`, for the end to say.
+            if wrote != -libc::EOPNOTSUPP {
+                hot.flags &= !DONTCACHE;
+            }
+            hot.phase = UNLINKING;
             self.ops.cold_mut(id).at = u64::from(res.unsigned_abs());
             return Step::Again;
         }

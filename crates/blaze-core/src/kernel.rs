@@ -62,11 +62,57 @@ pub const FEATURES: &[Feature] = &[
     Feature {
         name: "RWF_DONTCACHE",
         since: v(6, 14),
-        used_for: "store writes that should not fill the page cache",
+        used_for: "store writes the build won't read back soon (records a settle moved colder, \
+                   files only cloned from), on ext4, XFS and NFS",
     },
     Feature { name: "mseal", since: v(6, 10), used_for: "sealing the loader's code mappings" },
     Feature { name: "cachestat", since: v(6, 5), used_for: "the store's choice of warm entries" },
 ];
+
+/// A file system blaze writes [`crate::Cache::Drop`] writes to with `RWF_DONTCACHE`: one whose
+/// driver sets `FOP_DONTCACHE`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DontCache {
+    /// Its `statfs` `f_type`, of `linux/magic.h`.
+    pub magic: u32,
+    pub name: &'static str,
+    /// The release whose driver took the flag first.
+    pub since: Version,
+}
+
+/// The file systems that take `RWF_DONTCACHE`, by `f_type`: the one list of them. Data, never
+/// a probe: a [`crate::Cache::Drop`] write to any file system not here is a plain write, and
+/// one to a file system here that answers `EOPNOTSUPP` (a DAX mount, a driver built without
+/// it) fails naming the file, the file system and its release ([`DontCache::refused`]); it is
+/// never retried without the flag (`no-fallback`). Through Linux 7.3 btrfs, f2fs, bcachefs,
+/// tmpfs, FUSE (virtiofs too), overlayfs and 9p set no `FOP_DONTCACHE`, as far as is known; add
+/// one here with the release that adds it. `0xef53` is also ext2's and ext3's, which Linux
+/// mounts with the ext4 driver.
+pub const DONTCACHE: &[DontCache] = &[
+    DontCache { magic: 0xef53, name: "ext4", since: v(6, 17) },
+    DontCache { magic: 0x5846_5342, name: "XFS", since: v(6, 15) },
+    DontCache { magic: 0x6969, name: "NFS", since: v(6, 18) },
+];
+
+/// The file system of `f_type` (`statfs`'s, as a `u32`) where a [`crate::Cache::Drop`] write
+/// takes `RWF_DONTCACHE`; `None` where it is a plain write.
+pub fn dontcache(f_type: u32) -> Option<DontCache> {
+    DONTCACHE.iter().copied().find(|it| it.magic == f_type)
+}
+
+impl DontCache {
+    /// Why a write to `path` on this file system failed with `EOPNOTSUPP` for its
+    /// `RWF_DONTCACHE`.
+    pub fn refused(&self, path: &dyn fmt::Display) -> String {
+        let DontCache { name, since, .. } = self;
+        // alloc: an error's message, made as it fails.
+        format!(
+            "{path} on {name} refused RWF_DONTCACHE (EOPNOTSUPP), which {name} takes from Linux \
+             {since} (rule no-fallback: a write blaze asked to keep out of the page cache is \
+             never written again without the flag; a DAX mount refuses it too, docs/kernel.md)"
+        )
+    }
+}
 
 /// The kernel is older than [`FLOOR`], or says a release blaze cannot read.
 #[derive(Clone, PartialEq, Eq, Debug)]

@@ -1738,6 +1738,11 @@ pub struct Uring {
     slots_held: usize,
     /// Writes that bypassed the page cache, ended.
     direct_writes: u64,
+    /// Whether [`crate::Cache::Drop`] writes take `RWF_DONTCACHE`: the file system of the
+    /// root where it takes the flag (`Some(Some(..))`), or none (`Some(None)`), by `statfs`
+    /// of the root at the first such write; `None` before it. Not at [`Uring::new`]: a driver
+    /// may be made before its root is.
+    dontcache: Option<Option<crate::kernel::DontCache>>,
     /// Sends that went from the asker's pages (`IORING_OP_SEND_ZC`), ended.
     zero_copy_sends: u64,
     /// Completions to hand out at the next poll, in order.
@@ -1817,6 +1822,7 @@ impl Uring {
             closes: 0,
             slots_held: 0,
             direct_writes: 0,
+            dontcache: None,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
             watches: HashMap::new_in(Global),
@@ -2313,7 +2319,9 @@ impl Driver for Uring {
             }
             self.in_flight += 1;
             let started = match effect {
-                Effect::Write { file, bytes, .. } => self.write(tag, file, bytes).map(|()| None),
+                Effect::Write { file, bytes, cache, .. } => {
+                    self.write(tag, file, bytes, cache).map(|()| None)
+                }
                 Effect::Clone { from, to, .. } => {
                     self.copy(tag, Kind::Clone, &from, &to).map(|()| None)
                 }
@@ -2326,8 +2334,8 @@ impl Driver for Uring {
                 }
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
-                Effect::WriteAt { file, at, bytes, .. } => {
-                    self.write_at(tag, &file, at, bytes).map(|()| None)
+                Effect::WriteAt { file, at, bytes, cache, .. } => {
+                    self.write_at(tag, &file, at, bytes, cache).map(|()| None)
                 }
                 Effect::Rename { from, to, .. } => self.rename(tag, &from, &to).map(|()| None),
                 Effect::Mode { file, mode, .. } => {
@@ -2658,6 +2666,7 @@ mod tests {
                             file: file.clone(),
                             at: 0,
                             bytes,
+                            cache: crate::Cache::Keep,
                             tag: Tag(done.tag.0 + 1),
                         });
                     }
@@ -3270,6 +3279,7 @@ mod tests {
                 file: pack.clone(),
                 at: (n * piece) as u64,
                 bytes: bytes(n),
+                cache: crate::Cache::Keep,
                 tag: Tag(n as u64),
             })
             .collect();
@@ -3278,6 +3288,7 @@ mod tests {
             file: pack.clone(),
             at: odd,
             bytes: vec![9; DIRECT_PIECE + 1],
+            cache: crate::Cache::Keep,
             tag: Tag(99),
         });
         let mut seen = Vec::new();
@@ -3384,9 +3395,9 @@ mod tests {
         let mut driver = Uring::new(&root).unwrap();
         let name = |it: &str| FileName::new(it).unwrap();
         let mut effects = vec![
-            Effect::Write { file: name("out/blocked"), bytes: b"new".to_vec(), tag: Tag(1) },
-            Effect::Write { file: name("out/file"), bytes: vec![5; 3 << 20], tag: Tag(2) },
-            Effect::Write { file: name("out/fresh"), bytes: Vec::new(), tag: Tag(3) },
+            Effect::Write { file: name("out/blocked"), bytes: b"new".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) },
+            Effect::Write { file: name("out/file"), bytes: vec![5; 3 << 20], cache: crate::Cache::Keep, tag: Tag(2) },
+            Effect::Write { file: name("out/fresh"), bytes: Vec::new(), cache: crate::Cache::Keep, tag: Tag(3) },
         ];
         let mut seen = BTreeMap::new();
         run_until_idle(&mut driver, &mut effects, |done, _| {
@@ -4280,10 +4291,11 @@ mod tests {
                     file: block.clone(),
                     at,
                     bytes,
+                    cache: crate::Cache::Keep,
                     tag: Tag(10 * round + 1),
                 });
                 let bytes = round.to_le_bytes().to_vec();
-                writes.push(Effect::Write { file: whole.clone(), bytes, tag: Tag(10 * round + 2) });
+                writes.push(Effect::Write { file: whole.clone(), bytes, cache: crate::Cache::Keep, tag: Tag(10 * round + 2) });
                 let mut renames = Vec::with_capacity(1);
                 renames.push(Effect::Rename {
                     from: whole.clone(),
@@ -4340,8 +4352,8 @@ mod tests {
         let free = driver.table.free.borrow().len();
         let name = |it: &str| FileName::new(it).unwrap();
         let mut effects = vec![
-            Effect::WriteAt { file: name("missing"), at: 0, bytes: b"a".to_vec(), tag: Tag(1) },
-            Effect::Write { file: name("plain/under"), bytes: b"b".to_vec(), tag: Tag(2) },
+            Effect::WriteAt { file: name("missing"), at: 0, bytes: b"a".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) },
+            Effect::Write { file: name("plain/under"), bytes: b"b".to_vec(), cache: crate::Cache::Keep, tag: Tag(2) },
             Effect::Rename { from: name("plain"), to: name("plain/under"), tag: Tag(3) },
             Effect::Read { file: name("plain/under"), at: 0, len: 1, tag: Tag(4) },
         ];

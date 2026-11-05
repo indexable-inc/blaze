@@ -42,8 +42,8 @@ use std::alloc::Global;
 
 pub use self::journal::Journal;
 use crate::{
-    Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError,
-    LockMode, Meta, RECV_MOST, Tag,
+    Access, Address, Cache, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName,
+    IoError, LockMode, Meta, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
     wheel::{self, Wheel},
 };
@@ -325,6 +325,9 @@ pub struct Sim {
     /// with the clock then ([`Sim::record`]).
     recording: Vec<FileName>,
     recorded: Vec<(Duration, FileName, bool)>,
+    /// Each write's file and what it asked of the page cache, in the order asked, from
+    /// [`Sim::record_caches`] on: the simulated disk has no cache, so this is all it keeps.
+    caches: Option<Vec<(FileName, Cache)>>,
     /// Appends and writes of files under this directory take their bytes from what is left of
     /// its room ([`Sim::fill`]): a disk filling up.
     room: Option<(FileName, u64)>,
@@ -405,6 +408,7 @@ impl Sim {
             slow: None,
             recording: Vec::new(),
             recorded: Vec::new(),
+            caches: None,
             room: None,
             locks: HashMap::new_in(Global),
             // alloc: none until a locked file is removed.
@@ -631,6 +635,18 @@ impl Sim {
     /// What [`Sim::record`] recorded so far.
     pub fn recorded(&self) -> &[(Duration, FileName, bool)] {
         &self.recorded
+    }
+
+    /// From now on, records each [`Effect::Write`] and [`Effect::WriteAt`] as it is asked
+    /// for: its file and its [`Cache`], for a test of what an asker keeps in the page cache.
+    pub fn record_caches(&mut self) {
+        // alloc: a test's record, kept from here on
+        self.caches.get_or_insert_with(Vec::new);
+    }
+
+    /// What [`Sim::record_caches`] recorded so far; empty before it.
+    pub fn caches(&self) -> &[(FileName, Cache)] {
+        self.caches.as_deref().unwrap_or_default()
     }
 
     /// The syncs held so far ([`Sim::hold_syncs`]).
@@ -1416,6 +1432,13 @@ impl Sim {
 impl Driver for Sim {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         for effect in effects.drain(..) {
+            if let Some(caches) = &mut self.caches
+                && let Effect::Write { file, cache, .. } | Effect::WriteAt { file, cache, .. } =
+                    &effect
+            {
+                // clone: a test's record, once a write asked for
+                caches.push((file.clone(), *cache));
+            }
             match effect {
                 Effect::Watch { dir, tag } => {
                     self.watch(tag, dir, false);
@@ -1874,13 +1897,14 @@ mod tests {
         for seed in 0..300 {
             let mut sim = Sim::new(seed, Faults::default());
             let mut effects =
-                vec![Effect::Write { file: file.clone(), bytes: b"aaaa".to_vec(), tag: Tag(0) }];
+                vec![Effect::Write { file: file.clone(), bytes: b"aaaa".to_vec(), cache: crate::Cache::Keep, tag: Tag(0) }];
             run_until_idle(&mut sim, &mut effects, |_, _| {});
             let synced = seed % 2 == 0;
             let mut effects = vec![Effect::WriteAt {
                 file: file.clone(),
                 at: 2,
                 bytes: b"bbbb".to_vec(),
+                cache: crate::Cache::Keep,
                 tag: Tag(1),
             }];
             run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
@@ -1904,7 +1928,7 @@ mod tests {
         let mut sim = Sim::new(1, Faults::default());
         let to = FileName::new("out/app.new").unwrap();
         let mut effects =
-            vec![Effect::Write { file: to.clone(), bytes: b"new".to_vec(), tag: Tag(0) }];
+            vec![Effect::Write { file: to.clone(), bytes: b"new".to_vec(), cache: crate::Cache::Keep, tag: Tag(0) }];
         run_until_idle(&mut sim, &mut effects, |_, _| {});
         let mut effects = vec![Effect::Mode { file: to.clone(), mode: 0o755, tag: Tag(1) }];
         run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Moded));
@@ -1915,7 +1939,7 @@ mod tests {
             (sim.contents(&file), sim.mode(&file), sim.exists(&to)),
             (b"new".to_vec(), Some(0o755), false),
         );
-        let mut effects = vec![Effect::WriteAt { file: to, at: 0, bytes: vec![1], tag: Tag(3) }];
+        let mut effects = vec![Effect::WriteAt { file: to, at: 0, bytes: vec![1], cache: crate::Cache::Keep, tag: Tag(3) }];
         run_until_idle(&mut sim, &mut effects, |it, _| assert!(matches!(it.done, Done::Failed(_))));
     }
 
@@ -1934,9 +1958,9 @@ mod tests {
             found.expect("the check completed")
         };
         let mut effects = vec![
-            Effect::Write { file: a.clone(), bytes: b"a".to_vec(), tag: Tag(0) },
-            Effect::Write { file: b.clone(), bytes: b"b".to_vec(), tag: Tag(1) },
-            Effect::Write { file: name("other/c"), bytes: b"c".to_vec(), tag: Tag(2) },
+            Effect::Write { file: a.clone(), bytes: b"a".to_vec(), cache: crate::Cache::Keep, tag: Tag(0) },
+            Effect::Write { file: b.clone(), bytes: b"b".to_vec(), cache: crate::Cache::Keep, tag: Tag(1) },
+            Effect::Write { file: name("other/c"), bytes: b"c".to_vec(), cache: crate::Cache::Keep, tag: Tag(2) },
         ];
         run_until_idle(&mut sim, &mut effects, |_, _| {});
         assert_eq!(check(&mut sim), Done::Private(None));
@@ -2044,7 +2068,7 @@ mod tests {
                 "seed {seed}: a failed set makes nothing"
             );
             let mut effects =
-                vec![Effect::Write { file: moved.clone(), bytes: b"again".to_vec(), tag: Tag(7) }];
+                vec![Effect::Write { file: moved.clone(), bytes: b"again".to_vec(), cache: crate::Cache::Keep, tag: Tag(7) }];
             run_until_idle(&mut sim, &mut effects, |it, _| {
                 assert_eq!(it.done, Done::Written, "seed {seed}")
             });
@@ -2062,6 +2086,7 @@ mod tests {
             sim.submit(&mut vec![Effect::Write {
                 file: file.clone(),
                 bytes: b"new".to_vec(),
+                cache: crate::Cache::Keep,
                 tag: Tag(1),
             }]);
             let mut out = Vec::new();
@@ -2110,7 +2135,7 @@ mod tests {
             sim.submit(&mut effects);
             sim.change(&name("src/lib.rs"), b"fn main() {}");
             sim.change(&name("target/out"), b"not watched");
-            effects.push(Effect::Write { file: name("src/a/b.rs"), bytes: vec![1], tag: Tag(1) });
+            effects.push(Effect::Write { file: name("src/a/b.rs"), bytes: vec![1], cache: crate::Cache::Keep, tag: Tag(1) });
             effects.push(Effect::Unwatch { tag: Tag(9) });
             let mut heard = Vec::new();
             let mut lost = false;
@@ -2674,6 +2699,7 @@ mod tests {
         let write = |bytes: &[u8], tag| Effect::Write {
             file: head.clone(),
             bytes: bytes.to_vec(),
+            cache: crate::Cache::Keep,
             tag: Tag(tag),
         };
         let append = |bytes: &[u8], tag| Effect::Append {
