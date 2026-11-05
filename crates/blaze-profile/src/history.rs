@@ -1359,11 +1359,24 @@ impl History {
         let query_counts =
             [facts::query_counts(&self.query_counts)
                 .map_err(arrow_error(&schema::QUERY_COUNTS))?];
-        let misses = [facts::misses(&self.misses).map_err(arrow_error(&schema::MISSES))?];
+        // Split by their text: one build's can pass the 2 GiB a `Utf8` column holds (#1726).
+        let misses = facts::in_batches(&self.misses, MissRow::text_bytes, facts::BATCH_TEXT_BYTES, facts::misses)
+            .map_err(arrow_error(&schema::MISSES))?;
         let key_parts =
-            [facts::key_parts(&self.key_parts).map_err(arrow_error(&schema::KEY_PARTS))?];
-        let provenance =
-            [facts::provenance(&self.provenance).map_err(arrow_error(&schema::PROVENANCE))?];
+            facts::in_batches(
+                &self.key_parts,
+                KeyPartRow::text_bytes,
+                facts::BATCH_TEXT_BYTES,
+                facts::key_parts,
+            )
+                .map_err(arrow_error(&schema::KEY_PARTS))?;
+        let provenance = facts::in_batches(
+            &self.provenance,
+            ProvenanceRow::text_bytes,
+            facts::BATCH_TEXT_BYTES,
+            facts::provenance,
+        )
+        .map_err(arrow_error(&schema::PROVENANCE))?;
         let switches = [batches::switches(&self.read.switches, self.process)
             .map_err(arrow_error(&schema::SWITCHES))?];
         let mut events = vec![
