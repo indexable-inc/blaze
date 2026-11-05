@@ -27,7 +27,11 @@ pub const KINDS: &[&str] = &["claude", "codex", "cursor", "shell"];
 const SYSTEM_NOTE: &str = "You are running inside harness. Your only tool is `ts`, a persistent TypeScript REPL whose \
 description lists the functions in scope (web search, agents.spawn/send/screen/tree to run and talk to other agents, \
 process and task tables). Use it for everything. To run another agent, use agents.spawn in ts (never a built-in \
-sub-agent or collaboration tool), so it appears in the harness tree.";
+sub-agent or collaboration tool), so it appears in the harness tree. \
+The person sees every ts cell as it runs, drawn in the chat: its steps in plain words (searches, commands, files read \
+and written, agents started) and its result, with tables drawn as tables and command output as output. So never repeat \
+that in your reply: no markdown table or list restating results you just fetched, no pasted output. Refer to it \
+(\"the third result\", \"the build output above\"), then say what it means and what to do next.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
