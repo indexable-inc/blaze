@@ -1,0 +1,45 @@
+// The new-object picker's row (cmd+N, the card is hn.Picker in scene/widgets/palette.flecs): a template the host fills
+// from one act.Spawn action (src/app.rs sync_picker). Templates only (see row.flecs), after the prefabs they use.
+using flecs.script
+
+@tree ChildOf
+hn {
+  // One kind to start (`obj` its place in the list, `name` its title, `selected` the highlighted row): its brand mark
+  // (hn.Kind, as the sidebar shows it), its name, the shortcut that starts it from anywhere (`hint`, faint) and the key
+  // that picks it here (`cap`, in a keycap). The highlighted row holds the pill, which slides between rows.
+  @tree ChildOf
+  template PickRow : Row {
+    prop kind: string = "shell"
+    prop hint: string = ""
+    prop cap: string = ""
+    (IsA, hn.PickRowLook)
+    Action: {name: "pal:{obj}"}
+    glyph : ui.Symbol {
+      Size: {w: {kind: Fixed, value: $picker_mark, min: 0, max: 0}, h: {kind: Fixed, value: $picker_mark, min: 0, max: 0}}
+      const k = match $kind { "claude": hn.Kind.claude; "codex": hn.Kind.codex; "cursor": hn.Kind.cursor; "shell": hn.Kind.shell; _: hn.Kind.other }
+      Fill: k[Fill]
+      if k?[Mark] {
+        Mark: k[Mark]
+      } else {
+        Icon: k[Icon]
+      }
+    }
+    name : ui.Lead, Strong {
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0, weight: $weight_row}
+      Text: {s: $name}
+    }
+    spacer : ui.Spacer {}
+    hint : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+      Text: {s: $hint}
+    }
+    if $cap != "" {
+      cap : hn.Keycap {
+        label { Text: {s: $cap} }
+      }
+    }
+    if $selected {
+      pill : hn.PickPill {}
+    }
+  }
+}

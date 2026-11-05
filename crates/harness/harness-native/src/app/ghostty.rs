@@ -8,19 +8,21 @@ use super::*;
 const DEFAULT_PAD: [f32; 4] = [18.0, 18.0, 16.0, 16.0];
 
 /// The prefabs whose Fill follows the theme, each with the scene's own Fill (kept for an appearance with no theme).
-const TINTED: [&str; 7] = [
+const TINTED: [&str; 8] = [
     "Plate",
     "hn.Main",
     "hn.Palette.card",
+    "hn.Picker.card",
     "hn.SideClip",
     "hn.TitleBar.title",
     "hn.TitleBar.back",
     "hn.TitleBar.sub",
 ];
 /// The `export mut` token (scene/00-tokens.flecs) each of [`TINTED`] reads its Fill from.
-const TOKENS: [&str; 7] = [
+const TOKENS: [&str; 8] = [
     "tone_plate",
     "tone_term_ground",
+    "tone_card",
     "tone_card",
     "tone_side_tint",
     "tone_term_ink",
@@ -68,14 +70,14 @@ fn mix(a: term::Rgba, b: term::Rgba, t: f32) -> term::Rgba {
 }
 
 /// Each of [`TINTED`]'s colour from theme `t` in one appearance (`dark` picks the light or dark variant of the rule).
-fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 7] {
+fn derived(t: &term::Theme, dark: bool) -> [term::Rgba; 8] {
     let ground = t.bg;
-    // The palette's card a touch off the ground: toward the ink in the dark, toward white in the light.
+    // The overlays' cards (the palette's, the picker's) a touch off the ground: toward the ink in the dark, toward white in the light.
     let card = if dark { mix(t.bg, t.fg, 0.04) } else { mix(t.bg, [1.0; 4], 0.6) };
     let side = t.bg;
     let ink = alpha(t.fg, 0.92);
     let muted = alpha(t.fg, if dark { 0.5 } else { 0.55 });
-    [ground, ground, card, side, ink, muted, muted]
+    [ground, ground, card, card, side, ink, muted, muted]
 }
 
 /// Token `token` set to `f`: flecs re-runs what reads it (prefab `path`'s Fill, what instances made from now on copy), and

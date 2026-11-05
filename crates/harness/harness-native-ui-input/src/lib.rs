@@ -1,6 +1,7 @@
 //! The input pass, a hot-swappable module. A collect system gathers every hoverable `Node` with its `Laid` and draw key; a
 //! step system, run once a frame by the `PointerState` singleton the host writes from window events, resolves the topmost
-//! hit (by layer, `Z`, depth, then creation order) into `(Hovered, node)` on the app entity; a press on a Pressable sets
+//! hit (by layer, `Z`, depth, then creation order; a node on its way out, `Leaving` or under one, is never hit) into
+//! `(Hovered, node)` on the app entity; a press on a Pressable sets
 //! `(Pressed, node)`, on a Focusable `(Focused, node)`; letting go over the same Pressable tags it `Activated` so feature
 //! systems can observe the `Action`. With no hoverable node in the world the pass does nothing (the chrome that is not yet
 //! nodes keeps its own `Hovered`). The host ends the frame with [`end_frame`].
@@ -20,6 +21,7 @@ use harness_native_api::APP;
 use harness_native_ui_input_api::{
     Activated, Cursor, Focusable, Focused, Hoverable, Hovered, Pointer, PointerShape, PointerState, Pressable, Pressed,
 };
+use harness_native_ui_motion_api::Leaving;
 use harness_native_ui_node_api::{Clip, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
 
 struct Hit {
@@ -52,9 +54,12 @@ pub fn install(world: WorldRef<'_>) {
         let (mut depth, mut root) = (0u32, e);
         let mut clip: Option<Laid> = None;
         let mut cursor = e.try_cloned::<&Cursor>().map(|c| c.shape);
+        // A view going out on its Transition (an overlay closing, a row folding away) still draws but takes no pointer.
+        let mut leaving = e.has(Leaving::id());
         while let Some(p) = root.parent().filter(|p| p.has(Node::id())) {
             depth += 1;
             root = p;
+            leaving |= p.has(Leaving::id());
             if cursor.is_none() {
                 cursor = p.try_cloned::<&Cursor>().map(|c| c.shape);
             }
@@ -68,7 +73,7 @@ pub fn install(world: WorldRef<'_>) {
                 });
             }
         }
-        if root.has(Offscreen::id()) || root.has(Hosted::id()) {
+        if leaving || root.has(Offscreen::id()) || root.has(Hosted::id()) {
             return;
         }
         let level = root.try_cloned::<&Layer>().map_or_else(Default::default, |l| l.level);
