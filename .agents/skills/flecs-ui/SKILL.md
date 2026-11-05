@@ -78,6 +78,12 @@ New UI need not covered here: add a primitive (component + prim prefab + a galle
   through ChildOf tables (without `@tree ChildOf` the window draws empty), so each top-level scene scope keeps
   `@tree ChildOf` until they read Parent children too.
 - Since 4.2, prefabs, constraint traits, cached queries and query plans are addons: features of `hyperion-flecs-c`.
+- flecs orders the systems of one phase by entity id, not by when they were made (a scene load recycles ids), so a
+  system that must see another's results in the same `progress` goes in a later `Phase` (harness-native-flecs: the
+  layout pass in `Layout`, hits and matched geometry in `AfterLayout`, the pointer's resolve in `Resolve`, the draw pass
+  in `Draw`) and declares what it `reads`/`writes` so flecs merges first. Zoom is a uniform scale: layout, draw and input
+  are in view points (window points over `App::zoom()`), plates snap to device pixels at rest, and matched geometry lands
+  (never slides) when the room changes.
 
 ## Target: reactive templates (4.2 has them; no view uses them yet)
 

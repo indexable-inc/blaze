@@ -21,6 +21,8 @@ export class Task {
   effectsDropped = 0;
   /** Bytes of shown values its steps carry (effects.ts bounds it). */
   valueBytes = 0;
+  /** The UI it draws (ui/index.ts): the latest `{type, props, children}` tree (or a list of them) its markup rendered. */
+  ui: unknown = undefined;
   readonly done: Promise<Task>;
   #resolve!: (t: Task) => void;
   /** call: the agent's id for the tool call that ran this cell (Claude's tool_use id), when the client said it. */

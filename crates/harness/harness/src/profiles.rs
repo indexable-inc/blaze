@@ -31,7 +31,11 @@ sub-agent or collaboration tool), so it appears in the harness tree. \
 The person sees every ts cell as it runs, drawn in the chat: its steps in plain words (searches, commands, files read \
 and written, agents started) and its result, with tables drawn as tables and command output as output. So never repeat \
 that in your reply: no markdown table or list restating results you just fetched, no pasted output. Refer to it \
-(\"the third result\", \"the build output above\"), then say what it means and what to do next.";
+(\"the third result\", \"the build output above\"), then say what it means and what to do next. \
+To show a result as UI instead of prose (a dashboard, a comparison, a summary), write a ts cell that is Svelte 5 markup \
+(start it with <script> or an element) using Column, Row, Text (tone: ink muted strong error accent success warning), \
+Markdown, Code, Table (rows of records), Badge, Stat (label, value, note), Card (title), Divider and Spacer; runes only \
+($state, $derived, $effect, $props), and the person sees it drawn under the cell.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();

@@ -20,6 +20,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod genui;
+
 /// cod-chevron-right, cod-chevron-down.
 const CLOSED: &str = "\u{EAB6}";
 const OPENED: &str = "\u{EAB4}";
@@ -251,6 +253,8 @@ enum Row {
     Grid { v: Arc<Value>, cap: usize },
     /// Text a cell printed or returned: a command's output, a string, an error's stack.
     Output { text: String, error: bool },
+    /// What a cell draws (its Svelte markup's tree, [`genui`]).
+    Ui { v: Arc<Value> },
     /// "Show code" under an opened card.
     CodeToggle { block: String, open: bool },
     Thinking { block: String, open: bool, text: String, live: bool },
@@ -278,6 +282,7 @@ impl Row {
             Row::Grid { .. } => "hn.ChatGrid",
             Row::Output { error: true, .. } => "hn.ChatOutputError",
             Row::Output { .. } => "hn.ChatOutput",
+            Row::Ui { .. } => "hn.ChatUi",
             Row::CodeToggle { .. } => "hn.ChatCodeToggle",
             Row::Thinking { open: true, .. } => "hn.ChatThinkingOpen",
             Row::Thinking { .. } => "hn.ChatThinking",
@@ -494,6 +499,7 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
                 "record" => format!("{n} field{}", if n == 1 { "" } else { "s" }),
                 "scalar" => cell_text(&v["v"]),
                 "text" => first_line(v["v"].as_str().unwrap_or("")),
+                _ if !d.ui.is_null() => "Drew a view".into(),
                 _ => "Done".into(),
             };
             (kind_icon(""), words, String::new(), false)
@@ -525,7 +531,14 @@ fn card_rows(block: &str, d: &Detail, open: &HashSet<String>, out: &mut Vec<Row>
     let (icon, words, detail, error) = headline(d);
     let state = d.ms.filter(|_| d.status != "running").map(secs).unwrap_or_default();
     out.push(Row::Card { block: block.to_owned(), icon, words, detail, state, error, open: is_open });
+    // What it draws shows under its head, folded or open, in place of its value.
+    if !d.ui.is_null() {
+        out.push(Row::Ui { v: d.ui.clone() });
+    }
     if !is_open {
+        if !d.ui.is_null() {
+            return;
+        }
         let main = if d.value.is_null() { d.effects.iter().rev().map(|e| &e.value).find(|v| !v.is_null()) } else { Some(&d.value) };
         // A cell whose whole value is its head ("42") shows nothing more.
         if let Some(main) = main.filter(|m| !(d.effects.is_empty() && m["t"] == "scalar")) {
@@ -662,7 +675,7 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Card { words, .. } => vec![(&["head", "words"], words.clone(), false)],
         Row::Step { words, .. } => vec![(&["words"], words.clone(), false)],
         Row::Output { text, .. } => vec![(&["card", "text"], text.clone(), false)],
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => Vec::new(),
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::CodeToggle { .. } | Row::Ui { .. } => Vec::new(),
     }
 }
 
@@ -705,7 +718,7 @@ impl Row {
             Row::Quote(s) => format!("> {s}"),
             Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
             Row::Output { text, .. } => format!("```\n{text}\n```"),
-            Row::Tool { .. } | Row::Thinking { .. } | Row::Card { .. } | Row::Step { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => {
+            Row::Tool { .. } | Row::Thinking { .. } | Row::Card { .. } | Row::Step { .. } | Row::Grid { .. } | Row::CodeToggle { .. } | Row::Ui { .. } => {
                 return None;
             }
         })
@@ -1523,6 +1536,7 @@ fn fill_row(row: View<'_>, r: &Row) {
             text("detail", detail);
         }
         Row::Grid { v, cap } => fill_grid(row, v, *cap),
+        Row::Ui { v } => genui::fill(row, v),
         Row::Output { text: s, .. } => {
             if let Some(t) = row.part("card").and_then(|c| c.part("text")) {
                 t.text(s);

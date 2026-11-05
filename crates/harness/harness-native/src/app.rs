@@ -54,6 +54,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
     ("scene/widgets/chat.flecs", include_str!("../scene/widgets/chat.flecs")),
+    ("scene/widgets/genui.flecs", include_str!("../scene/widgets/genui.flecs")),
     ("scene/widgets/palette.flecs", include_str!("../scene/widgets/palette.flecs")),
     ("scene/widgets/picker.flecs", include_str!("../scene/widgets/picker.flecs")),
     ("scene/widgets/theme.flecs", include_str!("../scene/widgets/theme.flecs")),
@@ -1850,12 +1851,20 @@ impl App {
         self.select(Some(objs[(at + by).rem_euclid(n) as usize]));
     }
 
+    /// Command-= / Command-- / Command-0: the UI's scale steps (layout, drawing and input all in view points, window
+    /// points over the zoom). The pointer has not moved on the screen, so it stays where it is in window points: in view
+    /// points it scales with the zoom (else hover and hits would land on what was under it before the zoom). Matched
+    /// geometry lands on its rows (motion sees the room change), so nothing slides.
     pub fn step_zoom(&mut self, by: i32) {
+        let was = self.zoom();
         self.zoom = match by {
             0 => 4,
             b if b > 0 => (self.zoom + 1).min(ZOOMS.len() - 1),
             _ => self.zoom.saturating_sub(1),
         };
+        let k = was / self.zoom();
+        self.pointer.x *= k;
+        self.pointer.y *= k;
         self.poke();
     }
 
@@ -2014,6 +2023,61 @@ fn set_if(v: View<'_>, fill: Fill) {
 mod tests {
     use super::*;
 
+    /// Zoom is a uniform scale with nothing sliding: the picker's highlight (a MatchedGeometry pill on a row of a card
+    /// centred in the window, so the zoom moves the row in view points) is mid-slide to a new row when cmd+= lands; in that
+    /// same frame the pill sits exactly on its row, and the card is the zoom times as big in window points. It fails when
+    /// matched geometry runs before layout in a pass (flecs orders a phase by recycled entity ids: it read the last pass's
+    /// places) or slides across a change of room. Headless (the scene world, layout and motion; no window, Metal or daemon).
+    #[test]
+    fn zoom_lands_the_pill_on_its_row() {
+        use harness_native_ui_motion_api::Drawn;
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        let (win_w, win_h) = (1280.0_f32, 800.0_f32);
+        let frame = |z: f32| {
+            let room = Viewport { w: win_w / z, h: win_h / z };
+            if w.try_get::<&Viewport>(|v| *v) != Some(room) {
+                world.set(room);
+            }
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        };
+        let picker = View::root(w, "hn.Picker");
+        let items = picker.part("card").and_then(|c| c.part("items")).expect("hn.Picker's card.items");
+        let rows: Vec<View<'_>> = (0..3).map(|_| items.child("hn.PickRowLook")).collect();
+        rows[0].child("hn.PickPill");
+        for _ in 0..30 {
+            frame(1.0);
+        }
+        // Down one row: the old pill goes, the new row's pill slides from where the old one was drawn.
+        rows[0].entity().each_child(|c| c.destruct());
+        let pill = rows[1].child("hn.PickPill");
+        frame(1.0);
+        frame(1.0);
+        let drawn = |p: View<'_>| p.entity().try_cloned::<&Drawn>().expect("the pill is drawn");
+        let laid = |v: View<'_>| v.entity().try_cloned::<&Laid>().expect("laid out");
+        assert!((drawn(pill).y - laid(rows[1]).y).abs() > 1.0, "mid-slide before the zoom");
+        let card = picker.part("card").expect("card");
+        let at1 = laid(card);
+        // cmd+= to 1.25: the room shrinks, the card recentres, the pill lands on its row in this frame.
+        let z = 1.25;
+        frame(z);
+        let (d, r) = (drawn(pill), laid(rows[1]));
+        assert_eq!((d.x, d.y, d.w, d.h), (r.x, r.y, r.w, r.h), "the pill slid across the zoom");
+        let at = laid(card);
+        assert_eq!((at.w, at.h), (at1.w, at1.h), "the card keeps its size in view points (z times it in window points)");
+        assert!(((at.x + at.w * 0.5) * z - win_w * 0.5).abs() < 1e-2, "centred in the window at the zoom");
+        // The next frame, in the same room, moving the selection slides again.
+        rows[1].entity().each_child(|c| c.destruct());
+        let pill = rows[2].child("hn.PickPill");
+        frame(z);
+        frame(z);
+        assert!((drawn(pill).y - laid(rows[2]).y).abs() > 1.0, "a selection still slides");
+    }
+
     /// Every scene script loads, headless (no window, Metal or daemon): the tokens, the primitives, the harness scene and
     /// its widget files, the keys, the primitives gallery and the SwiftUI-vocabulary examples. A prefab named like a
     /// component it sets, or an entity named by a script keyword, fails here with flecs's error instead of at launch.
@@ -2053,7 +2117,9 @@ mod tests {
         let missing: Vec<&str> = [
             "ui.Table", "ui.TableRow", "ui.TableCell", "ui.TableHead", "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep",
             "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput", "hn.ChatOutputError", "hn.ChatCodeToggle", "hn.ChatCell",
-            "hn.ChatCellDim", "hn.ChatCellLink", "hn.ChatHead", "ex.TableDemo",
+            "hn.ChatCellDim", "hn.ChatCellLink", "hn.ChatHead", "ex.TableDemo", "hn.ChatUi", "hn.GenTone.ink",
+            "hn.GenTone.error", "hn.GenColumn", "hn.GenRow", "hn.GenText", "hn.GenMarkdown", "hn.GenCode", "hn.GenTable",
+            "hn.GenBadge", "hn.GenStat", "hn.GenCard", "hn.GenDivider", "hn.GenSpacer", "hn.GenUnknown",
         ]
         .into_iter()
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())

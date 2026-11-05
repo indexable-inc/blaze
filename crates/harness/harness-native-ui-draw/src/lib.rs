@@ -45,7 +45,8 @@ struct Stack {
 
 /// Create the draw systems in the module scope; deleting that scope removes them before unloading.
 pub fn install(world: WorldRef<'_>) {
-    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).each_iter(|it, row, _| {
+    // Last, from this pass's Laid and Drawn (layout and motion `writes` them; flecs merges them first).
+    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Draw).reads(Laid::id()).reads(Drawn::id()).reads(Pose::id()).each_iter(|it, row, _| {
         let e = it.entity(row);
         if e.parent().is_some_and(|p| p.has(Node::id())) {
             return;
