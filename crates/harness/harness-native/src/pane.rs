@@ -9,7 +9,7 @@
 //! - [`TermGrid`]: where the grid sits and how many cells it has (written by the sync, read by hit tests and drawing)
 //! - [`TermCursor`] and [`TermInput`]: the cursor, modes and sizes from the last snapshot (written by drawing, read by input)
 //! - [`TermSelection`]: the selection and the drag making it
-//! - [`TermScroll`]: smooth scrolling and the wheel's remainder; the whole rows back stay on the object's `Term`
+//! - [`TermScroll`]: row-snapped scrolling and the wheel's remainder; the whole rows back stay on the object's `Term`
 //! - [`TermMouse`]: the program's mouse button held down and the cell last reported
 //! - [`MarkedText`]: an input method's uncommitted text (only on the focused terminal)
 //! - [`TermFocus`]: the terminal keys go to (the focused pane's)
@@ -191,9 +191,9 @@ impl TermSelection {
     }
 }
 
-/// Smooth scrolling: the fraction of a row scrolled back past the object's whole rows, wheel lines not yet sent as keys
-/// or reports, and where the last frame drew the grid's first row (above the grid when a fraction is scrolled) and how
-/// many rows back that viewport was.
+/// Row-snapped scrolling: the wheel's fraction of a row not yet scrolled (the grid only moves by whole rows), wheel
+/// lines not yet sent as keys or reports, and where the last frame drew the grid's first row and how many rows back
+/// that viewport was.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct TermScroll {
     pub frac: f32,

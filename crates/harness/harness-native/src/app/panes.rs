@@ -417,8 +417,8 @@ impl App {
         }
         let Some((terms, key)) = self.parser_of(t) else { return };
         let mut st = self.get::<TermScroll>(t);
-        // A fraction of a row back: the viewport one row further back, lifted by what is left of that row.
-        let want = self.scroll(t) + usize::from(st.frac > 0.0);
+        // Whole rows only: the grid snaps to its cells, and a wheel's fraction of a row waits in `frac`.
+        let want = self.scroll(t);
         let mut map = terms.borrow_mut();
         let Some(parser) = map.get_mut(&key) else { return };
         parser.set_scrollback(want);
@@ -428,9 +428,7 @@ impl App {
         parser.set_scrollback(0);
         drop(map);
         self.stats_history(t, history);
-        let lift =
-            if st.frac > 0.0 && shown == want { (1.0 - st.frac) * self.grid.ch } else { 0.0 };
-        st.top = g.y - lift;
+        st.top = g.y;
         st.shift = shown as i64;
         self.put(t, st);
         self.put(t, TermInput::pack(&snap.input));
@@ -442,7 +440,6 @@ impl App {
             .map(|m| m.s.as_str().to_owned())
             .filter(|s| focus && !s.is_empty());
         let sel = self.get::<TermSelection>(t).get();
-        let (np, ng) = (d.panels.len(), d.glyphs.len());
         let paint = term::Paint {
             origin: (g.x, st.top),
             scale: sc,
@@ -462,15 +459,6 @@ impl App {
             &paint,
             upload,
         );
-        if lift > 0.0 {
-            let band = [g.y, g.y + g.h];
-            for p in &mut d.panels[np..] {
-                p.clip[..2].copy_from_slice(&band);
-            }
-            for gl in &mut d.glyphs[ng..] {
-                gl.clip[..2].copy_from_slice(&band);
-            }
-        }
         if self.grid.animating {
             // The cursor fades on the app clock: keep drawing.
             self.poke_why("cursor blink");
@@ -754,7 +742,8 @@ impl App {
     }
 
     /// A scroll of `dy` (points when `precise`, else lines; positive: back into the history) on the terminal under the
-    /// pointer (else the focused one). The primary screen scrolls its history by the pixel; a program with a mouse mode
+    /// pointer (else the focused one). The primary screen scrolls its history a whole row at a time (a trackpad's points
+    /// add up in `frac` until they make a row); a program with a mouse mode
     /// gets wheel reports, a full-screen one arrows.
     pub fn wheel(&mut self, dy: f32, precise: bool, m: KeyMods) {
         let Some(t) = self.term_at().or_else(|| self.focused_term()) else { return };

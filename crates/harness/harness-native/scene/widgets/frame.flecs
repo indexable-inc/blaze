@@ -68,7 +68,7 @@ hn {
   // device row and the Archive pinned under it, and clips what does not fit.
   prefab Tree : ui.Scroll {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-    Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $side_inset, r: 0, t: 0, b: 0}
   }
 
