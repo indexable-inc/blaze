@@ -246,6 +246,30 @@ const TERM_BUNDLED: [(&str, &[u8]); 5] = [
     ),
 ];
 
+/// The character of the bundled Symbols Nerd Font glyph named `name` (its PostScript glyph name, which is the Nerd Fonts
+/// cheat sheet's: `cod-check`, `dev-rust`, `seti-typescript`, `fa-gear`), None when the face has no glyph of that name.
+/// The names are read from the face's `post` and `cmap` tables once.
+#[must_use]
+pub fn nerd_symbol(name: &str) -> Option<char> {
+    use read_fonts::TableProvider;
+    static NAMES: std::sync::OnceLock<HashMap<String, char>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let mut by_name = HashMap::new();
+        let Some((_, bytes)) = TERM_BUNDLED.iter().find(|(n, _)| n.starts_with("SymbolsNerdFont")) else { return by_name };
+        let Ok(font) = read_fonts::FontRef::new(bytes) else { return by_name };
+        let (Ok(post), Ok(cmap)) = (font.post(), font.cmap()) else { return by_name };
+        let Some((_, _, table)) = cmap.best_subtable() else { return by_name };
+        for (cp, gid) in table.iter() {
+            let (Some(c), Ok(g)) = (char::from_u32(cp), u16::try_from(gid.to_u32())) else { continue };
+            if let Some(n) = post.glyph_name(read_fonts::types::GlyphId16::new(g)) {
+                by_name.entry(n.to_owned()).or_insert(c);
+            }
+        }
+        by_name
+    });
+    names.get(name).copied()
+}
+
 /// The Nerd Font symbols face and the colour emoji face, by PostScript name.
 const NERD_FONT: &str = "SymbolsNFM";
 const EMOJI_FONT: &str = "AppleColorEmoji";

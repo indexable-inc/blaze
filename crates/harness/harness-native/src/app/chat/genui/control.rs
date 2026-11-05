@@ -13,6 +13,7 @@ use harness_native_ui_input_api::{Focused, Pressable};
 use harness_native_ui_layout_api::LayoutPriority;
 use harness_native_ui_look_api::Edge;
 use harness_native_ui_motion_api::Pose;
+use std::collections::BTreeMap;
 
 /// The most options a Select, Choice or Radio shows.
 const MAX_OPTIONS: usize = 200;
@@ -24,7 +25,8 @@ const SLIDE_EVERY: f32 = 0.050;
 const CHECK: &str = "\u{EAB2}";
 const CHEVRON: &str = "\u{EAB4}";
 
-/// The controls that keep state while they are used.
+/// The controls that keep state while they are used: with tier 3's Split (its rule dragged as a slider's knob is) and
+/// Toast (a press hides it here as well as sending onDismiss).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Input,
@@ -32,6 +34,8 @@ enum Kind {
     Number,
     Slider,
     Select,
+    Split,
+    Toast,
 }
 
 impl Kind {
@@ -42,6 +46,8 @@ impl Kind {
             Kind::Number => "number",
             Kind::Slider => "slider",
             Kind::Select => "select",
+            Kind::Split => "split",
+            Kind::Toast => "toast",
         }
     }
 
@@ -52,8 +58,15 @@ impl Kind {
             "number" => Kind::Number,
             "slider" => Kind::Slider,
             "select" => Kind::Select,
+            "split" => Kind::Split,
+            "toast" => Kind::Toast,
             _ => return None,
         })
+    }
+
+    /// Dragged: a slider's knob, a split's rule.
+    fn drags(self) -> bool {
+        matches!(self, Kind::Slider | Kind::Split)
     }
 
     fn typed(self) -> bool {
@@ -111,8 +124,17 @@ impl Spec {
 }
 
 /// The Action of a press that sends `value` to `handler` of `cell`.
-fn send(cell: &str, handler: &str, value: Value) -> String {
+pub(super) fn send(cell: &str, handler: &str, value: Value) -> String {
     format!("ui:{}", serde_json::json!([cell, handler, value]))
+}
+
+/// The Action of a press that sends each of `events` (handler, value) to `cell`, in order: one event as [`send`] has it,
+/// more as a list of them (an Accordion's close-then-open, a Menu's pick-then-close).
+pub(super) fn sends(cell: &str, events: &[(String, Value)]) -> String {
+    match events {
+        [(h, v)] => send(cell, h, v.clone()),
+        _ => format!("ui:{}", Value::Array(events.iter().map(|(h, v)| serde_json::json!([cell, h, v])).collect())),
+    }
 }
 
 /// The controls in use: the field that has the keys (its own words, authoritative until it lets them go), the slider
@@ -124,6 +146,29 @@ pub struct Live {
     open: Option<u64>,
     now: f32,
     blink: bool,
+    /// What floats open over the transcript (a popover, a menu, a dialog, a sheet), by its element's entity: what closes
+    /// it. Filled as the trees are drawn; a press off a popover or a menu, or Escape, sends its close.
+    pub(super) floats: BTreeMap<u64, Float>,
+    /// Each toast's words, since when it shows (the clock), and whether it went (its time ran out, or it was pressed).
+    pub(super) toasts: BTreeMap<u64, Toast>,
+    /// Events a drawing decided to send (a toast whose time ran out): (cell, handler, value), sent by the next step.
+    pub(super) pending: Vec<(String, String, Value)>,
+    /// Something drawn moves on the clock (a spinner, a skeleton, a toast's time): keep drawing.
+    pub(super) anim: bool,
+}
+
+/// An open float: its cell, what closes it (the events to send), and whether it is modal (a dialog or a sheet: only
+/// Escape and its scrim close it, a press elsewhere cannot reach anything else).
+pub(super) struct Float {
+    pub(super) cell: String,
+    pub(super) close: Vec<(String, Value)>,
+    pub(super) modal: bool,
+}
+
+pub(super) struct Toast {
+    pub(super) text: String,
+    pub(super) since: f32,
+    pub(super) gone: bool,
 }
 
 struct Field {
@@ -168,7 +213,7 @@ fn flush(link: &Link, out: Vec<Out>) {
 
 // ---- Props ----
 
-fn describe(v: &Value) -> &'static str {
+pub(super) fn describe(v: &Value) -> &'static str {
     match v {
         Value::Null => "missing",
         Value::Bool(_) => "a bool",
@@ -302,19 +347,19 @@ fn shown(v: &Value) -> String {
 }
 
 /// Whether `a` is `b` (an option's value against `selected`): equal JSON, numbers by value (1 and 1.0 are one).
-fn same(a: &Value, b: &Value) -> bool {
+pub(super) fn same(a: &Value, b: &Value) -> bool {
     a == b || matches!((a.as_f64(), b.as_f64()), (Some(x), Some(y)) if x == y)
 }
 
 /// The handler `name` names while the control takes input: set, and the control not disabled.
-fn handler(node: &Value, name: &str) -> Option<String> {
+pub(super) fn handler(node: &Value, name: &str) -> Option<String> {
     if prop(node, "disabled") == &Value::Bool(true) {
         return None;
     }
     prop(node, name).as_str().filter(|s| !s.is_empty()).map(str::to_owned)
 }
 
-fn number(node: &Value, name: &str) -> Option<f64> {
+pub(super) fn number(node: &Value, name: &str) -> Option<f64> {
     prop(node, name).as_f64().filter(|v| v.is_finite())
 }
 
@@ -362,7 +407,7 @@ fn slider_step(min: f64, max: f64) -> f64 {
 // ---- Drawing ----
 
 /// Make `v` pressable with `action`, or not (None): a control that takes no input is never hovered or pressed.
-fn arm(v: View<'_>, action: Option<&str>) {
+pub(super) fn arm(v: View<'_>, action: Option<&str>) {
     let e = v.entity();
     match action {
         Some(a) => {
@@ -389,7 +434,7 @@ fn arm(v: View<'_>, action: Option<&str>) {
 }
 
 /// Fade `v` (and all in it) as `hn.GenInert` does while it takes no input.
-fn inert(v: View<'_>, off: bool) {
+pub(super) fn inert(v: View<'_>, off: bool) {
     let e = v.entity();
     if off {
         let pose = view::prefab(e.world(), "hn.GenInert").and_then(|p| p.try_cloned::<&Pose>()).unwrap_or_default();
@@ -402,7 +447,7 @@ fn inert(v: View<'_>, off: bool) {
 }
 
 /// A row's gap as its prefab has it, or none when its label is empty (so no label takes no room).
-fn gap(v: View<'_>, prefab: &str, label: &str) {
+pub(super) fn gap(v: View<'_>, prefab: &str, label: &str) {
     let base = view::prefab(v.entity().world(), prefab).and_then(|p| p.try_cloned::<&Flex>()).unwrap_or_default();
     let want = if label.is_empty() { Flex { gap: 0.0, ..base } } else { base };
     if v.entity().try_cloned::<&Flex>() != Some(want) {
@@ -412,7 +457,7 @@ fn gap(v: View<'_>, prefab: &str, label: &str) {
 
 /// A labelled control's parts in order (genui.flecs `hn.GenLabelled`): its label when it has one, its `body` made from
 /// `body`, and `menu` when given. The body.
-fn labelled<'a>(v: View<'a>, label: &str, body: &str, menu: Option<&str>) -> Option<View<'a>> {
+pub(super) fn labelled<'a>(v: View<'a>, label: &str, body: &str, menu: Option<&str>) -> Option<View<'a>> {
     let mut parts = Vec::with_capacity(3);
     if !label.is_empty() {
         parts.push(("label", "hn.GenLabel"));
@@ -435,7 +480,9 @@ fn edge_of(world: WorldRef<'_>, prefab: &str, part: &str) -> Option<Edge> {
 }
 
 /// Draw control `node` (of `kind`, one of the controls in genui's ELEMENTS) on `v`, and arm it.
-pub(super) fn control(v: View<'_>, node: &Value, kind: &str, b: &mut Budget<'_, '_>) {
+/// A Button that is a Popover's or Menu's trigger (`within`) sends the trigger's toggle after its own click, and is not
+/// faded for having no onClick of its own.
+pub(super) fn control(v: View<'_>, node: &Value, kind: &str, within: &Within, b: &mut Budget<'_, '_>) {
     let cell = b.cell;
     let label = words(node, "label");
     match kind {
@@ -444,8 +491,14 @@ pub(super) fn control(v: View<'_>, node: &Value, kind: &str, b: &mut Budget<'_, 
                 l.text(&label);
             }
             let h = handler(node, "onClick");
-            arm(v, h.as_deref().map(|h| send(cell, h, Value::Null)).as_deref());
-            inert(v, h.is_none());
+            let mut events: Vec<(String, Value)> = h.iter().map(|h| (h.clone(), Value::Null)).collect();
+            if let Within::Trigger(t) = within
+                && prop(node, "disabled") != &Value::Bool(true)
+            {
+                events.extend(t.iter().cloned());
+            }
+            arm(v, (!events.is_empty()).then(|| sends(cell, &events)).as_deref());
+            inert(v, events.is_empty());
         }
         "Toggle" | "Checkbox" => {
             let key = if kind == "Toggle" { "value" } else { "checked" };
@@ -568,6 +621,42 @@ fn slider(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
     }
 }
 
+/// A Split (genui.flecs `hn.GenSplit`, `hn.GenSplitDown` when vertical): its two panes `a` and `b` shared by the ratio
+/// (their Grow weights), the one the pointer has while its rule is dragged; the rule armed to be dragged when it has an
+/// onChange. The rule is [`SPLIT_HIT`] wide.
+pub(super) fn split(v: View<'_>, node: &Value, kids: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
+    let h = handler(node, "onChange");
+    let spec = Spec { cell: b.cell.to_owned(), node: v.id(), k: Kind::Split, change: h, submit: None, min: 0.05, max: 0.95, step: 0.001 };
+    let mut ratio = number(node, "ratio").unwrap_or(0.5).clamp(0.05, 0.95);
+    if let Some(s) = b.live.as_deref_mut().and_then(|l| l.slide.as_mut()).filter(|s| s.spec.node == v.id()) {
+        s.spec = spec.clone();
+        ratio = s.value;
+    }
+    let down = v.entity().try_cloned::<&Flex>().is_some_and(|f| f.axis == harness_native_ui_layout_api::FlexAxis::Column);
+    for (part, share) in [("a", ratio as f32), ("b", 1.0 - ratio as f32)] {
+        let Some(p) = v.part(part) else { continue };
+        let mut s = p.entity().try_cloned::<&Size>().unwrap_or_default();
+        let axis = if down { &mut s.h } else { &mut s.w };
+        if (axis.value - share).abs() > 1e-5 {
+            axis.value = share;
+            p.set(s);
+        }
+    }
+    if let Some(rule) = v.part("rule") {
+        arm(rule, spec.change.is_some().then(|| spec.action()).as_deref());
+    }
+    for (part, kid) in [("a", kids.first()), ("b", kids.get(1))] {
+        if let (Some(p), Some(kid)) = (v.part(part), kid) {
+            children(p, &[*kid], depth + 1, b);
+        }
+    }
+}
+
+/// The Action of a toast's plate: a press hides it and sends its onDismiss (when it has one).
+pub(super) fn toast_action(cell: &str, node: u64, dismiss: Option<String>) -> String {
+    Spec { cell: cell.to_owned(), node, k: Kind::Toast, change: dismiss, submit: None, min: 0.0, max: 0.0, step: 0.0 }.action()
+}
+
 fn select(v: View<'_>, node: &Value, label: &str, b: &mut Budget<'_, '_>) {
     let cell = b.cell;
     let opts = options(node).unwrap_or_default();
@@ -680,12 +769,28 @@ impl App {
     pub(in crate::app) fn genui_action(&mut self, payload: &str) {
         let parsed: Result<Value, _> = serde_json::from_str(payload);
         match parsed {
-            Ok(Value::Array(a)) if a.len() == 3 => {
+            Ok(Value::Array(a)) if a.len() == 3 && a[0].is_string() => {
                 let (Some(cell), Some(handler)) = (a[0].as_str(), a[1].as_str()) else {
                     eprintln!("harness-native: genui: a press's event names no cell and handler: {payload}");
                     return;
                 };
                 self.link.ui_event(cell, handler, a[2].clone());
+                self.genui.borrow_mut().open = None;
+            }
+            // Events sent in order (an Accordion's close-then-open, a Menu's pick-then-close): each [cell, handler,
+            // value], checked all before any is sent.
+            Ok(Value::Array(all)) if !all.is_empty() && all.iter().all(|e| e.is_array()) => {
+                let mut out = Vec::with_capacity(all.len());
+                for e in &all {
+                    match (e[0].as_str(), e[1].as_str(), e.as_array().map(Vec::len)) {
+                        (Some(cell), Some(handler), Some(3)) => out.push(Out { cell: cell.to_owned(), handler: handler.to_owned(), value: e[2].clone() }),
+                        _ => {
+                            eprintln!("harness-native: genui: a press's events hold one that is not [cell, handler, value]: {payload}");
+                            return;
+                        }
+                    }
+                }
+                flush(&self.link, out);
                 self.genui.borrow_mut().open = None;
             }
             Ok(v @ Value::Object(_)) => {
@@ -698,8 +803,14 @@ impl App {
                         let mut live = self.genui.borrow_mut();
                         live.open = if live.open == Some(spec.node) { None } else { Some(spec.node) };
                     }
-                    Kind::Slider => {
-                        let at = self.slider_at(&spec);
+                    Kind::Toast => {
+                        if let Some(t) = self.genui.borrow_mut().toasts.get_mut(&spec.node) {
+                            t.gone = true;
+                        }
+                        flush(&self.link, Out::new(&spec, spec.change.as_ref(), Value::Null).into_iter().collect());
+                    }
+                    Kind::Slider | Kind::Split => {
+                        let at = self.drag_at(&spec);
                         let mut live = self.genui.borrow_mut();
                         let sent = live.slide.take().filter(|s| s.spec.node == spec.node).and_then(|s| s.sent);
                         drop(live);
@@ -713,6 +824,24 @@ impl App {
             _ => eprintln!("harness-native: genui: a press's action is not an event: {payload}"),
         }
         self.poke();
+    }
+
+    /// Where the pointer puts dragged control `spec`'s value: a slider's ([`Self::slider_at`]) or a split's ratio (the
+    /// rule's middle along the split, less the rule: 0.05 to 0.95, to a thousandth).
+    fn drag_at(&self, spec: &Spec) -> Option<f64> {
+        if spec.k != Kind::Split {
+            return self.slider_at(spec);
+        }
+        let e = self.world.world_ref().entity_from_id(spec.node);
+        if !e.is_alive() {
+            return None;
+        }
+        let v = View::of(e);
+        let l = e.try_cloned::<&Laid>()?;
+        let down = e.try_cloned::<&Flex>().is_some_and(|f| f.axis == harness_native_ui_layout_api::FlexAxis::Column);
+        let rule = v.part("rule").and_then(|r| r.entity().try_cloned::<&Laid>())?;
+        let (at, start, len, hit) = if down { (self.pointer.y, l.y, l.h, rule.h) } else { (self.pointer.x, l.x, l.w, rule.w) };
+        Some(split_ratio(at, start, len, hit))
     }
 
     /// Where the pointer puts slider `spec`'s value: along its rail (the knob's middle within it), snapped and bounded.
@@ -781,10 +910,10 @@ impl App {
         let w = self.world.world_ref();
         let app = w.entity_named(APP);
         let focused = app.target(Focused::id(), 0).and_then(Spec::of).filter(|s| s.k.typed());
-        let pressed = app.target(Pressed::id(), 0).and_then(Spec::of).filter(|s| s.k == Kind::Slider);
+        let pressed = app.target(Pressed::id(), 0).and_then(Spec::of).filter(|s| s.k.drags());
         let hovered = app.target(Hovered::id(), 0).map(|e| *e.id());
         let (now, down, went_down) = (self.time, self.pointer.down, self.pointer.went_down);
-        let at = pressed.as_ref().filter(|_| down).and_then(|s| self.slider_at(s));
+        let at = pressed.as_ref().filter(|_| down).and_then(|s| self.drag_at(s));
         let mut out = Vec::new();
         let mut busy = false;
         {
@@ -842,12 +971,83 @@ impl App {
                     live.open = None;
                 }
             }
+            // What floats: gone from the trees are forgotten; a press off a popover or a menu (off its trigger and its
+            // plate) closes it.
+            prune(w, &mut live);
+            if went_down {
+                let inside = |el: u64| {
+                    hovered.is_some_and(|h| std::iter::successors(Some(w.entity_from_id(h)), |n| n.parent()).take(64).any(|n| *n.id() == el))
+                };
+                let off: Vec<u64> = live.floats.iter().filter(|(el, f)| !f.modal && !inside(**el)).map(|(el, _)| *el).collect();
+                for el in off {
+                    if let Some(f) = live.floats.remove(&el) {
+                        out.extend(f.close.into_iter().map(|(handler, value)| Out { cell: f.cell.clone(), handler, value }));
+                    }
+                }
+            }
+            out.extend(live.pending.drain(..).map(|(cell, handler, value)| Out { cell, handler, value }));
+            busy |= std::mem::take(&mut live.anim);
             busy |= live.field.is_some() && live.blink;
         }
         flush(&self.link, out);
         if busy {
             self.poke_why("genui control");
         }
+    }
+
+    /// Escape over a cell's floats: the open popovers and menus close (each sends its onToggle(false)); with none open,
+    /// the dialogs and sheets that may be dismissed do (onClose(false)). Whether any closed.
+    pub(in crate::app) fn genui_escape(&mut self) -> bool {
+        let w = self.world.world_ref();
+        let out: Vec<Out> = {
+            let mut live = self.genui.borrow_mut();
+            prune(w, &mut live);
+            let light: Vec<u64> = live.floats.iter().filter(|(_, f)| !f.modal).map(|(el, _)| *el).collect();
+            let shut =
+                if light.is_empty() { live.floats.iter().filter(|(_, f)| !f.close.is_empty()).map(|(el, _)| *el).collect() } else { light };
+            shut.into_iter()
+                .filter_map(|el| live.floats.remove(&el))
+                .flat_map(|f| f.close.into_iter().map(move |(handler, value)| Out { cell: f.cell.clone(), handler, value }))
+                .collect()
+        };
+        if out.is_empty() {
+            return false;
+        }
+        flush(&self.link, out);
+        self.poke();
+        true
+    }
+
+    /// The wheel over a cell's Scroll (genui.flecs `hn.GenScroll`, the hovered node or one around it): it moves while it
+    /// can (down or across, as the Scroll goes) and keeps the wheel; at its end the wheel goes on to the transcript.
+    pub(in crate::app) fn genui_wheel(&mut self, dx: f32, dy: f32) -> bool {
+        use harness_native_ui_layout_api::{ScrollExtent, ScrollState};
+        let w = self.world.world_ref();
+        let Some(h) = w.entity_named(APP).target(Hovered::id(), 0) else { return false };
+        let (down, across) = (view::prefab(w, "hn.GenScroll"), view::prefab(w, "hn.GenScrollAcross"));
+        let is = |e: EntityView<'_>, p: Option<EntityView<'_>>| p.is_some_and(|p| e.owns((flecs::IsA::ID, *p.id())));
+        for e in std::iter::successors(Some(h), |n| n.parent()).take(64) {
+            let sideways = is(e, across);
+            if !sideways && !is(e, down) {
+                continue;
+            }
+            let (Some(l), Some(x), st) = (e.try_cloned::<&Laid>(), e.try_cloned::<&ScrollExtent>(), e.try_cloned::<&ScrollState>().unwrap_or_default()) else {
+                return false;
+            };
+            let next = if sideways {
+                let by = if dx.abs() > dy.abs() { dx } else { dy };
+                ScrollState { x: (st.x - by).clamp(0.0, (x.w - l.w).max(0.0)), ..st }
+            } else {
+                ScrollState { y: (st.y - dy).clamp(0.0, (x.h - l.h).max(0.0)), ..st }
+            };
+            if next == st {
+                return false;
+            }
+            e.set(next);
+            self.poke();
+            return true;
+        }
+        false
     }
 
     /// Run `f` on the words of the field that has the keys; whether one has. A one-line field keeps to one line.
@@ -988,6 +1188,22 @@ impl App {
     }
 }
 
+/// A split's ratio with the pointer `at` along it (from `start`, `len` long, its rule `hit` wide): the rule's middle under
+/// the pointer, as a share of the room less the rule, kept within 0.05 and 0.95 and rounded to a thousandth.
+fn split_ratio(at: f32, start: f32, len: f32, hit: f32) -> f64 {
+    let frac = f64::from((at - start - hit * 0.5) / (len - hit).max(1.0));
+    (frac.clamp(0.05, 0.95) * 1000.0).round() / 1000.0
+}
+
+/// Forget the floats and toasts whose elements are gone from the trees (or closed: no plate or scrim now).
+fn prune(w: WorldRef<'_>, live: &mut Live) {
+    live.floats.retain(|el, _| {
+        let e = w.entity_from_id(*el);
+        e.is_alive() && (View::of(e).part("float").is_some() || View::of(e).part("scrim").is_some())
+    });
+    live.toasts.retain(|el, _| w.entity_from_id(*el).is_alive());
+}
+
 /// A number typed into `spec`'s field, bounded; None when it is not one.
 fn parse_num(s: &str, spec: &Spec) -> Option<f64> {
     let v: f64 = s.trim().replace('\u{2212}', "-").parse().ok().filter(|v: &f64| v.is_finite())?;
@@ -1019,5 +1235,16 @@ mod tests {
         assert_eq!(num_value(3.0), serde_json::json!(3));
         assert_eq!(slider_step(0.0, 1.0), 0.01);
         assert!(same(&serde_json::json!(1), &serde_json::json!(1.0)));
+    }
+
+    /// A split's rule dragged to the middle of a 413-wide split (a 13-wide rule) is half; past its ends it stops at 0.05
+    /// and 0.95; a ratio is to a thousandth.
+    #[test]
+    fn a_dragged_split_rule_gives_its_ratio() {
+        assert_eq!(split_ratio(206.5, 0.0, 413.0, 13.0), 0.5);
+        assert_eq!(split_ratio(-50.0, 0.0, 413.0, 13.0), 0.05);
+        assert_eq!(split_ratio(900.0, 0.0, 413.0, 13.0), 0.95);
+        assert_eq!(split_ratio(100.0 + 6.5 + 160.0, 100.0, 413.0, 13.0), 0.4);
+        assert_eq!(split_ratio(123.4567, 0.0, 413.0, 13.0), 0.292);
     }
 }

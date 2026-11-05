@@ -66,9 +66,14 @@ pub fn install(world: WorldRef<'_>) {
         // A view going out on its Transition (an overlay closing, a row folding away) still draws but takes no pointer; one
         // layout left out (Hidden: a ViewThatFits variant, a scroller's part while it is hidden) takes none either.
         let mut leaving = e.has(Leaving::id()) || e.has(Hidden::id());
+        // The highest Layer on it or around it: a node inside a lifted float (a popover's row) is hit in the float's stack.
+        let mut level = e.try_cloned::<&Layer>().map(|l| l.level);
         while let Some(p) = root.parent().filter(|p| p.has(Node::id())) {
             depth += 1;
             root = p;
+            if let Some(l) = p.try_cloned::<&Layer>() {
+                level = level.max(Some(l.level));
+            }
             leaving |= p.has(Leaving::id()) || p.has(Hidden::id());
             if cursor.is_none() {
                 cursor = p.try_cloned::<&Cursor>().map(|c| c.shape);
@@ -86,7 +91,7 @@ pub fn install(world: WorldRef<'_>) {
         if leaving || root.has(Offscreen::id()) || root.has(Hosted::id()) {
             return;
         }
-        let level = root.try_cloned::<&Layer>().map_or_else(Default::default, |l| l.level);
+        let level = level.unwrap_or_default();
         let z = e.try_cloned::<&Z>().map_or(0.0, |z| z.z);
         sink.borrow_mut().push(Hit {
             id: *e.id(),
