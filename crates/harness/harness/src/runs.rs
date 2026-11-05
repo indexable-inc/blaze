@@ -18,7 +18,6 @@
 //! the caller-visible stderr is final.err (every stage's stderr, as it arrived).
 use crate::{archive, db, paths};
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -28,53 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
-#[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum RunReq {
-    /// Start a command; returns `{id}` at once.
-    Run {
-        cmd: String,
-        cwd: Option<String>,
-        /// Variables set on top of the daemon's environment (or instead of it with `clear_env`).
-        #[serde(default)]
-        env: BTreeMap<String, String>,
-        #[serde(default)]
-        clear_env: bool,
-        session: Option<u64>,
-        parent: Option<String>,
-        stdin: Option<String>,
-        /// The REPL (MCP process) that started it, when it has no session; kept in meta as `repl`.
-        repl: Option<String>,
-    },
-    RunStatus { id: String },
-    /// The newest runs (of `session`), up to `limit`; with `before`, only runs numbered below it (the next page back);
-    /// with `q`, only runs whose command or id (`r12`) holds it, case-insensitively (a search over all history).
-    Runs { session: Option<u64>, limit: Option<usize>, before: Option<u64>, q: Option<String> },
-    /// stage: None reads the caller-visible streams (out = "final" stdout, err = final.err).
-    RunRead {
-        id: String,
-        stage: Option<usize>,
-        #[serde(default = "default_stream")]
-        stream: String,
-        #[serde(default)]
-        offset: u64,
-        max_bytes: Option<usize>,
-        /// Long-poll: wait up to this long for new data when there's none yet.
-        #[serde(default)]
-        wait_ms: u64,
-    },
-    RunKill { id: String },
-    RunWait { id: String, timeout_ms: Option<u64> },
-    /// Write to a live run's stdin (runs started with `live_stdin`); `close` ends it (EOF).
-    RunStdin {
-        id: String,
-        data: Option<String>,
-        #[serde(default)]
-        close: bool,
-    },
-}
-
-fn default_stream() -> String { "out".into() }
+pub use harness_proto::msg::RunReq;
 
 struct Live {
     pid: u32,

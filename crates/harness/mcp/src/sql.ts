@@ -5,7 +5,8 @@
 //   sessions, runs, stages   objects filtered by kind
 //   streams   (object, stream, path, bytes, compacted_ms, archive_path): one raw append-only file per object stream
 //   lines     (object, kind, stream, line_no, ts_ms, text): every line stream's line; also named `events`
-//   messages  (object, role, kind, tool, text, ts_ms): agent conversations parsed from their transcripts
+//   messages  (object, role, kind, tool, text, ts_ms): agent conversations: a TUI session's parsed from its transcript
+//             (objects/<id>/messages), a chat session's projected from its log here (wire.ts messageRows)
 //   chat      one row per event of every chat session's log (harness/src/chat/mod.rs has the event model)
 //   chats     one row per chat session
 //
@@ -13,18 +14,26 @@
 // compacted (running runs and sessions), tailed incrementally into memory before each query. Both use
 // one line rule (split on \n, lossy UTF-8; same as archive.rs), so a query answers the same before
 // and after the daemon compacts or restarts. A chat's log is not a line stream: it is never compacted,
-// stays one NDJSON file (objects/<id>/chat) for good, and `chat` reads those files directly, live or
-// long finished alike, numbering lines as the daemon does (harness-chat's `lines`).
+// stays one file (objects/<id>/chat) for good, live or long finished alike: wire.ts's MAGIC, then one
+// deterministic-CBOR event frame per record. The kernel decodes them here, incrementally before each
+// query (from the end of the last whole frame read; a file that shrank or changed inode, as the
+// daemon's one-time NDJSON conversion renames over it, is read again), into chat_lines as JSON text,
+// numbered by record from 1 as the daemon reads them (log.rs). A torn tail (a crash mid-append) is one
+// row with line NULL, read again next query; so is an undecodable frame, and a file that is not a log.
 import { DuckDBInstance, type DuckDBConnection, type DuckDBValue } from "@duckdb/node-api";
 import { existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { table, type Table } from "./table.ts";
 import { effect } from "./effects.ts";
+import { MAGIC, Projection, json, readFrames, readLog, type Log } from "./wire.ts";
 
 const HOME = () => process.env.HARNESS_HOME ?? `${process.env.HOME}/.harness`;
 const lit = (s: string) => `'${s.replaceAll("'", "''")}'`;
 
 type Tail = { object: string; stream: string; offset: number; lines: number };
 const tails = new Map<string, Tail>(); // by path
+/** A chat log read so far: its inode, the end of its last whole frame consumed, its records, its messages projection. */
+type ChatLog = { session: string; ino: number; offset: number; n: number; proj: Projection };
+const chatLogs = new Map<string, ChatLog>(); // by path
 
 let conn: Promise<DuckDBConnection> | undefined;
 let chain: Promise<unknown> = Promise.resolve();
@@ -39,6 +48,9 @@ async function connect(): Promise<DuckDBConnection> {
     create table live_lines(object varchar, stream varchar, line_no bigint, text varchar);
     create table live_tail(object varchar, stream varchar, line_no bigint, text varchar);
     create table live_objs(object varchar);
+    create table chat_lines(session varchar, n bigint, line varchar);
+    create table chat_tail(session varchar, n bigint, line varchar);
+    create table chat_msgs(object varchar, role varchar, kind varchar, tool varchar, text varchar, ts_ms bigint);
     create view objects as select id, kind, name, parent, cwd, args::json as args, created_ms, ended_ms, status, exit_code, signal, meta::json as meta from h.objects;
     create view sessions as select * from objects where kind in ('claude', 'codex', 'cursor', 'shell');
     create view runs as select *, args->>0 as cmd from objects where kind = 'proc';
@@ -104,30 +116,79 @@ async function syncLive(c: DuckDBConnection) {
       union all select object, stream, line_no, null::bigint, text from live_tail
     ) l left join h.objects o on o.id = l.object`);
   await c.run("create or replace view events as select * from lines");
-  const msgs = [...new Bun.Glob("*/messages").scanSync(`${HOME()}/objects`)];
+  await syncChats(c);
+  // A TUI session's transcript rows; a chat session's come from its log (an old `messages` file beside it is left out).
+  const objects = `${HOME()}/objects`;
+  const msgs = existsSync(objects) ? [...new Bun.Glob("*/messages").scanSync(objects)].filter((m) => !existsSync(`${objects}/${m.split("/")[0]}/chat`)) : [];
   await c.run(`create or replace view messages as ${msgs.length
-    ? `select * from read_json([${msgs.map((m) => lit(`${HOME()}/objects/${m}`)).join(", ")}], format = 'newline_delimited', ignore_errors = true,
+    ? `select * from read_json([${msgs.map((m) => lit(`${objects}/${m}`)).join(", ")}], format = 'newline_delimited', ignore_errors = true,
         columns = {object: 'VARCHAR', role: 'VARCHAR', kind: 'VARCHAR', tool: 'VARCHAR', text: 'VARCHAR', ts_ms: 'BIGINT'})`
-    : "select null::varchar object, null::varchar role, null::varchar kind, null::varchar tool, null::varchar text, null::bigint ts_ms where false"}`);
+    : "select null::varchar object, null::varchar role, null::varchar kind, null::varchar tool, null::varchar text, null::bigint ts_ms where false"}
+    union all select object, role, kind, tool, text, ts_ms from chat_msgs`);
   await chatViews(c);
 }
 
-/** Every chat log's lines: (session, n, line), n numbered from 1 over the file's `\n`-split pieces, blanks left out. */
-function chatLines(): string {
+/** Read what is new in every chat log into chat_lines and chat_msgs; its torn tail, or why it is not a log, into chat_tail. */
+async function syncChats(c: DuckDBConnection) {
   const objects = `${HOME()}/objects`;
-  const any = existsSync(objects) && !new Bun.Glob("*/chat").scanSync(objects).next().done;
-  if (!any) return "select null::varchar session, null::bigint n, null::varchar line where false";
-  return `select session, n, line from (
-      select session, generate_subscripts(ls, 1)::bigint n, unnest(ls) line
-      from (select regexp_extract(filename, '/objects/([^/]+)/chat$', 1) session, string_split(content, chr(10)) ls
-            from read_text(${lit(objects + "/*/chat")}))
-    ) where trim(line) != ''`;
+  const paths = new Set(existsSync(objects) ? [...new Bun.Glob("*/chat").scanSync(objects)].map((p) => `${objects}/${p}`) : []);
+  const forget = async (path: string, l: ChatLog) => {
+    await c.run("delete from chat_lines where session = $1", [l.session]);
+    await c.run("delete from chat_msgs where object = $1", [l.session]);
+    chatLogs.delete(path);
+  };
+  for (const [path, l] of chatLogs) if (!paths.has(path)) await forget(path, l);
+  const lines = await c.createAppender("chat_lines");
+  const msgs = await c.createAppender("chat_msgs");
+  const tail: { session: string; n: number }[] = [];
+  const str = (s: string | null) => (s === null ? msgs.appendNull() : msgs.appendVarchar(s));
+  for (const path of paths) {
+    const session = path.slice(objects.length + 1, -"/chat".length);
+    let st;
+    try { st = statSync(path); } catch { continue; } // gone since the glob: forgotten next query
+    let l = chatLogs.get(path);
+    if (l && (st.ino !== l.ino || st.size < l.offset)) { await forget(path, l); l = undefined; } // replaced or cut: read again
+    if (!l) chatLogs.set(path, (l = { session, ino: st.ino, offset: 0, n: 0, proj: new Projection(session) }));
+    if (st.size === l.offset) continue;
+    const buf = Buffer.alloc(st.size - l.offset);
+    const fd = openSync(path, "r");
+    let got: number;
+    try { got = readSync(fd, buf, 0, buf.length, l.offset); } finally { closeSync(fd); }
+    const bytes = new Uint8Array(buf.buffer, buf.byteOffset, got);
+    let log: Log;
+    if (l.offset === 0) {
+      const r = readLog(bytes);
+      if ("notALog" in r) { tail.push({ session, n: 1 }); continue; } // NDJSON the daemon has yet to convert, or foreign
+      if (bytes.length < MAGIC.length) continue; // empty, or cut inside the magic: nothing yet
+      log = r;
+    } else log = readFrames(bytes, l.offset, l.n);
+    for (const r of log.records) {
+      lines.appendVarchar(session); lines.appendBigInt(BigInt(r.n));
+      if (r.event) lines.appendVarchar(json(r.event)); else lines.appendNull();
+      lines.endRow();
+      if (!r.event) continue;
+      for (const m of l.proj.rows(r.event)) {
+        msgs.appendVarchar(m.object); msgs.appendVarchar(m.role); msgs.appendVarchar(m.kind); str(m.tool); msgs.appendVarchar(m.text);
+        if (m.ts_ms === null) msgs.appendNull(); else msgs.appendBigInt(BigInt(m.ts_ms));
+        msgs.endRow();
+      }
+    }
+    l.n += log.records.length;
+    l.offset = log.end;
+    if (log.torn) tail.push({ session, n: l.n + 1 }); // not consumed: read again next query
+  }
+  lines.flushSync(); lines.closeSync();
+  msgs.flushSync(); msgs.closeSync();
+  await c.run("delete from chat_tail");
+  const ta = await c.createAppender("chat_tail");
+  for (const t of tail) { ta.appendVarchar(t.session); ta.appendBigInt(BigInt(t.n)); ta.appendNull(); ta.endRow(); }
+  ta.flushSync(); ta.closeSync();
 }
 
 /** The `chat` and `chats` views over every chat log (see the header). */
 async function chatViews(c: DuckDBConnection) {
   await c.run(`create or replace view chat as
-    with l as (select session, n, line, json_valid(line) valid from (${chatLines()})),
+    with l as (select session, n, line, line is not null valid from (select session, n, line from chat_lines union all select session, n, line from chat_tail)),
     e as (select session, n, valid, case when valid then line::json end j from l)
     select session, n, j->>'ev' ev, (j->>'ts')::bigint ts_ms,
       j->>'ev' in ('block_start', 'delta', 'tool_start', 'tool_delta') partial,

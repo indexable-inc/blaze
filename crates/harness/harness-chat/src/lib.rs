@@ -1,5 +1,5 @@
-//! A chat session's state from its agent-neutral event log (harness/src/chat/mod.rs has the event model): one JSON object
-//! a line, `ev` naming it. This is the one reducer of that log: the daemon folds every event it records through it (the
+//! A chat session's state from its agent-neutral events (harness-proto's `event`; harness/src/chat/mod.rs has the table of
+//! what each means). This is the one reducer of a chat's events: the daemon folds every event it records through it (the
 //! chat's title, model, busy state and the agent's own session id for a resume), the daemon's restore of a past chat folds
 //! the log file through it, and the app folds the events an attach sends through it to draw the transcript.
 //!
@@ -7,11 +7,13 @@
 //! replaces what they grew. A `tool_detail` (what a harness REPL cell a tool call ran did: its steps and value) is kept by
 //! its call's block beside the items, whole each time, whichever comes first. Nothing here knows which agent wrote it.
 //!
-//! [`lines`] splits a log's bytes into its events, reporting a line that is not whole JSON (the torn last line a crash
-//! mid-append leaves) instead of dropping the log.
+//! [`Transcript::feed`] takes the bytes of a chat attach stream (its event frames, harness-proto's `T_EVENT`) in any
+//! pieces; [`Transcript::apply`] one typed event.
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use harness_proto::event::{self as ev, Body, Event, Kind};
+use harness_proto::frame;
 use serde_json::Value;
 
 /// One thing the transcript shows, in the order it happened.
@@ -76,32 +78,29 @@ pub struct Effect {
 }
 
 impl Detail {
-    fn of(v: &Value) -> Self {
-        let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_owned();
-        let effects = v["effects"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|e| Effect {
-                kind: s(e, "kind"),
-                doing: s(e, "doing"),
-                done: s(e, "done"),
-                target: s(e, "target"),
-                status: s(e, "status"),
-                ms: e["ms"].as_u64(),
-                detail: s(e, "detail"),
-                value: Arc::new(e["value"].clone()),
-            })
-            .collect();
+    fn of(d: &ev::Detail) -> Self {
         Self {
-            status: s(v, "status"),
-            ms: v["ms"].as_u64(),
-            code: s(v, "code"),
-            effects,
-            dropped: v["effects_dropped"].as_u64().unwrap_or(0),
-            value: Arc::new(v["value"].clone()),
-            ui: Arc::new(v["ui"].clone()),
-            logs: s(v, "logs"),
+            status: d.status.clone(),
+            ms: d.ms,
+            code: d.code.clone(),
+            effects: d
+                .effects
+                .iter()
+                .map(|e| Effect {
+                    kind: e.kind.clone(),
+                    doing: e.doing.clone(),
+                    done: e.done.clone(),
+                    target: e.target.clone(),
+                    status: e.status.clone(),
+                    ms: e.ms,
+                    detail: e.detail.clone(),
+                    value: Arc::new(e.value.clone()),
+                })
+                .collect(),
+            dropped: d.effects_dropped,
+            value: Arc::new(d.value.clone()),
+            ui: Arc::new(d.ui.clone()),
+            logs: d.logs.clone(),
         }
     }
 }
@@ -125,11 +124,11 @@ pub struct Transcript {
     pub details: HashMap<String, Detail>,
     /// The item each block id is, for its deltas and its final form.
     at: HashMap<String, usize>,
-    /// Bytes of a line not finished yet.
+    /// Bytes of a frame not finished yet.
     buf: Vec<u8>,
 }
 
-/// Two transcripts are equal when they hold the same conversation: the redraw counter and a part line not finished yet
+/// Two transcripts are equal when they hold the same conversation: the redraw counter and a part frame not finished yet
 /// are bookkeeping, not state.
 impl PartialEq for Transcript {
     fn eq(&self, o: &Self) -> bool {
@@ -152,18 +151,6 @@ pub fn title_of(text: &str) -> String {
     s
 }
 
-/// One line of a chat log: its number (from 1), its bytes as written, and its event (None when it is not whole JSON
-/// naming an `ev`: the torn last line a crash mid-append leaves).
-pub type Line<'a> = (usize, &'a [u8], Option<Value>);
-
-/// A chat log's lines (split on `\n`, a trailing piece without one counted as a line), each parsed, blank lines left
-/// out. A line that is not an event comes back with None, for the reader to report and skip; the rest of the log stands.
-pub fn lines(bytes: &[u8]) -> impl Iterator<Item = Line<'_>> {
-    bytes.split(|&b| b == b'\n').enumerate().filter(|(_, l)| !l.iter().all(u8::is_ascii_whitespace)).map(|(i, l)| {
-        (i + 1, l, serde_json::from_slice::<Value>(l).ok().filter(|v| v.get("ev").is_some_and(Value::is_string)))
-    })
-}
-
 impl Transcript {
     /// The name of tool call `block`, once its call came.
     #[must_use]
@@ -174,16 +161,29 @@ impl Transcript {
         }
     }
 
-    /// Bytes of the attach stream: whole lines are applied, a part line waits for the rest.
+    /// Bytes of a chat attach stream: its whole event frames are applied, a part frame waits for the rest. A frame that
+    /// is not an event (a schema bug, never a torn write: the socket carries whole frames) is skipped, and reported.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
         let mut start = 0;
-        while let Some(n) = self.buf[start..].iter().position(|&b| b == b'\n') {
-            let line = &self.buf[start..start + n];
-            if let Ok(v) = serde_json::from_slice::<Value>(line) {
-                self.apply(&v);
+        loop {
+            match frame::split(&self.buf[start..]) {
+                Ok(Some((t, payload, took))) => {
+                    if t == frame::T_EVENT {
+                        match harness_proto::cbor::decode::<Event>(payload) {
+                            Ok(e) => self.apply(&e),
+                            Err(e) => eprintln!("harness-chat: an event frame that is not an event: {e}"),
+                        }
+                    }
+                    start += took;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("harness-chat: {e}; the rest of the stream is dropped");
+                    start = self.buf.len();
+                    break;
+                }
             }
-            start += n + 1;
         }
         self.buf.drain(..start);
     }
@@ -201,96 +201,94 @@ impl Transcript {
     }
 
     /// One event.
-    pub fn apply(&mut self, v: &Value) {
-        let s = |k: &str| v[k].as_str().unwrap_or("").to_owned();
-        let block = s("block");
+    pub fn apply(&mut self, e: &Event) {
         self.rev = self.rev.wrapping_add(1);
-        match v["ev"].as_str().unwrap_or("") {
-            "session" => {
-                self.agent = s("agent");
-                self.model = s("model");
-                if let Some(id) = v["session_id"].as_str().filter(|id| !id.is_empty()) {
-                    self.session_id = id.to_owned();
+        match &e.body {
+            Body::Session { agent, model, session_id } => {
+                self.agent.clone_from(agent);
+                self.model.clone_from(model);
+                if let Some(id) = session_id.as_ref().filter(|id| !id.is_empty()) {
+                    self.session_id.clone_from(id);
                 }
             }
-            "user" => {
+            Body::User { text } => {
                 if self.title.is_empty() {
-                    self.title = title_of(v["text"].as_str().unwrap_or(""));
+                    self.title = title_of(text);
                 }
-                self.push("", Item::User { text: s("text") });
+                self.push("", Item::User { text: text.clone() });
             }
-            "busy" => self.busy = v["busy"].as_bool().unwrap_or(false),
-            "block_start" => {
-                let item = if v["kind"] == "thinking" {
-                    Item::Thinking { block: block.clone(), text: String::new(), done: false }
-                } else {
-                    Item::Text { block: block.clone(), text: String::new(), done: false }
+            Body::Busy { busy } => self.busy = *busy,
+            Body::BlockStart { block, kind } => {
+                let item = match kind {
+                    Kind::Thinking => Item::Thinking { block: block.clone(), text: String::new(), done: false },
+                    Kind::Text => Item::Text { block: block.clone(), text: String::new(), done: false },
                 };
-                self.push(&block, item);
+                self.push(block, item);
             }
-            "delta" => match self.get(&block) {
-                Some(Item::Text { text, done: false, .. } | Item::Thinking { text, done: false, .. }) => {
-                    text.push_str(v["text"].as_str().unwrap_or(""));
+            Body::Delta { block, text: more } => {
+                if let Some(Item::Text { text, done: false, .. } | Item::Thinking { text, done: false, .. }) = self.get(block) {
+                    text.push_str(more);
                 }
-                _ => {}
-            },
-            "block" => {
-                let (kind, text) = (s("kind"), s("text"));
-                let item = if kind == "thinking" {
-                    Item::Thinking { block: block.clone(), text, done: true }
-                } else {
-                    Item::Text { block: block.clone(), text, done: true }
+            }
+            Body::Block { block, kind, text } => {
+                let item = match kind {
+                    Kind::Thinking => Item::Thinking { block: block.clone(), text: text.clone(), done: true },
+                    Kind::Text => Item::Text { block: block.clone(), text: text.clone(), done: true },
                 };
-                match self.at.get(&block).copied() {
+                match self.at.get(block).copied() {
                     Some(i) => self.items[i] = item,
-                    None => self.push(&block, item),
+                    None => self.push(block, item),
                 }
             }
-            "tool_start" => {
+            Body::ToolStart { block, name } => {
                 let item = Item::Tool {
                     block: block.clone(),
-                    name: s("name"),
+                    name: name.clone(),
                     input: Value::Null,
                     partial: String::new(),
                     result: None,
                     done: false,
                 };
-                self.push(&block, item);
+                self.push(block, item);
             }
-            "tool_delta" => {
-                if let Some(Item::Tool { partial, done: false, .. }) = self.get(&block) {
-                    partial.push_str(v["json"].as_str().unwrap_or(""));
+            Body::ToolDelta { block, json } => {
+                if let Some(Item::Tool { partial, done: false, .. }) = self.get(block) {
+                    partial.push_str(json);
                 }
             }
-            "tool_call" => {
-                let (name, input) = (s("name"), v["input"].clone());
-                match self.get(&block) {
-                    Some(Item::Tool { name: n, input: i, partial, done, .. }) => {
-                        *n = name;
-                        *i = input;
-                        // The whole call replaces its streamed arguments (a replay that left them out holds the same).
-                        partial.clear();
-                        *done = true;
-                    }
-                    _ => self.push(
-                        &block,
-                        Item::Tool { block: block.clone(), name, input, partial: String::new(), result: None, done: true },
-                    ),
+            Body::ToolCall { block, name, input } => match self.get(block) {
+                Some(Item::Tool { name: n, input: i, partial, done, .. }) => {
+                    n.clone_from(name);
+                    i.clone_from(input);
+                    // The whole call replaces its streamed arguments (a replay that left them out holds the same).
+                    partial.clear();
+                    *done = true;
                 }
-            }
-            "tool_result" => {
-                let r = ToolResult { text: s("text"), error: v["error"].as_bool().unwrap_or(false) };
-                match self.get(&block) {
+                _ => self.push(
+                    block,
+                    Item::Tool {
+                        block: block.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        partial: String::new(),
+                        result: None,
+                        done: true,
+                    },
+                ),
+            },
+            Body::ToolResult { block, text, error } => {
+                let r = ToolResult { text: text.clone(), error: *error };
+                match self.get(block) {
                     Some(Item::Tool { result, .. }) => *result = Some(r),
                     _ => self.push("", Item::Note { text: r.text }),
                 }
             }
-            "tool_detail" => {
-                self.details.insert(block, Detail::of(v));
+            Body::ToolDetail(d) => {
+                self.details.insert(d.block.clone(), Detail::of(d));
             }
-            "note" => self.push("", Item::Note { text: s("text") }),
-            "error" => self.push("", Item::Error { text: s("text") }),
-            "turn_end" => {
+            Body::Note { text } => self.push("", Item::Note { text: text.clone() }),
+            Body::Error { text } => self.push("", Item::Error { text: text.clone() }),
+            Body::TurnEnd { ok, stop, duration_ms, cost_usd, .. } => {
                 // A turn's partials that never came whole (the agent died mid-block) stop streaming.
                 for it in &mut self.items {
                     match it {
@@ -300,15 +298,9 @@ impl Transcript {
                 }
                 self.push(
                     "",
-                    Item::TurnEnd {
-                        ok: v["ok"].as_bool().unwrap_or(false),
-                        stop: s("stop"),
-                        duration_ms: v["duration_ms"].as_u64(),
-                        cost_usd: v["cost_usd"].as_f64(),
-                    },
+                    Item::TurnEnd { ok: *ok, stop: stop.clone(), duration_ms: *duration_ms, cost_usd: *cost_usd },
                 );
             }
-            _ => self.rev = self.rev.wrapping_sub(1),
         }
     }
 }
@@ -331,7 +323,6 @@ mod tests {
 
     #[test]
     fn partials_grow_and_the_final_replaces_them() {
-        let mut t = Transcript::default();
         let lines = [
             r#"{"ev":"user","text":"hi"}"#,
             r#"{"ev":"busy","busy":true}"#,
@@ -346,9 +337,13 @@ mod tests {
             r#"{"ev":"turn_end","ok":true,"stop":"end_turn","duration_ms":1200,"cost_usd":0.01}"#,
             r#"{"ev":"busy","busy":false}"#,
         ];
-        let all = lines.join("\n") + "\n";
-        // Fed in two pieces cut mid-line.
-        let (a, b) = all.as_bytes().split_at(57);
+        let all: Vec<u8> = lines
+            .iter()
+            .flat_map(|l| Event::from_json(&serde_json::from_str(l).unwrap()).unwrap().frame())
+            .collect();
+        // Fed in two pieces cut mid-frame.
+        let mut t = Transcript::default();
+        let (a, b) = all.split_at(57);
         t.feed(a);
         t.feed(b);
         assert_eq!(t.items.len(), 4);
