@@ -35,7 +35,8 @@ function cell(v: unknown): [Cell, ColType] {
     case "string": return [clip(v, MAX_CELL), /^https?:\/\/\S+$/.test(v) ? "url" : "string"];
   }
   if (v instanceof Date) return [Number.isNaN(v.getTime()) ? null : v.toISOString(), "date"];
-  return [clip(nuon(v), MAX_CELL), "nested"];
+  // One line: a cell is drawn on one line, and a nested table prints its rows on lines of their own.
+  return [clip(nuon(v).replace(/\s*\n\s*/g, " "), MAX_CELL), "nested"];
 }
 
 /** The column type of cells of these types: the one they share (nulls aside), else `mixed`. */
