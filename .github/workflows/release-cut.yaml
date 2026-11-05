@@ -24,7 +24,7 @@ jobs:
   release:
     name: release
     if: github.ref == 'refs/heads/main'
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     timeout-minutes: 10
     permissions:
       contents: write

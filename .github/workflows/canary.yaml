@@ -43,7 +43,7 @@ jobs:
   cut:
     name: cut
     if: github.repository == 'indexable-inc/blaze'
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     # canary.py waits at most 90 minutes for main's build.
     timeout-minutes: 100
     permissions:

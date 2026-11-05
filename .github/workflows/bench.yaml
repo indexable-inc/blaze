@@ -36,7 +36,7 @@ defaults:
 jobs:
   tango:
     name: tango
-    runs-on: [ix, arm64, ix-cpu-64, blaze-tango]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-64, blaze-tango]
     # Two builds by blaze from main's build store, which runs longer than an hour when cold.
     timeout-minutes: 240
     steps:

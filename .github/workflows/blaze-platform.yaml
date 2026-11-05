@@ -81,7 +81,7 @@ jobs:
     # (harness/unittests.py), and hands over what it compiled, so only the crates built with
     # `cfg(test)` are compiled here.
     needs: build
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-tests"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-64", "blaze-tests"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     # A store blaze's release has not compiled into yet: 49 min on Linux x86-64, and over an
     # hour on macOS's 7 GB runner (the 16-minute step of 4-cpu Linux had not ended at 48). Long
     # enough for that one run to finish and push, which the runs after it then pull.
@@ -155,7 +155,7 @@ jobs:
 
   build:
     name: build
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-build"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-64", "blaze-build"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     # A store blaze's release has not compiled into builds for about 97 minutes on Linux
     # x86-64 (docs/unit-keys.md), and longer on macOS's 7 GB runner.
     timeout-minutes: ${{ startsWith(inputs.os, 'macos') && 240 || 150 }}
@@ -288,7 +288,7 @@ jobs:
     name: profile gate
     needs: build
     if: inputs.harnesses == '' && !startsWith(inputs.os, 'windows')
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-profile-gate"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-16", "blaze-profile-gate"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -346,7 +346,7 @@ jobs:
     name: harness (${{ matrix.part }})
     if: (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-harness"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-16", "blaze-harness"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     # A fast part is about four minutes of harnesses: one that hangs ends here, not at the hour.
     timeout-minutes: ${{ inputs.tier == 'fast' && inputs.harnesses == '' && 25 || 60 }}
     strategy:
@@ -426,7 +426,7 @@ jobs:
     # merge, and promote.yaml runs the whole corpus on every release before it is stable.
     if: inputs.smoke && inputs.tier != 'gate'
     needs: build
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-smoke"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-16", "blaze-smoke"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     timeout-minutes: ${{ (inputs.tier == 'fast' || inputs.tier == 'full') && 15 || 60 }}
     steps:
       - uses: actions/checkout@v7
@@ -453,7 +453,7 @@ jobs:
     name: blaze (${{ matrix.group }})
     if: inputs.blaze-cli
     needs: build
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-blaze-cli"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-16", "blaze-blaze-cli"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -497,7 +497,7 @@ jobs:
     name: projects (${{ matrix.projects }})
     if: inputs.projects
     needs: build
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-64", "blaze-projects"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-64", "blaze-projects"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     timeout-minutes: 120
     # Known to fail until https://github.com/indexable-inc/blaze/issues/26 is fixed: a test of
     # axum's example-testing crashes in the test binary the daemon builds. nushell's cold build
@@ -535,7 +535,7 @@ jobs:
     name: bench (ripgrep)
     if: inputs.bench
     needs: build
-    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON('["ix", "arm64", "ix-cpu-16", "blaze-bench"]') || inputs.os }}
+    runs-on: ${{ inputs.platform == 'linux-arm64' && fromJSON(format('["{0}", "arm64", "ix-cpu-16", "blaze-bench"]', (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix')) || inputs.os }}
     timeout-minutes: 60
     continue-on-error: true
     steps:

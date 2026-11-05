@@ -72,7 +72,7 @@ jobs:
   # .github/scripts/gate_changes.py). Anything that cannot be told counts as code.
   changes:
     name: changes
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     timeout-minutes: 5
     outputs:
       tier: ${{ steps.files.outputs.tier }}
@@ -94,7 +94,7 @@ jobs:
 
   scripts:
     name: harness imports, rustc sites
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -132,7 +132,7 @@ jobs:
   # passes are off. What it is told to ignore is in .github/actionlint.yaml.
   workflows:
     name: actionlint
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -161,7 +161,7 @@ jobs:
     name: linux x64 (cross-compiled, not run)
     needs: changes
     if: needs.changes.outputs.tier != 'none'
-    runs-on: [ix, arm64, ix-cpu-64, blaze-linux-x64-cross]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-64, blaze-linux-x64-cross]
     timeout-minutes: 150
     env:
       # Read by blaze's daemon when it starts (blaze-link's C driver, cc-rs in build scripts), so
@@ -243,7 +243,7 @@ jobs:
     name: blaze check --workspace, linux arm64
     needs: changes
     if: needs.changes.outputs.tier != 'none'
-    runs-on: [ix, arm64, ix-cpu-64, blaze-workspace-check]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-64, blaze-workspace-check]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -279,7 +279,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.tier != 'none'
     # On a 64-vCPU ix runner, as blaze-platform.yaml's build.
-    runs-on: [ix, arm64, ix-cpu-64, blaze-lint-baselines]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64, ix-cpu-64, blaze-lint-baselines]
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
@@ -306,7 +306,7 @@ jobs:
     name: ci
     needs: [changes, scripts, workflows, linux-arm64, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
-    runs-on: [ix, arm64]
+    runs-on: ["${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && 'ix-trusted' || 'ix' }}", arm64]
     timeout-minutes: 5
     steps:
       - env:
