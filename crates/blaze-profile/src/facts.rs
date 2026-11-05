@@ -454,6 +454,97 @@ pub fn misses(rows: &[MissRow]) -> Result<RecordBatch, ArrowError> {
     RecordBatch::try_new(batches::schema_of(&schema::MISSES), columns)
 }
 
+/// The most text one batch of a fact table holds. Arrow's `Utf8` columns address their bytes
+/// with `i32` offsets, so one column past 2 GiB is an "offset overflow"; a cold workspace
+/// build's `key_parts` passed that in one build (#1726). A quarter of a GiB a batch keeps every
+/// column far below it, whatever share of a row's text one column holds.
+pub const BATCH_TEXT_BYTES: usize = 256 << 20;
+
+/// `rows` as consecutive runs, in order, each holding at most `most` bytes of text by
+/// `text_bytes` (a row larger than `most` alone in its run): every row in exactly one run.
+pub fn runs<'a, T>(
+    rows: &'a [T],
+    text_bytes: impl Fn(&T) -> usize + 'a,
+    most: usize,
+) -> impl Iterator<Item = &'a [T]> + 'a {
+    let mut rest = rows;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut bytes = 0usize;
+        let mut end = 0;
+        while let Some(row) = rest.get(end) {
+            let next = bytes.saturating_add(text_bytes(row));
+            if end > 0 && next > most {
+                break;
+            }
+            bytes = next;
+            end += 1;
+        }
+        let (run, after) = rest.split_at(end);
+        rest = after;
+        Some(run)
+    })
+}
+
+/// `rows` as batches of `batch`, split by [`runs`] at `most` bytes of text (the flush passes
+/// [`BATCH_TEXT_BYTES`]); no rows is one empty batch, so every table still has its part.
+pub fn in_batches<T>(
+    rows: &[T],
+    text_bytes: impl Fn(&T) -> usize,
+    most: usize,
+    batch: impl Fn(&[T]) -> Result<RecordBatch, ArrowError>,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    if rows.is_empty() {
+        return Ok(vec![batch(rows)?]); // alloc: a flush's parts, once a flush
+    }
+    // alloc: a flush's parts, once a flush
+    runs(rows, text_bytes, most).map(batch).collect()
+}
+
+fn text_len(text: Option<&str>) -> usize {
+    text.map_or(0, str::len)
+}
+
+impl ProvenanceRow {
+    /// The bytes of text this row puts in its batch's string columns.
+    pub fn text_bytes(&self) -> usize {
+        self.query_key.len()
+            + self.kind.len()
+            + text_len(self.cause)
+            + text_len(self.cause_key.as_deref())
+            + text_len(self.cause_kind)
+            + text_len(self.what)
+    }
+}
+
+impl KeyPartRow {
+    /// The bytes of text this row puts in its batch's string columns.
+    pub fn text_bytes(&self) -> usize {
+        self.step.len()
+            + self.item.len()
+            + self.key.len()
+            + text_len(self.part.as_deref())
+            + text_len(self.hash.as_deref())
+            + text_len(self.names.as_deref())
+            + text_len(self.beyond)
+    }
+}
+
+impl MissRow {
+    /// The bytes of text this row puts in its batch's string columns.
+    pub fn text_bytes(&self) -> usize {
+        self.step.len()
+            + self.item.len()
+            + self.cause.len()
+            + text_len(self.what.as_deref())
+            + text_len(self.names.as_deref())
+            + text_len(self.was.as_deref())
+            + text_len(self.now.as_deref())
+    }
+}
+
 fn column(array: impl arrow_array::Array + 'static) -> ArrayRef {
     // alloc: a batch's column, once a flush
     std::sync::Arc::new(array)
@@ -468,6 +559,45 @@ mod tests {
     use arrow_array::{Array, cast::AsArray};
 
     use super::*;
+
+    /// Every row lands in exactly one run, in order, and a run holds more than `most` bytes of
+    /// text only when it is a single row: what keeps one flush's `key_parts` under the 2 GiB a
+    /// `Utf8` column holds (#1726).
+    #[hegel::test(test_cases = 300)]
+    fn runs_keep_every_row_once_in_order_under_the_cap(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let sizes: Vec<usize> =
+            tc.draw(gs::vecs(gs::integers::<usize>().max_value(1 << 12)).max_size(200));
+        let most = tc.draw(gs::integers::<usize>().max_value(1 << 13));
+        let rows: Vec<(usize, usize)> = sizes.iter().copied().enumerate().collect();
+        let mut seen = Vec::new();
+        for run in runs(&rows, |it| it.1, most) {
+            assert!(!run.is_empty(), "a run holds a row");
+            let bytes: usize = run.iter().map(|it| it.1).sum();
+            assert!(run.len() == 1 || bytes <= most, "{bytes} bytes in {} rows over {most}", run.len());
+            seen.extend(run.iter().map(|it| it.0));
+        }
+        assert_eq!(seen, (0..rows.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_flush_of_more_text_than_one_batch_holds_is_split_and_keeps_every_row() {
+        let row = KeyPartRow {
+            build_id: 7,
+            step: "codegen",
+            item: "x".repeat(1000),
+            key: "ab".into(),
+            part: None,
+            hash: None,
+            names: None,
+            beyond: None,
+        };
+        let most = 10 * row.text_bytes();
+        let rows = vec![row; 25];
+        let batches = in_batches(&rows, KeyPartRow::text_bytes, most, key_parts).unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(), [10, 10, 5]);
+        assert_eq!(in_batches(&[], KeyPartRow::text_bytes, most, key_parts).unwrap().len(), 1);
+    }
 
     #[test]
     fn a_links_row_says_patched_or_placed_and_a_crate_edge_its_kind() {
