@@ -1,4 +1,6 @@
-import { CONTROLS, DRAWING, TEXT_PROP, ViewNode, controlWire, wholeChartError, wireValue } from './element.ts';
+import { DRAWING, PROPS, article, TEXT_PROP, WIRED, WORDS_ONLY, ViewNode, elementWire, holdsError, placeError, wholeChartError, wireValue } from './element.ts';
+import type { ElementName } from './element.ts';
+import { resolveFile } from './media.ts';
 import type { Attachment, Handler } from './element.ts';
 import { drawWire } from './draw.ts';
 import type { Paint } from './draw.ts';
@@ -14,6 +16,9 @@ import { placed, rooted, runtime } from './svelte.ts';
 
 /** One drawn element: what travels to the app. */
 export interface UiNode { type: string; props: Record<string, unknown>; children: UiNode[] }
+
+/** The prop of an element that names a file on disk, sent as its absolute path. */
+const FILE_PROP: Partial<Record<string, string>> = { Image: 'src', FileRef: 'path' };
 
 /** At most one render per this long. */
 export const RENDER_MS = 16;
@@ -228,7 +233,11 @@ export class UiTree implements Attachment {
     const props: Record<string, unknown> = {};
     for (const [name, value] of Object.entries(node.props)) {
       if (node.ids.has(name)) props[name] = value;
-      else {
+      // A picture's or a file chip's file goes as its absolute path (media.ts), resolved before JSON would make a Bun.file `{}`.
+      else if (FILE_PROP[node.type] === name && value !== undefined && value !== null) {
+        try { props[name] = resolveFile(value, `<${node.type} ${name}>`); }
+        catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+      } else {
         const kept = plain(value);
         if (kept !== undefined) props[name] = kept;
       }
@@ -257,11 +266,21 @@ export class UiTree implements Attachment {
       return { type: node.type, props: drawn.props, children: leaf ? [] : this.children(node, drawn.paint) };
     }
     for (const [name, value] of Object.entries(props)) props[name] = wireValue(node.type, name, value);
-    // A control goes as exactly what the app reads of it (element.ts `controlWire`); a Button's words are its label, and nothing else is in it.
-    if (CONTROLS.has(node.type)) {
-      if (kids.some(child => child.isElement)) throw placed(new TypeError(`<${node.type}> holds ${kids.find(child => child.isElement)!.type}${node.at ? ` (${node.at})` : ''}: ${node.type === 'Button' ? 'a Button holds only its words, <Button>Save</Button>' : `a ${node.type} holds nothing`}`), node.at);
-      try { return { type: node.type, props: controlWire(node.type, props, node.at), children: [] }; }
-      catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+    // A control, and every element of tier 3, goes as exactly what the app reads of it (element.ts `elementWire`). One that holds only
+    // its words (a Button's label) or nothing has no children on the wire; the rest hold what `holdsError` lets them, where `placeError` does.
+    if (WIRED.has(node.type)) {
+      const where = node.at ? ` (${node.at})` : '';
+      const leaf = WORDS_ONLY.has(node.type) || !PROPS[node.type as ElementName].includes('children');
+      const inner = kids.find(child => child.isElement);
+      if (leaf && inner) throw placed(new TypeError(`<${node.type}> holds ${inner.type}${where}: ${WORDS_ONLY.has(node.type) ? `${article(node.type)} ${node.type} holds only its words, <${node.type}>${node.type === 'Button' ? 'Save' : 'Open'}</${node.type}>` : `${article(node.type)} ${node.type} holds nothing`}`), node.at);
+      try {
+        const error = placeError(node.type, node.parent?.type, node.at);
+        if (error) throw error;
+        const children = leaf ? [] : this.children(node);
+        const holds = holdsError(node.type, children.map(child => child.type), node.at);
+        if (holds) throw holds;
+        return { type: node.type, props: elementWire(node.type, props, node.at), children };
+      } catch (error) { throw error instanceof Error && !error.stack?.includes('repl-cell.js') ? placed(error, node.at) : error; }
     }
     return { type: node.type, props, children: leaf ? [] : this.children(node) };
   }

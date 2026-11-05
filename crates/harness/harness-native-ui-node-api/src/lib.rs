@@ -90,7 +90,8 @@ pub enum Level {
     Top,
 }
 
-/// The stack of a root node (`Layer: {level: Overlay}`); absent means `Base`. Children follow their root.
+/// The stack a node is drawn and hit-tested in (`Layer: {level: Overlay}`); absent means its root's (`Base` on a root). On a
+/// node inside a tree it lifts that node and all in it to its level when that is above its tree's (a float a view opens).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Layer {
     pub level: Level,

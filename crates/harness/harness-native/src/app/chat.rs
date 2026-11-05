@@ -1424,6 +1424,10 @@ impl App {
         if self.genui_editing() {
             return self.genui_edit(op);
         }
+        // Escape closes what a cell floats over the transcript (a popover, a menu, a dialog) before it interrupts.
+        if op == "interrupt" && self.genui_escape() {
+            return;
+        }
         let Some((_, _, sid)) = self.focused_chat() else { return };
         self.tree_focus = false;
         let (select, name) = match op.strip_prefix("select_") {

@@ -849,10 +849,34 @@ impl Painter {
         }
         let Some(pic) = e.try_cloned::<&Picture>() else { return Ok(()) };
         if !e.has(Pixelated::id()) {
-            return Err(format!(
-                "{path}: Picture {:?} without Pixelated: only pixel art is drawn so far",
-                pic.handle.as_str()
-            ));
+            // A photo (an absolute path to a PNG or JPEG): filtered, covering its box, cut to the box's shape about its
+            // middle (layout gives a contained photo a box of its own shape).
+            let handle = pic.handle.as_str();
+            if !handle.starts_with('/') {
+                return Err(format!(
+                    "{path}: Picture {handle:?} without Pixelated: a photo is an absolute path, pixel art is Pixelated"
+                ));
+            }
+            let rest = e.try_cloned::<&Laid>().map_or([rect[2], rect[3]], |l| [l.w, l.h]);
+            if rest[0] <= 0.0 || rest[1] <= 0.0 {
+                return Ok(());
+            }
+            // The shape to a thousandth, so a box that wobbles by a fraction of a point decodes once.
+            let milli = (rest[0] / rest[1] * 1000.0).round().max(1.0) as u32;
+            let key = format!("photo:{milli}:{handle}");
+            let sheet = match self.sheets.get(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let ph = crate::photo::decode(std::path::Path::new(handle), Some(milli as f32 / 1000.0))
+                        .map_err(|err| format!("{path}: {err}"))?;
+                    let s = Rc::new(Sheet { w: ph.w, h: ph.h, frames: vec![ph.rgba] });
+                    self.sheets.insert(key, s.clone());
+                    s
+                }
+            };
+            let img = ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 1.0], clip: [0.0; 4], clipx: [0.0; 4] };
+            d.image(img, sheet.frames[0].clone());
+            return Ok(());
         }
         let frames = e.try_cloned::<&Frames>().unwrap_or(Frames { count: 1, fps: 0.0 });
         let sheet = self

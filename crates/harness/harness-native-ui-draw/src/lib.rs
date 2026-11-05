@@ -114,6 +114,12 @@ fn walk(
         return;
     }
     let Some(laid) = e.try_cloned::<&Laid>() else { return };
+    // A node with a Layer of its own above its tree's lifts itself and all in it into that stack: a float a view opens
+    // over the rest of its window (a popover, a dialog's scrim) is drawn over every root below that level.
+    let stack = match e.try_cloned::<&Layer>() {
+        Some(l) if l.level > stack.level => Stack { level: l.level, ..stack },
+        _ => stack,
+    };
     // Mid-slide (MatchedGeometry) it is drawn at its Drawn frame and its children move with it.
     let drawn = e.try_cloned::<&Drawn>();
     let frame = drawn.map_or(Cut::of(&laid), |d| Cut { x: d.x, y: d.y, w: d.w, h: d.h });

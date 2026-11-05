@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { AT, BINDABLE, ELEMENT_NAMES, COMPONENT, ViewNode, cellError, isKnownElement } from './element.ts';
+import { AT, BINDABLE, BOUND_BY, ELEMENT_NAMES, COMPONENT, NOT_DRAWN, ViewNode, cellError, isKnownElement, notDrawnError } from './element.ts';
 import type { CellComponent, Handler } from './element.ts';
 import { SVG_TAGS, attributeError, isSvgTag, unknownTagError } from './draw.ts';
 import { FAILED_SNIPPET, PENDING_SNIPPET, compileComponent } from './compile.ts';
@@ -95,6 +95,7 @@ const renderer = {
       node.from = name;
       return node;
     }
+    if (NOT_DRAWN.has(name)) throw cellError(notDrawnError(name));
     if (!isKnownElement(name)) throw cellError(unknownTagError(name));
     return ViewNode.element(name);
   },
@@ -143,20 +144,24 @@ const components = new Map<string, CellComponent>();
 
 /**
  * Svelte source for one element as a component: its props are the element's, reactive ones updating just that attribute. A bindable
- * control (element.ts `BINDABLE`) declares its bound prop `$bindable()` and always listens for `change`: the event's value is written
- * back to the prop first (so `bind:value` follows the person, and a plain `value={x}` still moves under their hand), then the cell's
- * own `onchange` runs. So a bound control always carries its `onChange` handler id. Copied from den's repl/src/ui/svelte.ts.
+ * element (element.ts `BINDABLE`) declares its bound prop `$bindable()` and always listens for the events that write it back (`change`,
+ * or element.ts `BOUND_BY`: `toggle` for a fold or a float, `close` for a Dialog): the event's value (or the fixed one, `false` for a
+ * close) is written back to the prop first (so `bind:open` follows the person, and a plain `open={x}` still moves under their hand),
+ * then the cell's own handler runs. So a bound element always carries those handler ids. Copied from den's repl/src/ui/svelte.ts.
  */
 export function hostSource(name: string): string {
   const bound = BINDABLE[name];
   if (!bound) {
     return `<script>let { children, ...rest } = $props();</script><svelte:element this={${JSON.stringify(name)}} {...rest}>{@render children?.()}</svelte:element>`;
   }
+  const by = BOUND_BY[name] ?? [{ event: 'change' }];
+  const handlers = by.map(({ event }) => `on${event}`);
+  const writes = by.map(({ event, value }, i) => `  const write${i} = (v) => { ${bound} = ${value === undefined ? 'v' : JSON.stringify(value)}; return on${event}?.(v); };`).join('\n');
   return `<script>
-  let { ${bound} = $bindable(), onchange, children, ...rest } = $props();
-  const change = (v) => { ${bound} = v; return onchange?.(v); };
+  let { ${bound} = $bindable(), ${handlers.join(', ')}, children, ...rest } = $props();
+${writes}
 </script>
-<svelte:element this={${JSON.stringify(name)}} ${bound}={${bound}} onchange={change} {...rest}>{@render children?.()}</svelte:element>`;
+<svelte:element this={${JSON.stringify(name)}} ${bound}={${bound}} ${handlers.map((h, i) => `${h}={write${i}}`).join(' ')} {...rest}>{@render children?.()}</svelte:element>`;
 }
 
 /** The component of a source Svelte compiled, as the preloaded runtime would evaluate it. */
@@ -210,7 +215,8 @@ function listed(props: Anything): string {
 }
 
 /** The error for a template name that is nothing: the name, where the template says it, and both places it could have come from. */
-function notDefined(name: string, entry: CellName, props: Anything): ReferenceError {
+function notDefined(name: string, entry: CellName, props: Anything): Error {
+  if (NOT_DRAWN.has(name)) return cellError(notDrawnError(name, entry.at), entry.line);
   const element = /^[A-Z]/.test(name) ? `; the elements are ${ELEMENT_NAMES.join(', ')}` : '';
   const error = new ReferenceError(`${name} is not defined (${entry.at}): it is neither a prop passed to render() nor a variable of the cell (${listed(props)})${element}`);
   error.stack = `ReferenceError: ${error.message}\n    at repl-cell.js:${entry.line}:1`;

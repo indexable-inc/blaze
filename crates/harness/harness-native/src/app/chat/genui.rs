@@ -5,13 +5,20 @@
 //! ChildOf. A tree sent again is laid onto the same entities by place and type ([`view::for_each_of`]: the same key and
 //! prefab keeps its entity), so hover and the springs on what stayed keep running. A type not in [`ELEMENTS`] draws its
 //! name in the failed tone, never a guess. The caps (elements, depth, table rows and columns) cut a runaway tree and say so.
-//! Copied from den's den-native/src/genui.rs (its `slot`/`prune` is `for_each_of` here) and cut to the v1 elements.
+//! Copied from den's den-native/src/genui.rs (its `slot`/`prune` is `for_each_of` here). Tier 3 (layout, folding and
+//! tabs, what floats over the transcript, status, pictures, chips and files) is in genui/layout.rs, genui/float.rs and
+//! genui/media.rs, its props checked by genui/props.rs.
 use super::*;
 use harness_native_ui_layout_api::{Flex, Padding};
+use harness_native_ui_node_api::Laid;
 
 mod canvas;
 mod chart;
 mod control;
+mod float;
+mod layout;
+mod media;
+mod props;
 
 pub use control::Live;
 
@@ -22,7 +29,7 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 23] = [
+const ELEMENTS: [(&str, &str); 45] = [
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -46,6 +53,28 @@ const ELEMENTS: [(&str, &str); 23] = [
     ("Select", "hn.GenSelect"),
     ("Choice", "hn.GenChoice"),
     ("Radio", "hn.GenRadio"),
+    ("Grid", "hn.GenGrid"),
+    ("Stack", "hn.GenStack"),
+    ("Layer", "hn.GenLayer"),
+    ("Wrap", "hn.GenWrap"),
+    ("Scroll", "hn.GenScroll"),
+    ("Split", "hn.GenSplit"),
+    ("Tabs", "hn.GenTabs"),
+    ("Disclosure", "hn.GenDisclosure"),
+    ("Accordion", "hn.GenAccordion"),
+    ("Popover", "hn.GenPopover"),
+    ("Menu", "hn.GenMenu"),
+    ("Dialog", "hn.GenDialog"),
+    ("Sheet", "hn.GenSheet"),
+    ("Toast", "hn.GenToast"),
+    ("Progress", "hn.GenProgress"),
+    ("Loading", "hn.GenLoading"),
+    ("Skeleton", "hn.GenSkeleton"),
+    ("Icon", "hn.GenIcon"),
+    ("Image", "hn.GenImage"),
+    ("Chip", "hn.GenChip"),
+    ("Tile", "hn.GenTile"),
+    ("FileRef", "hn.GenFileRef"),
 ];
 /// The elements that take input (genui/control.rs).
 const CONTROLS: [&str; 10] = ["Button", "Toggle", "Checkbox", "Slider", "NumberField", "Input", "TextArea", "Select", "Choice", "Radio"];
@@ -60,13 +89,36 @@ struct Budget<'a, 'm> {
     measure: &'a mut Measure<'m>,
     cell: &'a str,
     live: Option<&'a mut Live>,
+    /// What the element being built sits in, and what its children will ([`children`] hands `next` down as `within`).
+    within: Within,
+    next: Within,
+    /// The pane the transcript scrolls in, as laid out last frame: what a dialog's scrim covers and a toast floats over.
+    pane: Laid,
+    /// The clock (seconds), for what moves on it (a spinner, a skeleton's breath, a toast's time).
+    now: f32,
+}
+
+/// What an element sits in, when that changes how it is drawn or what a press on it sends.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum Within {
+    #[default]
+    Flow,
+    /// A Stack: the one place a Layer may be.
+    Stack,
+    /// An Accordion, with the onToggle of the Disclosure in it that is open (opening another closes it first).
+    Accordion(Option<String>),
+    /// A Popover's or Menu's trigger: a press on it (on a Button in it as well) sends these events too.
+    Trigger(Vec<(String, Value)>),
 }
 
 /// Fill a `hn.ChatUi` row with the tree `ui` that cell `cell` (`<repl>.<task>`) drew. `live` is the app's controls in use
 /// (a field being typed in shows its own words); None draws the tree's values.
 pub(super) fn fill(row: View<'_>, ui: &Value, cell: &str, live: Option<&std::cell::RefCell<Live>>, measure: &mut Measure<'_>) {
     let mut guard = live.map(std::cell::RefCell::borrow_mut);
-    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure, cell, live: guard.as_deref_mut() };
+    let world = row.entity().world();
+    let now = world.try_get::<&harness_native_api::Clock>(|c| c.time).unwrap_or(0.0);
+    let pane = float::pane_of(row);
+    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure, cell, live: guard.as_deref_mut(), within: Within::Flow, next: Within::Flow, pane, now };
     if let Some(body) = row.part("body") {
         let nodes: Vec<&Value> = match ui {
             Value::Array(a) => a.iter().collect(),
@@ -91,12 +143,12 @@ fn prefab_of(kind: &str) -> &'static str {
 }
 
 /// The prefab `node` is drawn from: its type's, a pie's own, or [`UNKNOWN`] when it is refused ([`refusal`]).
-fn prefab_for(world: WorldRef<'_>, node: &Value) -> &'static str {
+fn prefab_for(world: WorldRef<'_>, node: &Value, within: &Within) -> &'static str {
     let kind = node["type"].as_str().unwrap_or("");
-    if refusal(world, node).is_some() {
+    if refusal(world, node, within).is_some() {
         return UNKNOWN;
     }
-    if let Some(p) = control::prefab(kind, node) {
+    if let Some(p) = control::prefab(kind, node).or_else(|| props::prefab(kind, node)) {
         return p;
     }
     match (kind, node["props"]["kind"].as_str()) {
@@ -107,9 +159,10 @@ fn prefab_for(world: WorldRef<'_>, node: &Value) -> &'static str {
 
 /// Why `node` is not drawn as its type, named for the agent and drawn in the failed tone in its place: an element the app
 /// does not know, or props it cannot draw (a Table's rows that are not a list, a Chart's data, a Canvas's shapes).
-fn refusal(world: WorldRef<'_>, node: &Value) -> Option<String> {
+fn refusal(world: WorldRef<'_>, node: &Value, within: &Within) -> Option<String> {
     let kind = node["type"].as_str().unwrap_or("");
     match kind {
+        k if props::TIER3.contains(&k) => props::check(node, within),
         "Chart" => chart::check(world, node),
         "Canvas" => canvas::check(world, node),
         k if CONTROLS.contains(&k) => control::check(node),
@@ -151,7 +204,10 @@ fn points(node: &Value, name: &str) -> Option<f32> {
 }
 
 /// Keep `parent`'s children in step with `nodes`: child `i` keyed `g<i>` and made from its type's prefab.
+/// Keep `parent`'s children in step with `nodes`: child `i` keyed `g<i>` and made from its type's prefab. They sit in
+/// what `b.next` says (taken: it holds for these children only).
 fn children(parent: View<'_>, nodes: &[&Value], depth: usize, b: &mut Budget<'_, '_>) {
+    let within = std::mem::take(&mut b.next);
     let mut kept = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
         if b.left == 0 || depth >= MAX_DEPTH {
@@ -159,20 +215,31 @@ fn children(parent: View<'_>, nodes: &[&Value], depth: usize, b: &mut Budget<'_,
             break;
         }
         b.left -= 1;
-        kept.push((format!("g{i}"), prefab_for(parent.entity().world(), node), *node));
+        kept.push((format!("g{i}"), prefab_for(parent.entity().world(), node, &within), *node));
     }
-    view::for_each_of(parent, kept, |v, node, _| element(v, node, depth, b));
+    view::for_each_of(parent, kept, |v, node, _| {
+        b.within = within.clone();
+        element(v, node, depth, b);
+    });
 }
 
 /// Set one element's props on its entity, and build its children.
 fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
-    if let Some(why) = refusal(v.entity().world(), node) {
+    let within = std::mem::take(&mut b.within);
+    if let Some(why) = refusal(v.entity().world(), node, &within) {
         v.text(&why);
         return;
     }
     let kind = node["type"].as_str().unwrap_or("");
     let kids: Vec<&Value> = node["children"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     match kind {
+        "Grid" | "Stack" | "Layer" | "Wrap" | "Scroll" | "Split" | "Tabs" | "Disclosure" | "Accordion" => {
+            layout::element(v, node, kind, &kids, depth, &within, b);
+        }
+        "Popover" | "Menu" | "Dialog" | "Sheet" | "Toast" => float::element(v, node, kind, &kids, depth, b),
+        "Progress" | "Loading" | "Skeleton" | "Icon" | "Image" | "Chip" | "Tile" | "FileRef" => {
+            media::element(v, node, kind, &kids, depth, b);
+        }
         "Column" | "Row" => {
             spacing(v, prefab_of(kind), node);
             children(v, &kids, depth + 1, b);
@@ -231,7 +298,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
                 eprintln!("harness-native: genui: {e}");
             }
         }
-        k if CONTROLS.contains(&k) => control::control(v, node, k, b),
+        k if CONTROLS.contains(&k) => control::control(v, node, k, &within, b),
         "Divider" => {}
         "Spacer" => {
             let want = match points(node, "size") {
@@ -598,6 +665,232 @@ mod tests {
         let mut activated = Vec::new();
         world.new_query::<&Activated>().each_entity(|e, _| activated.push(e.try_cloned::<&Action>().map(|a| a.name.as_str().to_owned())));
         assert_eq!(activated, [Some(r#"ui:["test.0","h1",null]"#.to_owned())], "the press activates the button and only it");
+    }
+
+    /// Property `tier-three-draws-and-sends`: every tier-3 element draws from a tree (laid out, with room), each press
+    /// is armed with the events it sends (a tab its value, a disclosure's head `!open`, an accordion's closed head the open
+    /// one's close then its own open, a popover's trigger and its button `!open`, a menu row its pick then the close, a
+    /// dialog's scrim onClose(false) and a sheet's that may not be dismissed nothing, a chip its value or `!selected`, a
+    /// tile its value, a file chip `open:` its path, a split's rule its drag), what floats is placed over the pane (a
+    /// popover's plate under its trigger, a dialog's plate on its scrim) and noted to close, misplaced or wrong props are
+    /// refused in words, a toast's time runs out into onDismiss(null), and real presses through the input pass activate
+    /// a dialog's scrim, a tab and an accordion's head with those events.
+    #[test]
+    fn tier_three_draws_and_sends() {
+        use harness_native_ui_input_api::{Action, Activated, PointerState};
+        use harness_native_ui_motion_api::Pose;
+        use harness_native_ui_text_api::Icon;
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_input::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        world.set(Viewport { w: 900.0, h: 2600.0 });
+        let icon = format!("{}/../../../docs/brand/blaze-icon-dark-180.png", env!("CARGO_MANIFEST_DIR"));
+        let t = |s: &str| serde_json::json!({"type": "Text", "props": {"text": s}, "children": []});
+        let lines: Vec<Value> = (0..12).map(|i| t(&format!("line {i}"))).collect();
+        let tree = |dialog: bool, sheet: bool, floats: bool| {
+            serde_json::json!([
+                {"type": "Grid", "props": {"columns": 2, "gap": 12, "pad": 0}, "children": [t("a"), t("b"), t("c")]},
+                {"type": "Stack", "props": {}, "children": [
+                    {"type": "Image", "props": {"src": icon, "width": 96, "height": 96, "fit": "cover"}, "children": []},
+                    {"type": "Layer", "props": {"anchor": "top-right", "x": -4, "y": 4, "z": 1}, "children": [
+                        {"type": "Badge", "props": {"text": "new"}, "children": []}]}]},
+                {"type": "Wrap", "props": {"gap": 8}, "children": [
+                    {"type": "Chip", "props": {"label": "Files", "selected": false, "onClick": "h2"}, "children": []},
+                    {"type": "Chip", "props": {"label": "Tests", "selected": true, "value": "tests", "onClick": "h3"}, "children": []}]},
+                {"type": "Scroll", "props": {"height": 100, "horizontal": false}, "children": lines},
+                {"type": "Split", "props": {"ratio": 0.4, "vertical": false, "onChange": "h6"}, "children": [t("left"), t("right")]},
+                {"type": "Tabs", "props": {"tabs": ["a", {"label": "Bee", "value": "b"}], "selected": "b", "onChange": "h1"}, "children": [t("body")]},
+                {"type": "Accordion", "props": {}, "children": [
+                    {"type": "Disclosure", "props": {"title": "Details", "open": true, "onToggle": "h7"}, "children": [t("details")]},
+                    {"type": "Disclosure", "props": {"title": "History", "open": false, "onToggle": "h8"}, "children": [t("history")]}]},
+                {"type": "Popover", "props": {"placement": "bottom", "open": floats, "onToggle": "h9"}, "children": [
+                    {"type": "Button", "props": {"label": "Info"}, "children": []}, t("inside")]},
+                {"type": "Menu", "props": {"items": ["Rename", "-", {"label": "Delete", "value": "rm", "danger": true, "keys": "\u{2318}D"},
+                    {"label": "Off", "value": "off", "disabled": true}], "open": floats, "onSelect": "h11", "onToggle": "h10"}, "children": [
+                    {"type": "Button", "props": {"label": "Actions"}, "children": []}]},
+                {"type": "Dialog", "props": {"title": "Delete the build?", "open": dialog, "dismissable": true, "onClose": "h15"}, "children": [t("sure?")]},
+                {"type": "Sheet", "props": {"title": "Settings", "open": sheet, "dismissable": false, "onClose": "h17"}, "children": [t("settings")]},
+                {"type": "Toast", "props": {"text": "Saved", "tone": "success", "duration": 0, "onDismiss": "h18"}, "children": []},
+                {"type": "Progress", "props": {"value": 3, "max": 5, "label": "Build"}, "children": []},
+                {"type": "Loading", "props": {"label": "Building"}, "children": []},
+                {"type": "Skeleton", "props": {"lines": 2}, "children": []},
+                {"type": "Icon", "props": {"name": "rust"}, "children": []},
+                {"type": "Tile", "props": {"gap": 8, "pad": 12, "value": "icon", "onClick": "h5"}, "children": [t("tile")]},
+                {"type": "FileRef", "props": {"path": "/x/src/tree.ts", "line": 60}, "children": []},
+                {"type": "Layer", "props": {"anchor": "top-left", "x": 0, "y": 0, "z": 0}, "children": []},
+                {"type": "Icon", "props": {"name": "no-such-icon-xyz"}, "children": []},
+                {"type": "Grid", "props": {"columns": 2, "gap": 12, "pad": 0, "foo": 1}, "children": []},
+                {"type": "Split", "props": {"ratio": 0.5, "vertical": true}, "children": [t("up"), t("down")]},
+                {"type": "Grid", "props": {"fit": 120, "gap": 12, "pad": 0}, "children": [t("x"), t("y")]},
+                {"type": "Scroll", "props": {"height": 80, "horizontal": true}, "children": [t("across")]},
+                {"type": "Toast", "props": {"text": "Going", "tone": "ink", "duration": 500, "onDismiss": "h19"}, "children": []}
+            ])
+        };
+        let live = std::cell::RefCell::new(Live::default());
+        let row = View::root(w, "hn.ChatUi");
+        let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
+        let mut frame = |ui: &Value, pointer: Option<PointerState>| {
+            if let Some(p) = pointer {
+                world.set(p);
+            }
+            fill(row, ui, "test.0", Some(&live), &mut measure);
+            harness_native_ui_layout::typeset::typeset(w, &mut harness_native_ui_layout::typeset::Estimate);
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        };
+        let ui = tree(true, true, true);
+        for _ in 0..6 {
+            frame(&ui, None);
+        }
+        let body = row.part("body").expect("body");
+        let el = |i: usize| body.part(&format!("g{i}")).unwrap_or_else(|| panic!("element {i}"));
+        fn part<'w>(v: View<'w>, path: &str) -> View<'w> {
+            path.split('.').try_fold(v, |v, p| v.part(p)).unwrap_or_else(|| panic!("no part {path}"))
+        }
+        let is = |v: View<'_>, prefab: &str| {
+            let p = view::prefab(w, prefab).unwrap_or_else(|| panic!("no prefab {prefab}"));
+            v.entity().owns((flecs::IsA::ID, *p.id()))
+        };
+        let laid = |v: View<'_>, what: &str| {
+            let l = v.entity().try_cloned::<&Laid>().unwrap_or_else(|| panic!("{what} is not laid out"));
+            assert!(l.w > 0.0 && l.h > 0.0, "{what} has no room: {l:?}");
+            l
+        };
+        let action = |v: View<'_>| v.entity().try_cloned::<&Action>().map(|a| a.name.as_str().to_owned());
+        let words_of = |v: View<'_>| v.entity().try_cloned::<&Text>().map(|t| t.s.as_str().to_owned()).unwrap_or_default();
+        let one = |h: &str, v: &str| format!(r#"ui:["test.0","{h}",{v}]"#);
+
+        // Each draws, as its prefab.
+        for (i, prefab) in [
+            (0, "hn.GenGrid"),
+            (1, "hn.GenStack"),
+            (2, "hn.GenWrap"),
+            (3, "hn.GenScroll"),
+            (4, "hn.GenSplit"),
+            (5, "hn.GenTabs"),
+            (6, "hn.GenAccordion"),
+            (7, "hn.GenPopover"),
+            (8, "hn.GenMenu"),
+            (9, "hn.GenDialog"),
+            (10, "hn.GenSheet"),
+            (11, "hn.GenToast"),
+            (12, "hn.GenProgress"),
+            (13, "hn.GenLoading"),
+            (14, "hn.GenSkeleton"),
+            (15, "hn.GenIcon"),
+            (16, "hn.GenTileOn"),
+            (17, "hn.GenFileRef"),
+            (21, "hn.GenSplitDown"),
+            (22, "hn.GenGridFit"),
+            (23, "hn.GenScrollAcross"),
+        ] {
+            assert!(is(el(i), prefab), "element {i} is a {prefab}");
+            laid(el(i), prefab);
+        }
+        let grid = |r: usize, c: usize| part(el(0), &format!("r{r}.c{c}"));
+        let (a, c) = (laid(grid(0, 0), "a grid cell"), laid(grid(1, 0), "the next row's cell"));
+        assert!(c.y >= a.y + a.h + 11.0 && (laid(grid(0, 1), "b").x - a.x - a.w - 12.0).abs() < 0.5, "two columns 12 apart");
+        let stack = laid(el(1), "the stack");
+        let pic = laid(part(el(1), "g0.pic"), "the image");
+        assert!((pic.w - 96.0).abs() < 0.5 && (pic.h - 96.0).abs() < 0.5, "a 96 by 96 image: {pic:?}");
+        assert_eq!(el(1).part("g0").and_then(|i| i.part("pic")).and_then(|p| p.entity().try_cloned::<&harness_native_ui_text_api::Picture>()).map(|p| p.handle.as_str().to_owned()), Some(icon.clone()));
+        let badge = laid(part(el(1), "g1.g0"), "the layer's badge");
+        assert!((stack.w - 96.0).abs() < 0.5, "a layer adds no size to its stack: {stack:?}");
+        assert!((badge.x + badge.w - (stack.x + stack.w - 4.0)).abs() < 0.5 && (badge.y - stack.y - 4.0).abs() < 0.5, "the badge at the top right, 4 in: {badge:?} in {stack:?}");
+        assert_eq!(action(part(el(2), "g0")), Some(one("h2", "true")), "a chip with no value sends !selected");
+        assert!(is(part(el(2), "g1"), "hn.GenChipOn"));
+        assert_eq!(action(part(el(2), "g1")), Some(one("h3", "\"tests\"")));
+        assert!((laid(el(3), "the scroll").h - 100.0).abs() < 0.5, "a scroll is its height tall");
+        let (sa, sb) = (laid(part(el(4), "a"), "the split's a"), laid(part(el(4), "b"), "the split's b"));
+        assert!((sa.w / (sa.w + sb.w) - 0.4).abs() < 0.01, "panes by the ratio: {sa:?} {sb:?}");
+        let rule = action(part(el(4), "rule")).unwrap_or_default();
+        assert!(rule.starts_with("ui:{") && rule.contains(r#""k":"split""#) && rule.contains(r#""change":"h6""#), "the rule drags: {rule}");
+        assert_eq!(action(part(el(21), "rule")), None, "a split with no onChange does not drag");
+        assert_eq!(action(part(el(5), "bar.tabs.t0")), Some(one("h1", "\"a\"")));
+        assert!(is(part(el(5), "bar.tabs.t1"), "hn.GenTabOn") && words_of(part(el(5), "bar.tabs.t1.head.label")) == "Bee");
+        laid(part(el(5), "body.g0"), "the tab's body");
+        assert_eq!(action(part(el(6), "g0.head")), Some(one("h7", "false")));
+        laid(part(el(6), "g0.body.g0"), "the open disclosure's body");
+        assert!(el(6).part("g1").and_then(|d| d.part("body")).is_none(), "a shut disclosure shows no body");
+        let both = r#"ui:[["test.0","h7",false],["test.0","h8",true]]"#;
+        assert_eq!(action(part(el(6), "g1.head")).as_deref(), Some(both), "opening one closes the open one first");
+        let trig = laid(part(el(7), "trigger"), "the popover's trigger");
+        assert_eq!(action(part(el(7), "trigger")), Some(one("h9", "false")));
+        assert_eq!(action(part(el(7), "trigger.g0")), Some(one("h9", "false")), "its button toggles it");
+        let fl = laid(part(el(7), "float"), "the popover's plate");
+        assert!(fl.y >= trig.y + trig.h + 5.5, "the plate opens under its trigger: {fl:?} {trig:?}");
+        laid(part(el(7), "float.g0"), "the popover's content");
+        let pick = r#"ui:[["test.0","h11","Rename"],["test.0","h10",false]]"#;
+        assert_eq!(action(part(el(8), "float.i0")).as_deref(), Some(pick));
+        assert!(is(part(el(8), "float.i1"), "hn.GenMenuSep") && is(part(el(8), "float.i2"), "hn.GenMenuDanger"));
+        assert_eq!(words_of(part(el(8), "float.i2.keys")), "\u{2318}D");
+        assert_eq!(action(part(el(8), "float.i3")), None, "a disabled item takes no press");
+        assert!(part(el(8), "float.i3").entity().try_cloned::<&Pose>().is_some_and(|p| p.fade > 0.0), "and is faded");
+        let pane = laid(el(9), "the dialog");
+        assert!((pane.w - 900.0).abs() < 0.5 && (pane.h - 2600.0).abs() < 0.5, "a dialog covers the pane: {pane:?}");
+        assert_eq!(action(part(el(9), "scrim")), Some(one("h15", "false")));
+        let plate = laid(part(el(9), "scrim.plate"), "the dialog's plate");
+        assert!(plate.w <= 380.5 && (plate.x + plate.w / 2.0 - 450.0).abs() < 1.0, "a dialog's plate is centred: {plate:?}");
+        assert_eq!(words_of(part(el(9), "scrim.plate.title")), "Delete the build?");
+        assert_eq!(action(part(el(10), "scrim")), None, "a sheet that may not be dismissed closes on no press");
+        let sheet = laid(part(el(10), "scrim.plate"), "the sheet's plate");
+        assert!((sheet.y + sheet.h - 2600.0).abs() < 0.5, "a sheet sits on the pane's foot: {sheet:?}");
+        let toast = action(part(el(11), "plate")).unwrap_or_default();
+        assert!(toast.contains(r#""k":"toast""#) && toast.contains(r#""change":"h18""#), "a toast's press dismisses it: {toast}");
+        let fill = laid(part(el(12), "body.fill"), "the progress");
+        assert!((fill.w / laid(part(el(12), "body"), "the track").w - 0.6).abs() < 0.01, "3 of 5");
+        assert!(part(el(13), "spinner.arc").entity().try_cloned::<&harness_native_ui_text_api::Vector>().is_some_and(|v| v.ma != 0.0 || v.mb != 0.0), "the arc turns");
+        assert!(is(part(el(14), "b1"), "hn.GenBoneShort") && laid(part(el(14), "b1"), "a bone").w < laid(part(el(14), "b0"), "a bone").w);
+        assert_eq!(el(15).entity().try_cloned::<&Icon>().map(|i| i.glyph.as_str().to_owned()).as_deref(), Some("\u{E7A8}"), "rust is a file kind");
+        assert_eq!(action(el(16)), Some(one("h5", "\"icon\"")));
+        assert_eq!(action(el(17)).as_deref(), Some("open:/x/src/tree.ts"));
+        assert_eq!((words_of(part(el(17), "name")), words_of(part(el(17), "line"))), ("tree.ts".to_owned(), ":60".to_owned()));
+        for (i, says) in [(18, "<Layer> is not in a Stack"), (19, "<Icon> name"), (20, "<Grid> has no prop \u{201C}foo\u{201D}")] {
+            let t = words_of(el(i));
+            assert!(t.contains(says), "element {i} is refused in words: {t:?}");
+        }
+        assert_eq!(live.borrow().floats.len(), 4, "the popover, the menu, the dialog and the sheet are noted to close");
+
+        // A toast's time runs out: it goes, and says so to its onDismiss.
+        world.get::<&mut Clock>(|c| c.time += 0.5);
+        frame(&ui, None);
+        assert!(el(24).part("plate").is_none(), "a toast whose time ran out goes");
+        assert!(el(11).part("plate").is_some(), "one that stays stays");
+        assert_eq!(live.borrow().pending, [("test.0".to_owned(), "h19".to_owned(), Value::Null)]);
+
+        // Real presses: the dialog's scrim (off its plate), then with nothing floating a tab and the accordion's shut head.
+        let press = |frame: &mut dyn FnMut(&Value, Option<PointerState>), ui: &Value, at: Laid| -> Vec<Option<String>> {
+            let (x, y) = (at.x + at.w / 2.0, at.y + at.h / 2.0);
+            let mut before = Vec::new();
+            world.new_query::<&Activated>().each_entity(|e, _| before.push(e.id()));
+            frame(ui, Some(PointerState { x, y, down: false, went_down: false, went_up: false }));
+            frame(ui, Some(PointerState { x, y, down: true, went_down: true, went_up: false }));
+            frame(ui, Some(PointerState { x, y, down: false, went_down: false, went_up: true }));
+            let mut got = Vec::new();
+            world.new_query::<&Activated>().each_entity(|e, _| {
+                if !before.contains(&e.id()) {
+                    got.push(e.try_cloned::<&Action>().map(|a| a.name.as_str().to_owned()));
+                }
+            });
+            got
+        };
+        let only_dialog = tree(true, false, false);
+        for _ in 0..4 {
+            frame(&only_dialog, None);
+        }
+        let corner = Laid { x: pane.x + 4.0, y: pane.y + 4.0, w: 4.0, h: 4.0 };
+        assert_eq!(press(&mut frame, &only_dialog, corner), [Some(one("h15", "false"))], "a press on the scrim closes the dialog");
+        let calm = tree(false, false, false);
+        for _ in 0..4 {
+            frame(&calm, None);
+        }
+        let tab = laid(part(el(5), "bar.tabs.t0"), "a tab");
+        assert_eq!(press(&mut frame, &calm, tab), [Some(one("h1", "\"a\""))], "a press on a tab sends its value");
+        let head = laid(part(el(6), "g1.head"), "the shut head");
+        assert_eq!(press(&mut frame, &calm, head), [Some(both.to_owned())], "a press on a shut head in an accordion sends both");
     }
 }
 

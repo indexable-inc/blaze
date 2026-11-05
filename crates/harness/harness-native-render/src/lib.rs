@@ -11,6 +11,7 @@ pub mod icons;
 pub mod markdown;
 pub mod pack;
 pub mod paint;
+pub mod photo;
 pub mod select;
 pub mod slug;
 pub mod text;
