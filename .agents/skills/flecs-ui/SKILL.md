@@ -49,6 +49,7 @@ springs, drawing (shared with harness-video in `harness-native-render`: Metal, t
 | Button / icon button | `ui.Button`; `ui.IconButton` (square wash hugging one `ui.Symbol`; never a full-width row wash) |
 | Icons | `ui.Symbol` + `Icon: {glyph}` (den's icon set); `ui.Icon` + `Mark: {name}` for brand marks (vector, Slug) |
 | Tooltip | `Tooltip: {text: "..."}` on any node (system tooltip; nearest ancestor's wins) |
+| Pointer shape | `Cursor: {shape: Text}` on a node (nearest ancestor's wins; makes it a hit target): Text on what takes typing or selection, Arrow on controls, Hand only on links (macOS's conventions); the host's zones (terminal grid, sidebar edge) and drags in `harness-native/src/app/pointer.rs` |
 | Scrolling | `ui.Scroll` (clips, shifts by `ScrollState`); the tree's inertia (harness-native-scroll-physics), knob and edge fades are in `harness-native/src/app/sidebar.rs` |
 | Motion | `MatchedGeometry {id}` (selection pill), `Transition: {kind: Opacity/Slide/Scale/Move}`, `Animate`, `HoverAmt`/`HoverLift` springs; spring params are tokens |
 | Pose / timeline | `Pose: {dx, dy, shrink, fade, cut}` (0 at rest; draw folds it into the subtree, layout ignores it); a `Cue` child animates any member by path over the clock (`harness-native-ui-timeline`, used by `harness-video`) |
@@ -141,6 +142,8 @@ existing action is entities only; a new action also needs a handler under its na
   `HARNESS_NATIVE_SIDEBAR=0`, `HARNESS_NATIVE_APPEARANCE=light`); see `harness-native/src/shot.rs` for the rest.
 - A real window without activation: `HARNESS_NATIVE_NO_ACTIVATE=1`. Never activate windows or synthesize input
   on the user's machine; use a private `HARNESS_HOME` daemon for tests.
+- The system pointer isn't in shots: `HARNESS_NATIVE_CURSOR_LOG=1` logs each shape change, a shot's hovers (`x,y,t;x,y,t`) log
+  theirs, F3's `ptr` line shows it; `HARNESS_NATIVE_GALLERY=prims` draws one of every primitive.
 - F3 shows the stats overlay (fps, cpu/gpu frame times, redraw reason, entity/draw counts); with nothing moving its
   state line must read idle.
 - Read the shot (or a 2x crop) before saying a visual change is done; measure alignment in pixels.
