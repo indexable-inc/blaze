@@ -74,6 +74,10 @@ pub(super) enum Kind {
     Cancel,
     /// A poll of a spawn's pidfd; [`Hot::of`] the spawn, which keeps the pidfd open.
     Exit,
+    /// A poll for `POLLPRI` of a PSI trigger armed on a memory pressure file ([`Cold::fds`]
+    /// 0), asked again after each event until it is stopped; its buffer is the file's path, for
+    /// the error that names it.
+    Pressure,
     /// One of a spawn's output pipes ([`Cold::fds`] 0), read into its buffer until it ends;
     /// [`STDERR`] for the second.
     Output,
@@ -96,7 +100,7 @@ pub(super) enum Kind {
 
 /// Given to the kernel before the ring failed: kept where it is, never freed or asked again.
 pub(super) const ABANDONED: u8 = 1 << 0;
-/// A listen being stopped.
+/// A listen, or a watch of memory pressure, being stopped.
 pub(super) const STOPPING: u8 = 1 << 1;
 /// A write at an offset that bypasses the page cache.
 pub(super) const DIRECT: u8 = 1 << 2;

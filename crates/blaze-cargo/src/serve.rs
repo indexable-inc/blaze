@@ -16,6 +16,7 @@
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+pub mod ceiling;
 mod daemon;
 mod fetch;
 mod fetch_url;
@@ -23,6 +24,8 @@ mod gc;
 mod heads;
 mod image;
 mod job;
+#[cfg(all(unix, feature = "native"))]
+mod machine;
 mod mounts;
 mod native;
 pub mod observe;
@@ -55,6 +58,14 @@ use anyhow::{Context, bail};
 use blaze_core::{Confine, FileName};
 
 pub use daemon::{Daemon, Options};
+#[cfg(all(unix, feature = "native"))]
+pub use machine::Machine;
+
+/// Where blaze keeps no machine's memory ledger (the seed's one-shot build, which is one
+/// process of its own; Windows, which has no `/tmp/blaze-<uid>` yet): there is no place in one
+/// to hold, so [`Options::machine`] is always `None`.
+#[cfg(not(all(unix, feature = "native")))]
+pub enum Machine {}
 
 /// What the line a daemon writes to its log once it listens starts with, then where and its
 /// pid: `blaze serve: listening on /run/blaze/v2.sock (pid 7)`. The client finds the daemon's
@@ -521,6 +532,18 @@ pub(crate) fn told_limit(
     told_memory(MEMORY_VAR, &text).map(Some)
 }
 
+/// The machine budget the engine was told: [`machine::MACHINE_VAR`]'s (`var`, as the
+/// environment has it) in GiB, else none, when it is made from the machine's limits
+/// ([`blaze_graph::arena::machine_wide`]).
+#[cfg(all(unix, feature = "native"))]
+fn told_machine(var: Option<std::ffi::OsString>) -> anyhow::Result<Option<(u64, String)>> {
+    let Some(var) = var else { return Ok(None) };
+    let text = var.into_string().map_err(|it| {
+        anyhow::anyhow!("{} {} is not UTF-8", machine::MACHINE_VAR, it.to_string_lossy())
+    })?;
+    told_memory(machine::MACHINE_VAR, &text).map(Some)
+}
+
 /// What a start says of the limit it runs under (`budget`, [`blaze_graph::arena::machine_budget`]'s):
 /// its bytes and what told it, and when a build's release is due under it
 /// ([`blaze_graph::admission::Squeeze`]): past the limit's line, or one subsystem a release
@@ -952,6 +975,14 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         memory: args.memory,
     };
     let engine = engine(serving, ready.as_ref())?;
+    // The hard ceiling (docs/memory-budget.md section 7, Hard), set before the daemon restores
+    // its image or takes a request: the kernel's limit where this process may set one, and the
+    // stop's guard's watch, at the budget itself (the machine's 3/4, or `--memory-gb`). In
+    // `blaze serve` alone, whose process is the daemon's own: never the one-shot build's or a
+    // test's, whose process is another's too.
+    if let Some(budget) = &engine.options.budget {
+        ceiling::hold(budget.bytes, &budget.from)?;
+    }
     let mut running = start(engine, "blaze serve", ready.as_ref())?;
     // blaze's update check (docs/install.md, "Updates"), off the loop, for the daemon's life.
     let _updates =
@@ -1109,6 +1140,23 @@ pub(crate) fn engine(
     // the daemon says it was started with ([`settings`]), so a client asking another is told.
     let told = told_limit(serving.memory, std::env::var_os(MEMORY_VAR))?;
     let settings = settings::of_daemon(told.as_ref(), |name| std::env::var_os(name));
+    // The machine's memory ledger joined (docs/memory-budget.md, section 7): the machine
+    // budget every daemon of this user shares, and this daemon's ceiling under it, the plane's
+    // budget. A ledger that cannot be joined stops the start, naming it.
+    #[cfg(all(unix, feature = "native"))]
+    let (machine, budget) = {
+        let told_machine = told_machine(std::env::var_os(machine::MACHINE_VAR))?;
+        let joined = machine::Machine::join(told_machine, told, &crate::version(), &build, &root()?)
+            .context("joining the machine's memory ledger")?;
+        tracing::info!(target: "blaze", "{}", joined.machine.said());
+        (Some(joined.machine), joined.ceiling)
+    };
+    #[cfg(not(all(unix, feature = "native")))]
+    let (machine, budget) = (
+        None,
+        blaze_graph::arena::machine_budget(1 << 30, told)
+            .context("the memory the daemon's tasks may hold")?,
+    );
     let options = Options {
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
@@ -1117,10 +1165,8 @@ pub(crate) fn engine(
         writer: writer_of(&paths.state)?,
         socket: paths.socket.as_deref().map(file_name).transpose()?,
         http: serving.http.zip(token),
-        budget: Some(
-            blaze_graph::arena::machine_budget(1 << 30, told)
-                .context("the memory the daemon's tasks may hold")?,
-        ),
+        budget: Some(budget),
+        machine,
         threads,
         io: 16,
         env: ["PATH", "HOME"]
@@ -1256,11 +1302,17 @@ fn begin(
 ) -> anyhow::Result<Daemon<blaze_core::Native, unit::Real>> {
     say(ready, Phase::State);
     let limit = options.budget.as_ref().map(limit_said);
+    #[cfg(all(unix, feature = "native"))]
+    let shared = options.machine.as_ref().map(|it| it.said().to_owned()); // alloc: the start's line
     let mut daemon = Daemon::start(driver, options, steps, runner)?;
     say(ready, Phase::Setup);
     // Each start says the limit it runs under, so a run's log shows it was told one (B5).
     if let Some(limit) = limit {
         eprintln!("{who}: {limit}");
+    }
+    #[cfg(all(unix, feature = "native"))]
+    if let Some(shared) = shared {
+        eprintln!("{who}: {shared}");
     }
     let started = daemon.started();
     if started.cold == Some(daemon::Cold::Interned) {

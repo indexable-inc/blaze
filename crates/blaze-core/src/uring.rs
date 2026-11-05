@@ -72,8 +72,8 @@ use std::alloc::Global;
 
 use self::ops::{Cold, Hot, Id, Kind};
 use crate::{
-    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, RECV_MOST,
-    Stamp, Tag,
+    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names,
+    PSI_TRIGGER, RECV_MOST, Stamp, Tag,
     handoff::Claims,
     wait::{self, Clock, Deadline, Monotonic},
     wheel::{self, Wheel},
@@ -2390,6 +2390,7 @@ impl Driver for Uring {
                 }
                 Effect::Unlock { lock, .. } => self.locks.unlock(lock).map(Some),
                 Effect::Watch { dir, .. } => self.watch(tag, dir, false).map(|()| None),
+                Effect::Pressure { .. } => self.pressure(tag).map(|()| None),
                 // Linux keeps no journal across a restart: the first batch says what of the
                 // cursor is lost, and the watch is live from its start.
                 Effect::Journal { dir, since, .. } => {
@@ -2552,13 +2553,17 @@ impl Driver for Uring {
                 }
             }
         }
-        // A watch or a journal goes on after a change, and a listen after an accept.
+        // A watch or a journal goes on after a change, a listen after an accept, and a watch of
+        // memory pressure after an event.
         let ended = out[before..]
             .iter()
             .filter(|it| {
                 !matches!(
                     it.done,
-                    Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                    Done::Changed { .. }
+                        | Done::Journaled(_)
+                        | Done::Accepted { .. }
+                        | Done::Pressed { .. }
                 )
             })
             .count();
@@ -2792,6 +2797,30 @@ mod tests {
             "{waited:?}"
         );
         assert_eq!(driver.in_flight(), 1);
+    }
+
+    /// A watch of memory pressure is a PSI trigger in flight until it is unwatched, or, on a
+    /// kernel without PSI or that lets this user arm none, fails at once naming the file.
+    #[test]
+    fn a_memory_pressure_watch_stays_until_unwatched() {
+        let mut driver = Uring::new(dir("uring-pressure")).unwrap();
+        driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
+        let mut out = Vec::new();
+        driver.poll(&mut out, Duration::from_millis(20));
+        if let Some(Done::Failed(IoError(why))) = out.first().map(|it| &it.done) {
+            assert!(why.contains("pressure"), "the failure names the pressure file: {why}");
+            assert_eq!(driver.in_flight(), 0);
+            return;
+        }
+        assert!(out.iter().all(|it| matches!(it.done, Done::Pressed { .. })), "{out:?}");
+        assert_eq!(driver.in_flight(), 1, "the watch stays in flight");
+        let mut seen = Vec::new();
+        run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(1) }], |done, _| {
+            seen.push(done.done)
+        });
+        assert_eq!(seen.last(), Some(&Done::Unwatched), "{seen:?}");
+        assert!(driver.watches.is_empty());
+        assert_eq!(driver.in_flight(), 0);
     }
 
     fn command(program: &str, args: &[&str], stdin: &[u8]) -> Command {

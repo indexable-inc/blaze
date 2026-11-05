@@ -1519,6 +1519,16 @@ struct Build<S: Steps> {
     applying: Option<Applying>,
 }
 
+/// Why the daemon lets go of the front ends it keeps ([`Jobs::let_go`]).
+#[derive(Clone, Copy)]
+enum LetGo {
+    /// The plane holds a task back for this many bytes of what the process holds besides its
+    /// tasks ([`blaze_graph::Plane::short`]).
+    Short(u64),
+    /// The system says memory is short.
+    Pressure,
+}
+
 /// A build of the units a view's front end applies, made in the job's one plane request
 /// ([`Jobs::next`]): the request stays open for the job's next view or its answer, so the
 /// build's end is its last node's settling ([`Jobs::settled`]), not the request's finish. One
@@ -1881,6 +1891,8 @@ struct Job<S: Steps> {
     /// lowering and held until the job is dropped: the collector renames no dir while a build
     /// holds it (docs/gc.md, "Leases").
     leases: Arc<Mutex<Leases>>,
+    /// What its client is told of its wait for memory ([`Jobs::tell_paused`]).
+    paused: blaze_graph::pressure::Paused,
     /// When it began, on the injected clock ([`World::now`]): what its [`Response::Doing`]
     /// and `blaze status` count its time from.
     began: Duration,
@@ -2588,6 +2600,10 @@ pub struct Jobs<S: Steps> {
     posts: Vec<(Posting, bool)>,
     /// The jobs that end, a buffer reused by each [`Jobs::wind_up`].
     over: Vec<(JobId, bool, Option<ApiError>)>,
+    /// The requests held back for memory, and the tasks granted memory running that they
+    /// wait on, buffers reused by each [`Jobs::tell_paused`].
+    held_back: Vec<u32>,
+    waited_on: Vec<u32>,
     /// A job ran a query or a unit since the image was written.
     pub cold: bool,
     /// A job finished since the last collection.
@@ -2706,6 +2722,10 @@ impl<S: Steps> Jobs<S> {
             out: Vec::new(),     // alloc: none until user code says something, then reused
             posts: Vec::new(),   // alloc: none until a write holds a task, then reused
             over: Vec::new(),    // alloc: none until a job ends, then reused
+            // alloc: none until a build is held back for memory, then reused
+            held_back: Vec::new(),
+            // alloc: none until a build is held back for memory, then reused
+            waited_on: Vec::new(),
             cold: false,
             ended: false,
             rows: Vec::new(),        // alloc: none until a build ends, then reused
@@ -2732,6 +2752,61 @@ impl<S: Steps> Jobs<S> {
         busy.extend(self.runs.iter_mut().map(|(_, it)| it.job));
         self.held_leases
             .retain(|(id, cancelled, _)| Arc::strong_count(cancelled) > 1 || busy.contains(id));
+    }
+
+    /// Each build's client told of its wait for memory (docs/memory-budget.md section 7, "What
+    /// the client is told"): a note once a task of its request has been held back for memory
+    /// alone for [`blaze_graph::pressure::PAUSED_AFTER_NS`], again as what it says changes, and
+    /// that it resumed once none is ([`blaze_graph::pressure::Paused`]). `machine` is the
+    /// machine ledger's say of who holds the rest, once its driver gives one. A speculative
+    /// job not promoted is told nothing: no client waits on it.
+    pub fn tell_paused(&mut self, w: &mut World<'_, S>, machine: Option<&str>) {
+        use blaze_graph::pressure::{RESUMED, Tell, paused_line};
+        let mut held_back = std::mem::take(&mut self.held_back);
+        held_back.clear();
+        w.plane.held_back(&mut held_back);
+        let (held, budget, cap) = w.plane.memory();
+        let waiting = |job: &Job<S>| job.paused.waiting();
+        let any = self.order.iter().any(|&id| self.jobs.get(key_of(id)).is_some_and(waiting));
+        let Some(budget) = budget.filter(|_| any || !held_back.is_empty()) else {
+            self.held_back = held_back;
+            return;
+        };
+        // What they wait on: the tasks granted memory running, in the order of their nodes,
+        // one a name (a task several requests share runs as one).
+        let plane: &Tasks<S> = &*w.plane;
+        // alloc: none but while a build is held back for memory, a pair a running task.
+        let mut running: Vec<(NodeId, &str)> = Vec::new();
+        plane.granted_running(|id, name| running.push((id, name)));
+        running.sort_unstable_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
+        running.dedup_by(|a, b| a.1 == b.1);
+        running.sort_unstable_by_key(|it| it.0);
+        let mut on = std::mem::take(&mut self.waited_on);
+        on.clear();
+        on.extend(running.iter().map(|it| it.0.0)); // alloc: none once it has held this many.
+        let names: Vec<&str> = running.iter().take(3).map(|it| it.1).collect(); // alloc: three at most.
+        let at = super::plane::ns(w.now);
+        let mut line: Option<String> = None;
+        for &id in &self.order {
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+            let Some(request) = job.request.filter(|_| !job.idle && !job.finished) else {
+                continue;
+            };
+            let now = held_back.binary_search(&request.0).is_ok();
+            let response = match job.paused.step(at, now, held, budget, &on) {
+                Tell::Nothing => continue,
+                Tell::Paused => {
+                    let line = line.get_or_insert_with(|| {
+                        paused_line(held, budget, cap, machine, on.len(), &names)
+                    });
+                    Diagnostic::note(line.clone()) // clone: one line, told to each build it holds back.
+                }
+                Tell::Resumed => Diagnostic::note(RESUMED.to_owned()), // alloc: once a resume
+            };
+            w.said.push(Said::Report(id, Response::Diagnostic(response)));
+        }
+        self.held_back = held_back;
+        self.waited_on = on;
     }
 
     /// Whether no job is under way.
@@ -2859,6 +2934,7 @@ impl<S: Steps> Jobs<S> {
             opened_ns: 0,
             opened_unix_ns: None,
             leases: Arc::default(), // alloc: once per job, shared with its lowering
+            paused: blaze_graph::pressure::Paused::default(),
             began: w.now,
             doing_said: None,
         };
@@ -3132,16 +3208,37 @@ impl<S: Steps> Jobs<S> {
     /// admission sees what is left; one that still fits nowhere starts alone once nothing
     /// granted memory runs (`blaze_graph::Plane`'s `pick`).
     fn short(&mut self, short: u64) {
+        self.let_go(LetGo::Short(short));
+    }
+
+    /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): as at
+    /// the soft ceiling, every kept front end is let go and each build's front end is asked for
+    /// a release now ([`Writer::pressed`]), whatever this daemon's own budget says.
+    pub fn pressed(&mut self) {
+        self.let_go(LetGo::Pressure);
+    }
+
+    fn let_go(&mut self, why: LetGo) {
         let kept = self.roots.fronts.iter().filter(|it| it.is_some()).count();
         if kept > 0 {
+            let short = match why {
+                LetGo::Short(short) => short,
+                LetGo::Pressure => 0,
+            };
             let _span = tracing::info_span!(target: "blaze", "kept front ends let go for memory", short, kept).entered();
             for (root, &id) in self.roots.ids.iter() {
                 if let Some(front) = self.roots.fronts[id as usize].take() {
-                    eprintln!(
-                        "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
-                         a task waits for {:.2} GiB the process holds besides its tasks",
-                        short as f64 / f64::from(1u32 << 30)
-                    );
+                    match why {
+                        LetGo::Short(short) => eprintln!(
+                            "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
+                             a task waits for {:.2} GiB the process holds besides its tasks",
+                            short as f64 / f64::from(1u32 << 30)
+                        ),
+                        LetGo::Pressure => eprintln!(
+                            "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
+                             the system says memory is short"
+                        ),
+                    }
                     drop(front);
                 }
             }
@@ -3149,7 +3246,10 @@ impl<S: Steps> Jobs<S> {
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             if let Stage::Units(build) = &mut job.stage {
-                build.writer.short();
+                match why {
+                    LetGo::Short(_) => build.writer.short(),
+                    LetGo::Pressure => build.writer.pressed(),
+                }
             }
         }
     }

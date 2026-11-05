@@ -29,7 +29,7 @@ use std::{
 use blaze_api::{ApiError, LiveFrame, Reply, RequestRef, Response};
 use blaze_core::Conn;
 use blaze_profile::{
-    facts::{CrateDepRow, KeyPartRow, LinkRow, ProvenanceRow, QueryCountRow, RunOutcome},
+    facts::{CrateDepRow, KeyPart, KeyedMiss, LinkRow, ProvenanceRow, QueryCountRow, RunOutcome},
     history::{self, BuildRow, History, OWNER},
     live::{self, Feed, Frame},
 };
@@ -351,29 +351,29 @@ fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceR
     }
 }
 
-/// The parts of the key of each thing `build` computed again, a row a part (one with no part
-/// for a key that exposes none): what two builds' keys are diffed by, across homes too.
-fn key_parts(build_id: u64, misses: &[blaze_kernel::Miss]) -> Vec<KeyPartRow> {
-    // alloc: once a build, a row a part of a miss's key
-    let mut rows = Vec::new();
-    for miss in misses {
-        let key = format!("{:x}", miss.key); // alloc: a row's text
-        let row = |part: Option<&blaze_kernel::Part>| KeyPartRow {
-            build_id,
-            step: miss.step,
-            item: miss.item.clone(),              // clone: a row's own text
-            key: key.clone(),                     // clone: a row's own text
-            part: part.map(|it| it.name.clone()), // clone: a row's own text
-            hash: part.and_then(|it| it.hash).map(|it| format!("{it:x}")), // alloc: a row's text
-            names: part.and_then(|it| it.names.clone()), // clone: a row's own text
-            beyond: miss.beyond,
-        };
-        if miss.parts.is_empty() {
-            rows.push(row(None));
-        }
-        rows.extend(miss.parts.iter().map(|part| row(Some(part))));
-    }
-    rows
+/// The parts of the key of each thing `build` computed again, one record a miss (a `key_parts`
+/// row a part, made only as the history writes them): what two builds' keys are diffed by,
+/// across homes too.
+fn key_parts(build_id: u64, misses: &[blaze_kernel::Miss]) -> Vec<KeyedMiss> {
+    let keyed = |miss: &blaze_kernel::Miss| KeyedMiss {
+        build_id,
+        step: miss.step,
+        item: miss.item.clone(), // clone: the record's own text, once a miss
+        key: format!("{:x}", miss.key), // alloc: the record's text, once a miss
+        // alloc: once a miss, a part each part of its key
+        parts: miss
+            .parts
+            .iter()
+            .map(|part| KeyPart {
+                name: part.name.clone(), // clone: a part's own text
+                hash: part.hash.map(|it| format!("{it:x}")), // alloc: a part's text
+                names: part.names.clone(), // clone: a part's own text
+            })
+            .collect(),
+        beyond: miss.beyond,
+    };
+    // alloc: once a build, a record a miss
+    misses.iter().map(keyed).collect()
 }
 
 /// What the query engine counted since the last take, as `build`'s `query_counts` rows. Taken

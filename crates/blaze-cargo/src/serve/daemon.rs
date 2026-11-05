@@ -31,7 +31,7 @@ use blaze_api::{
     session::{self, Session},
 };
 use blaze_cas::Store;
-use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
+use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, IoError, Mapping, Tag};
 use blaze_format::SchemaHash;
 use blaze_graph::{Budget, PlaneConfig, arena};
 use blaze_history::{Config as HistoryConfig, History, section::HistoryError};
@@ -87,6 +87,9 @@ const HANG_UP: Tag = Tag(OWN + 8);
 const STALL: Tag = Tag(OWN + 9);
 /// The image's write and its map ([`Images`]).
 const IMAGE: u64 = OWN + 10;
+/// The watch of the system's memory pressure ([`Effect::Pressure`], [`Daemon::pressure`]),
+/// after the image's two.
+const PRESSURE: Tag = Tag(OWN + 12);
 
 /// How long a stop waits for the driver's last effects once it hung up: past it, the
 /// connections still sending are hung up on ([`Server::abandon`]) and named in a warning.
@@ -100,6 +103,9 @@ const MEMORY_LOG_EVERY: Duration = Duration::from_secs(30);
 /// (a check's build releases nothing): a forced collect of each thread's heaps costs it a walk
 /// of their pages, so not at every plot.
 const GIVE_BACK_EVERY: Duration = Duration::from_secs(1);
+/// How often, at most, the daemon looks for builds held back for memory to tell their clients
+/// ([`Jobs::tell_paused`]): a quarter of the second a build waits before it is told.
+const PAUSED_EVERY: Duration = Duration::from_millis(250);
 /// How long one unit's step runs, while no other ends, before what every thread is inside is
 /// written to the log ([`Daemon::watch`]): a warning, never a failure.
 const LONG_STEP: Duration = Duration::from_secs(300);
@@ -116,6 +122,7 @@ fn ends_alone(effect: &Effect) -> bool {
             effect,
             Effect::Watch { .. }
                 | Effect::Journal { .. }
+                | Effect::Pressure { .. }
                 | Effect::Unwatch { .. }
                 | Effect::Listen { .. }
                 | Effect::Unlisten { .. }
@@ -343,7 +350,14 @@ pub struct Options {
     pub socket: Option<FileName>,
     /// Where HTTP is listened on, and the bearer token its clients send.
     pub http: Option<(SocketAddr, String)>,
+    /// The daemon's ceiling: the most its plane grants, never above the machine budget
+    /// ([`super::machine::Joined::ceiling`]).
     pub budget: Option<Budget>,
+    /// Its place in the machine's memory ledger, joined as its engine started
+    /// (docs/memory-budget.md, section 7): its plane admits against the allowance each turn of
+    /// it gives, under `budget`. `None` admits against `budget` alone: the simulation's daemons,
+    /// and where blaze keeps no ledger ([`super::Machine`]).
+    pub machine: Option<super::Machine>,
     /// Workers of the plane: the cores.
     pub threads: usize,
     /// IO tasks run at once (fetches).
@@ -479,6 +493,10 @@ pub struct Daemon<D: Driver, S: Steps> {
     abandoned: Option<Abandoned>,
     settling: bool,
     failed: Option<Failed>,
+    /// Its place in the machine's memory ledger ([`Options::machine`]); held so it leaves as the
+    /// daemon drops, and turned only where there is a ledger (native unix).
+    #[cfg_attr(not(all(unix, feature = "native")), allow(dead_code))]
+    machine: Option<super::Machine>,
     pid: u32,
     /// Which blaze it is ([`Options::build`]), for [`blaze_api::Status::build`].
     build: blaze_api::Build,
@@ -530,6 +548,12 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// When the daemon past its limit's line last asked for the heaps' free pages back
     /// ([`GIVE_BACK_EVERY`]), on the driver's clock.
     given_back: Duration,
+    /// Whether the system's memory pressure is watched ([`PRESSURE`]): from the start until its
+    /// watch fails (no source here) or is undone at the stop.
+    pressure_watched: bool,
+    /// When the builds held back for memory were last looked for ([`PAUSED_EVERY`]), on the
+    /// driver's clock.
+    paused_checked: Duration,
     /// The collector of what blaze keeps on disk ([`super::gc`]): `blaze serve`'s daemon's
     /// alone ([`Daemon::collect`]), as a test's daemons share no disk of their own.
     gc: Option<super::gc::Gc>,
@@ -852,8 +876,10 @@ impl fmt::Display for MemoryLine<'_> {
     }
 }
 
-/// Says [`MemoryLine`] in the daemon's log and on its standard error.
-fn log_memory(memory: &blaze_mem::tag::Snapshot) {
+/// Says [`MemoryLine`] in the daemon's log and on its standard error: every
+/// [`MEMORY_LOG_EVERY`], at a stop, and first in the postmortem of a daemon past its memory
+/// ceiling (`serve::stop`).
+pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let resident = crate::raw::memory::footprint(std::process::id());
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1007,12 +1033,16 @@ pub enum Failed {
     Stalled(String),
     /// A store stopped (a file of it could not be read or written), named.
     Store(String),
+    /// The machine's memory ledger could not be locked, read or written, or no longer has this
+    /// daemon's record: admitting on would be admitting against no machine budget.
+    Ledger(String),
 }
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failed::Server(why) | Failed::Stalled(why) | Failed::Store(why) => f.write_str(why),
+            Failed::Ledger(why) => write!(f, "the machine's memory ledger: {why}"),
             Failed::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
             Failed::Settle(error) => {
                 write!(f, "the database could not settle onto its image: {error}")
@@ -1371,6 +1401,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut plane = Plane::new(plane_config, history, runner)
             .map_err(|error| format!("the plane: {error}"))?;
         plane.number_from(observe.first_build());
+        // The first turn of the machine's memory ledger, before any request: until one, the
+        // plane would grant up to its ceiling whatever the other daemons hold.
+        #[cfg_attr(not(all(unix, feature = "native")), allow(unused_mut))]
+        let mut machine = options.machine;
+        #[cfg(all(unix, feature = "native"))]
+        if let Some(machine) = &mut machine {
+            plane.poll(driver.now());
+            if let Some(bytes) =
+                machine.turn(driver.now(), &mut plane).map_err(|why| format!("{why:#}"))?
+            {
+                blaze_graph::admission::set_budgets(bytes);
+            }
+        }
         let mut mounts = Mounts::recover(&vfs);
         let forgotten = mounts.forget_unwritten(&mut vfs, &format!("/{}", options.sources), |at| {
             crate::serve::fetch::on_disk_mark(std::path::Path::new(at))
@@ -1423,6 +1466,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             runs_end: RUNS_END,
         })
         .map_err(|error| format!("the jobs' tables: {error}"))?;
+        // The system's memory pressure, watched for the daemon's life: it fails at once where
+        // there is no source ([`Daemon::pressure`]).
+        effects.push(Effect::Pressure { tag: PRESSURE });
         Ok(Daemon {
             driver,
             effects,
@@ -1451,6 +1497,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             abandoned: None,
             settling: false,
             failed: None,
+            machine,
             pid: std::process::id(),
             build: options.build,
             settings: options.settings,
@@ -1472,6 +1519,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             builds: Vec::new(), // alloc: none until a build is looked at
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
+            pressure_watched: true,
+            paused_checked: Duration::ZERO,
             gc: None,
             fetch_urls: super::fetch_url::FetchUrls::new(),
             held: Vec::new(), // alloc: none until a build runs out of space
@@ -1679,6 +1728,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // The socket's name first: the next daemon may bind it while this one writes its
         // image, and a client that comes meanwhile finds no one rather than waits.
         self.server.unlisten(&mut self.effects);
+        // The pressure watch is in flight until it is undone: the stop's last step waits for
+        // nothing in flight.
+        if self.pressure_watched {
+            self.effects.push(Effect::Unwatch { tag: PRESSURE });
+        }
         let mut replies = std::mem::take(&mut self.replies);
         self.observe.stop(&mut replies);
         self.send(replies);
@@ -1844,7 +1898,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     fn ended(&mut self, completion: &Completion) {
         if matches!(
             completion.done,
-            Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+            Done::Changed { .. }
+                | Done::Journaled(_)
+                | Done::Accepted { .. }
+                | Done::Pressed { .. }
         ) {
             return;
         }
@@ -2037,6 +2094,58 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.fail(Failed::Stalled(said));
     }
 
+    /// What the system says of memory, on [`PRESSURE`] (docs/memory-budget.md section 7,
+    /// "Pressure"). An event acts as the soft ceiling does: the plane admits nothing past what
+    /// the process holds now until 10 s pass with no event ([`super::plane::Plane::pressed`]),
+    /// the front ends are asked for a release (once a [`blaze_graph::pressure::HOLD_NS`] of a
+    /// run of events), and the heaps give back their free pages (once a [`GIVE_BACK_EVERY`]).
+    /// A system with no source the daemon can watch says so once, in the log: the daemon admits
+    /// by its budget alone, which is no error.
+    fn pressure(&mut self, completion: Completion) {
+        match completion.done {
+            Done::Pressed { critical } => {
+                let now = self.driver.now();
+                let release = self.plane.pressed(now);
+                let _span =
+                    tracing::info_span!(target: "blaze", "memory pressure", critical, release)
+                        .entered();
+                if release {
+                    self.jobs.pressed();
+                }
+                if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
+                    self.given_back = now;
+                    blaze_mem::tag::give_back_heap();
+                }
+            }
+            Done::Unwatched => self.pressure_watched = false,
+            Done::Failed(IoError(why)) => {
+                self.pressure_watched = false;
+                eprintln!(
+                    "blaze serve: no memory pressure source is watched, so the daemon admits by \
+                     its budget alone: {why}"
+                );
+            }
+            other => {
+                self.pressure_watched = false;
+                tracing::warn!(target: "blaze", "the watch of memory pressure ended as no watch does: {other:?}");
+            }
+        }
+    }
+
+    /// Each build held back for memory past a second told so, at most once each
+    /// [`PAUSED_EVERY`] of the driver's clock ([`Jobs::tell_paused`]).
+    fn tell_paused(&mut self) {
+        let now = self.driver.now();
+        if now.saturating_sub(self.paused_checked) < PAUSED_EVERY {
+            return;
+        }
+        self.paused_checked = now;
+        let mut said = self.spare.said.pop().unwrap_or_default();
+        let says = self.machine.as_ref().and_then(|it| it.says());
+        self.jobs.tell_paused(&mut world!(self, said), says);
+        self.said(said);
+    }
+
     /// What each build is doing, looked at once each [`doing::EVERY`] of the driver's clock
     /// while a job runs ([`Jobs::doing`]): said to its client as `Response::Doing`, and kept in
     /// `builds` for `blaze status`. Reads the plane's running nodes, the recorder's open spans
@@ -2172,6 +2281,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             _ if self.images.owns(completion.tag) => {
                 self.images.complete(&mut self.vfs, completion, &mut self.effects)
             }
+            _ if completion.tag == PRESSURE => self.pressure(completion),
             SERVER..VFS => {
                 let mut arrived = self.spare.arrived.pop().unwrap_or_default();
                 self.server.complete(completion, &mut self.effects, &mut arrived);
@@ -2499,8 +2609,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut said = self.spare.said.pop().unwrap_or_default();
         self.jobs.apply_writes(&mut world!(self, said));
         self.said(said);
+        self.tell_paused();
         loop {
             self.plane.poll(self.driver.now());
+            #[cfg(all(unix, feature = "native"))]
+            self.ledger_turn();
             self.plane.happened(&mut happened);
             if happened.is_empty() {
                 break;
@@ -2512,6 +2625,24 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.said(said);
         }
         self.spare.happened = happened;
+    }
+
+    /// A turn of the machine's memory ledger, when one is due ([`super::machine::Machine::due`]):
+    /// the plane told its allowance, which it admits against, and the subsystems' budgets set to
+    /// it when it moved ([`blaze_graph::admission::set_budgets`]: what a release is decided
+    /// against). A turn that fails stops the daemon.
+    #[cfg(all(unix, feature = "native"))]
+    fn ledger_turn(&mut self) {
+        let at = self.driver.now();
+        let Some(machine) = &mut self.machine else { return };
+        if !machine.due(at, &self.plane) {
+            return;
+        }
+        match machine.turn(at, &mut self.plane) {
+            Ok(Some(bytes)) => blaze_graph::admission::set_budgets(bytes),
+            Ok(None) => {}
+            Err(why) => self.fail(Failed::Ledger(format!("{why:#}"))),
+        }
     }
 
     /// Between requests: the collections, and after a cold build the image and the settle.

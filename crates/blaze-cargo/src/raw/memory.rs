@@ -1,5 +1,5 @@
-//! Memory: what a process holds (macOS and Linux) and the machine has (macOS), and the
-//! allocator's purge.
+//! Memory: what a process holds (macOS and Linux) and the machine has (macOS), the kernel's
+//! fatal limit on this process's footprint (macOS), and the allocator's purge.
 
 /// Bytes of memory a process of this user owns: its physical footprint, which is what
 /// Activity Monitor shows, and which still counts pages macOS has compressed.
@@ -89,6 +89,88 @@ pub fn machine_bytes() -> Option<u64> {
     (ok == 0 && bytes != 0).then_some(bytes)
 }
 
+// SAFETY: libsystem_kernel's `int memorystatus_control(uint32_t command, int32_t pid, uint32_t
+// flags, void *buffer, size_t buffersize)`, as XNU's bsd/sys/kern_memorystatus.h declares it
+// (apple-oss-distributions/xnu, main at f6217f89, line 333); a declaration that differs would
+// have every call pass its arguments wrongly.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    // Private (rule macos-private-apis): no public API sets a fatal limit on a process's
+    // physical footprint. With one the kernel kills the daemon the moment it passes its
+    // ceiling, where otherwise the Mac pages itself into a full compressor and a watchdog
+    // panic (2026-11-05: twice, on a 128 GiB Mac). A daemon's own watch reads the footprint
+    // only every 100 ms; the kernel's ledger holds it at every page it takes.
+    fn memorystatus_control(
+        command: u32,
+        pid: i32,
+        flags: u32,
+        buffer: *mut libc::c_void,
+        buffersize: usize,
+    ) -> libc::c_int;
+}
+
+/// `MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES` of XNU's bsd/sys/kern_memorystatus.h (line 344):
+/// sets a process's active and inactive memory limits and their attributes apart.
+#[cfg(target_os = "macos")]
+const MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES: u32 = 7;
+
+/// `MEMORYSTATUS_MEMLIMIT_ATTR_FATAL` of kern_memorystatus.h (line 495): passing the limit
+/// kills the process (`memorystatus_on_ledger_footprint_exceeded`'s fatal path, a SIGKILL with
+/// the jetsam reason `JETSAM_REASON_MEMORY_PERPROCESSLIMIT`), not only warns it.
+#[cfg(target_os = "macos")]
+const MEMORYSTATUS_MEMLIMIT_ATTR_FATAL: u32 = 0x1;
+
+/// `memorystatus_memlimit_properties_t` of kern_memorystatus.h (lines 482-487), field for field:
+/// each limit in MiB (the kernel's "MB", times 1024 * 1024), which the kernel holds the
+/// process's physical footprint to ([`footprint`]'s `ri_phys_footprint`).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MemlimitProperties {
+    memlimit_active: i32,
+    memlimit_active_attr: u32,
+    memlimit_inactive: i32,
+    memlimit_inactive_attr: u32,
+}
+
+/// Has the kernel kill this process once its physical footprint passes `bytes` (rounded down to
+/// whole MiB, at least one), active or inactive alike: `memorystatus_control(
+/// MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, getpid(), 0, &props, sizeof props)` with
+/// `MEMORYSTATUS_MEMLIMIT_ATTR_FATAL` on both limits. The MiB the limit is at.
+///
+/// XNU's `memorystatus_control` (bsd/kern/kern_memorystatus.c, line 9193) refuses this command
+/// with `EPERM` to a process that is neither root nor entitled `com.apple.private.memorystatus`,
+/// its own pid included (only the freeze commands, and on development kernels the limit's raise
+/// and re-arm on its own pid, skip that check), and the sandbox's MAC hook may refuse it too.
+/// The error is the caller's to say: its daemon is then held by its own watch alone.
+#[cfg(target_os = "macos")]
+pub fn hold_own_footprint(bytes: u64) -> std::io::Result<i32> {
+    let mib = i32::try_from(bytes >> 20).unwrap_or(i32::MAX).max(1);
+    let mut props = MemlimitProperties {
+        memlimit_active: mib,
+        memlimit_active_attr: MEMORYSTATUS_MEMLIMIT_ATTR_FATAL,
+        memlimit_inactive: mib,
+        memlimit_inactive_attr: MEMORYSTATUS_MEMLIMIT_ATTR_FATAL,
+    };
+    // SAFETY: `getpid` takes nothing and touches no memory of this process.
+    let pid = unsafe { libc::getpid() };
+    // SAFETY: `props` is a live, whole `memorystatus_memlimit_properties_t` (`#[repr(C)]`, the
+    // header's four fields in order) for the call, which copies `size_of` of it in and keeps no
+    // pointer to it; a size other than the struct's is refused (`EINVAL`), never read past.
+    let set = unsafe {
+        memorystatus_control(
+            MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES,
+            pid,
+            0,
+            (&raw mut props).cast(),
+            size_of::<MemlimitProperties>(),
+        )
+    };
+    match set {
+        0 => Ok(mib),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 /// Gives the system back the pages of what was freed, which the allocator keeps to reuse
 /// otherwise. Only where blaze names its allocator, mimalloc (`native`); the seed profile runs
 /// on std's, which has no such call.
@@ -132,6 +214,31 @@ mod tests {
         let held = super::footprint(std::process::id());
         assert!(held.is_some_and(|it| it > 0));
         assert!(super::machine_bytes().is_some_and(|it| it > held.unwrap()));
+    }
+
+    /// The daemon's hard ceiling on macOS rests on the private `memorystatus_control` (rule
+    /// macos-private-apis): an update of macOS that takes it out of libSystem fails here, by
+    /// name, not in a daemon that then holds no kernel limit.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn memorystatus_control_is_in_libsystem() {
+        // SAFETY: `dlsym` reads the nul-terminated name and returns an address or null; nothing
+        // is called through it.
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"memorystatus_control".as_ptr()) };
+        assert!(
+            !found.is_null(),
+            "libSystem has no `memorystatus_control`, which the daemon's hard memory ceiling calls \
+             (MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES)"
+        );
+    }
+
+    /// The limit's record is the kernel's `memorystatus_memlimit_properties_t`: four 32-bit
+    /// fields, 16 bytes, which the kernel refuses at any other size.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_memlimit_record_is_the_kernels_size() {
+        assert_eq!(size_of::<super::MemlimitProperties>(), 16);
+        assert_eq!(align_of::<super::MemlimitProperties>(), 4);
     }
 
     #[cfg(feature = "native")]

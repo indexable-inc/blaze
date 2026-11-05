@@ -1,9 +1,11 @@
 ---
 status: plan
 summary: Memory as a scheduled budget: blaze reads the machine's real limit, admits work by its measured peak, sheds caches under pressure and stops with an error naming what cannot fit, never swapping a machine to death.
-date: 2026-10-29
+date: 2026-11-05
 ---
 # Memory as a scheduled budget
+
+Where this leads: [memory-pool.md](memory-pool.md), memory as one buffer pool with one evictor.
 
 blaze must never take a machine down. When what it was asked to build does not fit in the
 memory it may use, it stops with an error that names what did not fit and how much it needed
@@ -174,6 +176,143 @@ A unit with no record that grows past the budget while it runs alone is stopped,
 far recorded, and the build ends with the same error. Never a retry with less parallelism
 behind the user's back, never swap.
 
+### 7. The ceiling: blaze never takes the machine down
+
+2026-11-05: a 128 GiB Mac kernel-panicked twice (watchdog timeout, the memory compressor at
+"100% of segments limit (BAD)") with five daemons resident at 98.8, 76.7, 70, 42 and 18.6 GiB.
+Each daemon had its own budget and none knew of the others; one ran at 117.66 GiB over its own
+81.21 GiB limit because admission granted every cold unit 64 MiB (#1726). So admission alone is
+no bound. Four parts, each a bound on its own:
+
+**The machine budget**, one for every daemon of the user on the host. It is the least of the
+machine's limits (section 1: `hw.memsize`, `MemTotal`, cgroup `memory.max`/`memory.high`) times
+3/4, less what is not blaze's at start and the margin. `BLAZE_MACHINE_MEMORY_GB` sets it.
+`BLAZE_DAEMON_MEMORY_GB` (`--memory-gb`) is one daemon's ceiling, never more than the machine
+budget.
+
+**The ledger**, `/tmp/blaze-<uid>/machine` (never under `BLAZE_HOME`: two homes are one
+machine), a small file of fixed records read and rewritten under `flock`. One record a daemon:
+its pid and process start time (so a reused pid is not mistaken for it), home, version,
+ceiling, and its charge, `max(held, granted)`, rewritten as its plane takes a `Held` (at most
+every 250 ms, or at once when it moves by more than 1/64 of the budget). A daemon joins at start
+and leaves at exit. A record whose process is gone, or whose start time differs, is pruned by
+whoever takes the lock next. A daemon's **allowance** is the least of its ceiling and the
+machine budget less every other live daemon's charge. That allowance, not a fixed number, is the
+budget its plane admits against and its releases are decided on (`admission::set_budgets`,
+`Squeeze`). The arithmetic is a sans-IO core (`blaze_graph::ledger`); the flock and the file
+are its driver (`crates/blaze-cargo/src/serve/machine.rs`). A daemon that cannot open or lock the
+ledger stops with an error naming the file (no fallback to a budget of its own).
+
+As built (2026-11-05), where it differs from the above and why:
+- The core is `blaze_graph::ledger`, not `blaze_graph::machine`: that name is the build graph's.
+- Every ledger write is one turn under the lock: read, prune, compute the allowance, give it to
+  the plane (`PlaneInput::Allowance`), write the charge `max(held, granted)`, unlock. Between
+  turns the plane grants only up to its **room**, `min(allowance, max(granted, held))` as of the
+  last turn, so what it grants never passes the charge the others can read. A plane that has
+  never been given an allowance has no room limit, so the plane alone behaves as before.
+- Each record keeps the machine budget its daemon brought, and the budget is the least over the
+  live records. Daemons started at different times see different "not blaze's" memory, and
+  taking the least keeps the bound one number for all of them. At join, the other daemons'
+  held bytes are counted as blaze's, not as "not blaze's" (Linux only: macOS has no in-use
+  reading yet, so its budget is 3/4 of `hw.memsize` less the margin).
+- A task predicted at the whole ceiling (one with no record, which runs alone) starts alone
+  with its grant clamped to the allowance once the allowance is above zero. Without the clamp
+  it would wait forever for a machine the other daemons share.
+- Besides every 250 ms and moves past 1/64 of the budget, a daemon also turns 25 ms after its
+  plane held a task back for memory, so freed room reaches it quickly.
+- The file is fixed size (a 32-byte header, then 64 records of 128 bytes), checksummed, rewritten
+  whole and never synced: it describes live processes, so after a reboot nothing in it matters.
+  A file that fails to decode is an error naming it; it is removed by hand, never reset.
+- Start time is the kernel's own: clock ticks since boot on Linux (`/proc/<pid>/stat`), and
+  microseconds since the epoch on macOS (`proc_pidinfo`). It is only compared with itself.
+- Windows has no ledger yet, and neither does the seed without `native`: each keeps its own
+  ceiling as before.
+
+**The ceiling, enforced past admission.**
+- Soft, at the allowance: the plane admits nothing new, the daemon releases its front ends'
+  caches and gives back its heaps' free pages (section 3), and every client with a build held
+  back is told (below).
+- Hard, at the daemon's ceiling: the kernel's own limit.
+  - On macOS, `memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES)` on the daemon's
+    own pid, with a fatal active and inactive limit. This is private (rule
+    macos-private-apis): the kernel kills the daemon instead of the machine paging itself to
+    death, and a test checks the symbol is there. XNU allows it only to root or to a process
+    with the `com.apple.private.memorystatus` entitlement, even on its own pid
+    (`kern_memorystatus.c`). A daemon run by a user gets `EPERM`, says so once in its log, and
+    the watch below is its bound.
+  - On Linux, `memory.max` of the daemon's own cgroup where one is delegated
+    (`blaze_core::cgroup`), `memory.high` at 15/16 of it.
+  - Where neither applies, the daemon's watch thread (100 ms, the footprint
+    `resident_by` reads) ends the daemon with exit status `MEMORY_CEILING` once its footprint
+    passes the ceiling, after a postmortem naming the tags and the running tasks.
+
+  In each case the client says the daemon was stopped at its ceiling, naming it and the
+  ceiling, as a typed failure (`the daemon (pid N) was stopped at its memory ceiling of 48
+  GiB`), never a bare hang-up.
+
+**Pressure.** The system says before a budget can (`blaze_core::Effect::Pressure`, one more
+event of the driver's own wait, no thread):
+- macOS: a kqueue knote of `EVFILT_MEMORYSTATUS` (warn, critical), the private filter
+  `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` is made of; the public `EVFILT_VM` is `bad_filtops` in
+  XNU now.
+- Linux: a PSI trigger, `some 300000 2000000` (15% of a 2 s window: a process without
+  `CAP_SYS_RESOURCE` may arm only whole multiples of 2 s, Linux 6.5+), on the daemon's cgroup's
+  `memory.pressure` where the memory controller is delegated to it, else on
+  `/proc/pressure/memory`, polled through the ring for `POLLPRI`.
+- Where there is none (no PSI, a kernel before 6.5, Windows for now), the daemon says so once in
+  its log and admits by its budget alone.
+
+Either event makes the daemon act as at the soft ceiling now: no admission, release, give
+back. It keeps its allowance at what it holds until 10 s pass with no event
+(`blaze_graph::pressure::Pressured`, a sans-IO core). The plane takes it as
+`PlaneInput::Cap`; its budget is `min(allowance, cap)` (`blaze_graph::pressure::budget_under`,
+`Plane::budget_now`, the one join), every admission decision reads that, and under a cap no
+task starts alone (waiting does make room there). A task is refused as too big only against the
+allowance, never the cap. The front ends are asked for a release at the first event of a run
+and once each 10 s of it after.
+
+**What the client is told.** A build held back for memory for more than a second (a task of it
+ready, a thread of its pool free, and no room: `Plane::waits_for_memory`) is told, as a note
+(`Response::Diagnostic` of `Diagnostic::note`, no new protocol), once, then again when what the
+daemon holds moves by more than a 64th of the budget or the tasks it waits on change, and
+`build resumed` once none of it is held back (`blaze_graph::pressure::Paused`):
+`build paused: daemon at 47.9 of 48 GiB (machine 96 GiB, 40.1 held by pid 4242 of
+/Users/a/.blaze), waiting on 3 tasks: codegen of hir-ty, ...`. It names what waits, on what,
+and who holds the rest.
+
+**Proof.** A Hegel DST of the ledger core and the plane's admission against it
+(`crates/blaze-graph/src/ledger/tests.rs`).
+- The simulation runs several daemons, each with tasks whose grants and real use are drawn.
+  Their steps interleave with crashes (a daemon gone without leaving), pid reuse and restarts.
+- The oracle:
+  - at every step the live daemons' grants sum to at most the machine budget;
+  - no daemon admits while the charges sum to it;
+  - a task that fits is admitted within a bounded number of steps after others end
+    (bounded-progress).
+- Planted-bug controls it must catch:
+  - a read-modify-write of the ledger without the lock (two daemons both admit into the same
+    room);
+  - a prune that ignores start time (a dead daemon's charge kept by a reused pid);
+  - an allowance that leaves out another daemon's charge.
+
+### 8. One daemon per machine
+
+Two daemons on one machine are two of everything: two front ends of the same std, two stores'
+working sets, two budgets. By default blaze runs one daemon per user per machine. It holds
+`/tmp/blaze-<uid>/daemon.lock` (machine-wide, not under `BLAZE_HOME`), with its socket and its
+version in the ledger.
+- A client of another `BLAZE_HOME` of the same version uses the running daemon, which serves
+  that home's store and builds beside its own (one home a request, as a workspace is today).
+- A client whose binary differs (a lane testing a blaze it just built) does not start a second
+  daemon. It stops with an error naming the running one: its pid, home, version and resident
+  memory, and how to stop it or opt out.
+- `--isolated` (or `BLAZE_ISOLATED=1`) is the opt-out. It starts a second daemon that joins the
+  ledger like any other, so its charge counts against the one machine budget.
+
+Never two independent ceilings: whatever runs, the ledger's budget is the bound. The ledger and
+the budget land first (section 7). The single daemon and its reuse across homes come next, once
+a daemon can serve more than one home's store.
+
 ## The check in CI
 
 `harness/unittests.py` says the most the machine held, memory and swap, in the job's summary,
@@ -200,6 +339,9 @@ section 6, never killed by the kernel and never into swap.
 6. The live watch, and the error of section 6.
 7. Caches under pressure (section 3).
 8. Streaming codegen (section 4).
+9. The ceiling (section 7): the ledger and machine budget, the kernel's limit, pressure,
+   what the client is told; its DST.
+10. One daemon per machine (section 8).
 
 Each step is its own pull request with its numbers: the peak and time of the tests job before
 and after.

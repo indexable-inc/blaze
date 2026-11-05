@@ -1079,7 +1079,8 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Connect { .. }
         | Effect::Recv { .. }
         | Effect::Send { .. }
-        | Effect::Hangup { .. } => {
+        | Effect::Hangup { .. }
+        | Effect::Pressure { .. } => {
             unreachable!("timers, watches, processes and sockets are kept by the driver")
         }
     }
@@ -1804,6 +1805,16 @@ impl Driver for Threads {
                         self.tell(tag, Done::Failed(IoError(no_watch(watch))));
                     }
                 }
+                // The driver of no target the daemon runs on: its memory pressure is the
+                // native driver's (kqueue's on macOS, io_uring's on Linux), so it ends here.
+                Effect::Pressure { tag } => self.tell(
+                    tag,
+                    Done::Failed(IoError(
+                        "the threads driver watches no memory pressure: only kqueue (macOS) and \
+                         io_uring (Linux) do"
+                            .to_owned(), // alloc: an error path.
+                    )),
+                ),
                 // A lock never waits, so it is taken here rather than on an IO thread.
                 Effect::Lock { file, mode, tag } => {
                     let done = self.locks.lock(&self.shared.root, &file, mode, tag);

@@ -255,6 +255,90 @@ impl Drop for Cgroup {
     }
 }
 
+/// How the daemon's own cgroup holds it to its ceiling ([`hold_own`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnHeld {
+    /// Its cgroup's `memory.max` is the ceiling and `memory.high` 15/16 of it (with
+    /// `memory.swap.max` 0 where swap is accounted): the cgroup's directory.
+    Held { dir: PathBuf },
+    /// No cgroup v2 is delegated to it, or its own is the root's, which has no `memory.max`:
+    /// why. Nothing of the kernel's holds it; the daemon's own watch does.
+    NotDelegated(String),
+}
+
+/// `memory.high`'s share of the ceiling: the kernel reclaims and throttles the daemon from
+/// there, before `memory.max` has it killed (docs/memory-budget.md section 7, Hard).
+const HIGH_SIXTEENTHS: u64 = 15;
+
+/// Holds this process (the daemon) to `ceiling` bytes with its own cgroup v2, where one is
+/// delegated to it: the cgroup each process's cgroup is made beside ([`parent`], which moves
+/// the daemon into its leaf `daemon`, as the first spawn with a limit does) is readied, and the
+/// cgroup the daemon is then in gets `memory.max` = `ceiling`, `memory.high` = 15/16 of it and
+/// `memory.swap.max` = 0, so it can't pass the ceiling by swapping. Its spawns' cgroups are that
+/// leaf's siblings, each held to its own limit, so they are not counted against this one.
+///
+/// Delegation is what [`parent`] decides: where it can't ready a cgroup (no cgroup v2, the
+/// memory controller not delegated, others' processes in it), or the daemon's cgroup is the
+/// root (no `memory.max`), [`OwnHeld::NotDelegated`] says why. Once one is readied a write that
+/// fails is an error naming the file: a cgroup the daemon may write that does not take its
+/// limit is no limit. Call it again with a new ceiling to move the limit.
+pub fn hold_own(ceiling: u64) -> io::Result<OwnHeld> {
+    if let Err(why) = parent() {
+        // alloc: once a ceiling is set
+        return Ok(OwnHeld::NotDelegated(why.to_string()));
+    }
+    let cgroups = read(Path::new("/proc/self/cgroup"))?;
+    let mountinfo = read(Path::new("/proc/self/mountinfo"))?;
+    let own = own_dir(&cgroups, &mountinfo)
+        .map_err(|why| io::Error::new(io::ErrorKind::Unsupported, why))?;
+    // alloc: once a ceiling is set
+    let max = own.join("memory.max");
+    if !max.exists() {
+        return Ok(OwnHeld::NotDelegated(
+            // alloc: once a ceiling is set
+            format!(
+                "{} has no memory.max: it is the root cgroup, or the memory controller is not \
+                 enabled for it",
+                own.display()
+            ),
+        ));
+    }
+    let mut digits = [0u8; 20];
+    // High first: a lowered ceiling never has `memory.high` above `memory.max`, even for a
+    // moment.
+    let high = ceiling / 16 * HIGH_SIXTEENTHS;
+    // alloc: once a ceiling is set
+    write(&own.join("memory.high"), decimal(high, &mut digits)?)?;
+    write(&max, decimal(ceiling, &mut digits)?)?;
+    // alloc: once a ceiling is set
+    match write(&own.join("memory.swap.max"), b"0") {
+        Ok(()) => {}
+        // Swap accounting is off: with no swap on there is nothing to pass the ceiling by.
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !swap_in_use()? => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                // alloc: an error's message, made as it fails.
+                format!(
+                    "{}/memory.swap.max is missing (swap accounting is off) while swap is on: \
+                     the daemon could pass its ceiling by swapping",
+                    own.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(OwnHeld::Held { dir: own })
+}
+
+/// `value` in decimal, written into `digits` (room for `u64::MAX`'s 20).
+fn decimal(value: u64, digits: &mut [u8; 20]) -> io::Result<&[u8]> {
+    let mut rest = &mut digits[..];
+    write!(rest, "{value}")?;
+    let len = 20 - rest.len();
+    Ok(&digits[..len])
+}
+
 /// Waits until `events` says `populated 0`, or until `deadline`.
 fn wait_empty(events: &Path, deadline: Instant) {
     let Ok(file) = std::fs::File::open(events) else { return };
@@ -296,6 +380,26 @@ fn parent() -> io::Result<&'static Path> {
         .map_err(|why| io::Error::new(io::ErrorKind::Unsupported, why))?;
     ready(&own)?;
     Ok(PARENT.get_or_init(|| own).as_path())
+}
+
+/// The file whose memory pressure an [`crate::Effect::Pressure`] arms its PSI trigger on: the
+/// process's own cgroup's `memory.pressure` where the memory controller is delegated to it, so
+/// the pressure counted is the daemon's and its builds' (in cgroups below it), else the whole
+/// system's, `/proc/pressure/memory` (docs/memory-budget.md section 7, "Pressure"). Read
+/// without readying the cgroup: watching pressure moves no process.
+pub(crate) fn pressure_file() -> PathBuf {
+    // alloc: the paths, once per watch of memory pressure (one per daemon).
+    let delegated = || -> Option<PathBuf> {
+        if let Some(own) = PARENT.get() {
+            return Some(own.join("memory.pressure"));
+        }
+        let cgroups = read(Path::new("/proc/self/cgroup")).ok()?;
+        let mountinfo = read(Path::new("/proc/self/mountinfo")).ok()?;
+        let own = own_dir(&cgroups, &mountinfo).ok()?;
+        let controllers = read(&own.join("cgroup.controllers")).ok()?;
+        listed(&controllers, "memory").then(|| own.join("memory.pressure"))
+    };
+    delegated().unwrap_or_else(|| PathBuf::from("/proc/pressure/memory"))
 }
 
 /// Readies `own`, this process's cgroup, to hold a cgroup per process with the memory

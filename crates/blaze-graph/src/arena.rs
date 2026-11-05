@@ -718,8 +718,22 @@ pub fn own_of(snapshot: &blaze_mem::tag::Snapshot) -> u64 {
     blaze_mem::tag::resident().unwrap_or_else(|| snapshot.footprint(held()))
 }
 
-/// The memory the plane may grant: the machine's limit, less what others use within it, less
-/// `margin`.
+/// The share of each of the machine's own memory limits (`hw.memsize`, `MemTotal`, a cgroup's
+/// `memory.max`) that blaze may hold, as (numerator, denominator): 3/4 (docs/memory-budget.md
+/// section 7, "The machine budget"). The quarter left is the kernel's, the compressor's and the
+/// user's other programs', whatever blaze admits: on 2026-11-05 a 128 GiB Mac whose daemons
+/// were let hold all of it kernel-panicked twice with its compressor full. A limit the daemon is
+/// told (`BLAZE_DAEMON_MEMORY_GB`, `--memory-gb`) and `RLIMIT_AS` are not scaled: they are more
+/// limits, the least winning, so a daemon's ceiling is never more than this share.
+pub const MACHINE_SHARE: (u64, u64) = (3, 4);
+
+/// [`MACHINE_SHARE`] of `bytes`.
+const fn machine_share(bytes: u64) -> u64 {
+    bytes / MACHINE_SHARE.1 * MACHINE_SHARE.0
+}
+
+/// The memory the plane may grant: the machine's limit ([`MACHINE_SHARE`] of it), less what
+/// others use within it, less `margin`.
 ///
 /// The limit is the least of what the machine has and what the process may use: on Linux
 /// the machine's memory ([`linux_machine`]: `MemTotal`, or the ceiling a VM that hot-plugs
@@ -744,11 +758,31 @@ pub fn own_of(snapshot: &blaze_mem::tag::Snapshot) -> u64 {
 /// read or nothing is left, never a guess.
 pub fn machine_budget(margin: u64, told: Option<(u64, String)>) -> io::Result<Budget> {
     let mut limits = machine_limits()?;
+    for (bytes, from) in &mut limits {
+        *bytes = machine_share(*bytes);
+        // alloc: the budget's name, once per daemon start
+        *from = format!("{}/{} of {from}", MACHINE_SHARE.0, MACHINE_SHARE.1);
+    }
     limits.extend(told);
     #[cfg(unix)]
     // alloc: the budget's name, once per daemon start
     limits.extend(rlimit_as()?.map(|bytes| (bytes, "the process's RLIMIT_AS".to_owned())));
     let in_use = machine_in_use(own())?;
+    least(limits, in_use.as_ref(), margin)
+}
+
+/// The machine budget every blaze daemon of the user on the host shares (docs/memory-budget.md,
+/// section 7, [`crate::ledger`]): the least of the machine's limits ([`machine_budget`]'s, not
+/// `RLIMIT_AS` or a limit the daemon was told, which are one process's) times 3/4, less what
+/// others use within it and `margin`. `blaze` is what the ledger's other daemons hold now: in
+/// use, but not by others, since the budget is theirs too.
+pub fn machine_wide(margin: u64, blaze: u64) -> io::Result<Budget> {
+    let limits = machine_limits()?
+        .into_iter()
+        // alloc: a limit's name, once per daemon start
+        .map(|(bytes, from)| (bytes / 4 * 3, format!("3/4 of {from} ({})", gb(bytes))))
+        .collect();
+    let in_use = machine_in_use(own().saturating_add(blaze))?;
     least(limits, in_use.as_ref(), margin)
 }
 
@@ -861,32 +895,38 @@ fn linux_limits(root: &Path) -> io::Result<Vec<(u64, String)>> {
             // alloc: the error's message
             return Err(invalid(&cgroup, format!("a line `{line}`")));
         };
-        let (mount, file) = if hierarchy == "0" && controllers.is_empty() {
-            ("sys/fs/cgroup", "memory.max")
+        // cgroup v2's `memory.high` is a limit too: past it the kernel throttles and reclaims,
+        // the slow death a budget is to keep a build from (docs/memory-budget.md, section 1).
+        let (mount, files): (_, &[&str]) = if hierarchy == "0" && controllers.is_empty() {
+            ("sys/fs/cgroup", &["memory.max", "memory.high"])
         } else if controllers.split(',').any(|it| it == "memory") {
-            ("sys/fs/cgroup/memory", "memory.limit_in_bytes")
+            ("sys/fs/cgroup/memory", &["memory.limit_in_bytes"])
         } else {
             continue;
         };
         let mut at = Some(path);
         while let Some(group) = at {
-            let limit = root.join(mount).join(group.trim_start_matches('/')).join(file);
-            match std::fs::read_to_string(&limit) {
-                Ok(text) if text.trim() == "max" => {}
-                Ok(text) => {
-                    let bytes = text
-                        .trim()
-                        .parse::<u64>()
-                        // alloc: the error's message
-                        .map_err(|_| invalid(&limit, format!("a limit of `{}`", text.trim())))?;
-                    // alloc: a limit's name, once per cgroup level per daemon start
-                    limits.push((bytes, format!("{file} of cgroup {group}")));
-                }
-                // A cgroup has no limit file at the root of its hierarchy.
-                Err(why) if why.kind() == io::ErrorKind::NotFound => {}
-                Err(why) => {
-                    // alloc: the error's message
-                    return Err(io::Error::new(why.kind(), format!("{}: {why}", limit.display())));
+            for file in files {
+                let limit = root.join(mount).join(group.trim_start_matches('/')).join(file);
+                match std::fs::read_to_string(&limit) {
+                    Ok(text) if text.trim() == "max" => {}
+                    Ok(text) => {
+                        let bytes = text.trim().parse::<u64>().map_err(|_| {
+                            // alloc: the error's message
+                            invalid(&limit, format!("a limit of `{}`", text.trim()))
+                        })?;
+                        // alloc: a limit's name, once per cgroup level per daemon start
+                        limits.push((bytes, format!("{file} of cgroup {group}")));
+                    }
+                    // A cgroup has no limit file at the root of its hierarchy.
+                    Err(why) if why.kind() == io::ErrorKind::NotFound => {}
+                    Err(why) => {
+                        return Err(io::Error::new(
+                            why.kind(),
+                            // alloc: the error's message
+                            format!("{}: {why}", limit.display()),
+                        ));
+                    }
                 }
             }
             at = match group.rfind('/') {
@@ -1872,6 +1912,12 @@ mod tests {
         let budget = machine_budget(1 << 20, None).unwrap();
         assert!(budget.bytes > 0);
         assert!(budget.from.contains("a margin of 0.00 GB"), "{}", budget.from);
+        // The machine's own limit counts at its share, the quarter left to the machine.
+        assert!(
+            budget.from.starts_with("3/4 of ") || budget.from.starts_with("the process's RLIMIT_AS"),
+            "{}",
+            budget.from
+        );
         #[cfg(target_os = "linux")]
         assert!(budget.from.contains("others use in cgroup") || budget.from.contains("less a"));
     }
