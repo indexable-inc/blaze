@@ -433,8 +433,8 @@ pub enum HistoryError {
         path: PathBuf,
         error: io::Error,
     },
-    /// The history `dir` has no schema file of `tables` (it was written before they existed),
-    /// and writing them there failed: no view over it can be opened.
+    /// The history `dir` had no schema file of `tables` (it was written before they existed),
+    /// and writing one of them there failed (`error`, the first): no view over it can be opened.
     SchemasMissing {
         dir: PathBuf,
         tables: Vec<&'static str>,
@@ -459,6 +459,15 @@ pub enum HistoryError {
     Unclassified {
         dir: PathBuf,
         file: String,
+    },
+    /// Flush `seq` of the history `dir` was not committed: its files `files` were not placed
+    /// (each says why apart). Its commit would say its flight recorder rows are listed, and
+    /// those files' rows are not, so a crash before the next flush's commit would lose them; the
+    /// files it did place stay unlisted, and the next flush's commit lists them.
+    Unplaced {
+        dir: PathBuf,
+        seq: u64,
+        files: Vec<String>,
     },
     /// The flight recorder could not be kept past a crash, or a dead daemon's rows could not be
     /// read back ([`flight::postmortem`]).
@@ -533,6 +542,13 @@ impl fmt::Display for HistoryError {
                  the history can't be told: move it out of the directory",
                 dir.display()
             ),
+            HistoryError::Unplaced { dir, seq, files } => write!(
+                f,
+                "the profile history {}: flush {seq} was not committed, as its files {} were not placed; the next \
+                 flush lists the files it placed",
+                dir.display(),
+                files.join(", ")
+            ),
             HistoryError::Postmortem(error) => write!(f, "the profile history: {error}"),
             HistoryError::Client { build, table, why } => {
                 write!(
@@ -555,7 +571,9 @@ impl std::error::Error for HistoryError {
             HistoryError::Compact { error: CompactError::Io(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::Parquet(error), .. } => Some(error),
             HistoryError::Compact { error: CompactError::SchemaDiffers, .. } => None,
-            HistoryError::Manifest { .. } | HistoryError::Unclassified { .. } => None,
+            HistoryError::Manifest { .. }
+            | HistoryError::Unclassified { .. }
+            | HistoryError::Unplaced { .. } => None,
             HistoryError::Postmortem(error) => Some(error),
             HistoryError::Client { .. } => None,
         }
@@ -1512,6 +1530,7 @@ impl History {
         }
         let flush = files::Flush { seq, files: placing, recorder, crashes, ended };
         // The commit point, then what follows it (merges, the cap, a reap), all the core's. A
+        // flush with a file not placed is not committed ([`HistoryError::Unplaced`]), and a
         // commit that fails (another process held the manifest's lock past its bound) leaves
         // this flush's files in place, unlisted: the next flush lists them first, and a crash
         // before it leaves them to the next open's sweep, and their rings' rows to the
@@ -2001,8 +2020,13 @@ mod tests {
             })
             .unwrap();
         let flushed = history.flush(None).unwrap();
-        assert_eq!((flushed.builds, flushed.client, flushed.build), (1, 1, 81));
-        let read = read_back(&dir.join(format!("81-{:08}.builds.parquet", flushed.seq)));
+        assert_eq!((flushed.builds, flushed.client), (1, 1));
+        // Named for the highest build of what it read: another test's recorder rows of a
+        // later build, running at once, may name it past 81.
+        assert!(flushed.build >= 81, "{flushed:?}");
+        let read = read_back(
+            &dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)),
+        );
         let int = |name: &str| {
             read[0]
                 .column(schema::BUILDS.column(name).unwrap())

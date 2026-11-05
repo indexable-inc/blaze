@@ -1028,6 +1028,40 @@ fn the_oracle_catches_what_a_flush_consumed_marked_after_its_commit() {
     control(Plant::MarkAfterCommit);
 }
 
+/// The plan Hegel shrank on 2026-11-04, written out: pid 106's flush of row 5 fails to place
+/// its file (an injected failure), so the row is kept for the next flush; that flush's file
+/// fails to place too, its commit is done, and the power goes out on the next completion,
+/// before the test can re-mark the row as the next flush's. The core used to commit a flush
+/// with a file not placed, saying the recorder's flush listed, so the postmortem read past row
+/// 5 and it was lost. A flush with a file not placed is now not committed
+/// ([`HistoryError::Unplaced`]).
+#[test]
+fn a_row_whose_file_was_not_placed_survives_a_crash_after_that_flush() {
+    let crash = |at, record, reopen_at| Crash { at, record, reopen_at };
+    let flush = |rows, crash| Act::Flush { rows, end: true, fault: Fault::None, crash };
+    let plan = Plan {
+        seed: 5_047_471_726,
+        fail_one_in: 20,
+        latency_us: 1,
+        // alloc: a test's plan
+        acts: vec![
+            Act::Crash(crash(0, false, Some(0))),
+            Act::Crash(crash(0, true, None)),
+            flush(0, None),
+            flush(0, Some(crash(8, false, Some(0)))),
+            flush(1, None),
+            flush(1, Some(crash(0, true, None))),
+            flush(0, None),
+            flush(0, None),
+            flush(1, None),
+            flush(0, Some(crash(8, false, None))),
+        ],
+    };
+    if let Err(broke) = run(&plan, Plant::None) {
+        panic!("{broke}\nplan {plan:?}");
+    }
+}
+
 /// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
 #[test]
 fn replay_one_seed() {

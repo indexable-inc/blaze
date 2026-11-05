@@ -2693,6 +2693,8 @@ impl FlushJob {
                     Step::Pending => return Step::Pending,
                     Step::Ready(()) => {
                         let entries = std::mem::take(&mut self.entries);
+                        // alloc: empty unless a file is not placed
+                        let mut unplaced = Vec::new();
                         for (at, ((name, len, failed), entry)) in
                             self.place.take().into_iter().zip(entries).enumerate()
                         {
@@ -2702,6 +2704,7 @@ impl FlushJob {
                                     self.crashes = None;
                                 }
                                 self.out.placed.push(Some(error));
+                                unplaced.push(name);
                                 continue;
                             }
                             let Some(named) = Name::parse(&name) else {
@@ -2725,6 +2728,20 @@ impl FlushJob {
                         // row, and only then deleted.
                         if let Some((_, mut written)) = self.crashes.take() {
                             st.listing.append(&mut written);
+                        }
+                        // The commit says the recorder's flush `seq` is listed, rows of a file
+                        // not placed too: a crash between it and the next flush's commit would
+                        // lose them, as a postmortem reads past that flush's marks. So a flush
+                        // with a file not placed is not committed, as a commit that failed: its
+                        // placed files stay unlisted, and so do the crash records they consume,
+                        // for the next flush's commit; a crash before it leaves them to the next
+                        // open's sweep and every row of this flush to the postmortem.
+                        if !unplaced.is_empty() {
+                            return Step::Ready(Err(HistoryError::Unplaced {
+                                dir: cx.dir_path(),
+                                seq: self.seq,
+                                files: unplaced,
+                            }));
                         }
                         self.stage = Flushing::Change;
                     }
@@ -3070,8 +3087,9 @@ impl WriteListed {
 
 /// The schema file of every table there, as a reader needs before it opens views over the
 /// history: one missing (a history last written before its table existed) is written, the rest
-/// left as their writer wrote them. Those that can't be written are
-/// [`HistoryError::SchemasMissing`], naming them and why the first could not be.
+/// left as their writer wrote them. One that can't be written is
+/// [`HistoryError::SchemasMissing`], naming every table that was missing and why the first
+/// write failed.
 struct Schemas {
     /// Each schema file's name, its table and its bytes.
     files: Vec<(String, &'static str, Vec<u8>)>,
@@ -3090,15 +3108,13 @@ impl Schemas {
             return match place.resume(cx, done) {
                 Step::Pending => Step::Pending,
                 Step::Ready(()) => {
-                    let placed = place.take();
+                    // Every table the history had no schema file of, as a reader needs all of
+                    // them before any view opens: those written meanwhile too, so the error
+                    // names the same tables whichever of the writes failed.
                     // alloc: an error's tables
-                    let tables: Vec<&'static str> = placed
-                        .iter()
-                        .zip(&self.missing)
-                        .filter(|(it, _)| it.2.is_some())
-                        .map(|(_, &at)| self.files[at].1)
-                        .collect();
-                    match placed.into_iter().find_map(|it| it.2) {
+                    let tables: Vec<&'static str> =
+                        self.missing.iter().map(|&at| self.files[at].1).collect();
+                    match place.take().into_iter().find_map(|it| it.2) {
                         None => Step::Ready(Ok(Outcome::Schemas(Ok(())))),
                         Some(error) => {
                             Step::Ready(Ok(Outcome::Schemas(Err(HistoryError::SchemasMissing {
