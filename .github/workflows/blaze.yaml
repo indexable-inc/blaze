@@ -198,6 +198,9 @@ jobs:
             f="target/x86_64-unknown-linux-gnu/release/$bin"
             file "$f" | tee /dev/stderr | grep -q 'ELF 64-bit LSB .*x86-64' || { echo "::error::$f is not an x86-64 ELF"; exit 1; }
           done
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # The gate's build and unit tests, on ix (blaze-platform.yaml). On a push to main, the caches
   # for the train's runs and the next push's, and the snapshots the gate's runs fork.
@@ -254,6 +257,9 @@ jobs:
       - run: >-
           PYTHONPATH=tools/typed-input/src python3 tools/astlog/scan.py
           '{"astlog": "target/debug/astlog", "rules": "tools/astlog/rules", "paths": ["crates", "tools"], "exclude": ["crates/harness"]}'
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # AGENTS.md rule fix-through-blaze-lints: each clippy and blaze lint's findings, counted by
   # crate, may only shrink. crates/blaze-lints/baselines holds the counts, one file per lint;
@@ -291,6 +297,9 @@ jobs:
         run: >-
           target/release/blaze check --workspace --target aarch64-unknown-linux-gnu
           --message-format short --baselines crates/blaze-lints/baselines
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   ci:
     name: ci

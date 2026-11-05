@@ -100,6 +100,9 @@ jobs:
           name: result-${{ matrix.project }}
           path: ${{ runner.temp }}/out
           if-no-files-found: ignore
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   report:
     needs: [plan, project]

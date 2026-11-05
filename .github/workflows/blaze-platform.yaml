@@ -149,6 +149,9 @@ jobs:
         timeout-minutes: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 335 || startsWith(inputs.os, 'macos') && 220 || 150 }}
         run: |
           $PYTHON harness/unittests.py '{"args": ["--events", "json"]}'
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   build:
     name: build
@@ -271,6 +274,9 @@ jobs:
         run: |
           parts=$(uv run --frozen --no-dev python harness/focused.py parts "{\"harnesses\": $HARNESSES}")
           echo "parts=$parts" >> "$GITHUB_OUTPUT"
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # The profile's gate (crates/blaze-profile/src/gate.rs, docs/profiling.md "The gate") over the
   # history the build job's self-build wrote, run by the blaze this tree built and held to

@@ -85,6 +85,9 @@ jobs:
           name: pgo-${{ matrix.target }}
           path: ${{ runner.temp }}/pgo
           if-no-files-found: error
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   pin:
     name: pin

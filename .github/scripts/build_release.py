@@ -150,8 +150,28 @@ async def run(
         ) from None
     code = proc.returncode if proc.returncode is not None else -1
     if code != 0:
-        raise Failed(f"{step}: `{shown}` exited {code}; its last lines:\n{''.join(tail)}")
+        said = "".join(tail)
+        raise Failed(f"{step}: `{shown}` exited {code}; its last lines:\n{said}{daemon_log(said)}")
     return Ran(code, "".join(kept), "".join(tail))
+
+
+# The daemon's log, as blaze's client names it when the daemon did not start or listen ("its log
+# is <path>", "its log <path> says why"). The daemon says there why it ended; the client does not.
+DAEMON_LOG = re.compile(r"its log (?:is )?(/\S+?serve\.log)")
+DAEMON_LOG_LINES = 60
+
+
+def daemon_log(said: str) -> str:
+    """The last lines of the daemon log `said` names, or nothing when it names none."""
+    found = DAEMON_LOG.search(said)
+    if found is None:
+        return ""
+    path = Path(found.group(1))
+    try:
+        lines = path.read_text(errors="replace").splitlines()[-DAEMON_LOG_LINES:]
+    except OSError as error:
+        return f"\nthe daemon's log {path}: {error}"
+    return f"\nthe daemon's log {path}, its last lines:\n" + "\n".join(lines) + "\n"
 
 
 def host() -> str:
