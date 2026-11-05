@@ -136,6 +136,7 @@ pub fn panel_from(
         lens: [0.0; 4],
         fx3: [0.0; 4],
         clip: [0.0; 4],
+        clipx: [0.0; 4],
     }
 }
 
@@ -653,16 +654,23 @@ impl Painter {
                 ];
             }
         }
+        // The clip it sits in, both ways: a scroll cuts its content at its top and foot and at its sides (a table that
+        // scrolls sideways). A far edge of 0 reads as none in the shader, so a clip with nothing left in it keeps a sliver.
         if p.clipped {
-            let band = [p.clip_y, p.clip_y + p.clip_h];
+            let far = |at: f32, len: f32| (at + len.max(0.0)).max(f32::MIN_POSITIVE);
+            let band = [p.clip_y, far(p.clip_y, p.clip_h)];
+            let across = [p.clip_x, far(p.clip_x, p.clip_w)];
             for panel in &mut d.panels[at.panels..] {
                 panel.clip[..2].copy_from_slice(&band);
+                panel.clipx[..2].copy_from_slice(&across);
             }
             for glyph in &mut d.glyphs[at.glyphs..] {
                 glyph.clip[..2].copy_from_slice(&band);
+                glyph.clipx[..2].copy_from_slice(&across);
             }
             for m in &mut d.images[at.images..] {
                 m.clip[..2].copy_from_slice(&band);
+                m.clipx[..2].copy_from_slice(&across);
             }
         }
         Ok(at)
@@ -700,7 +708,7 @@ impl Painter {
             .map_err(|err| format!("{path}: {err}"))?;
         let frame = ((time * frames.fps).floor().max(0.0) as usize) % sheet.frames.len();
         let img =
-            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4] };
+            ImageInst { rect, size: [sheet.w as f32, sheet.h as f32, alpha, 0.0], clip: [0.0; 4], clipx: [0.0; 4] };
         d.image(img, sheet.frames[frame].clone());
         Ok(())
     }
@@ -740,7 +748,7 @@ impl Painter {
         let k = if rest[2] > 0.0 { rect[2] / rest[2] } else { 1.0 };
         let place = |r: [f32; 4]| [rect[0] + (r[0] - rest[0]) * k, rect[1] + (r[1] - rest[1]) * k, r[2] * k, r[3] * k];
         let size = [img.w as f32, img.h as f32, alpha, 0.0];
-        d.image(ImageInst { rect: place([x, y, img.w as f32 / sc, img.h as f32 / sc]), size, clip: [0.0; 4] }, img.rgba.into());
+        d.image(ImageInst { rect: place([x, y, img.w as f32 / sc, img.h as f32 / sc]), size, clip: [0.0; 4], clipx: [0.0; 4] }, img.rgba.into());
         Ok(())
     }
 

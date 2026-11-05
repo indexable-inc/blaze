@@ -6,15 +6,17 @@
 //!
 //! Columns are as wide as they need, measured by the host's typesetter: a short column (a bool, a number, a few words)
 //! hugs its widest cell and its header is never cut; the long ones share what is left by how much they need, down to a
-//! floor; past the floors the table scrolls sideways (its `scroll`). A cell cut short shows its whole value on hover.
-//! A press on a row (when the host gives an action) opens it below as a record, every field whole and wrapped (Nushell's
-//! `get`); only the rows in view exist, in two lazy columns around the open record.
+//! floor (at least half of what shows across, shared among them, so the main column is never cut to a sliver); past the
+//! floors the table scrolls sideways (its `scroll`). A cell cut short shows its whole value on hover.
+//! A press on a row (when the host gives an action) opens it below as a record, every field whole and wrapped at the
+//! width that shows (Nushell's `get`): it stays in view while the rows scroll sideways under it. Only the rows in view
+//! exist, in two lazy columns around the open record.
 use std::borrow::Cow;
 
 use harness_native_api::HoverAmt;
 use harness_native_flecs::prelude::*;
 use harness_native_ui_input_api::{Action, Tooltip};
-use harness_native_ui_layout_api::{Flex, Intrinsic, Justify, ScrollState, Size, SizeKind, Sizing};
+use harness_native_ui_layout_api::{AlignmentGuide, Flex, Intrinsic, Justify, ScrollState, Size, SizeKind, Sizing};
 use harness_native_ui_look_api::TextStyle;
 use harness_native_ui_node_api::Laid;
 
@@ -194,6 +196,8 @@ pub struct Opts<'s> {
 const SHORT_EM: f32 = 11.0;
 /// The narrowest a long column gets before the table scrolls sideways.
 const FLOOR_EM: f32 = 8.0;
+/// How much of what shows across the long columns keep between them before the table scrolls sideways.
+const LONG_SHARE: f32 = 0.5;
 /// The widest a column grows.
 const MAX_EM: f32 = 34.0;
 /// Rows measured for widths (a long table's later rows are like its first).
@@ -208,13 +212,21 @@ pub struct Width {
 
 impl Width {
     /// The width of a column whose header is `head` points wide and widest cell `widest`, in a face `em` points tall: a
-    /// short column's floor is its need (it hugs its content); a long one's is the less of its need and a few words, never
-    /// less than its header.
+    /// short column's floor is its need (it hugs its content); a long one's is the less of its need and the most of a few
+    /// words, its header and `share` (its part of what shows across).
     #[must_use]
-    pub fn of(head: f32, widest: f32, em: f32) -> Self {
-        let need = head.max(widest).min(MAX_EM * em).max(head).max(1.0);
-        let floor = if need <= SHORT_EM * em { need } else { head.max(FLOOR_EM * em).min(need) };
+    pub fn of(head: f32, widest: f32, em: f32, share: f32) -> Self {
+        let need = Self::need(head, widest, em);
+        let floor = if Self::short(need, em) { need } else { head.max(FLOOR_EM * em).max(share).min(need) };
         Self { need, floor }
+    }
+
+    fn need(head: f32, widest: f32, em: f32) -> f32 {
+        head.max(widest).min(MAX_EM * em).max(head).max(1.0)
+    }
+
+    fn short(need: f32, em: f32) -> bool {
+        need <= SHORT_EM * em
     }
 
     fn size(self) -> Size {
@@ -268,7 +280,11 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
         .collect();
     let of = |k: Kind| styles.iter().find(|s| s.0 == k).expect("every kind has a style");
     let em = of(Kind::Text).2.size.max(1.0);
-    let widths: Vec<Width> = (0..n)
+    let gap = head_row.entity().try_cloned::<&Flex>().map_or(0.0, |f| f.gap);
+    let pad = head_row.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().map_or(0.0, |p| p.l + p.r);
+    // What shows across: the sideways scroll's width as last laid (none before the first layout).
+    let view_w = scroll.entity().try_cloned::<&Laid>().map_or(0.0, |l| l.w);
+    let measured: Vec<(f32, f32)> = (0..n)
         .map(|c| {
             let head = if data.head { measure(&data.cols[c].name, &head_style, false) } else { 0.0 };
             let widest = (0..shown.min(MEASURED_ROWS))
@@ -277,9 +293,12 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
                     measure(&cell.shown(), &of(cell.kind).2, cell.kind == Kind::Markdown)
                 })
                 .fold(0.0, f32::max);
-            Width::of(head, widest, em)
+            (head, widest)
         })
         .collect();
+    let long = measured.iter().filter(|&&(h, x)| !Width::short(Width::need(h, x, em), em)).count().max(1);
+    let share = (view_w - pad).max(0.0) * LONG_SHARE / long as f32;
+    let widths: Vec<Width> = measured.iter().map(|&(head, widest)| Width::of(head, widest, em, share)).collect();
     let aligns: Vec<Justify> = (0..n)
         .map(|c| match data.align(c) {
             Align::End => Justify::End,
@@ -287,12 +306,10 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
             Align::Start | Align::Auto => Justify::Start,
         })
         .collect();
-    let gap = head_row.entity().try_cloned::<&Flex>().map_or(0.0, |f| f.gap);
-    let pad = head_row.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().map_or(0.0, |p| p.l + p.r);
     // As wide as the room, never narrower than every column's floor: past that the table scrolls sideways.
     let least = widths.iter().map(|w| w.floor).sum::<f32>() + gap * n.saturating_sub(1) as f32 + pad;
     set_size(inner, Size { w: Sizing { kind: SizeKind::Grow, value: 1.0, min: least, max: 0.0 }, h: Sizing::FIT });
-    keep_scroll(scroll, inner);
+    let scroll_x = keep_scroll(scroll, inner);
     let shape = |v: View<'_>, c: usize| {
         set_size(v, widths[c].size());
         let mut f = v.entity().try_cloned::<&Flex>().unwrap_or_default();
@@ -379,7 +396,14 @@ pub fn table<'a>(t: View<'a>, data: &Table, opts: Opts<'_>, measure: &mut dyn Fn
             (format!("f{c}"), pf, (o, c))
         })
         .collect();
-    set_size(open_node, Size { w: Sizing::GROW, h: if open.is_some() { Sizing::FIT } else { Sizing::fixed(0.0) } });
+    // As wide as what shows across, not the rows' whole width, and held in view as they scroll sideways under it: its words
+    // wrap where they can be read.
+    let open_w = if view_w > 0.0 { Sizing::fixed(view_w) } else { Sizing::GROW };
+    set_size(open_node, Size { w: open_w, h: if open.is_some() { Sizing::FIT } else { Sizing::fixed(0.0) } });
+    let pin = AlignmentGuide { dx: -scroll_x, dy: 0.0 };
+    if open_node.entity().try_cloned::<&AlignmentGuide>().unwrap_or_default() != pin {
+        open_node.set(pin);
+    }
     for_each_of(open_node, fields, |v, (o, c), _| {
         if let Some(k) = v.part("key") {
             k.text(&data.cols[c].name);
@@ -398,14 +422,16 @@ fn set_size(v: View<'_>, want: Size) {
     }
 }
 
-/// Keep a table's sideways scroll inside what its content overhangs (none when it fits).
-fn keep_scroll(scroll: View<'_>, inner: View<'_>) {
-    let (Some(s), Some(l)) = (scroll.entity().try_cloned::<&ScrollState>(), scroll.entity().try_cloned::<&Laid>()) else { return };
+/// Keep a table's sideways scroll inside what its content overhangs (none when it fits); the offset it keeps.
+fn keep_scroll(scroll: View<'_>, inner: View<'_>) -> f32 {
+    let Some(s) = scroll.entity().try_cloned::<&ScrollState>() else { return 0.0 };
+    let Some(l) = scroll.entity().try_cloned::<&Laid>() else { return s.x };
     let content = inner.entity().try_cloned::<&Laid>().map_or(0.0, |i| i.w);
     let x = s.x.clamp(0.0, (content - l.w).max(0.0));
     if (x - s.x).abs() > 0.01 {
         scroll.set(ScrollState { x, y: s.y });
     }
+    x
 }
 
 /// The table `e` is in (a node of it, or the table itself), by its parts: the `ui.Table` node, its `scroll` and `inner`.
@@ -484,11 +510,14 @@ mod tests {
     #[test]
     fn short_columns_hug_and_long_ones_share() {
         // A bool column: its header wider than its marks; never cut.
-        assert_eq!(Width::of(40.0, 10.0, 13.0), Width { need: 40.0, floor: 40.0 });
+        assert_eq!(Width::of(40.0, 10.0, 13.0, 200.0), Width { need: 40.0, floor: 40.0 });
         // A long text column: needs its widest cell up to the cap, gives way down to a few words.
-        let w = Width::of(30.0, 900.0, 13.0);
+        let w = Width::of(30.0, 900.0, 13.0, 0.0);
         assert_eq!(w.need, 34.0 * 13.0);
         assert_eq!(w.floor, 8.0 * 13.0);
+        // ...or to its share of what shows, when that is more (never past its need).
+        assert_eq!(Width::of(30.0, 900.0, 13.0, 200.0).floor, 200.0);
+        assert_eq!(Width::of(30.0, 900.0, 13.0, 1000.0).floor, 34.0 * 13.0);
         assert_eq!(host("https://www.corrosionhour.com/rust-november-2024/?x=1"), "corrosionhour.com");
         assert_eq!(host("http://user@docs.rs:8080/a"), "docs.rs:8080");
     }
