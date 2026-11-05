@@ -10,6 +10,9 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
+// `#![blaze::sans_io]` marks `now`'s fold a sans-IO core for `blaze::sans_io_core`.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
 mod keyed;
 

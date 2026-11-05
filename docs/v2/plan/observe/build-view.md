@@ -93,9 +93,15 @@ Readers, all of the same `Now`:
   of its strings, about every 500 ms while the build runs;
 - `blaze status`: each build under way (`Status::builds`) is its last `Now`, printed by the same
   renderer's compact form;
-- the explorer: the daemon's `Source` (docs/v2/plan/observe/explore-generic.md) publishes its
-  `tasks` and `task_edges` rows from the same `Fold`'s tasks, so the page's Running now and
-  the terminal agree.
+- the explorer: the page (indexable-inc/ix) runs the same crate compiled to wasm32, folding the
+  live feed's `tasks`, `task_edges` and `open` rows (docs/v2/plan/observe/explore-generic.md)
+  through the same `Fold`, so its Running now and the terminal are one model, not two that
+  agree by care. The daemon's `Source` publishes those rows from the plane as that plan says.
+
+The model compiles to wasm32 (coordinator's decision, 2026-11-05): `blaze_protocol::now` is
+sans-IO, depends on nothing but serde and blaze-serde, and a `wasm32-unknown-unknown` check of
+blaze-protocol is part of its proof. Its name and place are `blaze_protocol::now` (`Now`,
+`Fold`, `Look`, `Worker`); the explorer lane builds its wasm reader on these names.
 
 `blaze debug live` (`blaze_profile::live::Top`) stays the raw view of every thread; the build's
 view is per build.
@@ -156,6 +162,8 @@ A change of pressure is also due a line, so a log says when memory went from cal
   on small graphs (a chain, a diamond, Andrew's shape: one running codegen with 82 waiting behind
   it) and a Hegel property: every unfinished task waits on at least one blocker, and `holds` sums
   to at least the unfinished count minus the frontier.
+- `blaze check -p blaze-protocol --target wasm32-unknown-unknown` passes: the model the page
+  runs is the one the terminal runs.
 - The renderer is snapshot-tested with fixed `Now`s, sizes and keys (`expect_file!` under
   `crates/blaze-ui/src/board/snapshots/`): full, expanded, inline, compact, a download, a stall,
   and drawing at every size from 0 by 0 never panics and is the same twice.
