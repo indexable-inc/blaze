@@ -98,7 +98,7 @@ fn reads_back_what_a_map_holds(tc: &TestCase) {
 }
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
+pub(super) fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
     let cases =
         std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
