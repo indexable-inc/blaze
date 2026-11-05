@@ -168,7 +168,7 @@ const RECV_GROUP: u16 = 0;
 /// are taken.
 const INBOX: usize = 4 << 20;
 /// A send on a TCP connection of at least this many bytes goes from the asker's pages
-/// (`IORING_OP_SEND_ZC`, Linux 6.0): it saves the copy into the socket's buffers (~3 µs at
+/// (`IORING_OP_SEND_ZC`): it saves the copy into the socket's buffers (~3 µs at
 /// 10 GB/s for 32 KiB) and costs the pinning of its pages and a second completion, the
 /// notification, of ~1 µs together; below ~10 KiB the copy is the cheaper (the kernel's
 /// `msg_zerocopy.rst`). A Unix socket has no zero-copy sends, so its sends always copy.

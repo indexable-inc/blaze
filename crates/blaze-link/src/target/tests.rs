@@ -8,7 +8,7 @@ use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 
 use super::{
-    Ask, Cache, Located, Target, caseless, fhs, listing, loader, locate_with, output_with,
+    Ask, Cache, Located, Target, caseless, fhs, fhs_target, given_sysroot, listing, loader, locate_with, output_with,
     parse_version, reactor_with, rpaths, top_level_string,
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
@@ -285,6 +285,47 @@ fn the_glibc_abis_loader_is_the_interpreter_where_libc_is_the_fhs_ones() {
     ] {
         assert!(!fhs(Path::new(dir), "x86_64-linux-gnu"), "{dir}");
     }
+}
+
+/// A glibc built for an FHS system, wherever the linking machine keeps it (a `--sysroot`
+/// unpacked from a distribution's packages, Debian's cross root), is interpreted by the glibc
+/// ABI's loader, so the binary runs on the target; nix's own libc is not.
+#[test]
+fn a_sysroots_or_cross_roots_libc_is_interpreted_by_the_abis_loader() {
+    let root = Path::new("/opt/sysroot/jammy-x86_64");
+    for dir in [
+        "/opt/sysroot/jammy-x86_64/lib/x86_64-linux-gnu",
+        "/opt/sysroot/jammy-x86_64/usr/lib/x86_64-linux-gnu",
+        "/opt/sysroot/jammy-x86_64/lib64",
+        "/usr/x86_64-linux-gnu/lib",
+        "/usr/x86_64-linux-gnu/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+    ] {
+        assert!(fhs_target(Path::new(dir), "x86_64-linux-gnu", Some(root)), "{dir}");
+    }
+    for (dir, sysroot) in [
+        ("/opt/sysroot/jammy-x86_64/lib/x86_64-linux-gnu", None),
+        ("/opt/sysroot/jammy-x86_64/opt/lib", Some(root)),
+        ("/nix/store/abc-glibc-2.40/lib", Some(root)),
+        ("/usr/aarch64-linux-gnu/lib", Some(root)),
+        ("/usr/x86_64-linux-gnu/lib/extra", None),
+    ] {
+        assert!(!fhs_target(Path::new(dir), "x86_64-linux-gnu", sysroot), "{dir}");
+    }
+}
+
+#[test]
+fn the_drivers_sysroot_is_its_last_sysroot_word() {
+    let dir = std::env::temp_dir().canonicalize().unwrap();
+    let shown = dir.to_str().unwrap();
+    assert_eq!(given_sysroot(&["-m64"], "`cc`").unwrap(), None);
+    let joined = format!("--sysroot={shown}");
+    assert_eq!(given_sysroot(&["--sysroot=/nowhere-at-all", &joined], "`cc`").unwrap(), Some(dir.clone()));
+    assert_eq!(given_sysroot(&["--sysroot", shown], "`cc`").unwrap(), Some(dir));
+    let said = given_sysroot(&["--sysroot"], "`cc --sysroot`").unwrap_err().to_string();
+    assert!(said.contains("no directory after it"), "{said}");
+    let said = given_sysroot(&["--sysroot=/nowhere-at-all"], "`cc`").unwrap_err().to_string();
+    assert!(said.contains("/nowhere-at-all"), "{said}");
 }
 
 #[test]

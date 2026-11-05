@@ -13,7 +13,10 @@
 //! - Linux: `$CC_<triple with _>`, else `$CC`, else `cc`, with `-print-search-dirs` and
 //!   `-print-file-name=<file>`, all at once: distro GCC and Clang and nix's cc-wrapper answer
 //!   alike. The interpreter is the one that toolchain's `cc` passes: its own libc's loader
-//!   where that libc is outside the FHS directories (nix), and the glibc ABI's path otherwise.
+//!   where that libc is outside the FHS directories (nix), and the glibc ABI's path otherwise,
+//!   with a libc under the driver's `--sysroot` or Debian's cross root `/usr/<multiarch>`
+//!   counted as an FHS one (a release links against an old glibc sysroot that way,
+//!   `.github/scripts/sysroot.py`).
 //! - macOS: the SDK at `$SDKROOT`, else `xcrun --sdk macosx --show-sdk-path`: its `.tbd`s and
 //!   frameworks, and its version from `SDKSettings.json`. The minimum OS is
 //!   `$MACOSX_DEPLOYMENT_TARGET`, at least rustc's default for the triple.
@@ -988,6 +991,55 @@ fn fhs(dir: &Path, multiarch: &str) -> bool {
         || dir.strip_prefix("/lib/").or_else(|| dir.strip_prefix("/usr/lib/")) == Some(multiarch)
 }
 
+/// Whether `dir` holds a libc built for an FHS system of the target, so the binary's
+/// interpreter is the glibc ABI's path, wherever the libc sits on the machine that links:
+/// an FHS directory ([`fhs`]); one under the C driver's `--sysroot` (`sysroot`, canonical), as
+/// a glibc sysroot unpacked from a distribution's packages is (`<sysroot>/lib/<multiarch>`); or
+/// Debian's and Ubuntu's cross root, `/usr/<multiarch>/lib` (and `lib64`), where their
+/// `libc6-dev-<arch>-cross` packages put the target's glibc. Elsewhere (nix's store) the libc
+/// is the machine's own and its loader is the interpreter.
+fn fhs_target(dir: &Path, multiarch: &str, sysroot: Option<&Path>) -> bool {
+    if fhs(dir, multiarch) {
+        return true;
+    }
+    if let Some(inner) = sysroot.and_then(|root| dir.strip_prefix(root).ok()) {
+        return fhs(&Path::new("/").join(inner), multiarch);
+    }
+    let Some(dir) = dir.to_str() else { return false };
+    dir.trim_end_matches('/')
+        .strip_prefix("/usr/")
+        .and_then(|it| it.strip_prefix(multiarch))
+        .is_some_and(|it| matches!(it, "/lib" | "/lib64"))
+}
+
+/// The sysroot the C driver's own words give it (`--sysroot=<dir>` or `--sysroot <dir>`, the
+/// last one winning, as GCC and Clang take it), canonical; `None` where it is given none.
+fn given_sysroot(given: &[&str], said: &str) -> Result<Option<PathBuf>, LinkError> {
+    let mut found = None;
+    for (at, word) in given.iter().enumerate() {
+        let dir = match word.strip_prefix("--sysroot") {
+            Some("") => given.get(at + 1).copied().ok_or_else(|| {
+                // alloc: error path
+                fail(format!("the C driver {said} ends in --sysroot, with no directory after it"))
+            })?,
+            Some(rest) => match rest.strip_prefix('=') {
+                Some(dir) => dir,
+                None => continue,
+            },
+            None => continue,
+        };
+        found = Some(dir);
+    }
+    found
+        .map(|dir| {
+            std::fs::canonicalize(dir).map_err(|error| {
+                // alloc: error path
+                fail(format!("the C driver {said} is given --sysroot {dir}: {error}"))
+            })
+        })
+        .transpose()
+}
+
 /// The C toolchain for a Linux target, asked where its directories and its C runtime's files
 /// are.
 fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
@@ -1062,7 +1114,8 @@ fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
     // alloc: error path
     let real = std::fs::canonicalize(&libc)
         .map_err(|error| fail(format!("{}: {error}", libc.display())))?;
-    let interpreter = match real.parent().is_some_and(|it| fhs(it, multiarch)) {
+    let sysroot = given_sysroot(given, said)?;
+    let interpreter = match real.parent().is_some_and(|it| fhs_target(it, multiarch, sysroot.as_deref())) {
         // alloc: once per toolchain asked, the interpreter's path
         true => abi.to_owned(),
         false => found_loader

@@ -227,33 +227,35 @@ jobs:
       tier: ${{ needs.changes.outputs.tier }}
       smoke: true
 
-  # The daemon this change builds starts on Linux 6.8: GitHub's hosted ubuntu-22.04 runners
-  # boot Ubuntu's linux-azure 6.8 (6.8.0-1070-azure in November 2026), the release's Linux
-  # builds run there, and ix's kernel is newer. linux-azure 6.8.0-1063 and later invert
-  # io_uring's check of a provided buffer ring's reserved words (blaze-core's
-  # `ReservedCheck`), which stopped every daemon start of v0.20261105.3's release. The
-  # binary is the linux-arm64 build's, linked against the ix image's glibc (Ubuntu 24.04's),
-  # so it runs in an ubuntu:24.04 container, which shares the host's kernel; Docker's default
-  # seccomp profile refuses io_uring, so the container's is off.
-  linux-6-8:
-    name: daemon starts on Linux 6.8 (hosted ubuntu-22.04-arm)
+  # blaze refuses a kernel below its floor, Linux 7.2 (docs/kernel.md, blaze-core's
+  # `kernel::check`): the client and `blaze serve` each stop with the typed refusal, which names
+  # the running kernel, the floor, the features and the fix, and start nothing. The older kernel
+  # is faked with the UNAME26 personality (`setarch --uname-2.6`), under which uname says
+  # 2.6.x, on the ix runner's own 7.2 kernel; the same binary then starts and stops a daemon
+  # there unfaked. Replaces `linux-6-8` (#1790): no hosted runner's kernel (6.8 to 6.11) is one
+  # blaze runs on.
+  kernel-floor:
+    name: refuses a kernel below Linux 7.2 (faked uname)
     needs: [changes, linux-arm64]
     if: needs.changes.outputs.tier != 'none'
-    runs-on: ubuntu-22.04-arm
+    runs-on: [ix, arm64]
     timeout-minutes: 10
-    container:
-      image: ubuntu:24.04
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
-    env:
-      # As in `docker run`: the runner's /github/home belongs to its own user.
-      HOME: /root
     steps:
       - uses: actions/download-artifact@v8
         with:
           name: blaze-linux-arm64
-      - name: blaze serve listens, blaze status sees it, blaze stop ends it
+      - name: blaze status and blaze serve refuse Linux 2.6, then serve on Linux 7.2
         run: |
           tar -xf blaze.tar && uname -r
+          for words in status serve; do
+            if setarch "$(uname -m)" --uname-2.6 ./blaze $words > out.txt 2>&1; then
+              cat out.txt; echo "::error::blaze $words ran on a faked Linux $(setarch "$(uname -m)" --uname-2.6 uname -r)"; exit 1
+            fi
+            cat out.txt
+            for said in "blaze needs Linux 7.2 or later" "this is Linux 2.6." "OPENAT2_REGULAR" "Fix:" "ix VM"; do
+              grep -qF "$said" out.txt || { echo "::error::blaze $words's refusal does not say: $said"; exit 1; }
+            done
+          done
           ./blaze serve > serve.log 2>&1 & serve=$!
           for _ in $(seq 120); do
             ./blaze status | grep -qvx "no daemon is running" && break
@@ -349,7 +351,7 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, linux-arm64, kernel-floor, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5
