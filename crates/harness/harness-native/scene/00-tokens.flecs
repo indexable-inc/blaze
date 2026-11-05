@@ -299,6 +299,8 @@ export const copy_row_in = 0.11
 // Inline code's chip (MarkdownText).
 export const tone_code_chip: Fill = {dark: {1, 1, 1, 0.08}, light: {0, 0, 0, 0.06}}
 export const textarea_max_h = 132
+// How far a text area's placeholder starts after its caret (which stands at the words' start), as a macOS field's does.
+export const textarea_hint_inset = 4
 // ui.Table: a row's height, the room between columns, a row's inset and its words' size; ui.Result: a snippet's two lines.
 export const table_row = 24
 export const table_gap = 14

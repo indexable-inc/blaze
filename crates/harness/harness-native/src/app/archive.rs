@@ -290,11 +290,12 @@ impl App {
                 }
             }
         }
-        if out.is_empty() {
+        let exhausted = w.try_get::<&model::History>(|h| h.exhausted).unwrap_or(false);
+        // "Nothing archived yet" only once every older page is in: before that the foot's "Load older runs" is the truth.
+        if out.is_empty() && (exhausted || !items.is_empty()) {
             let note = if items.is_empty() { "Nothing archived yet" } else { "Nothing matches" };
             out.push(("note".into(), "hn.ArchNote", ARow::Note(note)));
         }
-        let exhausted = w.try_get::<&model::History>(|h| h.exhausted).unwrap_or(false);
         if !exhausted && chip != 1 {
             out.push(("more".into(), "hn.ArchMore", ARow::More));
         }
