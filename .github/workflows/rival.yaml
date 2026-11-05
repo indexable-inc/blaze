@@ -53,7 +53,16 @@ jobs:
           repository: astral-experiments/blaze
           path: astral
           persist-credentials: false
-      - uses: ./ours/.github/actions/rustup
+      # Inline, not ./ours/.github/actions/rustup: `ours` is the pull request's base, which may
+      # predate that action. ix's image has no rustup.
+      - name: rustup
+        run: |
+          if ! command -v rustup > /dev/null; then
+            if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+              curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+            fi
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
       - id: commits
         run: |
           echo "ours=$(git -C ours rev-parse HEAD)" >> "$GITHUB_OUTPUT"

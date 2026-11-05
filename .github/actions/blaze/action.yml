@@ -56,6 +56,11 @@ runs:
       run: |
         # Without --no-toolchain: install.sh has blaze fetch its toolchain now (`blaze toolchain`),
         # as a user's install does, rather than at the first build.
+        # install.sh puts blaze in $CARGO_HOME/bin; GitHub's hosted images have that on PATH, ix's
+        # image does not.
+        bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+        export PATH="$bin:$PATH"
+        echo "$bin" >> "$GITHUB_PATH"
         sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
         said=$(blaze-engine --version)
         version=$(echo "$said" | awk '$1 == "blaze" { print $2 }')
