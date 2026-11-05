@@ -371,6 +371,36 @@ export const tone_series8: Fill = {dark: {0.902, 0.404, 0.404, 1}, light: {0.890
 // The quietest ink on the terminal's ground: a chart's gridlines, a canvas's `faint`.
 export const tone_term_faint: Fill = {dark: {1, 1, 1, 0.13}, light: {0, 0, 0, 0.12}}
 export const line_gen_stat = 28
+// A cell's controls (genui/control.rs, hn.Gen<control> in widgets/genui.flecs), on the terminal's ground: one height for
+// a button, a field and a select; a switch's track and knob, a check box's square, a radio's dot, a slider's rail and
+// knob; a field's widest. Their plates each appearance its own step: a quiet control plate and the hairline round a
+// field, the off track, the knob, the solid accent under white words (the on state; deeper than tone_accent in dark so
+// white reads on it), a segment's raised plate.
+export const gen_control_h = 28
+export const gen_switch_w = 30
+export const gen_switch_h = 18
+export const gen_switch_knob = 14
+export const gen_box = 16
+export const gen_dot = 6
+export const gen_rail = 4
+export const gen_slider_knob = 16
+export const gen_field_w = 320
+export const gen_option_h = 26
+export const size_gen_control = 13
+export const tone_gen_plate: Fill = {dark: {1, 1, 1, 0.085}, light: {0, 0, 0, 0.055}}
+export const tone_gen_edge: Fill = {dark: {1, 1, 1, 0.12}, light: {0, 0, 0, 0.16}}
+export const tone_gen_field: Fill = {dark: {1, 1, 1, 0.045}, light: {1, 1, 1, 1}}
+export const tone_gen_track: Fill = {dark: {1, 1, 1, 0.17}, light: {0, 0, 0, 0.13}}
+export const tone_gen_knob: Fill = {dark: {0.95, 0.95, 0.96, 1}, light: {1, 1, 1, 1}}
+export const tone_gen_knob_edge: Fill = {dark: {0, 0, 0, 0.25}, light: {0, 0, 0, 0.16}}
+export const tone_gen_on: Fill = {dark: {0.400, 0.424, 0.957, 1}, light: {0.369, 0.384, 0.902, 1}}
+export const tone_gen_on_ink: Fill = {dark: {1, 1, 1, 1}, light: {1, 1, 1, 1}}
+export const tone_gen_segment: Fill = {dark: {1, 1, 1, 0.16}, light: {1, 1, 1, 1}}
+export const tone_gen_error_wash: Fill = $tone_failed_wash
+export const tone_gen_success_wash: Fill = {dark: {0.298, 0.718, 0.510, 0.15}, light: {0.18, 0.60, 0.38, 0.11}}
+export const tone_gen_warning_wash: Fill = {dark: {0.949, 0.733, 0.322, 0.15}, light: {0.78, 0.55, 0.10, 0.12}}
+// How faint a control is drawn while it takes no input (disabled, or no handler): a Pose fade.
+export const gen_inert_fade = 0.55
 
 // Code's colours by tree-sitter capture (harness-native-render/src/highlight.rs, a fenced block's `Highlight`):
 // `code_ink.<capture>` colours that capture and the ones under it (`function` colours `function.method` and

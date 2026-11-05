@@ -23,6 +23,8 @@ use std::sync::Arc;
 
 mod genui;
 
+pub(super) use genui::Live as GenLive;
+
 /// cod-chevron-right, cod-chevron-down.
 const CLOSED: &str = "\u{EAB6}";
 const OPENED: &str = "\u{EAB4}";
@@ -211,6 +213,8 @@ pub(super) enum Copied {
     Transcript,
     Input,
     TableRow(String, usize),
+    /// A cell's field's words (its words node).
+    Field(u64),
 }
 
 /// A place in a chat's transcript: row `row`, its `part`th words ([`texts`]), UTF-16 unit `at` of what they show (the
@@ -277,8 +281,8 @@ enum Row {
     Results { v: Arc<Value>, cap: usize },
     /// Text a cell printed or returned: a command's output, a string, an error's stack.
     Output { text: String, error: bool },
-    /// What a cell draws (its Svelte markup's tree, [`genui`]).
-    Ui { v: Arc<Value> },
+    /// What a cell draws (its Svelte markup's tree, [`genui`]), and the cell (`<repl>.<task>`) its events name.
+    Ui { v: Arc<Value>, cell: String },
     /// "Show code" under an opened card.
     CodeToggle { block: String, open: bool },
     Thinking { block: String, open: bool, text: String, live: bool },
@@ -709,7 +713,7 @@ fn card_rows(block: &str, d: &Detail, shown: Shown, fold: &HashMap<String, bool>
     out.push(Row::Card { block: block.to_owned(), icon, words, detail, state, error, open: shown != Shown::Folded });
     let draws = !empty_value(&d.ui);
     if draws {
-        out.push(Row::Ui { v: d.ui.clone() });
+        out.push(Row::Ui { v: d.ui.clone(), cell: d.cell.clone() });
     }
     match shown {
         Shown::Folded => {
@@ -1066,7 +1070,7 @@ impl App {
         let Some(ui) = v.part("ui") else { return };
         let mut paint = self.paint.borrow_mut();
         let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
-        genui::fill(ui, tree, &mut measure);
+        genui::fill(ui, tree, "gallery.0", Some(&self.genui), &mut measure);
     }
 
     /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
@@ -1154,7 +1158,7 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied() };
+                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui) };
                 fill_row(row, &rows[i].1, &ctx, &mut measure);
                 if let Some(mut pad) = view::prefab(w, rows[i].1.prefab()).and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()) {
                     if nested.contains(&rows[i].0) {
@@ -1198,7 +1202,8 @@ impl App {
             st.shift += s.shift;
         }
         // The input: its words (the marked text in), caret and selection, focused while the pane has the keyboard.
-        let focused = self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none();
+        let focused =
+            self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing();
         if let Some(area) = pv.part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("area")) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
@@ -1329,9 +1334,17 @@ impl App {
             self.poke();
         }
         // A focused input's caret fades on the clock: keep drawing.
-        if self.focused && self.look.themes[usize::from(self.dark)].blink && self.chat_focused() && !self.tree_focus && self.palette.is_none() {
+        if self.focused
+            && self.look.themes[usize::from(self.dark)].blink
+            && self.chat_focused()
+            && !self.tree_focus
+            && self.palette.is_none()
+            && !self.genui_editing()
+        {
             self.poke_why("caret blink");
         }
+        // A cell's controls: its field's typing, a dragged slider, an open select.
+        self.step_genui();
     }
 
     /// A scroll over a chat pane's transcript: its physics take it (scrolling up lets go of the bottom). Whether it was
@@ -1397,6 +1410,10 @@ impl App {
 
     /// Run `f` on the focused chat's draft; true when there is one.
     fn with_draft(&mut self, f: impl FnOnce(&mut Draft)) -> bool {
+        // A cell's field that has the keys takes them before the chat's input.
+        if self.genui_editing() {
+            return self.genui_draft(f);
+        }
         let Some((_, _, sid)) = self.focused_chat() else { return false };
         f(&mut self.chat.borrow_mut().entry(sid).or_default().draft);
         self.poke();
@@ -1405,6 +1422,9 @@ impl App {
 
     /// An `act.Edit` on the focused chat's input (scene/20-keys.flecs ctx.Chat).
     pub(super) fn chat_edit(&mut self, op: &str) {
+        if self.genui_editing() {
+            return self.genui_edit(op);
+        }
         let Some((_, _, sid)) = self.focused_chat() else { return };
         self.tree_focus = false;
         let (select, name) = match op.strip_prefix("select_") {
@@ -1446,7 +1466,8 @@ impl App {
         }
         match op {
             "newline" => _ = self.with_draft(|d| d.insert("\n")),
-            "send" => {
+            // Return, or Command-Return (which submits a cell's TextArea).
+            "send" | "submit" => {
                 let mut text = String::new();
                 self.with_draft(|d| {
                     if d.text.trim().is_empty() {
@@ -1518,6 +1539,9 @@ impl App {
     }
 
     pub(super) fn chat_marked(&self) -> Option<Option<String>> {
+        if let Some(m) = self.genui_marked() {
+            return Some(m);
+        }
         let (_, _, sid) = self.focused_chat()?;
         Some(self.chat.borrow().get(&sid).and_then(|s| s.draft.marked.clone()))
     }
@@ -1525,6 +1549,9 @@ impl App {
     /// What the focused chat has selected, for Command-C: its transcript's selection (a row taken whole as markdown),
     /// else its input's.
     pub(super) fn chat_copy(&self) -> Option<Option<(String, Copied)>> {
+        if let Some((text, node)) = self.genui_copy() {
+            return Some((!text.is_empty()).then_some((text, Copied::Field(node))));
+        }
         let (_, _, sid) = self.focused_chat()?;
         let states = self.chat.borrow();
         let Some(st) = states.get(&sid) else { return Some(None) };
@@ -1558,13 +1585,16 @@ impl App {
     /// Pulse what a copy in the focused chat took (`what`, from [`Self::chat_copy`]): the transcript's selected words, the
     /// input's, or a table's row. Each gets a fresh `CopyFlash` of the selection's CopyLook.
     pub(super) fn chat_flash(&self, what: &Copied) {
-        let Some((pane, _, _)) = self.focused_chat() else { return };
+        let pane = self.focused_chat().map(|c| c.0);
+        if pane.is_none() && !matches!(what, Copied::Field(_)) {
+            return;
+        }
         let w = self.world.world_ref();
-        let pv = View::of(w.entity_from_id(pane));
-        let list = pv.part("list").and_then(|l| l.part("rows"));
+        let list = pane.and_then(|p| View::of(w.entity_from_id(p)).part("list")).and_then(|l| l.part("rows"));
         let mut hit: Vec<u64> = Vec::new(); // alloc: the few nodes one copy pulses
         match what {
-            Copied::Input => hit.extend(input_text(w, pane).map(|t| t.id())),
+            Copied::Input => hit.extend(pane.and_then(|p| input_text(w, p)).map(|t| t.id())),
+            Copied::Field(node) => hit.push(*node),
             Copied::Transcript => {
                 if let Some(list) = list {
                     let root = list.id();
@@ -1674,40 +1704,7 @@ impl App {
         }
         let (lay, _, _, sid) = self.input_layout()?;
         let mut states = self.chat.borrow_mut();
-        let d = &mut states.entry(sid).or_default().draft;
-        if d.marked.is_some() {
-            return None;
-        }
-        let n = units(&d.text);
-        if lay.lines.is_empty() {
-            return Some(if matches!(m, Move::Down | Move::LineEnd) { d.text.len() } else { 0 });
-        }
-        let (x, li) = lay.caret(units(&d.text[..d.caret]));
-        let line = &lay.lines[li];
-        let u = match m {
-            Move::Up | Move::Down => {
-                let goal = *d.goal.get_or_insert(x);
-                let next = if m == Move::Up { li.checked_sub(1) } else { Some(li + 1).filter(|&i| i < lay.lines.len()) };
-                match next {
-                    Some(i) => {
-                        let l = &lay.lines[i];
-                        lay.index_at(goal, l.top + l.height * 0.5)
-                    }
-                    None if m == Move::Up => 0,
-                    None => n,
-                }
-            }
-            Move::LineStart => line.start,
-            // Before the newline that ends it, or before the space a soft wrap broke at (after it is the next line's start).
-            Move::LineEnd if line.hard_break => line.end.saturating_sub(1).max(line.start),
-            Move::LineEnd if line.end < n => {
-                let b = byte_of(&d.text, line.end);
-                let space = d.text[..b].chars().next_back().is_some_and(char::is_whitespace);
-                if space { line.end - 1 } else { line.end }
-            }
-            _ => line.end,
-        };
-        Some(byte_of(&d.text, u))
+        along_lines(&mut states.entry(sid).or_default().draft, &lay, m)
     }
 
     /// Where the focused chat's caret is (window points), for the input method's candidate window: the start of the
@@ -1807,6 +1804,15 @@ impl App {
         let pv = View::of(w.entity_from_id(p));
         let over = |v: Option<View<'_>>| v.and_then(|v| v.entity().try_cloned::<&Laid>()).is_some_and(|l| l.contains(x, y));
         let (in_input, in_list) = (over(pv.part("foot").and_then(|f| f.part("input"))), over(pv.part("list")));
+        // A press on a cell's control is the control's (genui/control.rs): it starts no selection in the transcript.
+        let on_control = w.entity_named(APP).target(Hovered::id(), 0).is_some_and(|h| {
+            std::iter::successors(Some(h), |n| n.parent())
+                .take(6)
+                .any(|n| n.try_cloned::<&Action>().is_some_and(|a| a.name.as_str().starts_with("ui:")))
+        });
+        if in_list && on_control {
+            return true;
+        }
         if in_input {
             let at = self.input_index(x, y);
             let mut states = self.chat.borrow_mut();
@@ -1897,16 +1903,56 @@ impl App {
     }
 }
 
+/// Where `m` takes draft `d`'s caret along its lines as laid out in `lay` (up and down keep their column's x, a line's
+/// start and end are the wrapped line's). None while an input method holds marked text.
+fn along_lines(d: &mut Draft, lay: &Layout, m: Move) -> Option<usize> {
+    if d.marked.is_some() {
+        return None;
+    }
+    let n = units(&d.text);
+    if lay.lines.is_empty() {
+        return Some(if matches!(m, Move::Down | Move::LineEnd) { d.text.len() } else { 0 });
+    }
+    let (x, li) = lay.caret(units(&d.text[..d.caret]));
+    let line = &lay.lines[li];
+    let u = match m {
+        Move::Up | Move::Down => {
+            let goal = *d.goal.get_or_insert(x);
+            let next = if m == Move::Up { li.checked_sub(1) } else { Some(li + 1).filter(|&i| i < lay.lines.len()) };
+            match next {
+                Some(i) => {
+                    let l = &lay.lines[i];
+                    lay.index_at(goal, l.top + l.height * 0.5)
+                }
+                None if m == Move::Up => 0,
+                None => n,
+            }
+        }
+        Move::LineStart => line.start,
+        // Before the newline that ends it, or before the space a soft wrap broke at (after it is the next line's start).
+        Move::LineEnd if line.hard_break => line.end.saturating_sub(1).max(line.start),
+        Move::LineEnd if line.end < n => {
+            let b = byte_of(&d.text, line.end);
+            let space = d.text[..b].chars().next_back().is_some_and(char::is_whitespace);
+            if space { line.end - 1 } else { line.end }
+        }
+        _ => line.end,
+    };
+    Some(byte_of(&d.text, u))
+}
+
 /// Where a transcript row is, for the parts that act on it: its session, its key, and the table row opened in it.
 struct RowCtx<'k> {
     sid: u64,
     key: &'k str,
     open: Option<usize>,
+    /// The app's cell controls in use, for a cell's UI (None: drawn from the tree alone).
+    ui: Option<&'k std::cell::RefCell<GenLive>>,
 }
 
 impl RowCtx<'static> {
     /// A row drawn outside the transcript (in a cell's generated UI): its tables' rows do not open.
-    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None };
+    const NOWHERE: Self = RowCtx { sid: 0, key: "", open: None, ui: None };
 }
 
 impl RowCtx<'_> {
@@ -2033,7 +2079,7 @@ fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>)
             }
         }
         Row::Results { v, cap } => fill_results(row, v, *cap),
-        Row::Ui { v } => genui::fill(row, v, measure),
+        Row::Ui { v, cell } => genui::fill(row, v, cell, ctx.ui, measure),
         Row::Output { text: s, .. } => {
             if let Some(t) = row.part("card").and_then(|c| c.part("text")) {
                 t.text(s);

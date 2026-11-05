@@ -11,6 +11,9 @@ use harness_native_ui_layout_api::{Flex, Padding};
 
 mod canvas;
 mod chart;
+mod control;
+
+pub use control::Live;
 
 /// The most elements one cell draws, how deep they nest, and the most rows and columns a table shows.
 const MAX_ELEMENTS: usize = 600;
@@ -19,7 +22,7 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 13] = [
+const ELEMENTS: [(&str, &str); 23] = [
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -33,20 +36,37 @@ const ELEMENTS: [(&str, &str); 13] = [
     ("Spacer", "hn.GenSpacer"),
     ("Chart", "hn.GenChart"),
     ("Canvas", "hn.GenCanvas"),
+    ("Button", "hn.GenButton"),
+    ("Toggle", "hn.GenToggle"),
+    ("Checkbox", "hn.GenCheckbox"),
+    ("Slider", "hn.GenSlider"),
+    ("NumberField", "hn.GenNumberField"),
+    ("Input", "hn.GenInput"),
+    ("TextArea", "hn.GenTextArea"),
+    ("Select", "hn.GenSelect"),
+    ("Choice", "hn.GenChoice"),
+    ("Radio", "hn.GenRadio"),
 ];
+/// The elements that take input (genui/control.rs).
+const CONTROLS: [&str; 10] = ["Button", "Toggle", "Checkbox", "Slider", "NumberField", "Input", "TextArea", "Select", "Choice", "Radio"];
 const UNKNOWN: &str = "hn.GenUnknown";
 
-/// What is left of the caps as a tree is built, and whether it was cut.
+/// What is left of the caps as a tree is built, and whether it was cut; with the cell the tree is (what its controls'
+/// events name) and the controls in use.
 struct Budget<'a, 'm> {
     left: usize,
     cut: bool,
     /// How tables measure their words (see [`view::table::table`]).
     measure: &'a mut Measure<'m>,
+    cell: &'a str,
+    live: Option<&'a mut Live>,
 }
 
-/// Fill a `hn.ChatUi` row with the tree `ui`.
-pub(super) fn fill(row: View<'_>, ui: &Value, measure: &mut Measure<'_>) {
-    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure };
+/// Fill a `hn.ChatUi` row with the tree `ui` that cell `cell` (`<repl>.<task>`) drew. `live` is the app's controls in use
+/// (a field being typed in shows its own words); None draws the tree's values.
+pub(super) fn fill(row: View<'_>, ui: &Value, cell: &str, live: Option<&std::cell::RefCell<Live>>, measure: &mut Measure<'_>) {
+    let mut guard = live.map(std::cell::RefCell::borrow_mut);
+    let mut b = Budget { left: MAX_ELEMENTS, cut: false, measure, cell, live: guard.as_deref_mut() };
     if let Some(body) = row.part("body") {
         let nodes: Vec<&Value> = match ui {
             Value::Array(a) => a.iter().collect(),
@@ -76,6 +96,9 @@ fn prefab_for(world: WorldRef<'_>, node: &Value) -> &'static str {
     if refusal(world, node).is_some() {
         return UNKNOWN;
     }
+    if let Some(p) = control::prefab(kind, node) {
+        return p;
+    }
     match (kind, node["props"]["kind"].as_str()) {
         ("Chart", Some("pie" | "donut")) => "hn.GenChartPie",
         _ => prefab_of(kind),
@@ -89,6 +112,7 @@ fn refusal(world: WorldRef<'_>, node: &Value) -> Option<String> {
     match kind {
         "Chart" => chart::check(world, node),
         "Canvas" => canvas::check(world, node),
+        k if CONTROLS.contains(&k) => control::check(node),
         "Table" => match prop(node, "rows") {
             Value::Null | Value::Array(_) => None,
             v => Some(format!(
@@ -207,6 +231,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
                 eprintln!("harness-native: genui: {e}");
             }
         }
+        k if CONTROLS.contains(&k) => control::control(v, node, k, b),
         "Divider" => {}
         "Spacer" => {
             let want = match points(node, "size") {
@@ -359,7 +384,7 @@ mod tests {
                 "columns": ["", "part", "tokens", "share"]}, "children": []}]});
         let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
         for _ in 0..6 {
-            fill(row, &ui, &mut measure);
+            fill(row, &ui, "test.0", None, &mut measure);
             world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
             world.progress_time(1.0 / 60.0);
         }
@@ -414,7 +439,7 @@ mod tests {
         ]);
         let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
         for _ in 0..6 {
-            fill(row, &ui, &mut measure);
+            fill(row, &ui, "test.0", None, &mut measure);
             world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
             world.progress_time(1.0 / 60.0);
         }
@@ -456,6 +481,123 @@ mod tests {
             let t = el(i).entity().try_cloned::<&Text>().map(|t| t.s.as_str().to_owned()).unwrap_or_default();
             assert!(!t.is_empty() && el(i).entity().try_cloned::<&Laid>().is_some(), "element {i} is refused in words: {t:?}");
         }
+    }
+
+    /// Property `controls-draw-and-press-sends`: a form of every control draws each as its prefab with its parts laid out,
+    /// arms each with the event it sends (`ui:` and `[cell, handler, value]`: a Toggle the negation of its value, a stepper
+    /// its value one step on, an option its value), leaves one with no handler inert, refuses a malformed one in words,
+    /// and a real press and release on a Button through the input pass activates it with `["test.0","h1",null]`.
+    #[test]
+    fn controls_draw_and_press_sends() {
+        use harness_native_ui_input_api::{Action, Activated, PointerState};
+        use harness_native_ui_motion_api::Pose;
+        let world = crate::app::scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        harness_native_ui_input::install(w);
+        harness_native_ui_motion::install(w);
+        world.set(Clock::default());
+        world.set(Viewport { w: 900.0, h: 1400.0 });
+        let row = View::root(w, "hn.ChatUi");
+        let sizes = serde_json::json!([{"label": "Small", "value": "s"}, {"label": "Medium", "value": "m"}, {"label": "Large", "value": "l"}]);
+        let ui = serde_json::json!([
+            {"type": "Button", "props": {"label": "Deploy", "onClick": "h1", "tone": "accent"}, "children": []},
+            {"type": "Toggle", "props": {"label": "Dry run", "value": false, "onChange": "h2"}, "children": []},
+            {"type": "Checkbox", "props": {"label": "Notify", "checked": true, "onChange": "h3"}, "children": []},
+            {"type": "Slider", "props": {"label": "Traffic", "min": 0, "max": 100, "step": 5, "value": 40, "onChange": "h4"}, "children": []},
+            {"type": "NumberField", "props": {"label": "Replicas", "min": 1, "max": 9, "value": 3, "onChange": "h5"}, "children": []},
+            {"type": "Input", "props": {"label": "Name", "value": "api", "onChange": "h6", "onSubmit": "h7"}, "children": []},
+            {"type": "TextArea", "props": {"label": "Notes", "placeholder": "Why", "onChange": "h8"}, "children": []},
+            {"type": "Select", "props": {"label": "Size", "options": sizes, "selected": "m", "onChange": "h9"}, "children": []},
+            {"type": "Choice", "props": {"options": sizes, "selected": "m", "onChange": "h10"}, "children": []},
+            {"type": "Radio", "props": {"options": [1, 2], "selected": 2.0, "onChange": "h11"}, "children": []},
+            {"type": "Button", "props": {"label": "Off", "onClick": "h12", "disabled": true}, "children": []},
+            {"type": "Toggle", "props": {"label": "Bad", "value": "yes", "onChange": "h13"}, "children": []}
+        ]);
+        let mut measure = |s: &str, st: &TextStyle, _md: bool| s.chars().count() as f32 * st.size.max(1.0) * 0.55;
+        let mut frame = |pointer: Option<PointerState>| {
+            if let Some(p) = pointer {
+                world.set(p);
+            }
+            fill(row, &ui, "test.0", None, &mut measure);
+            world.get::<&mut Clock>(|c| c.time += 1.0 / 60.0);
+            world.progress_time(1.0 / 60.0);
+        };
+        for _ in 0..6 {
+            frame(None);
+        }
+        let body = row.part("body").expect("body");
+        let el = |i: usize| body.part(&format!("g{i}")).unwrap_or_else(|| panic!("element {i}"));
+        let is = |v: View<'_>, prefab: &str| {
+            let p = view::prefab(w, prefab).unwrap_or_else(|| panic!("no prefab {prefab}"));
+            v.entity().owns((flecs::IsA::ID, *p.id()))
+        };
+        let laid = |v: View<'_>, what: &str| {
+            let l = v.entity().try_cloned::<&Laid>().unwrap_or_else(|| panic!("{what} is not laid out"));
+            assert!(l.w > 0.0 && l.h > 0.0, "{what} has no room: {l:?}");
+            l
+        };
+        let action = |v: View<'_>| v.entity().try_cloned::<&Action>().map(|a| a.name.as_str().to_owned());
+        fn part<'w>(v: View<'w>, path: &str) -> View<'w> {
+            path.split('.').try_fold(v, |v, p| v.part(p)).unwrap_or_else(|| panic!("no part {path}"))
+        }
+        let sends = |v: View<'_>, handler: &str, value: &str| {
+            assert_eq!(action(v), Some(format!(r#"ui:["test.0","{handler}",{value}]"#)), "{handler}");
+        };
+        for (i, prefab) in [
+            (0, "hn.GenButtonAccent"),
+            (1, "hn.GenToggle"),
+            (2, "hn.GenCheckboxOn"),
+            (3, "hn.GenSlider"),
+            (4, "hn.GenNumberField"),
+            (5, "hn.GenInput"),
+            (6, "hn.GenTextArea"),
+            (7, "hn.GenSelect"),
+            (8, "hn.GenChoice"),
+            (9, "hn.GenRadio"),
+            (10, "hn.GenButton"),
+        ] {
+            assert!(is(el(i), prefab), "element {i} is a {prefab}");
+            laid(el(i), prefab);
+        }
+        sends(el(0), "h1", "null");
+        sends(el(1), "h2", "true");
+        sends(el(2), "h3", "false");
+        let rail = part(el(3), "body.rail");
+        assert!(action(rail).is_some_and(|a| a.starts_with("ui:{")), "the slider's rail is armed: {:?}", action(rail));
+        laid(part(el(3), "body.rail.knob"), "the knob");
+        assert_eq!(part(el(3), "body.value").entity().try_cloned::<&Text>().map(|t| t.s.as_str().to_owned()).as_deref(), Some("40"));
+        sends(part(el(4), "body.minus"), "h5", "2");
+        sends(part(el(4), "body.plus"), "h5", "4");
+        for (i, what) in [(5, "the input's box"), (6, "the text area's box")] {
+            let bx = part(el(i), "body");
+            laid(bx, what);
+            assert!(action(bx).is_some_and(|a| a.starts_with("ui:{")), "{what} is armed");
+        }
+        let button = part(el(7), "body");
+        assert!(action(button).is_some_and(|a| a.starts_with("ui:{")), "the select is armed");
+        assert_eq!(part(button, "text").entity().try_cloned::<&Text>().map(|t| t.s.as_str().to_owned()).as_deref(), Some("Medium"));
+        for (n, (value, on)) in [("\"s\"", false), ("\"m\"", true), ("\"l\"", false)].into_iter().enumerate() {
+            let o = part(el(8), &format!("o{n}"));
+            assert!(is(o, if on { "hn.GenChoiceItemOn" } else { "hn.GenChoiceItem" }), "choice o{n} selected: {on}");
+            sends(o, "h10", value);
+        }
+        assert!(is(part(el(9), "o1"), "hn.GenRadioItemOn"), "2.0 selects the option 2");
+        sends(part(el(9), "o0"), "h11", "1");
+        assert_eq!(action(el(10)), None, "a disabled button takes no press");
+        assert!(el(10).entity().try_cloned::<&Pose>().is_some_and(|p| p.fade > 0.0), "and is faded");
+        let t = el(11).entity().try_cloned::<&Text>().map(|t| t.s.as_str().to_owned()).unwrap_or_default();
+        assert!(t.contains("<Toggle>") && t.contains("value"), "a malformed toggle is refused naming it and its prop: {t:?}");
+
+        // A press and release on the Button, through the input pass.
+        let b = laid(el(0), "the button");
+        let (x, y) = (b.x + b.w / 2.0, b.y + b.h / 2.0);
+        frame(Some(PointerState { x, y, down: false, went_down: false, went_up: false }));
+        frame(Some(PointerState { x, y, down: true, went_down: true, went_up: false }));
+        frame(Some(PointerState { x, y, down: false, went_down: false, went_up: true }));
+        let mut activated = Vec::new();
+        world.new_query::<&Activated>().each_entity(|e, _| activated.push(e.try_cloned::<&Action>().map(|a| a.name.as_str().to_owned())));
+        assert_eq!(activated, [Some(r#"ui:["test.0","h1",null]"#.to_owned())], "the press activates the button and only it");
     }
 }
 

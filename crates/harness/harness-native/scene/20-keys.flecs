@@ -137,6 +137,8 @@ act {
   prefab Edit
   ChatSend : act.Edit { EditOp: {op: "send"} }
   ChatNewline : act.Edit { EditOp: {op: "newline"} }
+  // Command-Return: sends the chat's message, and submits a cell's TextArea (where Return breaks the line).
+  ChatSubmit : act.Edit { EditOp: {op: "submit"} }
   ChatInterrupt : act.Edit { EditOp: {op: "interrupt"} }
   ChatLeft : act.Edit { EditOp: {op: "left"} }
   ChatRight : act.Edit { EditOp: {op: "right"} }
@@ -370,6 +372,7 @@ key {
   chat_send { Keybind: {key: "return"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_send_enter { Keybind: {key: "enter"}; (Does, act.ChatSend); (When, ctx.Chat) }
   chat_newline { Keybind: {key: "return", shift: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
+  chat_submit { Keybind: {key: "return", cmd: 1}; (Does, act.ChatSubmit); (When, ctx.Chat) }
   chat_newline_opt { Keybind: {key: "return", opt: 1}; (Does, act.ChatNewline); (When, ctx.Chat) }
   chat_interrupt { Keybind: {key: "escape"}; (Does, act.ChatInterrupt); (When, ctx.Chat) }
   chat_interrupt_ctrl { Keybind: {key: "c", ctrl: 1}; (Does, act.ChatInterrupt); (When, ctx.Chat) }

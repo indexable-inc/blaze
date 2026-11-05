@@ -953,13 +953,13 @@ impl App {
             if self.tree_focus && !k.mods.cmd && !k.mods.ctrl {
                 self.tree_focus = false;
             }
-            if self.chat_focused() {
+            if self.chat_focused() || self.genui_editing() {
                 if !k.mods.cmd && !k.mods.ctrl {
                     self.chat_type(k.text);
                 }
                 return;
             }
-        } else if self.palette.is_some() || self.chat_focused() {
+        } else if self.palette.is_some() || self.chat_focused() || self.genui_editing() {
             return;
         }
         let Some(t) = self.focused_term() else { return };
