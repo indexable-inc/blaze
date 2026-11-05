@@ -656,7 +656,14 @@ fn apply(w: WorldRef<'_>, dev: u64, idx: &mut Index, (terms, run_terms, chats): 
         // The stream ended (the program exited, or the daemon went): the last screen stays to read; the host attaches
         // again (on a fresh parser) when it wants the live one.
         Msg::Detached { .. } => {}
-        Msg::Runs(runs) => reconcile_runs(w, dev, idx, &runs, false),
+        Msg::Runs(runs) => {
+            // A poll with no runs at all: nothing older exists to page in, so the Archive says it is empty instead of
+            // offering older runs it can never find.
+            if runs.is_empty() && w.try_get::<&History>(|h| !h.exhausted).unwrap_or(true) {
+                w.set(History { loading: false, exhausted: true });
+            }
+            reconcile_runs(w, dev, idx, &runs, false);
+        }
         Msg::RunsPage { runs, full } => {
             reconcile_runs(w, dev, idx, &runs, true);
             w.set(History { loading: false, exhausted: !full });

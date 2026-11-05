@@ -1021,7 +1021,7 @@ impl App {
         let focused = self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none();
         if let Some(area) = pv.part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("area")) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
-            if let Some(h) = area.part("hint") {
+            if let Some(h) = area.part("hint_at").and_then(|a| a.part("hint")) {
                 // Its agent's name: "Message Codex…" in a Codex session.
                 let agent = match model::kind_name(w.entity_from_id(e)) {
                     "codex" => "Codex",
