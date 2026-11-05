@@ -87,6 +87,8 @@ fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
                 value: Some("80".to_owned()),
             },
         ],
+        builds: Vec::new(),
+        downloads: Vec::new(),
     };
     let line = status_json(&place, Some(&status)).unwrap();
     assert!(line.ends_with("}\n") && line.matches('\n').count() == 1, "{line}");
@@ -115,6 +117,8 @@ fn the_status_for_people() {
         build: blaze_api::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
+        builds: Vec::new(),
+        downloads: Vec::new(),
     };
     assert_eq!(
         status_lines(&status),
@@ -131,6 +135,8 @@ fn the_status_for_people() {
         build: blaze_api::Build::default(),
         bugs: Vec::new(),
         settings: Vec::new(),
+        builds: Vec::new(),
+        downloads: Vec::new(),
     };
     assert_eq!(
         status_lines(&idle),
@@ -177,6 +183,34 @@ fn the_status_for_people() {
         "{}",
         status_lines(&buggy)
     );
+    let building = Status {
+        builds: vec![blaze_api::Building {
+            id: 12,
+            what: "test -p blaze-api".to_owned(),
+            phase: "builds 412 units, 1 running".to_owned(),
+            spans: vec!["blaze-worker-3: task (2 min 05 s) > unit bodies `app::main` in app (4 s)".to_owned()],
+            for_ms: 125_400,
+        }],
+        downloads: vec![blaze_api::Downloading {
+            url: "https://example.com/llvm.tar.xz".to_owned(),
+            done: 34_000_000,
+            rate: None,
+            what: "llvm.tar.xz".to_owned(),
+            total: Some(410_000_000),
+            idle_ms: 0,
+            elapsed_ms: 9_000,
+        }],
+        ..buggy
+    };
+    assert!(
+        status_lines(&building).ends_with(
+            "builds: 1\n  #12 test -p blaze-api (2 min 05 s): builds 412 units, 1 running\n    \
+             blaze-worker-3: task (2 min 05 s) > unit bodies `app::main` in app (4 s)\n\
+             downloads: 1\n  llvm.tar.xz: 34.0 of 410.0 MB (8%)\n    from https://example.com/llvm.tar.xz\n"
+        ),
+        "{}",
+        status_lines(&building)
+    );
 }
 
 /// A daemon of one build: its Status says `build`; every request it is sent is kept, and each
@@ -207,6 +241,8 @@ impl Api for OfBuild {
                     uptime_ms: 40,
                     build: self.build.clone(),
                     bugs: Vec::new(),
+                    builds: Vec::new(),
+                    downloads: Vec::new(),
                 }),
                 Response::Done { ok: true },
             ],

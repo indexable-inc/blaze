@@ -175,16 +175,12 @@ async fn read_from(
     offset: u64,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let url = base.join(file)?;
-    let range = format!("bytes={offset}-");
-    let headers: &[(&str, &str)] = if offset == 0 { &[] } else { &[("range", &range)] };
-    let mut response = http.get_async(url.as_str(), headers).await?;
+    // In parallel ranges, said in blaze-fetch's downloads (the status line, `blaze status`, the
+    // build's stall bound) and stopped after its stall bound without a byte.
+    let response = http.get_from_async(url.as_str(), &[], offset, file).await?;
     match response.status {
         404 | 410 => Ok(None),
-        206 => Ok(Some(response.body)),
-        200 => {
-            let had = usize::try_from(offset).unwrap_or(usize::MAX).min(response.body.len());
-            Ok(Some(response.body.split_off(had)))
-        }
+        200 | 206 => Ok(Some(response.body)),
         _ => Err(HttpNotSuccessful::new(url.as_str(), &response).into()),
     }
 }

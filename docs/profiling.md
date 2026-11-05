@@ -1309,7 +1309,7 @@ counts, each of which only grows:
 | jobs ended | a worker pool job finishing (`Pool::ended`); never a worker's idle, search or switch span, nor the daemon loop's own turns |
 | queries completed | a query run or verified |
 | tasks and steps ended | a plane node settling (a task, or a unit's step), or a job's own effect ending (a placement, a look, its runs' IO) |
-| looks that found work running | a turn that finds a worker inside a job's code (`Pool::working`, one long compile) or a run of user code alive |
+| looks that found work running | a turn that finds a worker inside a job's code (`Pool::working`, one long compile), a run of user code alive, or a download that got a byte in the last second (`blaze_fetch::downloads`; a download that gets nothing stops itself after 30 s, naming its address) |
 
 When none of them has moved for the stall bound, 120 s unless `blaze serve --stall-bound SECS`
 says otherwise, the daemon:
@@ -1317,8 +1317,8 @@ says otherwise, the daemon:
 1. writes `state/stalls/<time>.json`: the flight recorder's last two minutes and the CPU
    samples as a Chrome trace (ui.perfetto.dev opens it);
 2. fails each running request with the error `blaze stalled: no job ended, no query
-   completed, no task or step ended and no job's code or run of user code was running for N s
-   while M tasks ran (the stall bound is B s,
+   completed, no task or step ended, no job's code or run of user code was running and no
+   download got a byte for N s while M tasks ran (the stall bound is B s,
    ...); it got to <the three counts>`, followed by each thread inside spans, outermost span
    first, with what each awaits, who runs it, and how long it has been in each, then every
    job waiting in the pool's wait graph with the key, counter or job it waits on and that

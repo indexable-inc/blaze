@@ -1,7 +1,7 @@
 name: release
 
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
-# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS and B3SUMS (a pin's fetch checks every list a release has, crates/blaze-engine/src/versions.rs),
+# Linux (x86_64, aarch64) and macOS (aarch64) and makes a GitHub release of that name: a `.tar.xz` and a `.tar.gz` per target (`blaze` a hard link to `blaze-engine`), a `.sha256` of each, SHA256SUMS and B3SUMS (a pin's fetch checks every list a release has, crates/blaze-engine/src/versions.rs),
 # the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
 # notes (what docs/CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
 # until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
@@ -137,15 +137,28 @@ jobs:
           mkdir "$NAME"
           cp LICENSE-APACHE LICENSE-MIT README.md docs/CHANGELOG.md "$NAME"
           cp shipped/* "$NAME"
+          # `blaze` and `blaze-engine` are one program (both run blaze_engine::main, which
+          # goes by neither name), linked twice: shipped once, as a hard link, which tar keeps,
+          # so the archive holds one copy.
+          ln -f "$NAME/blaze-engine" "$NAME/blaze"
           "$NAME/blaze-engine" --version | tee /dev/stderr | sed -n 1p | grep -E "^blaze ${{ needs.notes.outputs.version }} \([0-9a-f]{7}( [0-9]{4}-[0-9]{2}-[0-9]{2})?\)$"
           # `blaze` runs the one beside it.
           "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
+          # The `.tar.xz` is what blaze fetches for a pin, `blaze update` and install.sh, a
+          # third of the `.tar.gz`; the `.tar.gz` stays for blazes from before, which fetch only
+          # it. `-T0` splits it into blocks only past 192 MiB of input, which costs little.
+          command -v xz >/dev/null || brew install xz
+          tar cf - "$NAME" | xz -9e -T0 > "$NAME.tar.xz"
           tar czf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          ls -l "$NAME.tar.xz" "$NAME.tar.gz"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.NAME }}
-          path: ${{ env.NAME }}.tar.gz*
+          path: |
+            ${{ env.NAME }}.tar.xz*
+            ${{ env.NAME }}.tar.gz*
           if-no-files-found: error
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
@@ -241,7 +254,7 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
+            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
       # A canary: promote.yaml tests the archives just published and makes this same release
       # stable when they pass (docs/release.md). By dispatch, since a release this token
       # publishes starts no `release:` workflow. The canary pointer moves in `metadata`.

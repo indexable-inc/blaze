@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(super) mod doing;
 mod kept;
 mod slab;
 #[cfg(test)]
@@ -1880,6 +1881,11 @@ struct Job<S: Steps> {
     /// lowering and held until the job is dropped: the collector renames no dir while a build
     /// holds it (docs/gc.md, "Leases").
     leases: Arc<Mutex<Leases>>,
+    /// When it began, on the injected clock ([`World::now`]): what its [`Response::Doing`]
+    /// and `blaze status` count its time from.
+    began: Duration,
+    /// When its last [`Response::Doing`] was said, on the same clock ([`Jobs::doing`]).
+    doing_said: Option<Duration>,
 }
 
 /// A job's kept front end being stored ([`Jobs::store_kept`]), by one task of a plane request
@@ -1932,40 +1938,7 @@ impl<S: Steps> std::fmt::Display for WaitedOn<'_, S> {
             if at == JOBS_NAMED {
                 return write!(f, "; and {} more", count - at);
             }
-            write!(f, "; job {id} ")?;
-            match &job.stage {
-                Stage::Library(node) => write!(f, "waits for the toolchain's library, node {}", node.0)?,
-                Stage::Locals(node, _) => write!(f, "waits for its paths outside the view to be read again, node {}", node.0)?,
-                Stage::Plan(node, _) => write!(f, "waits for its plan, node {}", node.0)?,
-                Stage::Fetch(fetching) => write!(
-                    f,
-                    "waits for {} of its {} fetches, nodes from {}",
-                    fetching.left,
-                    fetching.fetches.len(),
-                    fetching.first.0
-                )?,
-                Stage::Native(wait) => write!(
-                    f,
-                    "waits for its pinned native inputs, {} of {} layouts left",
-                    wait.left,
-                    wait.nodes.len()
-                )?,
-                Stage::Lower(node, _, _) => write!(f, "waits for its lowering, node {}", node.0)?,
-                Stage::Units(build) => {
-                    write!(f, "builds {} units, nodes from {}", build.units.len(), build.first.0)?
-                }
-                Stage::Answer(node) => write!(f, "waits for its answer, node {}", node.0)?,
-                Stage::Ahead(node) => {
-                    write!(f, "waits for the units to build ahead, node {}", node.0)?
-                }
-                Stage::Runs(_) => f.write_str("runs its tests or its run")?,
-                Stage::Snapshot { ticket, .. } => write!(
-                    f,
-                    "waits for its snapshot's commit ({})",
-                    if ticket.is_some() { "the VFS's heads" } else { "the store's puts" }
-                )?,
-                Stage::Over => f.write_str("is over and waits to end")?,
-            }
+            write!(f, "; job {id} {}", StageSaid(&job.stage))?;
             match job.request {
                 Some(request) => write!(f, " (plane request {}", request.0)?,
                 None => f.write_str(" (no plane request")?,
@@ -1997,6 +1970,49 @@ impl<S: Steps> std::fmt::Display for WaitedOn<'_, S> {
             f.write_str(")")?;
         }
         Ok(())
+    }
+}
+
+/// Where a job is and what it waits on there (`waits for its pinned native inputs, 1 of 1
+/// layouts left`): what a stall ([`WaitedOn`]), the client's waiting line
+/// ([`Response::Doing`]) and `blaze status` say of it.
+struct StageSaid<'a, S: Steps>(&'a Stage<S>);
+
+impl<S: Steps> std::fmt::Display for StageSaid<'_, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Stage::Library(node) => write!(f, "waits for the toolchain's library, node {}", node.0),
+            Stage::Locals(node, _) => {
+                write!(f, "waits for its paths outside the view to be read again, node {}", node.0)
+            }
+            Stage::Plan(node, _) => write!(f, "waits for its plan, node {}", node.0),
+            Stage::Fetch(fetching) => write!(
+                f,
+                "waits for {} of its {} fetches, nodes from {}",
+                fetching.left,
+                fetching.fetches.len(),
+                fetching.first.0
+            ),
+            Stage::Native(wait) => write!(
+                f,
+                "waits for its pinned native inputs, {} of {} layouts left",
+                wait.left,
+                wait.nodes.len()
+            ),
+            Stage::Lower(node, _, _) => write!(f, "waits for its lowering, node {}", node.0),
+            Stage::Units(build) => {
+                write!(f, "builds {} units, nodes from {}", build.units.len(), build.first.0)
+            }
+            Stage::Answer(node) => write!(f, "waits for its answer, node {}", node.0),
+            Stage::Ahead(node) => write!(f, "waits for the units to build ahead, node {}", node.0),
+            Stage::Runs(_) => f.write_str("runs its tests or its run"),
+            Stage::Snapshot { ticket, .. } => write!(
+                f,
+                "waits for its snapshot's commit ({})",
+                if ticket.is_some() { "the VFS's heads" } else { "the store's puts" }
+            ),
+            Stage::Over => f.write_str("is over and waits to end"),
+        }
     }
 }
 
@@ -2843,6 +2859,8 @@ impl<S: Steps> Jobs<S> {
             opened_ns: 0,
             opened_unix_ns: None,
             leases: Arc::default(), // alloc: once per job, shared with its lowering
+            began: w.now,
+            doing_said: None,
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give

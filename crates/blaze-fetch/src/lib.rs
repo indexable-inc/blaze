@@ -40,10 +40,12 @@
 mod casefold;
 pub mod decisions;
 pub mod digest;
+pub mod downloads;
 pub mod error;
 pub mod fetcher;
 pub mod flight;
 pub mod graph;
+pub mod progress;
 pub mod request;
 pub mod store;
 pub mod tree;

@@ -70,6 +70,12 @@ pub struct Daemon<'a> {
     /// The bugs reported so far, for [`Status::bugs`]: the daemon's reading of
     /// `stdx::assert::reported::sites`, which allocates nothing when there are none.
     pub bugs: fn() -> Vec<crate::Bug>,
+    /// The builds under way as the daemon last looked (once a second while one runs), for
+    /// [`Status::builds`].
+    pub builds: &'a [crate::Building],
+    /// Every download in flight, for [`Status::downloads`]: the daemon's reading of
+    /// `blaze_fetch::downloads`, which allocates nothing when there is none.
+    pub downloads: fn() -> Vec<crate::Downloading>,
 }
 
 /// The requests under way, the views each connection holds, and the jobs of the build.
@@ -765,6 +771,9 @@ impl Session {
                     budget_bytes: cx.budget_bytes,
                     uptime_ms: cx.uptime_ms,
                     bugs: (cx.bugs)(),
+                    // clone: the reply's own copy, once per Status; none when idle.
+                    builds: cx.builds.to_vec(),
+                    downloads: (cx.downloads)(),
                 };
                 answer(out, req, Response::Status(status));
             }
