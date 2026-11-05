@@ -84,6 +84,41 @@ pub struct BlazeMark {
     pub exit: f32,
 }
 
+/// Kip, den's mascot (harness-native-kip), drawn live: a small voxel creature `size` points tall that plays the moods
+/// `mood` names in turn (`"wave"`, `"thinking then celebrate"`; act.rs reads the words, a word it does not know is passed
+/// over, none it knows is a wave), the last staying. A node measures his box (`Intrinsic`): room over his head for a hop
+/// and under his feet for his shadow, and on his right for a waving arm with his feet at the left (as he stands in a cell's
+/// words), or on both sides with his feet in the middle when `centre`. He plays his moods when he first comes into view,
+/// or with `settle` stands where they end (a reply read back from history), and plays them again when the pointer comes
+/// onto him after they have ended; he looks toward the pointer. Off screen his clock stops. His look and motion are the
+/// scene's `ui.kip` (kip.flecs).
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Kip {
+    pub mood: ScriptString,
+    pub size: f32,
+    pub centre: bool,
+    pub settle: bool,
+}
+
+/// Where a `Kip`'s feet stand in its node's box, instead of where its own box puts them: at `x`, `y` (fractions of the
+/// box from its top left) moved `dx`, `dy` points. Such a node measures nothing: it is laid on what Kip stands on (an
+/// `Overlay` on the composer, his feet on its top edge) and he is drawn past its edges.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct KipStand {
+    pub x: f32,
+    pub y: f32,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+/// How long a `Kip` shown for a moment (a turn's outcome on the composer) stays, `secs`, the last `fade` of them fading
+/// out. Read from a scene prefab by its host; nothing draws it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct KipLinger {
+    pub secs: f32,
+    pub fade: f32,
+}
+
 /// A block caret after the last glyph a node's words show (a `Pose.cut` types them on), in `ink`, from `at` to `until`
 /// seconds on the frame clock: solid while glyphs are arriving, then blinking, on for half of every `blink` seconds.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -202,6 +237,9 @@ hyperion_api_layouts::api_layouts! {
     "Pixelated" => alias Pixelated,
     "Frames" => alias Frames,
     "BlazeMark" => alias BlazeMark,
+    "Kip" => alias Kip,
+    "KipStand" => alias KipStand,
+    "KipLinger" => alias KipLinger,
     "Caret" => alias Caret,
     "TextEdit" => alias TextEdit,
     "Highlight" => alias Highlight,
@@ -225,6 +263,9 @@ pub fn register(world: &World) {
     world.component::<Pixelated>().writable();
     world.component::<Frames>().writable();
     world.component::<BlazeMark>().writable();
+    world.component::<Kip>().writable();
+    world.component::<KipStand>().writable();
+    world.component::<KipLinger>().writable();
     world.component::<Caret>().writable();
     world.component::<TextEdit>().writable();
     world.component::<Highlight>().writable();

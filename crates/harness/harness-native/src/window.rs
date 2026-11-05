@@ -187,6 +187,27 @@ fn wake_from_any_thread() -> Arc<dyn Fn() + Send + Sync> {
     })
 }
 
+/// Each frame counts on; a Kip's nap (below) is still due only when no frame came between.
+static FRAMES_DRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// The app went idle with the Kips in view at rest: wake in `secs` for the next one's blink or fidget, moving their clocks
+/// on by the time slept (den-native's `mascot_rest`), unless a frame was drawn meanwhile (their clocks ran with it).
+fn arm_kip_nap(secs: f64) {
+    let at = FRAMES_DRAWN.load(Ordering::SeqCst);
+    let Ok(when) = dispatch2::DispatchTime::try_from(std::time::Duration::from_secs_f64(secs.clamp(0.05, 60.0))) else {
+        return;
+    };
+    let _ = DispatchQueue::main().after(when, move || {
+        if FRAMES_DRAWN.load(Ordering::SeqCst) != at {
+            return;
+        }
+        with(|st| {
+            st.app.kip_woke(secs);
+            st.link.setPaused(false);
+        });
+    });
+}
+
 /// F3's overlay is shown and the app idle: wake once in its tick (about 4 Hz), no sooner.
 fn arm_stats_tick() {
     let when = dispatch2::DispatchTime::try_from(crate::app::STATS_TICK).expect("a short delay");
@@ -750,6 +771,7 @@ impl HarnessView {
     fn frame_into(&self, dest: Dest, entered: f64, t: f64, present: f64) {
         // Before this frame drains the daemon's messages: any posted after it may not have been drained.
         let seen = POSTED.load(Ordering::SeqCst);
+        FRAMES_DRAWN.fetch_add(1, Ordering::SeqCst);
         let points = self.bounds().size;
         let backing = self.convertSizeToBacking(points).width / points.width.max(1.0);
         // The keys were loaded again (the user's keys.flecs changed): the menu bar follows.
@@ -825,6 +847,9 @@ impl HarnessView {
                     st.last = None;
                     if st.app.stats_arm() {
                         arm_stats_tick();
+                    }
+                    if let Some(secs) = st.app.kip_nap() {
+                        arm_kip_nap(secs);
                     }
                 }
                 (false, _) if st.calm => {

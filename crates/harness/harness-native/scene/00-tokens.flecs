@@ -443,6 +443,11 @@ export const tone_gen_chip_on_edge: Fill = {dark: {1, 1, 1, 0.34}, light: {0, 0,
 // the code chip's wash as it shows on the terminal's ground, without letting what is under it through.
 export const tone_gen_badge: Fill = {dark: {0.196, 0.196, 0.212, 1}, light: {0.937, 0.937, 0.945, 1}}
 export const tone_gen_badge_edge: Fill = {dark: {1, 1, 1, 0.14}, light: {0, 0, 0, 0.12}}
+// A toned Badge's plate (den's GenBadge<Tone>): its tone, faint, over the ground, so the pill reads as the word's colour.
+export const tone_gen_badge_accent: Fill = {dark: {0.922, 0.918, 0.902, 0.12}, light: {0.086, 0.086, 0.090, 0.08}}
+export const tone_gen_badge_success: Fill = {dark: {0.55, 0.80, 0.40, 0.18}, light: {0.25, 0.55, 0.18, 0.12}}
+export const tone_gen_badge_warning: Fill = {dark: {0.94, 0.86, 0.28, 0.18}, light: {0.58, 0.52, 0.04, 0.14}}
+export const tone_gen_badge_error: Fill = {dark: {0.980, 0.451, 0.427, 0.18}, light: {0.788, 0.204, 0.176, 0.12}}
 // File kinds as the IntelliJ New UI colours them (den's scene/15-filetypes.flecs): an Icon's or a FileRef's kind.
 export const tone_file_rust: Fill = {dark: {0.878, 0.38, 0.298, 1}, light: {0.784, 0.263, 0.184, 1}}
 export const tone_file_typescript: Fill = {dark: {0.298, 0.604, 0.91, 1}, light: {0.165, 0.435, 0.753, 1}}
@@ -486,3 +491,17 @@ code_ink {
   comment { Fill: {dark: {0.498, 0.518, 0.557, 1}, light: {0.431, 0.467, 0.506, 1}} }
   variable { builtin { Fill: {dark: {0.878, 0.424, 0.459, 1}, light: {0.812, 0.133, 0.180, 1}} } }
 }
+
+// Kip in the app's chrome (the ui.Mascot primitive's `Kip`, kip.flecs): how tall he stands where he shows, and where.
+// An empty chat: kip_greet points tall, his feet kip_greet_lift above the composer's middle. While the agent works he
+// perches on the composer's top edge, kip_perch tall, kip_perch_in in from its right; a turn's end shows happy (or oops
+// on an error) for kip_outcome_secs, its last kip_outcome_fade fading. No chats: kip_empty tall over the empty pane's
+// note. The Archive with nothing in it: kip_archive tall over its note.
+export const kip_greet = 60
+export const kip_greet_lift = 18
+export const kip_perch = 24
+export const kip_perch_in = 30
+export const kip_outcome_secs = 2.6
+export const kip_outcome_fade = 0.4
+export const kip_empty = 72
+export const kip_archive = 44

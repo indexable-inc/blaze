@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SHADERS: [&str; 1] = ["harness"];
+const SHADERS: [&str; 2] = ["harness", "mascot"];
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));

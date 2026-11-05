@@ -18,6 +18,9 @@ pub enum SegKind {
     Path,
     /// One index into [`Draw::images`] (each binds its own texture, so a run is never more than one).
     Image,
+    /// Indices into [`Draw::kips`]: Kip (harness-native-kip), each its own picture rendered before the frame and set in
+    /// over its contact shadow (kip.rs).
+    Kip,
 }
 
 /// A run of consecutive instances of one kind, drawn in order.
@@ -43,6 +46,8 @@ pub struct Draw {
     /// Pictures and their straight RGBA8 texels (`size` wide and high), one texture each.
     pub images: Vec<ImageInst>,
     pub texels: Vec<Rc<[u8]>>,
+    /// The Kips this frame draws (kip.rs renders each picture before the frame, the pass sets them in by `segs`).
+    pub kips: Vec<harness_native_kip::MascotQuad>,
     /// Paint order: runs of instances by kind.
     pub segs: Vec<Seg>,
 }
@@ -83,6 +88,12 @@ impl Draw {
     pub fn sprite(&mut self, s: SpriteInst) {
         self.sprites.push(s);
         self.push_seg(SegKind::Sprite, self.sprites.len() - 1);
+    }
+
+    /// A Kip: its picture and its shadow, in paint order.
+    pub fn kip(&mut self, q: harness_native_kip::MascotQuad) {
+        self.kips.push(q);
+        self.push_seg(SegKind::Kip, self.kips.len() - 1);
     }
 
     /// A picture: `texels` (straight RGBA8, `size[0]` by `size[1]`) over `img.rect`.

@@ -9,6 +9,7 @@ use crate::pane::{
 };
 use harness_native_flecs::ComponentId;
 use harness_native_ui_layout_api::{ScrollExtent, ScrollState, ScrollerGrip, ScrollerPart, scroll_quietly};
+use harness_native_ui_text_api::{Kip, KipStand};
 use model::PaneKind;
 
 /// The prefab that draws a pane of `kind` (None: nothing shown).
@@ -17,7 +18,41 @@ fn pane_prefab(kind: Option<PaneKind>) -> &'static str {
         Some(PaneKind::Run) => "hn.RunPane",
         Some(PaneKind::Archive) => "hn.ArchivePane",
         Some(PaneKind::Chat) => "hn.ChatPane",
-        _ => "hn.TermPane",
+        Some(_) => "hn.TermPane",
+        None => "hn.EmptyPane",
+    }
+}
+
+/// Kip on `node` as scene prefab `look` has him (its `Kip`, and its `KipStand` when it has one) in `mood` (None: the
+/// look's), faded by `fade` (0 shown, 1 gone); or, with no look, taken off it: a node without a `Kip` draws nothing, and
+/// off screen his clock stops (harness-native-render kips.rs).
+pub(super) fn show_kip(node: View<'_>, look: Option<(&str, Option<&str>)>, fade: f32) {
+    let e = node.entity();
+    let Some((look, mood)) = look else {
+        if e.has(Kip::id()) {
+            _ = e.remove(Kip::id());
+        }
+        if e.has(KipStand::id()) {
+            _ = e.remove(KipStand::id());
+        }
+        return;
+    };
+    let p = view::prefab(e.world(), look).unwrap_or_else(|| panic!("the scene has no {look} (Kip's look in the chrome)"));
+    let mut k = p.try_cloned::<&Kip>().unwrap_or_else(|| panic!("{look} has no Kip"));
+    if let Some(m) = mood {
+        k.mood = m.into();
+    }
+    if e.try_cloned::<&Kip>().as_ref() != Some(&k) {
+        e.set(k);
+    }
+    match p.try_cloned::<&KipStand>() {
+        Some(s) if e.try_cloned::<&KipStand>() != Some(s) => _ = e.set(s),
+        None if e.has(KipStand::id()) => _ = e.remove(KipStand::id()),
+        _ => {}
+    }
+    let pose = harness_native_ui_motion_api::Pose { fade: fade.clamp(0.0, 1.0), ..Default::default() };
+    if e.try_cloned::<&harness_native_ui_motion_api::Pose>().unwrap_or_default() != pose {
+        e.set(pose);
     }
 }
 
@@ -148,8 +183,32 @@ impl App {
                 Some((e, PaneKind::Run)) => self.fill_run_pane(pane, e),
                 Some((_, PaneKind::Archive)) => self.fill_archive_pane(pane),
                 Some((e, PaneKind::Chat)) => self.fill_chat_pane(pane, e),
+                None => self.fill_empty_pane(pane),
                 _ => {}
             }
+        }
+    }
+
+    /// The main card with nothing selected (no chats yet): Kip waving once the daemon's list is in, over the key that
+    /// starts a chat. Before the list he is not there, so a launch does not flash him.
+    fn fill_empty_pane(&self, pane: u64) {
+        let w = self.world.world_ref();
+        let up = w
+            .lookup(model::LOCAL)
+            .target(model::Link::id(), 0)
+            .is_some_and(|t| *t.id() == *w.component_id::<model::Up>());
+        let v = View::of(w.entity_from_id(pane));
+        if let Some(k) = v.part("kip") {
+            show_kip(k, up.then_some(("hn.KipEmpty", None)), 0.0);
+        }
+        if let Some(n) = v.part("note") {
+            let key = self.hint("Picker");
+            let said = match (up, key.is_empty()) {
+                (false, _) => String::new(),
+                (true, false) => format!("Start a chat with {key}"),
+                (true, true) => "No chat open".to_owned(),
+            };
+            n.text(&said);
         }
     }
 

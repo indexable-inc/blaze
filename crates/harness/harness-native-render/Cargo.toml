@@ -11,6 +11,7 @@ build = "build.rs"
 harness-native-flecs = { path = "../harness-native-flecs" }
 harness-native-api = { path = "../harness-native-api" }
 harness-native-blaze = { path = "../harness-native-blaze" }
+harness-native-kip = { path = "../harness-native-kip" }
 harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
 tree-sitter-highlight = "0.25"
 tree-sitter-bash = "0.25"
@@ -21,6 +22,7 @@ tree-sitter-python = "0.25"
 tree-sitter-json = "0.24"
 tree-sitter = "0.25"
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
 harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
 harness-native-ui-layout = { path = "../harness-native-ui-layout" }
 harness-native-ui-look-api = { path = "../harness-native-ui-look-api" }

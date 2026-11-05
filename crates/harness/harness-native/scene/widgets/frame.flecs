@@ -127,6 +127,21 @@ hn {
     term : hn.Terminal {}
   }
 
+  // What the main card shows when nothing is selected (no chats yet): Kip, once the daemon's list is in (panes.rs sets
+  // his Kip from hn.KipEmpty), over a quiet note naming the key that starts one.
+  prefab EmptyPane : hn.Pane {
+    Flex: {axis: Column, gap: 10, align: Center, justify: Center, wrap: false}
+    kip : ui.Node {
+      Hoverable
+    }
+    note : ui.Line, Faint {
+      TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
+    }
+  }
+  prefab KipEmpty {
+    Kip: {mood: "wave then idle", size: $kip_empty, centre: true, settle: false}
+  }
+
   // A run or a stage (Proc, Stage): its stages as rows (a pipeline's), then its output, stdout and stderr in the order
   // they were written, stderr tinted. The title bar names it (its id and command) and says how it stands; no heading here.
   prefab RunPane : hn.Pane {

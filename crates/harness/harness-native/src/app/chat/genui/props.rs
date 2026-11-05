@@ -5,7 +5,7 @@
 use super::*;
 
 /// The tier-3 elements and the props each takes on the wire.
-const PROPS: [(&str, &[&str]); 22] = [
+const PROPS: [(&str, &[&str]); 23] = [
     ("Grid", &["columns", "fit", "gap", "pad"]),
     ("Stack", &[]),
     ("Layer", &["anchor", "x", "y", "z"]),
@@ -28,12 +28,13 @@ const PROPS: [(&str, &[&str]); 22] = [
     ("Chip", &["label", "selected", "value", "onClick"]),
     ("Tile", &["gap", "pad", "value", "onClick"]),
     ("FileRef", &["path", "line"]),
+    ("Kip", &["mood", "size"]),
 ];
 
-pub(super) const TIER3: [&str; 22] = {
-    let mut out = [""; 22];
+pub(super) const TIER3: [&str; 23] = {
+    let mut out = [""; 23];
     let mut i = 0;
-    while i < 22 {
+    while i < 23 {
         out[i] = PROPS[i].0;
         i += 1;
     }
@@ -53,7 +54,14 @@ const MAX_LINES: f64 = 20.0;
 const TONES: [&str; 7] = ["ink", "muted", "strong", "error", "accent", "success", "warning"];
 
 /// The elements that hold nothing.
-const LEAVES: [&str; 8] = ["Toast", "Progress", "Loading", "Skeleton", "Icon", "Image", "Chip", "FileRef"];
+const LEAVES: [&str; 9] = ["Toast", "Progress", "Loading", "Skeleton", "Icon", "Image", "Chip", "FileRef", "Kip"];
+
+/// A Kip's mood words (the kernel's `KIP_MOODS`; harness-native-kip act.rs plays them), what joins them, the most it plays in
+/// turn, and how tall it stands (points).
+const KIP_MOODS: [&str; 8] = ["wave", "happy", "celebrate", "thinking", "working", "oops", "sleepy", "idle"];
+const KIP_JOINS: [&str; 2] = ["then", "and"];
+const MAX_KIP_STEPS: usize = 6;
+pub(super) const KIP_SIZES: std::ops::RangeInclusive<f64> = 20.0..=160.0;
 
 /// The prefab a tier-3 element's props pick, when not its type's own.
 pub(super) fn prefab(kind: &str, node: &Value) -> Option<&'static str> {
@@ -178,6 +186,25 @@ pub(super) fn check(node: &Value, within: &Within) -> Option<String> {
             _ => text("label", false),
         },
         "Loading" => text("label", false),
+        "Kip" => {
+            let mood = match &p["mood"] {
+                Value::String(m) => m.to_lowercase(),
+                _ => return bad("mood", "mood words (it is required)"),
+            };
+            let words: Vec<&str> = mood.split(|c: char| !c.is_ascii_lowercase()).filter(|w| !w.is_empty() && !KIP_JOINS.contains(w)).collect();
+            if let Some(w) = words.iter().find(|w| !KIP_MOODS.contains(w)) {
+                let said: String = w.chars().take(32).collect();
+                return Some(format!("<Kip> mood \u{201C}{said}\u{201D} is not a mood: {}", KIP_MOODS.join(", ")));
+            }
+            if words.is_empty() || words.len() > MAX_KIP_STEPS {
+                return bad("mood", &format!("1 to {MAX_KIP_STEPS} mood words"));
+            }
+            match number("size") {
+                Err(e) => e,
+                Ok(Some(s)) if !KIP_SIZES.contains(&s) => bad("size", "points from 20 to 160"),
+                Ok(_) => None,
+            }
+        }
         "Skeleton" => match number("lines") {
             Err(e) => e,
             Ok(Some(n)) if !(1.0..=MAX_LINES).contains(&n) || n.fract() != 0.0 => bad("lines", "a whole number from 1 to 20"),

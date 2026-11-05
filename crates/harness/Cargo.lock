@@ -901,6 +901,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-native-kip"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "harness-native-model"
 version = "0.1.0"
 dependencies = [
@@ -922,8 +929,10 @@ dependencies = [
  "harness-native-api",
  "harness-native-blaze",
  "harness-native-flecs",
+ "harness-native-kip",
  "harness-native-ui-draw",
  "harness-native-ui-draw-api",
+ "harness-native-ui-input-api",
  "harness-native-ui-layout",
  "harness-native-ui-layout-api",
  "harness-native-ui-look-api",

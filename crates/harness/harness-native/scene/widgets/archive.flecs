@@ -45,6 +45,10 @@ hn {
     }
   }
 
+  prefab KipArchive {
+    Kip: {mood: "sleepy", size: $kip_archive, centre: true, settle: false}
+  }
+
   // A filter chip over the Archive's list (All, Sessions, Runs, Failed): lit (the selection's pill tone, strong ink) when on.
   prefab Chip : ui.Row {
     Pressable
@@ -133,9 +137,14 @@ hn {
 
   // The Archive's list when nothing is in it (or nothing matches), centred in the room the rows leave (ArchivePane's
   // `empty`).
-  prefab ArchNote : ui.Row {
-    Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+  // Kip over it (archive.rs sets his Kip from hn.KipArchive): asleep over an empty Archive, puzzling over a filter that
+  // matches nothing.
+  prefab ArchNote : ui.Column {
+    Flex: {axis: Column, gap: 6, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    kip : ui.Node {
+      Hoverable
+    }
     label : ui.Line, Faint {
       TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
     }

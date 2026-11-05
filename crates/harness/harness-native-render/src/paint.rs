@@ -16,7 +16,7 @@ use harness_native_ui_look_api::{Edge, Fill, HoverLook, Lift, PressLook, Rgba, S
 use harness_native_ui_motion_api::{CopyFlash, Pose};
 use harness_native_ui_node_api::Laid;
 use harness_native_ui_text_api::{
-    BlazeMark, Caret, Frames, Highlight, Mark, MarkdownText, OneLine, Picture, Pixelated, Text,
+    BlazeMark, Caret, Frames, Highlight, Kip, Mark, MarkdownText, OneLine, Picture, Pixelated, Text,
     TextEdit, Truncate, TruncateMode, Vector, VectorFit, VectorText,
 };
 use harness_native_ui_timeline_api::GlyphsIn;
@@ -46,6 +46,10 @@ pub struct Painter {
     sheets: HashMap<String, Rc<Sheet>>,
     /// Each `BlazeMark` node's fire, by entity and appearance: its automaton runs on from frame to frame.
     marks: HashMap<(u64, bool), harness_native_blaze::mark::Blaze>,
+    /// Each `Kip` node's mascot, stepped while it is painted (kips.rs).
+    kips: crate::kips::Kips,
+    /// What the Kips painted in the last frame want next ([`Painter::end_frame`]).
+    pub kip_wake: crate::kips::Wake,
     highlight: crate::highlight::Highlighter,
     /// Where a `Picture`'s handle is a path under (the scene's directory); None: this host draws no pictures.
     pub media: Option<PathBuf>,
@@ -241,6 +245,8 @@ impl Painter {
             widths: HashMap::new(),
             sheets: HashMap::new(),
             marks: HashMap::new(),
+            kips: crate::kips::Kips::default(),
+            kip_wake: crate::kips::Wake::None,
             paths: HashMap::new(),
             highlight: crate::highlight::Highlighter::default(),
             media: None,
@@ -357,11 +363,34 @@ impl Painter {
                 Intrinsic { w, h, at, base, last }
             })
             .collect();
-        typeset::apply(world, &wanted, &sizes)
+        typeset::apply(world, &wanted, &sizes) + Self::measure_kips(world)
+    }
+
+    /// Each `Kip` node's box as its `Intrinsic` (kips.rs `measure`); how many changed.
+    fn measure_kips(world: WorldRef<'_>) -> usize {
+        let mut changed = Vec::new();
+        world.new_query::<&Kip>().each_entity(|e, k| {
+            let Some([w, h]) = crate::kips::measure(e, k) else { return };
+            let now = e.try_cloned::<&Intrinsic>();
+            if now.is_none_or(|i| (i.w - w).abs() > 0.01 || (i.h - h).abs() > 0.01) {
+                changed.push((*e.id(), Intrinsic { w, h, at: w, base: 0.0, last: 0.0 }));
+            }
+        });
+        for (id, i) in &changed {
+            world.entity_from_id(*id).set(*i);
+        }
+        changed.len()
+    }
+
+    /// While nothing was drawn, `secs` went by: the Kips last in view move their clocks on (kips.rs). Whether one is due
+    /// to blink or fidget now.
+    pub fn rest_kips(&mut self, secs: f64) -> bool {
+        self.kips.rest(secs)
     }
 
     /// After a frame: an overflowed atlas is emptied (true: draw again, its glyphs are gone) and a big layout cache dropped.
     pub fn end_frame(&mut self) -> bool {
+        self.kip_wake = self.kips.end_frame();
         if self.layouts.len() > 4096 {
             self.layouts.clear();
         }
@@ -843,6 +872,10 @@ impl Painter {
     ) -> Result<(), String> {
         let path = e.path();
         let time = e.world().try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
+        if let Some(k) = e.try_cloned::<&Kip>() {
+            let laid = e.try_cloned::<&Laid>().map_or(rect, |l| [l.x, l.y, l.w, l.h]);
+            return self.kips.paint(d, e, &k, rect, laid, alpha, dark, sc, time);
+        }
         if let Some(m) = e.try_cloned::<&BlazeMark>() {
             let rest = e.try_cloned::<&Laid>().map_or(rect, |l| [l.x, l.y, l.w, l.h]);
             return self.blaze(d, e.id().0, m, rect, rest, alpha, dark, sc, time);

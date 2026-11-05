@@ -25,6 +25,8 @@ export const ELEMENT_NAMES = [
   'Progress', 'Loading', 'Skeleton',
   // Pictures, chips and files: a file kind or symbol, a picture on disk, a pill, a column pressed as a whole, a file chip that opens.
   'Icon', 'Image', 'Chip', 'Tile', 'FileRef',
+  // The agent as the app shows it: Kip, the voxel mascot, live in a mood or a short run of them.
+  'Kip',
 ] as const;
 export type ElementName = typeof ELEMENT_NAMES[number];
 
@@ -32,7 +34,7 @@ const known = new Set<string>(ELEMENT_NAMES);
 export const isKnownElement = (name: string): name is ElementName => known.has(name);
 
 /** Den's elements the harness app does not draw (yet): naming one is this error, never a blank or a ReferenceError. */
-export const NOT_DRAWN: ReadonlySet<string> = new Set(['Kip', 'Browser', 'Shader', 'Video']);
+export const NOT_DRAWN: ReadonlySet<string> = new Set(['Browser', 'Shader', 'Video']);
 export const notDrawnError = (name: string, where?: string): TypeError =>
   new TypeError(`<${name}> is not drawn by the harness app${where ? ` (${where})` : ''}: the elements are ${ELEMENT_NAMES.join(', ')}`);
 
@@ -103,6 +105,7 @@ export const PROPS: Record<ElementName, readonly string[]> = {
   Chip: ['label', 'selected', 'value', 'onclick', 'children'],
   Tile: ['gap', 'pad', 'value', 'onclick', 'children'],
   FileRef: ['path', 'line'],
+  Kip: ['mood', 'size'],
 };
 /** The props only a Text inside a Canvas reads. */
 export const CANVAS_TEXT_PROPS: ReadonlySet<string> = new Set(['x', 'y', 'anchor', 'size', 'fill']);
@@ -128,6 +131,26 @@ export const MAX_POINTS = 2000;
 export const MAX_OPTIONS = 200;
 export const MAX_LABEL = 200;
 export const MAX_LINES = 40;
+/**
+ * The words a Kip's `mood` takes (harness-native-kip act.rs reads the same), each a mood it plays: `celebrate` is two hops. `then`
+ * and `and` join them. It plays at most `MAX_KIP_STEPS`, and stands between `KIP_SIZE` points tall.
+ */
+export const KIP_MOODS = ['wave', 'happy', 'celebrate', 'thinking', 'working', 'oops', 'sleepy', 'idle'] as const;
+const KIP_JOINS = new Set(['then', 'and']);
+export const MAX_KIP_STEPS = 6;
+export const KIP_SIZE = { min: 20, max: 160, given: 64 } as const;
+/** The problem with a Kip's `mood`, or its words as the app reads them (one string, the moods in turn). */
+export function kipMoodOf(value: unknown): string | { words: string } {
+  const said = `words from ${KIP_MOODS.join(', ')}, or a few in turn: mood="wave then idle" or mood={['thinking', 'celebrate']}`;
+  const parts = typeof value === 'string' ? [value] : Array.isArray(value) && value.every(v => typeof v === 'string') ? value as string[] : undefined;
+  if (!parts) return said;
+  const words = parts.flatMap(p => p.toLowerCase().split(/[^a-z]+/)).filter(w => w !== '' && !KIP_JOINS.has(w));
+  const unknown = words.find(w => !(KIP_MOODS as readonly string[]).includes(w));
+  if (unknown !== undefined) return `${said} (it does not know "${unknown.slice(0, 32)}")`;
+  if (words.length === 0) return said;
+  if (words.length > MAX_KIP_STEPS) return `at most ${MAX_KIP_STEPS} moods in turn (it has ${words.length})`;
+  return { words: words.join(' ') };
+}
 /** The most tabs a Tabs shows, rows a Menu lists, columns a Grid has, lines a Skeleton is, and points a Scroll is tall. */
 export const MAX_TABS = 20;
 export const MAX_ITEMS = 50;
@@ -438,13 +461,17 @@ const ELEMENT_RULES: Partial<Record<ElementName, Record<string, Rule>>> = {
   Image: { src: file, width: positive, height: positive, fit: oneOf(IMAGE_FITS), alt: label },
   Chip: { label, selected: flag },
   FileRef: { path: file, line: whole(1, Number.MAX_SAFE_INTEGER, 'a line') },
+  Kip: {
+    mood: v => { const m = kipMoodOf(v); return typeof m === 'string' ? m : undefined; },
+    size: numeral(n => n >= KIP_SIZE.min && n <= KIP_SIZE.max, `points from ${KIP_SIZE.min} to ${KIP_SIZE.max} (how tall Kip stands)`),
+  },
 };
 
 /** The elements that go to the app as exactly the props `elementWire` gives them: the controls, and every element of tier 3. */
 export const WIRED: ReadonlySet<string> = new Set([
   'Button', 'Toggle', 'Checkbox', 'Slider', 'NumberField', 'Input', 'TextArea', 'Select', 'Choice', 'Radio',
   'Grid', 'Stack', 'Layer', 'Wrap', 'Scroll', 'Split', 'Tabs', 'Accordion', 'Disclosure', 'Popover', 'Menu', 'Dialog', 'Sheet', 'Toast',
-  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef',
+  'Progress', 'Loading', 'Skeleton', 'Icon', 'Image', 'Chip', 'Tile', 'FileRef', 'Kip',
 ]);
 
 /** Two values the same as JSON says them (a tab's value against the selected one). */
@@ -650,6 +677,14 @@ export function elementWire(element: string, props: Record<string, unknown>, whe
       out.path = props.path;
       if (given('line')) out.line = num('line');
       break;
+    case 'Kip': {
+      // Waves when no mood is said; the rules checked the words, so this reads them once more as the app does.
+      const mood = given('mood') ? kipMoodOf(props.mood) : { words: 'wave' };
+      if (typeof mood === 'string') throw fail(`has mood ${JSON.stringify(props.mood).slice(0, 60)}`, mood);
+      out.mood = mood.words;
+      out.size = num('size') ?? KIP_SIZE.given;
+      break;
+    }
     default:
       throw new Error(`elementWire: <${element}> is not one of the elements sent exactly (WIRED)`);
   }

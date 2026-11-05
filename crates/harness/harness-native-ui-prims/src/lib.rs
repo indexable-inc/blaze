@@ -9,7 +9,10 @@ use harness_native_flecs::prelude::*;
 pub use harness_native_ui_layout::{Estimate, Measure, typeset};
 
 /// `(name, source)` of the scene scripts, in load order; load after `00-tokens`.
-pub const SCENES: &[(&str, &str)] = &[("06-prims", include_str!("../scene/prims.flecs"))];
+pub const SCENES: &[(&str, &str)] = &[
+    ("06-prims", include_str!("../scene/prims.flecs")),
+    ("07-kip", include_str!("../scene/kip.flecs")),
+];
 
 /// The gallery scene: one of each primitive. Loaded by the gallery test and by a dev command, never by the app's scene.
 pub const GALLERY: (&str, &str) = ("90-gallery", include_str!("../scene/gallery.flecs"));

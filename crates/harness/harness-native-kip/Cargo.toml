@@ -1,0 +1,10 @@
+[package]
+name = "harness-native-kip"
+description = "den's mascot Kip, ported whole: the voxel character (model, rig), its moods, springs, walks and hops on the host's frame clock, the acts a `<Kip mood=...>` asks for, and one frame's render inputs for harness-native-render's mascot pass"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
