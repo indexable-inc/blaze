@@ -69,9 +69,8 @@ pub fn started(pid: u32) -> std::io::Result<Option<u64>> {
     // bytes is a valid value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a live local of `size` bytes that the call writes and does not keep.
-    let got = unsafe {
-        libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
-    };
+    let got =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
     if got == size {
         return Ok(Some(info.pbi_start_tvsec.saturating_mul(1_000_000) + info.pbi_start_tvusec));
     }
@@ -81,7 +80,9 @@ pub fn started(pid: u32) -> std::io::Result<Option<u64>> {
         _ => Err(std::io::Error::new(
             error.kind(),
             // alloc: the error's message
-            format!("proc_pidinfo(PROC_PIDTBSDINFO) of pid {pid} gave {got} of {size} bytes: {error}"),
+            format!(
+                "proc_pidinfo(PROC_PIDTBSDINFO) of pid {pid} gave {got} of {size} bytes: {error}"
+            ),
         )),
     }
 }
@@ -123,7 +124,9 @@ pub fn readable_within(fd: std::os::fd::BorrowedFd<'_>, long: Duration) -> std::
 /// parent, has ended.
 #[cfg(target_os = "linux")]
 pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
-    use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    use blaze_core::wait::{self, Clock as _, Deadline, Monotonic, Waited};
     let Ok(pid) = libc::pid_t::try_from(pid) else { return Ok(true) };
     // SAFETY: pidfd_open takes a number and flags and reads no memory of this process; the
     // descriptor it gives is owned below.
@@ -134,7 +137,20 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     }
     // SAFETY: the descriptor just opened, which nothing else owns.
     let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
-    readable_within(fd.as_fd(), long)
+    // A pidfd is readable once its process has ended: a poll of it on this thread's wait ring.
+    let clock = Monotonic::new();
+    let deadline = Deadline::after(clock.now(), long);
+    match wait::pollable(
+        "a process to end (its pidfd)",
+        fd.as_raw_fd(),
+        libc::POLLIN,
+        Some(deadline),
+        &clock,
+    ) {
+        Ok(Waited::Ready(_)) => Ok(true),
+        Ok(Waited::Deadline) => Ok(false),
+        Err(error) => Err(std::io::Error::other(error)),
+    }
 }
 
 /// Waits at most `long` for the process `pid` to end, on the kernel's word that it did
@@ -197,7 +213,8 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     // SAFETY: `process` is an open handle that nothing else owns: `OpenProcess` just made it.
     let process = unsafe { OwnedHandle::from_raw_handle(process) };
     // Rounded up, and short of `INFINITE`: a wait of less than a millisecond left is one.
-    let ms = u32::try_from(long.as_micros().div_ceil(1000)).unwrap_or(INFINITE - 1).min(INFINITE - 1);
+    let ms =
+        u32::try_from(long.as_micros().div_ceil(1000)).unwrap_or(INFINITE - 1).min(INFINITE - 1);
     // SAFETY: the handle is open for as long as `process` lives, which outlives the call.
     match unsafe { WaitForSingleObject(process.as_raw_handle(), ms) } {
         WAIT_OBJECT_0 => Ok(true),
@@ -209,8 +226,21 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
 /// Waits for the child `pid` to exit without reaping it (`waitid` with `WNOWAIT`), so its
 /// `std::process::Child` still waits for it and its pid is no other process's until then: a
 /// test executable's exit, waited for apart from its output (`cli::live`). A `pid` that is no
-/// child of this process (one already reaped) is refused with `ECHILD`.
-#[cfg(unix)]
+/// child of this process (one already reaped) is refused with `ECHILD`. On Linux the wait is
+/// `IORING_OP_WAITID` on this thread's wait ring.
+#[cfg(target_os = "linux")]
+pub fn wait_exited(pid: u32) -> std::io::Result<()> {
+    let clock = blaze_core::wait::Monotonic::new();
+    let pid =
+        libc::pid_t::try_from(pid).map_err(|_| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+    match blaze_core::wait::exited("a test executable's exit", pid, None, &clock) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(std::io::Error::from(error)),
+    }
+}
+
+/// As on Linux, with a blocking `waitid`.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn wait_exited(pid: u32) -> std::io::Result<()> {
     loop {
         // SAFETY: `siginfo_t` is a C struct of integers and unions of them, for which all-zero

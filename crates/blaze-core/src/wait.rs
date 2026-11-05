@@ -15,14 +15,22 @@
 //! and the IO backends' one-shot waits, `uring_enter` (Linux), `kevent` (macOS), and
 //! `completions` and `signaled` (Windows). The raw calls of these waits appear nowhere else
 //! in blaze; `.clippy.toml` bans them outside this module.
+//!
+//! On Linux every other blocking wait is one request on the thread's own wait ring
+//! (`wait/ring.rs`, an io_uring per waiting thread, its deadline in a registered wait region):
+//! a [`Parker`]'s futex wait, a child's exit ([`exited`], and the wait of a reap), a poll of one
+//! descriptor ([`pollable`]) and a sleep ([`sleep_until`]). The park's protocol and the reap's
+//! are sans-IO cores (`wait/parking.rs`, `wait/reaping.rs`), proven by the DST in `wait/tests.rs`.
 
 use std::time::{Duration, Instant};
 
+mod parking;
+mod reaping;
 mod retry;
 
-pub use self::retry::{Clock, Deadline, Once, WaitError, Waited};
 #[cfg(test)]
 pub(crate) use self::retry::Plant;
+pub use self::retry::{Clock, Deadline, Once, WaitError, Waited};
 
 #[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "Linux's waits: io_uring_enter and clock_nanosleep, one call each")]
@@ -32,6 +40,12 @@ mod linux;
 mod macos;
 #[cfg(not(any(unix, windows)))]
 mod other;
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "a thread's wait ring: io_uring_setup, io_uring_enter, io_uring_register and its mappings"
+)]
+mod ring;
 #[cfg(unix)]
 #[expect(unsafe_code, reason = "poll of the caller's descriptors, one call")]
 mod unix;
@@ -115,4 +129,135 @@ pub fn until<T>(
     once: impl FnMut(Option<Duration>) -> std::io::Result<Once<T>>,
 ) -> Result<Waited<T>, WaitError> {
     retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once)
+}
+
+/// One thread's park, woken from any thread: a token, as std's `thread::park` is (an unpark
+/// before the park makes it return at once), with an absolute deadline on an injected clock.
+/// On Linux the park is `IORING_OP_FUTEX_WAIT` on the thread's wait ring and the unpark
+/// `IORING_OP_FUTEX_WAKE` on the waker's (a plain `FUTEX_WAKE` from a thread with no ring);
+/// elsewhere std's park, until those systems' address waits land. Only one thread parks on a
+/// `Parker`; nothing signals it.
+pub struct Parker {
+    word: std::sync::atomic::AtomicU32,
+    #[cfg(not(target_os = "linux"))]
+    thread: parking_lot::Mutex<Option<std::thread::Thread>>,
+}
+
+impl Parker {
+    pub fn new() -> Parker {
+        Parker {
+            word: std::sync::atomic::AtomicU32::new(parking::EMPTY),
+            #[cfg(not(target_os = "linux"))]
+            thread: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Parks the calling thread for `what` until an unpark (`Ready`) or `deadline` on `clock`
+    /// (`Deadline`; forever for `None`).
+    pub fn park(
+        &self,
+        what: &'static str,
+        deadline: Option<Deadline>,
+        clock: &impl Clock,
+    ) -> Result<Waited<()>, WaitError> {
+        parking::park(&self.word, &self.kernel(), what, deadline, clock, parking::ParkPlant::None)
+    }
+
+    /// Wakes its thread, or makes its next park return at once.
+    pub fn unpark(&self) {
+        parking::unpark(&self.word, &self.kernel());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kernel(&self) -> ring::Futexes {
+        ring::Futexes
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn kernel(&self) -> ThreadPark<'_> {
+        ThreadPark(&self.thread)
+    }
+}
+
+impl Default for Parker {
+    fn default() -> Parker {
+        Parker::new()
+    }
+}
+
+/// The park of a system with no wait of this module on an address yet: std's thread park,
+/// the thread recorded before it says it is parked.
+#[cfg(not(target_os = "linux"))]
+struct ThreadPark<'a>(&'a parking_lot::Mutex<Option<std::thread::Thread>>);
+
+#[cfg(not(target_os = "linux"))]
+impl parking::Futex for ThreadPark<'_> {
+    fn prepare(&self, _: &std::sync::atomic::AtomicU32) {
+        *self.0.lock() = Some(std::thread::current());
+    }
+
+    fn wait<C: Clock>(
+        &self,
+        what: &'static str,
+        word: &std::sync::atomic::AtomicU32,
+        expected: u32,
+        deadline: Option<Deadline>,
+        clock: &C,
+    ) -> Result<Waited<()>, WaitError> {
+        until(what, clock, deadline, |left| {
+            if word.load(std::sync::atomic::Ordering::Acquire) != expected {
+                return Ok(Once::Ready(()));
+            }
+            match left {
+                Some(left) => std::thread::park_timeout(left),
+                None => std::thread::park(),
+            }
+            Ok(Once::Ready(()))
+        })
+    }
+
+    fn wake(&self, _: &std::sync::atomic::AtomicU32) {
+        if let Some(thread) = self.0.lock().as_ref() {
+            thread.unpark();
+        }
+    }
+}
+
+/// Waits until the child `pid` has exited, by `deadline` on `clock` (forever for `None`),
+/// leaving it unreaped: `IORING_OP_WAITID` with `WEXITED | WNOWAIT` on this thread's wait ring.
+/// A pid that is no child of this process (or one reaped already) fails with `ECHILD`.
+#[cfg(target_os = "linux")]
+pub fn exited(
+    what: &'static str,
+    pid: libc::pid_t,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    use reaping::Children as _;
+    ring::Kids.exited(what, pid, true, deadline, clock)
+}
+
+/// Reaps the child `pid` once it has exited, by `deadline` on `clock`: its status and what it
+/// used. The wait is [`exited`]'s, then one `wait4(WNOHANG)`.
+#[cfg(target_os = "linux")]
+pub(crate) fn reap(
+    what: &'static str,
+    pid: libc::pid_t,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<(libc::c_int, libc::rusage)>, WaitError> {
+    reaping::reap(what, &ring::Kids, pid, deadline, clock, reaping::ReapPlant::None)
+}
+
+/// Waits until `fd` is ready for `events` (`POLLIN`, `POLLPRI`, ...), by `deadline` on `clock`
+/// (forever for `None`): its `revents`. One `IORING_OP_POLL_ADD` on this thread's wait ring.
+#[cfg(target_os = "linux")]
+pub fn pollable(
+    what: &'static str,
+    fd: std::os::fd::RawFd,
+    events: libc::c_short,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<libc::c_short>, WaitError> {
+    ring::poll(what, fd, events, deadline, clock)
 }
