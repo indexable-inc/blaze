@@ -77,10 +77,16 @@ jobs:
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # The script alone: the job decides in seconds, before a whole checkout.
+      # The script alone: the job decides in seconds, before a whole checkout. The two flecs
+      # manifests are for the pin check below.
       - uses: actions/checkout@v7
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            vendor/flecs-c
+            crates/harness/vendor/hyperion-flecs-c
+      # blaze and harness build one flecs: the same indexable-inc/flecs rev in both manifests.
+      - run: python3 .github/scripts/flecs_pin.py
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}

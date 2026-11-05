@@ -102,6 +102,20 @@ def key_of(pkg_id: str) -> str:
     return f"{src.rstrip('/').rsplit('/', 1)[-1].split('?')[0]}@{frag}"
 
 
+def git_source(key: str, source: str, mdir: Path) -> dict:
+    """A git dependency pinned by rev (`git+<url>?rev=<rev>#<commit>`): the repository, the commit
+    and the package's directory in it. units.nix fetches it with builtins.fetchGit. The directory
+    is the manifest's below cargo's checkout, whose root cargo marks with `.cargo-ok`."""
+    url, _, commit = source.removeprefix("git+").partition("#")
+    url, _, query = url.partition("?")
+    if not query.startswith("rev=") or len(commit) != 40:
+        raise StepError(f"step 'nix': git dependency {key} is not pinned by rev ({source})")
+    root = next((d for d in [mdir, *mdir.parents] if (d / ".cargo-ok").is_file()), None)
+    if root is None:
+        raise StepError(f"step 'nix': no cargo checkout (.cargo-ok) above {mdir} for {key}")
+    return {"kind": "git", "url": url, "rev": commit, "dir": str(mdir.relative_to(root))}
+
+
 def build_packages(meta: dict, project_dir: Path) -> dict[str, dict]:
     lock = tomllib.loads((project_dir / "Cargo.lock").read_text())
     checksums = {(p["name"], p["version"]): p.get("checksum") for p in lock["package"]}
@@ -116,8 +130,10 @@ def build_packages(meta: dict, project_dir: Path) -> dict[str, dict]:
             source = {"kind": "registry", "checksum": cks}
         elif p["source"] is None:
             source = {"kind": "path", "dir": str(mdir.relative_to(ROOT))}
+        elif p["source"].startswith("git+"):
+            source = git_source(key, p["source"], mdir)
         else:
-            raise StepError(f"step 'nix': unsupported source {p['source']} for {key} (only registry and path)")
+            raise StepError(f"step 'nix': unsupported source {p['source']} for {key} (only registry, path and git)")
         packages[key] = {
             "name": p["name"], "version": p["version"], "source": source, "links": p.get("links"),
             "authors": ":".join(p["authors"]), "description": p["description"] or "",
