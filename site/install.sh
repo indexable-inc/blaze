@@ -295,6 +295,14 @@ for program in "$unpacked"/*; do
         put "$program" "$(basename "$program")"
     fi
 done
+# The explorer core the daemon serves the page, read from beside its binary (a release before
+# 2026-11 has none, and its daemon reads none).
+if [ -f "$unpacked/explore-core.wasm" ]; then
+    step "installing explore-core.wasm"
+    cp "$unpacked/explore-core.wasm" "$bin/.explore-core.wasm.blaze-new"
+    chmod 644 "$bin/.explore-core.wasm.blaze-new"
+    mv -f "$bin/.explore-core.wasm.blaze-new" "$bin/explore-core.wasm"
+fi
 
 # blaze's updates (docs/install.md, "Updates"): the blaze installed last runs, so a default an
 # earlier `blaze update` installed goes; and a canary install has `blaze update` follow canary,

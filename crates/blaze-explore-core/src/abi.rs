@@ -38,6 +38,14 @@ use crate::{
 /// This ABI's version: the exports, their signatures and meaning, and the views' shapes.
 pub const ABI: u32 = 1;
 
+/// [`ABI`] in the module's custom section `ix.explore.abi`, four bytes little-endian, so the
+/// program serving the core (`ix_prof::explore::wasm::SECTION`) says it in `hello` without
+/// running the module. Only the wasm build has it: the section's name is no Mach-O or ELF one.
+#[cfg(target_arch = "wasm32")]
+#[used]
+#[unsafe(link_section = "ix.explore.abi")]
+static ABI_SECTION: [u8; 4] = ABI.to_le_bytes();
+
 pub const OK: i32 = 0;
 pub const ERROR: i32 = 1;
 pub const NO_HANDLE: i32 = 2;
@@ -221,7 +229,7 @@ pub extern "C" fn explore_view(handle: u32, which: u32, now_ns: i64) -> i32 {
     with_core(|core| {
         let Core { sessions, out, .. } = &mut *core;
         out.clear();
-        let result = match (sessions.get(&handle), Which::from_u32(which)) {
+        let result = match (sessions.get_mut(&handle), Which::from_u32(which)) {
             // alloc: an error's text
             (None, _) => Err((NO_HANDLE, format!("explore_view: no session has handle {handle}"))),
             (Some(_), None) => Err((

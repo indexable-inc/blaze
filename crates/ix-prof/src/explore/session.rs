@@ -28,6 +28,7 @@ use super::{
     PROTOCOL, frame,
     link::Token,
     source::{Answer, Hello, Kind, OpError, Rule, Tick},
+    wasm::CoreWasm,
 };
 
 /// Requests one session may have in flight.
@@ -95,6 +96,8 @@ pub enum Step {
     Hello { first: bool },
     /// Op `name`, which the source answers ([`super::Source::op`]), `args` the request whole.
     Op { name: String, args: Value },
+    /// `core`: answer [`core_bytes`], the explorer core the server serves.
+    Core,
     /// Answer the error; the session goes on.
     Refuse(OpError),
     /// Answer the error, then close the session with `code`.
@@ -143,6 +146,7 @@ impl Session {
             return self.hello(token, &value);
         }
         match self.phase {
+            Phase::Open if op == "core" => Step::Core,
             Phase::Open => Step::Op { name: op, args: value },
             Phase::Hello => Step::Refuse(OpError::new(
                 Kind::Unauthenticated,
@@ -257,7 +261,12 @@ pub struct Served {
 
 /// The header of `hello`: the source's fields, the certificate served, the live stream's
 /// period, and the core's `protocol` beside the source's `layers`.
-pub fn hello_header(hello: &Hello, served: &Served, live_every: Duration) -> Map<String, Value> {
+pub fn hello_header(
+    hello: &Hello,
+    served: &Served,
+    live_every: Duration,
+    core: Option<&CoreWasm>,
+) -> Map<String, Value> {
     let mut source = Map::new();
     // alloc: once a session
     source.insert("kind".to_owned(), hello.kind.into());
@@ -289,7 +298,44 @@ pub fn hello_header(hello: &Hello, served: &Served, live_every: Duration) -> Map
         ("layers", layers),
     ];
     // alloc: once a session
-    header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect()
+    let mut header: Map<String, Value> =
+        header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
+    if let Some(core) = core {
+        // alloc: once a session
+        header.insert("core".to_owned(), core_header(core).into());
+    }
+    header
+}
+
+/// What `hello` and the `core` answer say of a core: its ABI, the hex SHA-256 of its bytes and
+/// how many there are.
+fn core_header(core: &CoreWasm) -> Map<String, Value> {
+    let fields = [
+        ("abi", Value::from(core.abi)),
+        ("sha256", core.sha256.as_str().into()),
+        ("bytes", core.bytes.len().into()),
+    ];
+    // alloc: once a session, or a `core` answer
+    fields.into_iter().map(|(key, value)| (key.to_owned(), value)).collect()
+}
+
+/// The `core` answer's bytes: a header naming the core (`op`, `abi`, `sha256`, `bytes`), then
+/// the module's raw bytes (not Arrow), starting [`frame::ALIGN`]-aligned; or, for a server with
+/// no core, the error `no_core` saying why (where the server looked and how to make one).
+pub fn core_bytes(core: &Result<CoreWasm, String>) -> Vec<u8> {
+    let core = match core {
+        Ok(core) => core,
+        // clone: an error path
+        Err(why) => return error_bytes(&OpError::new(Kind::NoCore, why.clone()).with("op", "core")),
+    };
+    let mut header = core_header(core);
+    // alloc: once a `core` answer
+    header.insert("op".to_owned(), "core".into());
+    // alloc: once a `core` answer, the bytes the driver writes
+    let mut out = Vec::with_capacity(core.bytes.len() + 256);
+    head(&mut out, &header);
+    out.extend_from_slice(&core.bytes);
+    out
 }
 
 /// What a tick sends of one table.
@@ -299,8 +345,8 @@ pub enum Emit {
     /// A frame with its rows and IPC.
     Rows,
     /// A frame of `rows: 0` and no IPC: a [`Rule::Replace`] set the page shows emptied. The page
-    /// replaces the last set, so it needs the empty one once; an [`Rule::Append`] table never
-    /// needs it.
+    /// replaces the last set, so it needs the empty one once; an [`Rule::Append`] or
+    /// [`Rule::Upsert`] table never needs it.
     Cleared,
 }
 
@@ -404,10 +450,15 @@ pub fn error_bytes(error: &OpError) -> Vec<u8> {
 }
 
 /// The `hello` answer's bytes.
-pub fn hello_bytes(hello: &Hello, served: &Served, live_every: Duration) -> Vec<u8> {
+pub fn hello_bytes(
+    hello: &Hello,
+    served: &Served,
+    live_every: Duration,
+    core: Option<&CoreWasm>,
+) -> Vec<u8> {
     // alloc: once a session
     let mut out = Vec::new();
-    head(&mut out, &hello_header(hello, served, live_every));
+    head(&mut out, &hello_header(hello, served, live_every, core));
     out
 }
 

@@ -78,6 +78,11 @@ pub enum Rule {
     /// Each frame's rows are the whole set, replacing the last (`open`): the session sends an
     /// emptied set once, as a frame of no rows.
     Replace,
+    /// Each frame's rows replace the page's rows of the same key, whole, and add the others
+    /// (`tasks`, by process and task): a frame carries only the rows that changed, and the page
+    /// evicts a row by the table's own rule (a settled task 60 s after its `end_ns`, on the
+    /// source's `at_ns`), so an empty frame is never sent.
+    Upsert,
 }
 
 /// One tick of a session's live feed: each table's next bytes of its Arrow IPC stream for the
@@ -196,6 +201,9 @@ pub enum Kind {
     Encode,
     /// The page stopped the request before it was answered.
     Cancelled,
+    /// `core`: the server serves no explorer core; the message says where it looked and how to
+    /// make one.
+    NoCore,
 }
 
 impl Kind {
@@ -208,6 +216,7 @@ impl Kind {
             Kind::Overloaded => "overloaded",
             Kind::Encode => "encode",
             Kind::Cancelled => "cancelled",
+            Kind::NoCore => "no_core",
         }
     }
 }

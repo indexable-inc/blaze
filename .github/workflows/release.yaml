@@ -133,6 +133,15 @@ jobs:
             '{"target": "${{ matrix.target }}", "out": "shipped", "pgo": "off"}'
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
+      # The explorer core (docs/v2/plan/observe/explore-core.md, decision 3): the page's state
+      # and views as wasm, built by the same stage 0 and shipped beside the binary as
+      # `explore-core.wasm`, where the daemon reads it to serve the page (`hello`'s `core`, the
+      # `core` op). One module for every target: it is wasm.
+      - name: blaze build -p blaze-explore-core --target wasm32-unknown-unknown
+        run: |
+          blaze build --release --locked -p blaze-explore-core --target wasm32-unknown-unknown
+          cp target/wasm32-unknown-unknown/release/blaze_explore_core.wasm shipped/explore-core.wasm
+          blaze stop
       - name: Archive
         run: |
           mkdir "$NAME"

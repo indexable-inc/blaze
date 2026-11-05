@@ -9,13 +9,17 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use blaze_protocol::cbor;
+use blaze_protocol::{
+    cbor,
+    now::{self, Phase, Pressure},
+};
 use blaze_serde::{Deserialize, Serialize};
 
 use crate::{
     Error,
     live::OpenRow,
     state::{BLAZE, Busy, Session, elapsed},
+    tasks::Tasks,
 };
 
 /// How long nothing may close while workers are busy before the headline says it is slow:
@@ -57,7 +61,9 @@ impl Which {
     }
 }
 
-/// Running now: which workers are busy, on what, for how long.
+/// Running now: which workers are busy, on what, for how long; and, from the one model of the
+/// moment (`blaze_protocol::now::Now`), the phase, the tasks' tally, what holds the rest back,
+/// the downloads, the memory and whether it is slow or stalled.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RunningNow {
     pub at_ns: String,
@@ -77,6 +83,105 @@ pub struct RunningNow {
     pub internal: Vec<ThreadRow>,
     pub quiet_ms: Option<u64>,
     pub quiet_text: Option<String>,
+    /// The phase's word (`compiling`, `linking`); `running` for a program with no tasks.
+    pub phase: String,
+    /// What the source says its stage waits on, or empty.
+    pub stage: String,
+    pub tally: TallyLine,
+    /// The unfinished tasks whose needs are all done, the one holding most back first.
+    pub blockers: Vec<BlockerRow>,
+    /// Every download in flight, oldest first.
+    pub downloads: Vec<DownloadRow>,
+    pub memory: MemoryLine,
+    /// The settled tasks that ran longest, longest first.
+    pub slowest: Vec<TookRow>,
+    /// Nothing settled, got a byte or closed for 10 s while a worker is busy or a download runs.
+    pub slow: bool,
+    /// Nothing moved for 10 s, no worker busy and no download in flight.
+    pub stalled: bool,
+    /// Since a task settled, a download got a byte or a span closed.
+    pub still_ms: u64,
+    pub still_text: String,
+}
+
+/// A task as a view names it: its ids as the source said them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TaskLine {
+    /// The source's process and task ids; `None` for a task that has left the live set.
+    pub process: Option<String>,
+    pub task: Option<String>,
+    pub kind: String,
+    pub name: String,
+}
+
+/// How many tasks are where.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TallyLine {
+    pub waiting: u64,
+    pub ready: u64,
+    pub running: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub total: u64,
+    /// `12 of 40 done · 3 running · 5 ready · 20 waiting`, and ` · 1 failed` when any did.
+    pub text: String,
+}
+
+/// An unfinished task whose needs are done, and what waits on it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BlockerRow {
+    pub task: TaskLine,
+    /// Running on a worker; otherwise ready and waiting for one.
+    pub running: bool,
+    /// Since it began running (the source's `start_ns`), or since it became ready.
+    pub for_ms: u64,
+    pub for_text: String,
+    /// The innermost span of the worker running it: `typeck_query app::main`.
+    pub doing: Option<String>,
+    /// Unfinished tasks waiting on it, directly or not.
+    pub holds: u64,
+    /// The longest path of unfinished tasks behind it.
+    pub chain: u64,
+    /// The first few waiting on it directly, by name.
+    pub behind: Vec<String>,
+    /// `serde (codegen) · running 4.2s · holds 12, chain 3`.
+    pub line: String,
+}
+
+/// A download in flight.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DownloadRow {
+    pub what: String,
+    pub done: u64,
+    pub total: Option<u64>,
+    /// Bytes a second over the last few seconds, once there are two samples.
+    pub rate: Option<u64>,
+    pub idle_ms: u64,
+    pub elapsed_ms: u64,
+    pub eta_ms: Option<u64>,
+    /// `serde-1.0.219.crate 1.2 MiB of 3.4 MiB · 800 KiB/s`.
+    pub text: String,
+}
+
+/// The memory the program holds.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLine {
+    pub held: u64,
+    pub peak: u64,
+    /// The ceiling it runs under; 0 for none known.
+    pub limit: u64,
+    /// `calm`, `rising`, `squeezed`, `over`.
+    pub pressure: String,
+    /// `holds 3.2 GiB, peak 4.0 GiB`, and ` of 16.0 GiB` with a ceiling.
+    pub text: String,
+}
+
+/// A settled task and how long it ran.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TookRow {
+    pub task: TaskLine,
+    pub ms: u64,
+    pub text: String,
 }
 
 /// A thread inside spans.
@@ -96,6 +201,8 @@ pub struct ThreadRow {
     pub for_text: String,
     /// Its open spans, outermost first, the innermost last.
     pub stack: Vec<SpanLine>,
+    /// The task its innermost span carries (`open.task`), for a worker on one.
+    pub task: Option<TaskLine>,
 }
 
 /// An open span of a thread's chain.
@@ -182,7 +289,7 @@ pub struct SessionView {
     pub lost: u64,
     pub other_frames: u64,
     pub refused: u64,
-    /// Streams begun of `open`, `spans` and `counters`.
+    /// Streams begun of `open`, `spans`, `counters`, `tasks` and `task_edges`.
     pub streams: Vec<u64>,
     /// The last tick the daemon could not encode: `kind: message`.
     pub refusal: Option<String>,
@@ -191,7 +298,12 @@ pub struct SessionView {
 }
 
 /// `which` at `now_ns` into `out` (cleared first) as one deterministic CBOR item.
-pub fn render(session: &Session, which: Which, now_ns: i64, out: &mut Vec<u8>) -> Result<(), Error> {
+pub fn render(
+    session: &mut Session,
+    which: Which,
+    now_ns: i64,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
     out.clear();
     let encoded = match which {
         Which::RunningNow => cbor::append(out, &running_now(session, now_ns)?),
@@ -222,6 +334,62 @@ pub fn duration_text(ms: u64) -> String {
 fn decimal(n: impl std::fmt::Display) -> String {
     // alloc: a view's text
     n.to_string()
+}
+
+/// A byte count for people, integer arithmetic only: `840 B`, `1.2 KiB`, `3.4 MiB`, `2.0 GiB`.
+pub fn bytes_text(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        // alloc: a view's text
+        return format!("{bytes} B");
+    }
+    let mut scale = 1024u64;
+    let mut unit = UNITS[0];
+    for (at, name) in UNITS.iter().enumerate().skip(1) {
+        let next = 1u64 << (10 * (at + 1));
+        if bytes < next {
+            break;
+        }
+        (scale, unit) = (next, name);
+    }
+    // alloc: a view's text
+    format!("{}.{} {unit}", bytes / scale, bytes % scale * 10 / scale)
+}
+
+/// The word of a memory's pressure.
+fn pressure_word(pressure: Pressure) -> &'static str {
+    match pressure {
+        Pressure::Calm => "calm",
+        Pressure::Rising => "rising",
+        Pressure::Squeezed => "squeezed",
+        Pressure::Over => "over",
+    }
+}
+
+/// The fold's task `task` as the source names it.
+fn task_line(tasks: &Tasks, task: &now::Task) -> TaskLine {
+    let key = tasks.key(task.id);
+    TaskLine {
+        process: key.map(|(process, _)| decimal(process)),
+        task: key.map(|(_, task)| decimal(task)),
+        // clone: a view's text
+        kind: task.kind.clone(),
+        name: task.name.clone(),
+    }
+}
+
+/// A span of the model as a label: its name, then its item or what it waits on.
+fn span_label(span: &now::Span) -> String {
+    // clone: a view's text
+    let mut out = span.name.clone();
+    if let Some(awaits) = &span.awaits {
+        out.push_str(" on ");
+        out.push_str(awaits);
+    } else if let Some(item) = span.item.as_deref().filter(|it| *it != span.name) {
+        out.push(' ');
+        out.push_str(item);
+    }
+    out
 }
 
 /// A crate's text's first word: `serde` of `serde v1.0.219 (lib)`.
@@ -330,11 +498,107 @@ fn thread_row(busy: &Busy<'_>, now: i64) -> ThreadRow {
         for_text: duration_text(for_ms),
         // alloc: a view's rows
         stack: busy.chain.iter().map(|it| line(it, now)).collect(),
+        task: None,
     }
 }
 
-pub fn running_now(session: &Session, now_ns: i64) -> Result<RunningNow, Error> {
+fn tally_line(tally: &now::Tally) -> TallyLine {
+    // alloc: a view's text
+    let mut text = format!(
+        "{} of {} done · {} running · {} ready · {} waiting",
+        tally.done, tally.total, tally.running, tally.ready, tally.waiting
+    );
+    if tally.failed > 0 {
+        text.push_str(&format!(" · {} failed", tally.failed));
+    }
+    TallyLine {
+        waiting: u64::from(tally.waiting),
+        ready: u64::from(tally.ready),
+        running: u64::from(tally.running),
+        done: u64::from(tally.done),
+        failed: u64::from(tally.failed),
+        total: u64::from(tally.total),
+        text,
+    }
+}
+
+fn blocker_row(tasks: &Tasks, blocker: &now::Blocker, now: i64) -> BlockerRow {
+    let task = task_line(tasks, &blocker.task);
+    let started = tasks.key(blocker.task.id).and_then(|key| tasks.row(key)).and_then(|it| it.start_ns);
+    let for_ms = match (blocker.running, started) {
+        (true, Some(start)) => ms(elapsed(now, start)),
+        _ => blocker.for_ms,
+    };
+    let for_text = duration_text(for_ms);
+    // alloc: a view's text
+    let line = format!(
+        "{} ({}) · {} {for_text} · holds {}, chain {}",
+        task.name,
+        task.kind,
+        if blocker.running { "running" } else { "ready" },
+        blocker.holds,
+        blocker.chain
+    );
+    BlockerRow {
+        task,
+        running: blocker.running,
+        for_ms,
+        for_text,
+        doing: blocker.span.as_ref().map(span_label),
+        holds: u64::from(blocker.holds),
+        chain: u64::from(blocker.chain),
+        // clone: a view's rows
+        behind: blocker.behind.clone(),
+        line,
+    }
+}
+
+fn download_row(download: &now::Download) -> DownloadRow {
+    // alloc: a view's text
+    let mut text = format!("{} {}", download.what, bytes_text(download.done));
+    if let Some(total) = download.total {
+        text.push_str(" of ");
+        text.push_str(&bytes_text(total));
+    }
+    if let Some(rate) = download.rate {
+        text.push_str(" · ");
+        text.push_str(&bytes_text(rate));
+        text.push_str("/s");
+    }
+    DownloadRow {
+        // clone: a view's text
+        what: download.what.clone(),
+        done: download.done,
+        total: download.total,
+        rate: download.rate,
+        idle_ms: download.idle_ms,
+        elapsed_ms: download.elapsed_ms,
+        eta_ms: download.eta_ms(),
+        text,
+    }
+}
+
+fn memory_line(memory: &now::Memory) -> MemoryLine {
+    // alloc: a view's text
+    let mut text = format!("holds {}, peak {}", bytes_text(memory.held), bytes_text(memory.peak));
+    if memory.limit > 0 {
+        text.push_str(" of ");
+        text.push_str(&bytes_text(memory.limit));
+    }
+    MemoryLine {
+        held: memory.held,
+        peak: memory.peak,
+        limit: memory.limit,
+        // alloc: a view's text
+        pressure: pressure_word(memory.pressure()).to_owned(),
+        text,
+    }
+}
+
+pub fn running_now(session: &mut Session, now_ns: i64) -> Result<RunningNow, Error> {
+    let model = session.look(now_ns)?;
     let running = session.running(now_ns)?;
+    let tasks = session.tasks();
     let busy_count = running.busy.len() as u64;
     let quiet_ms = running.quiet_ns.map(ms);
     // alloc: a view's text
@@ -352,21 +616,57 @@ pub fn running_now(session: &Session, now_ns: i64) -> Result<RunningNow, Error> 
         1 => if running.layered { "1 idle worker".to_owned() } else { "1 idle thread".to_owned() },
         n => format!("{n} idle {}", if running.layered { "workers" } else { "threads" }),
     };
+    let now = running.now_ns;
+    let busy = running
+        .busy
+        .iter()
+        .map(|it| {
+            let mut row = thread_row(it, now);
+            row.task = model
+                .busy
+                .iter()
+                .find(|busy| busy.thread == row.key)
+                .and_then(|busy| busy.task.as_ref())
+                .map(|task| task_line(tasks, task));
+            row
+        })
+        // alloc: a view's rows
+        .collect();
+    let phase = if tasks.any() { model.phase } else { Phase::Running };
     Ok(RunningNow {
         at_ns: decimal(running.at_ns),
-        now_ns: decimal(running.now_ns),
+        now_ns: decimal(now),
         headline,
         layered: running.layered,
         workers: running.workers,
         busy_count,
         idle: running.idle,
         idle_line,
+        busy,
         // alloc: a view's rows
-        busy: running.busy.iter().map(|it| thread_row(it, running.now_ns)).collect(),
-        // alloc: a view's rows
-        internal: running.internal.iter().map(|it| thread_row(it, running.now_ns)).collect(),
+        internal: running.internal.iter().map(|it| thread_row(it, now)).collect(),
         quiet_ms,
         quiet_text: quiet_ms.map(duration_text),
+        // alloc: a view's text
+        phase: phase.word().to_owned(),
+        // clone: a view's text
+        stage: model.stage.clone(),
+        tally: tally_line(&model.tally),
+        // alloc: a view's rows
+        blockers: model.blockers.iter().map(|it| blocker_row(tasks, it, now)).collect(),
+        // alloc: a view's rows
+        downloads: model.downloads.iter().map(download_row).collect(),
+        memory: memory_line(&model.memory),
+        slowest: model
+            .slowest
+            .iter()
+            .map(|it| TookRow { task: task_line(tasks, &it.task), ms: it.ms, text: duration_text(it.ms) })
+            // alloc: a view's rows
+            .collect(),
+        slow: model.slow(),
+        stalled: model.stalled(),
+        still_ms: model.quiet_ms,
+        still_text: duration_text(model.quiet_ms),
     })
 }
 

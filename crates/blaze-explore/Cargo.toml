@@ -20,9 +20,15 @@ test = false
 
 [dependencies]
 arrow-array.workspace = true
+arrow-ipc.workspace = true
 arrow-schema.workspace = true
+# The downloads in flight, which are tasks of the live feed.
+blaze-fetch.workspace = true
 blaze-hash.workspace = true
 blaze-profile.workspace = true
+# The plane's records as tasks (`now::Records`), one conversion with the build's live model.
+blaze-protocol.workspace = true
+parking_lot.workspace = true
 blaze-serde.workspace = true
 blaze-web.workspace = true
 # The explorer's server, which serves this crate's source.

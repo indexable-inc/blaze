@@ -211,7 +211,7 @@ fn an_emptied_replace_set_is_sent_once_as_no_rows() {
 #[test]
 fn hello_says_the_source_the_certificate_the_protocol_and_the_layers() {
     let served = Served { hash: "h".to_owned(), not_after_s: 99 };
-    let header = session::hello_header(&hello(), &served, Duration::from_millis(250));
+    let header = session::hello_header(&hello(), &served, Duration::from_millis(250), None);
     let header = Value::Object(header);
     assert_eq!(header["op"], "hello");
     assert_eq!(header["daemon"], "test 0.1");
@@ -226,6 +226,48 @@ fn hello_says_the_source_the_certificate_the_protocol_and_the_layers() {
     assert_eq!(header["protocol"], 1, "the first protocol");
     assert_eq!(header["layers"], serde_json::json!([{"name": "test", "version": 3}]));
     assert_eq!(header.as_object().unwrap().len(), 11, "{header}");
+}
+
+/// A wasm module holding only the core's ABI section, `abi`.
+fn core_module(abi: u32) -> Vec<u8> {
+    let name = super::wasm::SECTION.as_bytes();
+    let mut out = vec![0, b'a', b's', b'm', 1, 0, 0, 0, 0];
+    out.push(u8::try_from(1 + name.len() + 4).unwrap());
+    out.push(u8::try_from(name.len()).unwrap());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&abi.to_le_bytes());
+    out
+}
+
+#[test]
+fn hello_names_the_core_served_and_the_core_op_answers_its_bytes_after_an_aligned_header() {
+    let bytes = core_module(1);
+    let core = super::CoreWasm::new(bytes.clone(), "core.wasm").unwrap();
+    let served = Served { hash: "h".to_owned(), not_after_s: 99 };
+    let header = session::hello_header(&hello(), &served, Duration::from_millis(250), Some(&core));
+    let header = Value::Object(header);
+    let said = serde_json::json!({"abi": 1, "sha256": core.sha256, "bytes": bytes.len()});
+    assert_eq!(header["core"], said);
+    assert_eq!(header.as_object().unwrap().len(), 12, "{header}");
+
+    let answer = session::core_bytes(&Ok(core.clone()));
+    let len = u32::from_le_bytes(answer[..4].try_into().unwrap()) as usize;
+    assert_eq!((4 + len) % frame::ALIGN, 0, "the module starts 8-aligned");
+    let header: Value = serde_json::from_slice(&answer[4..4 + len]).unwrap();
+    assert_eq!(header["op"], "core");
+    assert_eq!(header["sha256"], core.sha256.as_str());
+    assert_eq!(&answer[4 + len..], &bytes[..], "the raw module follows its header");
+
+    let none = session::core_bytes(&Err("no core at /x/explore-core.wasm".to_owned()));
+    let header: Value = serde_json::from_slice(&none[4..]).unwrap();
+    assert_eq!(header["error"]["kind"], "no_core");
+    assert_eq!(header["error"]["message"], "no core at /x/explore-core.wasm");
+
+    let token = Token::random();
+    let mut session = Session::new("test explore");
+    let hello = format!(r#"{{"op":"hello","token":"{}"}}"#, token.as_str());
+    assert_eq!(session.request(&token, hello.as_bytes()), Step::Hello { first: true });
+    assert_eq!(session.request(&token, br#"{"op":"core"}"#), Step::Core);
 }
 
 #[test]
@@ -275,6 +317,7 @@ fn explorer(dev_origin: bool) -> Explorer {
         dev_origin,
         name: "test explore",
         every: Duration::from_millis(250),
+        core: Err("the test serves no core".to_owned()),
     })
     .unwrap()
 }

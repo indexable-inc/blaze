@@ -20,8 +20,8 @@ use std::alloc::Global;
 
 use crate::{
     flight::{
-        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, Read, SpanRow, SwitchRow,
-        ThreadNow, WaitedOn,
+        self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, OpenSpan, Read, SpanRow,
+        SwitchRow, ThreadNow, WaitedOn,
     },
     sampler::Sample,
     schema::{self, Table},
@@ -264,8 +264,21 @@ pub fn open(
         column(StringArray::from_iter(spans().map(|(_, (_, span))| span.awaits.as_deref()))),
         column(UInt64Array::from_iter(spans().map(|(_, (_, span))| span.owner))),
         column(Int64Array::from_value(at_ns, rows)),
+        column(UInt64Array::from_iter(threads.iter().flat_map(|thread| nearest_tasks(&thread.open)))),
     ];
     RecordBatch::try_new(schema_of(&schema::OPEN), columns)
+}
+
+/// Each of a thread's open spans' `task` (outermost first): the nearest task among the span
+/// and its ancestors, a daemon `task` span's plane request `<< 32 |` its node. A span of no
+/// build (`build` 0) carries none.
+fn nearest_tasks(open: &[OpenSpan]) -> impl Iterator<Item = Option<u64>> + '_ {
+    open.iter().scan(None, |nearest, span| {
+        if let (build @ 1.., Some(node)) = (span.build, span.node) {
+            *nearest = Some(u64::from(build) << 32 | (node & u64::from(u32::MAX)));
+        }
+        Some(*nearest)
+    })
 }
 
 /// The `samples` rows of `samples`, each frame named by `frames` (the frames of every address

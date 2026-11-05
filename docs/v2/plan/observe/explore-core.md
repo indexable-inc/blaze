@@ -115,8 +115,16 @@ to do something the page does not offer right there.
 1. The TS fixes ship first, alone: ids exact in the TS client, errors that name the message
    and field, the inline build picker (indexable-inc/ix).
 2. This plan; `Fold`'s generic task input and `u64` ids, agreed with lane tui-redesign.
-3. `blaze-explore-core`: the wire and the live state, built for wasm32 by blaze; the daemon's
-   source publishes `tasks` and `task_edges` from the plane (explore-generic.md step 5).
-4. The release ships the core; `hello` names it; the `core` op serves it.
+3. Done. `blaze-explore-core`: the wire and the live state, built for wasm32 by blaze; the
+   daemon's source publishes `tasks` (upserted whole, `Rule::Upsert`) and `task_edges` from the
+   plane (explore-generic.md step 5): the plane's one record conversion (`now::Records`) feeds
+   both its fold and `blaze_explore::Tasks`; a task is `request<<32|node`, downloads are tasks of
+   kind `download` with bytes as progress, and `open` gained `task`. The core folds those rows
+   through `now::Fold`, and Running now (phase, tally, blockers, downloads with rate, memory,
+   slow and stalled, busy rows with their task and stack) comes from its `Now`.
+4. Done. The release ships the core (`explore-core.wasm` in each archive, beside `blaze`, which
+   reads it from there); `hello` names it (`core: {abi, sha256, bytes}`, the ABI from the
+   module's `ix.explore.abi` section); the `core` op answers a header and the bytes. A missing
+   core is an error naming the path and the build command, answered to `core`.
 5. The page loads the core and draws Running now and Graph from it.
 6. The trace in the core; Trace, Builds, SQL and Views redone around their questions.

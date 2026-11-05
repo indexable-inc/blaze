@@ -844,6 +844,10 @@ pub struct Observe {
     history_gone: bool,
     /// A daemon with no history explains its builds on the loop (a simulation's).
     local: Option<Ledger>,
+    /// The plane's tasks as the explorer publishes them: the plane writes them
+    /// ([`super::plane::Plane::publish_tasks`]), the explorer's sessions read them.
+    #[cfg(feature = "native")]
+    tasks: Arc<blaze_explore::Tasks>,
 }
 
 /// A `blaze why` waiting for the reasons of builds that ended before it was asked: answered
@@ -855,6 +859,18 @@ struct Asked {
     all: bool,
     after: u64,
     until: Duration,
+}
+
+/// The explorer core the daemon serves the page: `explore-core.wasm` beside the daemon's
+/// executable, as the release archive lays it out (explore-core.md decision 3). With none, the
+/// explorer still serves; `hello` leaves out `core` and the `core` op answers why, naming the
+/// path and the command that builds it.
+#[cfg(feature = "native")]
+fn explore_core() -> Result<blaze_explore::CoreWasm, String> {
+    let exe = std::env::current_exe().map_err(|why| {
+        format!("the daemon's executable could not be found, so neither could {} beside it: {why}", blaze_explore::CORE_FILE)
+    })?;
+    blaze_explore::core_file(&exe)
 }
 
 /// The explorer's flush before each query (decision 3: a query reads every row recorded
@@ -927,7 +943,22 @@ impl Observe {
             asked: Vec::new(),            // alloc: none until a `blaze why` waits
             history_gone: false,
             local: None,
+            #[cfg(feature = "native")]
+            tasks: Arc::new(blaze_explore::Tasks::new()),
         }
+    }
+
+    /// The table of the plane's tasks the explorer publishes, for the plane to write.
+    #[cfg(feature = "native")]
+    pub fn tasks(&self) -> Arc<blaze_explore::Tasks> {
+        Arc::clone(&self.tasks)
+    }
+
+    /// One reading of the driver's clock (the plane's, `now`) against the profile's, so the
+    /// explorer says the plane's times on the clock of `spans` and `open`.
+    #[cfg(feature = "native")]
+    pub fn clock_tasks(&self, now: Duration) {
+        self.tasks.clock(super::plane::ns(now), blaze_profile::clock::mono_ns());
     }
 
     /// The number of the daemon's first build ([`Profiling::first_build`]); a daemon that
@@ -1061,6 +1092,8 @@ impl Observe {
                 world: None,
                 dev_origin: dev,
                 daemon: crate::release::get().version,
+                tasks: Arc::clone(&self.tasks),
+                core: explore_core(),
             };
             match blaze_explore::start(config) {
                 Ok(explorer) => self.explorer = Some((dev, explorer)),

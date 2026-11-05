@@ -233,9 +233,31 @@ pub enum State {
 }
 
 impl State {
+    /// Every state, in the order a task goes through them.
+    pub const ALL: [State; 6] =
+        [State::Waiting, State::Ready, State::Running, State::Done, State::Failed, State::Cancelled];
+
     /// Whether it may still move: waiting, ready or running.
     pub const fn unfinished(self) -> bool {
         matches!(self, State::Waiting | State::Ready | State::Running)
+    }
+
+    /// Its word on a wire (the explorer's `tasks.state`): `waiting`, `ready`, `running`,
+    /// `done`, `failed`, `cancelled`.
+    pub const fn word(self) -> &'static str {
+        match self {
+            State::Waiting => "waiting",
+            State::Ready => "ready",
+            State::Running => "running",
+            State::Done => "done",
+            State::Failed => "failed",
+            State::Cancelled => "cancelled",
+        }
+    }
+
+    /// The state `word` names ([`State::word`]); `None` for any other word.
+    pub fn from_word(word: &str) -> Option<State> {
+        State::ALL.into_iter().find(|it| it.word() == word)
     }
 }
 
@@ -436,12 +458,68 @@ pub struct Fold {
     /// The slowest settled tasks that ran, as how long each ran and its id, longest first and
     /// then by id: at most [`SLOWEST`].
     slowest: Vec<(u64, u64)>,
-    /// What reads an [`Event::Nodes`] keeps from one to the next.
-    order: Order,
-    /// A plane record's deps, widened to ids, kept from one record to the next.
-    widened: Vec<u64>,
+    /// What reads the plane's records keeps from one to the next.
+    records: Records,
     /// The blocker walk's buffers.
     walk: Walk,
+}
+
+/// One of the plane's graph records as a task: what [`Records::read`] makes of an
+/// [`Event::Node`], each node of an [`Event::Nodes`] and an [`Event::Moved`]. Ids are the plane's
+/// node ids, widened.
+#[derive(Debug, Clone, Copy)]
+pub enum Record<'a> {
+    /// A node said: its kind is the [`NodeKind`]'s name.
+    Task { id: u64, kind: &'static str, name: &'a str, deps: &'a [u64] },
+    /// A node moved: `state` as a task's, `node` as the plane said it (the outcome a view
+    /// names: cached, cached remotely, skipped, failed and why).
+    Moved { id: u64, state: State, node: &'a NodeState },
+}
+
+/// What reads the plane's records keeps from one to the next: the order of an [`Event::Nodes`]
+/// and the buffer a record's deps are widened into. The one place a plane record becomes a task:
+/// the [`Fold`] reads through it, and so does the explorer's daemon source.
+#[derive(Debug, Default)]
+pub struct Records {
+    order: Order,
+    widened: Vec<u64>,
+}
+
+impl Records {
+    pub fn new() -> Records {
+        Records::default()
+    }
+
+    /// Each task `event` says, to `each`, in the order said. Records of any other kind say
+    /// none, and so does a malformed [`Event::Nodes`].
+    pub fn read(&mut self, event: &Event, mut each: impl FnMut(Record<'_>)) {
+        match event {
+            Event::Node { id, kind, name, deps } => {
+                self.widened.clear();
+                // alloc: the widening buffer, kept from record to record.
+                self.widened.extend(deps.iter().map(|&dep| u64::from(dep)));
+                each(Record::Task { id: u64::from(*id), kind: kind.name(), name, deps: &self.widened });
+            }
+            Event::Nodes { .. } => {
+                let Some(Ok(batch)) = event.nodes(&mut self.order) else { return };
+                for node in batch.iter() {
+                    self.widened.clear();
+                    // alloc: the widening buffer, kept from record to record.
+                    self.widened.extend(node.deps.iter().map(|&dep| u64::from(dep)));
+                    each(Record::Task {
+                        id: u64::from(node.id),
+                        kind: node.kind.name(),
+                        name: node.name,
+                        deps: &self.widened,
+                    });
+                }
+            }
+            Event::Moved { id, state } => {
+                each(Record::Moved { id: u64::from(*id), state: State::from(state), node: state })
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The most tasks a fold keeps; a new task past them is ignored.
@@ -581,34 +659,20 @@ impl Fold {
         }
     }
 
-    /// One of the plane's records of the build, the one place they become tasks: a node (alone
-    /// or in an [`Event::Nodes`]) is a [`TaskRecord`] with its ids widened and its kind the
-    /// [`NodeKind`]'s name, a move is [`Fold::moved`] with its [`State`]. Records of any other
-    /// kind are ignored, and so is a malformed [`Event::Nodes`].
+    /// One of the plane's records of the build, read through [`Records`] (the one place they
+    /// become tasks) and taken with [`Fold::take_record`].
     pub fn take_event(&mut self, event: &Event) {
-        match event {
-            Event::Node { id, kind, name, deps } => {
-                let mut widened = std::mem::take(&mut self.widened);
-                widened.clear();
-                // alloc: the widening buffer, kept from record to record.
-                widened.extend(deps.iter().map(|&dep| u64::from(dep)));
-                self.add(u64::from(*id), kind.name(), name, &widened);
-                self.widened = widened;
-            }
-            Event::Nodes { .. } => {
-                let mut widened = std::mem::take(&mut self.widened);
-                if let Some(Ok(batch)) = event.nodes(&mut self.order) {
-                    for node in batch.iter() {
-                        widened.clear();
-                        // alloc: the widening buffer, kept from record to record.
-                        widened.extend(node.deps.iter().map(|&dep| u64::from(dep)));
-                        self.add(u64::from(node.id), node.kind.name(), node.name, &widened);
-                    }
-                }
-                self.widened = widened;
-            }
-            Event::Moved { id, state } => self.moved(u64::from(*id), State::from(state)),
-            _ => {}
+        let mut records = std::mem::take(&mut self.records);
+        records.read(event, |record| self.take_record(record));
+        self.records = records;
+    }
+
+    /// A plane record as a task: a [`Record::Task`] is [`Fold::take`], a [`Record::Moved`] is
+    /// [`Fold::moved`].
+    pub fn take_record(&mut self, record: Record<'_>) {
+        match record {
+            Record::Task { id, kind, name, deps } => self.add(id, kind, name, deps),
+            Record::Moved { id, state, .. } => self.moved(id, state),
         }
     }
 

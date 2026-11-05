@@ -1,6 +1,8 @@
 //! The live state, folded from hello, the live frames and answers: each thread's open span
 //! chain, which threads are the pool's workers, the recent closed spans, the counters' latest
-//! values; and [`Session::running`], the generic model Running now shows.
+//! values, the live tasks folded through `blaze_protocol::now::Fold` ([`crate::tasks`]); and
+//! the two models Running now shows: [`Session::look`], the fold's [`Now`] (phase, blockers,
+//! downloads, memory, slow or stalled), and [`Session::running`], each thread's whole chain.
 //!
 //! Everything kept is bounded: [`RECENT`] closed spans, [`MAX_THREADS`] threads, [`MAX_COUNTERS`]
 //! counters, and the frame splitter's buffer at a frame and a chunk.
@@ -23,11 +25,17 @@ use std::collections::{BTreeMap, VecDeque};
 
 use arrow_array::RecordBatch;
 
+use blaze_protocol::now::{self, Memory, Now, Worker};
+
 use crate::{
     Error,
-    live::{self, CounterRow, Decoder, OpenRow, SpanRow},
+    live::{self, CounterRow, Decoder, EdgeRow, OpenRow, SpanRow, TaskRow},
+    tasks::Tasks,
     wire::{self, Frames, Hello, HEAD, Live, LiveHead, Refusal},
 };
+
+/// The counter holding a process's footprint, what [`Now::memory`] says it holds.
+pub const FOOTPRINT: &str = "footprint bytes";
 
 /// Closed spans kept, newest last.
 pub const RECENT: usize = 256;
@@ -114,6 +122,8 @@ enum Table {
     Open,
     Spans,
     Counters,
+    Tasks,
+    Edges,
 }
 
 /// One session with the daemon: what it said, folded.
@@ -123,6 +133,8 @@ pub struct Session {
     open: Decoder,
     spans: Decoder,
     counters: Decoder,
+    tasks_in: Decoder,
+    edges_in: Decoder,
     frames: Frames,
     // Scratch, reused frame to frame.
     frame: Vec<u8>,
@@ -130,7 +142,13 @@ pub struct Session {
     open_rows: Vec<OpenRow>,
     span_rows: Vec<SpanRow>,
     counter_rows: Vec<CounterRow>,
+    task_rows: Vec<TaskRow>,
+    edge_rows: Vec<EdgeRow>,
     pub(crate) threads: BTreeMap<ThreadKey, Thread>,
+    /// The live tasks and their fold.
+    pub(crate) tasks: Tasks,
+    /// Spans closed since the last [`Session::look`]: progress, to the fold.
+    closed: u64,
     /// Closed spans, newest last.
     pub(crate) recent: VecDeque<SpanRow>,
     pub(crate) counters_now: BTreeMap<(u64, String), CounterRow>,
@@ -193,13 +211,19 @@ impl Session {
             open: Decoder::new("open"),
             spans: Decoder::new("spans"),
             counters: Decoder::new("counters"),
+            tasks_in: Decoder::new("tasks"),
+            edges_in: Decoder::new("task_edges"),
             frames: Frames::new(),
             frame: Vec::new(),
             batches: Vec::new(),
             open_rows: Vec::new(),
             span_rows: Vec::new(),
             counter_rows: Vec::new(),
+            task_rows: Vec::new(),
+            edge_rows: Vec::new(),
             threads: BTreeMap::new(),
+            tasks: Tasks::default(),
+            closed: 0,
             recent: VecDeque::new(),
             counters_now: BTreeMap::new(),
             at_ns: None,
@@ -233,9 +257,20 @@ impl Session {
         &self.stats
     }
 
-    /// Streams begun of `open`, `spans` and `counters`.
-    pub fn streams(&self) -> [u64; 3] {
-        [self.open.streams(), self.spans.streams(), self.counters.streams()]
+    /// The live tasks.
+    pub fn tasks(&self) -> &Tasks {
+        &self.tasks
+    }
+
+    /// Streams begun of `open`, `spans`, `counters`, `tasks` and `task_edges`.
+    pub fn streams(&self) -> [u64; 5] {
+        [
+            self.open.streams(),
+            self.spans.streams(),
+            self.counters.streams(),
+            self.tasks_in.streams(),
+            self.edges_in.streams(),
+        ]
     }
 
     /// The daemon's hello, the answer to the session's first request; once a session.
@@ -323,6 +358,8 @@ impl Session {
             "open" => Table::Open,
             "spans" => Table::Spans,
             "counters" => Table::Counters,
+            "tasks" => Table::Tasks,
+            "task_edges" => Table::Edges,
             _ => {
                 self.stats.other_frames += 1;
                 return Ok(());
@@ -337,6 +374,8 @@ impl Session {
             Table::Open => &mut self.open,
             Table::Spans => &mut self.spans,
             Table::Counters => &mut self.counters,
+            Table::Tasks => &mut self.tasks_in,
+            Table::Edges => &mut self.edges_in,
         };
         decoder.decode(head.ipc, &mut self.batches)?;
         let got = match table {
@@ -361,6 +400,20 @@ impl Session {
                 }
                 self.counter_rows.len()
             }
+            Table::Tasks => {
+                self.task_rows.clear();
+                for batch in &self.batches {
+                    live::task_rows(batch, &message, &mut self.task_rows)?;
+                }
+                self.task_rows.len()
+            }
+            Table::Edges => {
+                self.edge_rows.clear();
+                for batch in &self.batches {
+                    live::edge_rows(batch, &message, &mut self.edge_rows)?;
+                }
+                self.edge_rows.len()
+            }
         };
         if got as u64 != head.rows {
             return Err(Error::new(
@@ -370,7 +423,7 @@ impl Session {
                 format!("says {}, and its IPC holds {got}", head.rows),
             ));
         }
-        match table {
+        let folded = match table {
             Table::Open => self.fold_open(head.at_ns, &message),
             Table::Spans => {
                 self.fold_spans(head.at_ns);
@@ -380,7 +433,17 @@ impl Session {
                 self.fold_counters();
                 Ok(())
             }
-        }
+            Table::Tasks => {
+                self.tasks.upsert(&mut self.task_rows, head.at_ns);
+                Ok(())
+            }
+            Table::Edges => {
+                self.tasks.needs(&mut self.edge_rows, head.at_ns);
+                Ok(())
+            }
+        };
+        self.tasks.evict(head.at_ns);
+        folded
     }
 
     /// An `open` frame is the whole open set at `at_ns`: every chain is replaced; a frame with
@@ -459,6 +522,7 @@ impl Session {
             let end = row.start_ns.saturating_add(row.dur_ns);
             self.last_close_ns = Some(self.last_close_ns.map_or(end, |it| it.max(end)));
             let key = ThreadKey { process: row.process, thread: row.thread };
+            self.closed = self.closed.saturating_add(1);
             if let Some(thread) = self.threads.get_mut(&key) {
                 thread.closed += 1;
                 thread.seen_ns = thread.seen_ns.max(at_ns);
@@ -559,14 +623,56 @@ impl Session {
         Ok((hello, at_ns, now_ns.max(at_ns)))
     }
 
-    /// What is running at `now_ns`, the page's reading of the daemon's clock (hello's `clock`).
-    ///
-    /// SEAM(now::Fold): lane tui-redesign's `blaze_protocol::now::Fold` becomes the model's
-    /// one home (explore-core.md decision 4). When it lands, the live `tasks`/`task_edges`
-    /// rows convert here into `Fold::take(&TaskRecord { id: u64, kind, name, deps })` and
-    /// `Fold::moved(id, now::State)`, each busy worker's span `task` names its `Worker.task`,
-    /// and this returns `Fold`'s model in place of [`Running`]; until then [`Running`] is the
-    /// model, and nothing else in the core builds one.
+    /// Whether `thread` is a worker: every thread without the `blaze` layer, the pool's with
+    /// it.
+    fn worker(layered: bool, thread: &Thread) -> bool {
+        !layered || thread.pool_worker
+    }
+
+    /// The program at `now_ns`, the page's reading of the daemon's clock, as the one model
+    /// says it ([`now::Fold::look`] over the live tasks): each worker with its open spans (an
+    /// idle pool worker, inside only the pool's `worker` span, with none) and the task its
+    /// innermost span carries (`open.task`), the downloads, the spans closed since the last
+    /// look, and the memory the processes' [`FOOTPRINT`] counters say.
+    pub fn look(&mut self, now_ns: i64) -> Result<Now, Error> {
+        let (hello, _, now) = self.clock("running now", now_ns)?;
+        let layered = hello.layers.iter().any(|it| it == BLAZE);
+        let mut workers = 0u32;
+        // alloc: once a look, a worker each
+        let mut threads = Vec::new();
+        for (key, thread) in &self.threads {
+            if !Session::worker(layered, thread) {
+                continue;
+            }
+            workers = workers.saturating_add(1);
+            let idle = thread.open.first().is_none_or(|outer| layered && worker_span(outer));
+            let task = thread.open.last().and_then(|span| span.task);
+            threads.push(Worker {
+                // alloc: a worker's name in the look, `process:thread`, which the view joins on
+                thread: format!("{}:{}", key.process, key.thread),
+                task: task.and_then(|task| self.tasks.fold_id((key.process, task))),
+                open: if idle {
+                    Vec::new()
+                } else {
+                    thread.open.iter().map(|span| now_span(span, now)).collect()
+                },
+            });
+        }
+        let held = self
+            .counters_now
+            .iter()
+            .filter(|((_, name), _)| name == FOOTPRINT)
+            .map(|(_, row)| row.value.max(0.0) as u64)
+            .fold(0u64, u64::saturating_add);
+        let memory = Memory { held, ..Memory::default() };
+        let closed = std::mem::take(&mut self.closed);
+        Ok(self.tasks.look(now, workers, &threads, closed, &memory))
+    }
+
+    /// What is running at `now_ns`, the page's reading of the daemon's clock (hello's `clock`):
+    /// each thread inside spans with its whole chain, the workers busy or idle by the rule
+    /// above and the daemon's own threads apart. [`Session::look`] is the model of the same
+    /// moment; Running now shows both, joined by thread.
     pub fn running(&self, now_ns: i64) -> Result<Running<'_>, Error> {
         let (hello, at_ns, now) = self.clock("running now", now_ns)?;
         let layered = hello.layers.iter().any(|it| it == BLAZE);
@@ -576,7 +682,7 @@ impl Session {
         // alloc: once a view, at most a thread each
         let mut internal = Vec::new();
         for (key, thread) in &self.threads {
-            let worker = !layered || thread.pool_worker;
+            let worker = Session::worker(layered, thread);
             workers += u64::from(worker);
             let Some(outer) = thread.open.first() else { continue };
             if worker && layered && worker_span(outer) {
@@ -603,5 +709,18 @@ impl Session {
             internal,
             quiet_ns: self.last_close_ns.map(|it| elapsed(now, it)),
         })
+    }
+}
+
+/// An open span as the one model names it: its name, the function it is of as its item, its
+/// crate, what it waits on and for how long it has been open at `now`.
+fn now_span(span: &OpenRow, now: i64) -> now::Span {
+    now::Span {
+        // clone: the look's spans own their strings
+        name: span.name.clone(),
+        item: span.function.clone(),
+        krate: span.krate.clone(),
+        awaits: span.awaits.clone(),
+        for_ms: elapsed(now, span.start_ns) / 1_000_000,
     }
 }

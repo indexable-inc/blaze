@@ -23,7 +23,8 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
-# The view models' deterministic CBOR (`cbor::to_vec`), and later `now::Fold`.
+# The view models' deterministic CBOR (`cbor::to_vec`), and `now::Fold`, the one model of a
+# program as it runs.
 blaze-protocol.workspace = true
 blaze-serde.workspace = true
 serde.workspace = true
@@ -32,10 +33,12 @@ serde_json.workspace = true
 
 [dev-dependencies]
 # The daemon's own producers: the live tables' batches and their long-lived IPC streams
-# (blaze-profile's `batches::open` and `live::Encoder`) and the frames' heads (blaze-explore's
-# `frame`), so the tests decode exactly the bytes the daemon writes.
+# (blaze-profile's `batches::open` and `live::Encoder`, blaze-explore's `tasks::Feed`), so the
+# tests decode exactly the bytes the daemon writes.
 blaze-explore.workspace = true
 blaze-profile.workspace = true
+# The frames' heads (`explore::frame`) and a live tick, as the server writes them.
+ix-prof = { workspace = true, features = ["explore"] }
 
 [lints]
 workspace = true
