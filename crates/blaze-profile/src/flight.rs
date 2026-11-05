@@ -285,6 +285,11 @@ const SHARDS: usize = 16;
 const GENERATION: usize = 1 << 14;
 /// The epochs a `Sym` can say, in its bits 4..12; epoch 0 is the [`kept`] table's.
 const EPOCHS: u32 = 1 << 8;
+/// Tries one [`intern`] makes before it gives up on a name (counted, [`NAMES_LOST`]): each one
+/// that does not end found or given saw its shard's generation full and moved it on, and a
+/// generation holds [`GENERATION`] names, so only a shard filled this many times over while
+/// one call ran (its thread stopped meanwhile) runs out.
+const INTERN_TRIES: usize = 8;
 
 /// A `Sym`: bits 0..4 its shard, 4..12 its generation's epoch, 12.. its index from 1. A `Sym` of
 /// a generation let go reads as none; its epoch comes round again only after 255 more, by when
@@ -293,6 +298,18 @@ const fn sym(shard: usize, epoch: u32, index: usize) -> Sym {
     (index as u32 + 1) << 12 | epoch << 4 | shard as u32
 }
 
+/// The epoch after `epoch`: 1..=255 round, 0 being the kept table's and a shard's before its
+/// first name.
+const fn next_epoch(epoch: u32) -> u32 {
+    epoch % (EPOCHS - 1) + 1
+}
+
+/// The epoch before `epoch` (of 1..=255).
+const fn previous_epoch(epoch: u32) -> u32 {
+    if epoch <= 1 { EPOCHS - 1 } else { epoch - 1 }
+}
+
+/// The names of the kept and recovered tables: few, given under their lock.
 #[derive(Default)]
 struct Generation {
     epoch: u32,
@@ -317,72 +334,168 @@ impl Generation {
     }
 }
 
+/// One generation of a shard's names, shared with no lock: a hit is one papaya read, a new
+/// name an atomic add for its index and two papaya inserts. Nothing a thread holds while it
+/// gives a name stops another, so a thread stopped there (sampled, preempted, faulting) stops
+/// only itself; with the lock this replaced, 60 threads queued behind one the sampler had
+/// interrupted, the daemon's turn loop among them.
+#[derive(Default)]
+struct Shared {
+    /// The next index to give; past [`GENERATION`] the generation is full.
+    next: std::sync::atomic::AtomicUsize,
+    ids: blaze_hash::SharedMap<std::sync::Arc<str>, Sym>,
+    names: blaze_hash::SharedMap<Sym, std::sync::Arc<str>>,
+}
+
+/// A shard's names: its current generation's epoch, and its generations by epoch, the current
+/// one and the one before (and, between a move and the old one's removal, the one before
+/// that). A generation removed is freed once no thread reads it (papaya's reclamation).
 #[derive(Default)]
 struct Shard {
-    current: Generation,
-    previous: Generation,
+    /// 0 until the shard's first name.
+    current: AtomicU32,
+    generations: blaze_hash::SharedMap<u32, Shared>,
 }
 
 /// The names of a process's rows, by shard.
-struct Names([Mutex<Option<Shard>>; SHARDS]);
+struct Names([Shard; SHARDS]);
 
-static NAMES: Names = Names([const { Mutex::new(None) }; SHARDS]);
+static NAMES: std::sync::LazyLock<Names> = std::sync::LazyLock::new(Names::new);
 /// Names that live as long as what holds them, not a build: threads'.
 static KEPT: Mutex<Option<Generation>> = Mutex::new(None);
 static NAMES_FORGOTTEN: AtomicU64 = AtomicU64::new(0);
+/// Names given ([`intern`] found none): [`Plot::ProfileNamesGiven`].
+static NAMES_GIVEN: AtomicU64 = AtomicU64::new(0);
+/// Names two threads gave at once, the loser's number left unused: [`Plot::ProfileNamesRaced`].
+static NAMES_RACED: AtomicU64 = AtomicU64::new(0);
+/// Names [`INTERN_TRIES`] did not settle, read as none: [`Plot::ProfileNamesLost`].
+static NAMES_LOST: AtomicU64 = AtomicU64::new(0);
 
-/// The number of `name`, given it the first time in its generation: a hash and one lock of a
-/// shard of 16. A name the previous generation has is given a number of the current one, so a
+/// The number of `name`, given it the first time in its generation: a hash, then a lock-free
+/// read of its shard's current generation; a new name is an atomic add and two lock-free
+/// inserts. A name the previous generation has is given a number of the current one, so a
 /// name still in use outlives the generation it was first named in.
 pub fn intern(name: &str) -> Sym {
     NAMES.intern(name)
 }
 
 impl Names {
+    fn new() -> Names {
+        Names(std::array::from_fn(|_| Shard::default()))
+    }
+
     fn intern(&self, name: &str) -> Sym {
         use std::hash::{Hash, Hasher};
         let mut hasher = FixedHasher::default();
         name.hash(&mut hasher);
-        let shard = (hasher.finish() >> 60) as usize % SHARDS;
-        let mut names = lock(&self.0[shard]);
-        let names = names.get_or_insert_with(|| Shard {
-            current: Generation { epoch: 1, ..Generation::default() },
-            previous: Generation::default(),
-        });
-        if let Some(&id) = names.current.ids.get(name) {
-            return id;
+        let at = (hasher.finish() >> 60) as usize % SHARDS;
+        let shard = &self.0[at];
+        let generations = shard.generations.pin();
+        for _ in 0..INTERN_TRIES {
+            let epoch = shard.current.load(Ordering::Acquire);
+            let Some(generation) = generations.get(&epoch) else {
+                // The shard's first name, or a move whose new generation is not in yet.
+                Self::move_on(shard, epoch);
+                continue;
+            };
+            let ids = generation.ids.pin();
+            if let Some(&id) = ids.get(name) {
+                return id;
+            }
+            let index = generation.next.fetch_add(1, Ordering::Relaxed);
+            if index >= GENERATION {
+                Self::move_on(shard, epoch);
+                continue;
+            }
+            let id = sym(at, epoch, index);
+            // alloc: once per distinct name a generation, let go with it
+            let kept: std::sync::Arc<str> = name.into();
+            // Its text first, so no reader holds the number before the number reads as it.
+            // clone: a refcount, the name's one string shared by both maps
+            generation.names.pin().insert(id, kept.clone());
+            // clone: a refcount, as above
+            match ids.try_insert(kept.clone(), id) {
+                Ok(_) => {
+                    NAMES_GIVEN.fetch_add(1, Ordering::Relaxed);
+                    // Its insert before the mapping is read, as `persist` sets the mapping
+                    // before it reads the names: one of the two logs the name.
+                    fence(Ordering::SeqCst);
+                    postmortem::named(at, id, &kept);
+                    return id;
+                }
+                Err(taken) => {
+                    let won = *taken.current;
+                    generation.names.pin().remove(&id);
+                    NAMES_RACED.fetch_add(1, Ordering::Relaxed);
+                    return won;
+                }
+            }
         }
-        if names.current.names.len() == GENERATION {
-            let epoch = names.current.epoch % (EPOCHS - 1) + 1;
-            let full = std::mem::replace(
-                &mut names.current,
-                Generation { epoch, ..Generation::default() },
-            );
-            names.previous = full;
-        }
-        let id = names.current.add(shard, name);
-        // Under the shard's lock, so the mapping logs a shard's names in the order given.
-        postmortem::named(shard, id, name);
-        id
+        NAMES_LOST.fetch_add(1, Ordering::Relaxed);
+        0
     }
 
-    /// Every name a shard holds now, oldest generation first, to `each`, under the shard's
-    /// lock: what the mapping logs as it is made ([`postmortem`]).
+    /// Moves `shard` on from `seen`, its current epoch as a caller read it (full, or 0 before
+    /// any): the generation after it goes in, becomes current, and the one before `seen` goes.
+    /// Of threads that move it at once, one inserts and one swaps; the rest find it moved.
+    fn move_on(shard: &Shard, seen: u32) {
+        if shard.current.load(Ordering::Acquire) != seen {
+            return;
+        }
+        let generations = shard.generations.pin();
+        let next = next_epoch(seen);
+        // A generation of `next` already in is this move's (another thread's insert), or one a
+        // move as late as this one put in: never one with names, as only the current one is
+        // given into.
+        _ = generations.try_insert(next, Shared::default());
+        if shard
+            .current
+            .compare_exchange(seen, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && seen != 0
+        {
+            generations.remove(&previous_epoch(seen));
+        }
+    }
+
+    /// Every name a shard holds now, to `each`: what the mapping logs as it is made
+    /// ([`postmortem`]). A name given meanwhile may be passed here and log itself too.
     fn each(&self, shard: usize, mut each: impl FnMut(Sym, &str)) {
-        let names = lock(&self.0[shard]);
-        let Some(names) = names.as_ref() else { return };
-        for generation in [&names.previous, &names.current] {
-            for (at, name) in generation.names.iter().enumerate() {
-                each(sym(shard, generation.epoch, at), &**name);
+        let generations = self.0[shard].generations.pin();
+        for (_, generation) in generations.iter() {
+            for (&sym, name) in generation.names.pin().iter() {
+                each(sym, name);
             }
         }
     }
 
     /// The string of `sym`, an interned (not kept) name: none once its generation was let go.
     fn get(&self, sym: Sym) -> Option<std::sync::Arc<str>> {
-        let names = lock(&self.0[(sym & 0xf) as usize]);
+        let shard = &self.0[(sym & 0xf) as usize];
+        let generations = shard.generations.pin();
+        let generation = generations.get(&(sym >> 4 & (EPOCHS - 1)))?;
         // clone: a refcount
-        names.as_ref().and_then(|it| it.current.get(sym).or_else(|| it.previous.get(sym)).cloned())
+        generation.names.pin().get(&sym).cloned()
+    }
+}
+
+/// Names given, raced and lost since the process began, and names whose postmortem log entry
+/// another thread wrote ([`postmortem::handed_off`]): how contended interning was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NameCounts {
+    pub given: u64,
+    pub raced: u64,
+    pub lost: u64,
+    pub handed_off: u64,
+}
+
+/// See [`NameCounts`].
+pub fn name_counts() -> NameCounts {
+    NameCounts {
+        given: NAMES_GIVEN.load(Ordering::Relaxed),
+        raced: NAMES_RACED.load(Ordering::Relaxed),
+        lost: NAMES_LOST.load(Ordering::Relaxed),
+        handed_off: postmortem::handed_off(),
     }
 }
 
@@ -516,10 +629,20 @@ pub enum Plot {
     /// Reads of a thread's CPU clock the recorder made so far, one a boundary
     /// ([`crate::time::cpu`]).
     ProfileCpuReads,
+    /// Names the recorder gave so far ([`intern`] found none): span fields' and events' text.
+    /// Written with [`Plot::ProfileCostNs`], as are the three after it ([`name_counts`]).
+    ProfileNamesGiven,
+    /// Names two threads gave at once, one number left unused: how often interning collided.
+    ProfileNamesRaced,
+    /// Names [`intern`] gave up on, read as none: a shard moved on many times during one call.
+    ProfileNamesLost,
+    /// Names whose postmortem log entry a thread already writing that log wrote, as the giver's
+    /// try of the log's lock failed: how contended the name logs are. None waits for them.
+    ProfileNamesHandedOff,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 26] = [
+    pub const ALL: [Plot; 30] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -546,6 +669,10 @@ impl Plot {
         Plot::ProfileCostNs,
         Plot::ProfileSpansMade,
         Plot::ProfileCpuReads,
+        Plot::ProfileNamesGiven,
+        Plot::ProfileNamesRaced,
+        Plot::ProfileNamesLost,
+        Plot::ProfileNamesHandedOff,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -576,6 +703,10 @@ impl Plot {
             Plot::ProfileCostNs => "profile cost ns",
             Plot::ProfileSpansMade => "profile spans made",
             Plot::ProfileCpuReads => "profile cpu reads",
+            Plot::ProfileNamesGiven => "profile names given",
+            Plot::ProfileNamesRaced => "profile names raced",
+            Plot::ProfileNamesLost => "profile names lost",
+            Plot::ProfileNamesHandedOff => "profile names handed off",
         }
     }
 
@@ -4425,7 +4556,7 @@ mod tests {
 
     #[test]
     fn names_past_a_generation_are_still_named_and_older_ones_read_as_none_never_as_another() {
-        let names = Names([const { Mutex::new(None) }; SHARDS]);
+        let names = Names::new();
         let count = 3 * GENERATION * SHARDS;
         // alloc: a test's names
         let syms: Vec<Sym> = (0..count).map(|i| names.intern(&format!("key {i}"))).collect();
@@ -4449,6 +4580,51 @@ mod tests {
             Some("key 0"),
             "a name asked for again is named anew"
         );
+    }
+
+    /// Threads giving the same names and their own at once: each shared name is one number on
+    /// every thread, and every number reads back as its own name. With the shard locks this
+    /// replaced, these threads queued behind whichever held a shard.
+    #[test]
+    fn threads_naming_at_once_agree_on_each_number() {
+        const THREADS: usize = 16;
+        const SHARED: usize = 512;
+        const OWN: usize = 2048;
+        let names = Names::new();
+        // alloc: a test's numbers
+        let seen: Vec<Vec<Sym>> = std::thread::scope(|scope| {
+            let names = &names;
+            // alloc: a test's threads
+            let threads: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    scope.spawn(move || {
+                        // alloc: a test's numbers
+                        let mut shared = vec![0; SHARED];
+                        for i in 0..OWN {
+                            let own = names.intern(&format!("thread {t} name {i}"));
+                            assert_eq!(
+                                names.get(own).as_deref(),
+                                Some(format!("thread {t} name {i}").as_str()),
+                                "a thread's own name reads back"
+                            );
+                            // Each thread walks the shared names from its own place.
+                            let at = (i + t * 31) % SHARED;
+                            let sym = names.intern(&format!("shared {at}"));
+                            assert!(shared[at] == 0 || shared[at] == sym, "one number a name");
+                            shared[at] = sym;
+                        }
+                        shared
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        for at in 0..SHARED {
+            let sym = seen[0][at];
+            assert_ne!(sym, 0, "shared {at} was named");
+            assert!(seen.iter().all(|it| it[at] == sym), "every thread got one number for shared {at}");
+            assert_eq!(names.get(sym).as_deref(), Some(format!("shared {at}").as_str()));
+        }
     }
 
     #[test]

@@ -1203,12 +1203,17 @@ impl History {
         // before it, so it holds the idle stretch between them too.
         if let Some(of) = build {
             let cost = flight::cost();
+            let names = flight::name_counts();
             let build = u32::try_from(of).unwrap_or(0);
             self.read.counters.extend(
                 [
                     (Plot::ProfileCostNs, cost.ns),
                     (Plot::ProfileSpansMade, cost.spans),
                     (Plot::ProfileCpuReads, cost.cpu_reads),
+                    (Plot::ProfileNamesGiven, names.given),
+                    (Plot::ProfileNamesRaced, names.raced),
+                    (Plot::ProfileNamesLost, names.lost),
+                    (Plot::ProfileNamesHandedOff, names.handed_off),
                 ]
                 .map(|(plot, value)| CounterRow {
                     build,

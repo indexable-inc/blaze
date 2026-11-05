@@ -73,7 +73,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering, fence},
     },
 };
 
@@ -451,6 +451,25 @@ fn io_error<'a>(path: &'a Path, doing: &'static str) -> impl FnOnce(io::Error) -
 
 // --- The writer -------------------------------------------------------------------------
 
+/// A name log of the mapping: its head under the lock of its one writer, and the names given
+/// while another thread held it, which that writer writes before it lets go. A thread that
+/// gives a name only ever tries the lock, so a writer stopped mid-entry (sampled, preempted)
+/// delays the names behind it, never their givers.
+#[derive(Default)]
+struct NameLog {
+    head: Mutex<u64>,
+    // alloc: a name a pusher found its log's writer busy for, until the writer writes it
+    pending: crossbeam_queue::SegQueue<(Sym, Box<str>)>,
+}
+
+/// Names a thread left to its log's writer ([`Mapping::log_name`]) since the process began.
+static HANDED_OFF: AtomicU64 = AtomicU64::new(0);
+
+/// See [`HANDED_OFF`]: [`super::Plot::ProfileNamesHandedOff`].
+pub(crate) fn handed_off() -> u64 {
+    HANDED_OFF.load(Ordering::Relaxed)
+}
+
 /// The file of a live process: the fixed part mapped, and its stores, handed to rings as they
 /// are made.
 pub(crate) struct Mapping {
@@ -460,8 +479,8 @@ pub(crate) struct Mapping {
     file: Locked,
     /// The fixed part, `0..RINGS_AT`, mapped shared and never unmapped.
     fixed: std::ptr::NonNull<u8>,
-    /// Each log's bytes ever written, under the lock that keeps it to one writer at a time.
-    logs: [Mutex<u64>; LOGS],
+    /// Each log's bytes ever written, and the names waiting for its writer ([`NameLog`]).
+    logs: [NameLog; LOGS],
     /// One writer of the site records at a time.
     sites: Mutex<()>,
     /// The build each build record holds, 0 for none.
@@ -545,7 +564,7 @@ impl Mapping {
                 path,
                 file,
                 fixed,
-                logs: [const { Mutex::new(0) }; LOGS],
+                logs: std::array::from_fn(|_| NameLog::default()),
                 sites: Mutex::new(()),
                 builds: Mutex::new([0; BUILD_SLOTS]),
                 stores,
@@ -639,13 +658,56 @@ impl Mapping {
         Ok(store)
     }
 
-    /// Logs `name` as `sym` in log `log` (a shard, or [`SHARDS`] for kept names).
+    /// Logs `name` as `sym` in log `log` (a shard, or [`SHARDS`] for kept names). A name is
+    /// given on the hot path ([`super::intern`]), so no thread waits for a log: one that finds
+    /// it being written leaves its name to the writer ([`NameLog`]), counted as handed off.
     pub(crate) fn log_name(&self, log: usize, sym: Sym, name: &str) {
-        let Some(head) = self.logs.get(log) else { return };
-        let mut head = head.lock();
+        let Some(at) = self.logs.get(log) else { return };
+        let base = LOGS_AT + log * LOG_BYTES;
+        if let Some(mut head) = at.head.try_lock() {
+            self.write_name(base, &mut head, sym, name);
+            self.drain_names(base, at, head);
+            return;
+        }
+        // alloc: a name whose log another thread is writing, until that thread writes it
+        at.pending.push((sym, name.into()));
+        HANDED_OFF.fetch_add(1, Ordering::Relaxed);
+        // The push before the try below, as the writer's unlock before its look at the queue:
+        // one of the two sees the other, so no name waits in the queue with no writer.
+        fence(Ordering::SeqCst);
+        if let Some(head) = at.head.try_lock() {
+            self.drain_names(base, at, head);
+        }
+    }
+
+    /// Writes the names waiting for `at` while its lock is held as `head`, lets the lock go,
+    /// and takes it again for any pushed meanwhile whose pusher found it held. Bounded: each
+    /// round writes a name pushed after the round before let go, by a thread that then tried
+    /// the lock and failed, so it ends once the pushers stop.
+    fn drain_names(&self, base: usize, at: &NameLog, mut head: MutexGuard<'_, u64>) {
+        loop {
+            while let Some((sym, name)) = at.pending.pop() {
+                self.write_name(base, &mut head, sym, &name);
+            }
+            drop(head);
+            fence(Ordering::SeqCst);
+            if at.pending.is_empty() {
+                return;
+            }
+            match at.head.try_lock() {
+                Some(again) => head = again,
+                // Another writer took it, and drains what is left.
+                None => return,
+            }
+        }
+    }
+
+    /// Writes one entry of the log at `base`, its head `head`: the name's bytes, then its
+    /// trailer, then the head published.
+    fn write_name(&self, base: usize, head: &mut u64, sym: Sym, name: &str) {
+        let log = (base - LOGS_AT) / LOG_BYTES;
         let (text, cut_short) = cut(name, NAME_MAX);
         let padded = text.len().div_ceil(8) * 8;
-        let base = LOGS_AT + log * LOG_BYTES;
         self.ring_bytes(base, *head, text.as_bytes());
         let trailer = u64::from(sym) << 32 | u64::from(cut_short) << 31 | text.len() as u64;
         self.ring_bytes(base, *head + padded as u64, &trailer.to_ne_bytes());
@@ -961,7 +1023,10 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
     }
     let Some(mapping) = MAPPING.get() else { return Ok(()) };
     // The names given so far; those given from here on log themselves as they are given
-    // ([`named`]). A name given in between is logged twice, the same text both times.
+    // ([`named`]). A name given in between is logged twice, the same text both times. The
+    // mapping set before the names are read, as `intern` inserts a name before it reads the
+    // mapping: of the two, at least one sees the other.
+    fence(Ordering::SeqCst);
     for shard in 0..SHARDS {
         NAMES.each(shard, |sym, name| mapping.log_name(shard, sym, name));
     }
@@ -1686,6 +1751,50 @@ mod tests {
 
     fn plot_row(t0: u64, i: u64) -> [u64; WORDS] {
         [t0 + i * 10, i, 0, 0, KIND_PLOT << 62 | Plot::Queued as u64, 0, 7, 0]
+    }
+
+    /// Threads giving names while their log's writer is stopped mid-entry (as the sampler
+    /// stops a thread) wait for no one: each leaves its name to the writer and returns, the
+    /// writer writes them all before it lets go, and a postmortem reads every one.
+    #[test]
+    fn names_given_while_their_log_is_held_wait_for_no_one_and_all_read_back() {
+        const THREADS: u32 = 8;
+        const EACH: u32 = 100;
+        let dir = scratch("handoff");
+        let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
+        let log = &mapping.logs[3];
+        let held = log.head.lock();
+        let before = handed_off();
+        let named = |t: u32, i: u32| (sym(3, 1, (t * EACH + i) as usize), format!("name {t} {i}"));
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let mapping = &mapping;
+                scope.spawn(move || {
+                    for i in 0..EACH {
+                        let (sym, text) = named(t, i);
+                        mapping.log_name(3, sym, &text);
+                    }
+                });
+            }
+            // Every giver handed its names off with the log still held: none waited on it.
+            blaze_graph::spin::SpinWait::within(
+                "every name to be handed to the stopped writer",
+                std::time::Duration::from_secs(30),
+                || handed_off() - before >= u64::from(THREADS * EACH),
+            );
+        });
+        mapping.drain_names(LOGS_AT + 3 * LOG_BYTES, log, held);
+        assert!(log.pending.is_empty(), "the writer wrote every name left to it");
+        drop(mapping);
+        let found = dead(&dir).unwrap();
+        let header = found[0].bytes(0, PAGE, "test").unwrap();
+        let names = found[0].names(&header).unwrap();
+        for t in 0..THREADS {
+            for i in 0..EACH {
+                let (sym, text) = named(t, i);
+                assert_eq!(names.get(&sym), Some(&text), "the name of thread {t}'s give {i}");
+            }
+        }
     }
 
     /// A process writes rows into its mapping and dies (its lock let go): a postmortem reads
