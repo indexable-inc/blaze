@@ -169,12 +169,12 @@ pub fn describe(id: SourceId) -> String {
         SourceKind::Registry | SourceKind::SparseRegistry | SourceKind::LocalRegistry => {
             id.display_index()
         }
-        SourceKind::Directory => match id.url().to_file_path() {
+        SourceKind::Directory => match blaze_source::url_file(id.url()) {
             Ok(path) => format!("directory source `{}`", path.display()), // alloc: message text, at the edge
             Err(()) => id.to_string(),                                    // alloc: as above
         },
         SourceKind::Git(_) => format!("Git repository {id}"), // alloc: as above
-        SourceKind::Path => match id.url().to_file_path() {
+        SourceKind::Path => match blaze_source::url_file(id.url()) {
             Ok(path) => path.display().to_string(), // alloc: as above
             Err(()) => id.to_string(),              // alloc: as above
         },

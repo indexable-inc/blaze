@@ -169,6 +169,14 @@ runs that release, fetched once, saying so in one line on stderr, as a release d
 `blaze --ignore-pin <command>` runs the build itself there
 ([cargo.md](cargo.md#pinning-a-release-of-blaze)).
 
+## With MacPorts
+
+```sh
+sudo port install blaze
+```
+
+This fetches the blaze source and compiles locally without having to configure anything else on Apple Silicon Macs.
+
 ## The old names
 
 blaze had another name and another command before 2026-10-28, and no longer answers to either:

@@ -23,6 +23,23 @@ use triomphe::Arc;
 
 use super::{LowerError, files};
 
+/// The stable identities of the build-script runs a crate reads, each run by its run class's
+/// ([`run_classes`]; `class_of` is a unit's class). A profile can split runs of one package even
+/// for the same platform and features; their output directories are machine paths, so keys use
+/// the runs' portable unit identities instead (#1610). Runs of one class are one run to the
+/// front end, so units apart only in which run of a class they read keep one crate.
+pub(crate) fn build_script_runs(
+    units: &Units,
+    unit: &Unit,
+    class_of: impl Fn(usize) -> usize,
+) -> Box<[String]> {
+    unit.dependencies
+        .iter()
+        .filter(|dep| units.graph.units[dep.index].mode == Mode::RunCustomBuild)
+        .map(|dep| units.plans[class_of(dep.index)].unit_id.clone()) // clone: one stable identity per run class read by a crate
+        .collect() // alloc: crate graph input, kept for the front end's lifetime
+}
+
 /// `` `foo` (lib test for x86_64-unknown-linux-gnu) of foo v0.1.0 ``: a unit as an error names it.
 pub(crate) fn describe(package: &PackagePlan, unit: &Unit) -> String {
     let mode = match unit.mode {

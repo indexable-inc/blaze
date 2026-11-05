@@ -71,7 +71,8 @@ use crate::{
 
 /// The version of the words [`write`] writes: changes with any change to what a word means.
 /// 5: no inlined tables (only built MIR is kept, which has none).
-const WORDS_VERSION: u64 = 5;
+/// 6: a coroutine's locals carry the span of its body.
+const WORDS_VERSION: u64 = 6;
 
 /// The literals of a body that a location macro expanded to, sorted, with the store they are
 /// expressions of: the constants a body's MIR makes of them are written as slots and filled
@@ -583,10 +584,11 @@ impl<'db> Encode<'_, 'db> {
         closures.iter().for_each(|&it| self.id(it));
         match coroutine {
             None => self.word(0),
-            Some(CoroutineLocals { poll, context }) => {
+            Some(CoroutineLocals { poll, context, span }) => {
                 self.word(1);
                 self.local(*poll);
                 self.local(*context);
+                self.span(*span);
             }
         }
         self.count(unreached.len());
@@ -1620,7 +1622,11 @@ impl<'a, 'db> Decode<'a, 'db> {
         let closures = self.list_of("the body's closures", 2, |it| it.id())?;
         let coroutine = match self.word()? {
             0 => None,
-            1 => Some(CoroutineLocals { poll: self.local()?, context: self.local()? }),
+            1 => Some(CoroutineLocals {
+                poll: self.local()?,
+                context: self.local()?,
+                span: self.span()?,
+            }),
             _ => return Err(self.invalid("a coroutine's locals of no kind")),
         };
         let unreached = self.list("the body's unreached blocks", |it| it.block())?;

@@ -30,6 +30,9 @@ sonic-rs.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+uds_windows.workspace = true
+
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-protocol = { workspace = true, features = ["reference"] }

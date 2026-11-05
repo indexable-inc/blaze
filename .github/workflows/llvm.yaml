@@ -6,7 +6,7 @@ name: llvm
 # archives into the R2 bucket blaze-releases (`native/<name>`, under llvm.json's `release`,
 # .github/scripts/r2.py), each under a name that carries its sha256. The
 # fork is public, so no token is needed. The run's summary has the `targets` to write into llvm.json
-# (`llvm.py pin`), which the flake, CI and the release then fetch by that hash.
+# (`llvm.py` with `{"command": "pin", ...}`), which the flake, CI and the release then fetch by that hash.
 #
 # It runs when the recipe changes, and by hand after moving the pinned commit.
 on:
@@ -52,7 +52,12 @@ jobs:
       - run: python -m pip install ninja==1.13.0
       - if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
-      - run: python .github/scripts/llvm.py build --target ${{ matrix.target }} --work "${{ runner.temp }}/llvm" --out "${{ runner.temp }}/out"
+      - shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        # JSON, which escapes the backslashes of a Windows runner's temporary directory.
+        run: |
+          python .github/scripts/llvm.py "$(jq -nc --arg target "$TARGET" --arg work "$RUNNER_TEMP/llvm" --arg out "$RUNNER_TEMP/out" '{command: "build", target: $target, work: $work, out: $out}')"
       - uses: actions/upload-artifact@v7
         with:
           name: llvm-${{ matrix.target }}
@@ -97,6 +102,6 @@ jobs:
             ${{ steps.r2.outputs.r2 }}
       - name: Pins
         run: |
-          python3 .github/scripts/llvm.py pin "$RUNNER_TEMP"/llvm/*
+          python3 .github/scripts/llvm.py "$(jq -nc --arg root "$RUNNER_TEMP/llvm" '{command: "pin", root: $root}')"
           { echo '`crates/hir-ty-codegen/llvm.json` for these builds:'; echo '```json'; cat crates/hir-ty-codegen/llvm.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           cat crates/hir-ty-codegen/llvm.json

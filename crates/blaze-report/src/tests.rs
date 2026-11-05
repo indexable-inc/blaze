@@ -36,7 +36,7 @@ fn example() -> Report {
         })
         .fix(Fix::run(&["nix develop"]))
         .fix(Fix::run(&[
-            "python3 .github/scripts/llvm.py fetch --target aarch64-apple-darwin --dir ~/.blaze/llvm",
+            "python3 .github/scripts/llvm.py '{\"command\": \"fetch\", \"target\": \"aarch64-apple-darwin\", \"dir\": \"~/.blaze/llvm\"}'",
             "export LLVM_SYS_231_PREFIX=~/.blaze/llvm",
         ]))
         .log("/home/u/.cache/blaze/workers/67e8ace3/log")
@@ -52,7 +52,7 @@ error: llvm-sys can't find LLVM  [llvm: pin]
   └ blocks 247 packages, including blaze-engine
 
   fix   nix develop
-   or   python3 .github/scripts/llvm.py fetch --target aarch64-apple-darwin --dir ~/.blaze/llvm
+   or   python3 .github/scripts/llvm.py '{\"command\": \"fetch\", \"target\": \"aarch64-apple-darwin\", \"dir\": \"~/.blaze/llvm\"}'
         export LLVM_SYS_231_PREFIX=~/.blaze/llvm
 
   log   ~/.cache/blaze/workers/67e8ace3/log      more: blaze explain llvm-sys
@@ -73,7 +73,7 @@ error: llvm-sys can't find LLVM  [llvm: pin]
   └ blocks 247 packages, including blaze-engine
 
   fix   nix develop
-   or   python3 .github/scripts/llvm.py fetch --target aarch64-apple-darwin --dir ~/.blaze/llvm
+   or   python3 .github/scripts/llvm.py '{\"command\": \"fetch\", \"target\": \"aarch64-apple-darwin\", \"dir\": \"~/.blaze/llvm\"}'
         export LLVM_SYS_231_PREFIX=~/.blaze/llvm
 
   log   ~/.cache/blaze/workers/67e8ace3/log      more: blaze explain llvm-sys
@@ -92,7 +92,7 @@ fn example_as_json() {
         r#"{"Hash":"e152d9fa3c71b2d4"},{"Plain":"), pinned in "},{"Path":"/w/crates/hir-ty-codegen/llvm.json"}]},"#,
         r#"{"key":"found","text":[{"Var":"LLVM_SYS_231_PREFIX"},{"Plain":" is not set"}]}],"#,
         r#""fixes":[{"note":null,"lines":["nix develop"]},{"note":null,"lines":["#,
-        r#""python3 .github/scripts/llvm.py fetch --target aarch64-apple-darwin --dir ~/.blaze/llvm","#,
+        r#""python3 .github/scripts/llvm.py '{\"command\": \"fetch\", \"target\": \"aarch64-apple-darwin\", \"dir\": \"~/.blaze/llvm\"}'","#,
         r#""export LLVM_SYS_231_PREFIX=~/.blaze/llvm"]}],"#,
         r#""blocks":{"all":["blaze-engine","blaze-cargo"],"what":"packages","count":247,"notable":["blaze-engine"]},"#,
         r#""causes":[],"headline":[{"Plain":"llvm-sys can't find LLVM"}],"severity":"Error"}"#,

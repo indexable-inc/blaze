@@ -3295,7 +3295,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             )
         };
         match self.store.expr(expr) {
-            Expr::Literal(_) => true,
+            // A `const { .. }` block is a constant operand in rustc's MIR, as a constant item is
+            // (sqlx's `Cow::Borrowed(const { &[..] })`).
+            Expr::Literal(_) | Expr::Const(_) => true,
             Expr::Path(path) => {
                 // `Type::CONST` is resolved by inference, not by name.
                 if let Some((CandidateId::ConstId(_), _)) =
@@ -3326,8 +3328,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             }
             // The length is a constant already.
             Expr::Array(Array::Repeat { initializer, .. }) => self.is_promotable(initializer),
-            Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
-                fields.iter().all(|it| self.is_promotable(it.expr))
+            // `&M { a: 1, ..BASE }` copies the rest of its fields out of the base, which rustc
+            // promotes when the base is a constant (sqlx's `#[sqlx::test]` passes
+            // `&Migrator { .., ..Migrator::DEFAULT }` where `&'static` is wanted).
+            Expr::RecordLit { fields, spread, .. } => {
+                let base = match spread {
+                    RecordSpread::None => true,
+                    RecordSpread::Expr(base) => self.is_promotable(base),
+                    RecordSpread::FieldDefaults => false,
+                };
+                base && fields.iter().all(|it| self.is_promotable(it.expr))
             }
             Expr::Field { expr, .. } => self.is_promotable(expr),
             Expr::Call { callee, args } => {
@@ -4277,7 +4287,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         place: Place<'db>,
         current: BasicBlockId,
     ) -> Result<'db, Option<BasicBlockId>> {
-        let Some(CoroutineLocals { poll, context }) = self.result.coroutine else {
+        let Some(CoroutineLocals { poll, context, .. }) = self.result.coroutine else {
             not_supported!("await outside of an async block");
         };
         let lang_items = self.lang_items();
@@ -5216,7 +5226,34 @@ fn lower_closure_body_in<'db>(
             GenericArgs::new_from_slice(&[output.into()]),
         );
         let poll = ctx.alloc_local(Local { ty: poll.store() });
-        ctx.result.coroutine = Some(CoroutineLocals { poll, context });
+        // Lowering wraps the block an `async fn` or closure is written with in one that moves
+        // the parameters ahead of it.
+        let span = match (store.expr(expr), store.expr(root)) {
+            (
+                Expr::Closure {
+                    closure_kind:
+                        ClosureKind::Coroutine {
+                            kind: CoroutineKind::Async,
+                            source: CoroutineSource::Block,
+                        },
+                    ..
+                },
+                _,
+            ) => expr,
+            (
+                Expr::Closure {
+                    closure_kind:
+                        ClosureKind::Coroutine {
+                            kind: CoroutineKind::Async,
+                            source: CoroutineSource::Fn | CoroutineSource::Closure,
+                        },
+                    ..
+                },
+                Expr::Block { tail: Some(written), .. },
+            ) => written,
+            _ => implementation_error!("async body that is not an async block, fn or closure"),
+        };
+        ctx.result.coroutine = Some(CoroutineLocals { poll, context, span: span.into() });
     }
     let resolver_guard = ctx.resolver.update_to_inner_scope(db, ctx.store_owner, expr);
     let current = ctx.lower_params_and_bindings(

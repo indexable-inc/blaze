@@ -1,11 +1,14 @@
 //! [`HyperHttp`]: the [`Http`] blaze asks servers through (the `net` feature), on blaze-http:
 //! its sans-IO HTTP/1.1 client (`blaze_http::Client`: connections kept between requests by
 //! origin, redirects, gzip, TLS through rustls on ring with the machine's roots, every timeout
-//! a deadline) driven by its tokio driver on a runtime of this client's own.
+//! a deadline) driven by its tokio driver on a runtime of this client's own. Every request goes
+//! through the proxy the environment names for its origin, as curl and cargo read it
+//! (`blaze_http::proxy`), read once as the client is made: a variable that can't be used fails
+//! the client, naming it.
 //!
 //! The name is the first client's, kept so that no caller changes; nothing under it is hyper
 //! any more (no hyper, hyper-util, hyper-rustls or tokio-rustls: docs/v2/plan/observe/no-tracing.md,
-//! 6.1). No proxy is asked through, as none was before.
+//! 6.1).
 
 use std::{io::Read as _, sync::Arc, time::Duration};
 
@@ -54,7 +57,9 @@ impl HyperHttp {
         // only to the engine (its build.rs), so that a release changes no crate below it.
         let user_agent = "blaze (https://github.com/indexable-inc/blaze)";
         let tls = blaze_http::roots::native()?;
-        let config = Config { idle_most: IN_FLIGHT, ..Config::new(tls, user_agent, timeout) };
+        let proxies = blaze_http::proxy_env::from_env()?;
+        let config =
+            Config { idle_most: IN_FLIGHT, proxies, ..Config::new(tls, user_agent, timeout) };
         let driver = Driver::spawn(runtime.handle(), Client::new(config));
         Ok(HyperHttp {
             runtime,

@@ -2,7 +2,7 @@
 //! action of `SIGPIPE`, the CPU time used, and on Windows the handles a child inherits. std
 //! has none of these: each is the one system call that does it.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
 
 /// Whether the process `pid` runs: one this process may not signal (`EPERM`, another user's)
@@ -173,6 +173,37 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     }
     // A kqueue is readable once an event it watches has come.
     readable_within(queue.as_fd(), long)
+}
+
+/// Waits at most `long` for the process `pid` to end, on the kernel's word that it did (its
+/// process handle signalled), not by asking again and again: whether it ended. Any process this
+/// one may open is waited for, not only a child; one that is gone has ended.
+#[cfg(windows)]
+pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    // SAFETY: `OpenProcess` takes no pointer; any `pid` is either opened or refused with null.
+    // The handle it opens is owned below, so it is closed once.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        let error = std::io::Error::last_os_error();
+        // No process has the pid (and no handle holds one that had it): it ended.
+        let gone = error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32);
+        return if gone { Ok(true) } else { Err(error) };
+    }
+    // SAFETY: `process` is an open handle that nothing else owns: `OpenProcess` just made it.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    // Rounded up, and short of `INFINITE`: a wait of less than a millisecond left is one.
+    let ms = u32::try_from(long.as_micros().div_ceil(1000)).unwrap_or(INFINITE - 1).min(INFINITE - 1);
+    // SAFETY: the handle is open for as long as `process` lives, which outlives the call.
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), ms) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 /// Waits for the child `pid` to exit without reaping it (`waitid` with `WNOWAIT`), so its

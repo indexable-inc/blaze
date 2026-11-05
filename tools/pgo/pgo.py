@@ -575,7 +575,7 @@ class Tree:
 
 def fetch_llvm(target: str, work: Path) -> Llvm:
     prefix = work / "llvm"
-    cmd = [sys.executable, str(LLVM_PY), "fetch", "--target", target, "--dir", str(prefix)]
+    cmd = [sys.executable, str(LLVM_PY), json.dumps({"command": "fetch", "target": target, "dir": str(prefix)})]
     run("fetch the pinned LLVM", cmd, secs=1800)
     commit = json.loads(LLVM_PIN.read_text())["commit"]
     return Llvm(prefix, commit)

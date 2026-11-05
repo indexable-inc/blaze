@@ -723,6 +723,8 @@ fn known_file<'a>(table: impl Table<'a>, path: &str) -> bool {
 pub(crate) fn normal(path: &Path) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     let mut absolute = false;
+    // On Windows a host path's drive is the first part, as the daemon names it: `C:\a` is `/C:/a`.
+    let mut drive = None;
     for component in path.components() {
         match component {
             Component::RootDir => absolute = true,
@@ -731,13 +733,21 @@ pub(crate) fn normal(path: &Path) -> Option<String> {
                 parts.pop();
             }
             Component::Normal(part) => parts.push(part.to_str()?),
-            Component::Prefix(_) => return None,
+            Component::Prefix(prefix) => match prefix.kind() {
+                std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) if cfg!(windows) => {
+                    drive = Some(char::from(letter.to_ascii_uppercase()));
+                }
+                _ => return None,
+            },
         }
     }
     if !absolute {
         return None;
     }
-    Some(format!("/{}", parts.join("/")))
+    match drive {
+        Some(letter) => Some(format!("/{letter}:/{}", parts.join("/"))),
+        None => Some(format!("/{}", parts.join("/"))),
+    }
 }
 
 /// An absolute `/`-separated path without `.`, `..` or empty parts: `/a/b`, or `C:/a/b` with
@@ -842,7 +852,9 @@ mod normal_text_tests {
 
 /// [`normal`], borrowing a path that already is normal: the paths blaze-manifest asks for are.
 fn normal_ref(path: &Path) -> Option<Cow<'_, str>> {
+    // On Windows `Path::join` puts a `\` in the daemon's `/C:/a`: `normal` takes it out.
     if let Some(text) = path.to_str()
+        && !(cfg!(windows) && text.contains('\\'))
         && (text == "/"
             || (text.starts_with('/')
                 && text[1..].split('/').all(|it| !matches!(it, "" | "." | ".."))))
