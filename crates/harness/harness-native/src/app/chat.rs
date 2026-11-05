@@ -2,7 +2,7 @@
 //! structured events, not a terminal) drawn as a chat. The transcript comes from the model's [`model::chat::Transcript`]
 //! (agent-neutral events); each of its items becomes rows (a user message, the agent's markdown split into paragraphs,
 //! headings, list items, quotes and code blocks, thinking and tool calls folded to a line, a turn's foot) in a
-//! `ui.LazyStack`, so only the rows in view are entities. It scrolls on AppKit's physics and sticks to the bottom while
+//! `ui.LazyList`, so only the rows in view are entities. It scrolls on AppKit's physics and sticks to the bottom while
 //! the agent writes unless the person scrolled up. The input is a `ui.TextArea` edited here (`Draft`, keys in
 //! scene/20-keys.flecs ctx.Chat): Return sends, Shift+Return breaks the line, Escape interrupts.
 use super::*;
