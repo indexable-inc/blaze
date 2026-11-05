@@ -48,7 +48,6 @@ enum ARow {
         kids: usize,
     },
     More,
-    Note(&'static str),
 }
 
 /// Local midnight today (ms since the epoch).
@@ -217,8 +216,9 @@ impl App {
 
     /// The Archive's rows for its chip and search: day headings over the archived objects newest first, a session's
     /// archived runs under it while it is open (All and Sessions, no search); flat matches otherwise; the next page's
-    /// row at the foot until the daemon has no older runs.
-    fn archive_rows(&self) -> Vec<(String, &'static str, ARow)> {
+    /// row at the foot until the daemon has no older runs. With them, the note its empty state says (none while it has
+    /// rows, or while older pages may still hold some).
+    fn archive_rows(&self) -> (Vec<(String, &'static str, ARow)>, Option<&'static str>) {
         let w = self.world.world_ref();
         let chip = self.archive_chip();
         let q = self.archive_query().to_lowercase();
@@ -292,14 +292,12 @@ impl App {
         }
         let exhausted = w.try_get::<&model::History>(|h| h.exhausted).unwrap_or(false);
         // "Nothing archived yet" only once every older page is in: before that the foot's "Load older runs" is the truth.
-        if out.is_empty() && (exhausted || !items.is_empty()) {
-            let note = if items.is_empty() { "Nothing archived yet" } else { "Nothing matches" };
-            out.push(("note".into(), "hn.ArchNote", ARow::Note(note)));
-        }
+        let note = (out.is_empty() && (exhausted || !items.is_empty()))
+            .then_some(if items.is_empty() { "Nothing archived yet" } else { "Nothing matches" });
         if !exhausted && chip != 1 {
             out.push(("more".into(), "hn.ArchMore", ARow::More));
         }
-        out
+        (out, note)
     }
 
     /// Fill an Archive pane (the title bar names and counts it, [`Self::archive_subtitle`]): its search line, chips and list; and page in older runs once the list's
@@ -349,7 +347,15 @@ impl App {
         let mut foot_seen = false;
         let list_rect = list.entity().try_cloned::<&Laid>();
         // Only the rows in view are entities (recycled as the list scrolls); paging asks the daemon once the foot shows.
-        let rows = self.archive_rows();
+        let (rows, note) = self.archive_rows();
+        // The empty state: centred in the room the rows leave (scene/widgets/archive.flecs `empty`), not a row of them.
+        if let Some(empty) = list.part("empty") {
+            for_each(empty, "hn.ArchNote", note.map(|n| ("note", n)), |row, n, _| {
+                if let Some(p) = row.part("label") {
+                    p.text(n);
+                }
+            });
+        }
         view::lazy_for_each_of(
             lazy,
             rows.len() as u32,
@@ -360,7 +366,7 @@ impl App {
                     row.set(HoverAmt::default());
                 }
                 match rows[i as usize].2 {
-                    ARow::Section(s) | ARow::Note(s) => {
+                    ARow::Section(s) => {
                         if let Some(p) = row.part("label") {
                             p.text(s);
                         }
@@ -506,7 +512,7 @@ impl App {
             return all;
         }
         let shown =
-            self.archive_rows().iter().filter(|(_, _, r)| matches!(r, ARow::Item { .. })).count();
+            self.archive_rows().0.iter().filter(|(_, _, r)| matches!(r, ARow::Item { .. })).count();
         let what =
             if chip == 0 { "matching".to_owned() } else { CHIPS[usize::from(chip)].to_lowercase() };
         format!("{all}  \u{00B7}  {shown} {what}")
@@ -593,7 +599,7 @@ impl App {
 
     /// Return in the Archive: open its first row.
     pub(super) fn archive_open_first(&mut self) {
-        let first = self.archive_rows().into_iter().find_map(|(_, _, r)| match r {
+        let first = self.archive_rows().0.into_iter().find_map(|(_, _, r)| match r {
             ARow::Item { e, .. } => Some(e),
             _ => None,
         });

@@ -274,7 +274,7 @@ fn script_error(e: EntityView<'_>) -> Option<String> {
     .flatten()
 }
 
-/// A palette entry's glyph: a kind's mark (`look::kind_mark`), or a character in the muted ink.
+/// A palette entry's glyph: a kind's mark (`look::kind_mark`), or a codicon (`look::*_ICON`) in the muted ink.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PalGlyph {
     Kind(String),
@@ -1219,28 +1219,28 @@ impl App {
         }
         out.push((
             "kill".into(),
-            PalGlyph::Char("\u{2715}"),
+            PalGlyph::Char(crate::look::KILL_ICON),
             "Kill current object".into(),
             self.hint("Archive"),
             Do::Kill,
         ));
         out.push((
             "sidebar".into(),
-            PalGlyph::Char("\u{25E7}"),
+            PalGlyph::Char(crate::look::SIDEBAR_ICON),
             "Toggle sidebar".into(),
             self.hint("ToggleSidebar"),
             Do::Sidebar,
         ));
         out.push((
             "zoom-in".into(),
-            PalGlyph::Char("+"),
+            PalGlyph::Char(crate::look::ZOOM_IN_ICON),
             "Zoom in".into(),
             self.hint("ZoomIn"),
             Do::Zoom(1),
         ));
         out.push((
             "zoom-out".into(),
-            PalGlyph::Char("\u{2212}"),
+            PalGlyph::Char(crate::look::ZOOM_OUT_ICON),
             "Zoom out".into(),
             self.hint("ZoomOut"),
             Do::Zoom(-1),
@@ -1477,8 +1477,6 @@ impl App {
             self.world.set(Viewport { w: view.0, h: view.1 });
         }
         self.world.set(self.pointer);
-        let next = w.try_get::<&Paint>(|p| p.frame).unwrap_or(0).wrapping_add(1);
-        self.world.set(Paint { frame: next });
         self.world.get::<&mut Clock>(|c| {
             c.time += dt;
             c.moving = false;
@@ -1486,7 +1484,7 @@ impl App {
         let before = self.world.try_get::<&model::Inbox>(|i| i.applied);
         self.sync_view();
         self.typeset();
-        self.world.progress_time(dt);
+        self.progress(dt);
         if self.world.try_get::<&model::Inbox>(|i| i.applied) != before {
             // The daemon said something: the view follows in this frame.
             self.sync_view();
@@ -1496,7 +1494,7 @@ impl App {
             if self.typeset() == 0 {
                 break;
             }
-            self.world.progress_time(0.0);
+            self.progress(0.0);
             self.poke_why("layout");
         }
         self.forward_clicks();
@@ -1530,6 +1528,15 @@ impl App {
         }
         self.stats_end(&d);
         d
+    }
+
+    /// One `progress` of the world, its draw pass under a new `Paint` number (the contract: advanced before each
+    /// `progress`). A frame runs several while text settles, and only what the last one painted is drawn: a node a later
+    /// pass hid, faded out or clipped away does not keep the number of an earlier one.
+    fn progress(&mut self, dt: f32) {
+        let next = self.world.try_get::<&Paint>(|p| p.frame).unwrap_or(0).wrapping_add(1);
+        self.world.set(Paint { frame: next });
+        self.world.progress_time(dt);
     }
 
     /// The window's title-bar strip (from AppKit, in points; see window.rs): the view leaves it clear and sets the title in it.
@@ -1737,10 +1744,8 @@ impl App {
             p.alpha *= crate::look::alpha(w, e, lo);
             let is_term = e.has(TermNode::id());
             let scroller_part = e.has(harness_native_ui_layout_api::ScrollerPart::id());
-            if p.alpha <= 0.002 && !is_term {
-                continue;
-            }
-            if p.clipped && (p.clip_w <= 0.0 || p.clip_h <= 0.0) {
+            // Nothing is drawn that cannot be seen, a terminal's thousands of cells least of all.
+            if !seen(&p) {
                 continue;
             }
             let rect = [laid.x, laid.y, laid.w, laid.h];
@@ -1771,7 +1776,12 @@ impl App {
             let (np, ng) = (at.panels, at.glyphs);
             let turn = (p.kind == PaintKind::Icon).then(|| crate::look::turn(e)).flatten();
             if is_term && p.kind == PaintKind::Plate {
+                let cells = (d.panels.len(), d.glyphs.len(), d.sprites.len());
                 self.emit_term(id, d, sc, upload);
+                // Its cells at the node's opacity, as every other node's paint is (a fade, a Pose): never popped in whole.
+                if p.alpha < 1.0 {
+                    fade_cells(d, cells, p.alpha);
+                }
             }
             // A disclosure chevron turns about its middle.
             if let Some(turn) = turn {
@@ -1791,15 +1801,13 @@ impl App {
                     ];
                 }
             }
-            if p.clipped && !scroller_part {
-                // Cut to its band: soft at an edge with more beyond it (the tree's, else its clip's ClipFade; not a scroller).
-                if let Some(fade) = self.tree_fade(&p).or_else(|| (p.fade != [0.0; 2]).then_some(p.fade)) {
-                    for panel in &mut d.panels[np..] {
-                        panel.clip[2..].copy_from_slice(&fade);
-                    }
-                    for glyph in &mut d.glyphs[ng..] {
-                        glyph.fade[..2].copy_from_slice(&fade);
-                    }
+            // Cut to its band: soft at an edge with more beyond it (its clip's ClipFade: the tree's, a chat's; not a scroller).
+            if p.clipped && !scroller_part && p.fade != [0.0; 2] {
+                for panel in &mut d.panels[np..] {
+                    panel.clip[2..].copy_from_slice(&p.fade);
+                }
+                for glyph in &mut d.glyphs[ng..] {
+                    glyph.fade[..2].copy_from_slice(&p.fade);
                 }
             }
             let _ = Level::Base;
@@ -1988,6 +1996,27 @@ fn fmt_dur(ms: u64) -> String {
         10_000..60_000 => format!("{s}s"),
         60_000..3_600_000 => format!("{}m{:02}s", s / 60, s % 60),
         _ => format!("{}h{:02}m", s / 3600, (s / 60) % 60),
+    }
+}
+
+/// Whether what the draw pass painted can be seen: opaque past the cut and not clipped to nothing. Only that is drawn
+/// (`App::emit`), and only a terminal painted so this frame is laid out, followed and hit (src/app/panes.rs).
+pub(super) fn seen(p: &harness_native_ui_draw_api::Painted) -> bool {
+    p.alpha > 0.002 && !(p.clipped && (p.clip_w <= 0.0 || p.clip_h <= 0.0))
+}
+
+/// The panels, glyphs and sprites drawn from `from` on (a terminal's cells) at `alpha` of their opacity.
+fn fade_cells(d: &mut Draw, from: (usize, usize, usize), alpha: f32) {
+    for panel in &mut d.panels[from.0..] {
+        panel.fx2[1] *= alpha;
+    }
+    for glyph in &mut d.glyphs[from.1..] {
+        glyph.col_d[3] *= alpha;
+        glyph.col_l[3] *= alpha;
+    }
+    for sprite in &mut d.sprites[from.2..] {
+        sprite.fg[3] *= alpha;
+        sprite.bg[3] *= alpha;
     }
 }
 

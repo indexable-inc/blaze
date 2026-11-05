@@ -36,6 +36,12 @@ hn {
         Lazy: {count: 0, row: $row_h, overscan: 6}
         Flex: {axis: Column, gap: 1, align: Stretch, justify: Start, wrap: false}
       }
+      // The empty state (an hn.ArchNote, or nothing): a Grow child of the scroll takes what the rows leave of its viewport
+      // (and nothing once they overflow it), so the note sits in the middle of the list's room, not on a row.
+      empty : ui.List {
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+        Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+      }
     }
   }
 
@@ -125,10 +131,11 @@ hn {
     }
   }
 
-  // The Archive's list when nothing is in it (or nothing matches).
+  // The Archive's list when nothing is in it (or nothing matches), centred in the room the rows leave (ArchivePane's
+  // `empty`).
   prefab ArchNote : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $row_h, min: 0, max: 0}}
     label : ui.Line, Faint {
       TextStyle: {size: $size_body, line: 16, role: 0, bold: 0}
     }

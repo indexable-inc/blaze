@@ -55,8 +55,10 @@ hn {
   }
 
   // The sidebar's tree: one row per object, kept by key (src/view.rs). It takes the sidebar's height left over by the
-  // device row and the Archive pinned under it, and clips what does not fit.
+  // device row and the Archive pinned under it, and clips what does not fit: soft at an edge with more of it beyond
+  // (ClipFade, from the ScrollState its physics writes, src/app/sidebar.rs), hard at an edge it ends at.
   prefab Tree : ui.Scroll {
+    ClipFade: {len: $tree_fade_len}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: $side_inset, r: 0, t: 0, b: 0}
