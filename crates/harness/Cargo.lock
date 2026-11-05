@@ -926,6 +926,7 @@ dependencies = [
  "harness-native-api",
  "harness-native-flecs",
  "harness-native-ui-input-api",
+ "harness-native-ui-motion-api",
  "harness-native-ui-node-api",
 ]
 

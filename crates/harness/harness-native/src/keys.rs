@@ -22,10 +22,11 @@ pub struct Does;
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct When;
 
-/// An `act.Spawn`'s kind of object.
+/// An `act.Spawn`'s kind of object, and its name in the new-object picker (empty: it is not in the picker).
 #[derive(Component, Clone, Debug, Default, PartialEq)]
 pub struct SpawnKind {
     pub kind: ScriptString,
+    pub title: ScriptString,
 }
 
 /// An `act.SelectIndex`'s place in the tree (1 the first).
@@ -87,6 +88,7 @@ pub const ROOTS: [&str; 3] = ["ctx", "act", "key"];
 pub const TERMINAL: &str = "ctx::Terminal";
 pub const TREE: &str = "ctx::Tree";
 pub const PALETTE: &str = "ctx::Palette";
+pub const PICKER: &str = "ctx::Picker";
 pub const ARCHIVE: &str = "ctx::Archive";
 pub const CHAT: &str = "ctx::Chat";
 
@@ -402,6 +404,16 @@ impl Keymap {
         self.binds
             .iter()
             .find(|b| b.action == id && b.ctxs.is_empty() && !shadowed(&self.binds, b))
+            .map(|b| &b.chord)
+    }
+
+    /// The keys that run action `id` in context `ctx` alone (its first binding there that nothing shadows): the key a
+    /// picker row shows in its keycap.
+    #[must_use]
+    pub fn in_context(&self, id: u64, ctx: u64) -> Option<&Chord> {
+        self.binds
+            .iter()
+            .find(|b| b.action == id && b.ctxs == [ctx] && !shadowed(&self.binds, b))
             .map(|b| &b.chord)
     }
 

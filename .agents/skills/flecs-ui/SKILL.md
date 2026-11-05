@@ -130,7 +130,7 @@ template hn.ObjRow {
 
 `harness-native/scene/20-keys.flecs`: `act.*` action entities (params such as `SpawnKind`, `ZoomStep`, `SelectN`,
 `Bytes` on `act.SendBytes` children; `MenuItem`, `Selector`), `key.* { Keybind: {key, cmd, shift, opt, ctrl};
-(Does, act.X); (When, ctx.Tree) }`. No `When` holds everywhere; the innermost active context wins (`ctx.Palette`,
+(Does, act.X); (When, ctx.Tree) }`. No `When` holds everywhere; the innermost active context wins (`ctx.Palette` or `ctx.Picker`,
 `ctx.Archive`, then `ctx.Tree` over `ctx.Terminal`), later bindings win, unbound keys go to the terminal. The menu bar,
 palette hints and sidebar cmd+1-9 hints are generated from the same entities. User overrides:
 `$HARNESS_HOME/keys.flecs` (default `~/.harness`), run after the scene, reloaded when it changes. A new binding to an
