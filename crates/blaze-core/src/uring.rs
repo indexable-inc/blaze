@@ -2278,6 +2278,10 @@ impl Driver for Uring {
                         None
                     })
                 }
+                // No name to stamp: answered here, with no stamper woken for it.
+                Effect::Stamp { files, .. } if files.is_empty() => {
+                    Ok(Some(Done::Stamped(Vec::new())))
+                }
                 Effect::Stamp { files, .. } => self.sweep(tag, files).map(|()| None),
                 Effect::Entries { dir, .. } => self.list(tag, dir).map(|()| None),
                 Effect::Flush { watch, .. } => self.flush(watch, tag).map(|()| None),
