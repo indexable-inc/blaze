@@ -1105,11 +1105,13 @@ dependencies = [
 name = "blaze-http"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "blaze-sha256",
  "bytes",
  "flate2",
  "http",
  "httparse",
+ "percent-encoding",
  "quinn-proto",
  "rcgen",
  "rustls",

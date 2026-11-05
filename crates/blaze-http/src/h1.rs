@@ -19,7 +19,9 @@ const CHUNK_LINE_MOST: usize = 4 << 10;
 /// The request line and headers of a request for `target` (path and query) of `host` (its
 /// `Host`, port included when it is not the scheme's), its `headers` after the client's own,
 /// and the `Content-Length` of a body of `body` bytes where one is said: always for a body,
-/// and for an empty one of a method that carries one (`POST`, `PUT`, `PATCH`).
+/// and for an empty one of a method that carries one (`POST`, `PUT`, `PATCH`). Through an HTTP
+/// proxy, `target` is in absolute form and `proxy_authorization` the proxy's credentials, if
+/// it has any.
 ///
 /// A caller's `Host` replaces the client's. Header names are written as given, the client's in
 /// lower case, as hyper wrote them.
@@ -32,11 +34,15 @@ pub fn write_request(
     gzip: bool,
     headers: &[(String, String)],
     body: usize,
+    proxy_authorization: Option<&str>,
 ) {
     // Writes into a vector, which cannot fail.
     _ = write!(out, "{method} {target} HTTP/1.1\r\n");
     if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host")) {
         _ = write!(out, "host: {host}\r\n");
+    }
+    if let Some(credentials) = proxy_authorization {
+        _ = write!(out, "proxy-authorization: {credentials}\r\n");
     }
     _ = write!(out, "user-agent: {user_agent}\r\n");
     if gzip {
