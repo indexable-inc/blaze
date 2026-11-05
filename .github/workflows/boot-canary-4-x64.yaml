@@ -1,0 +1,43 @@
+# Temporary (boot-canary lane, 2026-11-05): one cargo bootstrap build of blaze-engine for
+# x86_64-unknown-linux-gnu, because no ix x86_64 VM can be placed. Deleted with its branch.
+name: boot-canary-4-x64
+on:
+  push:
+    branches: [boot-canary-4-x64]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v7
+      - name: free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - name: toolchain and LLVM
+        run: |
+          rustup toolchain install nightly-2026-10-27 --profile minimal
+          sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+          python3 .github/scripts/llvm.py fetch --target x86_64-unknown-linux-gnu --dir /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
+      - name: cargo build
+        env:
+          LLVM_SYS_231_PREFIX: /usr/local/lib/blaze-llvm/x86_64-unknown-linux-gnu
+          CARGO_INCREMENTAL: "0"
+          BLAZE_RELEASE: v0.20261105.4
+          BLAZE_GIT_SHA: e930296
+          BLAZE_GIT_DATE: "2026-11-05"
+        run: |
+          cargo +nightly-2026-10-27 build -p blaze-engine --release --locked
+          ls -la target/release
+          df -h /
+      - name: pack
+        run: |
+          mkdir out && cp target/release/blaze target/release/blaze-engine out/
+          ./out/blaze-engine --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: out/
+          if-no-files-found: error
