@@ -130,6 +130,11 @@ dictionary cap and restart the streams).
 
 ## The page (indexable-inc/ix, packages/web/src/lib/explore)
 
+Superseded by [explore-core.md](explore-core.md) (2026-11-05): the page's decoding, live state
+and trace layout move to `blaze-explore-core` in wasm, and the views are written from questions.
+What follows is what the TS page shipped (indexable-inc/ix#7612).
+
+
 - A stateful decoder per live table (fixes today's: each frame after the first is not a whole
   IPC stream), reset at the end-of-stream marker, feeding one store of the core tables, applied
   on TICK.
@@ -157,5 +162,6 @@ dictionary cap and restart the streams).
 4. `tasks`, `task_edges` and `open.task` in the core; ix-prof's producer, with a test that reads
    a task, its progress and a follows-from edge back through a session.
 5. The daemon's producer from the plane and the downloads registry (with lane fetch-progress).
-6. The page: the stateful decoder, Running now, Graph.
+6. The page: the stateful decoder, Running now, Graph (shipped in TS, ix#7612; the rest is
+   [explore-core.md](explore-core.md)).
 7. The feed carries samples, frames, stacks and allocations; the HTTP live stream goes.

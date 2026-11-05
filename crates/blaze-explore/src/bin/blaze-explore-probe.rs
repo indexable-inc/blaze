@@ -1,6 +1,6 @@
 //! The WebTransport probe: does a browser connect to a WebTransport server on 127.0.0.1 from an
 //! https page, pinning a self-signed certificate by its hash? An echo server with the
-//! explorer's own certificate (`blaze_explore::cert`): it prints the link to the probe page
+//! explorer's own certificate (`ix_prof::explore::cert`): it prints the link to the probe page
 //! (`probe/index.html` in this crate, served from an https origin), and echoes each
 //! bidirectional stream on itself, each unidirectional stream on one it opens, and each
 //! datagram. It prints what each session's CONNECT carried (path, Origin, User-Agent), so a run
@@ -16,7 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use blaze_explore::cert::{Cert, Validity};
+use ix_prof::explore::cert::{Cert, Validity};
 use blaze_http::h3::{
     Identity, ServerConfig, Transport,
     tokio_driver::{Driver, RecvStream, Request, SendStream, Session},
@@ -81,7 +81,8 @@ fn run() -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|why| format!("the wall clock: {why}"))?
         .as_secs();
-    let cert = Cert::make(Validity::starting(now)).map_err(|why| why.to_string())?;
+    let cert = Cert::make(Validity::starting(now), blaze_explore::NAME)
+        .map_err(|why| why.to_string())?;
     let identity = cert.identity().map_err(|why| why.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

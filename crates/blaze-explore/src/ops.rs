@@ -1,17 +1,19 @@
-//! The answer to each op but `hello` (the session's, `server`), with no transport in it: a
-//! header and at most one table. Everything here may wait (DuckDB runs as a process, Flecs
-//! answers on its own thread), so the server calls it on tokio's blocking pool.
+//! The answer to each op of the `blaze` layer (`hello` is the session's,
+//! `ix_prof::explore::session`), with no transport in it: a header and at most one table.
+//! Everything here may wait (DuckDB runs as a process, Flecs answers on its own thread), so the
+//! server calls it on tokio's blocking pool.
 
 use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema};
 use blaze_profile::{sql, views};
-use serde_json::{Map, Value};
+use ix_prof::explore::{Answer, Kind as Core, OpError, Table};
+use serde_json::Value;
 
 use crate::{
     tiles::{self, Lane, Range, TilesError},
-    wire::{Kind, Request, WireError},
+    wire::{Kind, Request},
 };
 
 /// Where the history's queries run: the pinned DuckDB CLI and the history's directory.
@@ -51,58 +53,10 @@ pub(crate) struct Context {
     pub(crate) world: Option<Arc<blaze_web::Graphs>>,
 }
 
-/// A table of an answer: its schema and its batches, all of it.
-pub(crate) struct Table {
-    pub(crate) schema: SchemaRef,
-    pub(crate) batches: Vec<RecordBatch>,
-}
-
-impl Table {
-    pub(crate) fn rows(&self) -> usize {
-        self.batches.iter().map(RecordBatch::num_rows).sum()
-    }
-
-    fn of(batches: Vec<RecordBatch>) -> Option<Table> {
-        // clone: an `Arc` of the schema
-        let schema = batches.first()?.schema();
-        Some(Table { schema, batches })
-    }
-}
-
-/// An answer: its header (`op` and what else the op says) and its table, if it has one.
-pub(crate) struct Answer {
-    pub(crate) header: Map<String, Value>,
-    pub(crate) table: Option<Table>,
-}
-
-impl Answer {
-    fn new(op: &'static str) -> Answer {
-        let mut header = Map::new();
-        // alloc: once a request, its header
-        header.insert("op".to_owned(), op.into());
-        Answer { header, table: None }
-    }
-
-    #[must_use]
-    fn with(mut self, key: &str, value: impl Into<Value>) -> Answer {
-        // alloc: once a request, its header
-        self.header.insert(key.to_owned(), value.into());
-        self
-    }
-}
-
-/// The answer to `request`. `hello` is the session's to answer; asked here it is a bug of the
-/// caller, said as `bad_args`. A message on `stop`, or its sender gone, kills a DuckDB query under
+/// The answer to `request`. A message on `stop`, or its sender gone, kills a DuckDB query under
 /// way, answered `cancelled`.
-pub(crate) fn answer(
-    cx: &Context,
-    request: Request,
-    stop: &sql::Stop,
-) -> Result<Answer, WireError> {
+pub(crate) fn answer(cx: &Context, request: Request, stop: &sql::Stop) -> Result<Answer, OpError> {
     match request {
-        Request::Hello { .. } => {
-            Err(WireError::new(Kind::BadArgs, "hello is answered by the session"))
-        }
         Request::Builds {} => {
             let sql = "SELECT * FROM builds ORDER BY started_ns";
             Ok(query(cx, "builds", sql, stop)?.0)
@@ -119,7 +73,7 @@ pub(crate) fn answer(
         Request::Spans { build, t0_ns, t1_ns } => {
             if t1_ns <= t0_ns {
                 let message = format!("t1_ns {t1_ns} is not after t0_ns {t0_ns}");
-                return Err(WireError::new(Kind::BadArgs, message));
+                return Err(OpError::new(Core::BadArgs, message));
             }
             let sql = format!(
                 "SELECT * FROM spans WHERE {} ORDER BY process, thread, start_ns",
@@ -176,14 +130,14 @@ fn overlapping(build: u64, t0_ns: i64, t1_ns: i64) -> String {
 }
 
 /// Runs `sql` over the history.
-fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, WireError> {
+fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, OpError> {
     let Some(duckdb) = &cx.history.duckdb else {
         let message = "the daemon was started with no DuckDB to query the history with: \
                        `blaze explore` passes the one `nix run .#duckdb` pins";
-        return Err(WireError::new(Kind::Sql, message).with("query", sql));
+        return Err(OpError::new(Kind::Sql, message).with("query", sql));
     };
     (cx.history.flush.0)().map_err(|why| {
-        WireError::new(
+        OpError::new(
             Kind::Flush,
             format!(
                 "the history was not flushed before the query, so it would miss recent rows: {why}"
@@ -194,12 +148,12 @@ fn run(cx: &Context, sql: &str, stop: &sql::Stop) -> Result<Vec<RecordBatch>, Wi
     let query = sql::Query { duckdb, history: &cx.history.dir, scope: sql::Scope::All, sql };
     sql::run_with(&query, stop).map_err(|error| {
         let kind = match (&error, error.kind()) {
-            (sql::SqlError::Stopped, _) => Kind::Cancelled,
-            (_, "no_such_view") => Kind::NoSuchView,
-            (_, "bad_args") => Kind::BadArgs,
-            _ => Kind::Sql,
+            (sql::SqlError::Stopped, _) => Core::Cancelled.name(),
+            (_, "no_such_view") => Kind::NoSuchView.name(),
+            (_, "bad_args") => Core::BadArgs.name(),
+            _ => Kind::Sql.name(),
         };
-        let mut wire = WireError::new(kind, error.to_string()).with("query", sql);
+        let mut wire = OpError::new(kind, error.to_string()).with("query", sql);
         if let sql::SqlError::Duckdb { message, .. } = &error {
             wire = wire.with("duckdb", message.as_str());
         }
@@ -213,7 +167,7 @@ fn query(
     op: &'static str,
     sql: &str,
     stop: &sql::Stop,
-) -> Result<(Answer, usize), WireError> {
+) -> Result<(Answer, usize), OpError> {
     let batches = run(cx, sql, stop)?;
     let table = Table::of(batches);
     let rows = table.as_ref().map_or(0, Table::rows);
@@ -221,37 +175,37 @@ fn query(
 }
 
 /// `Ok` when the history has build `build`, else `no_such_build`.
-fn known_build(cx: &Context, build: u64, stop: &sql::Stop) -> Result<(), WireError> {
+fn known_build(cx: &Context, build: u64, stop: &sql::Stop) -> Result<(), OpError> {
     let found =
         run(cx, &format!("SELECT build_id FROM builds WHERE build_id = {build} LIMIT 1"), stop)?;
     if found.iter().any(|it| it.num_rows() > 0) {
         return Ok(());
     }
-    Err(WireError::new(Kind::NoSuchBuild, format!("the history has no build {build}"))
+    Err(OpError::new(Kind::NoSuchBuild, format!("the history has no build {build}"))
         .with("build", build))
 }
 
-fn view_error(error: &views::ViewError) -> WireError {
+fn view_error(error: &views::ViewError) -> OpError {
     let kind = match error.kind() {
-        "no_such_view" => Kind::NoSuchView,
-        "bad_args" => Kind::BadArgs,
-        _ => Kind::Sql,
+        "no_such_view" => Kind::NoSuchView.name(),
+        "bad_args" => Core::BadArgs.name(),
+        _ => Kind::Sql.name(),
     };
-    WireError::new(kind, error.to_string())
+    OpError::new(kind, error.to_string())
 }
 
-fn tiles_error(error: &TilesError) -> WireError {
+fn tiles_error(error: &TilesError) -> OpError {
     let kind = match error {
-        TilesError::Range(_) => Kind::BadArgs,
-        TilesError::Column { .. } | TilesError::Value { .. } => Kind::Sql,
-        TilesError::Arrow(_) => Kind::Encode,
+        TilesError::Range(_) => Core::BadArgs.name(),
+        TilesError::Column { .. } | TilesError::Value { .. } => Kind::Sql.name(),
+        TilesError::Arrow(_) => Core::Encode.name(),
     };
-    WireError::new(kind, error.to_string())
+    OpError::new(kind, error.to_string())
 }
 
 /// The `views` table: each view's name, title, SQL with `$<arg>` where its arguments go, and
 /// the JSON Schema of its arguments.
-fn views_table() -> Result<Table, WireError> {
+fn views_table() -> Result<Table, OpError> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
         Field::new("title", DataType::Utf8, false),
@@ -269,38 +223,38 @@ fn views_table() -> Result<Table, WireError> {
     ];
     // clone: an `Arc` of the schema
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .map_err(|why| WireError::new(Kind::Encode, format!("the views table: {why}")))?;
+        .map_err(|why| OpError::new(Core::Encode, format!("the views table: {why}")))?;
     Ok(Table { schema, batches: vec![batch] })
 }
 
 /// Flecs's REST answer to `GET <path>` over the builds' world, its JSON in the header's
 /// `world`.
-fn world(cx: &Context, path: &str) -> Result<Answer, WireError> {
+fn world(cx: &Context, path: &str) -> Result<Answer, OpError> {
     let Some(graphs) = &cx.world else {
         let message = "the daemon keeps no build world: blaze_web::Graphs, the Flecs world of the \
                        builds' functions, is not made by the v2 daemon (crates/blaze-cargo) or fed \
                        its builds' records";
         return Err(
-            WireError::new(Kind::NoWorld, message).with("needs", "blaze_web::Graphs in the daemon")
+            OpError::new(Kind::NoWorld, message).with("needs", "blaze_web::Graphs in the daemon")
         );
     };
     if !path.starts_with('/') {
-        return Err(WireError::new(
-            Kind::BadArgs,
+        return Err(OpError::new(
+            Core::BadArgs,
             format!("the world's path `{path}` does not start with `/`"),
         ));
     }
-    let answered = graphs.rest("GET", path).map_err(|why| WireError::new(Kind::NoWorld, why))?;
+    let answered = graphs.rest("GET", path).map_err(|why| OpError::new(Kind::NoWorld, why))?;
     if answered.code != 200 {
         let message = format!(
             "Flecs answered {} to GET {path}: {}",
             answered.code,
             String::from_utf8_lossy(&answered.body)
         );
-        return Err(WireError::new(Kind::World, message).with("code", answered.code));
+        return Err(OpError::new(Kind::World, message).with("code", answered.code));
     }
     let world: Value = serde_json::from_slice(&answered.body).map_err(|why| {
-        WireError::new(
+        OpError::new(
             Kind::World,
             format!("Flecs's answer to GET {path} is not JSON ({}): {why}", answered.kind),
         )
@@ -311,10 +265,11 @@ fn world(cx: &Context, path: &str) -> Result<Answer, WireError> {
 #[cfg(test)]
 mod tests {
     use arrow_array::cast::AsArray;
+    use serde_json::Map;
 
     use super::*;
 
-    fn answer(cx: &Context, request: Request) -> Result<Answer, WireError> {
+    fn answer(cx: &Context, request: Request) -> Result<Answer, OpError> {
         super::answer(cx, request, &crossbeam_channel::never())
     }
 
@@ -348,40 +303,40 @@ mod tests {
     #[test]
     fn a_view_that_is_not_there_or_badly_asked_is_its_own_error() {
         let missing = answer(&cx(), Request::View { name: "nope".to_owned(), args: Map::new() });
-        assert_eq!(missing.err().map(|it| it.kind), Some(Kind::NoSuchView));
+        assert_eq!(missing.err().map(|it| it.kind), Some(Kind::NoSuchView.name()));
         let mut args = Map::new();
         args.insert("bulid".to_owned(), 3.into());
         let name = views::VIEWS[0].name.to_owned();
         let bad = answer(&cx(), Request::View { name, args });
-        assert_eq!(bad.err().map(|it| it.kind), Some(Kind::BadArgs));
+        assert_eq!(bad.err().map(|it| it.kind), Some(Core::BadArgs.name()));
     }
 
     #[test]
     fn with_no_duckdb_every_history_op_says_so_and_names_the_query() {
         let error = answer(&cx(), Request::Sql { sql: "SELECT 1".to_owned() }).err().unwrap();
-        assert_eq!(error.kind, Kind::Sql);
+        assert_eq!(error.kind, Kind::Sql.name());
         assert_eq!(error.detail["query"], "SELECT 1");
         assert!(error.message.contains("nix run .#duckdb"), "{error}");
         let error = answer(&cx(), Request::Builds {}).err().unwrap();
-        assert_eq!(error.kind, Kind::Sql);
+        assert_eq!(error.kind, Kind::Sql.name());
     }
 
     #[test]
     fn a_backwards_range_is_bad_args_before_any_query() {
         let spans = answer(&cx(), Request::Spans { build: 1, t0_ns: 9, t1_ns: 9 });
-        assert_eq!(spans.err().map(|it| it.kind), Some(Kind::BadArgs));
+        assert_eq!(spans.err().map(|it| it.kind), Some(Core::BadArgs.name()));
         let tiles = answer(
             &cx(),
             Request::Tiles { build: 1, t0_ns: 0, t1_ns: 10, bucket_ns: 0, lane: Lane::Thread },
         );
-        assert_eq!(tiles.err().map(|it| it.kind), Some(Kind::BadArgs));
+        assert_eq!(tiles.err().map(|it| it.kind), Some(Core::BadArgs.name()));
     }
 
     #[test]
     fn with_no_world_the_world_op_names_what_is_missing() {
         let error =
             answer(&cx(), Request::World { path: "/entity/flecs".to_owned() }).err().unwrap();
-        assert_eq!(error.kind, Kind::NoWorld);
+        assert_eq!(error.kind, Kind::NoWorld.name());
         assert!(error.message.contains("blaze_web::Graphs"), "{error}");
     }
 

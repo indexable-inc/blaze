@@ -1,4 +1,4 @@
-//! The bytes the daemon sends (explore-wire.md, "Frames").
+//! The bytes the server sends (explore-wire.md, "Frames").
 //!
 //! An answer, on the request's bidirectional stream: `u32 LE` header length, the header's JSON
 //! padded with spaces so that what follows starts a multiple of [`ALIGN`] bytes from the
@@ -10,9 +10,9 @@
 //! frame laid out as an answer, its alignment counted from the frame's own first byte (the byte
 //! after its length), since the page copies each frame out of the stream whole. A live frame's
 //! IPC is not a whole stream: it is the next messages of its table's one stream for the session
-//! (blaze-profile's `live::Encoder`), schema and dictionaries once, then a batch and its
-//! dictionaries' new values a frame, and an end-of-stream marker then a new schema where the
-//! stream starts again.
+//! (the source's encoder: blaze-profile's `live::Encoder` for the daemon), schema and
+//! dictionaries once, then a batch and its dictionaries' new values a frame, and an
+//! end-of-stream marker then a new schema where the stream starts again.
 
 use arrow_array::RecordBatch;
 use arrow_ipc::{

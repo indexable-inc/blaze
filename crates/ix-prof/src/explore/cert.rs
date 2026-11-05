@@ -5,18 +5,19 @@
 //! from [`BACKDATE_S`] before it is made, and made anew once [`ROTATE_AFTER_S`] (12 days) of
 //! that have passed: a day before it expires. [`Rotation`] is that rule alone, taking the time
 //! as an argument, so a test runs it on a clock of its own; the server asks it every
-//! `server::CHECK` (10 minutes) of the wall clock, so a machine that slept past the day is
+//! [`super::CHECK`] (10 minutes) of the wall clock, so a machine that slept past the day is
 //! caught within minutes of waking.
 //!
 //! What a session sees when the certificate is made anew: nothing breaks. QUIC checked the
 //! certificate once, in the handshake, and an open session keeps its keys. The live stream
 //! sends `{"op":"cert","certhash","not_after_unix_s"}`, and the page puts the new hash in its
 //! link for its next connection; a page opened later from the old link gets the browser's
-//! certificate error and asks for `blaze explore` again, which prints the current link.
+//! certificate error and asks for the link again (`blaze explore` for the daemon's), which
+//! prints the current one.
 
 use std::time::Duration;
 
-use crate::link;
+use super::link;
 
 pub const DAY_S: u64 = 86_400;
 /// How long a certificate is valid: under the 14 days WebTransport allows.
@@ -121,15 +122,16 @@ pub struct Cert {
 
 impl Cert {
     /// A certificate of `validity`: ECDSA P-256 with SHA-256, a key from the operating system's
-    /// random source (ring's), for `127.0.0.1` and `localhost`.
-    pub fn make(validity: Validity) -> Result<Cert, CertError> {
+    /// random source (ring's), for `127.0.0.1` and `localhost`, its common name `name` (the
+    /// server's, `blaze explore` for the daemon's).
+    pub fn make(validity: Validity, name: &str) -> Result<Cert, CertError> {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
         // alloc: once a certificate, every 12 days
         let mut params =
             rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned(), "localhost".to_owned()])?;
-        let mut name = rcgen::DistinguishedName::new();
-        name.push(rcgen::DnType::CommonName, "blaze explore");
-        params.distinguished_name = name;
+        let mut distinguished = rcgen::DistinguishedName::new();
+        distinguished.push(rcgen::DnType::CommonName, name);
+        params.distinguished_name = distinguished;
         let epoch = rcgen::date_time_ymd(1970, 1, 1);
         params.not_before = epoch + Duration::from_secs(validity.not_before_s);
         params.not_after = epoch + Duration::from_secs(validity.not_after_s);
@@ -236,8 +238,8 @@ mod tests {
     #[test]
     fn a_certificate_is_p256_der_rustls_and_the_pin_check_take_and_new_each_time() {
         let validity = Validity::starting(T0);
-        let first = Cert::make(validity).unwrap();
-        let second = Cert::make(validity).unwrap();
+        let first = Cert::make(validity, "blaze explore").unwrap();
+        let second = Cert::make(validity, "blaze explore").unwrap();
         assert_ne!(first.hash, second.hash, "a fresh key each time");
         assert_eq!(first.hash, link::certhash(&first.der));
         first.identity().unwrap();
