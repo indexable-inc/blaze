@@ -16,7 +16,7 @@ use harness_native_ui_layout_api::{
 };
 use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_motion_api::{
-    Animate, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Pose, Reveal, Shown, ShownWhen, SizeTween, Target,
+    Animate, CopyFlash, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Pose, Reveal, Shown, ShownWhen, SizeTween, Target,
     Transition, TransitionKind,
 };
 use harness_native_ui_node_api::{Hidden, Laid};
@@ -180,6 +180,21 @@ pub fn install(world: WorldRef<'_>) {
         }
         if settle(&mut sh.spring, target, Tune { omega: m.omega, zeta: m.zeta }, dt) {
             moving(&w);
+        }
+    });
+
+    // A copy's pulse (CopyFlash): back to rest on the `ui.spring.copy` token, then exactly at rest so nothing more is drawn
+    // and the frame goes idle. Without the token a pulse lands at rest at once.
+    world.system_named::<&mut CopyFlash>("CopyFlash").each_iter(|it, _, f| {
+        if f.spring == Spring::default() {
+            return;
+        }
+        let w = it.world();
+        let dt = it.delta_time();
+        f.age += dt;
+        match token(w, "copy") {
+            Some(m) if settle(&mut f.spring, 0.0, Tune { omega: m.omega.max(1.0), zeta: m.zeta.max(0.05) }, dt) => moving(&w),
+            _ => f.spring = Spring::default(),
         }
     });
 

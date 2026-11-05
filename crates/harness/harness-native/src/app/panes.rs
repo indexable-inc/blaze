@@ -2,6 +2,7 @@
 //! the focused one following the app's `(Selected, object)`; and every terminal's sync, drawing and input, which read
 //! and write the `hn.Terminal` node's components rather than any one terminal's fields on the App.
 use super::*;
+use harness_native_ui_motion_api::{CopyFlash, Motion};
 use crate::pane::{
     MarkedText, PaneFocus, PaneNode, TermCursor, TermFocus, TermGrid, TermInput, TermMouse,
     TermNode, TermScroll, TermSelection, Unit,
@@ -1020,14 +1021,23 @@ impl App {
         Some([x * z, y * z, self.grid.cw * z, self.grid.ch * z])
     }
 
-    /// The text of the focused terminal's selection, for the pasteboard (None: nothing selected, so Command-C does nothing).
-    pub fn copy(&self) -> Option<String> {
+    /// What Command-C puts on the pasteboard: the focused chat's selection, else the focused terminal's (None: nothing
+    /// selected, so it does nothing). What it took pulses (`CopyFlash`, harness-native-render select.rs).
+    pub fn copy(&mut self) -> Option<String> {
         if let Some(c) = self.chat_copy() {
-            return c;
+            let (text, what) = c?;
+            self.chat_flash(&what);
+            self.poke();
+            return Some(text);
         }
         let t = self.focused_term()?;
         let sel = self.get::<TermSelection>(t).get()?;
-        self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())
+        let text = self.with_parser(t, |p| term::selection_text(p, sel.ordered())).filter(|s| !s.is_empty())?;
+        let w = self.world.world_ref();
+        let omega = w.try_lookup("ui::spring::copy").and_then(|e| e.try_cloned::<&Motion>()).map_or(0.0, |m| m.omega);
+        self.put(t, CopyFlash::kicked(omega));
+        self.poke();
+        Some(text)
     }
 
     pub fn paste(&mut self, text: &str) {

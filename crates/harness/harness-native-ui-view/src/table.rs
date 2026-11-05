@@ -451,6 +451,26 @@ pub fn row_under(e: EntityView<'_>) -> Option<(EntityView<'_>, usize)> {
     Some((table_of(row)?, r))
 }
 
+/// Row `r`'s node of the first table at or under `e` (a view holding a table: a chat's transcript row), if it is made (only
+/// the rows in view are): what a copy of that row pulses.
+#[must_use]
+pub fn row_node(e: EntityView<'_>, r: usize) -> Option<EntityView<'_>> {
+    let name = format!("r{r}");
+    let mut stack = vec![e]; // alloc: a walk down one transcript row's few nodes
+    let mut seen = 0;
+    while let Some(n) = stack.pop() {
+        seen += 1;
+        if seen > 4096 {
+            return None;
+        }
+        if let Some(inner) = n.lookup_child("scroll").and_then(|s| s.lookup_child("inner")) {
+            return ["body", "rest"].iter().find_map(|part| inner.lookup_child(part).and_then(|p| p.lookup_child(&name)));
+        }
+        n.each_child(|c| stack.push(c));
+    }
+    None
+}
+
 /// Scroll the table `e` is in sideways by `dx` points (a horizontal swipe over it). Whether it took it: a table whose
 /// content overhangs its room.
 pub fn scroll_sideways(e: EntityView<'_>, dx: f32) -> bool {

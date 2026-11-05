@@ -111,6 +111,19 @@ pub struct HoverLook {
     pub radius: f32,
 }
 
+/// A copy's pulse over the selection (`ui.selection` in prims.flecs; den's FlashLook): the selection's shape grows by the share
+/// `grow` at the pulse's peak, and a light of the plate's colour at alpha `light` sweeps across each row over `sweep` seconds,
+/// the rows joining `stagger` seconds apart, each taking `row_in` seconds to come in. The pulse itself is a spring
+/// (`CopyFlash`, on the `ui.spring.copy` token).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct CopyLook {
+    pub grow: f32,
+    pub light: f32,
+    pub sweep: f32,
+    pub stagger: f32,
+    pub row_in: f32,
+}
+
 /// A band across the node's width that joins two other nodes' heights, as a merge view joins a chunk in one pane to the same
 /// chunk in the next: its left end spans the height of `(RibbonFrom, a)`, its right end that of `(RibbonTo, b)`, and its edges
 /// ease between them. Drawn in the node's Fill, cut to the clip it sits in. An end shorter than `min` (a side with no lines
@@ -150,6 +163,7 @@ hyperion_api_layouts::api_layouts! {
     "OnLook" => alias OnLook,
     "TextStyle" => alias TextStyle,
     "HoverLook" => alias HoverLook,
+    "CopyLook" => alias CopyLook,
     "Scheme" => alias Scheme,
 }
 
@@ -167,6 +181,7 @@ pub fn register(world: &World) {
     world.component::<OnLook>().writable();
     world.component::<TextStyle>().writable();
     world.component::<HoverLook>().writable();
+    world.component::<CopyLook>().writable();
     world.component::<Ribbon>().writable();
     world.component::<Scheme>().writable();
     world.component::<RibbonFrom>().add_trait::<flecs::Exclusive>().on_delete_target(flecs::Cleanup::Delete);
