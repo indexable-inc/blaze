@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn releases_parse_to_their_major_and_minor() {
-    assert_eq!(parse("7.2.11"), Some(v(7, 2)));
+    assert_eq!(parse("7.3.1"), Some(v(7, 3)));
     assert_eq!(parse("7.2"), Some(v(7, 2)));
     assert_eq!(parse("6.8.0-1070-azure"), Some(v(6, 8)));
     assert_eq!(parse("7.10-rc1"), Some(v(7, 10)));
@@ -12,11 +12,11 @@ fn releases_parse_to_their_major_and_minor() {
 }
 
 #[test]
-fn the_floor_admits_7_2_and_later_and_refuses_older() {
-    assert_eq!(admits("7.2.11"), Ok(v(7, 2)));
-    assert_eq!(admits("7.3.0"), Ok(v(7, 3)));
+fn the_floor_admits_7_3_and_later_and_refuses_older() {
+    assert_eq!(admits("7.3.1"), Ok(v(7, 3)));
+    assert_eq!(admits("7.4.0"), Ok(v(7, 4)));
     assert_eq!(admits("8.0.1"), Ok(v(8, 0)));
-    for old in ["7.1.9", "6.8.0-1070-azure", "6.11.0-1018-azure", "5.15.0"] {
+    for old in ["7.2.11", "7.1.9", "6.8.0-1070-azure", "6.11.0-1018-azure", "5.15.0"] {
         assert!(matches!(admits(old), Err(TooOld::Below { .. })), "{old}");
     }
     assert!(matches!(admits("garbage"), Err(TooOld::Unread { .. })));
@@ -27,7 +27,7 @@ fn the_floor_admits_7_2_and_later_and_refuses_older() {
 fn the_refusal_names_the_kernel_the_floor_the_features_and_the_fix() {
     let said = admits("6.8.0-1070-azure").unwrap_err().to_string();
     assert!(said.contains("Linux 6.8.0-1070-azure"), "{said}");
-    assert!(said.contains("Linux 7.2 or later"), "{said}");
+    assert!(said.contains("Linux 7.3 or later"), "{said}");
     for feature in FEATURES {
         assert!(said.contains(feature.name), "{said} lacks {}", feature.name);
     }
@@ -35,14 +35,12 @@ fn the_refusal_names_the_kernel_the_floor_the_features_and_the_fix() {
     assert!(said.contains("HWE"), "{said}");
 }
 
-/// The floor is the newest feature's release: a feature newer than it would be used on a
-/// kernel that lacks it.
+/// A feature newer than the floor would be used on a kernel that lacks it.
 #[test]
 fn no_feature_is_newer_than_the_floor() {
     for feature in FEATURES {
         assert!(feature.since <= FLOOR, "{} needs Linux {}", feature.name, feature.since);
     }
-    assert!(FEATURES.iter().any(|it| it.since == FLOOR));
 }
 
 /// A faked older kernel: the `UNAME26` personality makes `uname` say 2.6.x (as

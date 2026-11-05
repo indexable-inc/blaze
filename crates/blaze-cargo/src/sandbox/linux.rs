@@ -982,7 +982,7 @@ mod landlock {
     const SCOPE_SIGNAL: u64 = 1 << 1;
 
     /// The Landlock ABI every kernel blaze runs on has where Landlock is on: Linux 6.15 brought
-    /// ABI 7, and blaze refuses a kernel below `blaze_core::kernel::FLOOR` (7.2). Everything
+    /// ABI 7, and blaze refuses a kernel below `blaze_core::kernel::FLOOR` (7.3). Everything
     /// [`restrict`] asks for (`REFER` from ABI 2, `TRUNCATE` from 3, TCP from 4, scopes from 6)
     /// is in it, so it is asked for unconditionally.
     const MIN_ABI: i64 = 7;
@@ -1015,7 +1015,7 @@ mod landlock {
             // alloc: the error, once, and no sandbox is made.
             return Err(format!(
                 "this kernel's Landlock is ABI {abi}, and blaze's sandbox needs ABI {MIN_ABI} \
-                 (every Linux 7.2 or later with Landlock on has it, so this kernel is patched)"
+                 (every Linux 7.3 or later with Landlock on has it, so this kernel is patched)"
             ));
         }
         let error = std::io::Error::last_os_error();

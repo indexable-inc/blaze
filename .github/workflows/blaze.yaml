@@ -227,15 +227,15 @@ jobs:
       tier: ${{ needs.changes.outputs.tier }}
       smoke: true
 
-  # blaze refuses a kernel below its floor, Linux 7.2 (docs/kernel.md, blaze-core's
+  # blaze refuses a kernel below its floor, Linux 7.3 (docs/kernel.md, blaze-core's
   # `kernel::check`): the client and `blaze serve` each stop with the typed refusal, which names
   # the running kernel, the floor, the features and the fix, and start nothing. The older kernel
   # is faked with the UNAME26 personality (`setarch --uname-2.6`), under which uname says
-  # 2.6.x, on the ix runner's own 7.2 kernel; the same binary then starts and stops a daemon
+  # 2.6.x, on the ix runner's own 7.3 kernel; the same binary then starts and stops a daemon
   # there unfaked. Replaces `linux-6-8` (#1790): no hosted runner's kernel (6.8 to 6.11) is one
   # blaze runs on.
   kernel-floor:
-    name: refuses a kernel below Linux 7.2 (faked uname)
+    name: refuses a kernel below Linux 7.3 (faked uname)
     needs: [changes, linux-arm64]
     if: needs.changes.outputs.tier != 'none'
     runs-on: [ix, arm64]
@@ -244,7 +244,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: blaze-linux-arm64
-      - name: blaze status and blaze serve refuse Linux 2.6, then serve on Linux 7.2
+      - name: blaze status and blaze serve refuse Linux 2.6, then serve on Linux 7.3
         run: |
           tar -xf blaze.tar && uname -r
           for words in status serve; do
@@ -252,7 +252,7 @@ jobs:
               cat out.txt; echo "::error::blaze $words ran on a faked Linux $(setarch "$(uname -m)" --uname-2.6 uname -r)"; exit 1
             fi
             cat out.txt
-            for said in "blaze needs Linux 7.2 or later" "this is Linux 2.6." "OPENAT2_REGULAR" "Fix:" "ix VM"; do
+            for said in "blaze needs Linux 7.3 or later" "this is Linux 2.6." "OPENAT2_REGULAR" "Fix:" "ix VM"; do
               grep -qF "$said" out.txt || { echo "::error::blaze $words's refusal does not say: $said"; exit 1; }
             done
           done

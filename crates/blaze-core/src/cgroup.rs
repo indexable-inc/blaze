@@ -151,7 +151,7 @@ impl Cgroup {
                     io::ErrorKind::Unsupported,
                     // alloc: an error's message, made as it fails.
                     format!(
-                        "{} is missing: every kernel blaze runs on (Linux 7.2 or later, \
+                        "{} is missing: every kernel blaze runs on (Linux 7.3 or later, \
                          docs/kernel.md) keeps it in a cgroup v2 directory whose memory \
                          controller is on, so this one is not (Linux {})",
                         path.display(),
@@ -189,7 +189,7 @@ impl Cgroup {
                     io::ErrorKind::Unsupported,
                     // alloc: an error's message, made as it fails.
                     format!(
-                        "{} has no memory.peak: Linux 7.2 (blaze's floor) keeps it wherever the \
+                        "{} has no memory.peak: Linux 7.3 (blaze's floor) keeps it wherever the \
                          memory controller is on, so this is not a cgroup v2 directory with it \
                          (Linux {})",
                         self.dir().display(),

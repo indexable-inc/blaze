@@ -1,10 +1,10 @@
 //! The Linux kernel blaze runs on: its release, and the floor blaze refuses to start below.
 //!
-//! blaze needs Linux 7.2 or later (docs/kernel.md). Both the client and `blaze serve` call
+//! blaze needs Linux 7.3 or later (docs/kernel.md). Both the client and `blaze serve` call
 //! [`check`] before anything else: a kernel below the floor is a [`TooOld`] that names the
 //! running release, the floor, the features that need it and how to get a newer kernel. Above
 //! the floor every feature in [`FEATURES`] is used unconditionally, with no probe and no
-//! slower path for a kernel that lacks it (`no-fallback`): a 7.2 kernel can still be built
+//! slower path for a kernel that lacks it (`no-fallback`): a 7.3 kernel can still be built
 //! without one (`CONFIG_IO_URING=n`, a seccomp profile that refuses io_uring), and that is an
 //! error naming the config or the filter, never a version.
 
@@ -26,14 +26,15 @@ impl fmt::Display for Version {
     }
 }
 
-/// The oldest kernel blaze runs on: the one ix VMs and ix CI runners boot (7.2.11 in November
-/// 2026). Andrew's call, 2026-11-05: refuse older kernels with a clear message, then use the
-/// newest features freely.
-pub const FLOOR: Version = Version { major: 7, minor: 2 };
+/// The oldest kernel blaze runs on: the one ix VMs and ix CI runners boot (7.3.y in November
+/// 2026). Andrew's call, 2026-11-05 (raised from 7.2 the same day): refuse older kernels with a
+/// clear message, then use the newest features freely. It is the ix kernel, not the newest
+/// feature in use: docs/kernel.md plans 7.3 features (failfs and fchroot, the io_uring futex
+/// fix, userfaultfd RWP) that land on it.
+pub const FLOOR: Version = Version { major: 7, minor: 3 };
 
-/// A kernel feature blaze uses, the release that added it and what blaze uses it for. The
-/// newest of them is why [`FLOOR`] is where it is; docs/kernel.md has the whole map, with the
-/// planned ones.
+/// A kernel feature blaze uses, the release that added it and what blaze uses it for. docs/kernel.md
+/// has the whole map, with the planned ones.
 #[derive(Clone, Copy, Debug)]
 pub struct Feature {
     pub name: &'static str,
@@ -46,6 +47,7 @@ const fn v(major: u32, minor: u32) -> Version {
 }
 
 /// The features in use that need the newest kernels, newest first: what a [`TooOld`] names.
+/// None is newer than [`FLOOR`].
 pub const FEATURES: &[Feature] = &[
     Feature {
         name: "openat2 OPENAT2_REGULAR",
@@ -102,7 +104,7 @@ impl fmt::Display for TooOld {
             f,
             "\nFix: boot Linux {FLOOR} or later: your distribution's newer kernel package (a \
              mainline build, Ubuntu's HWE kernel, Fedora's or Arch's current kernel), or run \
-             blaze in an ix VM (`ix new`), which boots 7.2. A container shares its host's \
+             blaze in an ix VM (`ix new`), which boots 7.3. A container shares its host's \
              kernel, so the host needs it."
         )
     }
@@ -110,7 +112,7 @@ impl fmt::Display for TooOld {
 
 impl std::error::Error for TooOld {}
 
-/// The `major.minor` `release` starts with (`7.2.11`, `6.8.0-1070-azure`, `2.6.60`), if it
+/// The `major.minor` `release` starts with (`7.3.1`, `6.8.0-1070-azure`, `2.6.60`), if it
 /// does.
 pub fn parse(release: &str) -> Option<Version> {
     let mut parts = release.splitn(3, '.');

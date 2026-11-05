@@ -1,29 +1,31 @@
 ---
 status: current
-summary: blaze's minimum Linux kernel (7.2), why, and every kernel feature blaze uses or plans to, with its version, use, owner and status.
+summary: blaze's minimum Linux kernel (7.3), why, and every kernel feature blaze uses or plans to, with its version, use, owner and status.
 ---
 # The Linux kernel blaze runs on
 
-blaze needs **Linux 7.2 or later**. Below it, the client and `blaze serve` both stop before
+blaze needs **Linux 7.3 or later**. Below it, the client and `blaze serve` both stop before
 they do anything else, with a typed refusal (`TooOld` in `crates/blaze-core/src/kernel.rs`,
 checked by `blaze_core::kernel::check` from `blaze_cargo::cli::main`) that names the running
 kernel, the floor, the features that need it and the fix:
 
-    error: blaze needs Linux 7.2 or later, and this is Linux 6.8.0-1070-azure (rule
+    error: blaze needs Linux 7.3 or later, and this is Linux 6.8.0-1070-azure (rule
     kernel-floor, docs/kernel.md). It uses, with no slower path:
       - openat2 OPENAT2_REGULAR (Linux 7.2): store and cache reads that open only a regular file
       - ...
-    Fix: boot Linux 7.2 or later: your distribution's newer kernel package (a mainline build,
+    Fix: boot Linux 7.3 or later: your distribution's newer kernel package (a mainline build,
     Ubuntu's HWE kernel, Fedora's or Arch's current kernel), or run blaze in an ix VM (`ix new`),
-    which boots 7.2. A container shares its host's kernel, so the host needs it.
+    which boots 7.3. A container shares its host's kernel, so the host needs it.
 
-## Why 7.2
+## Why 7.3
 
 Andrew's call, 2026-11-05: fail on older kernels with a clear message, then use the latest
-features freely. 7.2 is what ix VMs and ix CI runners boot (7.2.11 in November 2026), so every
-machine blaze is built, tested and benchmarked on has it. A floor means one code path per
+features freely. The floor was set at 7.2 and raised to 7.3 the same day. 7.3 is what ix VMs and
+ix CI runners boot (7.3.y from November 2026), so every machine blaze is built, tested and
+benchmarked on has it. The floor is the ix kernel, not the newest feature in use: the 7.3
+features below are planned, and land on a floor that already has them. A floor means one code path per
 feature: no probe, no "Linux X or later has it" message, no slower path for a kernel that lacks
-it (`no-fallback`). What a 7.2 kernel can still lack is configuration (`CONFIG_IO_URING=n`,
+it (`no-fallback`). What a 7.3 kernel can still lack is configuration (`CONFIG_IO_URING=n`,
 Landlock off with `lsm=`), a sysctl (`kernel.io_uring_disabled`), a seccomp filter (Docker's
 default profile refuses io_uring) or a file system's support; each is an error naming that, never
 a version.
@@ -93,6 +95,9 @@ not built), **next** (an opportunity found, unowned).
 | clone3 `CLONE_AUTOREAP` (and `CLONE_PIDFD_AUTOKILL`, `CLONE_NNP`) | 7.1 | sandboxed children reaped and killed with their parent | sandbox lane | planned |
 | pidfd `PIDFD_THREAD`, `PIDFD_GET_INFO` | 6.9, 6.13 | a thread's pidfd; a child's exit status and cgroup from its pidfd | sandbox lane | planned |
 | rseq time-slice extension (`PR_RSEQ_SLICE_EXTENSION`, `rseq_slice_yield`) | 7.0 | a scheduler lock's holder asks for its slice to be extended | scheduler locks (unowned) | planned |
+| failfs and `fchroot(2)` | 7.3 | blaze's own worker and helper processes sandboxed alongside Landlock: a root changed through a descriptor, onto a file system that refuses everything not bound into it | sandbox lane | planned |
+| io_uring futex in-flight accounting fix | 7.3 | the deadline wait's futex-through-the-ring step (`IORING_OP_FUTEX_WAIT` above) relies on it; before 7.3 a ring's futex waits were miscounted in flight | deadline-waits | planned |
+| userfaultfd read-write protection (`UFFDIO_REGISTER_MODE_RWP`) | 7.3 | which mapped store and cache pages are hot: a read or write of a protected page faults once and is counted | store (unowned) | planned |
 
 ### Next (found while setting the floor, unowned)
 

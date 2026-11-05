@@ -145,7 +145,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     if !trampoline && let Err(code) = cores() {
         return ended(code);
     }
-    // The client and `blaze serve` both stop here on a kernel below blaze's floor (Linux 7.2,
+    // The client and `blaze serve` both stop here on a kernel below blaze's floor (Linux 7.3,
     // docs/kernel.md), before anything uses a feature it lacks: a typed refusal naming the
     // kernel, the floor, the features and the fix, never a slower path. A trampoline is a test
     // the daemon launched, on the kernel the daemon already checked.

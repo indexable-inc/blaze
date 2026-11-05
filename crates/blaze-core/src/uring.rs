@@ -21,7 +21,7 @@
 //!
 //! The ring is set up with the system calls themselves (`io_uring_setup`, `io_uring_enter`,
 //! `io_uring_register` and `mmap`), the layouts as `linux/io_uring.h` has them. Every kernel
-//! blaze runs on is Linux 7.2 or later (`crate::kernel::check`, docs/kernel.md), so each
+//! blaze runs on is Linux 7.3 or later (`crate::kernel::check`, docs/kernel.md), so each
 //! feature is used with no probe; a refusal is an error naming what was asked.
 //!
 //! A request in flight is a slot of columns ([`ops`]): 32 bytes a completion reads, the buffer
@@ -439,7 +439,7 @@ fn register<T>(
             io::ErrorKind::Unsupported,
             // alloc: the error of a setup that failed.
             format!(
-                "io_uring {what}: {error}: every kernel blaze runs on (Linux 7.2 or later, \
+                "io_uring {what}: {error}: every kernel blaze runs on (Linux 7.3 or later, \
                  docs/kernel.md) has it, so this one (Linux {}) refuses what it was given",
                 crate::kernel::release()
             ),
@@ -947,7 +947,7 @@ impl Ring {
         }
         // SAFETY: the call returned a file descriptor of its own.
         let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }); // alloc: setup, once per driver.
-        // Every kernel blaze runs on (Linux 7.2 or later) says each of these; one that does not
+        // Every kernel blaze runs on (Linux 7.3 or later) says each of these; one that does not
         // is not the io_uring blaze was written for, whatever its release says.
         let wanted = [
             (FEAT_SINGLE_MMAP, "IORING_FEAT_SINGLE_MMAP"),
@@ -960,7 +960,7 @@ impl Ring {
                 io::ErrorKind::Unsupported,
                 // alloc: the error of a setup that failed.
                 format!(
-                    "io_uring without {name}: every Linux 7.2 or later has it, and this one \
+                    "io_uring without {name}: every Linux 7.3 or later has it, and this one \
                      (Linux {}) does not say it does",
                     crate::kernel::release()
                 ),
@@ -1170,7 +1170,7 @@ impl Ring {
 
 /// What blaze says when `io_uring_setup` fails with `errno`: what failed, the likely cause and
 /// the fix. `disabled` is `/proc/sys/kernel/io_uring_disabled`, `kernel` the running
-/// kernel's release, which is at blaze's floor (Linux 7.2, `crate::kernel::check`), so a
+/// kernel's release, which is at blaze's floor (Linux 7.3, `crate::kernel::check`), so a
 /// refusal is the kernel's configuration or a filter, never its age. On Linux the build runs on io_uring and on nothing
 /// else, so this is where it stops.
 fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &str) -> String {
@@ -1217,9 +1217,9 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
         (libc::EINVAL, _) => write!(
             out,
             "this kernel (Linux {kernel}) refuses the ring's setup flags \
-             (IORING_SETUP_SQPOLL with IORING_SETUP_SINGLE_ISSUER), which every Linux 7.2 \
+             (IORING_SETUP_SQPOLL with IORING_SETUP_SINGLE_ISSUER), which every Linux 7.3 \
              takes, so its io_uring is patched or restricted. \
-             Fix: boot an unpatched Linux 7.2 or later (docs/kernel.md)"
+             Fix: boot an unpatched Linux 7.3 or later (docs/kernel.md)"
         ),
         (libc::ENOMEM, _) => write!(
             out,
@@ -4730,7 +4730,7 @@ mod tests {
     fn a_ring_refused_by_seccomp_says_what_failed_why_and_the_fix() {
         let error = io::Error::from_raw_os_error(libc::EPERM);
         assert_eq!(
-            super::setup_refused(libc::EPERM, &error, Some(0), "7.2.11"),
+            super::setup_refused(libc::EPERM, &error, Some(0), "7.3.1"),
             "blaze runs its build on io_uring on Linux and cannot start without it: \
              io_uring_setup failed with EPERM (Operation not permitted (os error 1)). \
              Likely cause: a seccomp policy that refuses io_uring_setup, such as Docker's \
@@ -4743,7 +4743,7 @@ mod tests {
     #[test]
     fn each_refusal_names_its_errno_cause_and_fix() {
         let says = |errno: i32, disabled: Option<u8>| {
-            super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "7.2.11")
+            super::setup_refused(errno, &io::Error::from_raw_os_error(errno), disabled, "7.3.1")
         };
         let cases: [(i32, Option<u8>, &str, &str, &str); 7] = [
             (
@@ -4768,7 +4768,7 @@ mod tests {
                 "io_uring_setup, io_uring_enter and io_uring_register",
             ),
             (libc::ENOSYS, None, "with ENOSYS", "CONFIG_IO_URING", "CONFIG_IO_URING=y"),
-            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "unpatched Linux 7.2"),
+            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SINGLE_ISSUER", "unpatched Linux 7.3"),
             (libc::ENOMEM, None, "with ENOMEM", "out of memory", "memory.max"),
             (libc::EBADF, None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
         ];
