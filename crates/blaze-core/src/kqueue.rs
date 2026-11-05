@@ -1476,7 +1476,8 @@ mod tests {
     fn run(driver: &mut impl Driver, effects: Vec<Effect>) -> BTreeMap<u64, Done> {
         let mut effects = effects;
         let mut seen = BTreeMap::new();
-        run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+        run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done))
+        .expect("the effects end");
         assert_eq!(driver.in_flight(), 0);
         seen
     }
@@ -1661,7 +1662,7 @@ mod tests {
             (tag @ (4 | 5), Done::Sent(bytes)) if bytes.is_empty() => ends.push(tag),
             (tag @ (7 | 9), Done::HungUp) | (tag @ 1, Done::Unlistened) => ends.push(tag),
             (tag, other) => panic!("{tag}: {other:?}"),
-        });
+        }).expect("the effects end");
         ends.sort();
         assert_eq!(ends, [1, 4, 5, 7, 9]);
         assert_ne!(server, client);
@@ -1749,7 +1750,7 @@ mod tests {
         run_until_idle(&mut driver, &mut effects, |done, _| {
             assert_eq!(done.done, Done::Fired);
             fired.push(done.tag.0);
-        });
+        }).expect("the effects end");
         assert_eq!(fired, [3, 2, 1, 0]);
     }
 
@@ -1853,7 +1854,7 @@ mod tests {
                     _ => return,
                 };
                 effects.push(next);
-            });
+            }).expect("the effects end");
             seen
         }
         let (ours, theirs) = (dir("files"), dir("files-threads"));
@@ -2055,7 +2056,7 @@ mod tests {
             (9, Done::Failed(_)) => refused = true,
             (7, Done::Changed { .. } | Done::Unwatched) => {}
             other => panic!("{other:?}"),
-        });
+        }).expect("the effects end");
         assert!(refused);
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
@@ -2084,7 +2085,7 @@ mod tests {
             (7, Done::Changed { .. }) => {}
             (7, Done::Unwatched) => order.push("unwatched"),
             other => panic!("{other:?}"),
-        });
+        }).expect("the effects end");
         assert!(matches!(order.as_slice(), ["flushed" | "failed", "unwatched"]), "{order:?}");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
@@ -2119,7 +2120,7 @@ mod tests {
         run_until_idle(driver, &mut effects, |it, _| match it.done {
             Done::Journaled(_) | Done::Unwatched => assert_eq!(it.tag, tag),
             other => panic!("{other:?}"),
-        });
+        }).expect("the effects end");
         assert_eq!(driver.in_flight(), 0);
     }
 

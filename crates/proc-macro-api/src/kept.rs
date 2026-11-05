@@ -731,7 +731,7 @@ mod budget {
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
-        });
+        }).expect("the effects end");
         assert!(store.ready());
         let lib = std::env::temp_dir().join(format!("blaze-kept-budget-{}", std::process::id()));
         std::fs::write(&lib, b"a macro's library").unwrap();
@@ -785,7 +785,7 @@ mod budget {
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
-        });
+        }).expect("the effects end");
         assert!(store.ready());
         let read = std::env::temp_dir().join(format!("blaze-kept-reads-{}", std::process::id()));
         std::fs::write(&read, b"included").unwrap();

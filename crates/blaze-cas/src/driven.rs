@@ -29,7 +29,7 @@ impl Driven {
         let mut effects = Vec::new();
         // alloc: setup, no layers: allocates nothing
         let mut store = Store::open(Config { dir, layers: Vec::new(), tags: TAGS }, &mut effects);
-        drive(&mut driver, &mut store, &mut effects);
+        drive(&mut driver, &mut store, &mut effects)?;
         if let Some(broken) = store.broken() {
             // alloc: the error of a store that cannot open
             return Err(broken.to_string());
@@ -62,7 +62,7 @@ impl Driven {
         // alloc: once a flush, which a tool asks for once
         let mut effects = Vec::new();
         self.store.flush(&mut effects);
-        drive(&mut self.driver, &mut self.store, &mut effects);
+        drive(&mut self.driver, &mut self.store, &mut effects)?;
         match self.store.broken() {
             // alloc: the error of a store that stopped
             Some(broken) => Err(broken.to_string()),
@@ -71,10 +71,12 @@ impl Driven {
     }
 }
 
-fn drive(driver: &mut Native, store: &mut Store, effects: &mut Vec<Effect>) {
+fn drive(driver: &mut Native, store: &mut Store, effects: &mut Vec<Effect>) -> Result<(), String> {
     run_until_idle(driver, effects, |completion, effects| {
         if store.owns(completion.tag) {
             store.complete(completion, effects);
         }
-    });
+    })
+    // alloc: the error of a store whose driver stalled
+    .map_err(|stalled| format!("the store's driver: {stalled}"))
 }

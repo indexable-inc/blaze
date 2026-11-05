@@ -31,7 +31,7 @@ fn kept_in(sim: &mut Sim) -> blaze_cas::Store {
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
         _ = store.complete(completion, effects);
-    });
+    }).expect("the effects end");
     assert!(store.ready(), "the store in the simulation opens");
     store
 }

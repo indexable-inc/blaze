@@ -1888,15 +1888,15 @@ mod tests {
             let file = name("log");
             let mut effects =
                 vec![Effect::Append { file: file.clone(), bytes: b"synced".to_vec(), tag: Tag(0) }];
-            run_until_idle(&mut sim, &mut effects, |_, _| {});
+            run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
             effects.push(Effect::Sync { file: file.clone(), tag: Tag(1) });
-            run_until_idle(&mut sim, &mut effects, |_, _| {});
+            run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
             effects.push(Effect::Append {
                 file: file.clone(),
                 bytes: b"-lost".to_vec(),
                 tag: Tag(2),
             });
-            run_until_idle(&mut sim, &mut effects, |_, _| {});
+            run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
             sim.crash();
             let left = sim.contents(&file);
             assert!(left.starts_with(b"synced") && b"synced-lost".starts_with(&left), "{left:?}");
@@ -1911,7 +1911,8 @@ mod tests {
                 .map(|n| Effect::Append { file: name("f"), bytes: vec![n as u8], tag: Tag(n) })
                 .collect();
             let mut order = Vec::new();
-            run_until_idle(&mut sim, &mut effects, |done, _| order.push(done));
+            run_until_idle(&mut sim, &mut effects, |done, _| order.push(done))
+            .expect("the effects end");
             (order, sim.contents(&name("f")))
         };
         assert_eq!(run(7), run(7));
@@ -1927,7 +1928,7 @@ mod tests {
         let file = name("log");
         let mut effects =
             vec![Effect::Append { file: file.clone(), bytes: b"a".to_vec(), tag: Tag(0) }];
-        run_until_idle(&mut sim, &mut effects, |_, _| {});
+        run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
         sim.submit(&mut vec![Effect::Sync { file: file.clone(), tag: Tag(1) }]);
         // Appended after the sync was asked for, completed before it.
         sim.files.get_mut(&file).unwrap().ops.push(Op::Append(b"b".to_vec()));
@@ -1974,7 +1975,7 @@ mod tests {
             let mut sim = Sim::new(seed, Faults::default());
             let mut effects =
                 vec![Effect::Write { file: file.clone(), bytes: b"aaaa".to_vec(), tag: Tag(0) }];
-            run_until_idle(&mut sim, &mut effects, |_, _| {});
+            run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
             let synced = seed % 2 == 0;
             let mut effects = vec![Effect::WriteAt {
                 file: file.clone(),
@@ -1982,11 +1983,12 @@ mod tests {
                 bytes: b"bbbb".to_vec(),
                 tag: Tag(1),
             }];
-            run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
+            run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Written))
+            .expect("the effects end");
             assert_eq!(sim.contents(&file), b"aabbbb");
             if synced {
                 let mut effects = vec![Effect::Sync { file: file.clone(), tag: Tag(2) }];
-                run_until_idle(&mut sim, &mut effects, |_, _| {});
+                run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
             }
             sim.crash();
             let after = sim.contents(&file);
@@ -2004,18 +2006,21 @@ mod tests {
         let to = FileName::new("out/app.new").unwrap();
         let mut effects =
             vec![Effect::Write { file: to.clone(), bytes: b"new".to_vec(), tag: Tag(0) }];
-        run_until_idle(&mut sim, &mut effects, |_, _| {});
+        run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
         let mut effects = vec![Effect::Mode { file: to.clone(), mode: 0o755, tag: Tag(1) }];
-        run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Moded));
+        run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Moded))
+        .expect("the effects end");
         let mut effects = vec![Effect::Rename { from: to.clone(), to: file.clone(), tag: Tag(2) }];
-        run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Renamed));
+        run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Renamed))
+        .expect("the effects end");
         sim.crash();
         assert_eq!(
             (sim.contents(&file), sim.mode(&file), sim.exists(&to)),
             (b"new".to_vec(), Some(0o755), false),
         );
         let mut effects = vec![Effect::WriteAt { file: to, at: 0, bytes: vec![1], tag: Tag(3) }];
-        run_until_idle(&mut sim, &mut effects, |it, _| assert!(matches!(it.done, Done::Failed(_))));
+        run_until_idle(&mut sim, &mut effects, |it, _| assert!(matches!(it.done, Done::Failed(_))))
+        .expect("the effects end");
     }
 
     /// What a test took from the user, or a mode that lets others write, is found by a check of
@@ -2029,7 +2034,8 @@ mod tests {
         let check = |sim: &mut Sim| {
             let mut found = None;
             let mut effects = vec![Effect::Private { dir: store.clone(), tag: Tag(9) }];
-            run_until_idle(sim, &mut effects, |it, _| found = Some(it.done));
+            run_until_idle(sim, &mut effects, |it, _| found = Some(it.done))
+            .expect("the effects end");
             found.expect("the check completed")
         };
         let mut effects = vec![
@@ -2037,7 +2043,7 @@ mod tests {
             Effect::Write { file: b.clone(), bytes: b"b".to_vec(), tag: Tag(1) },
             Effect::Write { file: name("other/c"), bytes: b"c".to_vec(), tag: Tag(2) },
         ];
-        run_until_idle(&mut sim, &mut effects, |_, _| {});
+        run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
         assert_eq!(check(&mut sim), Done::Private(None));
         sim.chmod(&name("other/c"), 0o666);
         sim.set_access(&name("other"), Access::OtherUser);
@@ -2071,7 +2077,8 @@ mod tests {
             let mut done = None;
             let mut effects =
                 vec![Effect::Times { file: file.clone(), modified_ns: at, tag: Tag(1) }];
-            run_until_idle(&mut sim, &mut effects, |it, _| done = Some(it.done));
+            run_until_idle(&mut sim, &mut effects, |it, _| done = Some(it.done))
+            .expect("the effects end");
             let after = sim.stamp(&file);
             assert_eq!(
                 (after.ino, after.size, after.mode),
@@ -2097,7 +2104,8 @@ mod tests {
                 Effect::Stat { file: file.clone(), tag: Tag(2) },
                 Effect::List { dir: name("target"), tag: Tag(3) },
             ];
-            run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag.0, it.done));
+            run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag.0, it.done))
+            .expect("the effects end");
             assert_eq!(
                 seen[&2],
                 Done::Stat(Some(Meta { len: 33, dir: false, modified_ns: at })),
@@ -2124,7 +2132,7 @@ mod tests {
                     effects.push(Effect::Times { file: file.clone(), modified_ns: 1, tag: Tag(6) });
                 }
                 seen.insert(it.tag.0, it.done);
-            });
+            }).expect("the effects end");
             assert!(
                 matches!(&seen[&4], Done::Failed(why) if why.0.contains("target/never-written")),
                 "seed {seed}: {:?}",
@@ -2146,7 +2154,7 @@ mod tests {
                 vec![Effect::Write { file: moved.clone(), bytes: b"again".to_vec(), tag: Tag(7) }];
             run_until_idle(&mut sim, &mut effects, |it, _| {
                 assert_eq!(it.done, Done::Written, "seed {seed}")
-            });
+            }).expect("the effects end");
             assert_ne!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a write moves the mtime on");
         }
     }
@@ -2222,7 +2230,7 @@ mod tests {
                 }
                 Done::Unwatched => ended = true,
                 _ => {}
-            });
+            }).expect("the effects end");
             assert!(ended, "seed {seed}");
             assert!(!heard.contains(&name("target/out")), "seed {seed}");
             if !lost {
@@ -2251,7 +2259,7 @@ mod tests {
                 Done::Changed { .. } => assert!(!ended, "seed {seed}: a change after the end"),
                 Done::Unwatched => ended = true,
                 other => panic!("seed {seed}: {other:?}"),
-            });
+            }).expect("the effects end");
             assert!(ended && sim.in_flight() == 0, "seed {seed}");
             // Changes told for after the end are not in flight: each is due, and dropped.
             let mut out = Vec::new();
@@ -2268,7 +2276,8 @@ mod tests {
             sim.change(&name("src/again"), b"3");
             let mut heard = Vec::new();
             sim.submit(&mut vec![Effect::Unwatch { tag: Tag(9) }]);
-            run_until_idle(&mut sim, &mut effects, |done, _| heard.push(done.done));
+            run_until_idle(&mut sim, &mut effects, |done, _| heard.push(done.done))
+            .expect("the effects end");
             assert_eq!(heard.last(), Some(&Done::Unwatched), "seed {seed}");
         }
         assert!(raced > 0 && clean > 0, "raced on {raced} seeds, clean on {clean}");
@@ -2301,7 +2310,7 @@ mod tests {
                 }
                 (11, Done::Failed(_)) => refused = true,
                 other => panic!("seed {seed}: {other:?}"),
-            });
+            }).expect("the effects end");
             assert_eq!(at_flush, Some(vec![name("src/a"), name("src/b")]), "seed {seed}");
             assert!(refused && ended, "seed {seed}");
             assert_eq!(sim.in_flight(), 0);
@@ -2317,7 +2326,8 @@ mod tests {
             Effect::Link { from: name("store/v"), to: name("target/b"), tag: Tag(2) },
         ];
         let mut seen = BTreeMap::new();
-        run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+        run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done))
+        .expect("the effects end");
         assert!(matches!(&seen[&Tag(1)], Done::Failed(why) if why.0.contains("does not copy")));
         assert_eq!(seen[&Tag(2)], Done::Linked);
         assert!(!sim.exists(&name("target/a")));
@@ -2370,7 +2380,8 @@ mod tests {
                 Effect::Kill { tag: Tag(99) },
             ];
             let mut seen = BTreeMap::new();
-            run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+            run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done))
+            .expect("the effects end");
             assert_eq!(sim.in_flight(), 0);
             let Done::Exited(echoed) = &seen[&Tag(1)] else { panic!("seed {seed}: {seen:?}") };
             assert_eq!((echoed.code, echoed.stdout.as_slice()), (Some(0), &b"input"[..]));
@@ -2571,7 +2582,8 @@ mod tests {
                 Effect::Recv { conn, most: 16, into: b"again".to_vec(), tag: Tag(4) },
                 Effect::Unlisten { tag: Tag(1) },
             ];
-            run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag, it.done));
+            run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag, it.done))
+            .expect("the effects end");
             assert_eq!(seen[&Tag(3)], Done::HungUp, "seed {seed}");
             assert!(
                 matches!(&seen[&Tag(4)], Done::Broken { buffer, error } if buffer == b"again" && error.0.contains("no connection")),
@@ -2715,7 +2727,8 @@ mod tests {
         effects.push(Effect::Unlisten { tag: Tag(2) });
         effects.push(Effect::Unlisten { tag: Tag(4) });
         let mut seen = BTreeMap::new();
-        run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+        run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done))
+        .expect("the effects end");
         assert!(matches!(&seen[&Tag(1)], Done::Failed(why) if why.0.contains("refused")));
         assert_eq!(seen[&Tag(2)], Done::Unlistened);
         assert!(matches!(&seen[&Tag(3)], Done::Failed(_)));
@@ -2726,7 +2739,8 @@ mod tests {
     /// Runs `effects` on `sim` until idle: each one's end by its tag.
     fn ran(sim: &mut Sim, mut effects: Vec<Effect>) -> BTreeMap<Tag, Done> {
         let mut seen = BTreeMap::new();
-        run_until_idle(sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done));
+        run_until_idle(sim, &mut effects, |done, _| _ = seen.insert(done.tag, done.done))
+        .expect("the effects end");
         seen
     }
 

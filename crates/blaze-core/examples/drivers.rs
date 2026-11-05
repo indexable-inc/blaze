@@ -41,7 +41,7 @@ fn commit(driver: &mut impl Driver) -> Vec<f64> {
                 if done.done == Done::Appended {
                     effects.push(Effect::Sync { file: file.clone(), tag: done.tag });
                 }
-            });
+            }).expect("the effects end");
             began.elapsed().as_secs_f64() * 1e6
         })
         .collect()
@@ -74,7 +74,7 @@ fn batch(driver: &mut impl Driver) -> Vec<f64> {
                         });
                     }
                 }
-            });
+            }).expect("the effects end");
             began.elapsed().as_secs_f64() * 1e6
         })
         .collect()
@@ -100,7 +100,7 @@ fn reads(driver: &mut impl Driver, dir: &std::path::Path) -> Vec<f64> {
             run_until_idle(driver, &mut effects, |done, _| match &done.done {
                 Done::Read(bytes) => assert_eq!(bytes.len(), 4 << 10),
                 _ => check(&done),
-            });
+            }).expect("the effects end");
             began.elapsed().as_secs_f64() * 1e3
         })
         .collect()

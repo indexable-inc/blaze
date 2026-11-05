@@ -276,7 +276,7 @@ fn opened(sim: &mut Sim) -> Store {
     run_until_idle(sim, &mut effects, |completion, effects| {
         let durable = store.complete(completion, effects);
         assert!(durable.is_empty(), "opening a store made {} puts durable", durable.len());
-    });
+    }).expect("the effects end");
     assert!(store.ready());
     store
 }
@@ -294,7 +294,7 @@ fn opened_in(sim: &mut Sim, dir: &str, layers: &[&str]) -> Store {
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);
-    });
+    }).expect("the effects end");
     assert!(store.ready(), "{:?}", store.broken());
     store
 }
@@ -305,7 +305,7 @@ fn flushed(sim: &mut Sim, store: &mut Store) {
     store.flush(&mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);
-    });
+    }).expect("the effects end");
 }
 
 /// Keeps `puts` in `store` as a daemon's owner does: none is durable (no expansion of these

@@ -963,24 +963,68 @@ pub trait Driver {
     fn now(&self) -> Duration;
 }
 
+/// How long [`run_until_idle`] waits, on the driver's clock, for its next completion before it
+/// gives up: the bound of its loop (rule bounded-progress). A minute, as the 60-second poll it
+/// replaced; on [`sim::Sim`] it is virtual time.
+pub const IDLE_STALL: Duration = Duration::from_secs(60);
+
+/// [`run_until_idle`] stopped with effects still in flight: none completed for
+/// [`IDLE_STALL`] on the driver's clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stalled {
+    /// Effects submitted and not completed when it stopped.
+    pub in_flight: usize,
+    /// How long it waited with nothing completing, on the driver's clock.
+    pub waited: Duration,
+}
+
+impl fmt::Display for Stalled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "run_until_idle: no effect completed for {:?} on the driver's clock with {} still \
+             in flight (rule bounded-progress); an effect that does not end by itself (a listen, \
+             a watch, a receive nothing sends to, a timer past the bound) holds it: end that \
+             effect, or poll the driver yourself",
+            self.waited, self.in_flight
+        )
+    }
+}
+
+impl std::error::Error for Stalled {}
+
+impl From<Stalled> for std::io::Error {
+    fn from(stalled: Stalled) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, stalled)
+    }
+}
+
 /// Runs `effects` and polls until every one of them has completed, handing each completion to
 /// `on`, which may push more effects (submitted before the next poll). For drivers whose
-/// effects all complete; a timer far ahead holds it until it fires, and a watch until it is
-/// unwatched.
+/// effects all complete: one that does not (a listen, a watch, a timer due past
+/// [`IDLE_STALL`]) ends it in [`Stalled`] once nothing has completed for [`IDLE_STALL`] on the
+/// driver's clock, never in a wait without end.
 pub fn run_until_idle(
     driver: &mut impl Driver,
     effects: &mut Vec<Effect>,
     mut on: impl FnMut(Completion, &mut Vec<Effect>),
-) {
+) -> Result<(), Stalled> {
     // Its callers are tests, examples and one-shot setup, never a hot loop.
     // alloc: once per call, until idle.
     let mut done = Vec::new();
+    let mut since = driver.now();
     loop {
         driver.submit(effects);
         if driver.in_flight() == 0 {
-            return;
+            return Ok(());
         }
-        driver.poll(&mut done, wait::Deadline::NEVER);
+        let stall = wait::Deadline::after(since, IDLE_STALL);
+        if driver.poll(&mut done, stall) > 0 {
+            since = driver.now();
+        } else if stall.passed(driver.now()) {
+            let waited = driver.now().saturating_sub(since);
+            return Err(Stalled { in_flight: driver.in_flight(), waited });
+        }
         for completion in done.drain(..) {
             on(completion, effects);
         }

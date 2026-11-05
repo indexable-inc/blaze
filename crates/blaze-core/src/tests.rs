@@ -104,7 +104,7 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             _ => return,
         };
         effects.push(next);
-    });
+    }).expect("the effects end");
     seen
 }
 
@@ -173,7 +173,8 @@ fn locks(driver: &mut impl Driver) -> Vec<Done> {
     ];
     let mut seen = Vec::new();
     for step in steps {
-        run_until_idle(driver, &mut vec![step], |done, _| seen.push(done.done));
+        run_until_idle(driver, &mut vec![step], |done, _| seen.push(done.done))
+        .expect("the effects end");
     }
     seen
 }
@@ -244,7 +245,7 @@ fn times(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             _ => return,
         };
         effects.push(next);
-    });
+    }).expect("the effects end");
     seen
 }
 
@@ -316,7 +317,8 @@ fn a_warm_times_set_allocates_nothing() {
     fn write(driver: &mut impl Driver) {
         let mut effects =
             vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
-        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
+        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written))
+        .expect("the effects end");
     }
     let mut sim = Sim::new(15, Faults::default());
     write(&mut sim);
@@ -421,7 +423,7 @@ fn watches_hear_a_file_written_under_them() {
     fn run(driver: &mut impl Driver, root: Option<&std::path::Path>) -> Vec<FileName> {
         let mut effects =
             vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
-        run_until_idle(driver, &mut effects, |_, _| {});
+        run_until_idle(driver, &mut effects, |_, _| {}).expect("the effects end");
         driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
         let mut effects = vec![Effect::Write {
             file: name("src/deep/lib.rs"),
@@ -471,7 +473,7 @@ fn watches_hear_a_file_written_under_them() {
 fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::path::Path) {
     let mut effects =
         vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
-    run_until_idle(driver, &mut effects, |_, _| {});
+    run_until_idle(driver, &mut effects, |_, _| {}).expect("the effects end");
     driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
     let mut done = Vec::new();
     for round in 0..50u64 {
@@ -513,7 +515,7 @@ fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::
         (7, Done::Changed { .. }) => {}
         (7, Done::Unwatched) => ended = true,
         other => panic!("{other:?}"),
-    });
+    }).expect("the effects end");
     assert!(refused && ended);
     assert_eq!(driver.in_flight(), 0);
 }
@@ -600,7 +602,7 @@ fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
             }
             (tag, other) => seen.push(format!("{tag}: {other:?}")),
         }
-    });
+    }).expect("the effects end");
     assert!(ended_after_hangup, "{seen:?}");
     assert_eq!(driver.in_flight(), 0);
     seen.sort();
@@ -704,7 +706,8 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
     fn run(driver: &mut impl Driver) -> Done {
         let mut effects = vec![Effect::Spawn { command: command(), tag: Tag(1) }];
         let mut done = None;
-        run_until_idle(driver, &mut effects, |it, _| done = Some(it.done));
+        run_until_idle(driver, &mut effects, |it, _| done = Some(it.done))
+        .expect("the effects end");
         done.expect("the spawn ended")
     }
     let check = |root: &std::path::Path, refused: Done, confined: Done| {
@@ -793,7 +796,7 @@ fn a_mapping_is_the_file() {
     run_until_idle(&mut sim, &mut effects, |done, _| match done.done {
         Done::Mapped(it) => mapped = Some(it),
         other => panic!("{other:?}"),
-    });
+    }).expect("the effects end");
     assert_eq!(mapped.expect("mapped").bytes(), b"packed");
 }
 
@@ -856,7 +859,8 @@ fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
     fn write(driver: &mut impl Driver) {
         let mut effects =
             vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
-        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
+        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written))
+        .expect("the effects end");
     }
     let mut sim = Sim::new(11, Faults::default());
     write(&mut sim);
@@ -1123,7 +1127,8 @@ fn hung_up_conns_name_nothing(
         Effect::Unlisten { tag: Tag(1) },
     ]);
     let mut done = BTreeMap::new();
-    run_until_idle(driver, &mut effects, |it, _| _ = done.insert(it.tag.0, it.done));
+    run_until_idle(driver, &mut effects, |it, _| _ = done.insert(it.tag.0, it.done))
+    .expect("the effects end");
     assert_eq!(
         done,
         BTreeMap::from([(1, Done::Unlistened), (40, Done::HungUp), (41, Done::HungUp)])
