@@ -4,9 +4,10 @@
 //! the shape changes and again on AppKit's `cursorUpdate:`.
 //!
 //! What decides, first to last:
-//! 1. A drag in progress: the sidebar's edge (column resize, one-way at its width's limits), a terminal selection (I-beam),
+//! 1. A drag in progress: the sidebar's edge (column resize, one-way folded or at its widest; src/app/side_drag.rs), a terminal selection (I-beam),
 //!    a press reported to a terminal's program (arrow), a press on a node (the shape it went down with).
-//! 2. The sidebar's draggable edge zone (the same test a press uses, `on_side_edge`).
+//! 2. The sidebar's draggable edge zone, or the window's left edge while it is folded (the same test a press uses,
+//!    `on_side_edge`).
 //! 3. The topmost hit node under the pointer: its `Cursor`, or its nearest ancestor's, said on the primitives and prefabs in
 //!    script (prims.flecs: `ui.Field` is Text) and resolved by the input pass into `PointerShape`
 //!    (harness-native-ui-input); a node that says none is the arrow.
@@ -20,33 +21,9 @@ use super::*;
 use harness_native_ui_input_api::PointerShape;
 
 impl App {
-    /// Whether the pointer is on the sidebar's draggable right edge, where a press drags its width: the sidebar shown,
-    /// no palette over it, within `SIDE_GRAB` points of the edge along its height.
-    pub(super) fn on_side_edge(&self) -> bool {
-        if self.palette.is_some() || !self.side_open {
-            return false;
-        }
-        let Some(l) = self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).filter(|l| l.w > 0.0) else {
-            return false;
-        };
-        let (x, y) = (self.pointer.x, self.pointer.y);
-        (x - (l.x + l.w)).abs() <= SIDE_GRAB && y >= l.y && y <= l.y + l.h
-    }
-
-    /// The sidebar edge's pointer: both ways, or only the way its width can still go at `SIDE_MIN` or `SIDE_MAX`
-    /// (NSSplitView's divider at its limit).
-    fn side_edge_pointer(&self) -> Pointer {
-        let w = self.side_w.or_else(|| self.sidebar().and_then(|s| s.try_cloned::<&Laid>()).map(|l| l.w));
-        match w {
-            Some(w) if w <= SIDE_MIN => Pointer::ResizeRight,
-            Some(w) if w >= SIDE_MAX => Pointer::ResizeLeft,
-            _ => Pointer::ResizeLeftRight,
-        }
-    }
-
     /// The system pointer's shape now, and why (the module's doc has the order).
     pub fn pointer_shape(&self) -> (Pointer, &'static str) {
-        if self.resizing {
+        if self.drag.active() {
             return (self.side_edge_pointer(), "drag: sidebar edge");
         }
         if let Some(s) = self.term_drag_pointer() {

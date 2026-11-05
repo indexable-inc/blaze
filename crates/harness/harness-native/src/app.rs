@@ -32,6 +32,7 @@ mod fold;
 mod keys;
 mod panes;
 mod pointer;
+mod side_drag;
 mod sidebar;
 mod stats;
 pub use stats::TICK as STATS_TICK;
@@ -182,8 +183,8 @@ pub struct App {
     watching: HashMap<u64, (u64, Option<u32>)>,
     /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
     side_w: Option<f32>,
-    /// Dragging the sidebar's edge.
-    resizing: bool,
+    /// Dragging the sidebar's edge, the window's rubber band past its widest, and their pulses (src/app/side_drag.rs).
+    drag: side_drag::SideDrag,
     /// A run (and stage) to select once the runs show it.
     pending_run: Option<(u64, Option<u32>)>,
     link: Link,
@@ -402,7 +403,10 @@ impl App {
         let device = side.child("hn.DeviceRow");
         let side_w = crate::prefs::get("sidebar_width")
             .and_then(|v| v.as_f64())
-            .map(|w| (w as f32).clamp(SIDE_MIN, SIDE_MAX));
+            .map(|v| {
+                let t = crate::look::side_drag(w);
+                (v as f32).clamp(t.min, t.max)
+            });
         if let Some(w) = side_w {
             set_side_width(side.entity(), w);
         }
@@ -436,7 +440,7 @@ impl App {
             watching: HashMap::new(),
             pending_run: None,
             side_w,
-            resizing: false,
+            drag: side_drag::SideDrag::default(),
             link,
             grid,
             zoom: 4,
@@ -1448,6 +1452,7 @@ impl App {
             self.grid = Grid::new(&mut self.paint.get_mut().fonts, self.look.size, scale);
         }
         self.step_sidebar(dt);
+        self.step_side_drag(dt);
         self.lay_chrome(z);
         self.step_fold();
         self.step_tree_scroll(dt);
@@ -1951,11 +1956,6 @@ impl App {
         self.poke();
     }
 }
-
-/// The sidebar's width range when dragged, and how near its edge a press grabs it (points).
-const SIDE_MIN: f32 = 180.0;
-const SIDE_MAX: f32 = 720.0;
-const SIDE_GRAB: f32 = 5.0;
 
 /// Set the sidebar node's (open) width; its fold's clip follows in `lay_chrome`.
 fn set_side_width(side: EntityView<'_>, v: f32) {
