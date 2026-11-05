@@ -1,6 +1,7 @@
 // The object API: every agent PTY (s7), process run (r12) and run stage (r12.0) is an object with an
 // id, a name, a parent, append-only streams (read here straight from ~/.harness, or via sql) and RPC
 // through the daemon's one `rpc {id, method, args}` op (see crates/harness/harness/src/object.rs).
+import { checkShell, refusal } from "./shell-check.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { req } from "./daemon.ts";
 import { sql } from "./sql.ts";
@@ -20,6 +21,8 @@ export type SpawnOpts = {
   parent?: string | Obj | null;
   /** proc: initial stdin text; the pipe stays open for .stdin() unless liveStdin: false. */
   stdin?: string; liveStdin?: boolean; cols?: number; rows?: number;
+  /** proc: why a command that only reads files or the tree needs the shell (else it is refused, shell-check.ts). */
+  why?: string;
 };
 export type { Msg };
 export type SliceOpts = { from?: number; to?: number; tail?: number; new?: boolean; cursor?: string };
@@ -236,6 +239,8 @@ async function spawnObject(kind: Kind, opts: SpawnOpts): Promise<Obj> {
   let body: Record<string, unknown>;
   if (kind === "proc") {
     if (!opts.cmd) throw new Error("spawn('proc') needs { cmd }");
+    const verdict = checkShell(opts.cmd, opts.why);
+    if (!verdict.ok) throw refusal(verdict.message);
     for (const [k, v] of Object.entries({ ...process.env, ...opts.env })) if (v !== undefined) env[k] = v;
     if (opts.parent === undefined) parent = process.env.HARNESS_RUN ?? selfSession();
     body = {

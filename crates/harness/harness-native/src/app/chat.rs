@@ -566,6 +566,8 @@ fn act_icon(a: Act) -> &'static str {
         Act::Edit | Act::Write => "write",
         Act::Delete => "delete",
         Act::Search => "search",
+        Act::List => "list",
+        Act::Build => "build",
         Act::Fetch => "net",
         Act::Query => "sql",
         Act::Spawn => "spawn",
@@ -582,25 +584,12 @@ fn kind_icon(kind: &str) -> &'static str {
         "delete" => "\u{EA81}", // cod-trash
         "net" => "\u{EB01}",    // cod-globe
         "search" => "\u{EA6D}", // cod-search
+        "list" => "\u{EA83}",   // cod-folder
+        "build" => "\u{EB6D}",  // cod-tools
         "spawn" => "\u{EC10}",  // cod-sparkle
         "sql" => "\u{EACE}",    // cod-database
         "error" => "\u{EA87}",  // cod-error
         _ => "\u{EAC4}",        // cod-code
-    }
-}
-
-/// How many steps of one kind did, in words: "Wrote 3 files".
-fn steps_of(kind: &str, n: usize) -> String {
-    match kind {
-        "exec" => format!("Ran {n} commands"),
-        "read" => format!("Read {n} files"),
-        "write" => format!("Wrote {n} files"),
-        "delete" => format!("Deleted {n} files"),
-        "net" => format!("Fetched {n} URLs"),
-        "search" => format!("Ran {n} searches"),
-        "spawn" => format!("Started {n} objects"),
-        "sql" => format!("Ran {n} queries"),
-        _ => format!("{n} steps"),
     }
 }
 
@@ -663,8 +652,9 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
             (kind_icon(""), words, String::new(), false)
         }
         [e] => (kind_icon(&e.kind), e.done.clone(), step_detail(&e.detail), failed),
-        [e, rest @ ..] if rest.iter().all(|r| r.kind == e.kind) => (kind_icon(&e.kind), steps_of(&e.kind, rest.len() + 1), String::new(), failed),
-        [e, rest @ ..] => (kind_icon(&e.kind), format!("{} and {} more", e.done, rest.len()), String::new(), failed),
+        [e, rest @ ..] if rest.iter().all(|r| r.kind == e.kind) => (kind_icon(&e.kind), group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
+        // Steps of more than one kind: what they did, counted by kind ("Read 3 files, searched 2 times"), as a run sums its calls.
+        [..] => (kind_icon(""), group::summary(d.effects.iter().map(|e| Act::of_effect(&e.kind))), String::new(), failed),
     }
 }
 
