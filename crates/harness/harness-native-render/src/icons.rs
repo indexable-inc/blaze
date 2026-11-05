@@ -9,6 +9,7 @@
 //! ink's centroid. A sparse starburst comes out a little smaller and a solid cube a little larger than equal bounds
 //! would make them, which is what reads as one size beside the terminal glyph.
 use crate::slug::{self, Outline, PathBuilder, Quad};
+use crate::vector::Seg;
 use std::sync::OnceLock;
 
 /// The vendored marks: name, then the SVG file (a 24 by 24 viewBox, as Simple Icons draws every mark).
@@ -137,240 +138,21 @@ fn ink(o: &Outline) -> ([f32; 2], f32) {
     (c, r2.sqrt())
 }
 
-/// A tokenizer over SVG path data: commands, numbers (`-.5.5` is two), and arc flags (one digit each, `00` is two).
-struct Lexer<'a> {
-    s: &'a [u8],
-    i: usize,
-}
-
-impl Lexer<'_> {
-    fn skip(&mut self) {
-        while self.i < self.s.len()
-            && (self.s[self.i].is_ascii_whitespace() || self.s[self.i] == b',')
-        {
-            self.i += 1;
-        }
-    }
-
-    fn command(&mut self) -> Option<u8> {
-        self.skip();
-        let c = *self.s.get(self.i)?;
-        c.is_ascii_alphabetic().then(|| {
-            self.i += 1;
-            c
-        })
-    }
-
-    /// Another number follows (a command's next set of arguments).
-    fn more(&mut self) -> bool {
-        self.skip();
-        self.s.get(self.i).is_some_and(|c| c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.'))
-    }
-
-    fn number(&mut self) -> Result<f64, String> {
-        self.skip();
-        let start = self.i;
-        let at = |i: usize| self.s.get(i).copied().unwrap_or(0);
-        let mut i = self.i;
-        if matches!(at(i), b'-' | b'+') {
-            i += 1;
-        }
-        let mut dot = false;
-        while at(i).is_ascii_digit() || (at(i) == b'.' && !dot) {
-            dot |= at(i) == b'.';
-            i += 1;
-        }
-        if matches!(at(i), b'e' | b'E')
-            && (at(i + 1).is_ascii_digit()
-                || (matches!(at(i + 1), b'-' | b'+') && at(i + 2).is_ascii_digit()))
-        {
-            i += 2;
-            while at(i).is_ascii_digit() {
-                i += 1;
-            }
-        }
-        self.i = i;
-        std::str::from_utf8(&self.s[start..i])
-            .ok()
-            .and_then(|t| t.parse().ok())
-            .ok_or_else(|| format!("bad number at byte {start}"))
-    }
-
-    fn flag(&mut self) -> Result<bool, String> {
-        self.skip();
-        let c = self.s.get(self.i).copied();
-        self.i += 1;
-        match c {
-            Some(b'0') => Ok(false),
-            Some(b'1') => Ok(true),
-            _ => Err(format!("bad arc flag at byte {}", self.i - 1)),
-        }
-    }
-}
-
-/// SVG path data `d` (viewBox units, y down) as closed contours of quadratics in ems (y up: the viewBox's foot is 0).
+/// SVG path data `d` (viewBox units, y down) as closed contours of quadratics in ems (y up: the viewBox's foot is 0),
+/// read by the one parser (vector.rs).
 pub fn parse(d: &str) -> Result<Vec<Vec<Quad>>, String> {
-    let mut lx = Lexer { s: d.as_bytes(), i: 0 };
     let mut pb = PathBuilder::default();
     let em = |p: [f64; 2]| [p[0] / VIEW, (VIEW - p[1]) / VIEW];
-    let (mut cur, mut start) = ([0.0f64; 2], [0.0f64; 2]);
-    // The last curve's second control point (for S and T), and which kind it was.
-    let mut last_c: Option<(u8, [f64; 2])> = None;
-    let mut cmd = lx.command().ok_or("path data does not start with a command")?;
-    loop {
-        let rel = cmd.is_ascii_lowercase();
-        let up = cmd.to_ascii_uppercase();
-        let base = if rel { cur } else { [0.0, 0.0] };
-        let pt = |lx: &mut Lexer<'_>| -> Result<[f64; 2], String> {
-            Ok([base[0] + lx.number()?, base[1] + lx.number()?])
-        };
-        let reflect = |kind: u8| match last_c {
-            Some((k, c)) if k == kind => [2.0 * cur[0] - c[0], 2.0 * cur[1] - c[1]],
-            _ => cur,
-        };
-        match up {
-            b'M' => {
-                let p = pt(&mut lx)?;
-                pb.move_to(em(p));
-                (cur, start) = (p, p);
-                last_c = None;
-                // Further pairs after a moveto are linetos.
-                cmd = if rel { b'l' } else { b'L' };
-                if lx.more() {
-                    continue;
-                }
-            }
-            b'L' => {
-                let p = pt(&mut lx)?;
-                pb.line_to(em(p));
-                cur = p;
-                last_c = None;
-            }
-            b'H' => {
-                let x = lx.number()? + if rel { cur[0] } else { 0.0 };
-                cur = [x, cur[1]];
-                pb.line_to(em(cur));
-                last_c = None;
-            }
-            b'V' => {
-                let y = lx.number()? + if rel { cur[1] } else { 0.0 };
-                cur = [cur[0], y];
-                pb.line_to(em(cur));
-                last_c = None;
-            }
-            b'C' | b'S' => {
-                let c1 = if up == b'C' { pt(&mut lx)? } else { reflect(b'C') };
-                let c2 = pt(&mut lx)?;
-                let p = pt(&mut lx)?;
-                pb.cubic_to(em(c1), em(c2), em(p));
-                cur = p;
-                last_c = Some((b'C', c2));
-            }
-            b'Q' | b'T' => {
-                let c = if up == b'Q' { pt(&mut lx)? } else { reflect(b'Q') };
-                let p = pt(&mut lx)?;
-                pb.quad_to(em(c), em(p));
-                cur = p;
-                last_c = Some((b'Q', c));
-            }
-            b'A' => {
-                let (rx, ry, rot) = (lx.number()?, lx.number()?, lx.number()?);
-                let (large, sweep) = (lx.flag()?, lx.flag()?);
-                let p = pt(&mut lx)?;
-                for [c1, c2, e] in arc_cubics(cur, [rx, ry], rot, large, sweep, p) {
-                    pb.cubic_to(em(c1), em(c2), em(e));
-                }
-                cur = p;
-                last_c = None;
-            }
-            b'Z' => {
-                pb.close();
-                cur = start;
-                last_c = None;
-            }
-            _ => return Err(format!("unknown command {}", cmd as char)),
-        }
-        if up != b'Z' && lx.more() {
-            continue;
-        }
-        match lx.command() {
-            Some(c) => cmd = c,
-            None if lx.i >= lx.s.len() => break,
-            None => return Err(format!("stray input at byte {}", lx.i)),
+    for s in crate::vector::segments(d)? {
+        match s {
+            Seg::Move(p) => pb.move_to(em(p)),
+            Seg::Line(p) => pb.line_to(em(p)),
+            Seg::Quad(c, p) => pb.quad_to(em(c), em(p)),
+            Seg::Cubic(c1, c2, p) => pb.cubic_to(em(c1), em(c2), em(p)),
+            Seg::Close => pb.close(),
         }
     }
     Ok(pb.finish())
-}
-
-/// An SVG elliptical arc (endpoint form, SVG 1.1 F.6.5) from `a` to `b` as cubics (control, control, end), a quarter
-/// turn or less each.
-fn arc_cubics(
-    a: [f64; 2],
-    r: [f64; 2],
-    rot_deg: f64,
-    large: bool,
-    sweep: bool,
-    b: [f64; 2],
-) -> Vec<[[f64; 2]; 3]> {
-    let (mut rx, mut ry) = (r[0].abs(), r[1].abs());
-    if a == b {
-        return Vec::new();
-    }
-    if rx == 0.0 || ry == 0.0 {
-        return vec![[a, b, b]];
-    }
-    let (sn, cs) = rot_deg.to_radians().sin_cos();
-    let (hx, hy) = ((a[0] - b[0]) * 0.5, (a[1] - b[1]) * 0.5);
-    let (x1, y1) = (cs * hx + sn * hy, -sn * hx + cs * hy);
-    let lam = (x1 * x1) / (rx * rx) + (y1 * y1) / (ry * ry);
-    if lam > 1.0 {
-        let k = lam.sqrt();
-        rx *= k;
-        ry *= k;
-    }
-    let num = (rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1).max(0.0);
-    let den = rx * rx * y1 * y1 + ry * ry * x1 * x1;
-    let mut co = (num / den).sqrt();
-    if large == sweep {
-        co = -co;
-    }
-    let (cxp, cyp) = (co * rx * y1 / ry, -co * ry * x1 / rx);
-    let (cx, cy) =
-        (cs * cxp - sn * cyp + (a[0] + b[0]) * 0.5, sn * cxp + cs * cyp + (a[1] + b[1]) * 0.5);
-    let angle = |ux: f64, uy: f64, vx: f64, vy: f64| (ux * vy - uy * vx).atan2(ux * vx + uy * vy);
-    let t1 = angle(1.0, 0.0, (x1 - cxp) / rx, (y1 - cyp) / ry);
-    let mut dt = angle((x1 - cxp) / rx, (y1 - cyp) / ry, (-x1 - cxp) / rx, (-y1 - cyp) / ry);
-    if !sweep && dt > 0.0 {
-        dt -= std::f64::consts::TAU;
-    } else if sweep && dt < 0.0 {
-        dt += std::f64::consts::TAU;
-    }
-    let n = (dt.abs() / std::f64::consts::FRAC_PI_2).ceil().max(1.0) as usize;
-    let step = dt / n as f64;
-    let k = 4.0 / 3.0 * (step / 4.0).tan();
-    // A point of the ellipse at parameter t, and its derivative.
-    let at = |t: f64| {
-        let (s, c) = t.sin_cos();
-        [cx + rx * c * cs - ry * s * sn, cy + rx * c * sn + ry * s * cs]
-    };
-    let dir = |t: f64| {
-        let (s, c) = t.sin_cos();
-        [-rx * s * cs - ry * c * sn, -rx * s * sn + ry * c * cs]
-    };
-    let mut out = Vec::with_capacity(n);
-    let mut p0 = a;
-    for i in 0..n {
-        let (ta, tb) = (t1 + step * i as f64, t1 + step * (i + 1) as f64);
-        let p3 = if i + 1 == n { b } else { at(tb) };
-        let (da, db) = (dir(ta), dir(tb));
-        out.push([
-            [p0[0] + k * da[0], p0[1] + k * da[1]],
-            [p3[0] - k * db[0], p3[1] - k * db[1]],
-            p3,
-        ]);
-        p0 = p3;
-    }
-    out
 }
 
 #[cfg(test)]

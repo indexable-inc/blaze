@@ -16,6 +16,13 @@ pub struct Fill {
     pub light: Rgba,
 }
 
+/// The ink a `Vector`'s outline is stroked in, per appearance (sRGB, drawn as given; alpha 0: no stroke).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stroke {
+    pub dark: Rgba,
+    pub light: Rgba,
+}
+
 /// Border colour (panels), ring colour (orbs).
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Edge {
@@ -154,6 +161,7 @@ hyperion_api_layouts::api_layouts! {
     "Rgba" => alias Rgba,
     "Fill" => alias Fill,
     "Edge" => alias Edge,
+    "Stroke" => alias Stroke,
     "Shape" => alias Shape,
     "Lift" => alias Lift,
     "Frost" => alias Frost,
@@ -172,6 +180,7 @@ pub fn register(world: &World) {
     world.component::<Rgba>().writable();
     world.component::<Fill>().writable();
     world.component::<Edge>().writable();
+    world.component::<Stroke>().writable();
     world.component::<Shape>().writable();
     world.component::<Lift>().writable();
     world.component::<Frost>().writable();

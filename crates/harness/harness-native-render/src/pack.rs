@@ -76,6 +76,63 @@ pub struct LineInst {
     pub col_l: [f32; 4],
     /// Half the line's width (points), 1 when a segment comes before this one, 1 when one comes after, opacity.
     pub shape: [f32; 4],
+    /// The band it shows in, as a panel's `clip` (top, foot), then how far it fades in from each (0: a hard cut).
+    pub clip: [f32; 4],
+    /// The band across, as a panel's `clipx` (left, right, then the fades).
+    pub clipx: [f32; 4],
+}
+
+/// A filled path (copied from den-native's pack.rs): one instance over its bounding box, reading its run of straight
+/// edges from `Draw::edges`; curves are flattened on the CPU (vector.rs). Each pixel takes its winding number and its
+/// distance to the nearest edge, so the fill is anti-aliased at any scale.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct PathInst {
+    /// The box round the path (points, y down).
+    pub rect: [f32; 4],
+    pub col_d: [f32; 4],
+    pub col_l: [f32; 4],
+    /// First edge, edge count, rule (0 nonzero, 1 even-odd), opacity.
+    pub shape: [f32; 4],
+    /// The band it shows in, as a panel's `clip`.
+    pub clip: [f32; 4],
+    /// The band across, as a panel's `clipx`.
+    pub clipx: [f32; 4],
+}
+
+impl PathInst {
+    /// The fill of the closed `rings` (each a polygon in points; the last point joins the first), each ring's edges
+    /// appended to `edges`. None when there is nothing to fill.
+    #[must_use]
+    pub fn fill(
+        rings: &[Vec<[f32; 2]>],
+        even_odd: bool,
+        ink: ([f32; 4], [f32; 4]),
+        alpha: f32,
+        edges: &mut Vec<[f32; 4]>,
+    ) -> Option<Self> {
+        let first = edges.len();
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for ring in rings.iter().filter(|r| r.len() >= 3) {
+            for (i, a) in ring.iter().enumerate() {
+                let b = ring[(i + 1) % ring.len()];
+                if *a != b {
+                    edges.push([a[0], a[1], b[0], b[1]]);
+                }
+                lo = [lo[0].min(a[0]), lo[1].min(a[1])];
+                hi = [hi[0].max(a[0]), hi[1].max(a[1])];
+            }
+        }
+        let count = edges.len() - first;
+        (count > 0).then(|| Self {
+            rect: [lo[0], lo[1], hi[0] - lo[0], hi[1] - lo[1]],
+            col_d: ink.0,
+            col_l: ink.1,
+            shape: [first as f32, count as f32, f32::from(u8::from(even_odd)), alpha],
+            clip: [0.0; 4],
+            clipx: [0.0; 4],
+        })
+    }
 }
 
 impl LineInst {
@@ -108,6 +165,8 @@ impl LineInst {
                         f32::from(u8::from(after.is_some())),
                         alpha,
                     ],
+                    clip: [0.0; 4],
+                    clipx: [0.0; 4],
                 }
             };
         match pts.as_slice() {
