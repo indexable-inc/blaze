@@ -2049,5 +2049,15 @@ mod tests {
             let c = v.entity().try_cloned::<&harness_native_ui_layout_api::Scroller>();
             assert!(c.is_some_and(|c| c.thin > 0.0 && c.wide > c.thin && c.min > 0.0), "{prefab} has no Scroller: {c:?}");
         }
+        // Prefabs the code names (a missing one would draw as a bare node, silently).
+        let missing: Vec<&str> = [
+            "ui.Table", "ui.TableRow", "ui.TableCell", "ui.TableHead", "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep",
+            "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput", "hn.ChatOutputError", "hn.ChatCodeToggle", "hn.ChatCell",
+            "hn.ChatCellDim", "hn.ChatCellLink", "hn.ChatHead", "ex.TableDemo",
+        ]
+        .into_iter()
+        .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())
+        .collect();
+        assert!(missing.is_empty(), "prefabs the code names but no scene has: {missing:?}");
     }
 }

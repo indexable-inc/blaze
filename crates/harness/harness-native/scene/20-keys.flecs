@@ -48,12 +48,14 @@ act {
   prefab Spawn
   SpawnClaude : act.Spawn { SpawnKind: {kind: "claude", title: "Claude"}
     MenuItem: {bar: "File", title: "New Claude"} }
-  // Claude in its own terminal UI (a PTY) instead of the chat pane; no title, so the palette and the menu offer it but
-  // the picker does not.
+  // Claude (and Codex, below) in its own terminal UI (a PTY) instead of the chat pane; no title, so the palette and the
+  // menu offer it but the picker does not.
   SpawnClaudeTui : act.Spawn { SpawnKind: {kind: "claude-tui"}
     MenuItem: {bar: "File", title: "New Claude (Terminal)"} }
   SpawnCodex : act.Spawn { SpawnKind: {kind: "codex", title: "Codex"}
     MenuItem: {bar: "File", title: "New Codex"} }
+  SpawnCodexTui : act.Spawn { SpawnKind: {kind: "codex-tui"}
+    MenuItem: {bar: "File", title: "New Codex (Terminal)"} }
   SpawnCursor : act.Spawn { SpawnKind: {kind: "cursor", title: "Cursor"}
     MenuItem: {bar: "File", title: "New Cursor"} }
   SpawnShell : act.Spawn { SpawnKind: {kind: "shell", title: "Shell"}

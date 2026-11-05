@@ -3,6 +3,9 @@
 //!
 //! Spring tunes are the node's own `Motion`, else a token prefab's (`ui.spring.transition`, `ui.spring.matched`,
 //! `ui.spring.layout` in prims.flecs). With neither, the change lands at once.
+//!
+//! It also runs each scroll's overlay scroller (`Scroller`): when it shows and fades, how wide each axis's knob is
+//! (`ScrollerState`), and its parts' fade.
 use std::collections::HashMap;
 
 use harness_native_api::{Clock, moving, settle};

@@ -6,6 +6,9 @@
 // ---- what the prims read ----
 export const size_caption = 11
 export const size_body = 13
+export const size_code = 11.5
+export const table_row = 22
+export const table_gap = 14
 export const radius_control = 6
 export const radius_card = 12
 export const spring_transition_omega = 20

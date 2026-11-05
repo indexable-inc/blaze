@@ -1,5 +1,6 @@
 import { withHiddenPage, type Page } from "../cdp.ts";
 import { table, type Table } from "../table.ts";
+import { effect, oneLine } from "../effects.ts";
 
 export type SearchResult = {
   title: string;
@@ -13,7 +14,14 @@ export type SearchResult = {
 };
 
 /** Search Google in a hidden tab of the browser on CDP :9222 (Dia) and return the organic results. */
-export async function googleSearch(query: string, opts: { limit?: number; hl?: string } = {}): Promise<Table<SearchResult>> {
+export function googleSearch(query: string, opts: { limit?: number; hl?: string } = {}): Promise<Table<SearchResult>> {
+  const q = JSON.stringify(oneLine(query, 60));
+  return effect("search", `Searching Google for ${q}`, `Searched Google for ${q}`, query, () => search(query, opts), (r) => ({
+    detail: `${r.length} result${r.length === 1 ? "" : "s"}`, show: r,
+  }));
+}
+
+async function search(query: string, opts: { limit?: number; hl?: string }): Promise<Table<SearchResult>> {
   const { limit = 10, hl = "en" } = opts;
   return withHiddenPage(async (page) => {
     await page.goto(`https://www.google.com/search?${new URLSearchParams({ q: query, hl })}`);

@@ -11,11 +11,14 @@ use harness_native_ui_layout_api::{ScrollState, ScrollerGrip, scroll_quietly};
 use harness_native_ui_text_api::{Highlight, TextEdit};
 use crate::pane::Unit;
 use harness_native_render::text::Layout;
+use harness_native_ui_input_api::Tooltip;
 use harness_native_ui_look_api::TextStyle;
 use harness_native_ui_text_api::{MarkdownText, Text};
-use model::chat::{Item, Transcript};
+use model::chat::{Detail, Item, Transcript};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// cod-chevron-right, cod-chevron-down.
 const CLOSED: &str = "\u{EAB6}";
@@ -240,6 +243,16 @@ enum Row {
     Quote(String),
     Code { lang: String, text: String },
     Tool { block: String, name: String, arg: String, state: String, open: bool, input: String, result: String },
+    /// A harness REPL cell's card head: its step's icon, what it did in words, a detail ("5 results"), how long it took.
+    Card { block: String, icon: &'static str, words: String, detail: String, state: String, error: bool, open: bool },
+    /// One step of an opened card that took several.
+    Step { icon: &'static str, words: String, detail: String, error: bool },
+    /// A table, record or list (the kernel's shown value), its first `cap` rows.
+    Grid { v: Arc<Value>, cap: usize },
+    /// Text a cell printed or returned: a command's output, a string, an error's stack.
+    Output { text: String, error: bool },
+    /// "Show code" under an opened card.
+    CodeToggle { block: String, open: bool },
     Thinking { block: String, open: bool, text: String, live: bool },
     Note(String),
     Error(String),
@@ -258,6 +271,14 @@ impl Row {
             Row::Code { .. } => "hn.ChatCode",
             Row::Tool { open: true, .. } => "hn.ChatToolOpen",
             Row::Tool { .. } => "hn.ChatTool",
+            Row::Card { error: true, .. } => "hn.ChatCardFailed",
+            Row::Card { .. } => "hn.ChatCard",
+            Row::Step { error: true, .. } => "hn.ChatStepFailed",
+            Row::Step { .. } => "hn.ChatStep",
+            Row::Grid { .. } => "hn.ChatGrid",
+            Row::Output { error: true, .. } => "hn.ChatOutputError",
+            Row::Output { .. } => "hn.ChatOutput",
+            Row::CodeToggle { .. } => "hn.ChatCodeToggle",
             Row::Thinking { open: true, .. } => "hn.ChatThinkingOpen",
             Row::Thinking { .. } => "hn.ChatThinking",
             Row::Note(_) => "hn.ChatNote",
@@ -387,6 +408,156 @@ fn tool_input(v: &serde_json::Value) -> String {
     }
 }
 
+/// The key in a chat's `open` set that shows card `block`'s code.
+fn code_key(block: &str) -> String {
+    format!("{block}#code")
+}
+
+/// Rows a folded card's table or output shows.
+const FOLDED_ROWS: usize = 8;
+
+/// codicons by step kind (mcp/src/effects.ts), and for a cell that took no step, an error, a running cell.
+fn kind_icon(kind: &str) -> &'static str {
+    match kind {
+        "exec" => "\u{EA85}",   // cod-terminal
+        "read" => "\u{EA7B}",   // cod-file
+        "write" => "\u{EA73}",  // cod-edit
+        "delete" => "\u{EA81}", // cod-trash
+        "net" => "\u{EB01}",    // cod-globe
+        "search" => "\u{EA6D}", // cod-search
+        "spawn" => "\u{EC10}",  // cod-sparkle
+        "sql" => "\u{EACE}",    // cod-database
+        "error" => "\u{EA87}",  // cod-error
+        _ => "\u{EAC4}",        // cod-code
+    }
+}
+
+/// How many steps of one kind did, in words: "Wrote 3 files".
+fn steps_of(kind: &str, n: usize) -> String {
+    match kind {
+        "exec" => format!("Ran {n} commands"),
+        "read" => format!("Read {n} files"),
+        "write" => format!("Wrote {n} files"),
+        "delete" => format!("Deleted {n} files"),
+        "net" => format!("Fetched {n} URLs"),
+        "search" => format!("Ran {n} searches"),
+        "spawn" => format!("Started {n} objects"),
+        "sql" => format!("Ran {n} queries"),
+        _ => format!("{n} steps"),
+    }
+}
+
+fn secs(ms: u64) -> String {
+    if ms >= 60_000 { format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000) } else { format!("{:.1}s", ms as f64 / 1000.0) }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_owned()
+}
+
+/// A shown scalar or cell as words: null as `null`, strings as they are.
+fn cell_text(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
+/// The first `n` lines of `s`, and a line saying how many more there were.
+fn head_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.trim_end().lines().collect();
+    if lines.len() <= n {
+        return lines.join("\n");
+    }
+    format!("{}\n\u{2026} {} more lines", lines[..n].join("\n"), lines.len() - n)
+}
+
+/// A card's head: the step running now, else the one step it took, else how many of one kind, else its value.
+fn headline(d: &Detail) -> (&'static str, String, String, bool) {
+    if let Some(e) = d.effects.iter().rev().find(|e| e.status == "running") {
+        return (kind_icon(&e.kind), format!("{}\u{2026}", e.doing), String::new(), false);
+    }
+    if d.status == "error" {
+        let why = d.value["message"].as_str().map_or_else(|| "failed".to_owned(), first_line);
+        return (kind_icon("error"), why, String::new(), true);
+    }
+    let failed = d.effects.iter().any(|e| e.status == "error");
+    match d.effects.as_slice() {
+        [] if d.status == "running" => (kind_icon(""), "Running\u{2026}".into(), String::new(), false),
+        [] => {
+            let v = &d.value;
+            let n = v["total"].as_u64().unwrap_or(0);
+            let words = match v["t"].as_str().unwrap_or("") {
+                "table" => format!("{n} row{}", if n == 1 { "" } else { "s" }),
+                "list" => format!("{n} item{}", if n == 1 { "" } else { "s" }),
+                "record" => format!("{n} field{}", if n == 1 { "" } else { "s" }),
+                "scalar" => cell_text(&v["v"]),
+                "text" => first_line(v["v"].as_str().unwrap_or("")),
+                _ => "Done".into(),
+            };
+            (kind_icon(""), words, String::new(), false)
+        }
+        [e] => (kind_icon(&e.kind), e.done.clone(), e.detail.clone(), failed),
+        [e, rest @ ..] if rest.iter().all(|r| r.kind == e.kind) => (kind_icon(&e.kind), steps_of(&e.kind, rest.len() + 1), String::new(), failed),
+        [e, rest @ ..] => (kind_icon(&e.kind), format!("{} and {} more", e.done, rest.len()), String::new(), failed),
+    }
+}
+
+/// The rows a shown value is drawn as: a grid, or output text (`cap` rows or lines of either).
+fn value_rows(v: &Arc<Value>, cap: usize, out: &mut Vec<Row>) {
+    match v["t"].as_str().unwrap_or("") {
+        "table" | "record" | "list" => out.push(Row::Grid { v: v.clone(), cap }),
+        "text" => out.push(Row::Output { text: head_lines(v["v"].as_str().unwrap_or(""), cap), error: false }),
+        "error" => {
+            let stack = v["stack"].as_str().filter(|s| !s.is_empty()).or_else(|| v["message"].as_str()).unwrap_or("");
+            out.push(Row::Output { text: head_lines(stack, cap), error: true });
+        }
+        _ => {}
+    }
+}
+
+/// A harness REPL cell's card (`tool_detail`): what it did in words, never its code. Folded, its head and its main value
+/// (the cell's own, else its last step's), [`FOLDED_ROWS`] of it; opened, each step and its value, the cell's value and
+/// logs in full, then "Show code".
+fn card_rows(block: &str, d: &Detail, open: &HashSet<String>, out: &mut Vec<Row>) {
+    let is_open = open.contains(block);
+    let (icon, words, detail, error) = headline(d);
+    let state = d.ms.filter(|_| d.status != "running").map(secs).unwrap_or_default();
+    out.push(Row::Card { block: block.to_owned(), icon, words, detail, state, error, open: is_open });
+    if !is_open {
+        let main = if d.value.is_null() { d.effects.iter().rev().map(|e| &e.value).find(|v| !v.is_null()) } else { Some(&d.value) };
+        // A cell whose whole value is its head ("42") shows nothing more.
+        if let Some(main) = main.filter(|m| !(d.effects.is_empty() && m["t"] == "scalar")) {
+            value_rows(main, FOLDED_ROWS, out);
+        }
+        return;
+    }
+    let many = d.effects.len() > 1;
+    for e in &d.effects {
+        if many {
+            let words = if e.status == "running" { format!("{}\u{2026}", e.doing) } else { e.done.clone() };
+            out.push(Row::Step { icon: kind_icon(&e.kind), words, detail: e.detail.clone(), error: e.status == "error" });
+        }
+        value_rows(&e.value, usize::MAX, out);
+    }
+    if d.dropped > 0 {
+        out.push(Row::Step { icon: kind_icon(""), words: format!("{} more steps, not kept", d.dropped), detail: String::new(), error: false });
+    }
+    if d.value["t"] == "scalar" && !d.effects.is_empty() {
+        out.push(Row::Output { text: cell_text(&d.value["v"]), error: false });
+    }
+    value_rows(&d.value, usize::MAX, out);
+    if !d.logs.is_empty() {
+        out.push(Row::Output { text: d.logs.clone(), error: false });
+    }
+    let code = open.contains(&code_key(block));
+    out.push(Row::CodeToggle { block: block.to_owned(), open: code });
+    if code {
+        out.push(Row::Code { lang: "ts".into(), text: d.code.clone() });
+    }
+}
+
 /// The transcript as rows, keyed so a row keeps its key as it streams.
 fn rows(t: &Transcript, open: &HashSet<String>) -> Vec<(String, Row)> {
     let mut out = Vec::new();
@@ -400,6 +571,7 @@ fn rows(t: &Transcript, open: &HashSet<String>) -> Vec<(String, Row)> {
                     part.push(Row::Thinking { block: block.clone(), open: open.contains(block), text: text.clone(), live: !done });
                 }
             }
+            Item::Tool { block, .. } if t.details.contains_key(block) => card_rows(block, &t.details[block], open, &mut part),
             Item::Tool { block, name, input, partial, result, done } => {
                 let state = match result {
                     Some(r) if r.error => "failed".to_owned(),
@@ -487,7 +659,10 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         ],
         Row::Thinking { open: true, text, .. } => vec![(&["text"], text.trim().to_owned(), false)],
         Row::Note(s) | Row::Error(s) => vec![(&["text"], s.clone(), false)],
-        Row::Tool { .. } | Row::Thinking { .. } => Vec::new(),
+        Row::Card { words, .. } => vec![(&["head", "words"], words.clone(), false)],
+        Row::Step { words, .. } => vec![(&["words"], words.clone(), false)],
+        Row::Output { text, .. } => vec![(&["card", "text"], text.clone(), false)],
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => Vec::new(),
     }
 }
 
@@ -529,7 +704,10 @@ impl Row {
             }
             Row::Quote(s) => format!("> {s}"),
             Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
-            Row::Tool { .. } | Row::Thinking { .. } => return None,
+            Row::Output { text, .. } => format!("```\n{text}\n```"),
+            Row::Tool { .. } | Row::Thinking { .. } | Row::Card { .. } | Row::Step { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => {
+                return None;
+            }
         })
     }
 }
@@ -703,7 +881,13 @@ impl App {
         if let Some(area) = pv.part("foot").and_then(|f| f.part("input")).and_then(|i| i.part("area")) {
             let (shown, [caret, anchor, lo, hi]) = st.draft.shown();
             if let Some(h) = area.part("hint") {
-                h.text(if shown.is_empty() { "Message Claude\u{2026}" } else { "" });
+                // Its agent's name: "Message Codex…" in a Codex session.
+                let agent = match model::kind_name(w.entity_from_id(e)) {
+                    "codex" => "Codex",
+                    "cursor" => "Cursor",
+                    _ => "Claude",
+                };
+                h.text(&if shown.is_empty() { format!("Message {agent}\u{2026}") } else { String::new() });
             }
             if let Some(txt) = area.part("text") {
                 txt.text(&shown);
@@ -861,7 +1045,7 @@ impl App {
         true
     }
 
-    /// Open or fold a tool call's or thinking's row.
+    /// Open or fold a tool call's or thinking's row, or a card's code (`block#code`).
     pub(super) fn chat_toggle(&mut self, block: &str) {
         let Some((_, _, sid)) = self.focused_chat().or_else(|| self.any_chat_with(block)) else { return };
         let mut states = self.chat.borrow_mut();
@@ -874,6 +1058,7 @@ impl App {
     }
 
     fn any_chat_with(&self, block: &str) -> Option<(u64, u64, u64)> {
+        let block = block.strip_suffix("#code").unwrap_or(block);
         let chats = self.chats.borrow();
         let sid = chats.iter().find(|(_, t)| t.items.iter().any(|i| matches!(i, Item::Tool { block: b, .. } | Item::Thinking { block: b, .. } if b == block)))?.0;
         Some((0, 0, *sid))
@@ -1314,6 +1499,101 @@ fn fill_row(row: View<'_>, r: &Row) {
             }
             text("text", s.trim());
         }
+        Row::Card { block, icon, words, detail, state, open, .. } => {
+            if let Some(h) = row.part("head") {
+                h.action(&format!("chat:open:{block}"));
+                if let Some(p) = h.part("disclose") {
+                    p.icon(if *open { OPENED } else { CLOSED });
+                }
+                if let Some(p) = h.part("icon") {
+                    p.icon(icon);
+                }
+                for (part, s) in [("words", words), ("detail", detail), ("state", state)] {
+                    if let Some(p) = h.part(part) {
+                        p.text(s);
+                    }
+                }
+            }
+        }
+        Row::Step { icon, words, detail, .. } => {
+            if let Some(p) = row.part("icon") {
+                p.icon(icon);
+            }
+            text("words", words);
+            text("detail", detail);
+        }
+        Row::Grid { v, cap } => fill_grid(row, v, *cap),
+        Row::Output { text: s, .. } => {
+            if let Some(t) = row.part("card").and_then(|c| c.part("text")) {
+                t.text(s);
+            }
+        }
+        Row::CodeToggle { block, open } => {
+            if let Some(h) = row.part("head") {
+                h.action(&format!("chat:open:{}", code_key(block)));
+                if let Some(p) = h.part("disclose") {
+                    p.icon(if *open { OPENED } else { CLOSED });
+                }
+                if let Some(p) = h.part("words") {
+                    p.text(if *open { "Hide code" } else { "Show code" });
+                }
+            }
+        }
+    }
+}
+
+/// A shown table, record or list (mcp/src/shown.ts) in a `ui.Table`, Nushell's way: a table gets an index column and a
+/// header, a record its keys beside its values, a list an index; numbers sit at the end, nulls are dim, links in the
+/// accent; a cell cut short shows its whole text on hover. A foot says how many rows there are, and how many are shown.
+fn fill_grid(row: View<'_>, v: &Value, cap: usize) {
+    let kind = v["t"].as_str().unwrap_or("");
+    let cols: Vec<(&str, &str)> =
+        v["cols"].as_array().into_iter().flatten().map(|c| (c["name"].as_str().unwrap_or(""), c["type"].as_str().unwrap_or(""))).collect();
+    let rows: &[Value] = v["rows"].as_array().map_or(&[], Vec::as_slice);
+    let total = v["total"].as_u64().unwrap_or(rows.len() as u64) as usize;
+    let shown = rows.len().min(cap);
+    let index = kind != "record";
+    let width = |c: usize| rows[..shown].iter().map(|r| cell_text(&r[c]).chars().count()).max().unwrap_or(0);
+    let mut columns = Vec::new();
+    if index {
+        columns.push(view::TableColumn { name: "#", chars: total.saturating_sub(1).to_string().len().max(1), end: true });
+    }
+    for (c, (name, ty)) in cols.iter().enumerate() {
+        let head = if kind == "table" { name.chars().count() } else { 0 };
+        columns.push(view::TableColumn { name, chars: width(c).max(head), end: *ty == "number" });
+    }
+    let off = usize::from(index);
+    if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
+        let head = (kind == "table").then_some("hn.ChatHead");
+        let prefab = |r: u32, c: usize| {
+            if c < off || (kind == "record" && c == 0) {
+                return "hn.ChatCellDim";
+            }
+            match &rows[r as usize][c - off] {
+                Value::Null => "hn.ChatCellDim",
+                Value::String(_) if cols[c - off].1 == "url" => "hn.ChatCellLink",
+                _ => "hn.ChatCell",
+            }
+        };
+        view::table(grid, &columns, shown as u32, head, prefab, |cell, r, c| {
+            let s = if c < off { r.to_string() } else { cell_text(&rows[r as usize][c - off]) };
+            if let Some(t) = cell.part("text") {
+                t.text(&s);
+            }
+            // The whole text on hover when the column cuts it.
+            let cut = s.chars().count() > columns[c].chars.min(view::TABLE_MAX_CHARS) || s.ends_with('\u{2026}');
+            let tip = cell.entity().try_cloned::<&Tooltip>();
+            if cut && tip.as_ref().is_none_or(|t| t.text.as_str() != s) {
+                cell.set(Tooltip { text: s.as_str().into() });
+            } else if !cut && tip.is_some() {
+                cell.entity().remove(Tooltip::id());
+            }
+        });
+    }
+    if let Some(f) = row.part("foot") {
+        let unit = if kind == "record" { "field" } else if kind == "list" { "item" } else { "row" };
+        let s = if total == 1 { "" } else { "s" };
+        f.text(&if shown < total { format!("{shown} of {total} {unit}s") } else { format!("{total} {unit}{s}") });
     }
 }
 

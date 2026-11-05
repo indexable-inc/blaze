@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { req } from "./daemon.ts";
 import { sql } from "./sql.ts";
 import { table, type Table } from "./table.ts";
+import { effect, oneLine } from "./effects.ts";
 
 export type Kind = "claude" | "codex" | "cursor" | "shell" | "proc";
 export type ObjInfo = {
@@ -216,7 +217,12 @@ export class Obj {
  * Start an object, or return the running one with this name (get-or-create, atomic in the daemon).
  * kind 'proc' runs opts.cmd like sh() (every stage stored) with a live stdin; agents get opts.prompt.
  */
-export async function spawn(kind: Kind, opts: SpawnOpts = {}): Promise<Obj> {
+export function spawn(kind: Kind, opts: SpawnOpts = {}): Promise<Obj> {
+  const what = kind === "proc" ? oneLine(opts.cmd ?? "") : AGENTS.has(kind) ? `${kind} agent${opts.name ? ` ${opts.name}` : ""}` : `${kind}${opts.name ? ` ${opts.name}` : ""}`;
+  return effect("spawn", `Starting ${what}`, `Started ${what}`, opts.name ?? kind, () => spawnObject(kind, opts), (o) => ({ detail: o.id }));
+}
+
+async function spawnObject(kind: Kind, opts: SpawnOpts): Promise<Obj> {
   const env: Record<string, string> = {};
   let parent: string | null = opts.parent === undefined ? null : opts.parent === null ? null : refId(opts.parent);
   let body: Record<string, unknown>;

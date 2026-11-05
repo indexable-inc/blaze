@@ -14,6 +14,7 @@
 import { DuckDBInstance, type DuckDBConnection, type DuckDBValue } from "@duckdb/node-api";
 import { existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { table, type Table } from "./table.ts";
+import { effect } from "./effects.ts";
 
 const HOME = () => process.env.HARNESS_HOME ?? `${process.env.HOME}/.harness`;
 const lit = (s: string) => `'${s.replaceAll("'", "''")}'`;
@@ -126,5 +127,5 @@ export function sql<Row extends object = Record<string, unknown>>(strings: Templ
   };
   const p = chain.then(run, run);
   chain = p.catch(() => {});
-  return p;
+  return effect("sql", "Querying the harness store", "Queried the harness store", text, () => p, (r) => ({ detail: `${r.length} row${r.length === 1 ? "" : "s"}`, show: r }));
 }
