@@ -150,14 +150,14 @@ impl App {
             italic: cfg.font_family_italic.clone(),
             bold_italic: cfg.font_family_bold_italic.clone(),
         };
-        let refont = self.paint.fonts.set_term_families(families) || size != self.look.size;
+        let refont = self.paint.get_mut().fonts.set_term_families(families) || size != self.look.size;
         self.look.size = size;
         if pad != self.look.pad {
             self.look.pad = pad;
             self.chrome_laid = None;
         }
         if refont {
-            self.grid = Grid::new(&mut self.paint.fonts, self.look.size, self.grid.scale);
+            self.grid = Grid::new(&mut self.paint.get_mut().fonts, self.look.size, self.grid.scale);
         }
         let themed = [cfg.light.background.is_some(), cfg.dark.background.is_some()];
         self.tint_tokens(themed);

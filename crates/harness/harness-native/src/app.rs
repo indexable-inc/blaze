@@ -170,7 +170,7 @@ pub struct Bump {
 pub struct App {
     pub world: World,
     /// Fonts, glyph atlas, layouts and pictures, and the paint pass shared with harness-video (harness-native-render).
-    paint: Painter,
+    paint: std::cell::RefCell<Painter>,
     terms: model::Terms,
     /// The parsers of runs and stages being read, by entity id.
     run_terms: model::Terms,
@@ -426,7 +426,7 @@ impl App {
         let grid = Grid::new(&mut paint.fonts, TERM_SIZE, 2.0);
         let mut app = Self {
             world,
-            paint,
+            paint: std::cell::RefCell::new(paint),
             terms,
             run_terms,
             chats,
@@ -1443,7 +1443,7 @@ impl App {
         let scale = backing * z;
         if self.grid.scale != scale {
             // Cells are whole device pixels: new metrics at a new scale (the pane's grid may change size with them).
-            self.grid = Grid::new(&mut self.paint.fonts, self.look.size, scale);
+            self.grid = Grid::new(&mut self.paint.get_mut().fonts, self.look.size, scale);
         }
         self.step_sidebar(dt);
         self.lay_chrome(z);
@@ -1503,7 +1503,7 @@ impl App {
             ..Draw::default()
         };
         self.emit(&mut d, scale, upload);
-        if self.paint.end_frame() {
+        if self.paint.get_mut().end_frame() {
             self.poke();
         }
         self.stats_end(&d);
@@ -1606,7 +1606,7 @@ impl App {
 
     /// Size every `Text` node with the typesetter; how many changed.
     fn typeset(&mut self) -> usize {
-        self.paint.typeset(self.world.world_ref())
+        self.paint.get_mut().typeset(self.world.world_ref())
     }
 
     /// What was activated this frame: a row selects its object, a palette entry runs.
@@ -1662,6 +1662,15 @@ impl App {
                 self.request_older();
             } else if let Some(b) = a.strip_prefix("chat:open:") {
                 self.chat_toggle(b);
+            } else if let Some(rest) = a.strip_prefix("chat:row:") {
+                self.chat_row_toggle(rest);
+            } else if let Some(url) = a.strip_prefix("open:") {
+                // A link in a view: the browser opens it (only web links; anything else stays put).
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    if let Err(e) = std::process::Command::new("/usr/bin/open").arg(url).spawn() {
+                        eprintln!("harness-native: open {url}: {e}");
+                    }
+                }
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {
@@ -1729,7 +1738,7 @@ impl App {
                     (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1),
                 )
             });
-            let at = match self.paint.node(d, e, &p, laid, p.dark(dark), held == Some(id), sc, upload) {
+            let at = match self.paint.get_mut().node(d, e, &p, laid, p.dark(dark), held == Some(id), sc, upload) {
                 Ok(at) => at,
                 Err(err) => {
                     eprintln!("harness-native: paint: {err}");
@@ -2041,9 +2050,14 @@ mod tests {
         assert!(bad.is_empty(), "{}", bad.join("\n"));
         // Prefabs the code names (a missing one would draw as a bare node, silently).
         let missing: Vec<&str> = [
-            "ui.Table", "ui.TableRow", "ui.TableCell", "ui.TableHead", "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep",
-            "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput", "hn.ChatOutputError", "hn.ChatCodeToggle", "hn.ChatCell",
-            "hn.ChatCellDim", "hn.ChatCellLink", "hn.ChatHead", "ex.TableDemo",
+            "ui.Table", "ui.TableHeadRow", "ui.TableRow", "ui.TableRecord", "ui.ResultList", "ui.Result",
+            "ui.TableCell", "ui.TableCellMd", "ui.TableCellCode", "ui.TableCellNum", "ui.TableCellDim",
+            "ui.TableCellLink", "ui.TableCellMark", "ui.TableHead", "ui.TableField", "ui.TableFieldMd",
+            "hn.ChatTableCell", "hn.ChatTableCellMd", "hn.ChatTableCellCode", "hn.ChatTableCellNum",
+            "hn.ChatTableCellDim", "hn.ChatTableCellLink", "hn.ChatTableCellMark", "hn.ChatTableHead",
+            "hn.ChatTableField", "hn.ChatTableFieldMd", "hn.ChatTable", "hn.ChatResults", "hn.ChatResult",
+            "hn.ChatCard", "hn.ChatCardFailed", "hn.ChatStep", "hn.ChatStepFailed", "hn.ChatGrid", "hn.ChatOutput",
+            "hn.ChatOutputError", "hn.ChatCodeToggle", "ex.TableDemo",
         ]
         .into_iter()
         .filter(|p| harness_native_ui_view::prefab(world.world_ref(), p).is_none())

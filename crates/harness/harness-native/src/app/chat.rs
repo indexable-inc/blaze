@@ -11,7 +11,6 @@ use harness_native_ui_layout_api::ScrollState;
 use harness_native_ui_text_api::{Highlight, TextEdit};
 use crate::pane::Unit;
 use harness_native_render::text::Layout;
-use harness_native_ui_input_api::Tooltip;
 use harness_native_ui_look_api::TextStyle;
 use harness_native_ui_text_api::{MarkdownText, Text};
 use model::chat::{Detail, Item, Transcript};
@@ -193,6 +192,8 @@ pub struct ChatState {
     /// The transcript's selection (where it was started, where it reaches), and the press-and-drag making one.
     sel: Option<(Spot, Spot)>,
     drag: Option<Drag>,
+    /// The table rows opened below their rows as records, by the transcript row the table is (its key).
+    rows_open: HashMap<String, usize>,
 }
 
 /// A place in a chat's transcript: row `row`, its `part`th words ([`texts`]), UTF-16 unit `at` of what they show (the
@@ -229,6 +230,7 @@ impl Default for ChatState {
             ours: false,
             sel: None,
             drag: None,
+            rows_open: HashMap::new(),
         }
     }
 }
@@ -249,6 +251,10 @@ enum Row {
     Step { icon: &'static str, words: String, detail: String, error: bool },
     /// A table, record or list (the kernel's shown value), its first `cap` rows.
     Grid { v: Arc<Value>, cap: usize },
+    /// A markdown table in the agent's words.
+    Table(Rc<view::table::Table>),
+    /// Search results a cell gave (a value the kernel tags `kind: "search"`), their first `cap`.
+    Results { v: Arc<Value>, cap: usize },
     /// Text a cell printed or returned: a command's output, a string, an error's stack.
     Output { text: String, error: bool },
     /// "Show code" under an opened card.
@@ -276,6 +282,8 @@ impl Row {
             Row::Step { error: true, .. } => "hn.ChatStepFailed",
             Row::Step { .. } => "hn.ChatStep",
             Row::Grid { .. } => "hn.ChatGrid",
+            Row::Table(_) => "hn.ChatTable",
+            Row::Results { .. } => "hn.ChatResults",
             Row::Output { error: true, .. } => "hn.ChatOutputError",
             Row::Output { .. } => "hn.ChatOutput",
             Row::CodeToggle { .. } => "hn.ChatCodeToggle",
@@ -288,8 +296,10 @@ impl Row {
 }
 
 /// Markdown split into the rows it is drawn as: paragraphs (soft breaks joined), headings, list items (continuation lines
-/// joined), quotes, fenced code (an unclosed fence, still streaming, runs to the end) and tables (as code).
-fn blocks(md: &str, out: &mut Vec<Row>) {
+/// joined), quotes, fenced code (an unclosed fence, still streaming, runs to the end) and GitHub tables (lines of pipes
+/// that are no table, as code). While it is `live` (still streaming) a table's row arrives whole: a last row not yet ended
+/// is held back, and so is a head whose delimiter line has not come.
+fn blocks(md: &str, live: bool, out: &mut Vec<Row>) {
     let lines: Vec<&str> = md.lines().collect();
     let mut para: Vec<&str> = Vec::new();
     let flush = |para: &mut Vec<&str>, out: &mut Vec<Row>| {
@@ -327,6 +337,21 @@ fn blocks(md: &str, out: &mut Vec<Row>) {
             out.push(Row::Heading(hashes as u8, t[hashes..].trim().trim_end_matches('#').trim().to_owned()));
             i += 1;
             continue;
+        }
+        if t.contains('|') {
+            if let Some((mut table, used)) = harness_native_render::markdown::table(&lines[i..]) {
+                flush(&mut para, out);
+                if live && i + used == lines.len() && !md.ends_with('\n') {
+                    table.rows.pop();
+                }
+                out.push(Row::Table(Rc::new(md_table(&table))));
+                i += used;
+                continue;
+            }
+            let last = i + 1 == lines.len() || (i + 2 == lines.len() && !md.ends_with('\n'));
+            if live && t.starts_with('|') && last {
+                break;
+            }
         }
         if t.starts_with('|') {
             flush(&mut para, out);
@@ -375,6 +400,37 @@ fn blocks(md: &str, out: &mut Vec<Row>) {
         i += 1;
     }
     flush(&mut para, out);
+}
+
+/// A markdown table as `ui.Table` shows it: its cells inline markdown (a plain number a number, at the end unless the
+/// delimiter line says otherwise), its columns aligned as the delimiter line says.
+fn md_table(t: &harness_native_render::markdown::Table) -> view::table::Table {
+    use harness_native_render::markdown::Align as A;
+    use view::table::{Align, Cell, Column, Kind};
+    let number = |s: &str| {
+        let s = s.trim_end_matches('%').trim_start_matches(['$', '+', '-']).replace(',', "");
+        !s.is_empty() && s.parse::<f64>().is_ok()
+    };
+    let cols = t
+        .head
+        .iter()
+        .zip(&t.align)
+        .map(|(h, a)| Column {
+            name: harness_native_render::markdown::inline(h).text,
+            align: match a {
+                A::None => Align::Auto,
+                A::Left => Align::Start,
+                A::Center => Align::Center,
+                A::Right => Align::End,
+            },
+        })
+        .collect();
+    let rows = t
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|c| Cell::new(if number(c) { Kind::Number } else { Kind::Markdown }, c.as_str())).collect())
+        .collect();
+    view::table::Table { cols, rows, head: true }
 }
 
 /// A list item's mark (`•` for a bullet, `3.` for a number) and its words.
@@ -506,6 +562,10 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
 
 /// The rows a shown value is drawn as: a grid, or output text (`cap` rows or lines of either).
 fn value_rows(v: &Arc<Value>, cap: usize, out: &mut Vec<Row>) {
+    if v["kind"] == "search" {
+        out.push(Row::Results { v: v.clone(), cap });
+        return;
+    }
     match v["t"].as_str().unwrap_or("") {
         "table" | "record" | "list" => out.push(Row::Grid { v: v.clone(), cap }),
         "text" => out.push(Row::Output { text: head_lines(v["v"].as_str().unwrap_or(""), cap), error: false }),
@@ -565,7 +625,7 @@ fn rows(t: &Transcript, open: &HashSet<String>) -> Vec<(String, Row)> {
         let mut part = Vec::new();
         match it {
             Item::User { text } => part.push(Row::User(text.clone())),
-            Item::Text { text, .. } => blocks(text, &mut part),
+            Item::Text { text, done, .. } => blocks(text, !done, &mut part),
             Item::Thinking { block, text, done } => {
                 if !text.trim().is_empty() || !done {
                     part.push(Row::Thinking { block: block.clone(), open: open.contains(block), text: text.clone(), live: !done });
@@ -662,7 +722,9 @@ fn texts(r: &Row) -> Vec<(&'static [&'static str], String, bool)> {
         Row::Card { words, .. } => vec![(&["head", "words"], words.clone(), false)],
         Row::Step { words, .. } => vec![(&["words"], words.clone(), false)],
         Row::Output { text, .. } => vec![(&["card", "text"], text.clone(), false)],
-        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => Vec::new(),
+        Row::Tool { .. } | Row::Thinking { .. } | Row::Grid { .. } | Row::CodeToggle { .. } | Row::Table(_) | Row::Results { .. } => {
+            Vec::new()
+        }
     }
 }
 
@@ -705,7 +767,8 @@ impl Row {
             Row::Quote(s) => format!("> {s}"),
             Row::Code { lang, text } => format!("```{lang}\n{text}\n```"),
             Row::Output { text, .. } => format!("```\n{text}\n```"),
-            Row::Tool { .. } | Row::Thinking { .. } | Row::Card { .. } | Row::Step { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => {
+            Row::Table(t) => t.markdown(),
+            Row::Results { .. } | Row::Tool { .. } | Row::Thinking { .. } | Row::Card { .. } | Row::Step { .. } | Row::Grid { .. } | Row::CodeToggle { .. } => {
                 return None;
             }
         })
@@ -732,10 +795,17 @@ fn transcript_text(rows: &[(String, Row)], lo: Spot, hi: Spot) -> String {
                 bits.push(s[byte_of(&s, a)..byte_of(&s, b)].to_owned());
             }
         }
-        if bits.is_empty() {
-            continue;
-        }
-        let piece = if whole { r.markdown().unwrap_or_else(|| bits.join("\n")) } else { bits.join(" ") };
+        // A row with no words to select (a table) is taken whole when the selection runs past it on both sides.
+        let piece = if bits.is_empty() {
+            match r.markdown().filter(|_| texts(r).is_empty() && lo.row < i && i < hi.row) {
+                Some(md) => md,
+                None => continue,
+            }
+        } else if whole {
+            r.markdown().unwrap_or_else(|| bits.join("\n"))
+        } else {
+            bits.join(" ")
+        };
         if let Some(prev) = last {
             let list = matches!(prev, Row::ListItem { .. }) && matches!(r, Row::ListItem { .. });
             out.push_str(if list { "\n" } else { "\n\n" });
@@ -833,6 +903,10 @@ impl App {
             // The transcript's selection, a wash over the words it covers in the input's selection colours.
             let sel = st.sel.map(|(a, b)| (a.min(b), a.max(b))).filter(|(a, b)| a != b);
             let wash = input_text(w, pane).and_then(|t| t.entity().try_cloned::<&TextEdit>()).unwrap_or_default();
+            // Tables measure their columns with the typesetter.
+            let mut paint = self.paint.borrow_mut();
+            let mut measure = |s: &str, style: &TextStyle, md: bool| paint.width(s, style, md);
+            let rows_open = &st.rows_open;
             let fresh_rows = |row: View<'_>, i: usize, new: bool| {
                 if new {
                     row.set(HoverAmt::default());
@@ -840,7 +914,8 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                fill_row(row, &rows[i].1);
+                let ctx = RowCtx { sid, key: &rows[i].0, open: rows_open.get(&rows[i].0).copied() };
+                fill_row(row, &rows[i].1, &ctx, &mut measure);
                 for (k, (path, src, md)) in texts(&rows[i].1).iter().enumerate() {
                     let Some(node) = path.iter().try_fold(row, |v, n| v.part(n)) else { continue };
                     let e = node.entity();
@@ -1180,7 +1255,66 @@ impl App {
             let rows = rows(chats.get(&sid).unwrap_or(&empty), &st.open);
             return Some(Some(transcript_text(&rows, a.min(b), a.max(b))).filter(|s| !s.is_empty()));
         }
-        Some(Some(st.draft.selected().to_owned()).filter(|s| !s.is_empty()))
+        let picked = st.draft.selected();
+        if !picked.is_empty() {
+            return Some(Some(picked.to_owned()));
+        }
+        // A table row: the one under the pointer, else the first one opened, as a markdown table of its header and it.
+        let chats = self.chats.borrow();
+        let empty = Transcript::default();
+        let rows = rows(chats.get(&sid).unwrap_or(&empty), &st.open);
+        let at = |key: &str, r: usize| {
+            let t = rows.iter().find(|(k, _)| k == key).and_then(|(_, row)| row_table(row))?;
+            (r < t.rows.len()).then(|| t.row_markdown(r))
+        };
+        if let Some((key, r)) = self.hovered_table_row()
+            && let Some(md) = at(&key, r)
+        {
+            return Some(Some(md));
+        }
+        Some(rows.iter().find_map(|(k, _)| st.rows_open.get(k).and_then(|&r| at(k, r))))
+    }
+
+    /// The transcript row (its key) and table row under the pointer, when it is over a table in a chat.
+    fn hovered_table_row(&self) -> Option<(String, usize)> {
+        let w = self.world.world_ref();
+        let t = w.entity_named(APP).target(Hovered::id(), 0)?;
+        let (table, r) = view::table::row_under(t)?;
+        let row = std::iter::successors(Some(table), |n| n.parent())
+            .take(8)
+            .find(|n| n.parent().is_some_and(|p| p.name() == "rows" && p.parent().is_some_and(|l| l.name() == "list")))?;
+        Some((row.name().to_string(), r))
+    }
+
+    /// A press on a table row in a chat (`{sid}:{key}:{row}`): open it below as a record, or close it when it is open.
+    pub(super) fn chat_row_toggle(&mut self, rest: &str) {
+        let Some((head, r)) = rest.rsplit_once(':') else { return };
+        let Some((sid, key)) = head.split_once(':') else { return };
+        let (Ok(sid), Ok(r)) = (sid.parse::<u64>(), r.parse::<usize>()) else { return };
+        let mut states = self.chat.borrow_mut();
+        let open = &mut states.entry(sid).or_default().rows_open;
+        if open.get(key) == Some(&r) {
+            open.remove(key);
+        } else {
+            open.insert(key.to_owned(), r);
+        }
+        drop(states);
+        self.poke();
+    }
+
+    /// A sideways scroll over a table: it takes it while its columns overhang its room. Whether one did.
+    pub(super) fn table_wheel(&mut self, ev: &sidebar::Wheel, z: f32) -> bool {
+        if ev.dx.abs() <= ev.dy.abs() {
+            return false;
+        }
+        let w = self.world.world_ref();
+        let Some(t) = w.entity_named(APP).target(Hovered::id(), 0) else { return false };
+        let dx = if ev.precise { ev.dx / z } else { ev.dx * 12.0 };
+        if view::table::scroll_sideways(t, -dx) {
+            self.poke();
+            return true;
+        }
+        false
     }
 
     /// Command-A in the focused chat's input. Whether a chat took it.
@@ -1196,7 +1330,7 @@ impl App {
         let (p, _, sid) = self.focused_chat()?;
         let w = self.world.world_ref();
         let txt = input_text(w, p)?;
-        let (lay, laid) = words_layout(&mut self.paint, txt.entity())?;
+        let (lay, laid) = words_layout(&mut self.paint.borrow_mut(), txt.entity())?;
         Some((lay, laid, p, sid))
     }
 
@@ -1295,7 +1429,7 @@ impl App {
                     return Some(Spot { row: i, part: k, at: 0 });
                 }
                 if y < l.y + l.h {
-                    let (lay, l) = words_layout(&mut self.paint, node.entity())?;
+                    let (lay, l) = words_layout(&mut self.paint.borrow_mut(), node.entity())?;
                     return Some(Spot { row: i, part: k, at: lay.index_at(x - l.x, y - l.y) });
                 }
                 last = Some(Spot { row: i, part: k, at: units(&shown(src, *md)) });
@@ -1422,8 +1556,18 @@ impl App {
     }
 }
 
+/// Where a transcript row is, for the parts that act on it: its session, its key, and the table row opened in it.
+struct RowCtx<'k> {
+    sid: u64,
+    key: &'k str,
+    open: Option<usize>,
+}
+
+/// A table's measure: words (in a style, inline markdown or not) to their one-line width in points.
+type Measure<'m> = dyn FnMut(&str, &TextStyle, bool) -> f32 + 'm;
+
 /// Fill one transcript row from what it shows.
-fn fill_row(row: View<'_>, r: &Row) {
+fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>) {
     let text = |name: &str, s: &str| {
         if let Some(p) = row.part(name) {
             p.text(s);
@@ -1509,7 +1653,15 @@ fn fill_row(row: View<'_>, r: &Row) {
             text("words", words);
             text("detail", detail);
         }
-        Row::Grid { v, cap } => fill_grid(row, v, *cap),
+        Row::Grid { v, cap } => fill_grid(row, v, *cap, ctx, measure),
+        Row::Table(t) => {
+            if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
+                let action = format!("chat:row:{}:{}", ctx.sid, ctx.key);
+                let opts = view::table::Opts { look: "hn.ChatTable", shown: t.rows.len(), action: Some(&action), open: ctx.open };
+                view::table(grid, t, opts, measure);
+            }
+        }
+        Row::Results { v, cap } => fill_results(row, v, *cap),
         Row::Output { text: s, .. } => {
             if let Some(t) = row.part("card").and_then(|c| c.part("text")) {
                 t.text(s);
@@ -1529,58 +1681,132 @@ fn fill_row(row: View<'_>, r: &Row) {
     }
 }
 
-/// A shown table, record or list (mcp/src/shown.ts) in a `ui.Table`, Nushell's way: a table gets an index column and a
-/// header, a record its keys beside its values, a list an index; numbers sit at the end, nulls are dim, links in the
-/// accent; a cell cut short shows its whole text on hover. A foot says how many rows there are, and how many are shown.
-fn fill_grid(row: View<'_>, v: &Value, cap: usize) {
+/// A shown table, record or list (mcp/src/shown.ts) as a `ui.Table`'s data, Nushell's way: a table gets an index column
+/// and a header, a record its keys (dim) beside its values, a list an index; each cell typed by its value and its column's
+/// type (numbers, bools, urls, nulls, code-ish strings in the monospace face).
+fn grid_table(v: &Value) -> view::table::Table {
+    use view::table::{Align, Cell, Column, Kind};
     let kind = v["t"].as_str().unwrap_or("");
     let cols: Vec<(&str, &str)> =
         v["cols"].as_array().into_iter().flatten().map(|c| (c["name"].as_str().unwrap_or(""), c["type"].as_str().unwrap_or(""))).collect();
     let rows: &[Value] = v["rows"].as_array().map_or(&[], Vec::as_slice);
-    let total = v["total"].as_u64().unwrap_or(rows.len() as u64) as usize;
-    let shown = rows.len().min(cap);
     let index = kind != "record";
-    let width = |c: usize| rows[..shown].iter().map(|r| cell_text(&r[c]).chars().count()).max().unwrap_or(0);
     let mut columns = Vec::new();
     if index {
-        columns.push(view::TableColumn { name: "#", chars: total.saturating_sub(1).to_string().len().max(1), end: true });
+        columns.push(Column { name: "#".into(), align: Align::End });
     }
-    for (c, (name, ty)) in cols.iter().enumerate() {
-        let head = if kind == "table" { name.chars().count() } else { 0 };
-        columns.push(view::TableColumn { name, chars: width(c).max(head), end: *ty == "number" });
+    columns.extend(cols.iter().map(|(name, _)| Column { name: (*name).to_owned(), align: Align::Auto }));
+    let url = |s: &str| (s.starts_with("https://") || s.starts_with("http://")) && !s.contains(char::is_whitespace);
+    let cell = |x: &Value, ty: &str| match x {
+        Value::Null => Cell::new(Kind::Dim, "null"),
+        Value::Bool(b) => Cell::new(Kind::Bool, b.to_string()),
+        Value::Number(n) => Cell::new(Kind::Number, n.to_string()),
+        Value::String(s) if url(s) => Cell::new(Kind::Url, s.as_str()),
+        Value::String(s) if ty == "number" => Cell::new(Kind::Number, s.as_str()),
+        Value::String(s) if ty == "nested" || ty == "date" || codeish(s) => Cell::new(Kind::Code, s.as_str()),
+        Value::String(s) => Cell::new(Kind::Text, s.as_str()),
+        x => Cell::new(Kind::Code, x.to_string()),
+    };
+    let rows = rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let mut out = Vec::with_capacity(columns.len());
+            if index {
+                out.push(Cell::new(Kind::Dim, r.to_string()));
+            }
+            for (c, (_, ty)) in cols.iter().enumerate() {
+                let x = &row[c];
+                out.push(if kind == "record" && c == 0 { Cell::new(Kind::Dim, cell_text(x)) } else { cell(x, ty) });
+            }
+            out
+        })
+        .collect();
+    view::table::Table { cols: columns, rows, head: kind == "table" }
+}
+
+/// The table a transcript row shows, as `ui.Table` holds it.
+fn row_table(r: &Row) -> Option<view::table::Table> {
+    match r {
+        Row::Table(t) => Some((**t).clone()),
+        Row::Grid { v, .. } => Some(grid_table(v)),
+        _ => None,
     }
-    let off = usize::from(index);
+}
+
+/// Whether a string reads as code rather than words: one token (no spaces) with a path, id or symbol's marks in it, or
+/// letters and digits mixed (`r12`, `src/app.rs`, `snake_case`, `a1b2c3`).
+fn codeish(s: &str) -> bool {
+    if s.chars().count() < 2 || s.contains(char::is_whitespace) {
+        return false;
+    }
+    let marks = s.contains(['/', '_', ':', '=', '#', '@', '(', '{', '[', '<', '\\']);
+    let digit = s.contains(|c: char| c.is_ascii_digit());
+    let letter = s.contains(char::is_alphabetic);
+    marks || (digit && letter)
+}
+
+/// Set a foot's words, folding it away when it has none.
+fn foot(f: View<'_>, s: &str) {
+    f.text(s);
+    let want = s.is_empty().then_some(Size { w: Sizing::GROW, h: Sizing::fixed(0.0) });
+    if f.entity().try_cloned::<&Size>() != want {
+        match want {
+            Some(z) => {
+                f.set(z);
+            }
+            None => {
+                f.entity().remove(Size::id());
+            }
+        }
+    }
+}
+
+/// A shown table, record or list (mcp/src/shown.ts) in a `ui.Table` ([`grid_table`]): its first `cap` rows, a press on a
+/// row of a table or list opening it below as a record. A foot says how many rows there are when not all show.
+fn fill_grid(row: View<'_>, v: &Value, cap: usize, ctx: &RowCtx<'_>, measure: &mut Measure<'_>) {
+    let kind = v["t"].as_str().unwrap_or("");
+    let data = grid_table(v);
+    let total = v["total"].as_u64().map_or(data.rows.len(), |t| t as usize);
+    let shown = data.rows.len().min(cap);
     if let Some(grid) = row.part("card").and_then(|c| c.part("grid")) {
-        let head = (kind == "table").then_some("hn.ChatHead");
-        let prefab = |r: u32, c: usize| {
-            if c < off || (kind == "record" && c == 0) {
-                return "hn.ChatCellDim";
-            }
-            match &rows[r as usize][c - off] {
-                Value::Null => "hn.ChatCellDim",
-                Value::String(_) if cols[c - off].1 == "url" => "hn.ChatCellLink",
-                _ => "hn.ChatCell",
-            }
-        };
-        view::table(grid, &columns, shown as u32, head, prefab, |cell, r, c| {
-            let s = if c < off { r.to_string() } else { cell_text(&rows[r as usize][c - off]) };
-            if let Some(t) = cell.part("text") {
-                t.text(&s);
-            }
-            // The whole text on hover when the column cuts it.
-            let cut = s.chars().count() > columns[c].chars.min(view::TABLE_MAX_CHARS) || s.ends_with('\u{2026}');
-            let tip = cell.entity().try_cloned::<&Tooltip>();
-            if cut && tip.as_ref().is_none_or(|t| t.text.as_str() != s) {
-                cell.set(Tooltip { text: s.as_str().into() });
-            } else if !cut && tip.is_some() {
-                cell.entity().remove(Tooltip::id());
-            }
-        });
+        let action = format!("chat:row:{}:{}", ctx.sid, ctx.key);
+        let action = (kind != "record").then_some(action.as_str());
+        view::table(grid, &data, view::table::Opts { look: "hn.ChatTable", shown, action, open: ctx.open }, measure);
     }
     if let Some(f) = row.part("foot") {
-        let unit = if kind == "record" { "field" } else if kind == "list" { "item" } else { "row" };
-        let s = if total == 1 { "" } else { "s" };
-        f.text(&if shown < total { format!("{shown} of {total} {unit}s") } else { format!("{total} {unit}{s}") });
+        let unit = if kind == "record" { "fields" } else if kind == "list" { "items" } else { "rows" };
+        foot(f, &if shown < total { format!("{shown} of {total} {unit}") } else { String::new() });
+    }
+}
+
+/// Search results (a table the kernel tags `kind: "search"`: title, url, site, snippet) as a `ui.ResultList`: each a
+/// link titled as its page, its host (an unresolved Google link: the site Google shows), two lines of its snippet.
+fn fill_results(row: View<'_>, v: &Value, cap: usize) {
+    let cols: Vec<&str> = v["cols"].as_array().into_iter().flatten().map(|c| c["name"].as_str().unwrap_or("")).collect();
+    let at = |name: &str| cols.iter().position(|c| *c == name);
+    let (title, url, site, snippet) = (at("title"), at("url"), at("site"), at("snippet"));
+    let rows: &[Value] = v["rows"].as_array().map_or(&[], Vec::as_slice);
+    let get = |r: &Value, c: Option<usize>| c.map(|c| cell_text(&r[c])).filter(|s| s != "null").unwrap_or_default();
+    let items: Vec<view::table::Result> = rows
+        .iter()
+        .take(cap)
+        .map(|r| {
+            let url = get(r, url);
+            let host = if url.contains("google.") || url.is_empty() {
+                get(r, site).split(['\u{203A}', ' ']).next().unwrap_or("").to_owned()
+            } else {
+                view::table::host(&url).to_owned()
+            };
+            view::table::Result { title: get(r, title), url, host, snippet: get(r, snippet) }
+        })
+        .collect();
+    if let Some(list) = row.part("list") {
+        view::table::results(list, &items, "hn.ChatResult");
+    }
+    let total = v["total"].as_u64().map_or(rows.len(), |t| t as usize);
+    if let Some(f) = row.part("foot") {
+        foot(f, &if items.len() < total { format!("{} of {total} results", items.len()) } else { String::new() });
     }
 }
 
@@ -1603,11 +1829,39 @@ mod tests {
     #[test]
     fn markdown_splits_into_rows() {
         let mut out = Vec::new();
-        blocks("# Title\n\nSome *words*\nwrapped.\n\n- one\n  more\n- two\n\n```ts\nconst x = 1;\n```\n> quoted", &mut out);
+        blocks("# Title\n\nSome *words*\nwrapped.\n\n- one\n  more\n- two\n\n```ts\nconst x = 1;\n```\n> quoted", false, &mut out);
         let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
         assert_eq!(kinds, ["hn.ChatH1", "hn.ChatProse", "hn.ChatItem", "hn.ChatItem", "hn.ChatCode", "hn.ChatQuote"]);
         assert!(matches!(&out[1], Row::Prose(s) if s == "Some *words* wrapped."));
         assert!(matches!(&out[2], Row::ListItem { text, .. } if text == "one more"));
+    }
+
+    /// A markdown table becomes one table row: typed cells, its alignment, numbers at the end; while it streams, its last
+    /// line (maybe cut) waits, and a table still on its header shows as nothing yet.
+    #[test]
+    fn markdown_tables_become_tables() {
+        use view::table::{Align, Kind};
+        let src = "Here:\n\n| name | `a|b` | n |\n|:-|:-:|-|\n| **x** | y \\| z | 12 |\n| [w](https://w.io) | | 3.5 |\n\nafter";
+        let mut out = Vec::new();
+        blocks(src, false, &mut out);
+        let kinds: Vec<&str> = out.iter().map(Row::prefab).collect();
+        assert_eq!(kinds, ["hn.ChatProse", "hn.ChatTable", "hn.ChatProse"]);
+        let Row::Table(t) = &out[1] else { panic!("not a table: {:?}", out[1].prefab()) };
+        assert_eq!(t.cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["name", "a|b", "n"]);
+        assert_eq!(t.cols.iter().map(|c| c.align).collect::<Vec<_>>(), [Align::Start, Align::Center, Align::Auto]);
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.cell(0, 2).kind, Kind::Number);
+        assert_eq!(t.align(2), Align::End);
+        assert_eq!(t.row_markdown(0), "| name | a\\|b | n |\n| :-- | :-: | --- |\n| **x** | y \\| z | 12 |");
+
+        // Streaming: the cut last line waits; a header alone shows nothing.
+        let mut live = Vec::new();
+        blocks("| a | b |\n|---|---|\n| 1 | 2 |\n| 3", true, &mut live);
+        let Some(Row::Table(t)) = live.first() else { panic!("no table while streaming") };
+        assert_eq!(t.rows.len(), 1);
+        let mut head = Vec::new();
+        blocks("Hi\n\n| a | b |", true, &mut head);
+        assert_eq!(head.iter().map(Row::prefab).collect::<Vec<_>>(), ["hn.ChatProse"]);
     }
 
     #[test]

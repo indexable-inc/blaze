@@ -21,7 +21,7 @@
 // slices, and anything a native addon does. The harness's own requests to harnessd are not effects either.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { currentTask, type Task } from "./tasks.ts";
-import { shown, type Shown } from "./shown.ts";
+import { shown, type Shown, type ShownKind } from "./shown.ts";
 
 export type EffectKind = "exec" | "read" | "write" | "delete" | "net" | "search" | "spawn" | "sql";
 
@@ -53,14 +53,14 @@ export const rawsOf = (t: Task): unknown[] => raws.get(t) ?? [];
 /** A running step; `end` it once. */
 export class Step {
   constructor(readonly task: Task, readonly e: Effect) {}
-  end(ok: boolean, detail = "", result?: unknown, show?: unknown) {
+  end(ok: boolean, detail = "", result?: unknown, show?: unknown, kind?: ShownKind) {
     const { task, e } = this;
     e.status = ok ? "ok" : "error";
     e.ms = Date.now() - e.started_ms;
     e.detail = detail;
     if (result !== undefined) (raws.get(task) ?? raws.set(task, []).get(task)!).push(result);
     if (show !== undefined && task.valueBytes < VALUE_BUDGET) {
-      e.value = shown(show, Math.min(64 << 10, VALUE_BUDGET - task.valueBytes));
+      e.value = shown(show, Math.min(64 << 10, VALUE_BUDGET - task.valueBytes), kind);
       task.valueBytes += JSON.stringify(e.value).length;
     }
     task.touch();
@@ -84,14 +84,14 @@ export const quiet = <T>(fn: () => T): T => inside.run(true, fn);
 /** Run `fn` as one step: begun now, ended when it settles, with `after` saying its detail and the value shown. */
 export async function effect<T>(
   kind: EffectKind, doing: string, done: string, target: string, fn: () => T | Promise<T>,
-  after: (r: T) => { ok?: boolean; detail?: string; show?: unknown } = () => ({}),
+  after: (r: T) => { ok?: boolean; detail?: string; show?: unknown; kind?: ShownKind } = () => ({}),
 ): Promise<T> {
   const s = step(kind, doing, done, target);
   if (!s) return fn();
   try {
     const r = await quiet(fn);
     const a = after(r);
-    s.end(a.ok ?? true, a.detail ?? "", r, a.show);
+    s.end(a.ok ?? true, a.detail ?? "", r, a.show, a.kind);
     return r;
   } catch (err) {
     s.end(false, err instanceof Error ? err.message : String(err));

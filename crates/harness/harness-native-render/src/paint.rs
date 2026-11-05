@@ -40,6 +40,8 @@ pub struct Painter {
     pub fonts: Fonts,
     pub cache: GlyphCache,
     layouts: HashMap<(String, u32, u32, bool, u8, u32), Rc<Layout>>,
+    /// One-line widths [`Painter::width`] measured, by text and style: cheap entries, kept longer than layouts.
+    widths: HashMap<(String, u32, bool, u8), f32>,
     sheets: HashMap<String, Rc<Sheet>>,
     /// Each `BlazeMark` node's fire, by entity and appearance: its automaton runs on from frame to frame.
     marks: HashMap<(u64, bool), harness_native_blaze::mark::Blaze>,
@@ -205,6 +207,7 @@ impl Painter {
             fonts: Fonts::new(look),
             cache: GlyphCache::new(ATLAS_SIZE),
             layouts: HashMap::new(),
+            widths: HashMap::new(),
             sheets: HashMap::new(),
             marks: HashMap::new(),
             highlight: crate::highlight::Highlighter::default(),
@@ -221,13 +224,14 @@ impl Painter {
     pub fn layout_as(&mut self, text: &str, style: &TextStyle, width: f32, md: bool) -> Rc<Layout> {
         let st = set_of(style);
         let code = style.role == 9;
+        let tabular = style.role == 10;
         let medium = !code && !st.bold && style.weight == 500;
         let key = (
             text.to_owned(),
             st.size.to_bits(),
             st.line.to_bits(),
             st.bold,
-            u8::from(code) | u8::from(medium) << 1 | u8::from(md) << 2,
+            u8::from(code) | u8::from(medium) << 1 | u8::from(md) << 2 | u8::from(tabular) << 3,
             width.to_bits(),
         );
         if let Some(l) = self.layouts.get(&key) {
@@ -238,6 +242,8 @@ impl Painter {
             Layout::rich(&mut self.fonts, &m.text, &m.runs, &[], st, 0.0, width)
         } else if code {
             Layout::in_face(&mut self.fonts, text, Face::Code, st, width)
+        } else if tabular {
+            Layout::in_face(&mut self.fonts, text, Face::Tabular, st, width)
         } else if medium {
             Layout::in_face(&mut self.fonts, text, Face::Medium, st, width)
         } else {
@@ -245,6 +251,57 @@ impl Painter {
         });
         self.layouts.insert(key, lay.clone());
         lay
+    }
+
+    /// How wide `text` runs on one line in `style` (inline markdown when `md`: its markers out), points; cached apart from
+    /// the layouts, so a table measuring every cell of its columns each frame neither shapes again nor drops layouts.
+    pub fn width(&mut self, text: &str, style: &TextStyle, md: bool) -> f32 {
+        // The face's say: the role (code, tabular), medium weight, markdown.
+        let face = style.role.clamp(0, 63) as u8 | u8::from(style.weight == 500) << 6 | u8::from(md) << 7;
+        let key = (text.to_owned(), style.size.to_bits(), style.bold != 0, face);
+        if let Some(&w) = self.widths.get(&key) {
+            return w;
+        }
+        let lay = self.layout_as(text, style, 1.0e5, md);
+        let w = lay.lines.iter().map(|l| l.width).fold(0.0, f32::max).ceil();
+        if self.widths.len() > 1 << 16 {
+            self.widths.clear();
+        }
+        self.widths.insert(key, w);
+        w
+    }
+
+    /// Inline markdown `src` on one line, cut with an ellipsis at its end to `room` points: the words shown with their
+    /// faces, the cut ones gone (a table cell). The links and code spans of what is left, for colour and chips.
+    fn layout_md_cut(&mut self, src: &str, style: &TextStyle, room: f32) -> (Rc<Layout>, crate::markdown::Inline) {
+        let mut m = crate::markdown::inline(src);
+        let st = set_of(style);
+        let rich = |fonts: &mut Fonts, text: &str, runs: &[crate::text::Run]| Layout::rich(fonts, text, runs, &[], st, 0.0, 1.0e5);
+        let full = rich(&mut self.fonts, &m.text, &m.runs);
+        if full.lines.iter().map(|l| l.width).fold(0.0, f32::max) <= room {
+            return (Rc::new(full), m);
+        }
+        let clip = |m: &crate::markdown::Inline, n: usize| -> Vec<crate::text::Run> {
+            m.runs.iter().filter(|r| r.start < n).map(|r| crate::text::Run { end: r.end.min(n), ..*r }).collect()
+        };
+        let fonts = &mut self.fonts;
+        let cut = typeset::elide(&m.text, TruncateMode::Tail, room, |t| {
+            let n = t.encode_utf16().count();
+            rich(fonts, t, &clip(&m, n)).lines.iter().map(|l| l.width).fold(0.0, f32::max)
+        });
+        let n = cut.encode_utf16().count();
+        let lay = rich(&mut self.fonts, &cut, &clip(&m, n));
+        let keep = n.saturating_sub(1);
+        m.code.retain_mut(|c| {
+            c.1 = c.1.min(keep);
+            c.0 < c.1
+        });
+        m.links.retain_mut(|l| {
+            l.1 = l.1.min(keep);
+            l.0 < l.1
+        });
+        m.text = cut;
+        (Rc::new(lay), m)
     }
 
     /// Measure every text node layout asked about and hand the sizes back; how many changed (layout runs again while any do).
@@ -359,7 +416,13 @@ impl Painter {
                     .try_cloned::<&Truncate>()
                     .map(|t| t.mode)
                     .or_else(|| e.has(OneLine::id()).then_some(TruncateMode::Tail));
-                let lay = if let Some(mode) = truncate {
+                let mut shown_md = None;
+                let lay = if let (Some(_), Some(_)) = (truncate, md) {
+                    // Inline markdown on one line (a table's cell): cut at its end, its faces kept.
+                    let (lay, m) = self.layout_md_cut(text.s.as_str(), &style, laid.w.max(1.0) + 0.5);
+                    shown_md = Some(m);
+                    lay
+                } else if let Some(mode) = truncate {
                     // One line, never wrapped: cut with an ellipsis (at its end, middle or start) to the width layout gave it.
                     let room = laid.w.max(1.0) + 0.5;
                     let cut = typeset::elide(text.s.as_str(), mode, room, |t| {
@@ -372,6 +435,17 @@ impl Painter {
                     self.layout(&cut, &style, 1.0e5)
                 } else {
                     self.layout_as(text.s.as_str(), &style, laid.w.max(1.0) + 0.5, md.is_some())
+                };
+                // Inline markdown's links, in the link ink (the text's own when MarkdownText says none).
+                let shown_md = match (md, shown_md) {
+                    (Some(_), Some(m)) => Some(m),
+                    (Some(_), None) => Some(crate::markdown::inline(text.s.as_str())),
+                    _ => None,
+                };
+                let link_ink = md.map(|m| if dark { m.link_dark } else { m.link_light }).filter(|c| c.a > 0.0).map(rgba);
+                let links: Vec<(usize, usize)> = match (&shown_md, link_ink) {
+                    (Some(m), Some(_)) => m.links.iter().map(|l| (l.0, l.1)).collect(),
+                    _ => Vec::new(),
                 };
                 // A Pose's `cut`: that share of its glyphs, from the end, not drawn yet (words typed on). Layout keeps
                 // their room, so nothing moves as they arrive.
@@ -404,6 +478,7 @@ impl Painter {
                                 .find(|s| (s.start..s.end).contains(&g.idx))
                                 .map(|s| tokens[s.name].1)
                         })
+                        .or_else(|| link_ink.filter(|_| links.iter().any(|l| (l.0..l.1).contains(&g.idx))))
                         .unwrap_or(ink);
                     let (a, dy, heat) = arrive.map_or((1.0, 0.0, 0.0), |m| m.of(n, time));
                     let hot = arrive.map_or([0.0; 4], |m| rgba(m.hot));
@@ -424,7 +499,7 @@ impl Painter {
                     // Code spans on a chip, a plate per line they cover.
                     let chip = rgba(if dark { m.chip_dark } else { m.chip_light });
                     let shape = Shape { radius: 3.0, n: 4.0, border: 0.0, feather: 0.0 };
-                    for (lo, hi) in crate::markdown::inline(text.s.as_str()).code {
+                    for &(lo, hi) in shown_md.as_ref().map_or(&[][..], |m| m.code.as_slice()) {
                         for r in spans_of(&lay, lo, hi) {
                             let rect = [laid.x + r[0] - 3.0, laid.y + r[1] + 1.0, r[2] + 6.0, r[3] - 2.0];
                             d.panel(panel_from(chip, [0.0; 4], shape, rect, p.alpha));

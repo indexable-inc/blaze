@@ -7,8 +7,12 @@ import { nuon } from "./nuon.ts";
 export type Cell = string | number | boolean | null;
 export type ColType = "string" | "number" | "bool" | "url" | "date" | "nested" | "null" | "mixed";
 export type Col = { name: string; type: ColType };
-/** A grid: a list of records (`table`, header shown), a record (`record`, key/value rows), a list of scalars (`list`). */
-export type Grid = { t: "table" | "record" | "list"; cols: Col[]; rows: Cell[][]; total: number };
+/** A grid: a list of records (`table`, header shown), a record (`record`, key/value rows), a list of scalars (`list`).
+ * `kind` says what the rows are when the app has a shape of its own for them (`search`: results with a title, url, site
+ * and snippet, drawn as a result list). */
+export type Grid = { t: "table" | "record" | "list"; cols: Col[]; rows: Cell[][]; total: number; kind?: ShownKind };
+/** What a value is, for the app's own shapes (see Grid). */
+export type ShownKind = "search";
 export type Shown =
   | Grid
   | { t: "scalar"; type: ColType; v: Cell }
@@ -57,8 +61,8 @@ function grid(t: Grid["t"], names: string[], items: unknown[][], budget: number)
   return { t, cols: names.map((name, i) => ({ name, type: unify(types[i]!) })), rows, total: items.length };
 }
 
-/** How the app shows `v`, in about `budget` bytes. */
-export function shown(v: unknown, budget = 64 << 10): Shown {
+/** How the app shows `v`, in about `budget` bytes; a table of `kind` (what the step that gave it knows it is) says so. */
+export function shown(v: unknown, budget = 64 << 10, kind?: ShownKind): Shown {
   if (v instanceof Error) return { t: "error", message: v.message, stack: clip(v.stack ?? "", 8 << 10) };
   if (typeof v === "string") return { t: "text", v: clip(v, budget), total: v.length };
   if (v instanceof Map) v = Object.fromEntries(v);
@@ -68,7 +72,8 @@ export function shown(v: unknown, budget = 64 << 10): Shown {
       const names: string[] = [];
       const known = new Set<string>();
       for (const r of v.slice(0, MAX_ROWS)) for (const k of Object.keys(r)) if (!known.has(k)) { known.add(k); names.push(k); }
-      return grid("table", names, v.map((r) => names.map((k) => (r as Record<string, unknown>)[k])), budget);
+      const g = grid("table", names, v.map((r) => names.map((k) => (r as Record<string, unknown>)[k])), budget);
+      return kind ? { ...g, kind } : g;
     }
     return grid("list", ["value"], v.map((x) => [x]), budget);
   }

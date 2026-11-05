@@ -71,7 +71,8 @@ hn {
     Padding: {l: 0, r: 0, t: 4, b: 6}
     text : ui.Words {
       Fill: $tone_term_ink
-      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light}
+      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light,
+        link_dark: $tone_accent.dark, link_light: $tone_accent.light}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
@@ -105,7 +106,8 @@ hn {
     text : ui.Words {
       Fill: $tone_term_ink
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light}
+      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light,
+        link_dark: $tone_accent.dark, link_light: $tone_accent.light}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
@@ -119,7 +121,8 @@ hn {
     text : ui.Words {
       Fill: $tone_term_muted
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light}
+      MarkdownText: {chip_dark: $tone_code_chip.dark, chip_light: $tone_code_chip.light,
+        link_dark: $tone_accent.dark, link_light: $tone_accent.light}
       TextStyle: {size: $size_chat, line: $line_chat, role: 0, bold: 0}
     }
   }
@@ -274,20 +277,75 @@ hn {
     words : ui.Lead { Fill: $tone_failed }
   }
 
-  // A table, record or list a cell gave, as a ui.Table on the card's plate (src/app/chat.rs fill_grid), and a foot saying
-  // how many rows. Its cells: words in the ink, nulls and the index dim, links in the accent, the header muted.
-  prefab ChatCell : ui.TableCell {
+  // The chat's look of a ui.Table (harness_native_ui_view::table with look "hn.ChatTable"): the ui.Table* cells in the
+  // terminal ground's inks: words and numbers in its ink, nulls, the index and the header muted, links in the accent.
+  prefab ChatTableCell : ui.TableCell {
     text : ui.Line { Fill: $tone_term_ink }
   }
-  prefab ChatCellDim : ui.TableCell {
+  prefab ChatTableCellMd : ui.TableCellMd {
+    text : ui.Line { Fill: $tone_term_ink }
+  }
+  prefab ChatTableCellCode : ui.TableCellCode {
+    text : ui.Line { Fill: $tone_term_ink }
+  }
+  prefab ChatTableCellNum : ui.TableCellNum {
+    text : ui.Line { Fill: $tone_term_ink }
+  }
+  prefab ChatTableCellDim : ui.TableCellDim {
     text : ui.Line { Fill: $tone_term_muted }
   }
-  prefab ChatCellLink : ui.TableCell {
-    text : ui.Line { Fill: $tone_accent }
-  }
-  prefab ChatHead : ui.TableHead {
+  prefab ChatTableCellLink : ui.TableCellLink {}
+  prefab ChatTableCellMark : ui.TableCellMark {
     text : ui.Line { Fill: $tone_term_muted }
   }
+  prefab ChatTableHead : ui.TableHead {
+    text : ui.Line { Fill: $tone_term_muted }
+  }
+  prefab ChatTableField : ui.TableField {
+    key : ui.Line { Fill: $tone_term_muted }
+    value : ui.Words { Fill: $tone_term_ink }
+  }
+  prefab ChatTableFieldMd : ui.TableFieldMd {
+    key : ui.Line { Fill: $tone_term_muted }
+    value : ui.Words { Fill: $tone_term_ink }
+  }
+
+  // A markdown table in the agent's words (src/app/chat.rs Row::Table): a ui.Table on a card's plate, its cells inline
+  // markdown, aligned as its delimiter line says.
+  prefab ChatTable : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 0, r: 0, t: 4, b: 8}
+    card : ui.Column {
+      Clip
+      Fill: $tone_chat_card
+      Edge: {dark: $tone_plate_line.dark, light: $tone_plate_line.light}
+      Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
+      Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      Padding: {l: 4, r: 4, t: 2, b: 4}
+      grid : ui.Table {}
+    }
+  }
+
+  // Search results a cell gave (the kernel tags them `kind: "search"`): a ui.ResultList, not a table.
+  prefab ChatResult : ui.Result {
+    host : ui.Line { Fill: $tone_term_muted }
+    snippet : ui.Words { Fill: $tone_term_ink }
+  }
+  prefab ChatResults : ui.Column {
+    Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: 25, r: 0, t: 4, b: 8}
+    list : ui.ResultList {}
+    foot : ui.Line, Faint {
+      Padding: {l: 0, r: 0, t: 4, b: 0}
+      TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
+    }
+  }
+
+  // A table, record or list a cell gave, as a ui.Table on the card's plate (src/app/chat.rs fill_grid), and a foot saying
+  // how many rows there are when not all show.
   prefab ChatGrid : ui.Column {
     Flex: {axis: Column, gap: 3, align: Stretch, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
@@ -299,7 +357,7 @@ hn {
       Shape: {radius: $radius_control, n: 4, border: 1, feather: 0}
       Flex: {axis: Column, gap: 0, align: Stretch, justify: Start, wrap: false}
       Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-      Padding: {l: 10, r: 10, t: 2, b: 4}
+      Padding: {l: 4, r: 4, t: 2, b: 4}
       grid : ui.Table {}
     }
     foot : ui.Line, Faint {
