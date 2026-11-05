@@ -152,6 +152,15 @@ pub enum CursorShape {
     Bar,
 }
 
+/// The viewport's place in the screen and its history, in rows: `total` rows in all, the viewport `offset` rows from the
+/// top of the history, `len` rows long (on the live screen, `offset + len == total`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
     /// Column and row (0-based): in the active area from [`Term::cursor`], in the viewport from [`Term::rows`].
@@ -514,6 +523,12 @@ impl Term {
     #[must_use]
     pub fn scrollback(&self) -> usize {
         self.term.scrollbar().map_or(0, |s| usize::try_from(s.total.saturating_sub(s.offset + s.len)).unwrap_or(0))
+    }
+
+    /// Where the viewport sits in the screen and its history, in rows (libghostty's scrollbar): what a scroller shows.
+    #[must_use]
+    pub fn scrollbar(&self) -> Option<Scrollbar> {
+        self.term.scrollbar().ok().map(|s| Scrollbar { total: s.total, offset: s.offset, len: s.len })
     }
 
     /// Rows of history above the live screen.

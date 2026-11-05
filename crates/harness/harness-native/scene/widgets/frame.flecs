@@ -100,9 +100,12 @@ hn {
 
   // The terminal primitive: the host draws its grid into this node's rect (src/term.rs) from its own components
   // (TermGrid, TermCursor, TermSelection, TermScroll, MarkedText, TermFocus; src/pane.rs). Its cells are GPU instances,
-  // not entities.
-  prefab Terminal : ui.Node {
+  // not entities. Its overlay scroller is ui.Scroller's, fed by the host (ScrollFed: src/app/panes.rs sets ScrollExtent and
+  // ScrollState from the scrollback's position in rows), shown while history scrolls and never on the alternate screen.
+  prefab Terminal : ui.Node, ui.Scroller {
     TermNode
+    ScrollFed
+    ScrollState: {x: 0, y: 0}
     Fill: $tone_clear
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
   }

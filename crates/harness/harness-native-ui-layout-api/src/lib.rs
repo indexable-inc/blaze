@@ -1,5 +1,6 @@
 //! Flex layout components (the Clay model, docs/ui-model.md section 4). Plain data: layout reads these and writes `Laid`.
 use harness_native_flecs::prelude::*;
+use harness_native_ui_spring_api::Spring;
 
 /// Which way a container lays its children: along a row, down a column, or on top of one another (`ZStack`).
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -148,6 +149,215 @@ pub struct Viewport {
 pub struct ScrollState {
     pub x: f32,
     pub y: f32,
+}
+
+/// How big a scroll's content is (points, padding included, never less than the scroll itself): what its overlay scroller
+/// and its host's physics measure against. Written by layout from the scroll's laid-out children, unless the scroll is
+/// `ScrollFed`.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollExtent {
+    pub w: f32,
+    pub h: f32,
+}
+
+/// On a scroll whose content its host draws itself (a terminal's grid over its scrollback): the host writes its
+/// `ScrollExtent` and `ScrollState`, and layout leaves the extent alone. A tag.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ScrollFed;
+
+/// An axis a scroll moves along.
+#[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ScrollAxis {
+    /// Up and down: the knob on the trailing edge.
+    #[default]
+    Y,
+    /// Across: the knob along the foot.
+    X,
+}
+
+impl ScrollAxis {
+    /// 0 across, 1 down: the index into `[w, h]` pairs.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+        }
+    }
+}
+
+/// A scroll's overlay scroller (macOS's overlay `NSScroller`), on every `ui.Scroll` through the `ui.Scroller` prefab
+/// (prims.flecs; `NoScroller` leaves it off): a thin rounded knob over the content's trailing edge (along the foot for
+/// the horizontal one) that shows while the content scrolls and `hold` seconds after, then fades on a spring; it takes no
+/// layout space. With the pointer within `grab` points of the edge the knob widens from `thin` to `wide` over a faint
+/// track; a drag on the knob scrolls in proportion, a press on the track pages toward it (keeping `keep` points of the
+/// last page in view). The knob is never shorter than `min`, but shortens under a rubber band past an end. Sizes are points,
+/// `inset` is the gap between the knob and the edge.
+///
+/// Its parts are child nodes (`ScrollerPart`): layout places them (`scroller_axis`), motion fades and widens them
+/// (`ScrollerState`), input drives them (`ScrollerGrip`). A host that drives a scroll's physics itself adopts a
+/// `ScrollState` it did not write as where the scroll now is.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Scroller {
+    pub thin: f32,
+    pub wide: f32,
+    pub inset: f32,
+    pub min: f32,
+    pub grab: f32,
+    pub hold: f32,
+    pub keep: f32,
+}
+
+/// A part of its parent scroll's overlay scroller: the knob, or the track under it, along `axis`. Layout places it and
+/// hides it while the scroller is hidden; its pointer is the arrow (prims.flecs). A node.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollerPart {
+    pub axis: ScrollAxis,
+    pub track: bool,
+}
+
+/// Leave a scroll's overlay scroller off: its parts stay hidden and the pointer never wakes them. A tag.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct NoScroller;
+
+/// How shown a scroller is, written by motion: `shown` 0 (gone) to 1, and how wide each axis's knob is, 0 thin to 1
+/// wide over its track; the scroll it last saw, how long it has been still since (seconds), and whether it has started
+/// (a scroller flashes once when its scroll first appears, as AppKit's do).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollerState {
+    pub shown: Spring,
+    pub wide_x: Spring,
+    pub wide_y: Spring,
+    pub seen_x: f32,
+    pub seen_y: f32,
+    pub still: f32,
+    pub started: bool,
+}
+
+impl ScrollerState {
+    /// How wide `axis`'s knob is (0 thin, 1 wide).
+    #[must_use]
+    pub fn wide(&self, axis: ScrollAxis) -> f32 {
+        match axis {
+            ScrollAxis::X => self.wide_x.x,
+            ScrollAxis::Y => self.wide_y.x,
+        }
+        .clamp(0.0, 1.0)
+    }
+}
+
+/// What the pointer does to a scroller, written by input: the axes it is near (bit 1 down, bit 2 across), the axis a knob
+/// drag holds (the same bits, 0 for none) and how far along the knob it took hold, a press on the track paging along `page`
+/// toward `goal` on `glide`, and whether the button's press has been taken (`held`, until it is let go).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollerGrip {
+    pub near: u8,
+    pub drag: u8,
+    pub grab: f32,
+    pub page: u8,
+    pub goal: f32,
+    pub glide: Spring,
+    pub held: bool,
+}
+
+/// The bit of `axis` in `ScrollerGrip`'s masks.
+#[must_use]
+pub const fn axis_bit(axis: ScrollAxis) -> u8 {
+    match axis {
+        ScrollAxis::Y => 1,
+        ScrollAxis::X => 2,
+    }
+}
+
+/// One axis of an overlay scroller as laid out: its track and knob (`[x, y, w, h]`, window points), where the knob's travel
+/// starts along the axis, how far it travels (track less the knob at rest, unbanded), and how far the content scrolls.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScrollerAxis {
+    pub track: [f32; 4],
+    pub knob: [f32; 4],
+    pub start: f32,
+    pub travel: f32,
+    pub max: f32,
+    pub view: f32,
+}
+
+impl ScrollerAxis {
+    /// Where the knob starts along the axis.
+    #[must_use]
+    pub fn knob_at(&self, axis: ScrollAxis) -> f32 {
+        self.knob[axis.index()]
+    }
+
+    /// The scroll that puts the knob's start at `at` along the axis (clamped to the content).
+    #[must_use]
+    pub fn scroll_for(&self, at: f32) -> f32 {
+        if self.travel <= 0.0 { 0.0 } else { ((at - self.start) / self.travel).clamp(0.0, 1.0) * self.max }
+    }
+}
+
+/// Whether a scroll `view` (`[w, h]`) over content `extent` moves along `axis`.
+#[must_use]
+pub fn overflows(view: [f32; 2], extent: [f32; 2], axis: ScrollAxis) -> bool {
+    let a = axis.index();
+    extent[a] > view[a] + 0.5
+}
+
+/// Lay out `axis` of the overlay scroller `c` of a scroll laid at `laid` (`[x, y, w, h]`) over content `extent`, scrolled
+/// `scroll`, its knob `wide` of the way from thin to wide. None when the content does not move along `axis`. The track is
+/// a strip `wide + 2 * inset` across at the trailing edge (the foot, across), short of the corner when the other axis
+/// scrolls too; the knob is as long as the share of the content in view (at least `min`), shortened by the part a rubber
+/// band holds past an end (down to its thickness).
+#[must_use]
+pub fn scroller_axis(c: &Scroller, laid: [f32; 4], extent: [f32; 2], scroll: [f32; 2], wide: f32, axis: ScrollAxis) -> Option<ScrollerAxis> {
+    let [x, y, w, h] = laid;
+    let view = [w, h];
+    if !overflows(view, extent, axis) {
+        return None;
+    }
+    let other = match axis {
+        ScrollAxis::X => ScrollAxis::Y,
+        ScrollAxis::Y => ScrollAxis::X,
+    };
+    let strip = c.wide + 2.0 * c.inset;
+    let corner = if overflows(view, extent, other) { strip } else { 0.0 };
+    let a = axis.index();
+    let thick = c.thin + (c.wide - c.thin) * wide.clamp(0.0, 1.0);
+    let (lead, len) = ([x, y][a], view[a]);
+    let start = lead + c.inset;
+    let room = (len - corner - 2.0 * c.inset).max(0.0);
+    let max = extent[a] - len;
+    let rest = (room * len / extent[a]).max(c.min.min(room)).min(room);
+    let travel = room - rest;
+    let s = scroll[a];
+    let over = if s < 0.0 { -s } else { (s - max).max(0.0) };
+    let knob_len = (rest - over).max(thick.min(room));
+    let at = if s <= 0.0 {
+        0.0
+    } else if s >= max {
+        room - knob_len
+    } else {
+        s / max * travel
+    };
+    let (track, knob) = match axis {
+        ScrollAxis::Y => ([x + w - strip, y, strip, h - corner], [x + w - c.inset - thick, start + at, thick, knob_len]),
+        ScrollAxis::X => ([x, y + h - strip, w - corner, strip], [start + at, y + h - c.inset - thick, knob_len, thick]),
+    };
+    Some(ScrollerAxis { track, knob, start, travel, max, view: len })
+}
+
+/// Set a scroll's `ScrollState` without waking its scroller: a host following its content (a transcript stuck to its
+/// foot as words arrive, a terminal on its live screen) moves it without the knob flashing at each step. A move with
+/// `set` shows the knob.
+pub fn scroll_quietly(e: EntityView<'_>, s: ScrollState) {
+    if e.try_cloned::<&ScrollState>() != Some(s) {
+        e.set(s);
+    }
+    if let Some(mut st) = e.try_cloned::<&ScrollerState>().filter(|st| st.started && (st.seen_x != s.x || st.seen_y != s.y)) {
+        st.seen_x = s.x;
+        st.seen_y = s.y;
+        e.set(st);
+    }
 }
 
 /// `(AnchoredTo, node)`: an overlay is placed against `node`'s `Laid`. Exclusive; deleting the anchor removes the link.
@@ -337,6 +547,13 @@ hyperion_api_layouts::api_layouts! {
     "Intrinsic" => alias Intrinsic,
     "Viewport" => alias Viewport,
     "ScrollState" => alias ScrollState,
+    "ScrollExtent" => alias ScrollExtent,
+    "ScrollFed" => alias ScrollFed,
+    "Scroller" => alias Scroller,
+    "ScrollerPart" => alias ScrollerPart,
+    "NoScroller" => alias NoScroller,
+    "ScrollerState" => alias ScrollerState,
+    "ScrollerGrip" => alias ScrollerGrip,
     "ShrinkFirst" => alias ShrinkFirst,
     "AnchoredTo" => alias AnchoredTo,
     "Side" => alias Side,
@@ -346,6 +563,7 @@ hyperion_api_layouts::api_layouts! {
     Justify,
     SizeKind,
     Opens,
+    ScrollAxis,
 }
 
 /// Register the layout vocabulary before any scene or system resolves it.
@@ -361,6 +579,14 @@ pub fn register(world: &World) {
     world.component::<ShrinkFirst>().writable();
     world.component::<Collapse>().writable();
     world.component::<ScrollState>().writable();
+    world.component::<ScrollExtent>().writable();
+    world.component::<ScrollFed>().writable();
+    // Aliased (as `Grid` is): it shares its name with the prefab that carries it (`prefab ui.Scroller { Scroller: ... }`).
+    world.component::<Scroller>().writable().aliased();
+    world.component::<ScrollerPart>().writable();
+    world.component::<NoScroller>().writable();
+    world.component::<ScrollerState>();
+    world.component::<ScrollerGrip>();
     world.component::<Side>().writable();
     world.component::<AlignSelf>().writable();
     world.component::<AlignmentGuide>().writable();

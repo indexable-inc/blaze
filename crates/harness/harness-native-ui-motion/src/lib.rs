@@ -3,15 +3,21 @@
 //!
 //! Spring tunes are the node's own `Motion`, else a token prefab's (`ui.spring.transition`, `ui.spring.matched`,
 //! `ui.spring.layout` in prims.flecs). With neither, the change lands at once.
+//!
+//! It also runs each scroll's overlay scroller (`Scroller`): when it shows and fades, how wide each axis's knob is
+//! (`ScrollerState`), and its parts' fade.
 use std::collections::HashMap;
 
 use harness_native_api::{Clock, moving, settle};
 use harness_native_flecs::prelude::*;
-use harness_native_ui_layout_api::{Collapse, Flex, FlexAxis, Padding, ScrollState, Size, Sizing, Viewport};
+use harness_native_ui_layout_api::{
+    Collapse, Flex, FlexAxis, NoScroller, Padding, ScrollAxis, ScrollExtent, ScrollState, Scroller, ScrollerGrip, ScrollerPart, ScrollerState, Size, Sizing,
+    Viewport, axis_bit, overflows,
+};
 use harness_native_ui_look_api::{Fill, Rgba};
 use harness_native_ui_motion_api::{
-    Animate, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Reveal, Shown, ShownWhen, SizeTween, Target, Transition,
-    TransitionKind,
+    Animate, Drawn, FillTween, FromEdge, Leaving, Matched, MatchedGeometry, Motion, PadTween, Pose, Reveal, Shown, ShownWhen, SizeTween, Target,
+    Transition, TransitionKind,
 };
 use harness_native_ui_node_api::{Hidden, Laid};
 use harness_native_ui_spring_api::{Spring, Tune};
@@ -314,6 +320,72 @@ pub fn install(world: WorldRef<'_>) {
         if still {
             moving(&w);
         }
+    });
+
+    // Overlay scrollers (`Scroller`, layout-api): shown while the scroll moves, `hold` seconds after and while the pointer
+    // is near or holds it, then faded (the `ui.spring.scroller_show` / `scroller_hide` springs); each axis's knob wide
+    // over its track while the pointer is near that edge or drags it (`ui.spring.scroller_wide`). The parts fade by
+    // their Pose: the knob with the scroller, the track with it and its axis's width.
+    world
+        .system_named::<(&Scroller, &ScrollState)>("Scroller")
+        .without(NoScroller::id())
+        .reads(ScrollerGrip::id())
+        .reads(ScrollExtent::id())
+        .writes(ScrollerState::id())
+        .writes(Pose::id())
+        .each_iter(|it, row, (c, s)| {
+        let (e, w, dt) = (it.entity(row), it.world(), it.delta_time());
+        let grip = e.try_cloned::<&ScrollerGrip>().unwrap_or_default();
+        let was = e.try_cloned::<&ScrollerState>();
+        let mut st = was.unwrap_or_default();
+        if !st.started {
+            // A scroller flashes once as its scroll first shows, as AppKit's do.
+            st.started = true;
+            (st.seen_x, st.seen_y, st.still) = (s.x, s.y, 0.0);
+        } else if (s.x - st.seen_x).abs() > 0.01 || (s.y - st.seen_y).abs() > 0.01 {
+            (st.seen_x, st.seen_y, st.still) = (s.x, s.y, 0.0);
+        } else {
+            st.still += dt;
+        }
+        let view = e.try_cloned::<&Laid>().map_or([0.0; 2], |l| [l.w, l.h]);
+        let ext = e.try_cloned::<&ScrollExtent>().map_or(view, |x| [x.w, x.h]);
+        let moves = |a: ScrollAxis| overflows(view, ext, a);
+        let any = moves(ScrollAxis::Y) || moves(ScrollAxis::X);
+        let holding = st.still < c.hold;
+        let show = any && (holding || grip.near != 0 || grip.drag != 0 || grip.page != 0);
+        let target = f32::from(u8::from(show));
+        let spring = |name: &str, fallback: Tune| token(w, name).map_or(fallback, |m| Tune { omega: m.omega, zeta: m.zeta });
+        let shown_tune = spring(if target > st.shown.x { "scroller_show" } else { "scroller_hide" }, Tune { omega: 30.0, zeta: 1.0 });
+        let wide_tune = spring("scroller_wide", Tune { omega: 30.0, zeta: 1.0 });
+        let mut going = settle(&mut st.shown, target, shown_tune, dt);
+        if !going {
+            st.shown = Spring::at(target);
+        }
+        for (a, sp) in [(ScrollAxis::Y, &mut st.wide_y), (ScrollAxis::X, &mut st.wide_x)] {
+            let bit = axis_bit(a);
+            let want = f32::from(u8::from(show && moves(a) && (grip.near & bit != 0 || grip.drag == bit)));
+            if settle(sp, want, wide_tune, dt) {
+                going = true;
+            } else {
+                *sp = Spring::at(want);
+            }
+        }
+        // Through the hold nothing moves, but its end must be drawn: the fade starts then.
+        if going || (show && holding) {
+            moving(&w);
+        }
+        if was != Some(st) {
+            e.set(st);
+        }
+        let shown = st.shown.x.clamp(0.0, 1.0);
+        e.each_child(|p| {
+            let Some(part) = p.try_cloned::<&ScrollerPart>() else { return };
+            let a = if part.track { shown * st.wide(part.axis) } else { shown };
+            let pose = Pose { fade: 1.0 - a, ..p.try_cloned::<&Pose>().unwrap_or_default() };
+            if p.try_cloned::<&Pose>() != Some(pose) {
+                p.set(pose);
+            }
+        });
     });
 }
 

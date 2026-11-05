@@ -15,7 +15,7 @@ pub use table::table;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_input_api::Action;
-use harness_native_ui_layout_api::{AnchoredTo, Background, Collapse, Lazy, LazyIndex, LazyRange, Overlay};
+use harness_native_ui_layout_api::{AnchoredTo, Background, Collapse, Lazy, LazyIndex, LazyRange, Overlay, ScrollerPart};
 use harness_native_ui_motion_api::{Leaving, Transition};
 use harness_native_ui_node_api::{Clip, Node, Placed};
 use harness_native_ui_text_api::{Icon, Text};
@@ -187,7 +187,8 @@ pub struct PropsHash {
 /// Keep `parent`'s rows in step with `rows`, SwiftUI's `ForEach`: one child per key, made from `prefab` and named by the key
 /// the first time the key is seen, deleted once it is gone, and kept in `rows`' order. `update` runs for every row with
 /// whether it was just made, to set what differs (its words, its state relations). The parent holds only rows (a `ui.List`
-/// or a `ui.Column` of them): a child that is not a row is deleted. A key seen twice keeps its first row.
+/// or a `ui.Column` of them): a child that is not a row is deleted, except a scroll's own scroller parts (`ScrollerPart`:
+/// a `ui.Scroll` may hold its rows directly). A key seen twice keeps its first row.
 ///
 /// Inside a system the rows it makes arrive at the end of the system; reordering waits for the call in which every row
 /// already exists (rows that are only appended keep their order without it).
@@ -224,7 +225,7 @@ pub fn for_each_of<'a, 'p, K: AsRef<str>, T>(parent: View<'a>, rows: impl IntoIt
     }
     let kept: HashSet<u64> = order.iter().copied().collect();
     parent.0.each_child(|c| {
-        if !kept.contains(&*c.id()) && !c.has(Leaving::id()) {
+        if !kept.contains(&*c.id()) && !c.has(Leaving::id()) && !c.has(ScrollerPart::id()) {
             leave(View(c));
         }
     });
@@ -293,7 +294,7 @@ pub fn lazy_for_each_of<'a, 'p, K: AsRef<str>>(
     // Rows no longer in view, free to be bound again.
     let mut spare: Vec<EntityView<'a>> = Vec::new();
     e.each_child(|c| {
-        if c.has(Node::id()) && !c.has(Leaving::id()) && !wanted.contains(c.name().as_str()) {
+        if c.has(Node::id()) && !c.has(Leaving::id()) && !c.has(ScrollerPart::id()) && !wanted.contains(c.name().as_str()) {
             spare.push(c);
         }
     });

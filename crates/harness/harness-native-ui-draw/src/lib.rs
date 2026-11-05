@@ -7,7 +7,7 @@
 use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{Paint, PaintKind, Painted};
 use harness_native_ui_look_api::{Edge, Fill, Ribbon, Scheme};
-use harness_native_ui_layout_api::{Background, Overlay};
+use harness_native_ui_layout_api::{Background, Overlay, ScrollerPart};
 use harness_native_ui_motion_api::{Drawn, Pose, Reveal, Shown};
 use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
 use harness_native_ui_text_api::{BlazeMark, Icon, Mark, Picture, Text};
@@ -46,7 +46,7 @@ struct Stack {
 /// Create the draw systems in the module scope; deleting that scope removes them before unloading.
 pub fn install(world: WorldRef<'_>) {
     // Last, from this pass's Laid and Drawn (layout and motion `writes` them; flecs merges them first).
-    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Draw).reads(Laid::id()).reads(Drawn::id()).each_iter(|it, row, _| {
+    world.system_named::<&Node>("UiPaint").without(Hosted::id()).without(Offscreen::id()).phase(Phase::Draw).reads(Laid::id()).reads(Drawn::id()).reads(Pose::id()).each_iter(|it, row, _| {
         let e = it.entity(row);
         if e.parent().is_some_and(|p| p.has(Node::id())) {
             return;
@@ -169,8 +169,8 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
     // A clipping node cuts its children (not itself) to its rectangle, inside any clip it is already in.
     let seen = Cut { x: vx, y: vy, w: frame.w * mine.s, h: frame.h * mine.s };
     let inner = if e.has(Clip::id()) { Some(seen.within(clip)) } else { clip };
-    // A Background child first, an Overlay child last, the rest by Z in between.
-    let layer = |c: EntityView<'_>| if c.has(Background::id()) { 0u8 } else if c.has(Overlay::id()) { 2 } else { 1 };
+    // A Background child first, an Overlay child (or a scroller's part) last, the rest by Z in between.
+    let layer = |c: EntityView<'_>| if c.has(Background::id()) { 0u8 } else if c.has(Overlay::id()) || c.has(ScrollerPart::id()) { 2 } else { 1 };
     let mut kids: Vec<_> = harness_native_ui_node_api::children(e).into_iter().map(|c| (layer(c), c.try_cloned::<&Z>().map_or(0.0, |z| z.z), c)).collect();
     kids.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
     for (_, _, c) in kids {

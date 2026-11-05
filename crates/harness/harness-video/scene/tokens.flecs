@@ -24,6 +24,24 @@ export const spring_matched_omega = 26
 export const spring_matched_zeta = 0.84
 export const spring_layout_omega = 18
 export const spring_layout_zeta = 1
+// ui.Scroller (the app's values, harness-native/scene/00-tokens.flecs).
+export const scroller_thin = 6
+export const scroller_wide = 10
+export const scroller_inset = 2
+export const scroller_min = 24
+export const scroller_grab = 16
+export const scroller_hold = 0.7
+export const scroller_keep = 24
+export const scroller_show_omega = 40
+export const scroller_show_zeta = 1
+export const scroller_hide_omega = 13
+export const scroller_hide_zeta = 1
+export const scroller_wide_omega = 32
+export const scroller_wide_zeta = 1
+export const scroller_page_omega = 20
+export const scroller_page_zeta = 1
+export const tone_scroller_knob: Fill = {dark: {1, 1, 1, 0.42}, light: {1, 1, 1, 0.42}}
+export const tone_scroller_track: Fill = {dark: {1, 1, 1, 0.07}, light: {1, 1, 1, 0.07}}
 
 export const tone_ground: Fill = {dark: {0.051, 0.067, 0.090, 1}, light: {0.051, 0.067, 0.090, 1}}
 export const tone_ink_1: Fill = {dark: {0.941, 0.965, 0.988, 1}, light: {0.941, 0.965, 0.988, 1}}

@@ -129,7 +129,8 @@ pub fn panel_from(
         fill_l: fill,
         edge_d: edge,
         edge_l: edge,
-        shape: [shape.radius, shape.n, shape.border, shape.feather],
+        // No corner rounder than half the short side (a pill: a large radius on a thin bar, a scroller's knob).
+        shape: [shape.radius.min(rect[2].min(rect[3]) * 0.5), shape.n, shape.border, shape.feather],
         fx: [0.0; 4],
         fx2: [0.0, alpha, 0.0, 0.0],
         lens: [0.0; 4],

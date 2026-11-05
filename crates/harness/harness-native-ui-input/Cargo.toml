@@ -13,6 +13,8 @@ harness-native-api = { path = "../harness-native-api" }
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
 harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
 harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
+harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
+harness-native-ui-spring-api = { path = "../harness-native-ui-spring-api" }
 
 [lints.rust]
 # The module exports are `no_mangle` statics and `extern "C"` fns (harness-native-api `module!`).

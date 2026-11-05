@@ -10,8 +10,11 @@
 //! says one), held from a press until its release, into the `PointerShape` singleton when it changes. The host puts its own
 //! zones and drags over it and sets the system pointer (harness-native's `App::pointer_shape` and window.rs).
 //!
-//! The state is the per-frame hit list shared by the two systems, rebuilt every frame, and the shape a press holds;
-//! everything else is in the world.
+//! A third system drives every scroll's overlay scroller (`Scroller`, layout-api): the pointer near an edge widens it, a
+//! press on its knob drags it, a press on its track pages (`ScrollerGrip`, and `ScrollState` itself).
+//!
+//! The state is the per-frame hit list shared by the systems, rebuilt every frame, the topmost hit and the shape a press
+//! holds; everything else is in the world.
 use core::cell::Cell;
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -21,8 +24,12 @@ use harness_native_api::APP;
 use harness_native_ui_input_api::{
     Activated, Cursor, Focusable, Focused, Hoverable, Hovered, Pointer, PointerShape, PointerState, Pressable, Pressed,
 };
-use harness_native_ui_motion_api::Leaving;
-use harness_native_ui_node_api::{Clip, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
+use harness_native_ui_layout_api::{
+    NoScroller, ScrollAxis, ScrollExtent, ScrollState, Scroller, ScrollerGrip, ScrollerPart, ScrollerState, axis_bit, scroller_axis,
+};
+use harness_native_ui_motion_api::{Leaving, Motion};
+use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
+use harness_native_ui_spring_api::{Spring, Tune};
 
 struct Hit {
     id: u64,
@@ -56,12 +63,13 @@ pub fn install(world: WorldRef<'_>) {
         let (mut depth, mut root) = (0u32, e);
         let mut clip: Option<Laid> = None;
         let mut cursor = e.try_cloned::<&Cursor>().map(|c| c.shape);
-        // A view going out on its Transition (an overlay closing, a row folding away) still draws but takes no pointer.
-        let mut leaving = e.has(Leaving::id());
+        // A view going out on its Transition (an overlay closing, a row folding away) still draws but takes no pointer; one
+        // layout left out (Hidden: a ViewThatFits variant, a scroller's part while it is hidden) takes none either.
+        let mut leaving = e.has(Leaving::id()) || e.has(Hidden::id());
         while let Some(p) = root.parent().filter(|p| p.has(Node::id())) {
             depth += 1;
             root = p;
-            leaving |= p.has(Leaving::id());
+            leaving |= p.has(Leaving::id()) || p.has(Hidden::id());
             if cursor.is_none() {
                 cursor = p.try_cloned::<&Cursor>().map(|c| c.shape);
             }
@@ -93,6 +101,9 @@ pub fn install(world: WorldRef<'_>) {
     let app = *world.lookup(APP).id();
     // The shape a press holds until its release (None: the press was on no node), while the button is down.
     let held: Cell<Option<Option<Pointer>>> = Cell::new(None);
+    // The topmost hit this pass, for the scrollers after it.
+    let topmost: Rc<Cell<Option<u64>>> = Rc::default();
+    let top_out = topmost.clone();
     world.system_named::<&PointerState>("UiPointer").phase(Phase::Resolve).each_iter(move |it, _, p| {
         let mut hits = hits.borrow_mut();
         hits.sort_by(|a, b| a.key.0.cmp(&b.key.0).then(a.key.1.total_cmp(&b.key.1)).then(a.key.2.cmp(&b.key.2)).then(a.key.3.cmp(&b.key.3)));
@@ -103,12 +114,131 @@ pub fn install(world: WorldRef<'_>) {
             .map(|h| Top { id: h.id, pressable: h.pressable, focusable: h.focusable, cursor: h.cursor.unwrap_or_default() });
         let any = !hits.is_empty();
         hits.clear();
+        top_out.set(top.map(|t| t.id));
         let w = it.world();
         shape(w, &held, top.map(|t| t.cursor), *p);
         if any {
             apply(w.entity_from_id(app), top, *p);
         }
     });
+    world
+        .system_named::<(&Scroller, &ScrollState, &Laid)>("UiScroller")
+        .without(NoScroller::id())
+        // After the pointer's resolve (flecs orders a phase's systems by id), so `topmost` is this pass's.
+        .phase(Phase::Draw)
+        .reads(ScrollExtent::id())
+        .reads(ScrollerState::id())
+        .each_iter(move |it, row, (c, s, l)| {
+            let (e, w) = (it.entity(row), it.world());
+            let Some(p) = w.try_get::<&PointerState>(|p| *p) else { return };
+            scroller(e, w, *c, *s, *l, p, topmost.get(), it.delta_time());
+        });
+}
+
+/// One pass of a scroll's overlay scroller under the pointer (`Scroller`, layout-api): which edges the pointer is near
+/// (they widen; only when what is on top is the scroll or inside it), a press on its knob taking hold of it and a press on
+/// its track paging toward the press (a glide on the `ui.spring.scroller_page` spring), the held knob scrolling in
+/// proportion as the pointer moves. It writes `ScrollState` itself; a host that runs a scroll's physics adopts that.
+#[allow(clippy::too_many_arguments)]
+fn scroller(e: EntityView<'_>, w: WorldRef<'_>, c: Scroller, s: ScrollState, l: Laid, p: PointerState, top: Option<u64>, dt: f32) {
+    let Some(x) = e.try_cloned::<&ScrollExtent>() else { return };
+    let st = e.try_cloned::<&ScrollerState>().unwrap_or_default();
+    let was = e.try_cloned::<&ScrollerGrip>().unwrap_or_default();
+    let mut g = was;
+    let (laid, ext, at) = ([l.x, l.y, l.w, l.h], [x.w, x.h], [s.x, s.y]);
+    let axes = [ScrollAxis::Y, ScrollAxis::X];
+    let geom = |a: ScrollAxis| scroller_axis(&c, laid, ext, at, st.wide(a), a);
+    // What is on top is this scroll or inside it (or nothing), and the pointer is inside every clip around it.
+    let ours = top.is_none_or(|t| std::iter::successors(Some(w.entity_from_id(t)), |n| n.parent()).any(|n| n.id() == e.id()));
+    let seen = clipped(e, l);
+    g.near = 0;
+    if ours && seen.contains(p.x, p.y) {
+        for a in axes {
+            let edge = match a {
+                ScrollAxis::Y => p.x >= l.x + l.w - c.grab,
+                ScrollAxis::X => p.y >= l.y + l.h - c.grab,
+            };
+            if edge && geom(a).is_some() {
+                g.near |= axis_bit(a);
+            }
+        }
+    }
+    if !p.down {
+        g.held = false;
+        g.drag = 0;
+    } else if p.went_down && !g.held {
+        // The press is taken once, however many passes the frame runs.
+        g.held = true;
+        let part = top.map(|t| w.entity_from_id(t)).filter(|t| t.parent().is_some_and(|q| q.id() == e.id()));
+        if let Some(part) = part.and_then(|t| t.try_cloned::<&ScrollerPart>())
+            && let Some(ax) = geom(part.axis)
+        {
+            let along = [p.x, p.y][part.axis.index()];
+            let knob = ax.knob_at(part.axis);
+            g.page = 0;
+            if part.track && !(along >= knob && along <= knob + ax.knob[2 + part.axis.index()]) {
+                let page = (ax.view - c.keep).max(ax.view * 0.5);
+                let now = at[part.axis.index()];
+                g.page = axis_bit(part.axis);
+                g.goal = (if along < knob { now - page } else { now + page }).clamp(0.0, ax.max);
+                g.glide = Spring::at(now);
+            } else {
+                g.drag = axis_bit(part.axis);
+                g.grab = along - knob;
+            }
+        }
+    }
+    let mut next = s;
+    for a in axes {
+        let i = a.index();
+        if g.drag == axis_bit(a)
+            && let Some(ax) = geom(a)
+        {
+            let to = ax.scroll_for([p.x, p.y][i] - g.grab);
+            if (to - at[i]).abs() > 0.01 {
+                if i == 0 { next.x = to } else { next.y = to }
+            }
+        } else if g.page == axis_bit(a) {
+            // Moved by someone else (a wheel) since the glide's last step: the glide lets go.
+            if (at[i] - g.glide.x).abs() > 0.5 {
+                g.page = 0;
+                continue;
+            }
+            let tune = w
+                .try_lookup("ui::spring::scroller_page")
+                .and_then(|t| t.try_cloned::<&Motion>())
+                .map_or(Tune { omega: 24.0, zeta: 1.0 }, |m| Tune { omega: m.omega, zeta: m.zeta });
+            if harness_native_api::settle(&mut g.glide, g.goal, tune, dt) {
+                harness_native_api::moving(&w);
+            } else {
+                g.glide = Spring::at(g.goal);
+                g.page = 0;
+            }
+            if i == 0 { next.x = g.glide.x } else { next.y = g.glide.x }
+        }
+    }
+    if next != s {
+        e.set(next);
+    }
+    if g != was {
+        e.set(g);
+    }
+}
+
+/// `l` cut to every `Clip` around `e`: where the pointer can reach it.
+fn clipped(e: EntityView<'_>, l: Laid) -> Laid {
+    let mut r = l;
+    let mut at = e.parent();
+    while let Some(n) = at.filter(|n| n.has(Node::id())) {
+        if n.has(Clip::id())
+            && let Some(c) = n.try_cloned::<&Laid>()
+        {
+            let (x, y) = (r.x.max(c.x), r.y.max(c.y));
+            r = Laid { x, y, w: ((r.x + r.w).min(c.x + c.w) - x).max(0.0), h: ((r.y + r.h).min(c.y + c.h) - y).max(0.0) };
+        }
+        at = n.parent();
+    }
+    r
 }
 
 /// Resolve the pointer's shape from `over` (the topmost hit's) and the press that may hold one, into `PointerShape` when it
@@ -222,5 +352,11 @@ pub fn cycle_focus(world: WorldRef<'_>, forward: bool) {
 harness_native_api::module!(
     "input",
     install,
-    [harness_native_api::API_LAYOUTS, harness_native_ui_node_api::API_LAYOUTS, harness_native_ui_input_api::API_LAYOUTS]
+    [
+        harness_native_api::API_LAYOUTS,
+        harness_native_ui_node_api::API_LAYOUTS,
+        harness_native_ui_input_api::API_LAYOUTS,
+        harness_native_ui_layout_api::API_LAYOUTS,
+        harness_native_ui_motion_api::API_LAYOUTS
+    ]
 );
