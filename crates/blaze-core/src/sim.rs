@@ -336,6 +336,9 @@ pub struct Sim {
     unlinked: Vec<Tag>,
     /// The locks another process holds ([`Sim::hold_lock`]).
     outside: HashMap<FileName, LockMode, Global>,
+    /// The tags of each [`Effect::Pressure`] in flight, in the order asked: each is told of
+    /// the memory pressure a test makes ([`Sim::press`]).
+    pressures: Vec<Tag>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -410,6 +413,17 @@ impl Sim {
             // alloc: none until a locked file is removed.
             unlinked: Vec::new(),
             outside: HashMap::new_in(Global),
+            // alloc: none until memory pressure is watched.
+            pressures: Vec::new(),
+        }
+    }
+
+    /// The system says memory is short: each [`Effect::Pressure`] in flight is told
+    /// [`Done::Pressed`], `critical` as given, after a delay drawn as any completion's.
+    pub fn press(&mut self, critical: bool) {
+        for at in 0..self.pressures.len() {
+            let tag = self.pressures[at];
+            self.tell(tag, Done::Pressed { critical }, Of::Op);
         }
     }
 
@@ -510,6 +524,7 @@ impl Sim {
         self.spawns.clear();
         self.watches.clear();
         self.ending = 0;
+        self.pressures.clear();
         self.told.clear();
         self.listens.clear();
         self.ends.clear();
@@ -1366,6 +1381,7 @@ impl Sim {
             | Effect::Recv { .. }
             | Effect::Send { .. }
             | Effect::Hangup { .. }
+            | Effect::Pressure { .. }
             | Effect::Unlock { .. } => {
                 unreachable!("watches, kills, sockets and unlocks are not pending effects")
             }
@@ -1429,6 +1445,27 @@ impl Driver for Sim {
                         // alloc: the batch's payload.
                         self.tell(tag, Done::Journaled(Box::new(batch)), Of::Change(id));
                     }
+                    continue;
+                }
+                Effect::Pressure { tag } => {
+                    match self.pressures.contains(&tag) {
+                        // alloc: an error's message.
+                        true => self.tell(
+                            tag,
+                            Done::Failed(IoError(format!(
+                                "memory pressure is watched as {tag:?} already"
+                            ))),
+                            Of::Op,
+                        ),
+                        // alloc: none past the most watched at once.
+                        false => self.pressures.push(tag),
+                    }
+                    continue;
+                }
+                // A watch of memory pressure ends after every pressure told it.
+                Effect::Unwatch { tag } if self.pressures.contains(&tag) => {
+                    self.pressures.retain(|&it| it != tag);
+                    self.tell_after(tag, tag, Done::Unwatched, Of::Op);
                     continue;
                 }
                 Effect::Unwatch { tag } => {
@@ -1755,7 +1792,10 @@ impl Driver for Sim {
         let ending = self.told.iter().filter(|it| {
             !matches!(
                 it.completion.done,
-                Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                Done::Changed { .. }
+                    | Done::Journaled(_)
+                    | Done::Accepted { .. }
+                    | Done::Pressed { .. }
             )
         });
         self.pending.len()
@@ -1763,6 +1803,7 @@ impl Driver for Sim {
             + (self.watches.len() - self.ending)
             + self.listens.len()
             + self.receiving.len()
+            + self.pressures.len()
             + ending.count()
     }
 

@@ -680,6 +680,10 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each node ready and not started: its `admission` span, open from the step it became
     /// ready, and that step's time ([`Plane::admitting`]).
     admitting: HashMap<NodeId, Admitting, Global>, // alloc: the plane's, an entry a ready node
+    /// What the system last said of memory ([`Plane::pressed`]), and the cap on the budget it
+    /// makes as last given to the plane ([`PlaneInput::Cap`]).
+    pressure: blaze_graph::pressure::Pressured,
+    capped: Option<u64>,
 }
 
 /// A ready node's wait for admission, as its profile span says it ([`Plane::admitting`]).
@@ -759,7 +763,53 @@ impl<W: Work, P: Predict> Plane<W, P> {
             replays: HashSet::new_in(Global), // alloc: the plane's, once
             per_kib: HashMap::new_in(Global), // alloc: the plane's, once
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
+            pressure: blaze_graph::pressure::Pressured::default(),
+            capped: None,
         })
+    }
+
+    /// The system says memory is short at `at` (docs/memory-budget.md section 7, "Pressure"):
+    /// from the next [`Plane::poll`] until [`blaze_graph::pressure::HOLD_NS`] after the last
+    /// such event, the budget the plane admits against is held at what the process holds now.
+    /// Whether the front ends are to be asked for a release for it
+    /// ([`blaze_graph::pressure::Pressured::release_due`]).
+    pub fn pressed(&mut self, at: Duration) -> bool {
+        self.pressure = self.pressure.pressed(ns(at), arena::held());
+        self.pressure.release_due(ns(at))
+    }
+
+    /// What admission counts the daemon at (the most of what it held as the plane last heard
+    /// and what its running tasks are granted), the budget it admits against (its allowance;
+    /// `None` with no budget), and the pressure cap on it while there is one.
+    pub fn memory(&self) -> (u64, Option<u64>, Option<u64>) {
+        let budget = self.graph.config().budget.as_ref().map(|it| it.bytes);
+        (self.graph.held().max(self.graph.granted()), budget, self.graph.cap())
+    }
+
+    /// The requests (by number) with a ready task held back for memory alone now
+    /// ([`blaze_graph::Plane::waits_for_memory`]), into `into`, ascending, each once.
+    pub fn held_back(&self, into: &mut Vec<u32>) {
+        for &id in self.admitting.keys() {
+            if self.graph.waits_for_memory(id)
+                && let Some((batch, _)) = self.task(id)
+            {
+                into.push(batch.request); // alloc: none once it has held this many.
+            }
+        }
+        into.sort_unstable();
+        into.dedup();
+    }
+
+    /// Each running task granted memory, by its node and name, to `each`: what a task held back
+    /// for memory waits on. A task several requests share comes once each.
+    pub fn granted_running<'a>(&'a self, mut each: impl FnMut(NodeId, &'a str)) {
+        self.graph.unsettled(|it| {
+            if matches!(it.state, NodeState::Running)
+                && self.graph.admitted(it.id).is_some_and(|admitted| admitted.granted > 0)
+            {
+                each(it.id, it.name);
+            }
+        });
     }
 
     pub fn budget(&self) -> Option<&Budget> {
@@ -1291,6 +1341,14 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.ran = ran;
         let held = PlaneInput::Held { at_ns: ns(at), bytes: arena::held() };
         self.step(held).unwrap_or_else(|error| panic!("the plane refused what is held: {error}"));
+        // The pressure cap, given as it changes: on an event, and once it passes.
+        let cap = self.pressure.cap(ns(at));
+        if cap != self.capped {
+            self.capped = cap;
+            let input = PlaneInput::Cap { at_ns: ns(at), bytes: cap };
+            self.step(input)
+                .unwrap_or_else(|error| panic!("the plane refused the pressure cap: {error}"));
+        }
     }
 
     /// What happened since the last call, in order, swapped into `into`, which is empty: the

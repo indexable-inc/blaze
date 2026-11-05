@@ -271,6 +271,15 @@ impl Uring {
                     ..Sqe::default()
                 }
             }
+            // One-shot, asked again after each event (`Step::Goes`): the trigger's own poll
+            // clears its event as it reports it, so each completion is one event.
+            Kind::Pressure => Sqe {
+                opcode: OP_POLL_ADD,
+                fd: raw(&cold.fds[0]),
+                op_flags: libc::POLLPRI as u32,
+                user_data,
+                ..Sqe::default()
+            },
             // A pipe has no position.
             Kind::Output => Sqe {
                 opcode: OP_READ,
@@ -595,6 +604,7 @@ impl Uring {
             | Kind::Stat
             | Kind::Load => self.path_step(id, link, res),
             Kind::Watch => self.watched(hot, res),
+            Kind::Pressure => self.pressed(id, hot, res),
             Kind::Exit => {
                 let spawn = Handle::from_bits(hot.of);
                 if res < 0 {
@@ -870,8 +880,8 @@ impl Uring {
         Step::Ends(Some(Done::unsent(bytes, io::Error::from_raw_os_error(errno))))
     }
 
-    /// Stops the watch or listen whose request is `id`: through the ring, or here if the
-    /// request has not reached the kernel yet.
+    /// Stops the watch, listen or watch of memory pressure whose request is `id`: through the
+    /// ring, or here if the request has not reached the kernel yet.
     pub(super) fn stop(&mut self, id: Id) {
         let Some(hot) = self.ops.get_mut(id) else { return };
         let (tag, kind, of) = (hot.tag, hot.kind, hot.of);
@@ -885,13 +895,13 @@ impl Uring {
                     return;
                 }
             }
-            Kind::Accept => {
+            Kind::Accept | Kind::Pressure => {
                 if hot.flags & STOPPING != 0 {
                     return;
                 }
                 hot.flags |= STOPPING;
             }
-            _ => unreachable!("a watch's or a listen's request"),
+            _ => unreachable!("a watch's, a listen's or a memory pressure watch's request"),
         }
         let Some(at) = self.waiting.iter().position(|&it| it == id) else {
             self.cancel(id);
@@ -906,6 +916,10 @@ impl Uring {
                     .get_mut(Handle::from_bits(of))
                     .expect("a watch's read's watching");
                 unflushed(&mut self.ready, &mut watching.flushes);
+                Done::Unwatched
+            }
+            Kind::Pressure => {
+                self.watches.remove(&tag);
                 Done::Unwatched
             }
             _ => {
@@ -928,7 +942,12 @@ impl Uring {
         };
         let waiting = self.waiting.contains(&id);
         let hot = self.ops.get(id).expect("a watch's read");
-        debug_assert_eq!(hot.kind, Kind::Watch);
+        if hot.kind != Kind::Watch {
+            // alloc: an error path.
+            return Err(io::Error::other(format!(
+                "{watch:?} watches memory pressure, not a directory: there is nothing to flush"
+            )));
+        }
         let Watching { tree, buffer, stopping, flushes, journal } =
             self.watchings.get_mut(Handle::from_bits(hot.of)).expect("a watch's read's watching");
         if *stopping {
@@ -1076,6 +1095,71 @@ impl Uring {
             self.start(Hot::new(tag, Kind::Watch, watch.to_bits()), ops::NO_BYTES, Cold::EMPTY);
         self.watches.insert(tag, id);
         Ok(())
+    }
+
+    /// Watches memory pressure as `tag` ([`Effect::Pressure`]): a PSI trigger ([`PSI_TRIGGER`])
+    /// armed on [`crate::cgroup::pressure_file`], opened read-write and non-blocking as the
+    /// kernel asks of a trigger, and polled for `POLLPRI` through the ring. A kernel without PSI
+    /// (no file), or one before 6.5 that lets only `CAP_SYS_RESOURCE` arm a trigger (`EPERM`),
+    /// fails it here, naming the file: the asker runs without a pressure source.
+    pub(super) fn pressure(&mut self, tag: Tag) -> io::Result<()> {
+        use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+        let path = crate::cgroup::pressure_file();
+        let named = |error: io::Error, doing: &str| {
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("{doing} {}: {error}", path.display()))
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|error| named(error, "opening the memory pressure file"))?;
+        file.write_all(PSI_TRIGGER).map_err(|error| {
+            named(
+                error,
+                &format!(
+                    "arming the PSI trigger {:?} on",
+                    String::from_utf8_lossy(&PSI_TRIGGER[..PSI_TRIGGER.len() - 1])
+                ),
+            )
+        })?;
+        // The path rides in the request's buffer, which a poll does not use, for the error
+        // that names it.
+        // alloc: once per watch of memory pressure, one per daemon.
+        let path = path.into_os_string().into_encoded_bytes();
+        let id = self.start(
+            Hot::new(tag, Kind::Pressure, 0),
+            path,
+            Cold { fds: [Some(OwnedFd::from(file)), None], ..Cold::EMPTY },
+        );
+        self.watches.insert(tag, id);
+        Ok(())
+    }
+
+    /// The poll of the watch of memory pressure `hot` (request `id`) completed with `res`.
+    /// Stopping, it ends; an event is a [`Done::Pressed`] and the poll is asked again; an error,
+    /// or a trigger the kernel tore down (its cgroup removed: `POLLERR`), ends it, naming the
+    /// file.
+    fn pressed(&mut self, id: Id, hot: Hot, res: i32) -> Step {
+        if hot.flags & STOPPING != 0 || res == -libc::ECANCELED {
+            self.watches.remove(&hot.tag);
+            return Step::Ends(Some(Done::Unwatched));
+        }
+        let gone = (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i32;
+        if res < 0 || res & gone != 0 {
+            self.watches.remove(&hot.tag);
+            let why = if res < 0 { error(res) } else { format!("poll said {res:#x}") }; // alloc: an error path.
+            let path = String::from_utf8_lossy(self.ops.buf(id));
+            // alloc: an error path.
+            let why = format!("watching memory pressure through the PSI trigger on {path}: {why}");
+            return Step::Ends(Some(Done::Failed(IoError(why))));
+        }
+        if res & libc::POLLPRI as i32 != 0 {
+            // PSI says nothing of how bad: no trigger here is the critical one.
+            return Step::Goes(Done::Pressed { critical: false });
+        }
+        Step::Again
     }
 
     /// Sends that went from the asker's pages and ended, since the driver was made.

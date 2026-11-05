@@ -64,6 +64,9 @@ pub struct Machine {
     broken: bool,
     /// What the start says of the machine budget.
     said: String,
+    /// Who else holds the machine's memory, as the last turn read the ledger, for a build's
+    /// paused line ([`Machine::says`]); empty while no other daemon holds any.
+    says: String,
 }
 
 /// What a daemon joined with: its place, and the ceiling its plane admits under.
@@ -177,6 +180,7 @@ impl Machine {
             allowance: None,
             broken: false,
             said,
+            says: String::new(),
         };
         Ok(Joined { machine, ceiling })
     }
@@ -229,6 +233,7 @@ impl Machine {
         let mut ledger = read(&self.file, &self.path, &mut bytes)?;
         let seen = Seen::of(&ledger, &self.path)?;
         let turn = ledger.turn(self.me, wall_ns(), &seen, &mut Turning { plane, at })?;
+        self.says_of(&ledger, &turn.allowance);
         write(&self.file, &self.path, &ledger, &mut bytes)?;
         drop(lock);
         if turn.pruned > 0 {
@@ -236,6 +241,56 @@ impl Machine {
         }
         self.last = Some((at, turn.charge));
         Ok(turn.allowance)
+    }
+
+    /// Who else holds the machine's memory as the last turn read it, for a build's paused line
+    /// (`machine 96.0 GiB, 40.1 held by 1 other daemon: pid 4242 of /Users/a/.blaze 40.1`);
+    /// `None` while no other daemon holds any, when this daemon's own ceiling is all that
+    /// holds it back.
+    pub(crate) fn says(&self) -> Option<&str> {
+        (!self.says.is_empty()).then_some(self.says.as_str())
+    }
+
+    fn says_of(&mut self, ledger: &Ledger<'_>, allowance: &Allowance) {
+        use std::fmt::Write as _;
+        self.says.clear();
+        if allowance.others == 0 {
+            return;
+        }
+        let daemons = allowance.daemons;
+        _ = write!(
+            self.says,
+            "machine {:.1} GiB, {:.1} held by {daemons} other daemon{}:",
+            gib(allowance.machine),
+            gib(allowance.others),
+            if daemons == 1 { "" } else { "s" }
+        );
+        // The two that hold the most, by pid among equals, so the line is the same for the
+        // same ledger.
+        let mut top: [Option<&Record>; 2] = [None; 2];
+        for it in ledger.records().filter(|it| it.process != self.me) {
+            let key = |r: &Record| (std::cmp::Reverse(r.charge()), r.process.pid);
+            if top[0].is_none_or(|t| key(it) < key(t)) {
+                top[1] = top[0];
+                top[0] = Some(it);
+            } else if top[1].is_none_or(|t| key(it) < key(t)) {
+                top[1] = Some(it);
+            }
+        }
+        for (at, it) in top.iter().flatten().enumerate() {
+            let home = String::from_utf8_lossy(it.home.kept());
+            _ = write!(
+                self.says,
+                "{} pid {} of {}{home} {:.1}",
+                if at > 0 { "," } else { "" },
+                it.process.pid,
+                if it.home.cut() { "..." } else { "" },
+                gib(it.charge())
+            );
+        }
+        if daemons > 2 {
+            _ = write!(self.says, ", and {} more", daemons - 2);
+        }
     }
 
     /// Takes this daemon's record out, under the lock: a clean exit.

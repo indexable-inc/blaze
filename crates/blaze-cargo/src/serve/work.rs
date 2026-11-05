@@ -745,6 +745,10 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// its tasks (`blaze_graph::Plane::short`): let go of what the front end keeps for no
     /// task to come, by a write [`Writer::waiting`] asks for, if that can help.
     fn short(&mut self) {}
+    /// On the loop, as the system says memory is short (docs/memory-budget.md section 7,
+    /// "Pressure"): let go of what the front end keeps for no task to come, by a write
+    /// [`Writer::waiting`] asks for, now, whatever this daemon's own budget says.
+    fn pressed(&mut self) {}
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
     /// costing one load. A write that fails (its error, or a panic, a maintainer's included,

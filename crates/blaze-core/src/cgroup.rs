@@ -382,6 +382,26 @@ fn parent() -> io::Result<&'static Path> {
     Ok(PARENT.get_or_init(|| own).as_path())
 }
 
+/// The file whose memory pressure an [`crate::Effect::Pressure`] arms its PSI trigger on: the
+/// process's own cgroup's `memory.pressure` where the memory controller is delegated to it, so
+/// the pressure counted is the daemon's and its builds' (in cgroups below it), else the whole
+/// system's, `/proc/pressure/memory` (docs/memory-budget.md section 7, "Pressure"). Read
+/// without readying the cgroup: watching pressure moves no process.
+pub(crate) fn pressure_file() -> PathBuf {
+    // alloc: the paths, once per watch of memory pressure (one per daemon).
+    let delegated = || -> Option<PathBuf> {
+        if let Some(own) = PARENT.get() {
+            return Some(own.join("memory.pressure"));
+        }
+        let cgroups = read(Path::new("/proc/self/cgroup")).ok()?;
+        let mountinfo = read(Path::new("/proc/self/mountinfo")).ok()?;
+        let own = own_dir(&cgroups, &mountinfo).ok()?;
+        let controllers = read(&own.join("cgroup.controllers")).ok()?;
+        listed(&controllers, "memory").then(|| own.join("memory.pressure"))
+    };
+    delegated().unwrap_or_else(|| PathBuf::from("/proc/pressure/memory"))
+}
+
 /// Readies `own`, this process's cgroup, to hold a cgroup per process with the memory
 /// controller: the controller must be delegated to it, and once it is enabled for its
 /// children no process may be in it, so this one moves into the leaf `daemon` first.

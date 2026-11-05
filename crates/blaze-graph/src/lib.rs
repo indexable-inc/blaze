@@ -52,6 +52,7 @@ pub mod par;
 pub mod plane;
 #[allow(unsafe_code)]
 pub mod pool;
+pub mod pressure;
 #[allow(unsafe_code)]
 pub mod pump;
 pub mod sched;
