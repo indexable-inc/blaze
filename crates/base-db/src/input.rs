@@ -638,6 +638,8 @@ pub struct ExtraCrateData {
     pub potential_cfg_options: Option<CfgOptions>,
     /// What it is built for, as cargo's units tell two builds of one package apart.
     pub built_for: BuiltFor,
+    /// Stable unit identities of the build-script runs this crate reads, in dependency order.
+    pub build_script_runs: Box<[String]>,
 }
 
 /// What a crate is built for: the host (a build without `--target`, or a build script and
@@ -827,7 +829,7 @@ impl Crate {
     /// path, and its disambiguator is the crate's own data and cfg. A dependency is its
     /// crate's ID, its name and a byte each of prelude, sysroot and private. Its
     /// [`LintOptions`] follow, each flag's lint and level and then the cap.
-    pub const DOMAIN: &'static str = "blaze v2 crate 6";
+    pub const DOMAIN: &'static str = "blaze v2 crate 7";
 
     pub fn data<'db, Db: ?Sized + blaze_query::db::Database>(
         self,
@@ -1013,6 +1015,10 @@ impl Crate {
             Some(cfg) => hasher.update(&[1]).id(&cfg_options_content(cfg)),
         };
         extra.built_for.hash_into(&mut hasher);
+        content::len(&mut hasher, extra.build_script_runs.len());
+        for run in &extra.build_script_runs {
+            hasher.part(run.as_bytes());
+        }
         hasher.id(&workspace.content()).id(&cfg_options_content(cfg)).id(&env.content());
         content::len(&mut hasher, lints.opts.len());
         for (lint, level) in &lints.opts {
@@ -1554,6 +1560,7 @@ impl CrateGraphBuilder {
                 display_name,
                 potential_cfg_options,
                 built_for: BuiltFor::default(),
+                build_script_runs: Box::new([]),
             },
             cfg_options,
             env,

@@ -813,6 +813,7 @@ fn lower_writes<T: blaze_query::Tree>(
             display_name: Some(base_db::CrateDisplayName::from_canonical_name(&unit.target.name)),
             potential_cfg_options: None,
             built_for: crates::built_for(unit.built_for()),
+            build_script_runs: crates::build_script_runs(units, unit, |at| class[at]),
         };
         // Its `OUT_DIR` and its runs by their run class: units apart only in which run of a
         // class they depend on (two profiles apart only in what a run never reads, as
