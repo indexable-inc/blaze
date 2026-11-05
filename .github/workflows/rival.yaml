@@ -78,7 +78,7 @@ jobs:
         run: |
           sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
           sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
-          python3 .github/scripts/llvm.py fetch --target aarch64-unknown-linux-gnu --dir /usr/local/lib/blaze-llvm/aarch64-unknown-linux-gnu
+          python3 .github/scripts/llvm.py '{"command": "fetch", "target": "aarch64-unknown-linux-gnu", "dir": "/usr/local/lib/blaze-llvm/aarch64-unknown-linux-gnu"}'
           LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/aarch64-unknown-linux-gnu blaze build --locked --release -p blaze-engine
           blaze stop
           mkdir -p ../bins/ours && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} ../bins/ours/ \;
