@@ -137,6 +137,9 @@ jobs:
           # timeout's own 124: the window was still up when it was stopped.
           test "$status" = 124 || { echo "::error::the window exited ($status) before it was stopped"; exit 1; }
           ! grep -E -i "panicked|Err\(" life.log
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   live-edits:
     name: live edits (macOS arm64)
@@ -175,3 +178,6 @@ jobs:
       - name: the demo builds on macOS
         run: cargo build --locked
         working-directory: demo/life
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log

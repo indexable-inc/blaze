@@ -1,0 +1,20 @@
+# The blaze daemon's log, printed after a failed job: the client says only that the daemon did not
+# start or listen, and the daemon says in its log why (`blaze serve`'s serve.log, under blaze's
+# cache directory). Use as the last step of a job that ran .github/actions/blaze, with
+# `if: failure()`.
+name: blaze daemon log
+description: Print the last lines of every blaze daemon log under blaze's cache directory.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        found=
+        for log in "${XDG_CACHE_HOME:-$HOME/.cache}"/blaze/*/serve.log "${XDG_CACHE_HOME:-$HOME/.cache}"/blaze/serve.log; do
+          [ -f "$log" ] || continue
+          found=1
+          echo "::group::$log (last 200 lines)"
+          tail -n 200 "$log"
+          echo "::endgroup::"
+        done
+        [ -n "$found" ] || echo "no blaze daemon log under ${XDG_CACHE_HOME:-$HOME/.cache}/blaze"

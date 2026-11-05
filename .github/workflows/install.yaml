@@ -169,6 +169,9 @@ jobs:
         with:
           name: archive
           path: blaze-commit-x86_64-unknown-linux-gnu.tar.gz
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   # A machine with no Rust: blaze brings its own, and the first `blaze run` prints the program's
   # output. The time is from the start of install.sh to that output. On the oldest systems a

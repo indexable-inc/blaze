@@ -64,3 +64,6 @@ jobs:
             /tmp/rj-live-*/v2/serve.log
             ~/.cache/blaze/v2/serve.log
           if-no-files-found: warn
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log

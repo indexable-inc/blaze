@@ -100,3 +100,6 @@ jobs:
           [ ! -x "$RUNNER_TEMP/bench-base" ] || exit 0
           "$RUNNER_TEMP/bench-head" --color never solo -t "$TIME" | tee "$RUNNER_TEMP/bench.txt"
           { echo '### blaze-bench'; echo '```'; cat "$RUNNER_TEMP/bench.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log

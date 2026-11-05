@@ -666,7 +666,10 @@ What stays on GitHub's hosted runners, and why:
   so that the binaries ask for an old glibc (`build_release.py` refuses one newer than RHEL 9's
   2.34); the ix image's glibc is 2.39. **TODO(sysroot)**: blaze has no `--sysroot`; it finds crt
   objects and libc through `$CC_<triple> -print-search-dirs`, and the sysroot archives of
-  [toolchain-c.md](v2/plan/toolchain-c.md) are not built. Once blaze links against an old glibc
+  [toolchain-c.md](v2/plan/toolchain-c.md) are not built. A driver given one
+  (`CC_aarch64_unknown_linux_gnu="gcc --sysroot=<glibc 2.34 tree>"`) finds the old glibc's files,
+  but blaze-link then takes the ELF interpreter from inside that tree, as libc's directory is not
+  an FHS one (`crates/blaze-link/src/target.rs`, `fhs`), so the binaries would not run elsewhere. Once blaze links against an old glibc
   sysroot, these move to ix.
 - Windows, which ix does not serve.
 - The bench workflows' measurements run on the machines `BENCH_RUNNERS` registers.

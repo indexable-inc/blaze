@@ -68,6 +68,9 @@ jobs:
           name: latency-${{ matrix.program }}
           path: ${{ runner.temp }}/latency.json
           if-no-files-found: warn
+      # Why the daemon ended, when it did (the client does not say).
+      - if: failure()
+        uses: ./.github/actions/daemon-log
 
   history:
     name: history and regressions
