@@ -29,7 +29,8 @@
 //! ## `tool_detail`: a REPL cell's steps and value
 //!
 //! The harness REPL (`mcp/src/repl.ts`) posts each cell to the daemon as it runs (`repl_task`), with the agent's id for
-//! the tool call that ran it when the agent gave one (Claude puts it in the MCP request's `_meta`). For a chat session
+//! the tool call that ran it when the agent gave one (in the MCP request's `_meta`: Claude as `claudecode/toolUseId`, Codex
+//! as `callId`, the id of its `mcpToolCall` item). For a chat session
 //! the daemon records each post as a `tool_detail` for that call's `block`: the cell's whole state, so the latest one
 //! stands for all before it (a reattach replays only the latest). It may come before the call's `tool_call` or after its
 //! `tool_result` (a backgrounded cell ends later). Its fields, as the kernel writes them:

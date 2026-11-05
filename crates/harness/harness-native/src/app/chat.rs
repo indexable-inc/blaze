@@ -565,7 +565,7 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
                 "record" => format!("{n} field{}", if n == 1 { "" } else { "s" }),
                 "scalar" => cell_text(&v["v"]),
                 "text" => first_line(v["v"].as_str().unwrap_or("")),
-                _ if !d.ui.is_null() => "Drew a view".into(),
+                _ if !empty_value(&d.ui) => "Drew a view".into(),
                 _ => "Done".into(),
             };
             (kind_icon(""), words, String::new(), false)
@@ -578,6 +578,10 @@ fn headline(d: &Detail) -> (&'static str, String, String, bool) {
 
 /// The rows a shown value is drawn as: a grid, or output text (`cap` rows or lines of either).
 fn value_rows(v: &Arc<Value>, cap: usize, out: &mut Vec<Row>) {
+    // An empty value (no rows, blank text: a handle with nothing to show) draws no body, only the card's head.
+    if empty_value(v) {
+        return;
+    }
     if v["kind"] == "search" {
         out.push(Row::Results { v: v.clone(), cap });
         return;
@@ -593,6 +597,24 @@ fn value_rows(v: &Arc<Value>, cap: usize, out: &mut Vec<Row>) {
     }
 }
 
+/// Whether a shown value (or a genui tree) has nothing to draw: null, a grid with no rows, blank text or error, an
+/// empty list of views.
+fn empty_value(v: &Value) -> bool {
+    let blank = |k: &str| v[k].as_str().is_none_or(|s| s.trim().is_empty());
+    match v {
+        Value::Null => true,
+        Value::Array(a) => a.iter().all(empty_value),
+        Value::Object(_) if v.get("type").is_some() => false, // a genui element
+        _ => match v["t"].as_str().unwrap_or("") {
+            "table" | "record" | "list" => v["rows"].as_array().is_none_or(Vec::is_empty),
+            "text" => blank("v"),
+            "error" => blank("stack") && blank("message"),
+            "scalar" => false,
+            _ => true,
+        },
+    }
+}
+
 /// A harness REPL cell's card (`tool_detail`): what it did in words, never its code. Folded, its head and its main value
 /// (the cell's own, else its last step's), [`FOLDED_ROWS`] of it; opened, each step and its value, the cell's value and
 /// logs in full, then "Show code".
@@ -602,14 +624,15 @@ fn card_rows(block: &str, d: &Detail, open: &HashSet<String>, out: &mut Vec<Row>
     let state = d.ms.filter(|_| d.status != "running").map(secs).unwrap_or_default();
     out.push(Row::Card { block: block.to_owned(), icon, words, detail, state, error, open: is_open });
     // What it draws shows under its head, folded or open, in place of its value.
-    if !d.ui.is_null() {
+    let draws = !empty_value(&d.ui);
+    if draws {
         out.push(Row::Ui { v: d.ui.clone() });
     }
     if !is_open {
-        if !d.ui.is_null() {
+        if draws {
             return;
         }
-        let main = if d.value.is_null() { d.effects.iter().rev().map(|e| &e.value).find(|v| !v.is_null()) } else { Some(&d.value) };
+        let main = if empty_value(&d.value) { d.effects.iter().rev().map(|e| &e.value).find(|v| !empty_value(v)) } else { Some(&d.value) };
         // A cell whose whole value is its head ("42") shows nothing more.
         if let Some(main) = main.filter(|m| !(d.effects.is_empty() && m["t"] == "scalar")) {
             value_rows(main, FOLDED_ROWS, out);
@@ -631,7 +654,7 @@ fn card_rows(block: &str, d: &Detail, open: &HashSet<String>, out: &mut Vec<Row>
         out.push(Row::Output { text: cell_text(&d.value["v"]), error: false });
     }
     value_rows(&d.value, usize::MAX, out);
-    if !d.logs.is_empty() {
+    if !d.logs.trim().is_empty() {
         out.push(Row::Output { text: d.logs.clone(), error: false });
     }
     let code = open.contains(&code_key(block));
