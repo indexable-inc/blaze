@@ -75,7 +75,7 @@ export const sidebar_zeta = 1
 // left edge does (wider, clear of AppKit's own window-resize band). side_keep is the least the main card keeps beside
 // it, lowering side_max in a narrow window.
 export const side_min = 180
-export const side_max = 480
+export const side_max = 300
 export const side_latch = 8
 export const side_give = 24
 export const side_soft = 48
