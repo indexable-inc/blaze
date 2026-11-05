@@ -47,12 +47,15 @@ at blaze's own threads, and a hang that cannot say where it is.
 6. **Signal-free sampling.** Nothing signals a pool or driver thread.
    - Linux: one `perf_event_open` task-clock event per thread that holds a flight ring,
      `PERF_SAMPLE_TID | TIME | CALLCHAIN` (user call chains the kernel walks by frame pointer,
-     `use_clockid` `CLOCK_MONOTONIC`), read from its mmap ring by the sampler thread. Off the
-     CPU: a context-switch event on the same thread (`PERF_COUNT_SW_CONTEXT_SWITCHES`, period
-     1, with `context_switch` records) gives the stack where the thread blocked and how long;
-     a block inside a span becomes off-CPU samples weighted by its length, a preemption counts
-     as on the CPU (runnable), as macOS's `TH_STATE_RUNNING` does. The perf ring reader is
-     ix-prof's (`crates/ix-prof/src/sampler/linux.rs`), shared, so blaze has one perf reader.
+     `use_clockid` `CLOCK_MONOTONIC`), with `context_switch` records in the same ring, read by
+     the sampler thread. Off the CPU: a switch-out that is not a preemption, inside a span,
+     becomes off-CPU samples weighted by how long it blocked, with no stack. The kernel's stack
+     of a block is a kernel-mode sample of a context-switch counter, which `exclude_kernel`
+     drops and kernel sampling needs `perf_event_paranoid` 1 or lower; the sampler must run at
+     2 (the common default), so the span says where it blocked (the raw-block gate decides by
+     span ancestry) and macOS keeps its blocked stack. A preemption counts as on the CPU
+     (runnable), as macOS's `TH_STATE_RUNNING` does. The perf ring reader is
+     `crates/ix-prof/src/perf.rs`, shared with ix-prof's sampler, so blaze has one perf reader.
    - Span and fiber attribution: perf's samples arrive after the fact, which is why the
      signal sampler replaced perf on 2026-11-04 (every sample read span 0). Each flight ring
      gets a **context log**: a fixed ring of `(ticks, span, job, fiber)` entries its thread
@@ -112,9 +115,9 @@ Each private symbol gets a comment naming it and why, and a test that resolves i
 
 - The wait: one clock read per entry, as `poll` already did. No allocation.
 - The context log: three relaxed stores and a clock read the flight ring already made, per span
-  enter and exit and per switch; 4096 entries of 32 bytes, 128 KiB a ring.
-- perf: one task-clock and one context-switch event per ring-holding thread, two mmap rings of
-  64 KiB. The context-switch event costs a sample per switch; measured on a self-build before
+  enter and exit and per switch; 4096 entries of 40 bytes (with the parent span), 160 KiB a ring.
+- perf: one task-clock event with switch records per ring-holding thread, one mmap ring of
+  64 KiB. Switch records cost a record per switch; measured on a self-build before
   and after, quoted in the sampler PR from the spans (`slow-is-p0-traced`).
 
 ## Migration

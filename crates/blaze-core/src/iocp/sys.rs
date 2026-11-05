@@ -13,20 +13,22 @@ use std::{
     },
     path::{Path, PathBuf},
     ptr::NonNull,
-    time::Duration,
 };
 
 use blaze_mem::{MemError, Region, Tag as MemTag};
 use windows_sys::Win32::{
-    Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+    Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{GetFullPathNameW, SetFileCompletionNotificationModes},
     System::IO::{
-        CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_0_0,
+        CreateIoCompletionPort, OVERLAPPED, OVERLAPPED_0_0,
         OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
     },
 };
 
-use crate::FileName;
+use crate::{
+    FileName,
+    wait::{self, Clock, Deadline, Waited},
+};
 
 /// A request's own completion: its `lpOverlapped` is a [`Head`] of the driver's.
 pub(super) const KEY_IO: usize = 0;
@@ -484,36 +486,19 @@ impl Port {
         post(self.raw(), key, bytes, carried)
     }
 
-    /// Up to `entries.len()` packets, waiting up to `wait` for the first; how many came.
+    /// Up to `entries.len()` packets, waiting until `until` on `clock` (forever for `None`)
+    /// for the first, through [`wait::completions`]; how many came, 0 by the deadline.
     pub(super) fn take(
         &self,
         entries: &mut [OVERLAPPED_ENTRY],
-        wait: Duration,
+        until: Option<Deadline>,
+        clock: &impl Clock,
     ) -> io::Result<usize> {
-        let mut got = 0;
-        // Rounded up, so a wait shorter than a millisecond is not a spin.
-        let ms = match wait.is_zero() {
-            true => 0,
-            false => u32::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(u32::MAX - 1),
-        };
-        // SAFETY: room for `entries.len()` entries and a count to write.
-        let ok = unsafe {
-            GetQueuedCompletionStatusEx(
-                self.raw(),
-                entries.as_mut_ptr(),
-                entries.len() as u32,
-                &mut got,
-                ms,
-                0,
-            )
-        };
-        if ok == 0 {
-            return match last() {
-                WAIT_TIMEOUT => Ok(0),
-                _ => Err(io::Error::last_os_error()),
-            };
+        let what = "a packet of the IOCP driver's completion port";
+        match wait::completions(what, self.raw(), entries, until, clock)? {
+            Waited::Ready(got) => Ok(got),
+            Waited::Deadline => Ok(0),
         }
-        Ok(got as usize)
     }
 }
 
@@ -546,7 +531,10 @@ pub(super) unsafe fn post_head(port: HANDLE, head: *mut OVERLAPPED) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::wait::Clock as _;
 
     /// A name made on the stack is what `format!` and [`wide`] make of the same parts, and
     /// allocates nothing.
@@ -585,12 +573,14 @@ mod tests {
         port.post(KEY_WAKE, 3, 7).unwrap();
         // SAFETY: all zeros is an `OVERLAPPED_ENTRY` of no packet: integers and a null pointer.
         let mut entries = [unsafe { std::mem::zeroed::<OVERLAPPED_ENTRY>() }; 2];
-        assert_eq!(port.take(&mut entries, Duration::from_millis(100)).unwrap(), 1);
+        let clock = crate::wait::Monotonic::new();
+        let soon = Some(Deadline::after(clock.now(), Duration::from_millis(100)));
+        assert_eq!(port.take(&mut entries, soon, &clock).unwrap(), 1);
         assert_eq!(entries[0].lpCompletionKey, KEY_WAKE);
         assert_eq!(entries[0].lpOverlapped as usize, 7);
         assert_eq!(entries[0].dwNumberOfBytesTransferred, 3);
         assert_eq!(
-            port.take(&mut entries, Duration::ZERO).unwrap(),
+            port.take(&mut entries, Some(Deadline::PASSED), &clock).unwrap(),
             0,
             "the refused packet was posted"
         );

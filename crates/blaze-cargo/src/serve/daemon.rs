@@ -1160,7 +1160,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 break;
             }
             driver.submit(&mut effects);
-            driver.poll(&mut done, Duration::from_millis(50));
+            driver.poll(
+                &mut done,
+                blaze_core::wait::Deadline::after(driver.now(), Duration::from_millis(50)),
+            );
             for completion in done.drain(..) {
                 if store.owns(completion.tag) {
                     store.complete(completion, &mut effects);
@@ -1693,14 +1696,18 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if matches!(self.stopping, Some(Stopping::Over)) {
             return false;
         }
+        use blaze_core::wait::Deadline;
+        // The turn's deadline on the driver's clock, the soonest of what ends the wait, passed
+        // to the driver as it is: no layer turns it into a length to restart (deadline-waits).
+        let now = self.driver.now();
         let mut wait = if !self.effects.is_empty() || self.plane.ready() {
-            (Duration::ZERO, Woken::Idle)
+            (Deadline::PASSED, Woken::Idle)
         } else if self.plane.running() > 0 {
-            (Duration::from_millis(1), Woken::PlaneTasks)
+            (Deadline::after(now, Duration::from_millis(1)), Woken::PlaneTasks)
         } else {
-            (Duration::from_millis(50), Woken::Idle)
+            (Deadline::after(now, Duration::from_millis(50)), Woken::Idle)
         };
-        let mut sooner = |until: Option<Duration>, woken: Woken| {
+        let mut sooner = |until: Option<Deadline>, woken: Woken| {
             if let Some(until) = until
                 && until < wait.0
             {
@@ -1708,26 +1715,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
         };
         sooner(
-            self.session
-                .deadline()
-                .map(|at| Duration::from_nanos(at.saturating_sub(ns(self.driver.now())))),
+            self.session.deadline().map(|at| Deadline::at(Duration::from_nanos(at))),
             Woken::Session,
         );
         // A job's wait for the store to make its puts durable has a deadline of its own.
-        sooner(
-            self.jobs.next_deadline().map(|at| at.saturating_sub(self.driver.now())),
-            Woken::Durable,
-        );
-        sooner(self.observe.wait(self.driver.now()), Woken::Observe);
+        sooner(self.jobs.next_deadline().map(Deadline::at), Woken::Durable);
+        sooner(self.observe.wait(now).map(|it| Deadline::after(now, it)), Woken::Observe);
         self.submit();
         let mut done = std::mem::take(&mut self.done);
-        let (wait, woken) = wait;
-        if wait.is_zero() {
-            self.driver.poll(&mut done, wait);
+        let (until, woken) = wait;
+        if until.passed(now) {
+            self.driver.poll(&mut done, until);
         } else {
             // The loop's time between its turns, said as a wait on what ends it (rule 13).
             let driver = &mut self.driver;
-            blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, wait));
+            blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, until));
         }
         for completion in &done {
             self.ended(completion);

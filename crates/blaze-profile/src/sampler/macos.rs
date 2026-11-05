@@ -2,7 +2,8 @@
 //! registers read and its frame pointers walked inside its own stack, and let go. A thread
 //! that is not running is sampled too when it is inside a span, marked off the CPU: what it
 //! blocks in, and whether a wait span says so, is what the raw-block gate reads. A blocked
-//! thread outside every span is not, as on Linux (`linux.rs`), where sampling it would wake it.
+//! thread outside every span is not, as on Linux (`linux.rs`). While the thread is stopped its
+//! ring's atomics give the span, job and fiber it is in, so no context log is read here.
 
 use std::time::{Duration, Instant};
 
@@ -10,11 +11,17 @@ use parking_lot::{Mutex, MutexGuard};
 
 use super::{DEPTH, Sample, Unsampled, keep};
 
-pub(super) const HOW: &str = "each thread that records spans, running or blocked inside a span, stopped (thread_suspend) and its frame pointers walked";
+pub(super) const HOW: &str = "each thread that records spans, running or blocked inside a span, stopped (thread_suspend) and its frame pointers walked, its span, job and fiber read while stopped";
 
 /// How often the samples taken are kept.
 const KEEP_EVERY: Duration = Duration::from_millis(100);
 
+// Mach calls (rule macos-private-apis): `thread_suspend`, `thread_get_state` and
+// `thread_resume` stop another thread of this task, read its registers and let it go. macOS
+// opens no kernel sampler to a process for itself (no perf, and kperf needs root), and a
+// signal would interrupt the kernel wait the thread is in; stopping it reads the exact
+// instant with nothing running on the thread. `the_mach_calls_resolve` fails naming any that
+// an OS update removed.
 unsafe extern "C" {
     fn thread_suspend(target: libc::thread_act_t) -> libc::kern_return_t;
     fn thread_resume(target: libc::thread_act_t) -> libc::kern_return_t;
@@ -154,8 +161,17 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
         return None;
     }
     let at = Instant::now();
-    let mut sample =
-        Sample { at, tid: thread.tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu };
+    let mut sample = Sample {
+        at,
+        tid: thread.tid,
+        depth: 0,
+        pcs: [0; DEPTH],
+        span: 0,
+        build: 0,
+        on_cpu,
+        job: 0,
+        fiber: 0,
+    };
     // SAFETY: the port of a live thread that is not this one (the sampler holds no ring).
     if unsafe { thread_suspend(thread.port) } != libc::KERN_SUCCESS {
         return None;
@@ -170,6 +186,7 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
     if got == libc::KERN_SUCCESS {
         walk(&state, thread.low, thread.high, &mut sample);
         sample.span = ring.innermost();
+        (sample.job, sample.fiber) = ring.running_now();
         // A span a sample names is written whole, never folded.
         crate::flight::keep(sample.span);
         sample.build = crate::flight::build_of(sample.span);
@@ -229,8 +246,24 @@ mod tests {
             span: 0,
             build: 0,
             on_cpu: true,
+            job: 0,
+            fiber: 0,
         };
         walk(&state, base, high, &mut sample);
         assert_eq!(&sample.pcs[..usize::from(sample.depth)], &[0x1000, 0x1001, 0x1002, 0x1003]);
+    }
+
+    /// The Mach calls the sampler stops threads with resolve at run time: an OS update that
+    /// removed one fails here, naming it (rule macos-private-apis).
+    #[test]
+    fn the_mach_calls_resolve() {
+        for name in [c"thread_suspend", c"thread_get_state", c"thread_resume"] {
+            // SAFETY: `RTLD_DEFAULT` searches every loaded image; `name` is NUL-terminated.
+            let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            assert!(
+                !at.is_null(),
+                "the Mach call {name:?}, which the sampler stops threads with, is gone from this macOS"
+            );
+        }
     }
 }

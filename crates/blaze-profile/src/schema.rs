@@ -503,6 +503,16 @@ pub const SAMPLES: Table = Table {
             "`on` when its thread was running or runnable as it was sampled, `off` when blocked inside a span, so what it blocked in shows; the same on Linux and macOS",
         ),
         STACK_PCS,
+        opt(
+            "job",
+            Type::U64,
+            "the job running on its thread as it was sampled, as `switches.job` names it (a pool job's own number before it joined the graph); null for none, and in rows of a blaze before it",
+        ),
+        opt(
+            "fiber",
+            Type::U32,
+            "the fiber that job ran on, as `switches.fiber` names it; null for none, and in rows of a blaze before it",
+        ),
     ],
 };
 

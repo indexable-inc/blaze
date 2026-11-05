@@ -503,12 +503,6 @@ pub(super) fn pidfd_open(pid: pid_t) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-pub(super) fn poll(fds: &mut [libc::pollfd], timeout: c_int) -> c_int {
-    // SAFETY: `fds` is live and exclusive for the call, which reads and writes `fds.len()`
-    // entries of it and no more.
-    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) }
-}
-
 /// Reads `pid`'s memory at `remote` (its addresses, which are never dereferenced here) into
 /// the spare capacity of `into`, which grows by what was read: what `process_vm_readv`
 /// returned.

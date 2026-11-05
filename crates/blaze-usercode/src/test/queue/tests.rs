@@ -1071,7 +1071,7 @@ fn simulated(two_outside: bool) {
                     }
                 }
             }
-            sim.poll(&mut out, Duration::ZERO);
+            sim.poll(&mut out, blaze_core::wait::Deadline::NEVER);
             for completion in out.drain(..) {
                 assert!(queue.owns(completion.tag), "seed {seed}");
                 queue.complete(completion, sim.now(), &mut effects);

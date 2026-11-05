@@ -8,15 +8,21 @@
 //! a ring, running or runnable (on), or blocked inside a span (off); a blocked thread outside
 //! every span is not sampled. Each walks frame pointers (blaze keeps them on both).
 //!
-//! - Linux: each tick the sampler's thread signals each such thread with a realtime signal
-//!   (`tgkill`), and the thread's handler walks its own stack on its alternate signal stack and
-//!   writes the sample into its ring's slot, which the sampler collects on its next tick
-//!   (`linux.rs` says why a signal and not `perf_event_open`). Where the signal cannot be set
-//!   up, [`start`] says why.
+//! - Linux: `perf_event_open`, no signals: the sampler's thread opens a task-clock event with
+//!   switch records on each such thread and reads its ring; the kernel walks the user stack of
+//!   each sample on the CPU, and a block inside a span is weighed from its switch out and in
+//!   into samples off the CPU with no stack (`linux.rs` says why). Each sample's span, job and
+//!   fiber come from its ring's context log at the sample's time
+//!   ([`crate::flight::Ring::context_at`]), since perf's samples arrive after the fact. Where
+//!   the kernel refuses the event, [`start`] says why.
 //! - macOS (aarch64): no kernel sampler is open to a process for itself, but a thread of the
 //!   process may stop another: each tick the sampler stops each such thread
 //!   (`thread_suspend`), reads its registers, walks its frame pointers inside its own stack,
-//!   and lets it go. Nothing is allocated and no lock taken while a thread is stopped.
+//!   reads its innermost span, job and fiber from its ring, and lets it go. Nothing is
+//!   allocated and no lock taken while a thread is stopped.
+//!
+//! Nothing signals a thread: a signal interrupts the kernel wait it lands in
+//! (docs/v2/plan/design/deadline-waits.md).
 //! - Elsewhere [`start`] says there is no sampler.
 
 use std::{sync::atomic::AtomicBool, time::Instant};
@@ -53,8 +59,14 @@ pub(crate) struct Sample {
     pub(crate) span: u64,
     pub(crate) build: u32,
     /// Whether it was running or runnable (on) or blocked (off) as it was sampled: a thread
-    /// blocked inside a span is sampled too, so a block no wait span says shows in its stack.
+    /// blocked inside a span is sampled too, so a block no wait span says shows in its span
+    /// (and in its stack on macOS; Linux's blocked samples have none, depth 0).
     pub(crate) on_cpu: bool,
+    /// The job running on its thread as it was sampled (its slot's generation << 32 | its
+    /// slot, as switch rows name it; a pool job's own number before it joined the graph), and
+    /// its fiber: 0 for none. Not a column of the profile's `samples` table yet.
+    pub(crate) job: u64,
+    pub(crate) fiber: u32,
 }
 
 /// What a [`Ring`] holds.
@@ -202,8 +214,8 @@ fn run(_hz: u32) -> Result<&'static str, Unsampled> {
 #[cfg(target_os = "linux")]
 pub(crate) use linux::Thread;
 /// What a thread's ring holds for the sampler, under the lock the thread takes to leave, so no
-/// thread is stopped or signalled once it is gone: on macOS its port and stack, on Linux its
-/// slot and alternate signal stack.
+/// thread is stopped or read once it is gone: on macOS its port and stack, on Linux its tid
+/// and the perf events the sampler opened on it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use macos::Thread;
 
@@ -267,6 +279,9 @@ pub(crate) fn taken(since: Instant, epoch: &Epoch) -> (Vec<Sampled>, String) {
         .map(|it| Sampled {
             tid: it.tid,
             at_us: epoch.us(it.at),
+            span: it.span,
+            job: it.job,
+            fiber: it.fiber,
             // Innermost first, as dumps read it: each address's frames (outermost first)
             // reversed, so an inlined function comes before the one it was inlined into.
             stack: it.pcs[..usize::from(it.depth)]
@@ -295,8 +310,17 @@ mod tests {
     #[test]
     fn the_ring_keeps_the_newest_samples() {
         let at = Instant::now();
-        let sample =
-            |tid| Sample { at, tid, depth: 0, pcs: [0; DEPTH], span: 0, build: 0, on_cpu: true };
+        let sample = |tid| Sample {
+            at,
+            tid,
+            depth: 0,
+            pcs: [0; DEPTH],
+            span: 0,
+            build: 0,
+            on_cpu: true,
+            job: 0,
+            fiber: 0,
+        };
         let batch: Vec<Sample> = (0..KEPT as u64 + 10).map(sample).collect();
         // A ring of its own: the process's is the sampler's, which another test runs.
         let mut samples = Samples { ring: Vec::new(), next: 0, state: String::new() };
@@ -312,8 +336,9 @@ mod tests {
     #[test]
     fn a_busy_thread_is_sampled_and_named() {
         if let Err(why) = start(HZ * 20) {
-            // The system refused the sampler (Linux: a seccomp filter refusing
-            // `process_vm_readv`, or the signal taken): the error says so, and so do dumps.
+            // The system refused the sampler (Linux: `perf_event_open` refused by
+            // `kernel.perf_event_paranoid` or a seccomp filter): the error says so, and so do
+            // dumps.
             assert!(!why.0.is_empty());
             return;
         }

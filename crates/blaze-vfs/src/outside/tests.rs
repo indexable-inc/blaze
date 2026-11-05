@@ -22,7 +22,7 @@ fn pump(sim: &mut Sim, outside: &mut Outside<'_>, effects: &mut Vec<Effect>) {
     let mut done = Vec::new();
     loop {
         sim.submit(effects);
-        if sim.poll(&mut done, Duration::ZERO) == 0 {
+        if sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) == 0 {
             return;
         }
         for completion in done.drain(..) {
@@ -221,7 +221,7 @@ fn a_change_made_before_a_flush_is_seen_once_it_completes() {
         let mut done = Vec::new();
         while !outside.flushed() {
             sim.submit(&mut effects);
-            assert!(sim.poll(&mut done, Duration::ZERO) > 0, "seed {seed}: the flush never came");
+            assert!(sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) > 0, "seed {seed}: the flush never came");
             for completion in done.drain(..) {
                 outside.complete(completion, &mut effects);
             }
@@ -536,7 +536,7 @@ fn checks_wants_and_rounds_allocate_nothing() {
         assert_eq!(effects.len(), 1);
         while !outside.flushed() {
             sim.submit(&mut effects);
-            sim.poll(&mut done, Duration::ZERO);
+            sim.poll(&mut done, blaze_core::wait::Deadline::NEVER);
             for completion in done.drain(..) {
                 assert_at_most(0, "a flush heard", || outside.complete(completion, &mut effects));
             }
@@ -548,7 +548,7 @@ fn checks_wants_and_rounds_allocate_nothing() {
     let mut heard = false;
     while !heard {
         sim.submit(&mut effects);
-        assert!(sim.poll(&mut done, Duration::ZERO) > 0, "the change was never told");
+        assert!(sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) > 0, "the change was never told");
         for completion in done.drain(..) {
             heard |= matches!(completion.done, Done::Changed { .. });
             assert_at_most(0, "a change heard", || outside.complete(completion, &mut effects));

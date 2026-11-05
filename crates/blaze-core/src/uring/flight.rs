@@ -409,7 +409,7 @@ impl Uring {
     /// Shows the kernel what was written to the ring, waking its thread where it sleeps.
     pub(super) fn submit_ring(&mut self) {
         if self.ring.unsubmitted > 0
-            && let Err(error) = self.ring.enter(None)
+            && let Err(error) = self.ring.enter(None, &Monotonic::since(self.start))
         {
             self.fail_unsubmitted(&error);
         }
@@ -1131,7 +1131,8 @@ impl Drop for Uring {
             }
             *left > 0
         });
-        let deadline = Instant::now() + LETTING_GO;
+        let clock = Monotonic::since(self.start);
+        let deadline = Deadline::after(clock.now(), LETTING_GO);
         let mut posted = Vec::new(); // alloc: the driver's drop, once.
         let cancel = Sqe {
             opcode: OP_ASYNC_CANCEL,
@@ -1142,7 +1143,7 @@ impl Drop for Uring {
         };
         let mut alive = true;
         while alive && !self.ops.is_empty() && !self.ring.push(&[cancel]) {
-            alive = Instant::now() < deadline && self.ring.enter(None).is_ok();
+            alive = !deadline.passed(clock.now()) && self.ring.enter(None, &clock).is_ok();
             self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
         }
         while alive {
@@ -1170,12 +1171,11 @@ impl Drop for Uring {
                 }
             }
             self.provided.publish();
-            let left = deadline.saturating_duration_since(Instant::now());
             let lent = self.ops.iter().any(|(_, it)| it.kind != Kind::Cancel);
-            if !lent || left.is_zero() {
+            if !lent || deadline.passed(clock.now()) {
                 break;
             }
-            alive = self.ring.enter(Some(left)).is_ok();
+            alive = self.ring.enter(Some(deadline), &clock).is_ok();
             self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
         }
         self.spawning.clear();

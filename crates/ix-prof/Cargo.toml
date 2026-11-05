@@ -21,8 +21,9 @@ default = ["sampler", "layer"]
 sampler = []
 # `ix_prof::layer()`, a `tracing_subscriber::Layer`.
 layer = ["dep:tracing-subscriber"]
-# `/debug/pprof/*` and `/debug/pprof/live` on a loopback port.
-http = []
+# `/debug/pprof/*` and `/debug/pprof/live` on a loopback port. Its accept loop waits through
+# blaze-core's one deadline wait (rule deadline-waits).
+http = ["dep:blaze-core"]
 
 [dependencies]
 addr2line.workspace = true
@@ -30,6 +31,7 @@ arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true
+blaze-core = { workspace = true, optional = true }
 # The dev runtime's stubs and jump table: a function pointer of a blaze dev run is its slot's
 # stub, which only the jump table ties to its function (symbols.rs).
 blaze-inproc-rt.workspace = true

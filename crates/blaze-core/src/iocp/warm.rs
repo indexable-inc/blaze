@@ -20,11 +20,11 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
-        INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        INVALID_HANDLE_VALUE,
     },
     System::Threading::{
         CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-        GetCurrentProcess, GetProcessId, WaitForSingleObject,
+        GetCurrentProcess, GetProcessId,
     },
 };
 
@@ -95,10 +95,16 @@ fn driver_stderr() -> io::Result<Option<OwnedHandle>> {
     sys::owned(copy).map(Some)
 }
 
-/// Whether the launcher's process has ended.
+/// Whether the launcher's process has ended: one look, no wait.
 pub(super) fn ended(process: &OwnedHandle) -> bool {
-    // SAFETY: an open process; a wait of no time.
-    unsafe { WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+    let clock = crate::wait::Monotonic::new();
+    let looked = crate::wait::signaled(
+        "the warm launcher's process to have ended",
+        process.as_raw_handle(),
+        Some(crate::wait::Deadline::PASSED),
+        &clock,
+    );
+    matches!(looked, Ok(crate::wait::Waited::Ready(())))
 }
 
 /// A run's handles duplicated into the warm launcher: closed there as this drops, unless

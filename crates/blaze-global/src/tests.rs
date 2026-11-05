@@ -230,7 +230,7 @@ impl World {
         let mut out = Vec::new();
         loop {
             self.sim.submit(&mut self.effects);
-            if self.sim.poll(&mut out, Duration::ZERO) == 0 {
+            if self.sim.poll(&mut out, blaze_core::wait::Deadline::NEVER) == 0 {
                 break;
             }
             for completion in out.drain(..) {
