@@ -13,8 +13,3 @@ paths:
     ignore:
       # The crates.io job is off on purpose until the rename (#270); `if: false` is how.
       - 'constant expression "false" in condition'
-  .github/workflows/blaze.yaml:
-    ignore:
-      # GitHub's concurrency `queue` key (2026-05-07); actionlint 1.7.12 predates it
-      # (rhysd/actionlint#654).
-      - 'unexpected key "queue" for "concurrency" section'
