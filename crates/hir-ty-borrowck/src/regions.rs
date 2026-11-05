@@ -1290,10 +1290,11 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 {
                     body.param_locals.first().and_then(|&it| {
                         let ty = local_tys[it.into_raw().into_u32() as usize]?;
-                        self.self_reference(function, ty).or(match ty.kind() {
-                            TyKind::Ref(region, ..) => Some(region),
-                            _ => None,
-                        })
+                        self.self_reference(
+                            function,
+                            ty,
+                            GenericArgs::identity_for_item(self.interner(), function.into()),
+                        )
                     })
                 }
                 _ => None,
@@ -2697,21 +2698,27 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         self.scratch.tys.give(params);
     }
 
-    /// The self type of the impl `function` is in with its anonymous lifetimes universal
-    /// regions, when it has any.
-    /// The region of the one `&Self` in the type of a method's `self` (`self: Box<&Self>`,
-    /// `Pin<&mut Self>`), which rustc's lifetime elision gives the elided lifetimes of the
-    /// return type.
-    fn self_reference(&self, function: hir_def::FunctionId, ty: Ty<'db>) -> Option<Region<'db>> {
-        let ItemContainerId::ImplId(impl_) = function.lookup(self.ctx.db).container else {
-            return None;
-        };
+    /// The region of the one `&Self` in a method's receiver (`self: Box<&Self>`,
+    /// `Pin<&mut Self>`), which lifetime elision gives to the return type. A by-value
+    /// `Self` that is itself a reference does not supply a receiver lifetime.
+    fn self_reference(
+        &self,
+        function: hir_def::FunctionId,
+        ty: Ty<'db>,
+        args: GenericArgs<'db>,
+    ) -> Option<Region<'db>> {
         let interner = self.interner();
         let erase = |ty: Ty<'db>| {
             let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
             super::liveness::normalize_erased(self.ctx, ty).unwrap_or(ty)
         };
-        let self_ty = erase(self.ctx.db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip());
+        let self_ty = match function.lookup(self.ctx.db).container {
+            ItemContainerId::ImplId(impl_) => {
+                erase(self.ctx.db.impl_self_ty(impl_).instantiate(interner, args).skip_norm_wip())
+            }
+            ItemContainerId::TraitId(_) => erase(args.types().next()?),
+            _ => return None,
+        };
         let mut found = Vec::new_in(self.ctx.frame);
         let mut stack = Vec::new_in(self.ctx.frame);
         stack.push(ty);
@@ -5991,7 +5998,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                             _ => (false, false),
                         };
                         let function = match def {
-                            CallableDefId::FunctionId(it) => Some(it),
+                            CallableDefId::FunctionId(it) => Some((it, fn_args)),
                             _ => None,
                         };
                         let mut inputs = self.scratch.tys.take();
@@ -6154,7 +6161,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
 
     /// A callee's signature with the lifetimes it elides, which RA leaves as errors, made
     /// region variables by the elision rules: each elided input lifetime its own, an elided
-    /// output lifetime that of `self` when `self` is a reference, else that of the only
+    /// output lifetime that of the receiver's reference to `Self`, else that of the only
     /// lifetime of the inputs. The default lifetime of a trait object is not one of them.
     /// An `impl Trait` `function` returns has, for each lifetime its parameters leave out, that
     /// lifetime's region.
@@ -6165,7 +6172,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     #[allow(clippy::too_many_arguments)]
     fn elide(
         &mut self,
-        function: Option<hir_def::FunctionId>,
+        function: Option<(hir_def::FunctionId, GenericArgs<'db>)>,
         inputs: &[Ty<'db>],
         output: Ty<'db>,
         self_param: bool,
@@ -6174,7 +6181,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         out: &mut FVec<'a, Ty<'db>>,
     ) -> Ty<'db> {
         let interner = self.interner();
-        let groups = function.map(|it| hir_ty::elided_groups(self.ctx.db, it));
+        let groups = function.map(|(it, _)| hir_ty::elided_groups(self.ctx.db, it));
         let mut errors = filled(self.ctx.frame, inputs.len(), Vec::new_in(self.ctx.frame));
         let (impl_self, writes_self, ret_self) = match impl_self {
             Some((raw, writes, ret)) => {
@@ -6226,8 +6233,10 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             })
         }));
         let inputs: &[Ty<'db>] = out;
-        let self_region = match inputs.first().map(|it| it.kind()) {
-            Some(TyKind::Ref(region, ..)) if self_param => Some(region),
+        let self_region = match (self_param, function, inputs.first()) {
+            (true, Some((function, args)), Some(&receiver)) => {
+                self.self_reference(function, receiver, args)
+            }
             _ => None,
         };
         let mut distinct = self.scratch.regions.take();
@@ -6259,7 +6268,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
         });
         self.scratch.regions.give(distinct);
         let output = match function {
-            Some(function) => {
+            Some((function, _)) => {
                 let mut regions = Vec::new_in(self.ctx.frame);
                 hir_ty::elided_lifetimes(self.ctx.db, function).regions_into(&errors, &mut regions);
                 hir_ty::with_elided_regions(self.ctx.db, output, function, &regions)
