@@ -195,6 +195,10 @@ pub fn sync_object(oid: &str) -> anyhow::Result<()> {
 }
 
 fn sync_one(oid: &str, kind: &str, meta: &Value, claimed: &[PathBuf]) -> anyhow::Result<()> {
+    // A chat session writes its own messages stream from its events (chat/mod.rs).
+    if meta["mode"] == "chat" {
+        return Ok(());
+    }
     let mut guard = CURSORS.lock().unwrap();
     let cursors = guard.get_or_insert_with(HashMap::new);
     let src = match cursors.get(oid) {
