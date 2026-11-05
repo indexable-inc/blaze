@@ -233,6 +233,18 @@ impl Session {
         self.write_lines(&lines)
     }
 
+    /// Switch a chat session's model and/or effort for its turns from here on ([`chat::Chat::choose`]): recorded, and asked
+    /// of its agent when it runs (else its resume starts with it).
+    pub fn chat_choose(&self, model: Option<&str>, effort: Option<&str>) -> Result<()> {
+        let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session, so it has no model to set", self.id))?;
+        let lines = c.choose(model, effort, &self.tx)?;
+        changed();
+        if self.ended.lock().is_none() {
+            self.write_lines(&lines)?;
+        }
+        Ok(())
+    }
+
     /// Stop a chat session's turn in flight.
     pub fn chat_interrupt(&self) -> Result<()> {
         let c = self.chat.as_ref().ok_or_else(|| anyhow!("session {} is not a chat session", self.id))?;
@@ -449,7 +461,7 @@ impl Daemon {
         prompt: Option<&str>, name: Option<String>, env: &BTreeMap<String, String>, meta: Value, created_ms: u64,
     ) -> Result<u64> {
         let adapter: Box<dyn chat::Adapter> = match kind {
-            "claude" => Box::new(chat::claude::Claude::new(launch.effort.clone())),
+            "claude" => Box::new(chat::claude::Claude::new(&launch)),
             "codex" => Box::new(chat::codex::Codex::new(&cwd)),
             other => anyhow::bail!("{other} has no chat adapter (chat/mod.rs); spawn it with mode \"tui\""),
         };
@@ -584,7 +596,9 @@ impl Daemon {
         let Some(session) = session else {
             anyhow::bail!("its log never named {}'s id for the conversation (it predates harness recording it), so there is nothing to resume", s.kind);
         };
-        // The person's own args from the first launch (a model, flags), less any that chose a conversation.
+        // The person's own args from the first launch (a model, flags), less any that chose a conversation, and less a
+        // model or effort the chat has chosen since (`choice` events), which it resumes with instead.
+        let chosen = c.chosen();
         let mut args = Vec::new();
         let mut user = meta["user_args"].as_array().into_iter().flatten().filter_map(Value::as_str);
         while let Some(a) = user.next() {
@@ -592,12 +606,29 @@ impl Daemon {
                 "-r" | "--resume" | "--session-id" => {
                     let _ = user.next();
                 }
+                "-m" | "--model" if chosen.0.is_some() => {
+                    let _ = user.next();
+                }
+                "--effort" if chosen.1.is_some() => {
+                    let _ = user.next();
+                }
+                a if chosen.0.is_some() && a.starts_with("--model=") => {}
+                a if chosen.1.is_some() && a.starts_with("--effort=") => {}
                 "-c" | "--continue" => {}
                 a => args.push(a.to_owned()),
             }
         }
         match s.kind.as_str() {
-            "claude" => args.extend(["--resume".to_owned(), session.clone()]),
+            "claude" => {
+                args.extend(["--resume".to_owned(), session.clone()]);
+                if let Some(m) = &chosen.0 {
+                    args.extend(["--model".to_owned(), m.clone()]);
+                }
+                if let Some(e) = &chosen.1 {
+                    args.extend(["--effort".to_owned(), e.clone()]);
+                }
+            }
+            // Codex's choice rides on its thread/resume and every turn/start (chat/codex.rs `with_choice`).
             "codex" => {}
             other => anyhow::bail!("{other} has no chat adapter to resume with"),
         }
@@ -609,9 +640,9 @@ impl Daemon {
         )?;
         // Claude's adapter says the effort its launch passed, so it is made after the launch.
         let adapter: Box<dyn chat::Adapter> = if s.kind == "claude" {
-            Box::new(chat::claude::Claude::new(launch.effort.clone()))
+            Box::new(chat::claude::Claude::new(&launch))
         } else {
-            Box::new(chat::codex::Codex::resume(&s.cwd, &session))
+            Box::new(chat::codex::Codex::resume(&s.cwd, &session).with_choice(chosen))
         };
         let mut argv = vec![launch.program.clone()];
         argv.extend(launch.args.iter().cloned());
@@ -683,6 +714,10 @@ impl Daemon {
                 } else {
                     crate::inject::send(&s, &text, submit.unwrap_or(true))?;
                 }
+                Reply::Ok
+            }
+            Req::SetModel { id, model, effort } => {
+                self.get(id)?.chat_choose(model.as_deref(), effort.as_deref())?;
                 Reply::Ok
             }
             Req::Screen { id } => {

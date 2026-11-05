@@ -38,6 +38,24 @@ pub enum Body {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// The models the agent offers, each with the efforts it takes, in its own order: its own list (claude's
+    /// `list_models` control request, codex's `model/list`), asked for as it starts. What the composer's pickers list
+    /// and what a [`Body::Choice`] is checked against.
+    Models { models: Vec<ModelChoice> },
+    /// The person chose the model (a [`ModelChoice::id`]) and/or the effort the turns from here on run with (written by
+    /// the daemon as it asks the agent for it, before the agent's `session` event confirms it). A resume starts the agent
+    /// with the latest of each.
+    Choice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
+    /// How much of the model's context window the conversation fills (tokens), as the agent last reported it: claude's
+    /// last call of a turn (its input, cache and output tokens) against `modelUsage`'s `contextWindow`; codex's
+    /// `thread/tokenUsage/updated` (`last.totalTokens` against `modelContextWindow`). `window` is 0 when the agent did not
+    /// say.
+    Context { used: u64, window: u64 },
     /// The person's message (written by the daemon as it sends it).
     User { text: String },
     /// A turn started (true) or ended (false).
@@ -76,6 +94,36 @@ pub enum Body {
         #[serde(default)]
         text: String,
     },
+}
+
+/// One model an agent offers ([`Body::Models`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct ModelChoice {
+    /// What a switch names (claude's alias, `opus`; codex's model id).
+    pub id: String,
+    /// The model it runs as (`claude-opus-5-5`), what the agent's `session` event names; empty when the agent did not say.
+    #[serde(default)]
+    pub model: String,
+    /// Its name as the agent shows it (`Opus 5.5`).
+    #[serde(default)]
+    pub name: String,
+    /// The agent's line about it.
+    #[serde(default)]
+    pub about: String,
+    /// The reasoning efforts it takes, lowest first; none when it takes no effort.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// The effort it runs with when none is chosen, when the agent says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl ModelChoice {
+    /// Whether this is the model a `session` event (or a choice) names: by its id or by the model it runs as.
+    #[must_use]
+    pub fn is(&self, model: &str) -> bool {
+        !model.is_empty() && (self.id == model || self.model == model)
+    }
 }
 
 /// A REPL cell's state, as a `tool_detail` event carries it (mcp/src/effects.ts and shown.ts shape its parts).
@@ -157,6 +205,18 @@ impl Event {
                 session_id: v["session_id"].as_str().filter(|i| !i.is_empty()).map(str::to_owned),
                 effort: v["effort"].as_str().filter(|i| !i.is_empty()).map(str::to_owned),
             },
+            "models" => Body::Models {
+                models: v["models"].as_array().into_iter().flatten().map(|m| ModelChoice {
+                    id: m["id"].as_str().unwrap_or("").to_owned(),
+                    model: m["model"].as_str().unwrap_or("").to_owned(),
+                    name: m["name"].as_str().unwrap_or("").to_owned(),
+                    about: m["about"].as_str().unwrap_or("").to_owned(),
+                    efforts: m["efforts"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    effort: m["effort"].as_str().map(str::to_owned),
+                }).collect(),
+            },
+            "choice" => Body::Choice { model: v["model"].as_str().map(str::to_owned), effort: v["effort"].as_str().map(str::to_owned) },
+            "context" => Body::Context { used: v["used"].as_u64().unwrap_or(0), window: v["window"].as_u64().unwrap_or(0) },
             "user" => Body::User { text: s("text") },
             "busy" => Body::Busy { busy: v["busy"].as_bool().unwrap_or(false) },
             "block_start" => Body::BlockStart { block: block(), kind: kind() },
@@ -245,6 +305,9 @@ impl Body {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Session { .. } => "session",
+            Self::Models { .. } => "models",
+            Self::Choice { .. } => "choice",
+            Self::Context { .. } => "context",
             Self::User { .. } => "user",
             Self::Busy { .. } => "busy",
             Self::BlockStart { .. } => "block_start",

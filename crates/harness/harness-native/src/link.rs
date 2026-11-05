@@ -618,6 +618,22 @@ impl Link {
         }
     }
 
+    /// Switch chat session `id`'s model and/or reasoning effort for its turns from here on (`Request::SetModel`: the daemon
+    /// has its agent switch and logs the choice). A refusal (a model or effort its agent does not offer) is logged naming
+    /// the chat and what was asked.
+    pub fn chat_choose(&self, id: u64, model: Option<String>, effort: Option<String>) {
+        let poke = self.poke.clone();
+        std::thread::spawn(move || {
+            let what = format!("model {model:?} effort {effort:?}");
+            match request(Request::SetModel { id, model, effort }) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("harness-native: set-model {id} ({what}): {e}"),
+                Err(e) => eprintln!("harness-native: set-model {id} ({what}): {e}"),
+            }
+            let _ = poke.send(());
+        });
+    }
+
     /// Interrupt chat session `id`'s turn in flight.
     pub fn chat_interrupt(&self, id: u64) {
         std::thread::spawn(move || {

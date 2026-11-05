@@ -55,6 +55,7 @@ export type Request =
   | { op: "spawn"; kind: string; args?: string[]; parent?: number | null; cwd?: string | null; prompt?: string | null; name?: string | null; cols?: number | null; rows?: number | null; mode?: string | null }
   | { op: "attach"; id: number; cols?: number | null; rows?: number | null; events?: boolean }
   | { op: "send"; id: number; text: string; raw?: boolean; submit?: boolean | null }
+  | { op: "set_model"; id: number; model?: string | null; effort?: string | null }
   | { op: "screen" | "kill" | "forget"; id: number }
   | { op: "resize"; id: number; cols: number; rows: number }
   | ({ op: "repl_task" } & Record<string, unknown>)
@@ -117,9 +118,14 @@ export type Detail = {
   value: unknown; ui: unknown; logs: string;
 };
 export type Kind = "text" | "thinking";
+/** One model an agent offers (a models event). */
+export type ModelChoice = { id: string; model: string; name: string; about: string; efforts: string[]; effort?: string };
 /** What happened. */
 export type Body =
-  | { ev: "session"; agent: string; model: string; session_id?: string }
+  | { ev: "session"; agent: string; model: string; session_id?: string; effort?: string }
+  | { ev: "models"; models: ModelChoice[] }
+  | { ev: "choice"; model?: string; effort?: string }
+  | { ev: "context"; used: number; window: number }
   | { ev: "user"; text: string }
   | { ev: "busy"; busy: boolean }
   | { ev: "block_start"; block: string; kind: Kind }
@@ -137,7 +143,7 @@ export type Body =
 export type Event = { ts: number } & Body;
 
 // A field's type as serde reads it: required (no default), defaulted when missing, or optional (missing or null is none).
-type F = "s" | "b" | "u" | "f" | "k" | "v" | "effects";
+type F = "s" | "b" | "u" | "f" | "k" | "v" | "effects" | "models";
 type Spec = Record<string, [F, "req" | "def" | "opt"]>;
 const DETAIL: Spec = {
   block: ["s", "req"], cell: ["s", "req"], status: ["s", "req"], ms: ["u", "opt"], code: ["s", "def"], effects: ["effects", "def"],
@@ -148,7 +154,10 @@ const EFFECT: Spec = {
   started_ms: ["u", "opt"], ms: ["u", "opt"], detail: ["s", "def"], value: ["v", "def"],
 };
 const BODIES: Record<Body["ev"], Spec> = {
-  session: { agent: ["s", "req"], model: ["s", "req"], session_id: ["s", "opt"] },
+  session: { agent: ["s", "req"], model: ["s", "req"], session_id: ["s", "opt"], effort: ["s", "opt"] },
+  models: { models: ["models", "req"] },
+  choice: { model: ["s", "opt"], effort: ["s", "opt"] },
+  context: { used: ["u", "req"], window: ["u", "req"] },
   user: { text: ["s", "req"] },
   busy: { busy: ["b", "req"] },
   block_start: { block: ["s", "req"], kind: ["k", "req"] },
@@ -163,7 +172,10 @@ const BODIES: Record<Body["ev"], Spec> = {
   error: { text: ["s", "req"] },
   turn_end: { ok: ["b", "req"], stop: ["s", "req"], duration_ms: ["u", "opt"], cost_usd: ["f", "opt"], usage: ["v", "def"], text: ["s", "def"] },
 };
-const EMPTY: Record<F, () => unknown> = { s: () => "", b: () => false, u: () => 0, f: () => 0, k: () => "text", v: () => null, effects: () => [] };
+const MODEL: Spec = {
+  id: ["s", "req"], model: ["s", "def"], name: ["s", "def"], about: ["s", "def"], efforts: ["v", "def"], effort: ["s", "opt"],
+};
+const EMPTY: Record<F, () => unknown> = { s: () => "", b: () => false, u: () => 0, f: () => 0, k: () => "text", v: () => null, effects: () => [], models: () => [] };
 
 const isMap = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof Uint8Array);
 
@@ -183,12 +195,12 @@ function fields(m: Record<string, unknown>, spec: Spec, what: string): Record<st
       : f === "u" ? (typeof x === "number" && Number.isInteger(x) && x >= 0) || (typeof x === "bigint" && x >= 0n)
       : f === "f" ? typeof x === "number" || typeof x === "bigint"
       : f === "k" ? x === "text" || x === "thinking"
-      : f === "effects" ? Array.isArray(x)
+      : f === "effects" || f === "models" ? Array.isArray(x)
       : true;
-    if (!ok) throw new Error(`${what}: \`${k}\` is not ${{ s: "a string", b: "a bool", u: "a u64", f: "a number", k: "text or thinking", v: "", effects: "a list" }[f]}`);
-    out[k] = f === "effects" ? (x as unknown[]).map((e, i) => {
-      if (!isMap(e)) throw new Error(`${what}: effects[${i}] is not a map`);
-      return fields(e, EFFECT, `${what} effects[${i}]`);
+    if (!ok) throw new Error(`${what}: \`${k}\` is not ${{ s: "a string", b: "a bool", u: "a u64", f: "a number", k: "text or thinking", v: "", effects: "a list", models: "a list" }[f]}`);
+    out[k] = f === "effects" || f === "models" ? (x as unknown[]).map((e, i) => {
+      if (!isMap(e)) throw new Error(`${what}: ${k}[${i}] is not a map`);
+      return fields(e, f === "effects" ? EFFECT : MODEL, `${what} ${k}[${i}]`);
     }) : f === "f" && typeof x === "bigint" ? Number(x) : x;
   }
   return out;
