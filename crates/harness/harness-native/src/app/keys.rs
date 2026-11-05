@@ -231,6 +231,9 @@ impl App {
             &[keys::PALETTE]
         } else if self.archive_focused() {
             &[keys::ARCHIVE]
+        } else if self.genui_editing() {
+            // A cell's field has the keys: the chat input's edits act on it.
+            &[keys::CHAT]
         } else if self.chat_focused() {
             if self.tree_focus { &[keys::TREE, keys::CHAT] } else { &[keys::CHAT] }
         } else if self.tree_focus {

@@ -1,13 +1,14 @@
 import { SVELTE, isElement } from './element.ts';
 import { UI_FILE, placeOfFrame } from './compile.ts';
-import { cellRuntime, elementGlobals, runtime } from './svelte.ts';
+import { askComponent, cellRuntime, elementGlobals, runtime } from './svelte.ts';
+import { askProps, planAsk, type AskOptions } from './ask.ts';
 import { UiTree, interval } from './tree.ts';
 import type { UiNode } from './tree.ts';
 import { currentTask, inTask, type Task } from '../tasks.ts';
 
 /*
  * What a cell is handed for UI: the element components (`Column`, `Text`, ...), `render`, `svelte` (a template tag compile.ts expands
- * before the cell runs) and `interval()`. Runes (`$state`, `$derived`, `$effect`, `$props`) are the compiler's; `onMount`,
+ * before the cell runs), `interval()` and `ask()` (a question shown under the cell, answered through the same tree). Runes (`$state`, `$derived`, `$effect`, `$props`) are the compiler's; `onMount`,
  * `onDestroy` (imported for you), `untrack` and `tick` are Svelte's own. A cell that is markup, or whose value is a component, is
  * drawn; so is `render(component, props)`, again in the same cell replacing the tree. The tree rides on the cell's post to harnessd
  * (`ui` in repl.ts `body`), sent again each time it changes; the app draws it under the cell's card (harness-native chat/genui.rs).
@@ -16,30 +17,129 @@ import { currentTask, inTask, type Task } from '../tasks.ts';
 
 export { isElement, type UiNode };
 
-/** Trees kept live (their effects and intervals running) at once; mounting one more unmounts the oldest. */
+/** Cells whose UI is kept live (their effects and intervals running) at once; mounting one more unmounts the oldest's. */
 const MAX_LIVE = 16;
-const live = new Map<Task, UiTree>();
+/** The most questions (`ask`) one cell shows, answered or not. */
+const MAX_ASKS = 16;
 
-/** Mount `component` with `props` as task `t`'s UI, replacing any it had; what the first render throws is thrown here. */
-export function show(t: Task, component: unknown, props: Record<string, unknown> = {}): UiTree {
-  live.get(t)?.unmount();
-  live.delete(t);
-  const tree = new UiTree({
-    emit: (ui) => { t.ui = ui; t.touch(); },
+/** One question a cell shows: its tree, and what withdraws it while the cell still waits for it. */
+interface Prompt { tree: UiTree; withdraw(why: string): void }
+/** What a cell shows: its own UI (`render`, or a cell that is markup) and, below it, the questions it asked. */
+interface Shown { main?: UiTree; asks: Prompt[] }
+const live = new Map<Task, Shown>();
+
+/** The cell's UI as the app gets it: its own tree's nodes, then each question's, as one node or a list. */
+function update(t: Task, shown: Shown): void {
+  const parts = [shown.main?.ui, ...shown.asks.map(ask => ask.tree.ui)].flatMap(ui => ui === undefined ? [] : Array.isArray(ui) ? ui : [ui]);
+  t.ui = parts.length === 0 ? undefined : parts.length === 1 ? parts[0] : parts;
+  t.touch();
+}
+
+/** The trees of task `t`: what it shows, made now when it shows nothing yet; the oldest cell's past MAX_LIVE are unmounted. */
+function shownOf(t: Task): Shown {
+  let shown = live.get(t);
+  if (shown) return shown;
+  live.set(t, shown = { asks: [] });
+  for (const [old, oldest] of live) {
+    if (live.size <= MAX_LIVE) break;
+    oldest.main?.unmount();
+    for (const ask of oldest.asks) { ask.withdraw(`${MAX_LIVE} newer cells drew UI`); ask.tree.unmount(); }
+    live.delete(old);
+  }
+  return shown;
+}
+
+/** A tree of task `t`'s: each render goes out with the rest of what the cell shows, and what it runs runs as the cell. */
+function treeOf(t: Task, shown: Shown): UiTree {
+  return new UiTree({
+    emit: () => update(t, shown),
     fail: (what, error) => {
       t.logs.push(`[ui] ${what} failed: ${(uiError(error) ?? (error instanceof Error ? `${error.name}: ${error.message}` : String(error))).replace(/\n\s+at repl-cell\.js:.*/, '')}`);
       t.touch();
     },
     enter: (fn) => inTask(t, fn),
   });
-  tree.mount(component, props);
-  live.set(t, tree);
-  for (const [old, oldest] of live) {
-    if (live.size <= MAX_LIVE) break;
-    oldest.unmount();
-    live.delete(old);
+}
+
+/**
+ * Run handler `handler` of task `id`'s live UI with `value` (what the person did, from the app through harnessd): its own UI's or a
+ * question's. The tree re-renders and posts itself as it does after any change. When it cannot run, the reason goes in that cell's
+ * logs (or is returned, when no live tree is that cell's).
+ */
+export async function dispatch(id: string, handler: string, value: unknown): Promise<string | undefined> {
+  for (const [t, shown] of live) {
+    if (t.id !== id) continue;
+    for (const tree of [shown.main, ...shown.asks.map(ask => ask.tree)]) {
+      if (tree && await tree.dispatch(handler, value)) return undefined;
+    }
+    t.logs.push(`[ui] ${handler} did nothing: no element of this cell's UI has that handler now (it re-rendered without it)`);
+    t.touch();
+    return undefined;
+  }
+  return `ui event ${handler} for cell ${id}: its UI is not live (the cell was replaced, or ${MAX_LIVE} newer UIs unmounted it)`;
+}
+
+/** Mount `component` with `props` as task `t`'s UI, replacing any it had (its questions stay); what the first render throws is thrown here. */
+export function show(t: Task, component: unknown, props: Record<string, unknown> = {}): UiTree {
+  const shown = shownOf(t);
+  shown.main?.unmount();
+  const tree = treeOf(t, shown);
+  shown.main = tree;
+  try { tree.mount(component, props); }
+  catch (error) {
+    if (shown.main === tree) shown.main = undefined;
+    update(t, shown);
+    throw error;
   }
   return tree;
+}
+
+/**
+ * `ask(text, {options, default, detail, allowText, block})` (ask.ts): the question goes below what the calling cell shows, drawn
+ * with the cell's elements, and the person's answer comes back through `dispatch` as any control's does. Resolves with the label
+ * picked or the words typed; with a default and no `block`, at once with the default.
+ */
+export function ask(text: string, options?: AskOptions): Promise<string> {
+  const t = currentTask();
+  if (!t) return Promise.reject(new Error('ask() shows its question under the cell that calls it; call it in a cell (or a handler of its UI)'));
+  let plan: ReturnType<typeof planAsk>;
+  try { plan = planAsk(text, options); } catch (error) { return Promise.reject(error); }
+  const shown = shownOf(t);
+  if (shown.asks.length >= MAX_ASKS) return Promise.reject(new RangeError(`ask: cell ${t.id} already shows ${MAX_ASKS} questions; ask in a new cell, or ask one question with options`));
+  const preset = plan.default === undefined ? undefined : plan.options[plan.default]!.label;
+  const { promise, resolve, reject } = Promise.withResolvers<string>();
+  let waiting = plan.block;
+  const tree = treeOf(t, shown);
+  const prompt: Prompt = {
+    tree,
+    withdraw(why) {
+      if (!waiting) return;
+      waiting = false;
+      reject(new Error(`ask: ${JSON.stringify(text)} was withdrawn unanswered: ${why}`));
+    },
+  };
+  const answer = (said: string) => {
+    if (waiting) { waiting = false; resolve(said); return; }
+    // It did not wait: the cell went ahead with the default; an answer that differs is said where the agent reads the cell.
+    if (said !== preset) {
+      t.logs.push(`[ask] ${JSON.stringify(text)}: the person answered ${JSON.stringify(said)}; the cell went ahead with ${JSON.stringify(preset)}`);
+      t.touch();
+    }
+  };
+  shown.asks.push(prompt);
+  try { tree.mount(askComponent, { ...elementGlobals(), ...askProps(plan), answer }); }
+  catch (error) { shown.asks.splice(shown.asks.indexOf(prompt), 1); update(t, shown); return Promise.reject(error); }
+  if (!plan.block) return Promise.resolve(preset!);
+  // A cell that stops with an error (its timeout) while it waits withdraws the question: nothing would hear the answer.
+  void t.done.then(() => {
+    if (!waiting || t.status !== 'error') return;
+    prompt.withdraw('the cell stopped');
+    tree.unmount();
+    const at = shown.asks.indexOf(prompt);
+    if (at >= 0) shown.asks.splice(at, 1);
+    update(t, shown);
+  });
+  return promise;
 }
 
 /** What React users reach for, and the Svelte way to say it: calling one throws this instead of a ReferenceError. */
@@ -67,12 +167,21 @@ export function installUi(scope: Record<string, unknown>): void {
   Object.assign(scope, {
     interval,
     svelte,
+    ask,
     render(component: unknown, props?: Record<string, unknown>) {
       const t = currentTask();
       if (!t) throw new Error('render() draws under the cell that calls it; call it in a cell');
       if (typeof component !== 'function') throw new TypeError('render takes a component: render(svelte`<Text>hi</Text>`, props), or write the cell as markup');
-      show(t, component, props);
-      return { unmount: () => { live.get(t)?.unmount(); live.delete(t); } };
+      const tree = show(t, component, props);
+      return {
+        unmount: () => {
+          const shown = live.get(t);
+          if (!shown || shown.main !== tree) return;
+          tree.unmount();
+          shown.main = undefined;
+          update(t, shown);
+        },
+      };
     },
   });
   Object.defineProperty(scope, SVELTE, { get: () => cellRuntime(), enumerable: false });

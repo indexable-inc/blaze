@@ -43,7 +43,10 @@ For charts use <Chart kind=\"bar|stacked|line|area|scatter|pie|donut\" data={[..
 labels={[...]} unit height /> (pie and donut take data as [{label, value}]); never draw a chart by hand. For drawings, \
 SVG (svg, g, path, rect, circle, ellipse, line, polyline, polygon, text) or Canvas (view, Group, Path, Rect, Circle, Line, \
 Polyline, Text); inks are tone names (ink, muted, accent, success, warning, error, faint, series1..series8), never \
-colours. An element or prop not listed is an error naming it and its line.";
+colours. For input use Button (label, onclick), Toggle, Checkbox, Slider, NumberField, Input, TextArea, Select, Choice and \
+Radio (options), with bind:value (bind:checked, bind:selected) to $state; what the person does runs the cell's handlers \
+and redraws it. To ask the person and wait for the answer, await ask(text, {options, default}). An element or prop not \
+listed is an error naming it and its line.";
 
 fn mcp_env(ctx: &Ctx) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();

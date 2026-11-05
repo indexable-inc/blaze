@@ -181,6 +181,8 @@ pub struct App {
     /// The chat sessions' transcripts, by session id, and each chat pane's own state (src/app/chat.rs).
     chats: model::Chats,
     chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
+    /// The cells' controls in use (chat/genui/control.rs): a field typed in, a slider dragged, a select open.
+    genui: std::cell::RefCell<chat::GenLive>,
     /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
     watching: HashMap<u64, (u64, Option<u32>)>,
     /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
@@ -443,6 +445,7 @@ impl App {
             run_terms,
             chats,
             chat: std::cell::RefCell::default(),
+            genui: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
             side_w,
@@ -1693,6 +1696,8 @@ impl App {
                 self.chat_toggle(b);
             } else if let Some(rest) = a.strip_prefix("chat:row:") {
                 self.chat_row_toggle(rest);
+            } else if let Some(ev) = a.strip_prefix("ui:") {
+                self.genui_action(ev);
             } else if let Some(url) = a.strip_prefix("open:") {
                 // A link in a view: the browser opens it (only web links; anything else stays put).
                 if url.starts_with("https://") || url.starts_with("http://") {

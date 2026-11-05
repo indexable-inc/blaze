@@ -49,6 +49,8 @@ pub struct ToolResult {
 /// so a row that draws one holds it without a copy.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Detail {
+    /// The cell, `<repl>.<task>`: what an event from the UI it draws names (`Request::UiEvent`).
+    pub cell: String,
     /// `running`, `done` or `error`.
     pub status: String,
     pub ms: Option<u64>,
@@ -82,6 +84,7 @@ pub struct Effect {
 impl Detail {
     fn of(d: &ev::Detail) -> Self {
         Self {
+            cell: d.cell.clone(),
             status: d.status.clone(),
             ms: d.ms,
             code: d.code.clone(),

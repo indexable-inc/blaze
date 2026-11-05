@@ -1,4 +1,4 @@
-import { DRAWING, TEXT_PROP, ViewNode, wholeChartError, wireValue } from './element.ts';
+import { CONTROLS, DRAWING, TEXT_PROP, ViewNode, controlWire, wholeChartError, wireValue } from './element.ts';
 import type { Attachment, Handler } from './element.ts';
 import { drawWire } from './draw.ts';
 import type { Paint } from './draw.ts';
@@ -257,6 +257,12 @@ export class UiTree implements Attachment {
       return { type: node.type, props: drawn.props, children: leaf ? [] : this.children(node, drawn.paint) };
     }
     for (const [name, value] of Object.entries(props)) props[name] = wireValue(node.type, name, value);
+    // A control goes as exactly what the app reads of it (element.ts `controlWire`); a Button's words are its label, and nothing else is in it.
+    if (CONTROLS.has(node.type)) {
+      if (kids.some(child => child.isElement)) throw placed(new TypeError(`<${node.type}> holds ${kids.find(child => child.isElement)!.type}${node.at ? ` (${node.at})` : ''}: ${node.type === 'Button' ? 'a Button holds only its words, <Button>Save</Button>' : `a ${node.type} holds nothing`}`), node.at);
+      try { return { type: node.type, props: controlWire(node.type, props, node.at), children: [] }; }
+      catch (error) { throw error instanceof Error ? placed(error, node.at) : error; }
+    }
     return { type: node.type, props, children: leaf ? [] : this.children(node) };
   }
 }
