@@ -98,7 +98,7 @@ export interface PolylineProps extends ShapeProps { points: string | number[] | 
  * The controls. Each sends what the person did back to its handler (index.ts `dispatch`): a press is `onclick` (called with null), a
  * change `onchange` (with the new value), Enter in an Input or Cmd+Enter in a TextArea `onsubmit` (with the text). The bindable one
  * of each (`bind:value`, `bind:checked`, `bind:selected`) is written back first, then the handler runs. A control with neither a
- * binding nor a handler only shows its value. On the wire (element.ts `controlWire`) a handler is its id as `onClick`, `onChange`,
+ * binding nor a handler only shows its value. On the wire (element.ts `elementWire`) a handler is its id as `onClick`, `onChange`,
  * `onSubmit`, and defaults are filled in.
  */
 /** A press. Its label is `label`, or the words between its tags (`<Button>Save</Button>`); its plate is plain unless `tone` says. */
@@ -124,6 +124,60 @@ export interface ChoiceProps { options: ControlOption[]; selected?: unknown; dis
 /** Options each with its round mark, one picked, in a column (or a `row`). Binds `selected`. */
 export interface RadioProps { options: ControlOption[]; selected?: unknown; row?: boolean; disabled?: boolean; onchange?: Handle }
 
+/*
+ * Layout, folding, floating, status and pictures. Each goes to the app as exactly what element.ts `elementWire` gives it, defaults
+ * filled in; the bindable ones (`bind:ratio`, `bind:selected`, `bind:open`) are written back from their event first, then the handler runs.
+ */
+/** Equal columns, row-major: `columns` of them (2 when neither is said), or as many as `fit` (each at least that many points wide). Gap 12. */
+export interface GridProps { columns?: number; fit?: number; gap?: number; pad?: number }
+/** Children on top of one another in one box, as big as its largest child that is not a Layer. */
+export interface StackProps {}
+/** Where a Layer is pinned in its Stack. */
+export type LayerAnchor = 'top-left' | 'top' | 'top-right' | 'left' | 'center' | 'right' | 'bottom-left' | 'bottom' | 'bottom-right';
+/** A child of a Stack (only there) pinned at `anchor` (top-left), moved by `x`, `y` points; a higher `z` is above. It adds no size. */
+export interface LayerProps { anchor?: LayerAnchor; x?: number; y?: number; z?: number }
+/** Children left to right, wrapping to the next line; gap 8. */
+export interface WrapProps { gap?: number }
+/** Its children in a window `height` (240, at most 600) points tall, or wide when `horizontal`, that scrolls with the wheel. */
+export interface ScrollProps { height?: number; horizontal?: boolean }
+/** Exactly two panes, side by side (or `vertical`ly), the first `ratio` (0.05 to 0.95, 0.5) of the room; dragging the divider sends the new ratio. Binds `ratio`. */
+export interface SplitProps { ratio?: number; vertical?: boolean; onchange?: Handle<number> }
+/** A row of 1 to 20 tabs over its children; the cell shows the selected one's body with {#if}. A press sends the tab's value. Binds `selected` (the first tab's value when not said). */
+export interface TabsProps { tabs: ControlOption[]; selected?: unknown; onchange?: Handle }
+/** Disclosures only, at most one open: opening one closes the open one (each hears `ontoggle`). */
+export interface AccordionProps {}
+/** A head of `title` that shows its children when open; a press on the head sends `!open`. Binds `open`. */
+export interface DisclosureProps { title: string; open?: boolean; ontoggle?: Handle<boolean> }
+/** Its first child is the trigger, drawn in place; the rest float on `placement` side (bottom) while open. A press on the trigger toggles it; a press outside or Escape sends false. Binds `open`. */
+export interface PopoverProps { placement?: 'top' | 'bottom' | 'left' | 'right'; open?: boolean; ontoggle?: Handle<boolean> }
+/** A row of a Menu: words (its label and its value), '-' (a separator), or a row with a value, a red `danger`, `disabled`, and the `keys` it shows. */
+export type MenuItem = string | number | '-' | { separator: true } | { label: string; value?: unknown; danger?: boolean; disabled?: boolean; keys?: string };
+/** 1 to 50 rows under its one child, the trigger. Picking a row sends `onselect` with its value and closes it. Binds `open`. */
+export interface MenuProps { items: MenuItem[]; open?: boolean; onselect?: Handle; ontoggle?: Handle<boolean> }
+/** A modal over a scrim covering the pane. When `dismissable` (true), Escape or a press on the scrim sends `onclose`, and `bind:open` becomes false. A Sheet rises from the pane's foot. */
+export interface DialogProps { title?: string; open?: boolean; dismissable?: boolean; onclose?: Handle<false> }
+export interface SheetProps { title?: string; open?: boolean; dismissable?: boolean; onclose?: Handle<false> }
+/** Words floating at the pane's foot for `duration` ms (4000; 0 stays), gone when pressed (`ondismiss`); shown again whenever its words change. Its text is also its children. */
+export interface ToastProps { text?: string; tone?: Tone; duration?: number; ondismiss?: Handle<null> }
+/** A bar `value` (0) of `max` (1) full, with an optional `label`. */
+export interface ProgressProps { value?: number; max?: number; label?: string }
+/** A spinner and quiet words (`Loading`); its label is also its children. */
+export interface LoadingProps { label?: string }
+/** `lines` (3, 1 to 20) grey bars that breathe, where text is on its way. */
+export interface SkeletonProps { lines?: number }
+/** A file kind (`rust`, `markdown`) or symbol by `name`, from the app's file palette and symbol set; an unknown name is drawn as an error. */
+export interface IconProps { name: string }
+/** A file on disk (a path, relative ones from the working directory, `~/` the home directory, or a `{path}`), as the app is given it: an absolute path. */
+export type FileSource = string | URL | Blob | { path: string };
+/** A picture from a file (no http or data: URLs). Natural size, at most the column wide and 360 tall, unless `width`/`height` say; `fit` (contain) in a box of both. */
+export interface ImageProps { src: FileSource; width?: number; height?: number; fit?: 'contain' | 'cover'; alt?: string }
+/** A pill, brighter when `selected`. A press sends `value`, or `!selected` when it has none. Its label is also its children. */
+export interface ChipProps { label?: string; selected?: boolean; value?: unknown; onclick?: Handle }
+/** Its children in a column, pressed as a whole (it lights under the pointer); a press sends `value`. Gap 8, pad 12. */
+export interface TileProps { gap?: number; pad?: number; value?: unknown; onclick?: Handle }
+/** A file chip, its kind's icon and its name; a press opens the file (at `line`) as the transcript's file chips do. */
+export interface FileRefProps { path: FileSource; line?: number }
+
 /** Every built-in element's props, by element name. */
 export interface ElementProps {
   Column: ColumnProps; Row: RowProps; Text: TextProps; Markdown: MarkdownProps; Code: CodeProps; Table: TableProps;
@@ -131,6 +185,10 @@ export interface ElementProps {
   Canvas: CanvasProps; Group: GroupProps; Path: PathProps; Rect: RectProps; Circle: CircleProps; Line: LineProps; Polyline: PolylineProps;
   Button: ButtonProps; Toggle: ToggleProps; Checkbox: CheckboxProps; Slider: SliderProps; NumberField: NumberFieldProps; Input: InputProps;
   TextArea: TextAreaProps; Select: SelectProps; Choice: ChoiceProps; Radio: RadioProps;
+  Grid: GridProps; Stack: StackProps; Layer: LayerProps; Wrap: WrapProps; Scroll: ScrollProps; Split: SplitProps; Tabs: TabsProps;
+  Accordion: AccordionProps; Disclosure: DisclosureProps; Popover: PopoverProps; Menu: MenuProps; Dialog: DialogProps; Sheet: SheetProps;
+  Toast: ToastProps; Progress: ProgressProps; Loading: LoadingProps; Skeleton: SkeletonProps; Icon: IconProps; Image: ImageProps;
+  Chip: ChipProps; Tile: TileProps; FileRef: FileRefProps;
 }
 
 /** True when ElementProps names exactly the elements element.ts draws; the constant under it fails to type-check otherwise. */
