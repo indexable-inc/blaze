@@ -616,6 +616,11 @@ async fn conn(d: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             let s = match d.get(id) {
                 Ok(s) => s,
                 Err(e) => {
+                    // A chat that ended before this daemon started: its history from its record, then its exit.
+                    if let Some(info) = db::session(id).filter(|s| s["mode"] == "chat") {
+                        proto::write_json(&mut w, &json!({ "ok": true, "info": info })).await?;
+                        return attach_ended_chat(id, &info, events, w).await;
+                    }
                     proto::write_json(&mut w, &json!({ "error": e.to_string() })).await?;
                     continue;
                 }
@@ -730,30 +735,9 @@ async fn attach_chat(
     let (history, mut rx) = c.history_and_subscribe(&s.tx);
     let exited = *s.exit.lock().unwrap();
     let sid = s.id;
-    let render = move |lines: &[u8]| -> Vec<u8> {
-        if events {
-            return lines.to_vec();
-        }
-        let mut out = String::new();
-        for l in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-            out.push_str(&chat::text_of(&serde_json::from_slice(l).unwrap_or(Value::Null)));
-        }
-        out.replace('\n', "\r\n").into_bytes()
-    };
+    let render = chat_render(events);
     let mut out = tokio::spawn(async move {
-        // The history in frames of whole lines, about 256 KB each.
-        let mut buf = Vec::new();
-        for l in &history {
-            buf.extend_from_slice(l.as_bytes());
-            buf.push(b'\n');
-            if buf.len() >= 256 * 1024 {
-                proto::write_frame(&mut w, proto::T_DATA, &render(&buf)).await?;
-                buf.clear();
-            }
-        }
-        if !buf.is_empty() {
-            proto::write_frame(&mut w, proto::T_DATA, &render(&buf)).await?;
-        }
+        send_history(&mut w, &history, &render).await?;
         if let Some(code) = exited {
             proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": code }).to_string().as_bytes()).await?;
             return Ok::<_, anyhow::Error>(());
@@ -792,6 +776,53 @@ async fn attach_chat(
     out.abort();
     s.attached.fetch_sub(1, Ordering::Relaxed);
     res
+}
+
+/// How a chat attach sends event lines: as they are (`events`, the app), or as the conversation's text (the terminal
+/// client).
+fn chat_render(events: bool) -> impl Fn(&[u8]) -> Vec<u8> + Send + 'static {
+    move |lines: &[u8]| -> Vec<u8> {
+        if events {
+            return lines.to_vec();
+        }
+        let mut out = String::new();
+        for l in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            out.push_str(&chat::text_of(&serde_json::from_slice(l).unwrap_or(Value::Null)));
+        }
+        out.replace('\n', "\r\n").into_bytes()
+    }
+}
+
+/// A chat's history to an attach, in T_DATA frames of whole lines, about 256 KB each.
+async fn send_history(
+    w: &mut tokio::net::unix::OwnedWriteHalf, history: &[impl AsRef<str>], render: impl Fn(&[u8]) -> Vec<u8>,
+) -> Result<()> {
+    let mut buf = Vec::new();
+    for l in history {
+        buf.extend_from_slice(l.as_ref().as_bytes());
+        buf.push(b'\n');
+        if buf.len() >= 256 * 1024 {
+            proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        proto::write_frame(w, proto::T_DATA, &render(&buf)).await?;
+    }
+    Ok(())
+}
+
+/// An attach to a chat that ended before this daemon started (`info` its index row): its history from its record,
+/// then its exit.
+async fn attach_ended_chat(id: u64, info: &Value, events: bool, mut w: tokio::net::unix::OwnedWriteHalf) -> Result<()> {
+    let path = db::object_dir(&format!("s{id}")).join("chat");
+    let read = path.clone();
+    let history = tokio::task::spawn_blocking(move || chat::history_of(&read))
+        .await?
+        .with_context(|| format!("attach s{id}: reading its chat record {}", path.display()))?;
+    send_history(&mut w, &history, chat_render(events)).await?;
+    proto::write_frame(&mut w, proto::T_EXIT, json!({ "code": info["exit"] }).to_string().as_bytes()).await?;
+    Ok(())
 }
 
 /// Random RFC 4122 v4 UUID (for Claude's --session-id).
