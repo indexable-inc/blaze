@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
-import { AT, BINDABLE, BOUND_BY, ELEMENT_NAMES, COMPONENT, NOT_DRAWN, ViewNode, cellError, isKnownElement, notDrawnError } from './element.ts';
-import type { CellComponent, Handler } from './element.ts';
+import { AT, BINDABLE, BOUND_BY, ELEMENT_NAMES, COMPONENT, NOT_DRAWN, OUTRO, TRANSITIONS, ViewNode, cellError, isKnownElement, notDrawnError, transitionOf, written } from './element.ts';
+import type { CellComponent, Handler, Transition } from './element.ts';
 import { SVG_TAGS, attributeError, isSvgTag, unknownTagError } from './draw.ts';
 import { FAILED_SNIPPET, PENDING_SNIPPET, compileComponent } from './compile.ts';
 import { sveltePath } from './files.ts';
@@ -12,7 +12,7 @@ import { ASK_SOURCE } from './ask.ts';
  * the object `renderer` below (createElement, insert, setAttribute, addEventListener, ...) wherever the browser's would call the DOM.
  * This file loads that Svelte, gives the renderer nodes to work on, and makes every element name a preloaded component. Copied
  * from den's repl/src/ui/svelte.ts (den's docs/ui-runtime.md says why Svelte and which Svelte: the custom renderer is a pull
- * request that has not landed), without den's transitions and own elements.
+ * request that has not landed), with den's transitions (`trans`, and the outro `removeNode` plays) and without den's own elements.
  *
  * Which svelte: the package's own `exports` map hands a server build to anything that does not set the `custom-renderer` (or
  * `browser`) condition, and a server build has no reactivity, so the UI would draw once and never move. The client build is
@@ -66,10 +66,24 @@ function insertNode(parent: ViewNode, node: ViewNode, anchor: ViewNode | null): 
   if (before !== parent) before?.tree?.touch();
 }
 
-/** Takes `node` out of its parent. */
+/** The transition each element plays as it goes (`out:fly`, `transition:fade`, or `exit={...}`), kept off the wire until it goes. */
+const outros = new WeakMap<ViewNode, Transition>();
+
+/**
+ * Takes `node` out of its parent. One with an outro stays where it is with `exit` set, which tells the app it is going now, and is
+ * taken out once its transition has played (its ms and delay), unless something moved it meanwhile.
+ */
 function removeNode(node: ViewNode): void {
   const parent = node.parent;
   if (!parent) return;
+  const outro = outros.get(node);
+  if (outro && node.tree) {
+    outros.delete(node);
+    node.setProp('exit', outro);
+    const timer = setTimeout(() => { if (node.parent === parent) removeNode(node); }, outro.ms + outro.delay);
+    timer.unref?.();
+    return;
+  }
   const at = parent.children.indexOf(node);
   if (at >= 0) parent.children.splice(at, 1);
   node.parent = undefined;
@@ -107,12 +121,27 @@ const renderer = {
   setAttribute(node: ViewNode, name: string, value: unknown) {
     // Where the cell writes the element (compile.ts gives each its place first), kept off the wire for the errors below.
     if (name === AT) { node.at = typeof value === 'string' ? value : undefined; return; }
+    // How it goes: held until it does (`removeNode`), since `exit` on the wire means it is going now. `exit={...}` is checked first.
+    if (name === OUTRO || (name === 'exit' && !node.from)) {
+      if (name === 'exit') {
+        const error = attributeError(node.type, name, value, node.at, node.props);
+        if (error) throw placed(error, node.at);
+      }
+      const outro = value === undefined || value === null || value === false ? undefined : transitionOf(value);
+      if (typeof outro === 'string') throw placed(new TypeError(`${written('exit', value)} on <${node.type}> is not ${outro}${node.at ? ` (${node.at})` : ''}`), node.at);
+      if (outro) outros.set(node, outro);
+      else outros.delete(node);
+      return;
+    }
     // What compile.ts could not check at its line (a spread, a value made of text and expressions) is checked here, at the element's.
     const error = attributeError(node.from ?? node.type, name, value, node.at, node.props);
     if (error) throw placed(error, node.at);
     node.setProp(name, value);
   },
-  removeAttribute(node: ViewNode, name: string) { node.setProp(name, undefined); },
+  removeAttribute(node: ViewNode, name: string) {
+    if (name === OUTRO || name === 'exit') { outros.delete(node); return; }
+    node.setProp(name, undefined);
+  },
   hasAttribute: (node: ViewNode, name: string) => name in node.props,
   setText(node: ViewNode, text: string) {
     if (node.kind === 'text' || node.kind === 'comment') { node.text = text; node.tree?.touch(); return; }
@@ -193,9 +222,20 @@ export function hostComponent(name: string): CellComponent {
   return component;
 }
 
+/**
+ * `File` is also the web class cells use: calling it (as compiled markup does) draws the element, and `new File(...)` and
+ * `instanceof File` still reach the class. Copied from den's repl/src/ui/svelte.ts.
+ */
+function fileComponent(): unknown {
+  const real: unknown = globalThis.File;
+  const draw = (args: unknown[]) => (hostComponent('File') as unknown as (...a: unknown[]) => unknown)(...args);
+  const target = typeof real === 'function' ? real : function File() {};
+  return new Proxy(target, { apply: (_target, _this, args: unknown[]) => draw(args) });
+}
+
 /** The element components (`Column`, `Row`, ...), as a cell is handed them. */
 export function elementGlobals(): Record<string, unknown> {
-  return Object.fromEntries(ELEMENT_NAMES.map(name => [name, hostComponent(name)]));
+  return Object.fromEntries(ELEMENT_NAMES.map(name => [name, name === 'File' ? fileComponent() : hostComponent(name)]));
 }
 
 /** How the cell reaches a name a template uses without declaring it (compile.ts writes one of these per name). */
@@ -287,14 +327,43 @@ export function rooted(body: unknown, given: Record<string, unknown>, onerror: (
   return { component: root, props: { body, given, onerror, onloaded, settle } };
 }
 
+/** Svelte's params of each transition, and how they are named on the wire (`duration` is `ms`). */
+const TRANSITION_PARAMS: Readonly<Record<string, readonly string[]>> = {
+  fly: ['x', 'y', 'opacity', 'duration', 'delay'], fade: ['duration', 'delay'], scale: ['start', 'opacity', 'duration', 'delay'],
+  slide: ['axis', 'duration', 'delay'],
+};
+
+/**
+ * Svelte's transition `name` with its `params` (`transition:fly={{ y: 8, duration: 200 }}`, compile.ts) as the app's: Svelte's
+ * defaults (400 ms, no delay, fading from 0), its params by their names (`duration` is `ms`). The app plays a spring, so an `easing`
+ * or a `css`/`tick` function is an error, as is a param the transition has not; `line` and `at` place it at the cell's line.
+ * Copied from den's repl/src/ui/svelte.ts.
+ */
+function trans(name: string, params: unknown, line: number, at: string): Transition {
+  const fail = (why: string) => cellError(new TypeError(`${why} (${at})`), line);
+  if (!(TRANSITIONS as readonly string[]).includes(name)) throw fail(`transition ${JSON.stringify(name)} is not one the app plays: ${TRANSITIONS.join(', ')}`);
+  if (params !== undefined && params !== null && (typeof params !== 'object' || Array.isArray(params))) throw fail(`${name}'s params are ${JSON.stringify(params) ?? String(params)}: an object, {{ ${TRANSITION_PARAMS[name]!.join(', ')} }}`);
+  const p = (params ?? {}) as Record<string, unknown>;
+  const takes = TRANSITION_PARAMS[name]!;
+  for (const [key, v] of Object.entries(p)) {
+    if (v === undefined) continue;
+    if (!takes.includes(key)) throw fail(`${name} has no param ${JSON.stringify(key)}${key === 'easing' || typeof v === 'function' ? ' (the app plays a spring, settled in duration ms, not a function of time)' : ''}: ${name} takes ${takes.join(', ')}`);
+    if (key === 'axis') { if (v !== 'x' && v !== 'y') throw fail(`${name}'s axis is ${JSON.stringify(v)}: x or y`); continue; }
+    if (typeof v !== 'number' || !Number.isFinite(v)) throw fail(`${name}'s ${key} is ${JSON.stringify(v) ?? String(v)}, which is not a number${typeof v === 'function' ? ' (the app plays a spring, not a function of time)' : ''}`);
+  }
+  const t = transitionOf({ kind: name, x: p.x, y: p.y, start: p.start, opacity: p.opacity, axis: p.axis, ms: p.duration, delay: p.delay });
+  if (typeof t === 'string') throw fail(`${name}'s params are not ${t}`);
+  return t;
+}
+
 /** The words a failed boundary shows for `error`: its message's first line. */
 const said = (error: unknown): string => String((error as Error | undefined)?.message ?? error).split('\n', 1)[0]!;
 
-/** What compiled components are given as `__repl_svelte` (compile.ts): Svelte's client runtime, the renderer, the brand of a component, the names it reads, its prop check and a failed boundary's words. */
-export function cellRuntime(): { client: Anything; renderer: Anything; component: (fn: unknown, awaits?: boolean) => CellComponent; free: typeof free; prop: typeof prop; said: typeof said } {
+/** What compiled components are given as `__repl_svelte` (compile.ts): Svelte's client runtime, the renderer, the brand of a component, the names it reads, its prop check, a failed boundary's words and its transitions. */
+export function cellRuntime(): { client: Anything; renderer: Anything; component: (fn: unknown, awaits?: boolean) => CellComponent; free: typeof free; prop: typeof prop; said: typeof said; trans: typeof trans } {
   const { client } = runtime();
   return {
-    client, renderer, free, prop, said,
+    client, renderer, free, prop, said, trans,
     component: (fn: unknown, awaits = false) => Object.defineProperties(fn as CellComponent, {
       [COMPONENT]: { value: true }, [AWAITS]: { value: awaits },
     }),

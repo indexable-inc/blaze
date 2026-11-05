@@ -84,7 +84,7 @@ impl App {
             return;
         }
         let (gdx, gdy) = if ev.precise { (ev.dx / z, ev.dy / z) } else { (ev.dx * 12.0, ev.dy * 12.0) };
-        if self.table_wheel(&ev, z) || self.genui_wheel(gdx, gdy) || self.chat_wheel(&ev, z) {
+        if self.table_wheel(&ev, z) || self.genui_common_wheel(gdx, gdy) || self.genui_wheel(gdx, gdy) || self.chat_wheel(&ev, z) {
             return;
         }
         if self.archive_wheel(if ev.precise { ev.dy / z } else { ev.dy }, ev.precise) {

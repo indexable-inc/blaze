@@ -35,6 +35,106 @@ pub struct Pose {
     pub cut: f32,
 }
 
+/// The axis a [`Posed`] node's `share` unfolds along: down from its top, or across from its leading edge.
+#[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PoseAxis {
+    #[default]
+    Y,
+    X,
+}
+
+/// A node's own pose, which it glides to on springs (den's universal `x`, `y`, `scale` and `opacity`): drawn moved by `x`,
+/// `y` points, scaled about its middle by `scale`, at `opacity`, and unfolded to the share `share` of its frame along
+/// `axis` (cut from its far edge; 1 is whole). Whatever writes it, motion springs [`Posing`] (what draw folds) to it, on
+/// `omega`, `zeta` (omega 0: the node's `Motion`, else the `ui.spring.pose` token). Draw folds it after [`Pose`], which other
+/// owners write and which never springs, and mixes it toward a [`HoverPose`] by the node's `HoverAmt`. Layout never reads
+/// it: posing a node never moves its neighbours.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct Posed {
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
+    pub opacity: f32,
+    pub share: f32,
+    pub axis: PoseAxis,
+    pub omega: f32,
+    pub zeta: f32,
+}
+
+impl Posed {
+    /// Where it stands with nothing said: in place, whole and opaque, on the default spring.
+    pub const REST: Self = Self { x: 0.0, y: 0.0, scale: 1.0, opacity: 1.0, share: 1.0, axis: PoseAxis::Y, omega: 0.0, zeta: 0.0 };
+}
+
+impl Default for Posed {
+    fn default() -> Self {
+        Self::REST
+    }
+}
+
+/// The springs a [`Posed`] node is drawn at, chasing its `Posed`; none moves before clock time `hold` (an entrance's
+/// delay). A writer that wants a node to come in from somewhere sets this at that pose as it makes the node
+/// ([`Posing::at`], den's `enter`); a node with none lands on its `Posed`.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Posing {
+    pub x: Spring,
+    pub y: Spring,
+    pub scale: Spring,
+    pub opacity: Spring,
+    pub share: Spring,
+    pub hold: f32,
+}
+
+impl Posing {
+    /// Standing still at `p` until clock time `hold`.
+    #[must_use]
+    pub fn at(p: Posed, hold: f32) -> Self {
+        Self { x: Spring::at(p.x), y: Spring::at(p.y), scale: Spring::at(p.scale), opacity: Spring::at(p.opacity), share: Spring::at(p.share), hold }
+    }
+
+    /// Where its springs are now, with `of`'s axis and tune.
+    #[must_use]
+    pub fn now(&self, of: Posed) -> Posed {
+        Posed { x: self.x.x, y: self.y.x, scale: self.scale.x, opacity: self.opacity.x, share: self.share.x, ..of }
+    }
+}
+
+/// A [`Posed`] node that glides from where it was laid to where it is laid now instead of jumping (FLIP, Svelte's
+/// `animate:flip`): when its place in its parent moves, motion pushes its `Posing` back by the move, and it springs home.
+/// `x`, `y` are where it was last laid in its parent (points from the parent's top left); `seen` is false until then.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Flip {
+    pub x: f32,
+    pub y: f32,
+    pub seen: bool,
+}
+
+/// What a node's pose becomes under the pointer, mixed in by its `HoverAmt` (0 off it, 1 on it): each field `set` names
+/// ([`HoverPose::X`], `Y`, `SCALE`, `OPACITY`) eased toward its value here, the rest left as its pose has them.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct HoverPose {
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
+    pub opacity: f32,
+    pub set: u8,
+}
+
+impl HoverPose {
+    pub const X: u8 = 1;
+    pub const Y: u8 = 2;
+    pub const SCALE: u8 = 4;
+    pub const OPACITY: u8 = 8;
+
+    /// `p` with this hover's fields mixed in by `t`.
+    #[must_use]
+    pub fn mix(&self, p: Posed, t: f32) -> Posed {
+        let m = |bit: u8, a: f32, b: f32| if self.set & bit != 0 { a + (b - a) * t } else { a };
+        Posed { x: m(Self::X, p.x, self.x), y: m(Self::Y, p.y, self.y), scale: m(Self::SCALE, p.scale, self.scale), opacity: m(Self::OPACITY, p.opacity, self.opacity), ..p }
+    }
+}
+
 /// The width (points) a node with a Motion widens to as it shows: its Place `w` eased to this by how shown it is.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Expand {
@@ -248,6 +348,11 @@ hyperion_api_layouts::api_layouts! {
     "FillTween" => alias FillTween,
     TransitionKind,
     FromEdge,
+    PoseAxis,
+    "Posed" => alias Posed,
+    "Posing" => alias Posing,
+    "HoverPose" => alias HoverPose,
+    "Flip" => alias Flip,
     "Motion" => alias Motion,
     "Reveal" => alias Reveal,
     "Pose" => alias Pose,
@@ -263,6 +368,10 @@ pub fn register(world: &World) {
     world.component::<Motion>().writable();
     world.component::<Reveal>().writable();
     world.component::<Pose>().writable();
+    world.component::<Posed>().writable();
+    world.component::<Posing>();
+    world.component::<HoverPose>().writable();
+    world.component::<Flip>().writable();
     world.component::<Expand>().writable();
     world.component::<ShownWhen>().writable();
     world.component::<Shown>();

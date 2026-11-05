@@ -23,8 +23,6 @@ export class Task {
   valueBytes = 0;
   /** The UI it draws (ui/index.ts): the latest `{type, props, children}` tree (or a list of them) its markup rendered. */
   ui: unknown = undefined;
-  /** The top-level names the cell bound (all it declares when it finished, those it reached when it threw): the checker's scope grows by these. */
-  bound: string[] = [];
   readonly done: Promise<Task>;
   #resolve!: (t: Task) => void;
   /** call: the agent's id for the tool call that ran this cell (Claude's tool_use id), when the client said it. */
@@ -55,12 +53,17 @@ export function watchTasks(fn: (t: Task) => void) { onChange = fn; }
 /** The task the running code belongs to, if any. */
 export const currentTask = (): Task | undefined => als.getStore();
 
-/** A new task: `id` is the one the MCP server gave the cell (ids are one counter across lanes), else the next of this process's. */
-export function newTask(code: string, call: string | null = null, id?: string): Task {
-  const t = new Task(id ?? `t${++seq}`, code, call);
+export function newTask(code: string, call: string | null = null): Task {
+  const t = new Task(`t${++seq}`, code, call);
   registry.set(t.id, t);
   return t;
 }
+
+/** The tool call id that ran task `id` (`t3`): null when the client did not say it, undefined when this kernel ran no such task. */
+export const taskCall = (id: string): string | null | undefined => registry.get(id)?.call;
+
+/** How many tasks this kernel has run: their ids are t1 to this. */
+export const taskCount = (): number => seq;
 
 /** Run fn with console output routed to the task's logs. */
 export const inTask = <T>(t: Task, fn: () => T): T => als.run(t, fn);

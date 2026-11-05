@@ -185,6 +185,8 @@ pub struct App {
     chat: std::cell::RefCell<HashMap<u64, chat::ChatState>>,
     /// The cells' controls in use (chat/genui/control.rs): a field typed in, a slider dragged, a select open.
     genui: std::cell::RefCell<chat::GenLive>,
+    /// The universal handlers' pointer, key and focus state (genui/common.rs).
+    gen_prims: std::cell::RefCell<chat::GenPrims>,
     /// The runs and stages whose output the link follows (each shown by a pane), by entity: their run and stage.
     watching: HashMap<u64, (u64, Option<u32>)>,
     /// The sidebar's width (points) as last dragged, kept in native.json; None: the scene's.
@@ -320,6 +322,8 @@ fn scene_world() -> Result<World, String> {
     view::register(&world);
     world.component::<HoverLift>().writable();
     world.component::<Bump>().writable();
+    world.component::<chat::GenFeel>().writable();
+    world.component::<chat::GenOn>();
     script::install(&world);
     let _ = world.entity_named(APP);
     world.set(Clock::default());
@@ -449,6 +453,7 @@ impl App {
             chats,
             chat: std::cell::RefCell::default(),
             genui: std::cell::RefCell::default(),
+            gen_prims: std::cell::RefCell::default(),
             watching: HashMap::new(),
             pending_run: None,
             side_w,
@@ -1733,7 +1738,7 @@ impl App {
                 self.media_action(m);
             } else if let Some(target) = a.strip_prefix("open:") {
                 // A link in a view (the browser), or a file (a cell's FileRef) in the app its kind opens in, at its line.
-                crate::open::open(target);
+                crate::open::open(target, alt);
             } else if a == "chat:focus" {
                 self.tree_focus = false;
             } else if a == "pal:close" {

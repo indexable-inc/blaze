@@ -4,7 +4,7 @@ import { askComponent, cellRuntime, elementGlobals, runtime } from './svelte.ts'
 import { askProps, planAsk, type AskOptions } from './ask.ts';
 import { UiTree, interval } from './tree.ts';
 import type { UiNode } from './tree.ts';
-import { currentTask, inTask, type Task } from '../tasks.ts';
+import { currentTask, inTask, taskCall, taskCount, type Task } from '../tasks.ts';
 
 /*
  * What a cell is handed for UI: the element components (`Column`, `Text`, ...), `render`, `svelte` (a template tag compile.ts expands
@@ -58,7 +58,18 @@ function treeOf(t: Task, shown: Shown): UiTree {
       t.touch();
     },
     enter: (fn) => inTask(t, fn),
+    cell: (task) => cellCall(t, task),
   });
+}
+
+/** The tool call that ran `task`, for a CellRef in task `t`'s UI; or why it cannot be shown: only another cell this lane ran can be. */
+function cellCall(t: Task, task: string): string | { refused: string } {
+  const ran = taskCount() === 0 ? 'this lane has run no cells' : `this lane's cells are t1 to t${taskCount()}`;
+  if (task === t.id) return { refused: `is the cell itself: a CellRef shows another cell of this lane (${ran})` };
+  const call = taskCall(task);
+  if (call === undefined) return { refused: `names a cell this lane never ran: ${ran}` };
+  if (call === null) return { refused: `names ${task}, whose tool call the agent's client did not say, so the app cannot find it` };
+  return call;
 }
 
 /**
@@ -143,12 +154,12 @@ export function ask(text: string, options?: AskOptions): Promise<string> {
 }
 
 /** What React users reach for, and the Svelte way to say it: calling one throws this instead of a ReferenceError. */
-const REACT_HOOKS = {
+const REACT_HOOKS: Record<string, string> = {
   useState: 'let v = $state(initial) in a <script>, read v and assign v = next; the markup updates',
   useEffect: '$effect(() => ...) re-runs when the $state it reads changes (return a cleanup function); onMount(fn) runs once; there is no dependency array',
   useMemo: 'const m = $derived(expression), read m',
   useInterval: 'interval(fn, ms), which stops when the tree unmounts',
-} as const satisfies Record<string, string>;
+};
 
 /** `svelte\`...\`` is expanded when the cell is compiled (compile.ts); a call that reaches the runtime was written in a way that cannot be. */
 function svelte(): never {
@@ -156,19 +167,6 @@ function svelte(): never {
 }
 
 /** Install the UI globals on a REPL's scope (a getter for the runtime, so Svelte loads when a component first runs). */
-/** A component a cell can mount: an element (`Column`, ...), a `svelte` template, or a cell that is markup. */
-export type UiComponent = { readonly __uiComponent: unique symbol };
-/** What `installUi` puts in a cell's scope, as the type checker sees it (globals.ts). */
-export type UiGlobals = { readonly [K in import('./element.ts').ElementName]: UiComponent } & {
-  /** `svelte\`<Text>{label}</Text>\``: a component, compiled with the cell; names it uses come from `render`'s props, then the cell. */
-  svelte(strings: TemplateStringsArray): UiComponent;
-  render(component: UiComponent, props?: Record<string, unknown>): { unmount(): void };
-  ask(text: string, options?: AskOptions): Promise<string>;
-  interval(fn: () => unknown, ms: number): () => void;
-  untrack<T>(fn: () => T): T;
-  tick(): Promise<void>;
-} & { readonly [K in keyof typeof REACT_HOOKS]: (...args: unknown[]) => never };
-
 export function installUi(scope: Record<string, unknown>): void {
   Object.assign(scope, elementGlobals());
   for (const [name, instead] of Object.entries(REACT_HOOKS)) {

@@ -141,6 +141,21 @@ pub(super) fn sends(cell: &str, events: &[(String, Value)]) -> String {
     }
 }
 
+/// The Action of a press that does more than send `events` (handler, value) to `cell`: opens `open` first (an `open:`
+/// target, src/open.rs; Option shows it in the Finder), and shuts the context menu `shut` here.
+pub(super) fn then(cell: &str, events: &[(String, Value)], open: Option<&str>, shut: Option<u64>) -> String {
+    let send: Vec<Value> = events.iter().map(|(h, v)| serde_json::json!([cell, h, v])).collect();
+    let mut o = serde_json::Map::new();
+    o.insert("send".to_owned(), Value::Array(send));
+    if let Some(t) = open {
+        o.insert("open".to_owned(), Value::String(t.to_owned()));
+    }
+    if let Some(n) = shut {
+        o.insert("shut".to_owned(), Value::from(n));
+    }
+    format!("ui:{}", Value::Object(o))
+}
+
 /// The controls in use: the field that has the keys (its own words, authoritative until it lets them go), the slider
 /// being dragged, the select whose list is open (its entity). With the clock and whether carets blink, for drawing.
 #[derive(Default)]
@@ -164,6 +179,27 @@ pub struct Live {
     splits: BTreeMap<u64, Kept>,
     /// The cells' Shaders and Videos, and the host's Media they are drawn by (genui/surface.rs).
     pub(super) surf: super::surface::Surfaces,
+    /// The new elements' (lane E): the colour pickers picked here and the system colour panel's (genui/color.rs), the
+    /// drop zones drawn and the one Finder files are carried over (genui/dropzone.rs).
+    pub(super) colors: super::color::Colors,
+    pub(super) drops: super::dropzone::Drops,
+    /// Each popover that opens on hover, by its element's entity: whether it is open (the pointer on its trigger or its
+    /// plate), so its onToggle hears each change once.
+    pub(super) hovering: BTreeMap<u64, bool>,
+    /// Each context menu open, by its element's entity: where the right press was, from its region's corner.
+    pub(super) context: BTreeMap<u64, [f32; 2]>,
+    /// When each Loading and Skeleton first showed (the clock): they stay unseen a moment, then fade in.
+    pub(super) born: BTreeMap<u64, f32>,
+    /// Each context menu's region as last drawn, by its entity: what a right press in it opens.
+    pub(super) regions: BTreeMap<u64, Region>,
+}
+
+/// A context menu's region: its cell, the menu's element (the entity [`Live`]'s context is keyed by) and its onToggle.
+#[derive(Clone)]
+pub(super) struct Region {
+    pub(super) cell: String,
+    pub(super) menu: u64,
+    pub(super) toggle: Option<String>,
 }
 
 /// The value of the slider (or split, or scrub rail) of entity `node` while it is dragged: where the pointer has it, not
@@ -525,8 +561,9 @@ pub(super) fn control(v: View<'_>, node: &Value, kind: &str, within: &Within, b:
             if let Some(l) = v.part("label") {
                 l.text(&label);
             }
+            // Its onClick hears its `value` (null when it has none).
             let h = handler(node, "onClick");
-            let mut events: Vec<(String, Value)> = h.iter().map(|h| (h.clone(), Value::Null)).collect();
+            let mut events: Vec<(String, Value)> = h.iter().map(|h| (h.clone(), prop(node, "value").clone())).collect();
             if let Within::Trigger(t) = within
                 && prop(node, "disabled") != &Value::Bool(true)
             {
@@ -861,6 +898,29 @@ impl App {
                 flush(&self.link, out);
                 self.genui.borrow_mut().open = None;
             }
+            Ok(v @ Value::Object(_)) if v["k"] == "color" => self.genui_color(&v),
+            // A press that does more than send (a FileRef's: open the file, then tell its onClick; a context menu's row: pick,
+            // then shut the menu here): `{open?, shut?, send}` (genui/media.rs, genui/float.rs `then`).
+            Ok(Value::Object(o)) if o.contains_key("send") => {
+                let mut out = Vec::new();
+                for e in o["send"].as_array().into_iter().flatten() {
+                    match (e[0].as_str(), e[1].as_str(), e.as_array().map(Vec::len)) {
+                        (Some(cell), Some(handler), Some(3)) => out.push(Out { cell: cell.to_owned(), handler: handler.to_owned(), value: e[2].clone() }),
+                        _ => {
+                            eprintln!("harness-native: genui: a press's events hold one that is not [cell, handler, value]: {payload}");
+                            return;
+                        }
+                    }
+                }
+                if let Some(target) = o.get("open").and_then(Value::as_str) {
+                    crate::open::open(target, self.press.1.alt);
+                }
+                if let Some(el) = o.get("shut").and_then(Value::as_u64) {
+                    self.genui.borrow_mut().context.remove(&el);
+                }
+                flush(&self.link, out);
+                self.genui.borrow_mut().open = None;
+            }
             Ok(v @ Value::Object(_)) => {
                 let Some(spec) = Spec::parse(&v) else {
                     eprintln!("harness-native: genui: a control's action is not one: {payload}");
@@ -1133,6 +1193,7 @@ impl App {
                 };
                 let off: Vec<u64> = live.floats.iter().filter(|(el, f)| !f.modal && !inside(**el)).map(|(el, _)| *el).collect();
                 for el in off {
+                    live.context.remove(&el);
                     if let Some(f) = live.floats.remove(&el) {
                         out.extend(f.close.into_iter().map(|(handler, value)| Out { cell: f.cell.clone(), handler, value }));
                     }
@@ -1148,6 +1209,26 @@ impl App {
         }
     }
 
+    /// A right press at the pointer: the context menu whose region it is in (the innermost) opens there, telling its
+    /// onToggle. Whether one did.
+    pub(in crate::app) fn genui_context(&mut self) -> bool {
+        let w = self.world.world_ref();
+        let Some(h) = w.entity_named(APP).target(Hovered::id(), 0) else { return false };
+        let (x, y) = (self.pointer.x, self.pointer.y);
+        let out = {
+            let mut live = self.genui.borrow_mut();
+            prune(w, &mut live);
+            let found = std::iter::successors(Some(h), |n| n.parent()).take(64).find_map(|n| live.regions.get(&*n.id()).map(|r| (n, r.clone())));
+            let Some((region, r)) = found else { return false };
+            let at = region.try_cloned::<&Laid>().unwrap_or_default();
+            live.context.insert(r.menu, [x - at.x, y - at.y]);
+            r.toggle.map(|handler| Out { cell: r.cell, handler, value: Value::Bool(true) })
+        };
+        flush(&self.link, out.into_iter().collect());
+        self.poke();
+        true
+    }
+
     /// Escape over a cell's floats: the open popovers and menus close (each sends its onToggle(false)); with none open,
     /// the dialogs and sheets that may be dismissed do (onClose(false)). Whether any closed.
     pub(in crate::app) fn genui_escape(&mut self) -> bool {
@@ -1156,16 +1237,23 @@ impl App {
             let mut live = self.genui.borrow_mut();
             prune(w, &mut live);
             let light: Vec<u64> = live.floats.iter().filter(|(_, f)| !f.modal).map(|(el, _)| *el).collect();
-            let shut =
+            let shut: Vec<u64> =
                 if light.is_empty() { live.floats.iter().filter(|(_, f)| !f.close.is_empty()).map(|(el, _)| *el).collect() } else { light };
-            shut.into_iter()
+            // A context menu closes here whether or not it has an onToggle to tell.
+            let mut any = false;
+            for el in &shut {
+                any |= live.context.remove(el).is_some();
+            }
+            let out: Vec<Out> = shut
+                .into_iter()
                 .filter_map(|el| live.floats.remove(&el))
                 .flat_map(|f| f.close.into_iter().map(move |(handler, value)| Out { cell: f.cell.clone(), handler, value }))
-                .collect()
+                .collect();
+            if out.is_empty() && !any {
+                return false;
+            }
+            out
         };
-        if out.is_empty() {
-            return false;
-        }
         flush(&self.link, out);
         self.poke();
         true
@@ -1356,6 +1444,10 @@ fn prune(w: WorldRef<'_>, live: &mut Live) {
     });
     live.toasts.retain(|el, _| w.entity_from_id(*el).is_alive());
     live.splits.retain(|el, _| w.entity_from_id(*el).is_alive());
+    live.hovering.retain(|el, _| w.entity_from_id(*el).is_alive());
+    live.context.retain(|el, _| w.entity_from_id(*el).is_alive());
+    live.born.retain(|el, _| w.entity_from_id(*el).is_alive());
+    live.regions.retain(|el, _| w.entity_from_id(*el).is_alive());
 }
 
 /// A number typed into `spec`'s field, bounded; None when it is not one.

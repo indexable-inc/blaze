@@ -12,8 +12,8 @@ use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, Message, define_class, 
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSColor, NSCursor, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard,
-    NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions,
+    NSBackingStoreType, NSColor, NSColorPanel, NSColorSpace, NSCursor, NSDragOperation, NSDraggingInfo, NSEvent, NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeFileURL, NSPasteboardTypeString, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions,
     NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
     NSVisualEffectView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
@@ -91,6 +91,20 @@ fn text_of(obj: &AnyObject) -> String {
     } else {
         String::new()
     }
+}
+
+/// The paths of the files a drag carries (den-native window.rs).
+fn dragged_paths(pb: &NSPasteboard) -> Vec<String> {
+    let items = pb.pasteboardItems().map(|items| items.to_vec()).unwrap_or_default();
+    // SAFETY: NSPasteboardTypeFileURL is a valid static pasteboard type.
+    let file = unsafe { NSPasteboardTypeFileURL };
+    items
+        .iter()
+        .filter_map(|it| it.stringForType(file).and_then(|u| objc2_foundation::NSURL::URLWithString(&u)))
+        .filter(|u| u.isFileURL())
+        .filter_map(|u| u.path())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn not_found() -> NSRange {
@@ -341,6 +355,47 @@ define_class!(
             if let Some(Outcome::Selector(sel)) = with(|st| st.app.run_action(id, None)) {
                 send_selector(self.mtm(), &sel);
             }
+            wake();
+        }
+
+        // Files carried in from Finder (den-native window.rs): a generated DropZone under them lights, and takes them when
+        // they are let go (genui/dropzone.rs).
+        #[unsafe(method(draggingEntered:))]
+        fn dragging_entered(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.files_over(info)
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+            self.files_over(info)
+        }
+
+        #[unsafe(method(draggingExited:))]
+        fn dragging_exited(&self, _info: Option<&ProtocolObject<dyn NSDraggingInfo>>) {
+            with(|st| st.app.genui_files_over(None));
+            wake();
+        }
+
+        #[unsafe(method(performDragOperation:))]
+        fn perform_drag_operation(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            let p = self.convertPoint_fromView(info.draggingLocation(), None);
+            let paths = dragged_paths(&info.draggingPasteboard());
+            let took = with(|st| st.app.genui_files_dropped(p.x as f32, p.y as f32, &paths)).unwrap_or(false);
+            wake();
+            took
+        }
+
+        /// The system colour panel's colour changed (a ColorPicker's well opened it, genui/color.rs): its colour in sRGB
+        /// goes to the picker.
+        #[unsafe(method(genuiColorChanged:))]
+        fn genui_color_changed(&self, _sender: Option<&AnyObject>) {
+            let panel = NSColorPanel::sharedColorPanel(self.mtm());
+            let Some(c) = panel.color().colorUsingColorSpace(&NSColorSpace::sRGBColorSpace()) else {
+                eprintln!("harness-native: the colour panel's colour has no sRGB form");
+                return;
+            };
+            let rgb = [c.redComponent(), c.greenComponent(), c.blueComponent()];
+            with(|st| st.app.genui_color_panel(rgb));
             wake();
         }
 
@@ -647,6 +702,31 @@ impl HarnessView {
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
+    /// Files carried over the view: a copy when a generated DropZone is under them, else nothing.
+    fn files_over(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> NSDragOperation {
+        let p = self.convertPoint_fromView(info.draggingLocation(), None);
+        let takes = with(|st| st.app.genui_files_over(Some((p.x as f32, p.y as f32)))).unwrap_or(false);
+        wake();
+        if takes { NSDragOperation::Copy } else { NSDragOperation::None }
+    }
+
+    /// Open the system colour panel on `rgb` (sRGB, 0 to 1) for a ColorPicker's well, its picks sent to
+    /// `genuiColorChanged:`. Only on the user's press (the app asks after a frame that ran one), never in a shot.
+    fn open_color_panel(&self, rgb: [f64; 3]) {
+        let panel = NSColorPanel::sharedColorPanel(self.mtm());
+        panel.setShowsAlpha(false);
+        // Its colour first, so setting it is not sent back as a pick.
+        panel.setColor(&NSColor::colorWithSRGBRed_green_blue_alpha(rgb[0], rgb[1], rgb[2], 1.0));
+        let target: &AnyObject = self;
+        // SAFETY: the view lives as long as the window (the app's), and genuiColorChanged: is its method above.
+        unsafe {
+            panel.setTarget(Some(target));
+            panel.setAction(Some(sel!(genuiColorChanged:)));
+        }
+        panel.setContinuous(true);
+        panel.orderFront(None);
+    }
+
     fn local(&self, event: &NSEvent) -> NSPoint {
         self.convertPoint_fromView(event.locationInWindow(), None)
     }
@@ -859,6 +939,11 @@ impl HarnessView {
                 (false, _) => {}
             }
         });
+        // A press on a ColorPicker's well this frame asked for the system colour panel: opened here, outside the state's
+        // borrow, since AppKit may call back into the view.
+        if let Some(rgb) = with(|st| st.app.take_color_panel()).flatten() {
+            self.open_color_panel(rgb);
+        }
     }
 }
 
@@ -1174,6 +1259,9 @@ fn make_window(mtm: MainThreadMarker) -> Result<(), String> {
         )
     };
     view.addTrackingArea(&area);
+    // Finder files dragged over the window, for a generated DropZone (genui/dropzone.rs).
+    // SAFETY: NSPasteboardTypeFileURL is a valid static pasteboard type.
+    view.registerForDraggedTypes(&NSArray::from_slice(&[unsafe { NSPasteboardTypeFileURL }]));
 
     let link = CAMetalDisplayLink::initWithMetalLayer(CAMetalDisplayLink::alloc(), &layer);
     link.setDelegate(Some(ProtocolObject::from_ref(&*view)));
