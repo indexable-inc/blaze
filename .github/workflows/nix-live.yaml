@@ -25,7 +25,8 @@ on:
       - "flake.nix"
       - "flake.lock"
       - "tools/nix/**"
-      - "Cargo.lock"
+      # Every lock: demo/life has its own, which unit_graph.py reads with --locked.
+      - "**/Cargo.lock"
       - "**/Cargo.toml"
       - ".github/workflows/nix-live.yaml"
   workflow_dispatch:
