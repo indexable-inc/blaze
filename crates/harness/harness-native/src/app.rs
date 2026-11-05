@@ -136,10 +136,8 @@ struct Ids {
     archive_row: u64,
     /// The overlay on screen and what it is (made again when the mode changes).
     palette: Option<(u64, Mode)>,
-    /// The title-bar strip's root (`hn.TitleBar`), its label and the muted words after it.
+    /// The title-bar strip's root (`hn.TitleBar`): only the back chevron, no title.
     bar: u64,
-    bar_title: u64,
-    bar_sub: u64,
 }
 
 /// The window's title-bar strip as AppKit lays it out, in points: how tall it is (0 in fullscreen, where it is hidden)
@@ -407,8 +405,6 @@ impl App {
         root.child("hn.Seam");
         let main = root.child("hn.Main");
         let bar = View::root(w, "hn.TitleBar");
-        let bar_title = bar.part("title").map_or(0, View::id);
-        let bar_sub = bar.part("sub").map_or(0, View::id);
         let ids = Ids {
             tree: tree.id(),
             device: device.id(),
@@ -416,8 +412,6 @@ impl App {
             archive_row: archive_row.id(),
             palette: None,
             bar: bar.id(),
-            bar_title,
-            bar_sub,
         };
         let mut paint = Painter::new(TypeLook { code_scale: 1.0, ..TypeLook::default() });
         let grid = Grid::new(&mut paint.fonts, TERM_SIZE, 2.0);
@@ -851,7 +845,7 @@ impl App {
     fn sync_title(&mut self) {
         let w = self.world.world_ref();
         let sel = self.selected();
-        let (title, sub) = match sel.map(|e| w.entity_from_id(e)) {
+        let (title, _subtitle) = match sel.map(|e| w.entity_from_id(e)) {
             Some(o) => {
                 let e = *o.id();
                 let kind = model::kind_name(o);
@@ -897,19 +891,6 @@ impl App {
         } else {
             "harness".to_owned()
         };
-        // The prefab's ink while the window is key, at half its alpha while it is not.
-        let focused = self.focused;
-        let ink = |part: &str| {
-            let mut f = view::prefab(w, "hn.TitleBar")
-                .and_then(|p| p.lookup_child(part))
-                .and_then(|c| c.try_cloned::<&Fill>())
-                .unwrap_or_default();
-            if !focused {
-                f.dark.a *= 0.5;
-                f.light.a *= 0.5;
-            }
-            f
-        };
         // The back chevron, while the focused pane has somewhere to go back to.
         if let Some(b) = View::of(w.entity_from_id(self.ids.bar)).part("back") {
             let on = self.back_target().is_some();
@@ -920,15 +901,6 @@ impl App {
             {
                 sz.w = Sizing::fixed(box_w);
                 b.set(sz);
-            }
-        }
-        for (id, text, part) in [
-            (self.ids.bar_title, clip_text(&title, 80), "title"),
-            (self.ids.bar_sub, clip_text(&sub, 90), "sub"),
-        ] {
-            if id != 0 {
-                let v = View::of(w.entity_from_id(id)).text(&text);
-                set_if(v, ink(part));
             }
         }
     }
