@@ -3,10 +3,22 @@
 //! -z now`, `--eh-frame-hdr`, `--build-id`, `--as-needed`, `-Bsymbolic` for a shared library).
 //!
 //! Four segments, each its own `PT_LOAD` starting on a page: read-only (the headers, the
-//! dynamic linking tables, `.rodata`, `.eh_frame_hdr`, `.eh_frame`), code, relro (what the
-//! loader writes and then makes read-only: `.data.rel.ro`, the init arrays, `.dynamic`, the
-//! GOT) and writable data with the TLS template and `.bss` last. A region's file offset is
+//! dynamic linking tables, `.rodata`, `.eh_frame_hdr`, `.eh_frame`), relro (what the loader
+//! writes and then makes read-only: `.data.rel.ro`, the init arrays, `.dynamic`, the GOT),
+//! code, and writable data with the TLS template and `.bss` last. A region's file offset is
 //! its address, so a region never moves in the file while its address stays.
+//!
+//! Relro comes before the code, where lld and mold put it after: call frame records reach
+//! the GOT and the code with 32-bit PC-relative fields (a CIE's personality is
+//! `indirect|pcrel|sdata4` to its GOT cell, an FDE's first address and LSDA
+//! `pcrel|sdata4`), so `.eh_frame`, `.gcc_except_table` (in `.rodata`) and the GOT sit
+//! together and only the code is past them. After the code, a debug image's personality
+//! cell was past its ±2 GiB reach once the code and the patch room after it (as large as
+//! the code, up to 1 GiB) passed 2 GiB, with 1.4 GB of code (blaze's own debug build on
+//! AArch64). Now only an FDE past 2 GiB of code is out of reach, which `.eh_frame`'s
+//! 32-bit encoding (and `.eh_frame_hdr`'s table) cannot say, and the stage refuses it
+//! naming the record ([`crate::place`]'s `check_reach`). The code reaches the GOT and the
+//! data with `adrp` (±4 GiB) or `rip`-relative fields either way.
 //!
 //! A dev executable ([`crate::DevRun`]) adds a `PT_LOAD` after these for each reservation, of
 //! no access and no file bytes, and its start hook's pointer is the first of
@@ -96,8 +108,9 @@ pub(crate) struct Last {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum Segment {
     Read,
-    Code,
+    /// Before the code, next to `.eh_frame`: see the module's docs.
     Relro,
+    Code,
     Write,
     /// A dev run's reservation, one `PT_LOAD` each, after every other segment.
     Reserve(Reserve),
@@ -134,8 +147,8 @@ impl Segment {
     fn rank(self) -> u32 {
         match self {
             Segment::Read => 0,
-            Segment::Code => 1,
-            Segment::Relro => 2,
+            Segment::Relro => 1,
+            Segment::Code => 2,
             Segment::Write => 3,
             Segment::Reserve(reserve) => 4 + reserve as u32,
         }
@@ -376,13 +389,15 @@ impl Writer for Elf {
         }
     }
 
-    /// Relro is read-only once the loader has relocated it (`-z now`): `Prot::R` here, so it
-    /// starts on a page of its own; its `PT_LOAD` is writable for the loader.
+    /// Relro is what its `PT_LOAD` is, writable for the loader (`PT_GNU_RELRO` makes it
+    /// read-only once relocated, `-z now`): `Prot::RW`, so between the read-only segment
+    /// and the code it starts and ends on pages of its own, as the layout breaks pages only
+    /// where the protection changes.
     fn prot(&self, class: &Class) -> Prot {
         match Segment::of(class) {
-            Segment::Read | Segment::Relro => Prot::R,
+            Segment::Read => Prot::R,
             Segment::Code => Prot::RX,
-            Segment::Write => Prot::RW,
+            Segment::Relro | Segment::Write => Prot::RW,
             Segment::Reserve(_) => Prot::NONE,
         }
     }

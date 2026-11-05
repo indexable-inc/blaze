@@ -1,4 +1,3 @@
-use blaze_protocol::events::NodeKind;
 use blaze_protocol::now::{Blocker, Busy, Download, Memory, Now, Phase, Span, Tally, Task, Took};
 use expect_test::expect_file;
 use ratatui::{buffer::Buffer, layout::Rect};
@@ -8,8 +7,8 @@ use crate::test_view::Paint;
 
 const GIB: u64 = 1 << 30;
 
-fn task(id: u32, kind: NodeKind, name: &str) -> Task {
-    Task { id, kind, name: name.to_owned() }
+fn task(id: u64, kind: &str, name: &str) -> Task {
+    Task { id, kind: kind.to_owned(), name: name.to_owned() }
 }
 
 /// Andrew's `blaze test` of 2026-11-05: 15 of 16 workers idle while one spent four and a half
@@ -31,12 +30,12 @@ fn andrew() -> Now {
         workers: 16,
         busy: vec![Busy {
             thread: "blaze-worker-3".to_owned(),
-            task: Some(task(7, NodeKind::Codegen, "core")),
+            task: Some(task(7, "codegen", "core")),
             span: span.clone(),
             path: vec!["task".to_owned(), "codegen".to_owned(), "copy_prop".to_owned()],
         }],
         blockers: vec![Blocker {
-            task: task(7, NodeKind::Codegen, "core"),
+            task: task(7, "codegen", "core"),
             running: true,
             for_ms: 270_000,
             span: Some(span),
@@ -50,9 +49,9 @@ fn andrew() -> Now {
         }],
         downloads: Vec::new(),
         slowest: vec![
-            Took { task: task(3, NodeKind::Bodies, "hir-ty"), ms: 72_000 },
-            Took { task: task(4, NodeKind::Codegen, "syntax"), ms: 48_000 },
-            Took { task: task(5, NodeKind::ScriptRun, "ring"), ms: 31_000 },
+            Took { task: task(3, "bodies", "hir-ty"), ms: 72_000 },
+            Took { task: task(4, "codegen", "syntax"), ms: 48_000 },
+            Took { task: task(5, "script-run", "ring"), ms: 31_000 },
         ],
         quiet_ms: 270_000,
         memory: Memory {
@@ -124,7 +123,7 @@ fn stall() -> Now {
         tally: Tally { waiting: 19, ready: 1, running: 0, done: 100, failed: 0, total: 120 },
         workers: 16,
         blockers: vec![Blocker {
-            task: task(40, NodeKind::Link, "blaze-cargo blaze"),
+            task: task(40, "link", "blaze-cargo blaze"),
             running: false,
             for_ms: 45_000,
             span: None,
@@ -272,7 +271,7 @@ fn a_line_is_due_on_a_change_or_every_ten_seconds() {
     assert!(board.line(&mut out), "ten seconds after the last line");
     out.clear();
 
-    now.blockers[0].task = task(40, NodeKind::Link, "blaze-cargo blaze");
+    now.blockers[0].task = task(40, "link", "blaze-cargo blaze");
     board.take(now.clone());
     assert!(board.line(&mut out), "the first blocker changed");
     assert!(out.contains("on link blaze-cargo blaze"), "{out}");

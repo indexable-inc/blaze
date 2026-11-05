@@ -1,9 +1,16 @@
 //! A build as it runs now: the one model of it that its client's live view, `blaze status`
 //! and the explorer's daemon source read (docs/v2/plan/observe/build-view.md). [`Now`] is the
 //! wire type, said to a build's client about twice a second; [`Fold`] is the sans-IO core
-//! that builds it from the plane's graph records ([`Event::Node`], [`Event::Nodes`],
-//! [`Event::Moved`]), the clock it is handed ([`Fold::advance_clock`]) and what one look at
-//! the daemon found ([`Look`]: each worker's open spans, the downloads, the stage's words).
+//! that builds it from tasks and their moves ([`TaskRecord`]s through [`Fold::take`], [`State`]s
+//! through [`Fold::moved`]), the clock it is handed ([`Fold::advance_clock`]) and what one look
+//! at the daemon found ([`Look`]: each worker's open spans, the downloads, the stage's words).
+//!
+//! Its input is generic, so the explorer's page (compiled to `wasm32-unknown-unknown`) folds any
+//! program's live feed with the same core: a task is a `u64` id, a kind that is its layer's label
+//! and a name, with the ids it waits on. The plane's graph records ([`Event::Node`],
+//! [`Event::Nodes`], [`Event::Moved`]) become tasks in one place, [`Fold::take_event`], their
+//! kind the [`NodeKind`]'s name (`codegen`, `script-run`). A program that is no build (no task of
+//! a build's kind) is in [`Phase::Running`].
 //!
 //! What it answers: the phase and what it really does; how many workers are busy and, for each,
 //! its innermost span; what the unfinished tasks wait on (the [`Blocker`]s) and how much each
@@ -11,7 +18,9 @@
 
 #![blaze::sans_io]
 
-use std::cmp::Reverse;
+use std::{alloc::Global, cmp::Reverse};
+
+use blaze_hash::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +42,9 @@ pub enum Phase {
     Testing,
     /// Every task settled; the build is writing its answer.
     Finishing,
+    /// A program that is not a build: tasks run, no phase. No task it knows has a kind of
+    /// [`NodeKind::ALL`]'s names.
+    Running,
 }
 
 impl Phase {
@@ -47,6 +59,7 @@ impl Phase {
             Phase::Linking => "linking",
             Phase::Testing => "testing",
             Phase::Finishing => "finishing",
+            Phase::Running => "running",
         }
     }
 }
@@ -182,8 +195,9 @@ pub struct Tally {
     pub waiting: u32,
     pub ready: u32,
     pub running: u32,
-    /// Built, cached or skipped.
+    /// Settled well ([`State::Done`]: for a build, built, cached or skipped).
     pub done: u32,
+    /// Failed or cancelled.
     pub failed: u32,
     pub total: u32,
 }
@@ -191,15 +205,64 @@ keys [done, ready, total, failed, running, waiting]
 }
 
 crate::in_key_order! {
-/// A task of the build's graph: a plane node.
+/// A task of the program's graph: for a build, a plane node.
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Task {
-    pub id: u32,
-    pub kind: NodeKind,
-    /// `<package> <target>`, as the plane names it.
+    pub id: u64,
+    /// Its layer's label: for a build, the [`NodeKind`]'s name (`codegen`, `script-run`).
+    pub kind: String,
+    /// For a build, `<package> <target>`, as the plane names it.
     pub name: String,
 }
 keys [id, kind, name]
+}
+
+/// Where a task is.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum State {
+    /// A task it waits on is not settled.
+    Waiting,
+    /// Everything it waits on settled; it waits for a worker.
+    Ready,
+    Running,
+    /// Settled by doing its work, or by not needing to (for a build: built, cached or skipped).
+    Done,
+    Failed,
+    /// Never run: what it was part of was cancelled.
+    Cancelled,
+}
+
+impl State {
+    /// Whether it may still move: waiting, ready or running.
+    pub const fn unfinished(self) -> bool {
+        matches!(self, State::Waiting | State::Ready | State::Running)
+    }
+}
+
+impl From<&NodeState> for State {
+    fn from(state: &NodeState) -> State {
+        match state {
+            NodeState::Waiting => State::Waiting,
+            NodeState::Ready => State::Ready,
+            NodeState::Running => State::Running,
+            NodeState::Built | NodeState::Cached { .. } | NodeState::Skipped { .. } => State::Done,
+            NodeState::Failed { .. } => State::Failed,
+            NodeState::Cancelled => State::Cancelled,
+        }
+    }
+}
+
+crate::in_key_order! {
+/// A task as a feed says it: its id, its layer's label, its name and the ids it waits on (a
+/// dep not yet said is unsettled until it is). What [`Fold::take`] adds or updates.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TaskRecord {
+    pub id: u64,
+    pub kind: String,
+    pub name: String,
+    pub deps: Vec<u64>,
+}
+keys [id, deps, kind, name]
 }
 
 crate::in_key_order! {
@@ -294,12 +357,12 @@ pub struct Took {
 keys [ms, task]
 }
 
-/// A worker thread as one look found it: its name, the plane node its `task` span runs (when
-/// it is inside one), and its open spans, outermost first. A worker with no open span is idle.
+/// A worker thread as one look found it: its name, the task its `task` span runs (when it is
+/// inside one), by id, and its open spans, outermost first. A worker with no open span is idle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worker {
     pub thread: String,
-    pub node: Option<u32>,
+    pub task: Option<u64>,
     pub open: Vec<Span>,
 }
 
@@ -320,34 +383,40 @@ pub struct Look<'a> {
     pub memory: &'a Memory,
 }
 
-
-/// The sans-IO core: folds a build's graph records and looks into [`Now`]s.
+/// The sans-IO core: folds a program's tasks, their moves and looks into [`Now`]s.
 ///
-/// It keeps the plane's tasks by id (the plane's ids are dense), each with its kind, name, deps,
-/// where it is and when it became ready, began running and was first seen, and a short list of
-/// the slowest settled tasks, kept as they settle. A [`Fold::look`] reads them with what the
-/// look found; it reuses its buffers from one look to the next.
+/// It keeps each task in a slot, the slots in the order the tasks were first said, with a map
+/// from id to slot (only ever asked, never walked, so its order reaches no output): its kind,
+/// name, deps, where it is and when it became ready, began running and was first seen; and a
+/// short list of the slowest settled tasks, kept as they settle. At most [`MOST_TASKS`] tasks are
+/// kept: a new one past them is ignored. A [`Fold::look`] reads them with what the look found;
+/// it reuses its buffers from one look to the next.
 ///
 /// **Phase.** The first of these that holds:
 ///
-/// 1. [`Phase::Finishing`]: it knows a task and none is unfinished (waiting, ready or running).
-/// 2. [`Phase::Fetching`]: a download is in flight and no task runs.
-/// 3. [`Phase::Starting`]: it knows no task (and no download is in flight).
-/// 4. A task runs: [`Phase::Testing`] when one of them is a [`NodeKind::Test`], else
+/// 1. [`Phase::Running`]: it knows a task and none has a build's kind (one of
+///    [`NodeKind::ALL`]'s names): the program is no build.
+/// 2. [`Phase::Finishing`]: it knows a task and none is unfinished (waiting, ready or running).
+/// 3. [`Phase::Fetching`]: a download is in flight and no task runs.
+/// 4. [`Phase::Starting`]: it knows no task (and no download is in flight).
+/// 5. A task runs: [`Phase::Testing`] when one of them is a [`NodeKind::Test`], else
 ///    [`Phase::Linking`] when one is a [`NodeKind::Link`], else [`Phase::Compiling`].
-/// 5. Nothing runs and nothing is ready: [`Phase::Planning`] when the stage's words mention
+/// 6. Nothing runs and nothing is ready: [`Phase::Planning`] when the stage's words mention
 ///    `plan` or `lowering`, else [`Phase::Resolving`] when they mention `fetch` or `resolve`
 ///    or a [`NodeKind::Manifest`] or [`NodeKind::Fetch`] task is unfinished.
-/// 6. Otherwise [`Phase::Compiling`].
+/// 7. Otherwise [`Phase::Compiling`].
+///
+/// A kind is told by its name ([`NodeKind::name`]), since a task's kind is its label.
 ///
 /// **Blockers.** The frontier is every unfinished task whose deps have all settled (a failed
-/// dep counts as settled). The unfinished tasks are walked in dependency order (Kahn's, one
-/// step per edge, so a cycle, which the plane never sends, is left out rather than walked),
-/// each carrying the set of frontier tasks it waits on, directly or not, as a bitset over the
-/// first 256 of the frontier (the running ones first, then the longest ready). A
-/// blocker's `holds` is how many unfinished tasks off the frontier carry it, `chain` the
-/// longest path of unfinished tasks behind it. A frontier task past the cap is still a
-/// blocker, holding 0: it is carried by no one.
+/// dep counts as settled; a dep never said does not). The unfinished tasks are walked in
+/// dependency order (Kahn's, one step per edge, so a cycle, which the plane never sends, is left
+/// out rather than walked), each carrying the set of frontier tasks it waits on, directly or not,
+/// as a bitset over the first 256 of the frontier (the running ones first, then the longest
+/// ready). A blocker's `holds` is how many unfinished tasks off the frontier carry it, `chain`
+/// the longest path of unfinished tasks behind it, `behind` the first few waiting on it directly,
+/// in the order they were said. A frontier task past the cap is still a blocker, holding 0: it is
+/// carried by no one.
 #[derive(Debug, Default)]
 pub struct Fold {
     /// The clock, as nanoseconds since the build began; it never goes back.
@@ -356,24 +425,27 @@ pub struct Fold {
     clocked: bool,
     /// When a task last settled, a download last got a byte or a look said a span closed.
     moved_ns: u64,
-    /// The graph's tasks, by plane id.
-    tasks: Vec<Option<Slot>>,
+    /// The tasks, in the order first said.
+    tasks: Vec<Slot>,
+    /// Each task's slot in `tasks`, by id. Asked, never iterated.
+    slots: HashMap<u64, u32, Global>,
     /// Releases counted ([`Memory::releases`]).
     releases: u32,
     /// The most memory held at any look ([`Memory::peak`]).
     peak: u64,
     /// The slowest settled tasks that ran, as how long each ran and its id, longest first and
     /// then by id: at most [`SLOWEST`].
-    slowest: Vec<(u64, u32)>,
+    slowest: Vec<(u64, u64)>,
     /// What reads an [`Event::Nodes`] keeps from one to the next.
     order: Order,
+    /// A plane record's deps, widened to ids, kept from one record to the next.
+    widened: Vec<u64>,
     /// The blocker walk's buffers.
     walk: Walk,
 }
 
-/// The highest plane id the fold keeps a task for. The plane's ids are dense, so a record of a
-/// higher one is no build's that a fold could hold, and it is ignored.
-const MOST_ID: u32 = 1 << 24;
+/// The most tasks a fold keeps; a new task past them is ignored.
+pub const MOST_TASKS: usize = 1 << 22;
 
 /// How many frontier tasks the blocker walk tells apart; the rest hold 0.
 const FRONTIER: usize = 256;
@@ -384,42 +456,22 @@ const MS: u64 = 1_000_000;
 /// No place: a task off the walk, or off the frontier.
 const NONE: u32 = u32::MAX;
 
-/// Where a task is, as the fold counts it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum At {
-    Waiting,
-    Ready,
-    Running,
-    /// Built, cached or skipped.
-    Done,
-    /// Failed or cancelled.
-    Failed,
+/// Whether `kind` is a build's: one of [`NodeKind::ALL`]'s names.
+fn build_kind(kind: &str) -> bool {
+    NodeKind::ALL.iter().any(|it| it.name() == kind)
 }
 
-impl At {
-    fn of(state: &NodeState) -> At {
-        match state {
-            NodeState::Waiting => At::Waiting,
-            NodeState::Ready => At::Ready,
-            NodeState::Running => At::Running,
-            NodeState::Built | NodeState::Cached { .. } | NodeState::Skipped { .. } => At::Done,
-            NodeState::Failed { .. } | NodeState::Cancelled => At::Failed,
-        }
-    }
-
-    fn unfinished(self) -> bool {
-        matches!(self, At::Waiting | At::Ready | At::Running)
-    }
-}
-
-/// A task of the graph as the fold keeps it.
+/// A task as the fold keeps it.
 #[derive(Debug)]
 struct Slot {
-    kind: NodeKind,
+    id: u64,
+    kind: String,
+    /// Whether `kind` is a build's ([`build_kind`]).
+    build: bool,
     name: String,
-    deps: Vec<u32>,
-    at: At,
-    /// When its node record came.
+    deps: Vec<u64>,
+    state: State,
+    /// When it was first said.
     seen_ns: u64,
     /// When it last became ready.
     ready_ns: Option<u64>,
@@ -431,27 +483,32 @@ impl Slot {
     /// Since when it is where it is, for a blocker's `for_ms`: since it began running, else
     /// since it became ready, else since it was first seen.
     fn since_ns(&self) -> u64 {
-        match (self.at, self.running_ns, self.ready_ns) {
-            (At::Running, Some(running), _) => running,
+        match (self.state, self.running_ns, self.ready_ns) {
+            (State::Running, Some(running), _) => running,
             (_, _, Some(ready)) => ready,
             _ => self.seen_ns,
         }
     }
 
-    fn task(&self, id: u32) -> Task {
+    fn task(&self) -> Task {
         // alloc: a task named in a look's answer, which owns its strings.
-        Task { id, kind: self.kind, name: self.name.clone() }
+        Task { id: self.id, kind: self.kind.clone(), name: self.name.clone() }
     }
 }
 
 /// The blocker walk's buffers, kept from one look to the next so a warm look reuses them.
-/// "Place" is a task's index among the unfinished ones, in id order.
+/// "Place" is a task's index among the unfinished ones, in slot order.
 #[derive(Debug, Default)]
 struct Walk {
-    /// Each id's place, or [`NONE`] when it is not unfinished.
+    /// Each slot's place, or [`NONE`] when it is not unfinished.
     place: Vec<u32>,
-    /// The unfinished tasks' ids, by place.
+    /// The unfinished tasks' slots, by place.
     unfinished: Vec<u32>,
+    /// Each place's deps, by place ([`NONE`] for a dep that is not unfinished), place after
+    /// place.
+    deps: Vec<u32>,
+    /// Where each place's deps begin in `deps` (`len + 1` of them).
+    deps_at: Vec<u32>,
     /// The frontier's places: the tracked ones first, in the order their bits go.
     frontier: Vec<u32>,
     /// Each place's frontier bit, or [`NONE`].
@@ -474,7 +531,7 @@ struct Walk {
     /// How many unfinished tasks off the frontier carry each tracked bit.
     holds: Vec<u32>,
     /// The frontier as ranked: holds, chain, for how long in ms, id, place.
-    ranked: Vec<(u32, u32, u64, u32, u32)>,
+    ranked: Vec<(u32, u32, u64, u64, u32)>,
 }
 
 impl Fold {
@@ -491,20 +548,66 @@ impl Fold {
         self.now_ns = self.now_ns.max(at_ns);
     }
 
-    /// One of the plane's records of the build. Records of any other kind are ignored, and so
-    /// are a malformed [`Event::Nodes`], a move of a node never said and an id past any graph
-    /// a fold holds.
-    pub fn take(&mut self, event: &Event) {
+    /// A task said: added, waiting, or, said again, given the new description while it keeps
+    /// where it is. A new task past [`MOST_TASKS`] is ignored.
+    pub fn take(&mut self, task: &TaskRecord) {
+        self.add(task.id, &task.kind, &task.name, &task.deps);
+    }
+
+    /// A task moved: when it became ready or began running is kept, and a settle restarts the
+    /// quiet time and, for a task that ran, enters the slowest list. A move of a task never
+    /// said is ignored.
+    pub fn moved(&mut self, id: u64, state: State) {
+        let now = self.now_ns;
+        let Some(&at) = self.slots.get(&id) else { return };
+        let slot = &mut self.tasks[at as usize];
+        let was = slot.state;
+        slot.state = state;
+        let mut ran = None;
+        match state {
+            State::Ready if was != State::Ready => slot.ready_ns = Some(now),
+            State::Running if was != State::Running => slot.running_ns = Some(now),
+            State::Done | State::Failed | State::Cancelled if was.unfinished() => {
+                self.moved_ns = self.moved_ns.max(now);
+                ran = slot.running_ns.map(|began| now.saturating_sub(began));
+            }
+            _ => {}
+        }
+        if state.unfinished() && !was.unfinished() {
+            self.slowest.retain(|&(_, it)| it != id);
+        }
+        if let Some(ran) = ran {
+            self.keep_slowest(id, ran);
+        }
+    }
+
+    /// One of the plane's records of the build, the one place they become tasks: a node (alone
+    /// or in an [`Event::Nodes`]) is a [`TaskRecord`] with its ids widened and its kind the
+    /// [`NodeKind`]'s name, a move is [`Fold::moved`] with its [`State`]. Records of any other
+    /// kind are ignored, and so is a malformed [`Event::Nodes`].
+    pub fn take_event(&mut self, event: &Event) {
         match event {
-            Event::Node { id, kind, name, deps } => self.node(*id, *kind, name, deps),
+            Event::Node { id, kind, name, deps } => {
+                let mut widened = std::mem::take(&mut self.widened);
+                widened.clear();
+                // alloc: the widening buffer, kept from record to record.
+                widened.extend(deps.iter().map(|&dep| u64::from(dep)));
+                self.add(u64::from(*id), kind.name(), name, &widened);
+                self.widened = widened;
+            }
             Event::Nodes { .. } => {
+                let mut widened = std::mem::take(&mut self.widened);
                 if let Some(Ok(batch)) = event.nodes(&mut self.order) {
                     for node in batch.iter() {
-                        self.node(node.id, node.kind, node.name, node.deps);
+                        widened.clear();
+                        // alloc: the widening buffer, kept from record to record.
+                        widened.extend(node.deps.iter().map(|&dep| u64::from(dep)));
+                        self.add(u64::from(node.id), node.kind.name(), node.name, &widened);
                     }
                 }
+                self.widened = widened;
             }
-            Event::Moved { id, state } => self.moved(*id, state),
+            Event::Moved { id, state } => self.moved(u64::from(*id), State::from(state)),
             _ => {}
         }
     }
@@ -528,7 +631,7 @@ impl Fold {
             releases: self.releases,
         };
         let busy = self.busy(look.threads);
-        let blockers = blockers(&self.tasks, self.now_ns, &mut self.walk, &busy);
+        let blockers = blockers(&self.tasks, &self.slots, self.now_ns, &mut self.walk, &busy);
         let phase = self.phase(&tally, look);
         let quiet_ms = self.quiet_ms(look);
         Now {
@@ -548,69 +651,45 @@ impl Fold {
         }
     }
 
-    /// A node record: a task with its deps. Said again, it takes the new description and keeps
-    /// where it is.
-    fn node(&mut self, id: u32, kind: NodeKind, name: &str, deps: &[u32]) {
-        if id > MOST_ID {
+    /// A task with its deps: [`Fold::take`]'s, by parts.
+    fn add(&mut self, id: u64, kind: &str, name: &str, deps: &[u64]) {
+        let build = build_kind(kind);
+        if let Some(&at) = self.slots.get(&id) {
+            let slot = &mut self.tasks[at as usize];
+            slot.kind.clear();
+            slot.kind.push_str(kind);
+            slot.build = build;
+            slot.name.clear();
+            slot.name.push_str(name);
+            slot.deps.clear();
+            slot.deps.extend_from_slice(deps);
             return;
         }
-        let at = id as usize;
-        if self.tasks.len() <= at {
-            // alloc: the graph's tasks, by id, grown as the plane says them.
-            self.tasks.resize_with(at + 1, || None);
+        if self.tasks.len() >= MOST_TASKS {
+            return;
         }
-        match &mut self.tasks[at] {
-            Some(slot) => {
-                slot.kind = kind;
-                slot.name.clear();
-                slot.name.push_str(name);
-                slot.deps.clear();
-                slot.deps.extend_from_slice(deps);
-            }
-            empty @ None => {
-                *empty = Some(Slot {
-                    kind,
-                    // alloc: a task's name, kept for the build.
-                    name: name.to_owned(),
-                    // alloc: a task's deps, kept for the build.
-                    deps: deps.to_vec(),
-                    at: At::Waiting,
-                    seen_ns: self.now_ns,
-                    ready_ns: None,
-                    running_ns: None,
-                });
-            }
-        }
-    }
-
-    /// A task moved: when it became ready or began running is kept, and a settle restarts the
-    /// quiet time and, for a task that ran, enters the slowest list.
-    fn moved(&mut self, id: u32, state: &NodeState) {
-        let now = self.now_ns;
-        let Some(Some(slot)) = self.tasks.get_mut(id as usize) else { return };
-        let (was, at) = (slot.at, At::of(state));
-        slot.at = at;
-        let mut ran = None;
-        match at {
-            At::Ready if was != At::Ready => slot.ready_ns = Some(now),
-            At::Running if was != At::Running => slot.running_ns = Some(now),
-            At::Done | At::Failed if was.unfinished() => {
-                self.moved_ns = self.moved_ns.max(now);
-                ran = slot.running_ns.map(|began| now.saturating_sub(began));
-            }
-            _ => {}
-        }
-        if at.unfinished() && !was.unfinished() {
-            self.slowest.retain(|&(_, it)| it != id);
-        }
-        if let Some(ran) = ran {
-            self.keep_slowest(id, ran);
-        }
+        // alloc: the id's slot, kept for the build.
+        self.slots.insert(id, self.tasks.len() as u32);
+        // alloc: the tasks, in the order said, grown as they come.
+        self.tasks.push(Slot {
+            id,
+            // alloc: a task's kind, kept for the build.
+            kind: kind.to_owned(),
+            build,
+            // alloc: a task's name, kept for the build.
+            name: name.to_owned(),
+            // alloc: a task's deps, kept for the build.
+            deps: deps.to_vec(),
+            state: State::Waiting,
+            seen_ns: self.now_ns,
+            ready_ns: None,
+            running_ns: None,
+        });
     }
 
     /// Puts a settled task that ran `ran_ns` in its place in the slowest list, if it is among
     /// the [`SLOWEST`].
-    fn keep_slowest(&mut self, id: u32, ran_ns: u64) {
+    fn keep_slowest(&mut self, id: u64, ran_ns: u64) {
         self.slowest.retain(|&(_, it)| it != id);
         let key = (Reverse(ran_ns), id);
         let place = self.slowest.partition_point(|&(ns, it)| (Reverse(ns), it) < key);
@@ -623,13 +702,13 @@ impl Fold {
 
     fn tally(&self) -> Tally {
         let mut tally = Tally::default();
-        for slot in self.tasks.iter().flatten() {
-            let count = match slot.at {
-                At::Waiting => &mut tally.waiting,
-                At::Ready => &mut tally.ready,
-                At::Running => &mut tally.running,
-                At::Done => &mut tally.done,
-                At::Failed => &mut tally.failed,
+        for slot in &self.tasks {
+            let count = match slot.state {
+                State::Waiting => &mut tally.waiting,
+                State::Ready => &mut tally.ready,
+                State::Running => &mut tally.running,
+                State::Done => &mut tally.done,
+                State::Failed | State::Cancelled => &mut tally.failed,
             };
             *count += 1;
             tally.total += 1;
@@ -647,7 +726,7 @@ impl Fold {
             outer(b)
                 .cmp(&outer(a))
                 .then_with(|| a.thread.cmp(&b.thread))
-                .then_with(|| a.node.cmp(&b.node))
+                .then_with(|| a.task.cmp(&b.task))
         });
         // alloc: the look's answer, one entry a busy worker.
         let mut busy = Vec::with_capacity(on.len());
@@ -658,7 +737,7 @@ impl Fold {
             busy.push(Busy {
                 // alloc: the look's answer owns its strings.
                 thread: worker.thread.clone(),
-                task: worker.node.and_then(|id| self.task(id)),
+                task: worker.task.and_then(|id| self.task(id)),
                 // alloc: the look's answer owns its spans.
                 span: span.clone(),
                 // alloc: the look's answer owns its span names.
@@ -668,16 +747,15 @@ impl Fold {
         busy
     }
 
-    fn task(&self, id: u32) -> Option<Task> {
-        self.slot(id).map(|slot| slot.task(id))
-    }
-
-    fn slot(&self, id: u32) -> Option<&Slot> {
-        self.tasks.get(id as usize).and_then(Option::as_ref)
+    fn task(&self, id: u64) -> Option<Task> {
+        self.slots.get(&id).map(|&at| self.tasks[at as usize].task())
     }
 
     /// The phase, by the rule in [`Fold`]'s documentation.
     fn phase(&self, tally: &Tally, look: &Look<'_>) -> Phase {
+        if tally.total > 0 && !self.tasks.iter().any(|slot| slot.build) {
+            return Phase::Running;
+        }
         let unfinished = tally.waiting + tally.ready + tally.running;
         if tally.total > 0 && unfinished == 0 {
             return Phase::Finishing;
@@ -688,13 +766,13 @@ impl Fold {
         if tally.total == 0 {
             return Phase::Starting;
         }
-        let tasks = || self.tasks.iter().flatten();
+        let is = |slot: &Slot, kind: NodeKind| slot.kind == kind.name();
         if tally.running > 0 {
-            let running = || tasks().filter(|slot| slot.at == At::Running);
-            if running().any(|slot| slot.kind == NodeKind::Test) {
+            let running = || self.tasks.iter().filter(|slot| slot.state == State::Running);
+            if running().any(|slot| is(slot, NodeKind::Test)) {
                 return Phase::Testing;
             }
-            if running().any(|slot| slot.kind == NodeKind::Link) {
+            if running().any(|slot| is(slot, NodeKind::Link)) {
                 return Phase::Linking;
             }
             return Phase::Compiling;
@@ -704,8 +782,9 @@ impl Fold {
             if mentions(stage, "plan") || mentions(stage, "lowering") {
                 return Phase::Planning;
             }
-            let resolving = tasks().any(|slot| {
-                slot.at.unfinished() && matches!(slot.kind, NodeKind::Manifest | NodeKind::Fetch)
+            let resolving = self.tasks.iter().any(|slot| {
+                slot.state.unfinished()
+                    && (is(slot, NodeKind::Manifest) || is(slot, NodeKind::Fetch))
             });
             if mentions(stage, "fetch") || mentions(stage, "resolve") || resolving {
                 return Phase::Resolving;
@@ -747,10 +826,18 @@ fn mentions(words: &str, word: &str) -> bool {
 
 /// The ranked blockers: the walk in [`Fold`]'s documentation. `busy` gives each running
 /// blocker its worker's innermost span.
-fn blockers(tasks: &[Option<Slot>], now_ns: u64, walk: &mut Walk, busy: &[Busy]) -> Vec<Blocker> {
+fn blockers(
+    tasks: &[Slot],
+    slots: &HashMap<u64, u32, Global>,
+    now_ns: u64,
+    walk: &mut Walk,
+    busy: &[Busy],
+) -> Vec<Blocker> {
     let Walk {
         place,
         unfinished,
+        deps,
+        deps_at,
         frontier,
         bit,
         start,
@@ -763,42 +850,56 @@ fn blockers(tasks: &[Option<Slot>], now_ns: u64, walk: &mut Walk, busy: &[Busy])
         holds,
         ranked,
     } = walk;
-    let slot = |id: u32| tasks.get(id as usize).and_then(Option::as_ref);
-    let settled = |id: u32| slot(id).is_some_and(|it| !it.at.unfinished());
 
-    // The unfinished tasks, by place in id order.
+    // The unfinished tasks, by place in slot order.
     place.clear();
     // alloc: the walk's buffer, kept from look to look.
     place.resize(tasks.len(), NONE);
     unfinished.clear();
-    for (id, it) in tasks.iter().enumerate() {
-        if it.as_ref().is_some_and(|it| it.at.unfinished()) {
-            place[id] = unfinished.len() as u32;
+    for (at, it) in tasks.iter().enumerate() {
+        if it.state.unfinished() {
+            place[at] = unfinished.len() as u32;
             // alloc: the walk's buffer, kept from look to look.
-            unfinished.push(id as u32);
+            unfinished.push(at as u32);
         }
     }
     let len = unfinished.len();
-    let place_of = |id: u32| place.get(id as usize).copied().filter(|&it| it != NONE);
+    let slot = |at: u32| &tasks[unfinished[at as usize] as usize];
 
-    // Each place's dependents, by counting and then filling, a duplicate dep kept once; the
-    // frontier; how many unfinished deps each waits on.
+    // Each place's deps by place, each id asked of the map once a look; the frontier: the
+    // places whose every dep is said and settled.
+    deps.clear();
+    deps_at.clear();
+    // alloc: the walk's buffer, kept from look to look.
+    deps_at.push(0);
+    frontier.clear();
+    for at in 0..len as u32 {
+        let mut open = false;
+        for dep in &slot(at).deps {
+            let of = slots.get(dep).map(|&it| it as usize);
+            open |= of.is_none_or(|it| tasks[it].state.unfinished());
+            // alloc: the walk's buffer, kept from look to look.
+            deps.push(of.map_or(NONE, |it| place[it]));
+        }
+        // alloc: the walk's buffer, kept from look to look.
+        deps_at.push(deps.len() as u32);
+        if !open {
+            // alloc: the walk's buffer, kept from look to look.
+            frontier.push(at);
+        }
+    }
+    let deps_of = |at: usize| &deps[deps_at[at] as usize..deps_at[at + 1] as usize];
+
+    // Each place's dependents, by counting and then filling, a duplicate dep kept once; how
+    // many unfinished deps each waits on.
     start.clear();
     // alloc: the walk's buffer, kept from look to look.
     start.resize(len + 1, 0);
-    frontier.clear();
-    for (at, &id) in unfinished.iter().enumerate() {
-        let Some(it) = slot(id) else { continue };
-        let mut open = false;
-        for &dep in &it.deps {
-            if let Some(dep) = place_of(dep) {
+    for at in 0..len {
+        for &dep in deps_of(at) {
+            if dep != NONE {
                 start[dep as usize + 1] += 1;
             }
-            open |= !settled(dep);
-        }
-        if !open {
-            // alloc: the walk's buffer, kept from look to look.
-            frontier.push(at as u32);
         }
     }
     let mut sum = 0;
@@ -815,10 +916,11 @@ fn blockers(tasks: &[Option<Slot>], now_ns: u64, walk: &mut Walk, busy: &[Busy])
     waiting.clear();
     // alloc: the walk's buffer, kept from look to look.
     waiting.resize(len, 0);
-    for (at, &id) in unfinished.iter().enumerate() {
-        let Some(it) = slot(id) else { continue };
-        for &dep in &it.deps {
-            let Some(dep) = place_of(dep) else { continue };
+    for at in 0..len {
+        for &dep in deps_of(at) {
+            if dep == NONE {
+                continue;
+            }
             let (from, to) = (start[dep as usize] as usize, end[dep as usize] as usize);
             if to > from && dependents[to - 1] == at as u32 {
                 continue;
@@ -832,8 +934,8 @@ fn blockers(tasks: &[Option<Slot>], now_ns: u64, walk: &mut Walk, busy: &[Busy])
 
     // The frontier's bits: the running ones first, then the longest ready, then by id.
     frontier.sort_by_key(|&at| {
-        let id = unfinished[at as usize];
-        slot(id).map_or((true, 0, id), |it| (it.at != At::Running, it.since_ns(), id))
+        let it = slot(at);
+        (it.state != State::Running, it.since_ns(), it.id)
     });
     let tracked = frontier.len().min(FRONTIER);
     let words = tracked.div_ceil(64);
@@ -907,13 +1009,12 @@ fn blockers(tasks: &[Option<Slot>], now_ns: u64, walk: &mut Walk, busy: &[Busy])
     // Ranked by holds, chain, for how long, then id; the first BLOCKERS named.
     ranked.clear();
     for &at in frontier.iter() {
-        let id = unfinished[at as usize];
-        let Some(it) = slot(id) else { continue };
+        let it = slot(at);
         let b = bit[at as usize];
         let held = if b == NONE { 0 } else { holds[b as usize] };
         let for_ms = now_ns.saturating_sub(it.since_ns()) / MS;
         // alloc: the walk's buffer, kept from look to look.
-        ranked.push((held, down[at as usize], for_ms, id, at));
+        ranked.push((held, down[at as usize], for_ms, it.id, at));
     }
     ranked.sort_unstable_by_key(|&(held, chain, for_ms, id, _)| {
         (Reverse(held), Reverse(chain), Reverse(for_ms), id)
@@ -921,7 +1022,7 @@ fn blockers(tasks: &[Option<Slot>], now_ns: u64, walk: &mut Walk, busy: &[Busy])
     // alloc: the look's answer, at most BLOCKERS.
     let mut named = Vec::with_capacity(ranked.len().min(BLOCKERS));
     for &(held, chain, for_ms, id, at) in ranked.iter().take(BLOCKERS) {
-        let Some(it) = slot(id) else { continue };
+        let it = slot(at);
         let span = busy
             .iter()
             .find(|worker| worker.task.as_ref().is_some_and(|task| task.id == id))
@@ -930,14 +1031,13 @@ fn blockers(tasks: &[Option<Slot>], now_ns: u64, walk: &mut Walk, busy: &[Busy])
         let behind = after(at)
             .iter()
             .take(BEHIND)
-            .filter_map(|&next| slot(unfinished[next as usize]))
             // alloc: the look's answer owns its names, at most BEHIND.
-            .map(|next| next.name.clone())
+            .map(|&next| slot(next).name.clone())
             // alloc: the look's answer, at most BEHIND.
             .collect();
         named.push(Blocker {
-            task: it.task(id),
-            running: it.at == At::Running,
+            task: it.task(),
+            running: it.state == State::Running,
             for_ms,
             span,
             holds: held,

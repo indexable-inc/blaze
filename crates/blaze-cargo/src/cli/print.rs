@@ -219,14 +219,11 @@ pub struct Printer<'a, O: Write, E: Write> {
     failures: Vec<Report>,
     /// Where the failures are kept ([`super::observe::last_failure`]); `None` keeps none.
     remember: Option<Result<PathBuf, String>>,
-    /// How long the build had run when its last `Waiting` line was printed
-    /// ([`ResponseRef::Doing`]): one every [`WAITING_EVERY`] at most.
-    waited: Option<u64>,
+    /// The build's live model as the last [`ResponseRef::Doing`] carried it, for its compact
+    /// line off the live view ([`blaze_ui::board::Board::line`]): one when the phase, the first
+    /// blocker or the memory's pressure changes, and otherwise every 10 s of the build.
+    board: blaze_ui::board::Board,
 }
-
-/// How often a build that waits on something other than a unit (a download, a lowering) says so
-/// off the live view, in milliseconds of the build's run.
-const WAITING_EVERY: u64 = 5_000;
 
 impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     /// `root` is the checkout's, which the files spans name are under.
@@ -251,7 +248,9 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             root: root.to_string_lossy().into_owned(), // alloc: once a printer
             home: None,
             held: Vec::new(),     // alloc: none until a unit failed with a report
-            waited: None,
+            // The compact line names no command and has no color: the board's are for its
+            // drawn forms.
+            board: blaze_ui::board::Board::new("blaze", blaze_ui::test_view::Paint::Plain),
             failures: Vec::new(), // alloc: as above
             remember: None,
         }
@@ -466,22 +465,14 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 self.line.push('\n');
             }
             ResponseRef::Diagnostic(diagnostic) => self.diagnostic(diagnostic)?,
-            // `Waiting downloading llvm-….tar.xz: 34.0 of 410.0 MB (8%), … (12 s)`: what a build
-            // that compiles nothing waits on, every few seconds, never under `-q` or JSON.
-            ResponseRef::Doing(doing)
-                if !self.shown.quiet
-                    && !self.shown.format.json()
-                    && doing.on.is_some()
-                    && self.waited.is_none_or(|at| doing.for_ms >= at + WAITING_EVERY) =>
-            {
-                let on = doing.on.as_deref().unwrap_or_default();
-                self.waited = Some(doing.for_ms);
+            // `[15m14s] compiling 488/570 · 1/16 busy · mem 20.1/24.0 GB · on codegen core (…)`:
+            // the build's compact line when one is due, never under `-q` or JSON.
+            ResponseRef::Doing(doing) if !self.shown.quiet && !self.shown.format.json() => {
+                self.board.take(doing.now);
                 self.to(false)?;
-                say::status_word(&mut self.line, "Waiting", self.shown.color);
-                self.line.push_str(on);
-                let secs = std::time::Duration::from_millis(doing.for_ms);
-                let _ = write!(self.line, " ({})", blaze_fetch::progress::Secs(secs));
-                self.line.push('\n');
+                if self.board.line(&mut self.line) {
+                    self.line.push('\n');
+                }
             }
             ResponseRef::BuildScript(ran) if self.shown.format.json() => {
                 self.to(true)?;

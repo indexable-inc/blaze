@@ -505,8 +505,8 @@ fn cargo(asked: &Invocation) -> i32 {
         fixing,
         terminal,
     };
-    // On a terminal, `test` draws its live view, whose screen thread writes stderr: the locks
-    // below are taken only off that path.
+    // On a terminal, `build`, `check` and `test` draw the live view, whose screen thread
+    // writes stderr: the locks below are taken only off that path.
     if live::wanted(asked, shown) {
         let then = live::drive(&mut client, asked, &place, request, shown, started);
         // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
@@ -518,7 +518,7 @@ fn cargo(asked: &Invocation) -> i32 {
         return match then {
             Ok(Then::Exit(code)) => code,
             Ok(Then::Exec(_) | Then::Fix(_)) => {
-                refused("the live test view ended in neither an exit code nor an error", color)
+                refused("the live view ended in neither an exit code nor an error", color)
             }
             Err(error) => refused(&error.to_string(), color),
         };
