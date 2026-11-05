@@ -567,6 +567,9 @@ impl App {
             self.poke();
             return;
         }
+        if self.chat_pointer_drag() {
+            return;
+        }
         if let Some(t) = self.term_with(|a, t| a.get::<TermMouse>(t).report.is_some()) {
             if let Some(b) = self.get::<TermMouse>(t).button() {
                 self.report_mouse(t, b, MouseAct::Motion, m);
@@ -619,6 +622,9 @@ impl App {
             self.tree_focus = false;
             self.focus_pane(p);
         }
+        if b == Button::Left && self.chat_pointer_down(clicks) {
+            return;
+        }
         let Some(t) = self.term_at() else { return };
         let Some((vr, col)) = self.pointer_cell(t, false) else { return };
         if self.reporting(t, m) {
@@ -661,6 +667,9 @@ impl App {
         if b == Button::Left {
             self.pointer.down = false;
             self.pointer.went_up = true;
+        }
+        if b == Button::Left && self.chat_pointer_up() {
+            return;
         }
         let code = TermMouse::code(b);
         if let Some(t) = self.term_with(|a, t| a.get::<TermMouse>(t).report == Some(code)) {
@@ -939,7 +948,7 @@ impl App {
 
     /// Where typed text goes (window points): the cell after the focused terminal's cursor and any marked text, for the
     /// input method's candidate window.
-    pub fn caret_rect(&self) -> Option<[f32; 4]> {
+    pub fn caret_rect(&mut self) -> Option<[f32; 4]> {
         if let Some(r) = self.chat_caret_rect() {
             return r;
         }

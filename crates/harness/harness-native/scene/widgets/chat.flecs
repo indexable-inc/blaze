@@ -7,6 +7,7 @@ hn {
   // The pane: the transcript scrolling over the card's ground, a column as wide as reads well; the input under it.
   prefab ChatPane : hn.Pane {
     list : ui.Scroll {
+      Cursor: {shape: Text}
       Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
       rows : ui.LazyList {
         LazyStack: {estimate: $chat_row_estimate, overscan: 600}
