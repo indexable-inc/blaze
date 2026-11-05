@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 struct Cursor {
     src: PathBuf,
@@ -199,7 +199,7 @@ fn sync_one(oid: &str, kind: &str, meta: &Value, claimed: &[PathBuf]) -> anyhow:
     if meta["mode"] == "chat" {
         return Ok(());
     }
-    let mut guard = CURSORS.lock().unwrap();
+    let mut guard = CURSORS.lock();
     let cursors = guard.get_or_insert_with(HashMap::new);
     let src = match cursors.get(oid) {
         Some(c) => c.src.clone(),

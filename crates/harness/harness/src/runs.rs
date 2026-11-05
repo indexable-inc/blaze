@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
@@ -46,7 +47,7 @@ struct Store {
 fn dir() -> PathBuf { paths::home().join("runs") }
 
 /// Whether any run is still going (the daemon's sweep then tells `watch` clients its stages may have moved).
-pub fn any_live() -> bool { !store().live.lock().unwrap().is_empty() }
+pub fn any_live() -> bool { !store().live.lock().is_empty() }
 
 fn store() -> &'static Store {
     static S: OnceLock<Store> = OnceLock::new();
@@ -307,15 +308,15 @@ pub fn spawn(
 
 /// The live run holding `name`, if any.
 pub fn live_named(name: &str) -> Option<String> {
-    store().live.lock().unwrap().iter().find(|(_, l)| l.name.as_deref() == Some(name)).map(|(id, _)| id.clone())
+    store().live.lock().iter().find(|(_, l)| l.name.as_deref() == Some(name)).map(|(id, _)| id.clone())
 }
 
 /// Write `data` to a live run's stdin (also appended to its `stdin` stream), then close it if asked.
 fn write_stdin(id: &str, data: Option<&str>, close: bool) -> Result<Value> {
     use std::io::Write;
     let d = run_dir(id)?;
-    let l = store().live.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow!("run {id} is not running"))?;
-    let mut w = l.stdin.lock().unwrap();
+    let l = store().live.lock().get(id).cloned().ok_or_else(|| anyhow!("run {id} is not running"))?;
+    let mut w = l.stdin.lock();
     if let Some(data) = data.filter(|s| !s.is_empty()) {
         let pipe = w.as_mut().ok_or_else(|| anyhow!("run {id} has no open stdin (spawn it with live stdin; closed already?)"))?;
         pipe.write_all(data.as_bytes()).with_context(|| format!("write stdin of {id}"))?;
@@ -332,7 +333,7 @@ fn write_stdin(id: &str, data: Option<&str>, close: bool) -> Result<Value> {
 /// Send a signal to a live run's process group.
 pub fn signal(id: &str, sig: i32) -> Result<Value> {
     run_dir(id)?;
-    let Some(l) = store().live.lock().unwrap().get(id).cloned() else { return Ok(json!({ "ok": true, "running": false })) };
+    let Some(l) = store().live.lock().get(id).cloned() else { return Ok(json!({ "ok": true, "running": false })) };
     unsafe { libc::kill(-(l.pid as i32), sig) };
     Ok(json!({ "ok": true, "running": true }))
 }
@@ -402,7 +403,7 @@ fn start(
     });
     write_meta(&d, &meta)?;
     let (tx, rx) = watch::channel(false);
-    st.live.lock().unwrap().insert(id.clone(), Arc::new(Live { pid, done: rx, name, stdin: Mutex::new(stdin_pipe) }));
+    st.live.lock().insert(id.clone(), Arc::new(Live { pid, done: rx, name, stdin: Mutex::new(stdin_pipe) }));
     index(&id);
     crate::daemon::changed();
     let mut err = child.stderr.take().ok_or_else(|| anyhow!("no stderr pipe"))?;
@@ -446,7 +447,7 @@ fn start(
             overlay(&d, &mut m, false);
             let _ = write_meta(&d, &m);
         }
-        store().live.lock().unwrap().remove(&id2);
+        store().live.lock().remove(&id2);
         let id3 = id2.clone();
         let _ = tokio::task::spawn_blocking(move || {
             index(&id3);
@@ -541,7 +542,7 @@ pub fn backfill() {
         .filter_map(|e| e.file_name().to_str().filter(|n| n.starts_with('r')).map(str::to_string))
         .collect();
     for id in ids {
-        if run_dir(&id).is_ok() && !db::is_compacted(&id) && !store().live.lock().unwrap().contains_key(&id) {
+        if run_dir(&id).is_ok() && !db::is_compacted(&id) && !store().live.lock().contains_key(&id) {
             index(&id);
         }
     }
@@ -550,7 +551,7 @@ pub fn backfill() {
 fn status(id: &str, with_procs: bool) -> Result<Value> {
     let d = run_dir(id)?;
     let mut m = read_meta(&d)?;
-    let live = store().live.lock().unwrap().get(id).cloned();
+    let live = store().live.lock().get(id).cloned();
     overlay(&d, &mut m, live.is_some());
     m["final_out_bytes"] = json!(terminal_files(&m, &d).iter().map(|p| size(p)).sum::<u64>());
     m["final_err_bytes"] = json!(size(&d.join("final.err")));
@@ -726,7 +727,7 @@ fn read_ordered(id: &str, stage: Option<usize>, offset: u64, max: usize, wait_ms
     }
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     loop {
-        let done = !store().live.lock().unwrap().contains_key(id);
+        let done = !store().live.lock().contains_key(id);
         // (ts, stage, seq) orders the segments; within one stage the index is already in write order.
         let mut segs: Vec<(u64, usize, usize, Chunk)> = vec![];
         for &k in &stages {
@@ -797,7 +798,7 @@ fn read(id: &str, stage: Option<usize>, stream: &str, offset: u64, max: usize, w
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     loop {
         // Check liveness before reading, so `done` with `eof` means nothing more can arrive.
-        let done = !store().live.lock().unwrap().contains_key(id);
+        let done = !store().live.lock().contains_key(id);
         let (mut data, total) = read_concat(&files, offset, max)?;
         // Don't split a UTF-8 character across reads.
         let keep = match std::str::from_utf8(&data) {
@@ -820,7 +821,7 @@ fn read(id: &str, stage: Option<usize>, stream: &str, offset: u64, max: usize, w
 
 fn kill(id: &str) -> Result<Value> {
     run_dir(id)?;
-    let Some(l) = store().live.lock().unwrap().get(id).cloned() else { return Ok(json!({ "ok": true, "running": false })) };
+    let Some(l) = store().live.lock().get(id).cloned() else { return Ok(json!({ "ok": true, "running": false })) };
     let pg = l.pid as i32;
     unsafe { libc::kill(-pg, libc::SIGTERM) };
     let mut done = l.done.clone();
@@ -834,7 +835,7 @@ fn kill(id: &str) -> Result<Value> {
 
 async fn wait(id: &str, timeout_ms: Option<u64>) -> Result<Value> {
     run_dir(id)?;
-    let live = store().live.lock().unwrap().get(id).cloned();
+    let live = store().live.lock().get(id).cloned();
     if let Some(l) = live {
         let mut done = l.done.clone();
         let fut = done.wait_for(|d| *d);
