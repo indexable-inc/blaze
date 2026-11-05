@@ -6,7 +6,7 @@
 //! frame number the host set in the [`Paint`] singleton before `progress`; [`painted`] sorts roots by layer, `Z` and id.
 use harness_native_flecs::prelude::*;
 use harness_native_ui_draw_api::{Paint, PaintKind, Painted};
-use harness_native_ui_look_api::{Edge, Fill, Ribbon};
+use harness_native_ui_look_api::{Edge, Fill, Ribbon, Scheme};
 use harness_native_ui_layout_api::{Background, Overlay};
 use harness_native_ui_motion_api::{Drawn, Pose, Reveal, Shown};
 use harness_native_ui_node_api::{Clip, Hidden, Hosted, Laid, Layer, Level, Node, Offscreen, Z};
@@ -54,7 +54,7 @@ pub fn install(world: WorldRef<'_>) {
         let level = e.try_cloned::<&Layer>().map_or_else(Default::default, |l| l.level);
         let z = e.try_cloned::<&Z>().map_or(0.0, |z| z.z);
         let stack = Stack { frame, level, z, root: *e.id() as u32 };
-        walk(e, 1.0, Affine::ID, None, stack, &mut 0);
+        walk(e, 1.0, Affine::ID, None, 0, stack, &mut 0);
     });
 }
 
@@ -105,7 +105,7 @@ fn revealed(e: EntityView<'_>, r: Cut) -> (f32, Affine) {
     (alpha, Affine { s: sc, tx: cx - cx * sc + rv.dx * off, ty: cy - cy * sc + rv.dy * off })
 }
 
-fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>, stack: Stack, seq: &mut u32) {
+fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>, scheme: u8, stack: Stack, seq: &mut u32) {
     if e.has(Hidden::id()) {
         return;
     }
@@ -119,6 +119,7 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
         return;
     }
     let mine = parent.then(own);
+    let scheme = e.try_cloned::<&Scheme>().map_or(scheme, |s| if s.dark { 1 } else { 2 });
     let (vx, vy) = mine.at(frame.x, frame.y);
     // Children: laid out against `laid`, drawn where the frame went.
     let kids_affine = mine.then(Affine { s: 1.0, tx: frame.x - laid.x, ty: frame.y - laid.y });
@@ -157,6 +158,7 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
             w: frame.w,
             h: frame.h,
             scale: mine.s,
+            scheme,
         };
         if e.try_cloned::<&Painted>() != Some(next) {
             e.set(next);
@@ -171,7 +173,7 @@ fn walk(e: EntityView<'_>, parent_alpha: f32, parent: Affine, clip: Option<Cut>,
     let mut kids: Vec<_> = harness_native_ui_node_api::children(e).into_iter().map(|c| (layer(c), c.try_cloned::<&Z>().map_or(0.0, |z| z.z), c)).collect();
     kids.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
     for (_, _, c) in kids {
-        walk(c, alpha, kids_affine, inner, stack, seq);
+        walk(c, alpha, kids_affine, inner, scheme, stack, seq);
     }
 }
 

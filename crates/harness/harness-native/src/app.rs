@@ -1629,7 +1629,7 @@ impl App {
                     (1.0 + (m.scale - 1.0) * hover + m.kick_scale * bump).max(0.1),
                 )
             });
-            let at = match self.paint.node(d, e, &p, laid, dark, held == Some(id), sc, upload) {
+            let at = match self.paint.node(d, e, &p, laid, p.dark(dark), held == Some(id), sc, upload) {
                 Ok(at) => at,
                 Err(err) => {
                     eprintln!("harness-native: paint: {err}");

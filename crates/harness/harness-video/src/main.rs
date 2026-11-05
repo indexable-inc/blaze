@@ -229,7 +229,7 @@ impl Stage {
             if p.alpha <= 0.002 || (p.clipped && (p.clip_w <= 0.0 || p.clip_h <= 0.0)) {
                 continue;
             }
-            if let Err(err) = self.painter.node(&mut d, e, &p, laid, true, false, sc, upload) {
+            if let Err(err) = self.painter.node(&mut d, e, &p, laid, p.dark(true), false, sc, upload) {
                 errors.push(err);
             }
         }

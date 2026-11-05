@@ -435,6 +435,14 @@ fn pasteboard_set(text: &str) {
 }
 
 impl App {
+    /// Whether the terminal's ground (hn.Main's Fill, `tone_term_ground`) is dark in the window's appearance.
+    fn term_ground_dark(&self) -> bool {
+        let w = self.world.world_ref();
+        let Some(f) = view::prefab(w, "hn.Main").and_then(|e| e.try_cloned::<&Fill>()) else { return self.dark };
+        let c = if self.dark { f.dark } else { f.light };
+        0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.5
+    }
+
     /// Whether the focused pane shows a chat session (keys go to its input).
     pub(super) fn chat_focused(&self) -> bool {
         self.focused_chat().is_some()
@@ -475,6 +483,16 @@ impl App {
                 st.ours = true;
                 self.chats.borrow_mut().remove(&sid);
                 self.link.attach(sid, 80, 24, true);
+            }
+        }
+        // Drawn in the appearance of the ground it sits on (the terminal's, dark in both appearances unless the Ghostty
+        // theme says otherwise), so its inks, plates and washes read on it whatever the window's appearance.
+        let scheme = harness_native_ui_look_api::Scheme { dark: self.term_ground_dark() };
+        for part in ["list", "foot"] {
+            if let Some(v) = pv.part(part)
+                && v.entity().try_cloned::<&harness_native_ui_look_api::Scheme>() != Some(scheme)
+            {
+                v.entity().set(scheme);
             }
         }
         let chats = self.chats.borrow();
