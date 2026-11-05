@@ -130,3 +130,21 @@ impl Highlighter {
         Ok(spans)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chat's ```rust block (its file `code.rust`) colours its keyword, function name and string by the names asked about;
+    /// asked about none, nothing is coloured (a scene with no `code_ink` draws code in one ink).
+    #[test]
+    fn a_fenced_rust_block_gets_its_captures() {
+        let mut h = Highlighter::default();
+        let names: Vec<String> = ["function", "keyword", "string"].map(str::to_owned).to_vec();
+        let text = "fn reverse(s: &str) -> String { \"x\".into() }";
+        let spans = h.spans("code.rust", text, &names).unwrap();
+        let named = |n: usize| spans.iter().filter(|s| s.name == n).count();
+        assert!(named(0) >= 1 && named(1) >= 1 && named(2) >= 1, "{spans:?}");
+        assert!(h.spans("code.rust", text, &[]).unwrap().is_empty());
+    }
+}

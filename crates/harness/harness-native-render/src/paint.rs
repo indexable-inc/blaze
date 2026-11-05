@@ -73,20 +73,21 @@ pub fn rgba(c: Rgba) -> [f32; 4] {
     [c.r, c.g, c.b, c.a]
 }
 
-/// The `code_ink` tokens: each entity under `code_ink` with a `Fill`, by its dotted path below it, in the dark ink.
-fn code_ink(w: WorldRef<'_>) -> Vec<(String, [f32; 4])> {
-    fn walk(e: EntityView<'_>, prefix: &str, out: &mut Vec<(String, [f32; 4])>) {
+/// The `code_ink` tokens: each entity under `code_ink` with a `Fill`, by its dotted path below it, in its `dark` or
+/// light ink.
+fn code_ink(w: WorldRef<'_>, dark: bool) -> Vec<(String, [f32; 4])> {
+    fn walk(e: EntityView<'_>, prefix: &str, dark: bool, out: &mut Vec<(String, [f32; 4])>) {
         e.each_child(|c| {
             let name = if prefix.is_empty() { c.name() } else { format!("{prefix}.{}", c.name()) };
             if let Some(f) = c.try_cloned::<&Fill>() {
-                out.push((name.clone(), rgba(f.dark)));
+                out.push((name.clone(), rgba(if dark { f.dark } else { f.light })));
             }
-            walk(c, &name, out);
+            walk(c, &name, dark, out);
         });
     }
     let mut out = Vec::new();
     if let Some(root) = w.try_lookup("code_ink") {
-        walk(root, "", &mut out);
+        walk(root, "", dark, &mut out);
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -380,7 +381,7 @@ impl Painter {
                 let time = e.world().try_get::<&Clock>(|c| c.time).unwrap_or(0.0);
                 let inks = match e.try_cloned::<&Highlight>() {
                     Some(h) => {
-                        let tokens = code_ink(e.world());
+                        let tokens = code_ink(e.world(), dark);
                         let names: Vec<String> = tokens.iter().map(|(n, _)| n.clone()).collect();
                         let spans = self
                             .highlight
