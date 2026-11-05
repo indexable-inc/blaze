@@ -87,8 +87,9 @@ use serde::{Deserialize, Serialize};
 /// sends its own recorder's rows of a build to the daemon, which writes them to the history. 39:
 /// [`Request::Lock`]. 40: [`Status::uptime_ms`], for `blaze status --json`. 41:
 /// [`Response::Doing`] (what a build waits on and what each unit under way does, about once a
-/// second), [`Status::builds`] and [`Status::downloads`].
-pub const SCHEMA: u32 = 41;
+/// second), [`Status::builds`] and [`Status::downloads`]. 42: [`Doing::now`] and
+/// [`Building::now`], the build's live model (`blaze_protocol::now::Now`).
+pub const SCHEMA: u32 = 42;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -868,6 +869,9 @@ pub struct Doing {
     /// left`, the longest open span on its threads with its age, or the stage it is in (`waits
     /// for its pinned native inputs, 1 of 1 layouts left`); `None` while a unit compiles.
     pub on: Option<String>,
+    /// The build as it runs now, the one model the view draws ([`blaze_protocol::now::Now`]);
+    /// the strings around it say the same for a client that draws no view.
+    pub now: blaze_protocol::now::Now,
     /// The daemon's workers running a job's code now (`blaze_graph::pool::Pool::working`),
     /// and those that are not: with most idle, the build waits on what the busy ones run.
     pub busy: u32,
@@ -1586,6 +1590,8 @@ pub struct Building {
     /// Its plane request: the build's number in the profile history and its spans; 0 before
     /// the job has posted one (while it fetches, or its views open).
     pub id: u32,
+    /// Its last live model ([`Doing::now`]): what `blaze status` draws.
+    pub now: blaze_protocol::now::Now,
     /// The command, as the client ran it: `test -p blaze-api`, or the work's name for an
     /// agent's request (`check`).
     pub what: String,
